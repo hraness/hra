@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstat, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 
@@ -122,4 +123,40 @@ export async function assertProductionPackageOnly(
   if (installPreflightRuntimes !== 1) {
     throw new Error("The install artifact must contain exactly one reviewed self-contained install preflight runtime.");
   }
+}
+
+export async function assertReviewedReleaseInventory(packageRoot: string): Promise<void> {
+  const expected = Object.freeze({
+    count: 104,
+    jsonBytes: 4_651,
+    sha256: "f5a0e01b7b98234afe957b05367d6babf6d049c93d981295ab74fa5c1ebcd894",
+  });
+  const inventory: Array<readonly [string, "directory" | "file", number, number]> = [];
+  const visit = async (path: string): Promise<void> => {
+    for (const name of (await readdir(path)).sort()) {
+      const child = join(path, name);
+      const metadata = await lstat(child);
+      if (
+        metadata.isSymbolicLink()
+        || (metadata.isFile() && metadata.nlink !== 1)
+        || (!metadata.isDirectory() && !metadata.isFile())
+      ) {
+        throw new Error("The package inventory contains a non-canonical filesystem object.");
+      }
+      inventory.push([
+        relative(packageRoot, child).replaceAll("\\", "/"),
+        metadata.isDirectory() ? "directory" : "file",
+        metadata.mode & 0o777,
+        metadata.isFile() ? metadata.size : 0,
+      ]);
+      if (metadata.isDirectory()) await visit(child);
+    }
+  };
+  await visit(packageRoot);
+  const canonical = `${JSON.stringify(inventory)}\n`;
+  if (
+    inventory.length !== expected.count
+    || Buffer.byteLength(canonical) !== expected.jsonBytes
+    || createHash("sha256").update(canonical).digest("hex") !== expected.sha256
+  ) throw new Error("The package archive path, type, mode, count, or size inventory is not the reviewed release inventory.");
 }

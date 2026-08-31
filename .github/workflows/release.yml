@@ -1,0 +1,324 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release source and build exact artifact
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      artifact_digest: ${{ steps.release_artifact.outputs.artifact-digest }}
+      artifact_id: ${{ steps.release_artifact.outputs.artifact-id }}
+      npm_preflight_run_attempt: ${{ steps.npm_preflight.outputs.run_attempt }}
+      npm_preflight_run_id: ${{ steps.npm_preflight.outputs.run_id }}
+      npm_preflight_state: ${{ steps.npm_preflight.outputs.state }}
+      verified_sha: ${{ steps.identity.outputs.sha }}
+      verified_tag: ${{ steps.identity.outputs.tag }}
+      verified_tag_object: ${{ steps.identity.outputs.tag_object }}
+    steps:
+      - name: Require one stable tag push
+        id: request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+          EVENT_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "push" || "$EVENT_REF_TYPE" != "tag" || "$EVENT_REF" != "refs/tags/$EVENT_REF_NAME" ]]; then
+            echo "::error::Release request is not one exact tag push"
+            exit 1
+          fi
+          if [[ ! "$EVENT_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release request is not one stable semantic-version tag"
+            exit 1
+          fi
+          printf 'tag=%s\n' "$EVENT_REF_NAME" >> "$GITHUB_OUTPUT"
+      - name: Check out the exact tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          ref: refs/tags/${{ steps.request.outputs.tag }}
+      - name: Fetch only governed release history
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_TAG: ${{ steps.request.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "true"
+          git fetch --force --no-tags --unshallow origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$VERIFIED_TAG:refs/tags/$VERIFIED_TAG"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"
+          git show-ref --verify --quiet "refs/tags/$VERIFIED_TAG"
+          while IFS= read -r release_ref; do
+            case "$release_ref" in
+              "refs/remotes/origin/$DEFAULT_BRANCH"|"refs/tags/$VERIFIED_TAG") ;;
+              *)
+                echo "::error::Unexpected ref entered governed release history"
+                exit 1
+                ;;
+            esac
+          done < <(git for-each-ref --format='%(refname)')
+          test "$(git for-each-ref --format='%(refname)' | wc -l | tr -d ' ')" = "2"
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - name: Install Node and npm trusted-publishing client
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.19.0"
+          registry-url: https://registry.npmjs.org
+      - name: Verify annotated tag, exact main head, and package version
+        id: identity
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REQUESTED_TAG: ${{ steps.request.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$(git cat-file -t "$REQUESTED_TAG")" != "tag" ]]; then
+            echo "::error::Release tag is not annotated"
+            exit 1
+          fi
+          version="$(bun -e 'const value = await Bun.file("package.json").json(); if (typeof value.version !== "string") process.exit(1); process.stdout.write(value.version)')"
+          if [[ "$REQUESTED_TAG" != "v$version" ]]; then
+            echo "::error::Release tag does not match package version"
+            exit 1
+          fi
+          tag_commit="$(git rev-parse --verify "refs/tags/$REQUESTED_TAG^{commit}")"
+          tag_object="$(git rev-parse --verify "refs/tags/$REQUESTED_TAG^{tag}")"
+          main_commit="$(git rev-parse --verify "origin/$DEFAULT_BRANCH^{commit}")"
+          head_commit="$(git rev-parse --verify "HEAD^{commit}")"
+          if [[ "$tag_commit" != "$head_commit" ]] || ! git merge-base --is-ancestor "$tag_commit" "$main_commit"; then
+            echo "::error::Release checkout must equal the annotated tag commit and reviewed main must contain it"
+            exit 1
+          fi
+          printf 'sha=%s\n' "$tag_commit" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+          printf 'tag_object=%s\n' "$tag_object" >> "$GITHUB_OUTPUT"
+      - name: Install exact locked dependencies without lifecycle scripts
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Run complete repository gate
+        run: bun run check
+      - name: Require registry-only runtime dependencies
+        run: bun run ./scripts/check-release-package.ts
+      - name: Create one exact npm tarball and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          npm pack --ignore-scripts --pack-destination artifacts .
+          expected="$(bun -e 'import { releaseArchiveName } from "./scripts/release-package-policy"; const value = await Bun.file("package.json").json(); process.stdout.write(releaseArchiveName(value.version))')"
+          test -f "artifacts/$expected"
+          test "$(find artifacts -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')" = "1"
+          bun run ./scripts/release-artifact-checksum.ts write "$GITHUB_WORKSPACE/artifacts/$expected" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+      - name: Record exact npm registry preflight
+        id: npm_preflight
+        run: |
+          set -euo pipefail
+          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          state="$(bun run ./scripts/check-npm-artifact-state.ts "$artifact")"
+          if [[ "$state" != "absent" && "$state" != "exact" ]]; then
+            echo "::error::npm registry preflight returned an invalid state"
+            exit 1
+          fi
+          printf 'state=%s\nrun_id=%s\nrun_attempt=%s\n' "$state" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Preserve exact release bytes
+        id: release_artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hra-release-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  exact_artifact:
+    name: Exact tarball install (${{ matrix.os }})
+    needs: verify
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - name: Check out verified source with complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          ref: ${{ needs.verify.outputs.verified_sha }}
+      - name: Fetch only governed release history
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_TAG: ${{ needs.verify.outputs.verified_tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "true"
+          git fetch --force --no-tags --unshallow origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$VERIFIED_TAG:refs/tags/$VERIFIED_TAG"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"
+          git show-ref --verify --quiet "refs/tags/$VERIFIED_TAG"
+          while IFS= read -r release_ref; do
+            case "$release_ref" in
+              "refs/remotes/origin/$DEFAULT_BRANCH"|"refs/tags/$VERIFIED_TAG") ;;
+              *)
+                echo "::error::Unexpected ref entered governed release history"
+                exit 1
+                ;;
+            esac
+          done < <(git for-each-ref --format='%(refname)')
+          test "$(git for-each-ref --format='%(refname)' | wc -l | tr -d ' ')" = "2"
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - name: Install exact locked dependencies without lifecycle scripts
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Require exact artifact identity
+        env:
+          VERIFIED_ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
+          VERIFIED_ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+        run: |
+          [[ "$VERIFIED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$VERIFIED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+      - name: Download exact release bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          merge-multiple: true
+          path: artifacts
+      - name: Verify checksum and complete installed-package behavior
+        run: |
+          set -euo pipefail
+          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          test -n "$artifact"
+          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+          bun run ./scripts/check-package.ts "$artifact"
+
+  publish:
+    name: Publish exact npm and GitHub artifacts
+    needs: [verify, exact_artifact]
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      VERIFIED_SHA: ${{ needs.verify.outputs.verified_sha }}
+      VERIFIED_TAG: ${{ needs.verify.outputs.verified_tag }}
+      VERIFIED_TAG_OBJECT: ${{ needs.verify.outputs.verified_tag_object }}
+      HRA_APPROVE_NPM_PUBLICATION: ${{ vars.HRA_APPROVE_NPM_PUBLICATION }}
+      HRA_NPM_PREFLIGHT_RUN_ATTEMPT: ${{ needs.verify.outputs.npm_preflight_run_attempt }}
+      HRA_NPM_PREFLIGHT_RUN_ID: ${{ needs.verify.outputs.npm_preflight_run_id }}
+      HRA_NPM_PREFLIGHT_STATE: ${{ needs.verify.outputs.npm_preflight_state }}
+    steps:
+      - name: Check out verified source with complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          ref: ${{ needs.verify.outputs.verified_sha }}
+      - name: Fetch only governed release history
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_TAG: ${{ needs.verify.outputs.verified_tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "true"
+          git fetch --force --no-tags --unshallow origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$VERIFIED_TAG:refs/tags/$VERIFIED_TAG"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"
+          git show-ref --verify --quiet "refs/tags/$VERIFIED_TAG"
+          while IFS= read -r release_ref; do
+            case "$release_ref" in
+              "refs/remotes/origin/$DEFAULT_BRANCH"|"refs/tags/$VERIFIED_TAG") ;;
+              *)
+                echo "::error::Unexpected ref entered governed release history"
+                exit 1
+                ;;
+            esac
+          done < <(git for-each-ref --format='%(refname)')
+          test "$(git for-each-ref --format='%(refname)' | wc -l | tr -d ' ')" = "2"
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - name: Install Node and npm trusted-publishing client
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.19.0"
+          registry-url: https://registry.npmjs.org
+      - name: Install exact locked dependencies without lifecycle scripts
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Require registry readiness and trusted publishing support
+        run: |
+          bun run ./scripts/check-release-package.ts
+          bun run ./scripts/check-npm-trusted-publishing.ts
+      - name: Require exact artifact identity
+        env:
+          VERIFIED_ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
+          VERIFIED_ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+        run: |
+          [[ "$VERIFIED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$VERIFIED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+      - name: Download validated release bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          merge-multiple: true
+          path: artifacts
+      - name: Revalidate remote authority and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_object="$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$VERIFIED_TAG" --jq 'select(.object.type == "tag") | .object.sha')"
+          test "$tag_object" = "$VERIFIED_TAG_OBJECT"
+          remote_tag="$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq 'select(.tag == env.VERIFIED_TAG and .object.type == "commit") | .object.sha')"
+          remote_main="$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha')"
+          test "$remote_tag" = "$VERIFIED_SHA"
+          git fetch --force --no-tags origin "$remote_main"
+          git merge-base --is-ancestor "$VERIFIED_SHA" "$remote_main"
+          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+      - name: Create immutable GitHub Release from the same bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/publish-github-release.ts "$VERIFIED_TAG" "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+      - name: Publish exact tarball through npm trusted publishing
+        run: |
+          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/publish-npm-release.ts "$artifact"
+      - name: Admit exact public npm and GitHub state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun run ./scripts/check-public-release.ts

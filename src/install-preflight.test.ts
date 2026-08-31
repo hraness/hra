@@ -39,13 +39,46 @@ import {
 } from "./install-preflight-runtime";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
+// Installer security tests use the complete publishable package tree with only
+// dependency resolution metadata removed. The package gate separately checks
+// the unchanged production tarball and its exact dependency policy.
+const TEST_STAGING_DEADLINE_MS = 45_000;
+const PUBLIC_LOADER_INSTALL_CALL = "await m.installHraRelease(a);";
+const BOUNDED_TEST_LOADER_INSTALL_CALL =
+  `await m.installHraRelease(a,{stageDeadlineMilliseconds:${String(TEST_STAGING_DEADLINE_MS)}});`;
+const BOUNDED_TEST_PREFLIGHT_LOADER = HRA_INSTALL_PREFLIGHT_LOADER.replace(
+  PUBLIC_LOADER_INSTALL_CALL,
+  BOUNDED_TEST_LOADER_INSTALL_CALL,
+);
+if (
+  HRA_INSTALL_PREFLIGHT_LOADER.indexOf(PUBLIC_LOADER_INSTALL_CALL)
+    !== HRA_INSTALL_PREFLIGHT_LOADER.lastIndexOf(PUBLIC_LOADER_INSTALL_CALL)
+  || BOUNDED_TEST_PREFLIGHT_LOADER === HRA_INSTALL_PREFLIGHT_LOADER
+  || BOUNDED_TEST_PREFLIGHT_LOADER.replace(
+    BOUNDED_TEST_LOADER_INSTALL_CALL,
+    PUBLIC_LOADER_INSTALL_CALL,
+  ) !== HRA_INSTALL_PREFLIGHT_LOADER
+) throw new Error("The installer test loader did not receive its one bounded staging deadline.");
 // Two serialized staging installs may each consume their complete bounded
 // installer budget. Keep the outer test deadline above both inner budgets so
 // scheduling delay cannot terminate a valid second install.
 const SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS = 180_000;
 const temporaryRoots: string[] = [];
+type DirectTestChild = Readonly<{
+  exited: Promise<number>;
+  kill: (signal?: number | NodeJS.Signals) => void;
+}>;
+const directTestChildren = new Set<DirectTestChild>();
 let archivePath: string;
 let archiveSha256: string;
+let installerFixtureManifest: Record<string, unknown>;
+let sourcePackageManifest: Record<string, unknown>;
+
+const trackDirectTestChild = <Child extends DirectTestChild>(child: Child): Child => {
+  directTestChildren.add(child);
+  void child.exited.finally(() => directTestChildren.delete(child));
+  return child;
+};
 
 type FetchObservation = Readonly<{
   accept: string | null;
@@ -74,13 +107,13 @@ const run = async (
   command: readonly [string, ...string[]],
   input: Readonly<{ cwd: string; environment?: NodeJS.ProcessEnv }>,
 ): Promise<Readonly<{ exitCode: number; stderr: string; stdout: string }>> => {
-  const child = Bun.spawn([...command], {
+  const child = trackDirectTestChild(Bun.spawn([...command], {
     cwd: input.cwd,
     env: input.environment ?? process.env,
     stderr: "pipe",
     stdin: "ignore",
     stdout: "pipe",
-  });
+  }));
   const [exitCode, stderr, stdout] = await Promise.all([
     child.exited,
     new Response(child.stderr).text(),
@@ -174,15 +207,16 @@ const runInstaller = async (root: string): Promise<Readonly<{
 }>> => {
   await mkdir(join(root, "home"), { recursive: true, mode: 0o700 });
   await chmod(join(root, "home"), 0o700);
-  return await run([
-    "/bin/sh",
-    "-c",
-    'umask 077; exec "$1" "$2" "$3"',
-    "hra-install-test",
-    process.execPath,
-    resolve(import.meta.dir, "install-preflight.ts"),
-    archivePath,
-  ], { cwd: root, environment: installEnvironment(root) });
+  const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+  const program = [
+    `const module = await import(${JSON.stringify(runtimePath)});`,
+    `await module.installHraRelease(${JSON.stringify(archivePath)}, { stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)} });`,
+    `process.stdout.write(${JSON.stringify(`${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`)});`,
+  ].join("\n");
+  return await run([process.execPath, "-e", program], {
+    cwd: root,
+    environment: installEnvironment(root),
+  });
 };
 
 const runTrustedLoader = async (
@@ -195,10 +229,12 @@ const runTrustedLoader = async (
 }>> => {
   await mkdir(join(root, "home"), { recursive: true, mode: 0o700 });
   await chmod(join(root, "home"), 0o700);
-  const child = Bun.spawn([
+  const child = trackDirectTestChild(Bun.spawn([
     process.execPath,
     "-e",
-    HRA_INSTALL_PREFLIGHT_LOADER,
+    sourceSha256 === HRA_INSTALL_PREFLIGHT_SOURCE_SHA256
+      ? BOUNDED_TEST_PREFLIGHT_LOADER
+      : HRA_INSTALL_PREFLIGHT_LOADER,
     "--",
     archivePath,
     sourceSha256,
@@ -208,7 +244,7 @@ const runTrustedLoader = async (
     stderr: "pipe",
     stdin: Bun.file(resolve(import.meta.dir, "install-preflight-runtime.ts")),
     stdout: "pipe",
-  });
+  }));
   const [exitCode, stderr, stdout] = await Promise.all([
     child.exited,
     new Response(child.stderr).text(),
@@ -280,7 +316,7 @@ const runOfficialInstaller = async (
       ? "async () => { const stage = (await fs.readdir(" + JSON.stringify(authorityRoot) + ")).find((entry) => entry.startsWith(\".staging-\")); if (!stage) throw new Error(\"The private archive stage is missing.\"); const privatePath = path.join(" + JSON.stringify(authorityRoot) + ", stage, \".hra-release-archive.tgz\"); const bytes = Buffer.from(await fs.readFile(privatePath)); bytes[0] = (bytes[0] ?? 0) ^ 1; await fs.writeFile(privatePath, bytes, { mode: 0o600 }); }"
       : "undefined") + ";",
     "try {",
-    "  await module.installHraRelease(module.HRA_INSTALL_ARCHIVE_URL, { beforePrivateArchiveReadback, fetcher });",
+    `  await module.installHraRelease(module.HRA_INSTALL_ARCHIVE_URL, { beforePrivateArchiveReadback, fetcher, stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)} });`,
     "  process.stdout.write(`${module.HRA_INSTALL_SUCCESS}\\n`);",
     "} finally {",
     `  await fs.writeFile(${JSON.stringify(observationsPath)}, JSON.stringify(observations), { mode: 0o600 });`,
@@ -359,6 +395,7 @@ const assertStalledStageRecovers = async (
 
 beforeAll(async () => {
   const root = await makeRoot("hra-install-archive-");
+  sourcePackageManifest = await readJsonRecord(join(repositoryRoot, "package.json"));
   const packed = await run([
     process.execPath,
     "pm",
@@ -367,12 +404,42 @@ beforeAll(async () => {
     root,
   ], { cwd: repositoryRoot });
   if (packed.exitCode !== 0) throw new Error(`Could not build installer fixture: ${packed.stderr}${packed.stdout}`);
-  archivePath = join(root, "hra-0.1.0.tgz");
+  const productionArchivePath = join(root, "hraness-hra-0.1.0.tgz");
+  const extractedRoot = join(root, "extracted");
+  await mkdir(extractedRoot, { mode: 0o700 });
+  const extracted = await run(["tar", "-xzf", productionArchivePath, "-C", extractedRoot], { cwd: root });
+  if (extracted.exitCode !== 0) {
+    throw new Error(`Could not extract installer fixture: ${extracted.stderr}${extracted.stdout}`);
+  }
+  const extractedPackageRoot = join(extractedRoot, "package");
+  installerFixtureManifest = await readJsonRecord(join(extractedPackageRoot, "package.json"));
+  delete installerFixtureManifest.dependencies;
+  delete installerFixtureManifest.devDependencies;
+  await writeFile(
+    join(extractedPackageRoot, "package.json"),
+    `${JSON.stringify(installerFixtureManifest, undefined, 2)}\n`,
+    { mode: 0o600 },
+  );
+  await rm(productionArchivePath);
+  const repacked = await run([
+    process.execPath,
+    "pm",
+    "pack",
+    "--destination",
+    root,
+  ], { cwd: extractedPackageRoot });
+  if (repacked.exitCode !== 0) {
+    throw new Error(`Could not repack installer fixture: ${repacked.stderr}${repacked.stdout}`);
+  }
+  archivePath = productionArchivePath;
   await chmod(archivePath, 0o600);
   archiveSha256 = createHash("sha256").update(await readFile(archivePath)).digest("hex");
 });
 
 afterAll(async () => {
+  const unsettledChildren = [...directTestChildren];
+  for (const child of unsettledChildren) child.kill("SIGTERM");
+  await Promise.allSettled(unsettledChildren.map(async (child) => await child.exited));
   if (process.platform === "darwin") {
     await Promise.all(temporaryRoots.map(async (root) => {
       await run(["/bin/chmod", "-RN", root], { cwd: tmpdir() });
@@ -384,12 +451,25 @@ afterAll(async () => {
 }, 60_000);
 
 describe("transactional HRA installer", () => {
+  test("strips only dependency maps from the private installer fixture", () => {
+    expect(sourcePackageManifest.dependencies).toEqual({
+      "@hraness/oh": "0.2.7",
+      "@openai/codex": "0.149.0",
+      convex: "1.45.0",
+      zod: "4.4.3",
+    });
+    const dependencyFreeSourceManifest = { ...sourcePackageManifest };
+    delete dependencyFreeSourceManifest.dependencies;
+    delete dependencyFreeSourceManifest.devDependencies;
+    expect(installerFixtureManifest).toEqual(dependencyFreeSourceManifest);
+  });
+
   test("binds the public command to one tagged preflight and one exact tagged archive", async () => {
     expect(HRA_INSTALL_PREFLIGHT_SOURCE_URL).toBe(
       "https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts",
     );
     expect(HRA_INSTALL_ARCHIVE_URL).toBe(
-      "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+      "https://github.com/hraness/hra/releases/download/v0.1.0/hraness-hra-0.1.0.tgz",
     );
     const runtimeBytes = await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts"));
     expect(createHash("sha256").update(runtimeBytes).digest("hex")).toBe(
@@ -613,9 +693,9 @@ describe("transactional HRA installer", () => {
     expect(activeMetadata.isSymbolicLink()).toBeTrue();
     const activeTarget = await realpath(activePath);
     expect(activeTarget).toContain(`${join(bunRoot, "install", "hra", "versions")}/`);
-    expect(activeTarget).toEndWith("/install/global/node_modules/hra/src/cli.ts");
+    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/hra/src/cli.ts");
     expect((await lstat(activeTarget)).mode & 0o777).toBe(0o755);
-    expect(await Bun.file(join(bunRoot, "install", "global", "node_modules", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(bunRoot, "install", "global", "node_modules", "@hraness", "hra")).exists()).toBeFalse();
     expect(await Bun.file(join(bunRoot, "install", "hra", "install-intent.json")).exists()).toBeFalse();
     const versions = await readdir(join(bunRoot, "install", "hra", "versions"));
     expect(versions).toHaveLength(1);
@@ -636,7 +716,7 @@ describe("transactional HRA installer", () => {
       "install",
       "global",
       "package.json",
-    ))).toEqual({ dependencies: { hra: "0.1.0" } });
+    ))).toEqual({ dependencies: { "@hraness/hra": "0.1.0" } });
 
     const second = await runInstaller(root);
     expect(second).toEqual({
@@ -767,6 +847,7 @@ describe("transactional HRA installer", () => {
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `const archive = ${JSON.stringify(localArchive)};`,
       "await module.installHraRelease(archive, {",
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterArchiveIdentityResolved: async () => {",
       "    const bytes = Buffer.from(await fs.readFile(archive));",
       "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
@@ -804,6 +885,7 @@ describe("transactional HRA installer", () => {
       'const fs = await import("node:fs/promises");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  beforeStageWorkerSpawn: async (privateArchivePath) => {",
       "    const bytes = Buffer.from(await fs.readFile(privateArchivePath));",
       "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
@@ -831,6 +913,7 @@ describe("transactional HRA installer", () => {
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageWorkerStarted: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
       "    if (!stage) throw new Error(\"The private archive stage is missing.\");",
@@ -861,10 +944,11 @@ describe("transactional HRA installer", () => {
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageCleanupCustody: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
       "    if (!stage) throw new Error(\"The extracted package stage is missing.\");",
-      `    const packageFile = path.join(${JSON.stringify(authorityRoot)}, stage, "install/global/node_modules/hra/src/domain/values.ts");`,
+      `    const packageFile = path.join(${JSON.stringify(authorityRoot)}, stage, "install/global/node_modules/@hraness/hra/src/domain/values.ts");`,
       "    const bytes = Buffer.from(await fs.readFile(packageFile));",
       "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
       "    await fs.writeFile(packageFile, bytes);",
@@ -895,6 +979,7 @@ describe("transactional HRA installer", () => {
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageCleanupCustody: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
       "    if (!stage) throw new Error(\"The cleanup stage is missing.\");",
@@ -929,6 +1014,7 @@ describe("transactional HRA installer", () => {
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageWorkerExit: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
       "    if (!stage) throw new Error(\"The cache stage is missing.\");",
@@ -961,6 +1047,7 @@ describe("transactional HRA installer", () => {
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  beforeCacheQuarantine: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
       "    if (!stage) throw new Error(\"The held cache stage is missing.\");",
@@ -994,6 +1081,7 @@ describe("transactional HRA installer", () => {
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterVersionRename: async () => {",
       `    const versionsRoot = ${JSON.stringify(versionsRoot)};`,
       "    const version = (await fs.readdir(versionsRoot)).find((entry) => !entry.endsWith(\"-authentic\"));",
@@ -1024,6 +1112,7 @@ describe("transactional HRA installer", () => {
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterVersionRebind: async () => {",
       `    const versionsRoot = ${JSON.stringify(versionsRoot)};`,
       "    const version = (await fs.readdir(versionsRoot)).find((entry) => !entry.endsWith(\"-authentic\"));",
@@ -1106,14 +1195,14 @@ describe("transactional HRA installer", () => {
       `  afterStageWorkerReady: async (bunPid, lockPid) => { await Bun.write(${JSON.stringify(sentinel)}, String(bunPid) + " " + String(lockPid) + "\\n"); await new Promise(() => {}); },`,
       "});",
     ].join("\n");
-    const child = Bun.spawn([process.execPath, "-e", program], {
+    const child = trackDirectTestChild(Bun.spawn([process.execPath, "-e", program], {
       cwd: root,
       detached: true,
       env: installEnvironment(root),
       stderr: "ignore",
       stdin: "ignore",
       stdout: "ignore",
-    });
+    }));
     const deadline = Date.now() + 10_000;
     while (!await Bun.file(sentinel).exists() && Date.now() < deadline) await Bun.sleep(25);
     if (!await Bun.file(sentinel).exists()) {
@@ -1160,7 +1249,7 @@ describe("transactional HRA installer", () => {
       await Bun.sleep(10);
       recovered = await runInstaller(root);
     }
-    expect(recovered.exitCode).toBe(0);
+    expect(recovered.exitCode, recovered.stderr).toBe(0);
     expect(recovered.stdout).toBe(`${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`);
     expect((await lstat(join(bunRoot, "bin", "hra"))).isSymbolicLink()).toBeTrue();
     expect((await readdir(authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeFalse();
@@ -1178,6 +1267,7 @@ describe("transactional HRA installer", () => {
       [
         `const module = await import(${JSON.stringify(runtimePath)});`,
         `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+        `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
         `  ${hook}: () => { throw new Error(${JSON.stringify(`test interruption at ${hook}`)}); },`,
         "});",
       ].join("\n"),
@@ -1198,12 +1288,12 @@ describe("transactional HRA installer", () => {
     expect((await lstat(publishedTarget)).mode & 0o777).toBe(0o755);
 
     const recovered = await runInstaller(root);
-    expect(recovered.exitCode).toBe(0);
+    expect(recovered.exitCode, recovered.stderr).toBe(0);
     expect(await realpath(activePath)).toBe(publishedTarget);
     expect(await Bun.file(join(root, "bun root", "install", "hra", "install-intent.json")).exists()).toBeFalse();
   }, 60_000);
 
-  test("detects same-size dependency mutation after normalization before PATH publication", async () => {
+  test("detects same-size installed-tree mutation after normalization before PATH publication", async () => {
     const root = await makeRoot("hra-install-tree-digest-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
@@ -1211,9 +1301,10 @@ describe("transactional HRA installer", () => {
     const program = [
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterNormalized: async () => {",
       `    const versions = await (await import("node:fs/promises")).readdir(${JSON.stringify(versionsRoot)});`,
-      `    const path = ${JSON.stringify(versionsRoot)} + "/" + versions[0] + "/install/global/node_modules/zod/package.json";`,
+      `    const path = ${JSON.stringify(versionsRoot)} + "/" + versions[0] + "/install/global/node_modules/@hraness/hra/src/domain/values.ts";`,
       "    const bytes = Buffer.from(await Bun.file(path).arrayBuffer());",
       "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
       "    await Bun.write(path, bytes);",
@@ -1239,6 +1330,7 @@ describe("transactional HRA installer", () => {
     const program = [
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageWorkerExit: async () => {",
       '    const fs = await import("node:fs/promises");',
       '    const path = await import("node:path");',

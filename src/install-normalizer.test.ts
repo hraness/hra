@@ -42,7 +42,7 @@ const manifest = (scripts: Record<string, string> = {
   build: "bun ./build.ts",
 }): Record<string, unknown> => ({
   bin: { hra: "./src/cli.ts" },
-  name: "hra",
+  name: "@hraness/hra",
   scripts,
   version: "0.1.0",
 });
@@ -221,7 +221,7 @@ type InstallFixture = Readonly<{
 const installFixture = async (): Promise<InstallFixture> => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "hra-install-normalizer-")));
   temporaryDirectories.push(root);
-  const packageRoot = join(root, "node_modules", "hra");
+  const packageRoot = join(root, "node_modules", "@hraness", "hra");
   const sourceDirectory = join(packageRoot, "src");
   const binDirectory = join(root, "node_modules", ".bin");
   const cliPath = join(sourceDirectory, "cli.ts");
@@ -235,7 +235,7 @@ const installFixture = async (): Promise<InstallFixture> => {
   await writeFile(normalizerPath, "// reviewed fixture normalizer\n", { mode: 0o644 });
   await writeFile(cliPath, await readFile(join(repositoryRoot, "src", "cli.ts")), { mode: 0o755 });
   await chmod(cliPath, 0o777);
-  await symlink("../hra/src/cli.ts", binLink);
+  await symlink("../@hraness/hra/src/cli.ts", binLink);
   return { binLink, cliPath, normalizerPath, packageRoot, root };
 };
 
@@ -446,7 +446,7 @@ describe("lifecycle-free Bun install normalizer", () => {
         beforePublishRename: async () => {
           await rename(binDirectory, heldBinDirectory);
           await mkdir(binDirectory, { mode: 0o755 });
-          await symlink("../hra/src/cli.ts", join(binDirectory, "hra"));
+          await symlink("../@hraness/hra/src/cli.ts", join(binDirectory, "hra"));
         },
       },
     })).rejects.toThrow("directory path no longer names its held custody descriptor");
@@ -539,7 +539,7 @@ describe("lifecycle-free Bun install normalizer", () => {
       { cwd: packageSource, environment },
     );
     expect(hraPack.exitCode).toBe(0);
-    const hraArchive = join(archiveDirectory, "hra-0.1.0.tgz");
+    const hraArchive = join(archiveDirectory, "hraness-hra-0.1.0.tgz");
     let installedCli: string | undefined;
     const installAndNormalize = async (): Promise<void> => {
       const installation = await run(
@@ -553,7 +553,7 @@ describe("lifecycle-free Bun install normalizer", () => {
       expect(currentCli).toBe(installedCli);
       expect(currentCli).toContain(`${join(globalInstall, "install", "hra", "versions")}/`);
       expect((await lstat(currentCli)).mode & 0o777).toBe(0o755);
-      expect(await Bun.file(join(globalInstall, "install", "global", "node_modules", "hra")).exists()).toBeFalse();
+      expect(await Bun.file(join(globalInstall, "install", "global", "node_modules", "@hraness", "hra")).exists()).toBeFalse();
       expect(await access(hostileSentinel).then(() => "present", () => "absent")).toBe("absent");
       const trustAfter = JSON.parse(await readFile(globalManifestPath, "utf8")) as Record<string, unknown>;
       expect(trustAfter.trustedDependencies).toEqual(["existing-trusted-fixture"]);
@@ -604,7 +604,7 @@ describe("lifecycle-free Bun install normalizer", () => {
       { cwd: packageSource },
     );
     expect(packed.exitCode).toBe(0);
-    const archive = join(archiveDirectory, "hra-0.1.0.tgz");
+    const archive = join(archiveDirectory, "hraness-hra-0.1.0.tgz");
     const environment = {
       ...process.env,
       BUN_INSTALL: globalInstall,
@@ -627,7 +627,7 @@ describe("lifecycle-free Bun install normalizer", () => {
     expect(installed.exitCode).not.toBe(0);
     expect(installed.stderr).not.toContain(HRA_INSTALL_CLI_SHA256);
     expect(await Bun.file(join(globalInstall, "bin", "hra")).exists()).toBeFalse();
-    expect(await Bun.file(join(globalInstall, "install", "global", "node_modules", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(globalInstall, "install", "global", "node_modules", "@hraness", "hra")).exists()).toBeFalse();
     const authorityEntries = await readdir(join(globalInstall, "install", "hra"));
     expect(authorityEntries.some((entry) => entry.startsWith(".staging-"))).toBeTrue();
   });
