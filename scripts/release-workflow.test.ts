@@ -93,7 +93,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("Current V2 claims from `.11` onward");
     expect(releaseRecord).toContain("repository path `hraness/hra`, numeric owner ID");
     expect(releaseRecord).toContain("`307125679`, numeric repository ID `1343008607`");
-    expect(releaseRecord).toContain("ref `refs/tags/v0.1.3`");
+    expect(releaseRecord).toContain("ref `refs/tags/v0.1.4`");
   });
 
   test("gives GitHub publisher commands only their explicit non-OIDC environment", () => {
@@ -307,21 +307,21 @@ describe("release workflow", () => {
   test("binds residual draft identity to the exact same run and artifact authority", () => {
     const source = {
       GITHUB_EVENT_NAME: "push",
-      GITHUB_REF: "refs/tags/v0.1.3",
-      GITHUB_REF_NAME: "v0.1.3",
+      GITHUB_REF: "refs/tags/v0.1.4",
+      GITHUB_REF_NAME: "v0.1.4",
       GITHUB_REF_TYPE: "tag",
       GITHUB_REPOSITORY: "hraness/hra",
       GITHUB_REPOSITORY_ID: "1343008607",
       GITHUB_RUN_ATTEMPT: "2",
       GITHUB_RUN_ID: "123",
-      GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.3",
+      GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.4",
     };
-    const run = githubReleaseRun("v0.1.3", source);
+    const run = githubReleaseRun("v0.1.4", source);
     const input = {
       artifacts: [{ name: "hra.tgz", sha256: "c".repeat(64), size: 7 }],
       commitSha: "a".repeat(40),
       run,
-      tag: "v0.1.3",
+      tag: "v0.1.4",
       tagObjectSha: "b".repeat(40),
     } as const;
     const body = draftReleaseBody(input);
@@ -339,7 +339,7 @@ describe("release workflow", () => {
     });
     expect(() => parseReleaseBody(futureAttemptBody, input, "draft"))
       .toThrow("workflow-attempt ordering");
-    expect(() => githubReleaseRun("v0.1.3", { ...source, GITHUB_RUN_ATTEMPT: "3", GITHUB_RUN_ID: "124" }))
+    expect(() => githubReleaseRun("v0.1.4", { ...source, GITHUB_RUN_ATTEMPT: "3", GITHUB_RUN_ID: "124" }))
       .not.toThrow();
   });
 
@@ -393,7 +393,7 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: durable `v0.1.3` forward-release and retry contract.");
+    expect(releaseRecord).toContain("Status: durable `v0.1.4` forward-release and retry contract.");
     expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
     expect(releaseRecord).toContain("Release workflow run `33363290345`, attempt 1");
@@ -415,9 +415,24 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("pins Node 24.20.0 with npm 11.19.0");
     expect(releaseRecord).toContain("proves the exact OIDC exchange before creating another GitHub Release");
     expect(releaseRecord).toContain("forwards numeric repository-owner identity");
+    expect(releaseRecord).toContain("## Immutable v0.1.3 failure record");
+    expect(releaseRecord).toContain("tag object `61ebcaf33616bc29675053465725bc294f06f9d2`");
+    expect(releaseRecord).toContain("reviewed `main` commit `eef84596ec3891bcd29691d087449641dfda7e62`");
+    expect(releaseRecord).toContain("Release workflow run `33411496909`, attempt 1");
+    expect(releaseRecord).toContain("Actions artifact `9765501271`");
+    expect(releaseRecord).toContain("`sha256:df1f40d36e19b92b92c8d6b256e49c7caa54ed5850bf353dec2c38995b3d449b`");
+    expect(releaseRecord).toContain("651,739-byte tarball with SHA-256 `cd7847d3e7c7369f05ad35bb80372e7a648875fc2201b1490591f9028db549ed`");
+    expect(releaseRecord).toContain("88-byte checksum file with SHA-256 `371394f881aa1f0ed692ccf287c277571f2e0e78892f84a1652b5d3fea540f6c`");
+    expect(releaseRecord).toContain("Publish job `99553962517` stopped at `Prove npm trusted-publisher exchange without publication`");
+    expect(releaseRecord).toContain("later GitHub Release, npm publication, and public-admission steps were skipped");
+    expect(releaseRecord).toContain("no `v0.1.3` GitHub Release or draft and no npm `0.1.3` exist");
+    expect(releaseRecord).toContain("`latest` and `bootstrap` still name `0.1.0-bootstrap.0`");
+    expect(releaseRecord).toContain("The publication variable was deleted");
+    expect(releaseRecord).toContain("legacy distributed-task path and the bounded current hosted-runner `/idtoken/` path");
+    expect(releaseRecord).toContain("permits only one `api-version=2.0` query parameter");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
     expect(releaseRecord).toContain("npm trusted publishing names repository `hraness/hra` and workflow `release.yml`");
-    expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.3` becomes authoritative only when");
+    expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.4` becomes authoritative only when");
     expect(releaseRecord).toContain("Immutable local CLI release; hosted sync not yet live.");
     expect(releaseRecord).toContain("tag remains `release-ready` until exact release admission");
     expect(releaseRecord).toContain("Neither phase claims that hosted sync is available.");
@@ -426,11 +441,11 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("`@hraness/hra@0.1.0-bootstrap.0`");
     expect(releaseRecord).toContain("npm also assigns `latest` to the first published version");
     expect(releaseRecord).toContain("resolves through both `bootstrap` and `latest`");
-    expect(releaseRecord).toContain("replaces the bootstrap seed as `latest` with exact stable `0.1.3`");
+    expect(releaseRecord).toContain("replaces the bootstrap seed as `latest` with exact stable `0.1.4`");
     expect(releaseRecord).toContain("every earlier attempt's bounded GitHub Jobs API record");
     expect(releaseRecord).toContain("again immediately before the POST");
-    expect(releaseRecord).toContain("`dist-tags.latest` to name `0.1.3`");
-    expect(releaseRecord).toContain("`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.3`");
+    expect(releaseRecord).toContain("`dist-tags.latest` to name `0.1.4`");
+    expect(releaseRecord).toContain("`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.4`");
     expect(releaseRecord).toContain("npm CLI 11.19.0");
     expect(releaseRecord).toContain("numeric owner ID\n`307125679`");
     expect(releaseRecord).toContain("owner ID `307125679`");
