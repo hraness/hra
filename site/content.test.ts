@@ -50,7 +50,7 @@ describe("public content contract", () => {
     });
   });
 
-  test("leads both public surfaces with the eventual beta install command", () => {
+  test("leads both public surfaces with the release-ready immutable CLI install command", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
     const encodedInstallCommand = htmlText(publicContent.installCommand);
@@ -75,15 +75,25 @@ describe("public content contract", () => {
     );
   });
 
-  test("marks unavailable external endpoints in source", () => {
+  test("marks the local release ready and website live while keeping hosted sync unavailable", () => {
     expect(publicContent.endpoints).toEqual({
-      betaTag: "beta-not-yet-live",
+      betaTag: "release-ready",
       githubRepository: "live",
       hostedSync: "beta-not-yet-live",
-      website: "beta-not-yet-live",
+      website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("beta-not-yet-live");
-    expect(renderSiteHtml()).toContain("beta-not-yet-live");
+    for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
+      expect(surface).toContain("Immutable local CLI release; hosted sync not yet live");
+      expect(surface).toContain("works once GitHub exposes the immutable");
+      expect(surface).toContain("public CLI stays immutable once admitted");
+      expect(surface).not.toContain("release tag is release-ready");
+      expect(surface).toContain("optional hosted sync remains beta-not-yet-live");
+      expect(surface).toContain("Local release boundary");
+      expect(surface).toContain("once its GitHub Release exists");
+      expect(surface).not.toContain("install command becomes usable");
+      expect(surface).not.toContain("Beta not yet live");
+      expect(surface).not.toContain("No published `v0.1.0` tag currently exposes these commands");
+    }
   });
 
   test("publishes protected cloud auth and the exact device-pairing path", () => {

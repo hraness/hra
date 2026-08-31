@@ -50,9 +50,33 @@ jobs:
       - name: Check out the exact tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
           persist-credentials: false
           ref: refs/tags/${{ steps.request.outputs.tag }}
+      - name: Fetch only governed release history
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_TAG: ${{ steps.request.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "true"
+          git fetch --force --no-tags --unshallow origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$VERIFIED_TAG:refs/tags/$VERIFIED_TAG"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"
+          git show-ref --verify --quiet "refs/tags/$VERIFIED_TAG"
+          while IFS= read -r release_ref; do
+            case "$release_ref" in
+              "refs/remotes/origin/$DEFAULT_BRANCH"|"refs/tags/$VERIFIED_TAG") ;;
+              *)
+                echo "::error::Unexpected ref entered governed release history"
+                exit 1
+                ;;
+            esac
+          done < <(git for-each-ref --format='%(refname)')
+          test "$(git for-each-ref --format='%(refname)' | wc -l | tr -d ' ')" = "2"
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -69,7 +93,6 @@ jobs:
           REQUESTED_TAG: ${{ steps.request.outputs.tag }}
         run: |
           set -euo pipefail
-          git fetch --force origin "$DEFAULT_BRANCH" "refs/tags/$REQUESTED_TAG:refs/tags/$REQUESTED_TAG"
           if [[ "$(git cat-file -t "$REQUESTED_TAG")" != "tag" ]]; then
             echo "::error::Release tag is not annotated"
             exit 1
@@ -140,9 +163,33 @@ jobs:
       - name: Check out verified source with complete history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
           persist-credentials: false
           ref: ${{ needs.verify.outputs.verified_sha }}
+      - name: Fetch only governed release history
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_TAG: ${{ needs.verify.outputs.verified_tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "true"
+          git fetch --force --no-tags --unshallow origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$VERIFIED_TAG:refs/tags/$VERIFIED_TAG"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"
+          git show-ref --verify --quiet "refs/tags/$VERIFIED_TAG"
+          while IFS= read -r release_ref; do
+            case "$release_ref" in
+              "refs/remotes/origin/$DEFAULT_BRANCH"|"refs/tags/$VERIFIED_TAG") ;;
+              *)
+                echo "::error::Unexpected ref entered governed release history"
+                exit 1
+                ;;
+            esac
+          done < <(git for-each-ref --format='%(refname)')
+          test "$(git for-each-ref --format='%(refname)' | wc -l | tr -d ' ')" = "2"
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -174,6 +221,7 @@ jobs:
     name: Publish exact npm and GitHub artifacts
     needs: [verify, exact_artifact]
     permissions:
+      actions: read
       contents: write
       id-token: write
     runs-on: ubuntu-24.04
@@ -191,9 +239,33 @@ jobs:
       - name: Check out verified source with complete history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
           persist-credentials: false
           ref: ${{ needs.verify.outputs.verified_sha }}
+      - name: Fetch only governed release history
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERIFIED_TAG: ${{ needs.verify.outputs.verified_tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "true"
+          git fetch --force --no-tags --unshallow origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH" \
+            "+refs/tags/$VERIFIED_TAG:refs/tags/$VERIFIED_TAG"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"
+          git show-ref --verify --quiet "refs/tags/$VERIFIED_TAG"
+          while IFS= read -r release_ref; do
+            case "$release_ref" in
+              "refs/remotes/origin/$DEFAULT_BRANCH"|"refs/tags/$VERIFIED_TAG") ;;
+              *)
+                echo "::error::Unexpected ref entered governed release history"
+                exit 1
+                ;;
+            esac
+          done < <(git for-each-ref --format='%(refname)')
+          test "$(git for-each-ref --format='%(refname)' | wc -l | tr -d ' ')" = "2"
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -232,7 +304,7 @@ jobs:
           remote_tag="$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq 'select(.tag == env.VERIFIED_TAG and .object.type == "commit") | .object.sha')"
           remote_main="$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha')"
           test "$remote_tag" = "$VERIFIED_SHA"
-          git fetch --force origin "$remote_main"
+          git fetch --force --no-tags origin "$remote_main"
           git merge-base --is-ancestor "$VERIFIED_SHA" "$remote_main"
           artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
           bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"

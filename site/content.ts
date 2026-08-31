@@ -276,7 +276,7 @@ export const siteDocumentPaths: readonly string[] = [
   ...readingPages.map((page) => page.canonicalPath),
 ];
 
-export const publicReleaseState: "release-ready" | "staged" = "staged";
+export const publicReleaseState: "release-ready" | "staged" = "release-ready";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
   "https://github.com/hraness/hra/releases/download/v0.1.0/hraness-hra-0.1.0.tgz",
@@ -290,20 +290,20 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-    betaTag: "beta-not-yet-live",
+    betaTag: "release-ready",
     githubRepository: "live",
     hostedSync: "beta-not-yet-live",
-    website: "beta-not-yet-live",
+    website: "live",
   },
   links,
   introduction: [
     {
       kind: "notice",
-      label: "Beta not yet live",
+      label: "Immutable local CLI release; hosted sync not yet live",
       content: [
-        text("The "),
+        text("The exact install command below works once GitHub exposes the immutable "),
         code("v0.1.0"),
-        text(" tag and hosted sync service are beta-not-yet-live. The install command becomes usable when the beta tag is published."),
+        text(" Release and its verified archive. The website is live; the public CLI stays immutable once admitted, and optional hosted sync remains beta-not-yet-live."),
       ],
     },
     paragraph(
@@ -513,11 +513,11 @@ export const publicContent: PublicContent = {
       blocks: [
         {
           kind: "notice",
-          label: "Release status",
+          label: "Local release boundary",
           content: [
-            text("This section documents the frozen source contract for the planned beta. No published "),
+            text("These commands are part of the immutable "),
             code("v0.1.0"),
-            text(" tag currently exposes these commands."),
+            text(" local CLI release and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol."),
           ],
         },
         paragraph(

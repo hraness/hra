@@ -17,6 +17,13 @@ import {
   publishedReleaseBody,
   type GitHubReleaseIdentityInput,
 } from "./github-release-identity";
+import {
+  classifyCreatedDraftInventory,
+  classifyLaterAttemptDraftInventory,
+  classifyPublishedDraftInventory,
+  parseReleaseInventoryPage,
+  priorAttemptProvesNoDraftCreation,
+} from "./github-release-retry-policy";
 import { parseGitHubIncludedJsonResponse } from "./release-included-response";
 import { assertReleasePackageReady, releaseArchiveName } from "./release-package-policy";
 
@@ -24,6 +31,7 @@ const [tag, archiveArgument, checksumArgument] = process.argv.slice(2);
 if (tag === undefined || archiveArgument === undefined || checksumArgument === undefined) {
   throw new Error("Usage: publish-github-release.ts TAG ARTIFACT.tgz SHA256SUMS");
 }
+const releaseTag: string = tag;
 if (process.env.GITHUB_REPOSITORY !== publicRepository) {
   throw new Error(`GitHub Release publication must run in ${publicRepository}.`);
 }
@@ -154,6 +162,33 @@ function release(): unknown {
   ]).stdout.toString("utf8")) as unknown;
 }
 
+type ReleaseTagLookup = Readonly<
+  | { state: "missing" }
+  | { release: Readonly<Record<string, unknown>>; state: "draft" | "published" }
+>;
+
+function readReleaseTagLookup(): ReleaseTagLookup {
+  const result = run([
+    "gh", "api", "--include", `/repos/${publicRepository}/releases/tags/${tag}`,
+  ], true);
+  const response = parseGitHubIncludedJsonResponse(result.stdout);
+  if (response.status === 404) {
+    if (
+      result.exitCode === 0
+      || response.body.message !== "Not Found"
+      || response.body.status !== "404"
+    ) throw new Error(`GitHub Release ${tag} returned an inexact missing response.`);
+    return Object.freeze({ state: "missing" });
+  }
+  if (result.exitCode !== 0 || response.status !== 200 || typeof response.body.draft !== "boolean") {
+    throw new Error(`Could not determine whether GitHub Release ${tag} exists.`);
+  }
+  return Object.freeze({
+    release: response.body,
+    state: response.body.draft ? "draft" : "published",
+  });
+}
+
 function releaseById(id: number): Readonly<Record<string, unknown>> {
   return readJson(["gh", "api", `/repos/${publicRepository}/releases/${String(id)}`]);
 }
@@ -200,24 +235,27 @@ function exactDraft(value: unknown): ExactDraft {
   });
 }
 
-function findDraft(): ExactDraft | null {
-  const inventory = JSON.parse(run([
-    "gh", "api", `/repos/${publicRepository}/releases?per_page=100&page=1`,
-  ]).stdout.toString("utf8")) as unknown;
-  if (!Array.isArray(inventory) || inventory.length >= 100) {
-    throw new Error("GitHub Release draft inventory is malformed or incomplete.");
+function matchingDraftIds(): readonly number[] {
+  const identifiers: number[] = [];
+  for (let page = 1; page <= 10; page += 1) {
+    const projection = JSON.parse(run([
+      "gh", "api", `/repos/${publicRepository}/releases?per_page=100&page=${String(page)}`,
+      "--jq", "[.[] | {id: .id, draft: .draft, tag_name: .tag_name}]",
+    ]).stdout.toString("utf8")) as unknown;
+    const inventory = parseReleaseInventoryPage(projection, releaseTag);
+    identifiers.push(...inventory.candidateIds);
+    if (inventory.complete) {
+      if (new Set(identifiers).size !== identifiers.length) {
+        throw new Error("GitHub Release draft inventory contains duplicate identifiers.");
+      }
+      return Object.freeze(identifiers);
+    }
   }
-  const matches = inventory.filter((item) => {
-    const candidate = record(item, "GitHub Release inventory item");
-    return candidate.draft === true && candidate.tag_name === tag;
-  });
-  if (matches.length > 1) throw new Error(`Multiple residual drafts exist for ${tag}.`);
-  return matches.length === 0 ? null : exactDraft(matches[0]);
+  throw new Error("GitHub Release draft inventory exceeded its ten-page recovery bound.");
 }
 
 function assertNoResidualDraft(): void {
-  const residual = findDraft();
-  if (residual !== null) {
+  if (matchingDraftIds().length !== 0) {
     throw new Error(`Residual draft ${tag} remains after immutable publication.`);
   }
 }
@@ -230,6 +268,17 @@ function readExactDraftById(id: number): ExactDraft {
     throw new Error(`Residual draft ${tag} changed identity during recovery.`);
   }
   return draft;
+}
+
+async function waitForCreatedDraftInventory(id: number): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    if (classifyCreatedDraftInventory(matchingDraftIds(), id) === "exact") return;
+    if (Date.now() >= deadline) {
+      throw new Error(`GitHub Release ${tag} draft did not become visible in bounded inventory.`);
+    }
+    await Bun.sleep(1_000);
+  }
 }
 
 function verifyDraftAssets(draft: ExactDraft): readonly string[] {
@@ -258,6 +307,101 @@ function verifyDraftAssets(draft: ExactDraft): readonly string[] {
     }
   }
   return Object.freeze(missing);
+}
+
+function assertPublishedIdentity(value: unknown, expectedId: number): void {
+  const published = record(value, `Published GitHub Release ${tag}`);
+  if (
+    releaseId(published, `Published GitHub Release ${tag}`) !== expectedId
+    || published.name !== expectedTitle
+  ) throw new Error(`Published GitHub Release ${tag} changed numeric or display identity.`);
+  parseReleaseBody(published.body, releaseIdentity, "published");
+  const coordinate = parseGitHubRelease(published, inspection.version);
+  assertReleaseAssetBytes(coordinate, archiveBytes, checksumBytes, sha256);
+}
+
+function assertConvergingPublishedIdentity(id: number): void {
+  const value = releaseById(id);
+  try {
+    assertPublishedIdentity(value, id);
+    return;
+  } catch {
+    const draft = exactDraft(value);
+    if (draft.id !== id || verifyDraftAssets(draft).length !== 0) {
+      throw new Error(`GitHub Release ${tag} is neither the exact complete draft nor exact publication.`);
+    }
+  }
+}
+
+async function waitForPublishedDraftInventory(id: number): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    if (classifyPublishedDraftInventory(matchingDraftIds(), id) === "exact") return;
+    assertConvergingPublishedIdentity(id);
+    if (Date.now() >= deadline) {
+      throw new Error(`GitHub Release ${tag} retained a draft inventory entry beyond its bound.`);
+    }
+    await Bun.sleep(1_000);
+  }
+}
+
+function currentAttemptCanCreateDraft(): boolean {
+  if (process.env.GITHUB_SHA !== releaseIdentity.commitSha) {
+    throw new Error("GitHub Release retry history is not bound to the verified workflow commit.");
+  }
+  if (releaseRun.attempt === 1) return true;
+  if (releaseRun.attempt > 51) {
+    throw new Error("GitHub Release recovery exceeded its workflow-attempt bound.");
+  }
+  for (let attempt = 1; attempt < releaseRun.attempt; attempt += 1) {
+    const jobs = readJson([
+      "gh", "api",
+      `/repos/${publicRepository}/actions/runs/${releaseRun.id}/attempts/${String(attempt)}/jobs?filter=all&per_page=100`,
+      "--jq",
+      "{total_count, jobs: [.jobs[] | {id: .id, run_id: .run_id, run_url: .run_url, workflow_name: .workflow_name, head_sha: .head_sha, run_attempt: .run_attempt, name: .name, status: .status, conclusion: .conclusion, steps: [.steps[]? | {name: .name, status: .status, conclusion: .conclusion}]}]}",
+    ]);
+    if (!priorAttemptProvesNoDraftCreation(jobs, {
+      attempt,
+      commitSha: releaseIdentity.commitSha,
+      runId: releaseRun.id,
+    })) return false;
+  }
+  return true;
+}
+
+type LaterAttemptProviderState = Readonly<{
+  draftIds: readonly number[];
+  lookup: ReleaseTagLookup;
+}>;
+
+async function waitForLaterAttemptProviderState(): Promise<LaterAttemptProviderState> {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    const lookup = readReleaseTagLookup();
+    const draftIds = matchingDraftIds();
+    if (lookup.state === "published") {
+      const id = releaseId(lookup.release, `Published GitHub Release ${tag}`);
+      assertPublishedIdentity(lookup.release, id);
+      if (classifyPublishedDraftInventory(draftIds, id) === "exact") {
+        return Object.freeze({ draftIds: Object.freeze([]), lookup });
+      }
+      assertConvergingPublishedIdentity(id);
+    } else if (lookup.state === "draft") {
+      const draft = exactDraft(lookup.release);
+      if (classifyCreatedDraftInventory(draftIds, draft.id) === "exact") {
+        return Object.freeze({ draftIds: Object.freeze([draft.id]), lookup });
+      }
+    } else {
+      const state = classifyLaterAttemptDraftInventory(draftIds);
+      if (state.state === "recover") {
+        return Object.freeze({ draftIds: Object.freeze([state.draftId]), lookup });
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Later attempt cannot prove the provider state for GitHub Release ${tag}.`);
+    }
+    await Bun.sleep(1_000);
+  }
 }
 
 function completeDraftAssets(draft: ExactDraft): ExactDraft {
@@ -305,18 +449,38 @@ function publishDraft(draft: ExactDraft): number {
   return draft.id;
 }
 
+async function createDraft(): Promise<ExactDraft> {
+  if (!currentAttemptCanCreateDraft()) {
+    throw new Error("A prior workflow attempt may already have created the GitHub Release draft.");
+  }
+  verifyRemoteAnnotatedTag();
+  const freshLookup = readReleaseTagLookup();
+  const freshDraftIds = matchingDraftIds();
+  if (freshLookup.state !== "missing" || freshDraftIds.length !== 0) {
+    throw new Error("GitHub Release provider state changed before draft creation.");
+  }
+  const created = exactDraft(readJson([
+    "gh", "api", "--method", "POST", `/repos/${publicRepository}/releases`,
+    "-f", `tag_name=${tag}`, "-f", `name=${expectedTitle}`, "-f", `body=${expectedDraftBody}`,
+    "-F", "draft=true", "-F", "prerelease=false", "-F", "generate_release_notes=false",
+  ]));
+  await waitForCreatedDraftInventory(created.id);
+  const draft = readExactDraftById(created.id);
+  if (draft.id !== created.id) {
+    throw new Error(`GitHub inventoried a different draft identity for ${tag}.`);
+  }
+  verifyDraftAssets(draft);
+  return draft;
+}
+
 async function verifyPublishedRelease(expectedId: number): Promise<void> {
   let lastError: unknown;
   const deadline = Date.now() + 90_000;
   while (Date.now() < deadline) {
     try {
       const published = releaseById(expectedId);
-      if (releaseId(published, `GitHub Release ${tag}`) !== expectedId || published.name !== expectedTitle) {
-        throw new Error(`GitHub Release ${tag} changed numeric or display identity.`);
-      }
-      parseReleaseBody(published.body, releaseIdentity, "published");
+      assertPublishedIdentity(published, expectedId);
       const coordinate = parseGitHubRelease(published, inspection.version);
-      assertReleaseAssetBytes(coordinate, archiveBytes, checksumBytes, sha256);
       for (const [asset, sourceBytes] of [
         [coordinate.tarball, archiveBytes],
         [coordinate.checksum, checksumBytes],
@@ -343,45 +507,50 @@ async function verifyPublishedRelease(expectedId: number): Promise<void> {
 }
 
 verifyRemoteAnnotatedTag();
-const existing = run([
-  "gh", "api", "--include", `/repos/${publicRepository}/releases/tags/${tag}`,
-], true);
-const existingResponse = parseGitHubIncludedJsonResponse(existing.stdout);
+let lookup = readReleaseTagLookup();
+let initialDraftIds = matchingDraftIds();
+const priorMayHaveCreated = releaseRun.attempt > 1 && !currentAttemptCanCreateDraft();
+if (priorMayHaveCreated) {
+  const later = await waitForLaterAttemptProviderState();
+  lookup = later.lookup;
+  initialDraftIds = later.draftIds;
+} else if (lookup.state === "draft") {
+  const direct = exactDraft(lookup.release);
+  await waitForCreatedDraftInventory(direct.id);
+  initialDraftIds = [direct.id];
+} else if (lookup.state === "published") {
+  const publishedId = releaseId(lookup.release, `Existing GitHub Release ${tag}`);
+  assertPublishedIdentity(lookup.release, publishedId);
+  await waitForPublishedDraftInventory(publishedId);
+  initialDraftIds = [];
+}
+
 let publishedReleaseId: number;
-if (existing.exitCode === 0 && existingResponse.status === 200) {
-  if (existingResponse.body.draft === true) {
-    const draft = exactDraft(existingResponse.body);
-    verifyDraftAssets(draft);
-    const completeDraft = completeDraftAssets(draft);
-    publishedReleaseId = publishDraft(completeDraft);
-    await verifyPublishedRelease(publishedReleaseId);
-  } else {
-    publishedReleaseId = releaseId(existingResponse.body, `Existing GitHub Release ${tag}`);
-    await verifyPublishedRelease(publishedReleaseId);
+if (lookup.state === "published") {
+  if (initialDraftIds.length !== 0) {
+    throw new Error(`Published GitHub Release ${tag} has ambiguous residual drafts.`);
   }
+  publishedReleaseId = releaseId(lookup.release, `Existing GitHub Release ${tag}`);
+  await verifyPublishedRelease(publishedReleaseId);
 } else {
-  if (
-    existing.exitCode === 0
-    || existingResponse.status !== 404
-    || existingResponse.body.message !== "Not Found"
-    || existingResponse.body.status !== "404"
-  ) throw new Error(`Could not determine whether GitHub Release ${tag} exists.`);
-  let draft = findDraft();
-  if (draft === null) {
-    verifyRemoteAnnotatedTag();
-    const created = exactDraft(readJson([
-      "gh", "api", "--method", "POST", `/repos/${publicRepository}/releases`,
-      "-f", `tag_name=${tag}`, "-f", `name=${expectedTitle}`, "-f", `body=${expectedDraftBody}`,
-      "-F", "draft=true", "-F", "prerelease=false", "-F", "generate_release_notes=false",
-    ]));
-    draft = findDraft();
-    if (draft === null || draft.id !== created.id) {
-      throw new Error(`GitHub did not inventory the same exact draft for ${tag}.`);
+  if (initialDraftIds.length > 1) throw new Error(`Multiple residual drafts exist for ${tag}.`);
+  let draft: ExactDraft;
+  const draftId = initialDraftIds[0];
+  if (lookup.state === "draft") {
+    const direct = exactDraft(lookup.release);
+    if (draftId !== direct.id) {
+      throw new Error(`GitHub Release ${tag} draft is not uniquely confirmed by inventory.`);
     }
+    draft = readExactDraftById(direct.id);
+  } else if (draftId !== undefined) {
+    draft = readExactDraftById(draftId);
+  } else {
+    draft = await createDraft();
   }
   verifyDraftAssets(draft);
   const completeDraft = completeDraftAssets(draft);
   publishedReleaseId = publishDraft(completeDraft);
+  await waitForPublishedDraftInventory(publishedReleaseId);
   await verifyPublishedRelease(publishedReleaseId);
 }
 const latest = readJson(["gh", "api", `/repos/${publicRepository}/releases/latest`]);

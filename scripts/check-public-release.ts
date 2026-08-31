@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 
 import {
   assertReleaseAssetBytes,
+  npmRegistryReleaseMetadata,
   parseGitHubRelease,
   parseNpmRelease,
   publicPackageName,
@@ -87,6 +88,31 @@ async function artifact(url: string, label: string): Promise<Uint8Array> {
   return boundedBytes(response, label, maximumArtifactBytes);
 }
 
+async function npmMetadata(
+  url: string,
+  label: string,
+  version: string,
+  endpoint: "latest" | "version",
+): Promise<Record<string, unknown>> {
+  const response = await fetch(url, {
+    cache: "no-store",
+    headers: {
+      Accept: "application/json",
+      "Cache-Control": "no-cache",
+      "User-Agent": "hra-release-admission",
+    },
+    redirect: "error",
+    signal: AbortSignal.timeout(20_000),
+  });
+  const metadata: Record<string, unknown> | null = await npmRegistryReleaseMetadata(
+    response,
+    version,
+    endpoint,
+  );
+  if (metadata === null) throw new Error(`${label} is absent.`);
+  return metadata;
+}
+
 if (environment("GITHUB_REPOSITORY") !== publicRepository) {
   throw new Error(`Public release admission must run in ${publicRepository}.`);
 }
@@ -108,10 +134,20 @@ if (verifiedTag !== `v${inspection.version}`) throw new Error("Release tag and p
 
 const registry = `https://registry.npmjs.org/${encodeURIComponent(publicPackageName)}`;
 const npmRelease = parseNpmRelease(
-  await json(`${registry}/${encodeURIComponent(inspection.version)}`, "npm exact release"),
+  await npmMetadata(
+    `${registry}/${encodeURIComponent(inspection.version)}`,
+    "npm exact release",
+    inspection.version,
+    "version",
+  ),
   inspection.version,
 );
-const npmLatest = parseNpmRelease(await json(`${registry}/latest`, "npm latest release"), inspection.version);
+const npmLatest = parseNpmRelease(await npmMetadata(
+  `${registry}/latest`,
+  "npm latest release",
+  inspection.version,
+  "latest",
+), inspection.version);
 if (npmLatest.integrity !== npmRelease.integrity || npmLatest.shasum !== npmRelease.shasum) {
   throw new Error("npm latest does not resolve to the exact admitted version.");
 }

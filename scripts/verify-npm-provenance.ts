@@ -7,7 +7,11 @@ const NPM_PUBLISH_V01 = "https://github.com/npm/attestation/tree/main/specs/publ
 const FULCIO_GITHUB_ISSUER = "https://token.actions.githubusercontent.com";
 const GITHUB_BUILD_TYPE = "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1";
 const GITHUB_BUILDER_ID = "https://github.com/actions/runner/github-hosted";
-const GITHUB_REPOSITORY_URL = "https://github.com/hraness/hra";
+const GITHUB_REPOSITORY_OWNER = "hraness";
+const GITHUB_REPOSITORY_OWNER_ID = "307125679";
+const GITHUB_REPOSITORY_NAME = "hra";
+const GITHUB_REPOSITORY = `${GITHUB_REPOSITORY_OWNER}/${GITHUB_REPOSITORY_NAME}`;
+const GITHUB_REPOSITORY_URL = `https://github.com/${GITHUB_REPOSITORY}`;
 const GITHUB_REPOSITORY_ID = "1343008607";
 const MAXIMUM_DSSE_PAYLOAD_BYTES = 256 * 1_024;
 const MAXIMUM_CRYPTO_INPUT_BYTES = 1024 * 1_024;
@@ -51,6 +55,13 @@ function escapeRegularExpression(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
+export function canonicalAsciiDerUtf8String(value: string): string {
+  if (!/^[\x20-\x7e]{1,127}$/u.test(value)) {
+    throw new Error("Fulcio UTF8String claim must be bounded nonempty canonical ASCII.");
+  }
+  return `${String.fromCharCode(0x0c, value.length)}${value}`;
+}
+
 function decodeStatement(bundle: JsonRecord, label: string): JsonRecord {
   const envelope = record(bundle.dsseEnvelope, `${label} DSSE envelope`);
   if (envelope.payloadType !== "application/vnd.in-toto+json" || typeof envelope.payload !== "string") {
@@ -82,25 +93,28 @@ export function npmProvenanceSignerPolicy(tag: string, sha: string, invocation: 
   ) throw new Error("npm provenance signer coordinates are invalid.");
   const ref = `refs/tags/${tag}`;
   const identity = `${GITHUB_REPOSITORY_URL}/.github/workflows/release.yml@${ref}`;
+  const der = canonicalAsciiDerUtf8String;
   return Object.freeze({
     certificateIdentityURI: `^${escapeRegularExpression(identity)}$`,
     certificateIssuer: FULCIO_GITHUB_ISSUER,
     certificateOIDs: Object.freeze({
       "1.3.6.1.4.1.57264.1.2": "push",
       "1.3.6.1.4.1.57264.1.3": sha,
-      "1.3.6.1.4.1.57264.1.5": "hraness/hra",
+      "1.3.6.1.4.1.57264.1.5": GITHUB_REPOSITORY,
       "1.3.6.1.4.1.57264.1.6": ref,
-      "1.3.6.1.4.1.57264.1.11": "github-hosted",
-      "1.3.6.1.4.1.57264.1.12": GITHUB_REPOSITORY_URL,
-      "1.3.6.1.4.1.57264.1.13": sha,
-      "1.3.6.1.4.1.57264.1.14": ref,
-      "1.3.6.1.4.1.57264.1.15": GITHUB_REPOSITORY_ID,
-      "1.3.6.1.4.1.57264.1.18": identity,
-      "1.3.6.1.4.1.57264.1.19": sha,
-      "1.3.6.1.4.1.57264.1.20": "push",
-      "1.3.6.1.4.1.57264.1.21": invocation,
-      "1.3.6.1.4.1.57264.1.22": "public",
-      "1.3.6.1.4.1.57264.1.24": `repo:hraness/hra:ref:${ref}`,
+      "1.3.6.1.4.1.57264.1.11": der("github-hosted"),
+      "1.3.6.1.4.1.57264.1.12": der(GITHUB_REPOSITORY_URL),
+      "1.3.6.1.4.1.57264.1.13": der(sha),
+      "1.3.6.1.4.1.57264.1.14": der(ref),
+      "1.3.6.1.4.1.57264.1.15": der(GITHUB_REPOSITORY_ID),
+      "1.3.6.1.4.1.57264.1.18": der(identity),
+      "1.3.6.1.4.1.57264.1.19": der(sha),
+      "1.3.6.1.4.1.57264.1.20": der("push"),
+      "1.3.6.1.4.1.57264.1.21": der(invocation),
+      "1.3.6.1.4.1.57264.1.22": der("public"),
+      "1.3.6.1.4.1.57264.1.24": der(
+        `repo:${GITHUB_REPOSITORY_OWNER}@${GITHUB_REPOSITORY_OWNER_ID}/${GITHUB_REPOSITORY_NAME}@${GITHUB_REPOSITORY_ID}:ref:${ref}`,
+      ),
     }),
   });
 }

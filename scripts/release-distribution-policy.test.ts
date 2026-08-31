@@ -4,6 +4,8 @@ import { describe, expect, test } from "bun:test";
 import {
   assertReviewedReleaseCommitOnStableBranch,
   assertReleaseAssetBytes,
+  classifyNpmRegistryRelease,
+  npmRegistryReleaseMetadata,
   parseGitHubRelease,
   parseGitHubBranchCommitSha,
   parseNpmRelease,
@@ -127,6 +129,55 @@ describe("HRA public distribution policy", () => {
     expect(parseNpmRelease(payload, version).tarball).toEndWith("/hra-1.2.3.tgz");
     delete (payload._npmUser as { trustedPublisher?: unknown }).trustedPublisher;
     expect(() => parseNpmRelease(payload, version)).toThrow("trusted publisher");
+  });
+
+  test("classifies exact npm metadata and endpoint-specific package documents", async () => {
+    const exact = { license: "MIT", name: "@hraness/hra", version };
+    const other = { license: "MIT", name: "@hraness/hra", version: "1.2.2" };
+    const packument = {
+      _id: "@hraness/hra",
+      name: "@hraness/hra",
+      versions: { "1.2.2": other },
+    };
+    expect(classifyNpmRegistryRelease(exact, version)).toEqual(exact);
+    expect(classifyNpmRegistryRelease(packument, version)).toBeNull();
+    expect(classifyNpmRegistryRelease({
+      ...packument,
+      versions: { ...packument.versions, [version]: exact },
+    }, version)).toEqual(exact);
+    expect(() => classifyNpmRegistryRelease({
+      ...packument,
+      "dist-tags": { latest: "1.2.2" },
+      versions: { ...packument.versions, [version]: exact },
+    }, version, "latest")).toThrow("does not make the requested version latest");
+    expect(classifyNpmRegistryRelease({
+      ...packument,
+      "dist-tags": { latest: version },
+      versions: { ...packument.versions, [version]: exact },
+    }, version, "latest")).toEqual(exact);
+    expect(() => classifyNpmRegistryRelease({ ...packument, _id: ["@attacker", "hra"].join("/") }, version))
+      .toThrow("neither exact version metadata nor the exact package document");
+    expect(() => classifyNpmRegistryRelease({
+      ...packument,
+      versions: { [version]: other },
+    }, version)).toThrow("inexact version entry");
+    const inherited = Object.create({ [version]: exact }) as Record<string, unknown>;
+    expect(classifyNpmRegistryRelease({ ...packument, versions: inherited }, version)).toBeNull();
+
+    const response = new Response(JSON.stringify(packument), {
+      headers: { "content-type": "application/json" },
+      status: 200,
+    });
+    expect(await npmRegistryReleaseMetadata(response, version, "version")).toBeNull();
+    const missing = new Response(JSON.stringify(`version not found: ${version}`), {
+      headers: { "content-type": "application/json" },
+      status: 404,
+    });
+    expect(await npmRegistryReleaseMetadata(missing, version, "version")).toBeNull();
+    await expect(npmRegistryReleaseMetadata(new Response("not JSON", {
+      headers: { "content-type": "text/plain" },
+      status: 404,
+    }), version, "version")).rejects.toThrow("did not return JSON");
   });
 
   test("requires exactly the immutable tarball and checksum bytes", () => {

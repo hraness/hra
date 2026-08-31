@@ -713,7 +713,7 @@ const makeReceipt = (input: Readonly<{
 };
 
 /**
- * Exact Oh v0.2.0 working-profile adapter. Every Oh handle is host-owned,
+ * Exact public Oh v0.2.7 working-profile adapter. Every Oh handle is host-owned,
  * directory-scoped, and closed before this lifecycle port resolves.
  */
 export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {

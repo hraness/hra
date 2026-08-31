@@ -1,4 +1,5 @@
 import { releaseArchiveName } from "./release-package-policy";
+import { readBoundedJsonResponse } from "./bounded-json-response";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -79,6 +80,66 @@ export function assertReviewedReleaseCommitOnStableBranch(
 }
 
 export type NpmReleaseCoordinate = Readonly<{ integrity: string; shasum: string; tarball: string }>;
+
+export function classifyNpmRegistryRelease(
+  value: unknown,
+  version: string,
+  endpoint: "latest" | "version" = "version",
+): JsonRecord | null {
+  text(version, SEMVER, "npm release version");
+  const label = `${publicPackageName}@${version} npm registry release`;
+  const payload = record(value, label);
+  if (payload.name !== publicPackageName) {
+    throw new Error(`${label} has the wrong package coordinate.`);
+  }
+  if (payload.version === version) return payload;
+  if (payload.version !== undefined || payload._id !== publicPackageName) {
+    throw new Error(`${label} is neither exact version metadata nor the exact package document.`);
+  }
+  if (endpoint === "latest") {
+    const tags = record(payload["dist-tags"], `${publicPackageName} npm distribution tags`);
+    if (!Object.hasOwn(tags, "latest") || tags.latest !== version) {
+      throw new Error(`${label} package document does not make the requested version latest.`);
+    }
+  }
+  const versions = record(payload.versions, `${publicPackageName} npm package versions`);
+  if (!Object.hasOwn(versions, version)) return null;
+  const release = record(versions[version], label);
+  if (release.name !== publicPackageName || release.version !== version) {
+    throw new Error(`${label} package document contains an inexact version entry.`);
+  }
+  return release;
+}
+
+export async function npmRegistryReleaseMetadata(
+  response: Response,
+  version: string,
+  endpoint: "latest" | "version" = "version",
+): Promise<JsonRecord | null> {
+  const label = `${publicPackageName}@${version} npm registry release`;
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") throw new Error(`${label} did not return JSON.`);
+  if (response.status === 404) {
+    const payload = await readBoundedJsonResponse(response, label, 128 * 1_024);
+    const absent = payload === "Not Found"
+      || payload === `version not found: ${version}`
+      || (payload !== null
+        && typeof payload === "object"
+        && !Array.isArray(payload)
+        && Object.keys(payload).length === 1
+        && ["Not Found", "Not found"].includes((payload as JsonRecord).error as string));
+    if (!absent) throw new Error(`${label} returned an invalid missing-version response.`);
+    return null;
+  }
+  if (response.status !== 200) {
+    throw new Error(`${label} returned HTTP ${String(response.status)}.`);
+  }
+  return classifyNpmRegistryRelease(
+    await readBoundedJsonResponse(response, label, 128 * 1_024),
+    version,
+    endpoint,
+  );
+}
 
 export function parseNpmRelease(value: unknown, version: string): NpmReleaseCoordinate {
   text(version, SEMVER, "npm release version");

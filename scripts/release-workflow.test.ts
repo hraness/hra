@@ -37,6 +37,7 @@ describe("release workflow", () => {
     for (const path of [
       "/scripts/github-publisher-environment.ts",
       "/scripts/github-release-identity.ts",
+      "/scripts/github-release-retry-policy.ts",
       "/scripts/bounded-json-response.ts",
       "/scripts/publish-github-release.ts",
       "/scripts/publish-npm-release.ts",
@@ -46,19 +47,45 @@ describe("release workflow", () => {
   });
 
   test("bounds every npm metadata read and aligns GitHub artifact output with package policy", async () => {
-    const [preflight, npmPublisher, githubPublisher] = await Promise.all([
+    const [preflight, npmPublisher, githubPublisher, distributionPolicy] = await Promise.all([
       readFile(join(import.meta.dir, "check-npm-artifact-state.ts"), "utf8"),
       readFile(join(import.meta.dir, "publish-npm-release.ts"), "utf8"),
       readFile(join(import.meta.dir, "publish-github-release.ts"), "utf8"),
+      readFile(join(import.meta.dir, "release-distribution-policy.ts"), "utf8"),
     ]);
-    expect(preflight).toContain("readBoundedJsonResponse(response, \"npm registry exact release\")");
-    expect(npmPublisher).toContain("readBoundedJsonResponse(response, \"npm registry exact release\")");
+    expect(distributionPolicy).toContain("readBoundedJsonResponse(response, label, 128 * 1_024)");
+    expect(preflight).toContain("const metadata: Record<string, unknown> | null = await npmRegistryReleaseMetadata(");
+    expect(npmPublisher).toContain('metadata(versionUrl, "version")');
+    expect(npmPublisher).toContain('metadata(latestUrl, "latest")');
+    expect(npmPublisher).toContain("lookupCompleteRelease()");
     expect(preflight).not.toContain("response.json()");
     expect(npmPublisher).not.toContain("response.json()");
     expect(githubPublisher).toContain("const maximumArtifactBytes = 64 * 1024 * 1024");
     expect(githubPublisher).toContain("maxBuffer: maximumStdoutBytes + 1");
     expect(githubPublisher.match(/false, maximumArtifactBytes\)\.stdout/gu)?.length).toBe(2);
     expect(githubPublisher).not.toContain("maxBuffer: 32 * 1_024 * 1_024");
+  });
+
+  test("matches current Fulcio V2 bytes while retaining every signer claim", async () => {
+    const [policy, signer, releaseRecord] = await Promise.all([
+      readFile(join(import.meta.dir, "verify-npm-provenance.ts"), "utf8"),
+      readFile(join(import.meta.dir, "verify-npm-provenance-crypto.mjs"), "utf8"),
+      readFile(join(import.meta.dir, "..", "docs", "beta-release.md"), "utf8"),
+    ]);
+    for (const source of [policy, signer]) {
+      expect(source).toContain("canonicalAsciiDerUtf8String");
+      expect(source).toContain("String.fromCharCode(0x0c, value.length)");
+      expect(source).toContain('"1.3.6.1.4.1.57264.1.2": "push"');
+      expect(source).toContain('"1.3.6.1.4.1.57264.1.11": der("github-hosted")');
+      expect(source).toContain(
+        "`repo:${GITHUB_REPOSITORY_OWNER}@${GITHUB_REPOSITORY_OWNER_ID}/${GITHUB_REPOSITORY_NAME}@${GITHUB_REPOSITORY_ID}:ref:${ref}`",
+      );
+      expect(source).not.toContain("`repo:hraness/hra:ref:${ref}`");
+    }
+    expect(releaseRecord).toContain("Current V2 claims from `.11` onward");
+    expect(releaseRecord).toContain("repository path `hraness/hra`, numeric owner ID");
+    expect(releaseRecord).toContain("`307125679`, numeric repository ID `1343008607`");
+    expect(releaseRecord).toContain("ref `refs/tags/v0.1.0`");
   });
 
   test("gives GitHub publisher commands only their explicit non-OIDC environment", () => {
@@ -86,6 +113,37 @@ describe("release workflow", () => {
     expect(environment.ACTIONS_ID_TOKEN_REQUEST_URL).toBeUndefined();
     expect(environment.UNRELATED_SECRET).toBeUndefined();
     expect(() => githubPublisherEnvironment({ GH_TOKEN: "github-secret" })).toThrow();
+  });
+
+  test("isolates complete release history to reviewed main and the immutable tag", async () => {
+    const workflow = asRecord(Bun.YAML.parse(await readFile(
+      join(import.meta.dir, "..", ".github", "workflows", "release.yml"),
+      "utf8",
+    )), "release workflow");
+    const jobs = asRecord(workflow.jobs, "release workflow jobs");
+
+    for (const jobName of ["verify", "exact_artifact", "publish"] as const) {
+      const job = asRecord(jobs[jobName], `${jobName} job`);
+      if (!Array.isArray(job.steps)) throw new TypeError(`${jobName} steps must be an array`);
+      const steps = job.steps.map((step, index) => asRecord(step, `${jobName} step ${index}`));
+      const checkoutIndex = steps.findIndex((step) => step.uses === reviewedActions.checkout);
+      const fetchIndex = steps.findIndex((step) => step.name === "Fetch only governed release history");
+      expect(checkoutIndex).toBeGreaterThanOrEqual(0);
+      expect(fetchIndex).toBe(checkoutIndex + 1);
+      expect(asRecord(steps[checkoutIndex]?.with, `${jobName} checkout inputs`)).toMatchObject({
+        "fetch-depth": 1,
+        "fetch-tags": false,
+        "persist-credentials": false,
+      });
+      const fetch = String(steps[fetchIndex]?.run);
+      expect(fetch).toContain("git fetch --force --no-tags --unshallow origin");
+      expect(fetch).toContain("+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH");
+      expect(fetch).toContain("+refs/tags/$VERIFIED_TAG:refs/tags/$VERIFIED_TAG");
+      expect(fetch).toContain("git rev-parse --is-shallow-repository");
+      expect(fetch).toContain("git for-each-ref --format='%(refname)'");
+      expect(fetch).toContain("Unexpected ref entered governed release history");
+      expect(fetch).not.toContain("--all");
+    }
   });
 
   test("binds residual draft identity to the exact same run and artifact authority", () => {
@@ -170,16 +228,24 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: prepared but blocked before publication.");
+    expect(releaseRecord).toContain("Status: durable `v0.1.0` release-transition and retry contract.");
     expect(releaseRecord).toContain("no `v0.1.0` tag");
-    expect(releaseRecord).toContain("GitHub `@hraness/oh#v0.2.0` runtime dependency");
-    expect(releaseRecord).toContain("exact registry version `0.2.4`");
+    expect(releaseRecord).toContain("immutable public registry release `@hraness/oh@0.2.7`");
+    expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
+    expect(releaseRecord).toContain("npm trusted publishing names repository `hraness/hra` and workflow `release.yml`");
+    expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.0` becomes authoritative only when");
+    expect(releaseRecord).toContain("Immutable local CLI release; hosted sync not yet live.");
+    expect(releaseRecord).toContain("tag remains `release-ready` until exact release admission");
+    expect(releaseRecord).toContain("Neither phase claims that hosted sync is available.");
     expect(releaseRecord).toContain("may create\none annotated stable-semver tag before or after");
     expect(releaseRecord).toContain("outer digest is a transport assertion, not independent release authority");
     expect(releaseRecord).toContain("`@hraness/hra@0.1.0-bootstrap.0`");
     expect(releaseRecord).toContain("npm also assigns `latest` to the first published version");
     expect(releaseRecord).toContain("resolves through both `bootstrap` and `latest`");
     expect(releaseRecord).toContain("replaces the bootstrap seed as `latest` with exact stable `0.1.0`");
+    expect(releaseRecord).toContain("every earlier attempt's bounded GitHub Jobs API record");
+    expect(releaseRecord).toContain("again immediately before the POST");
+    expect(releaseRecord).toContain("`dist-tags.latest` to name `0.1.0`");
     expect(releaseRecord).toContain("`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.0`");
     expect(releaseRecord).toContain("npm CLI 11.15.0 or newer");
     const workflow = await readFile(releaseWorkflow, "utf8");
@@ -252,6 +318,7 @@ describe("release workflow", () => {
     const jobs = asRecord(workflow.jobs, "release workflow jobs");
     const publish = asRecord(jobs.publish, "release publish job");
     expect(asRecord(publish.permissions, "release publish permissions")).toEqual({
+      actions: "read",
       contents: "write",
       "id-token": "write",
     });
@@ -284,6 +351,7 @@ describe("release workflow", () => {
     }));
     expect(tokenEnvironments).toEqual({
       "Check out verified source with complete history": {},
+      "Fetch only governed release history": {},
       "Install Bun": {},
       "Install Node and npm trusted-publishing client": {},
       "Install exact locked dependencies without lifecycle scripts": {},
@@ -349,13 +417,47 @@ describe("release workflow", () => {
       readFile(join(import.meta.dir, "check-public-release.ts"), "utf8"),
     ]);
     expect(publisher.match(/verifyRemoteAnnotatedTag\(\);/gu)?.length ?? 0).toBeGreaterThanOrEqual(4);
-    expect(publisher).toContain("parseGitHubIncludedJsonResponse(existing.stdout)");
+    expect(publisher).toContain("parseGitHubIncludedJsonResponse(result.stdout)");
     expect(publisher).toContain('"-F", "draft=true"');
     expect(publisher).toContain("exactDraft");
-    expect(publisher).toContain("findDraft");
+    expect(publisher).toContain("matchingDraftIds");
     expect(publisher).toContain("verifyDraftAssets");
-    expect(publisher).toContain("inventory.length >= 100");
+    expect(publisher).toContain("parseReleaseInventoryPage(projection, releaseTag)");
+    expect(publisher).toContain("ten-page recovery bound");
     expect(publisher).toContain("Multiple residual drafts exist");
+    expect(publisher).toContain("waitForCreatedDraftInventory(created.id)");
+    expect(publisher).toContain("waitForPublishedDraftInventory(publishedReleaseId)");
+    expect(publisher).toContain("waitForLaterAttemptProviderState()");
+    expect(publisher).toContain("priorAttemptProvesNoDraftCreation(jobs");
+    expect(publisher).toContain("process.env.GITHUB_SHA !== releaseIdentity.commitSha");
+    expect(publisher.match(/currentAttemptCanCreateDraft\(\)/gu)?.length ?? 0)
+      .toBeGreaterThanOrEqual(3);
+    expect(publisher).toContain("GitHub Release provider state changed before draft creation");
+    const providerSnapshotIndex = publisher.indexOf("let initialDraftIds = matchingDraftIds()");
+    const priorMutationIndex = publisher.indexOf("const priorMayHaveCreated = releaseRun.attempt > 1");
+    const laterConvergenceIndex = publisher.indexOf("if (priorMayHaveCreated)", priorMutationIndex);
+    const directDraftIndex = publisher.indexOf('else if (lookup.state === "draft")', laterConvergenceIndex);
+    expect(providerSnapshotIndex).toBeGreaterThan(-1);
+    expect(priorMutationIndex).toBeGreaterThan(providerSnapshotIndex);
+    expect(laterConvergenceIndex).toBeGreaterThan(priorMutationIndex);
+    expect(directDraftIndex).toBeGreaterThan(laterConvergenceIndex);
+    expect(publisher.slice(laterConvergenceIndex, directDraftIndex))
+      .toContain("await waitForLaterAttemptProviderState()");
+    const convergenceStart = publisher.indexOf("async function waitForLaterAttemptProviderState");
+    const convergenceEnd = publisher.indexOf("function completeDraftAssets", convergenceStart);
+    const convergence = publisher.slice(convergenceStart, convergenceEnd);
+    expect(convergence).toContain("for (;;)");
+    expect(convergence.indexOf("readReleaseTagLookup()"))
+      .toBeLessThan(convergence.indexOf("matchingDraftIds()"));
+    expect(convergence).toContain("classifyCreatedDraftInventory(draftIds, draft.id)");
+    expect(convergence).toContain("classifyPublishedDraftInventory(draftIds, id)");
+    const createStart = publisher.indexOf("async function createDraft");
+    const createEnd = publisher.indexOf("async function verifyPublishedRelease", createStart);
+    const create = publisher.slice(createStart, createEnd);
+    expect(create.indexOf("currentAttemptCanCreateDraft()"))
+      .toBeLessThan(create.indexOf("readReleaseTagLookup()"));
+    expect(create.indexOf("readReleaseTagLookup()"))
+      .toBeLessThan(create.indexOf('"gh", "api", "--method", "POST"'));
     expect(publisher).toContain("assertNoResidualDraft();");
     expect(publisher).toContain("remains after immutable publication");
     expect(publisher).toContain("contains ambiguous assets");

@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 import { readBoundedJsonResponse } from "./bounded-json-response";
-import { parseNpmRelease } from "./release-distribution-policy";
+import {
+  npmRegistryReleaseMetadata,
+  parseNpmRelease,
+  type NpmReleaseCoordinate,
+} from "./release-distribution-policy";
 import {
   decideNpmPublicationTransition,
 } from "./npm-publication-transition";
@@ -52,23 +56,48 @@ const registryPreflightRunAttempt = preflightRunAttempt;
 const registryPreflightRunId = preflightRunId;
 const expectedIntegrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
 const expectedShasum = createHash("sha1").update(bytes).digest("hex");
-const url = `https://registry.npmjs.org/${encodeURIComponent(inspection.name)}/${inspection.version}`;
+const registry = `https://registry.npmjs.org/${encodeURIComponent(inspection.name)}`;
+const versionUrl = `${registry}/${inspection.version}`;
+const latestUrl = `${registry}/latest`;
 
-async function lookup(): Promise<boolean> {
+async function metadata(
+  url: string,
+  endpoint: "latest" | "version",
+): Promise<Record<string, unknown> | null> {
   const response = await fetch(url, {
     cache: "no-store",
     headers: { Accept: "application/json", "Cache-Control": "no-cache" },
     redirect: "error",
     signal: AbortSignal.timeout(10_000),
   });
-  if (response.status === 404) return false;
-  if (response.status !== 200) throw new Error(`npm registry returned HTTP ${String(response.status)}.`);
-  const payload = await readBoundedJsonResponse(response, "npm registry exact release");
-  const coordinate = parseNpmRelease(payload, inspection.version);
-  if (coordinate.integrity !== expectedIntegrity || coordinate.shasum !== expectedShasum) {
-    throw new Error(`${inspection.name}@${inspection.version} exists with different immutable bytes.`);
+  return npmRegistryReleaseMetadata(response, inspection.version, endpoint);
+}
+
+type CompleteNpmRelease = Readonly<{
+  latest: NpmReleaseCoordinate;
+  version: NpmReleaseCoordinate;
+}>;
+
+async function lookupCompleteRelease(): Promise<CompleteNpmRelease | null> {
+  const versionMetadata = await metadata(versionUrl, "version");
+  if (versionMetadata === null) return null;
+  const latestMetadata = await metadata(latestUrl, "latest");
+  if (latestMetadata === null) {
+    throw new Error(`${inspection.name}@${inspection.version} exists but npm latest is missing.`);
   }
-  return true;
+  return Object.freeze({
+    latest: parseNpmRelease(latestMetadata, inspection.version),
+    version: parseNpmRelease(versionMetadata, inspection.version),
+  });
+}
+
+function requireExactRelease(release: CompleteNpmRelease): void {
+  if (
+    release.version.integrity !== expectedIntegrity
+    || release.version.shasum !== expectedShasum
+    || release.latest.integrity !== expectedIntegrity
+    || release.latest.shasum !== expectedShasum
+  ) throw new Error(`${inspection.name}@${inspection.version} is not npm latest with exact immutable bytes.`);
 }
 
 async function registryJson(url: string, label: string): Promise<unknown> {
@@ -113,8 +142,9 @@ async function admitProvenance(
   }
 }
 
+const existing = await lookupCompleteRelease();
 const transition = decideNpmPublicationTransition({
-  currentArtifactState: await lookup() ? "exact" : "absent",
+  currentArtifactState: existing === null ? "absent" : "exact",
   currentRunAttempt: workflowRunAttempt,
   currentRunId: workflowRunId,
   preflightArtifactState: registryPreflightState,
@@ -122,6 +152,8 @@ const transition = decideNpmPublicationTransition({
   preflightRunId: registryPreflightRunId,
 });
 if (transition.action === "admit_existing") {
+  if (existing === null) throw new Error("The exact npm release disappeared after transition planning.");
+  requireExactRelease(existing);
   await admitProvenance(transition.attemptPolicy, transition.maximumProvenanceAttempt);
   console.log(`${inspection.name}@${inspection.version} already contains the exact trusted-publisher bytes.`);
 } else {
@@ -183,15 +215,25 @@ if (transition.action === "admit_existing") {
     boundedOutput(child.stderr),
   ]);
   if (exitCode !== 0) throw new Error("npm trusted publication failed without exposing provider output.");
-  let observed = false;
+  let observed: CompleteNpmRelease | null = null;
+  let lookupFailure: unknown;
   for (let attempt = 0; attempt < 60; attempt += 1) {
     if (attempt > 0) await Bun.sleep(3_000);
-    if (await lookup()) {
-      observed = true;
-      break;
+    try {
+      const candidate = await lookupCompleteRelease();
+      if (candidate !== null) {
+        requireExactRelease(candidate);
+        observed = candidate;
+        break;
+      }
+    } catch (error) {
+      lookupFailure = error;
     }
   }
-  if (!observed) throw new Error("npm publication did not become readable with exact provenance-bearing bytes.");
+  if (observed === null) {
+    const detail = lookupFailure instanceof Error ? ` ${lookupFailure.message}` : "";
+    throw new Error(`npm publication did not become readable as latest with exact provenance-bearing bytes.${detail}`);
+  }
   await admitProvenance("exact", workflowRunAttempt);
   console.log(`Published exact ${inspection.name}@${inspection.version} through npm trusted publishing.`);
 }
