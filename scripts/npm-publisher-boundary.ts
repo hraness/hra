@@ -1,3 +1,7 @@
+import { chmod, mkdtemp, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 const maximumPublisherOutputBytes = 1024 * 1024;
 const publisherTimeoutMilliseconds = 5 * 60_000;
 const npmRegistry = "https://registry.npmjs.org";
@@ -13,6 +17,8 @@ export type NpmPublisherFailure =
   | "output_limit_exceeded"
   | "post_exchange_failed"
   | "provenance_failed"
+  | "publisher_configuration_cleanup_failed"
+  | "publisher_configuration_failed"
   | "publisher_process_failed"
   | "publisher_timed_out"
   | "trusted_exchange_not_proven"
@@ -110,6 +116,10 @@ export function assertNpmPublisherIdentity(
 }
 
 function classifyFailure(output: string, trustedExchangeProven: boolean): NpmPublisherFailure {
+  if (
+    output.includes("Exit prior to config file resolving")
+    && output.includes("double-loading config \"")
+  ) return "publisher_configuration_failed";
   if (output.includes("Skipped because incorrect permissions for id-token within GitHub workflow")) {
     return "github_oidc_permission_missing";
   }
@@ -171,8 +181,67 @@ async function boundedOutput(
   return new TextDecoder().decode(output);
 }
 
+type NpmPublisherConfiguration = Readonly<{
+  directory: string;
+  global: string;
+  user: string;
+}>;
+
+async function removeIfPresent(path: string, operation: (value: string) => Promise<void>): Promise<boolean> {
+  try {
+    await operation(path);
+    return true;
+  } catch (error) {
+    return error instanceof Error
+      && "code" in error
+      && (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
+async function removeNpmPublisherConfiguration(
+  configuration: NpmPublisherConfiguration,
+): Promise<void> {
+  const filesRemoved = await Promise.all([
+    removeIfPresent(configuration.global, unlink),
+    removeIfPresent(configuration.user, unlink),
+  ]);
+  const directoryRemoved = await removeIfPresent(configuration.directory, rmdir);
+  if (filesRemoved.includes(false) || !directoryRemoved) {
+    throw new Error("npm publisher configuration cleanup failed.");
+  }
+}
+
+async function createNpmPublisherConfiguration(): Promise<NpmPublisherConfiguration> {
+  let configuration: NpmPublisherConfiguration | undefined;
+  let directory: string | undefined;
+  try {
+    const parent = await realpath(tmpdir());
+    directory = await mkdtemp(join(parent, "hra-npm-publisher-"));
+    directory = await realpath(directory);
+    configuration = Object.freeze({
+      directory,
+      global: join(directory, "global.npmrc"),
+      user: join(directory, "user.npmrc"),
+    });
+    await chmod(directory, 0o700);
+    await writeFile(configuration.user, "", { flag: "wx", mode: 0o600 });
+    await writeFile(configuration.global, "", { flag: "wx", mode: 0o600 });
+    await chmod(configuration.user, 0o600);
+    await chmod(configuration.global, 0o600);
+    return configuration;
+  } catch {
+    if (configuration !== undefined) {
+      await removeNpmPublisherConfiguration(configuration).catch(() => undefined);
+    } else if (directory !== undefined) {
+      await rmdir(directory).catch(() => undefined);
+    }
+    throw new Error("npm publisher configuration setup failed.");
+  }
+}
+
 export function npmPublisherEnvironment(
   source: Readonly<Record<string, string | undefined>>,
+  configuration: NpmPublisherConfiguration,
 ): Record<string, string> {
   const environment = Object.fromEntries([
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
@@ -212,8 +281,8 @@ export function npmPublisherEnvironment(
     NPM_CONFIG_LOGS_MAX: "0",
     NPM_CONFIG_REGISTRY: npmRegistry,
     NPM_CONFIG_UPDATE_NOTIFIER: "false",
-    NPM_CONFIG_GLOBALCONFIG: "/dev/null",
-    NPM_CONFIG_USERCONFIG: "/dev/null",
+    NPM_CONFIG_GLOBALCONFIG: configuration.global,
+    NPM_CONFIG_USERCONFIG: configuration.user,
   };
 }
 
@@ -250,12 +319,52 @@ export async function runNpmPublisher(input: Readonly<{
   if (!Number.isSafeInteger(timeoutMilliseconds) || timeoutMilliseconds < 1) {
     throw new Error("npm trusted publication received an invalid timeout.");
   }
+  let configuration: NpmPublisherConfiguration;
+  try {
+    configuration = await createNpmPublisherConfiguration();
+  } catch {
+    return Object.freeze({
+      exitCode: 1,
+      failure: "publisher_configuration_failed",
+      trustedExchangeProven: false,
+    });
+  }
+  let result: NpmPublisherResult;
+  try {
+    result = await runConfiguredNpmPublisher(input, configuration, timeoutMilliseconds, dependencies);
+  } catch {
+    result = Object.freeze({
+      exitCode: 1,
+      failure: "publisher_process_failed",
+      trustedExchangeProven: false,
+    });
+  }
+  try {
+    await removeNpmPublisherConfiguration(configuration);
+  } catch {
+    return Object.freeze({
+      exitCode: result.exitCode,
+      failure: "publisher_configuration_cleanup_failed",
+      trustedExchangeProven: result.trustedExchangeProven,
+    });
+  }
+  return result;
+}
+
+async function runConfiguredNpmPublisher(input: Readonly<{
+  dryRun: boolean;
+  source: Readonly<Record<string, string | undefined>>;
+  tarball: string;
+}>, configuration: NpmPublisherConfiguration, timeoutMilliseconds: number, dependencies: Readonly<{
+  spawn?: NpmPublisherSpawn;
+  timeoutMilliseconds?: number;
+}>): Promise<NpmPublisherResult> {
   let child: PublisherChild;
   try {
     child = (dependencies.spawn ?? spawnNpmPublisher)(
       npmPublisherArguments(input.tarball, input.dryRun),
       {
-        env: npmPublisherEnvironment(input.source),
+        env: npmPublisherEnvironment(input.source, configuration),
         stderr: "pipe",
         stdin: "ignore",
         stdout: "pipe",
