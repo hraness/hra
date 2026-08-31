@@ -7,6 +7,7 @@ const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const SHA512_INTEGRITY = /^sha512-[A-Za-z0-9+/]+={0,2}$/u;
 const SEMVER = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const OIDC_CONFIGURATION = /^oidc:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const GITHUB_BRANCH = /^[A-Za-z0-9._/-]+$/u;
 
 export const publicPackageName = "@hraness/hra";
 export const publicRepository = "hraness/hra";
@@ -28,6 +29,53 @@ function positiveInteger(value: unknown, label: string): number {
     throw new Error(`${label} must be a positive safe integer.`);
   }
   return value;
+}
+
+export function parseGitHubBranchCommitSha(value: unknown, branch: string): string {
+  text(branch, GITHUB_BRANCH, "GitHub branch");
+  const reference = record(value, `GitHub branch ${branch}`);
+  const object = record(reference.object, `GitHub branch ${branch} object`);
+  if (
+    reference.ref !== `refs/heads/${branch}`
+    || object.type !== "commit"
+    || typeof object.sha !== "string"
+    || !SHA1.test(object.sha)
+  ) throw new Error(`GitHub branch ${branch} is invalid.`);
+  return object.sha;
+}
+
+export function assertReviewedReleaseCommitOnStableBranch(
+  comparisonValue: unknown,
+  finalHeadValue: unknown,
+  input: Readonly<{ branch: string; headSha: string; reviewedSha: string }>,
+): void {
+  text(input.branch, GITHUB_BRANCH, "GitHub branch");
+  text(input.headSha, SHA1, "GitHub branch commit");
+  text(input.reviewedSha, SHA1, "Reviewed release commit");
+  const finalHeadSha = parseGitHubBranchCommitSha(finalHeadValue, input.branch);
+  if (finalHeadSha !== input.headSha) {
+    throw new Error(`GitHub branch ${input.branch} moved during release authority verification.`);
+  }
+
+  const comparison = record(comparisonValue, `GitHub ${input.branch} ancestry comparison`);
+  const base = record(comparison.base_commit, "GitHub comparison base");
+  const mergeBase = record(comparison.merge_base_commit, "GitHub comparison merge base");
+  const aheadBy = comparison.ahead_by;
+  const expectedUrl =
+    `https://api.github.com/repos/${publicRepository}/compare/${input.reviewedSha}...${input.headSha}`;
+  if (
+    !Number.isSafeInteger(aheadBy)
+    || Number(aheadBy) < 0
+    || comparison.behind_by !== 0
+    || (aheadBy === 0 ? comparison.status !== "identical" : comparison.status !== "ahead")
+    || comparison.url !== expectedUrl
+    || base.sha !== input.reviewedSha
+    || mergeBase.sha !== input.reviewedSha
+  ) {
+    throw new Error(
+      `Reviewed release commit ${input.reviewedSha} is not an ancestor of current ${input.branch}.`,
+    );
+  }
 }
 
 export type NpmReleaseCoordinate = Readonly<{ integrity: string; shasum: string; tarball: string }>;

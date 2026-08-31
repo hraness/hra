@@ -177,6 +177,9 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("may create\none annotated stable-semver tag before or after");
     expect(releaseRecord).toContain("outer digest is a transport assertion, not independent release authority");
     expect(releaseRecord).toContain("`@hraness/hra@0.1.0-bootstrap.0`");
+    expect(releaseRecord).toContain("npm also assigns `latest` to the first published version");
+    expect(releaseRecord).toContain("resolves through both `bootstrap` and `latest`");
+    expect(releaseRecord).toContain("replaces the bootstrap seed as `latest` with exact stable `0.1.0`");
     expect(releaseRecord).toContain("`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.0`");
     expect(releaseRecord).toContain("npm CLI 11.15.0 or newer");
     const workflow = await readFile(releaseWorkflow, "utf8");
@@ -379,6 +382,17 @@ describe("release workflow", () => {
     expect(publisher).toContain("const verifiedTagObject = process.env.VERIFIED_TAG_OBJECT");
     expect(publisher).toContain("tagObject.sha !== verifiedTagObject");
     expect(publisher).toContain("/git/tags/${verifiedTagObject}");
+    expect(publisher).toContain("/compare/${releaseCommitSha}...${headSha}");
+    expect(publisher).toContain("assertReviewedReleaseCommitOnStableBranch(comparison, finalHead");
+    expect(publisher).not.toContain("comparison.head_commit");
+    const branchRead = "/git/ref/heads/${releaseDefaultBranch}";
+    const firstBranchReadIndex = publisher.indexOf(branchRead);
+    const compareIndex = publisher.indexOf("/compare/${releaseCommitSha}...${headSha}");
+    const finalBranchReadIndex = publisher.lastIndexOf(branchRead);
+    expect(publisher.match(/\/git\/ref\/heads\/\$\{releaseDefaultBranch\}/gu)?.length).toBe(2);
+    expect(firstBranchReadIndex).toBeGreaterThanOrEqual(0);
+    expect(compareIndex).toBeGreaterThan(firstBranchReadIndex);
+    expect(finalBranchReadIndex).toBeGreaterThan(compareIndex);
     expect(admission).toContain('environment("VERIFIED_TAG_OBJECT", /^[0-9a-f]{40}$/u)');
     expect(admission).toContain("tagRef.object.sha !== verifiedTagObject");
     expect(admission).toContain("`${api}/git/tags/${verifiedTagObject}`");

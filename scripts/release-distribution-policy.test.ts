@@ -2,8 +2,10 @@ import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 
 import {
+  assertReviewedReleaseCommitOnStableBranch,
   assertReleaseAssetBytes,
   parseGitHubRelease,
+  parseGitHubBranchCommitSha,
   parseNpmRelease,
 } from "./release-distribution-policy";
 
@@ -23,6 +25,85 @@ const asset = (name: string, bytes: Uint8Array, id: number) => ({
 });
 
 describe("HRA public distribution policy", () => {
+  test("binds reviewed ancestry to one stable captured main commit", () => {
+    const reviewedSha = "a".repeat(40);
+    const nextSha = "b".repeat(40);
+    const head = (sha: string) => ({
+      object: {
+        sha,
+        type: "commit",
+        url: `https://api.github.com/repos/hraness/hra/git/commits/${sha}`,
+      },
+      ref: "refs/heads/main",
+      url: "https://api.github.com/repos/hraness/hra/git/refs/heads/main",
+    });
+    const comparison = (headSha: string, aheadBy: number, status: string) => ({
+      ahead_by: aheadBy,
+      base_commit: { sha: reviewedSha },
+      behind_by: 0,
+      commits: [],
+      merge_base_commit: { sha: reviewedSha },
+      status,
+      total_commits: aheadBy,
+      url: `https://api.github.com/repos/hraness/hra/compare/${reviewedSha}...${headSha}`,
+    });
+
+    expect(parseGitHubBranchCommitSha(head(reviewedSha), "main")).toBe(reviewedSha);
+    expect(() => assertReviewedReleaseCommitOnStableBranch(
+      comparison(reviewedSha, 0, "identical"),
+      head(reviewedSha),
+      { branch: "main", headSha: reviewedSha, reviewedSha },
+    )).not.toThrow();
+    expect(() => assertReviewedReleaseCommitOnStableBranch(
+      comparison(nextSha, 1, "ahead"),
+      head(nextSha),
+      { branch: "main", headSha: nextSha, reviewedSha },
+    )).not.toThrow();
+    expect(() => assertReviewedReleaseCommitOnStableBranch(
+      comparison(reviewedSha, 0, "identical"),
+      head(nextSha),
+      { branch: "main", headSha: reviewedSha, reviewedSha },
+    )).toThrow("moved during release authority verification");
+  });
+
+  test("rejects malformed, divergent, and internally inconsistent GitHub comparisons", () => {
+    const reviewedSha = "a".repeat(40);
+    const headSha = "b".repeat(40);
+    const branchHead = {
+      object: { sha: headSha, type: "commit" },
+      ref: "refs/heads/main",
+    };
+    const exact = {
+      ahead_by: 1,
+      base_commit: { sha: reviewedSha },
+      behind_by: 0,
+      merge_base_commit: { sha: reviewedSha },
+      status: "ahead",
+      url: `https://api.github.com/repos/hraness/hra/compare/${reviewedSha}...${headSha}`,
+    };
+    const assert = (value: unknown) => assertReviewedReleaseCommitOnStableBranch(
+      value,
+      branchHead,
+      { branch: "main", headSha, reviewedSha },
+    );
+
+    for (const invalid of [
+      { ...exact, ahead_by: -1 },
+      { ...exact, ahead_by: 0 },
+      { ...exact, behind_by: 1 },
+      { ...exact, status: "diverged" },
+      { ...exact, url: `https://api.github.com/repos/hraness/hra/compare/${reviewedSha}...main` },
+      { ...exact, base_commit: { sha: headSha } },
+      { ...exact, merge_base_commit: { sha: headSha } },
+    ]) expect(() => assert(invalid)).toThrow("not an ancestor");
+
+    expect(() => assertReviewedReleaseCommitOnStableBranch(
+      { ...exact, ahead_by: 0, status: "identical" },
+      { ...branchHead, ref: "refs/heads/trunk" },
+      { branch: "main", headSha, reviewedSha },
+    )).toThrow("GitHub branch main is invalid");
+  });
+
   test("requires npm trusted-publisher provenance", () => {
     const payload = {
       _npmUser: {

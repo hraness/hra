@@ -57,14 +57,18 @@ revalidation, GitHub Release publication/readback, and final public-admission st
 
 The first npm publication is a separate bootstrap ceremony because npm cannot attach a
 trusted publisher to a package coordinate that does not yet exist. It must publish only a
-non-executable coordinate seed, `@hraness/hra@0.1.0-bootstrap.0`, under the non-`latest`
-`bootstrap` dist-tag. It must never consume stable `0.1.0`, expose the HRA executable, or
-reuse any retained stable tarball. The ceremony requires explicit operator approval and
-the repository variable
+non-executable coordinate seed, `@hraness/hra@0.1.0-bootstrap.0`, while requesting the
+`bootstrap` dist-tag. npm also assigns `latest` to the first published version of a new
+package coordinate even when the publication requests another tag, so the seed initially
+resolves through both `bootstrap` and `latest`; that registry invariant is not a stable
+promotion. The seed must never consume stable `0.1.0`, expose the HRA executable, or reuse
+any retained stable tarball. The ceremony requires explicit operator approval and the
+repository variable
 `HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.0` before stable publication.
 
 After the coordinate exists, an operator using npm CLI 11.15.0 or newer configures the sole
 trusted publisher as GitHub repository `hraness/hra`, workflow `release.yml`, publish-only,
 with no npm environment. Stable `0.1.0` remains the first OIDC/provenance publication. The
-stable workflow never performs the bootstrap, grants a second publisher, or promotes the
-bootstrap seed to `latest`.
+stable workflow never performs the bootstrap or grants a second publisher. Its successful
+publication replaces the bootstrap seed as `latest` with exact stable `0.1.0`, while the
+seed remains available only as the explicitly named `bootstrap` version and dist-tag.

@@ -3,8 +3,10 @@ import { readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 
 import {
+  assertReviewedReleaseCommitOnStableBranch,
   assertReleaseAssetBytes,
   parseGitHubRelease,
+  parseGitHubBranchCommitSha,
   publicRepository,
 } from "./release-distribution-policy";
 import { githubPublisherEnvironment } from "./github-publisher-environment";
@@ -37,6 +39,8 @@ const defaultBranch = process.env.DEFAULT_BRANCH;
 if (defaultBranch === undefined || !/^[A-Za-z0-9._/-]+$/u.test(defaultBranch)) {
   throw new Error("GitHub Release publication requires one verified default branch.");
 }
+const releaseCommitSha: string = verifiedSha;
+const releaseDefaultBranch: string = defaultBranch;
 const manifest = JSON.parse(await readFile(resolve(import.meta.dir, "..", "package.json"), "utf8")) as unknown;
 const inspection = assertReleasePackageReady(manifest);
 const archive = resolve(archiveArgument);
@@ -128,27 +132,20 @@ function verifyRemoteAnnotatedTag(): void {
     throw new Error(`Remote annotated tag ${tag} does not target the verified commit.`);
   }
   const head = readJson([
-    "gh", "api", `/repos/${publicRepository}/git/ref/heads/${defaultBranch}`,
+    "gh", "api", `/repos/${publicRepository}/git/ref/heads/${releaseDefaultBranch}`,
   ]);
-  const headObject = record(head.object, `Remote ${defaultBranch} ref object`);
-  if (
-    head.ref !== `refs/heads/${defaultBranch}`
-    || headObject.type !== "commit"
-    || typeof headObject.sha !== "string"
-    || !/^[0-9a-f]{40}$/u.test(headObject.sha)
-  ) throw new Error(`Remote ${defaultBranch} ref is invalid.`);
+  const headSha = parseGitHubBranchCommitSha(head, releaseDefaultBranch);
   const comparison = readJson([
-    "gh", "api", `/repos/${publicRepository}/compare/${verifiedSha}...${defaultBranch}`,
+    "gh", "api", `/repos/${publicRepository}/compare/${releaseCommitSha}...${headSha}`,
   ]);
-  const base = record(comparison.base_commit, "Reviewed-main comparison base");
-  const mergeBase = record(comparison.merge_base_commit, "Reviewed-main merge base");
-  const comparisonHead = record(comparison.head_commit, "Reviewed-main comparison head");
-  if (
-    !["ahead", "identical"].includes(String(comparison.status))
-    || base.sha !== verifiedSha
-    || mergeBase.sha !== verifiedSha
-    || comparisonHead.sha !== headObject.sha
-  ) throw new Error(`Reviewed release commit is not an ancestor of current ${defaultBranch}.`);
+  const finalHead = readJson([
+    "gh", "api", `/repos/${publicRepository}/git/ref/heads/${releaseDefaultBranch}`,
+  ]);
+  assertReviewedReleaseCommitOnStableBranch(comparison, finalHead, {
+    branch: releaseDefaultBranch,
+    headSha,
+    reviewedSha: releaseCommitSha,
+  });
 }
 
 function release(): unknown {
