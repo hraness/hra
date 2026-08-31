@@ -468,6 +468,9 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("`f598c36c331f87676382dfffd19907a8e9107b8f`");
     expect(releaseRecord).toContain("isolated public installation returned `hra-install-safe`");
     expect(releaseRecord).toContain("The publication variable remains absent");
+    expect(releaseRecord).toContain("Ordinary pull-request and `main` CI uses the same governed-history principle");
+    expect(releaseRecord).toContain("unshallows only that exact commit into `refs/remotes/ci/verified`");
+    expect(releaseRecord).toContain("The package gate still scans `rev-list --all`");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
     expect(releaseRecord).toContain("npm trusted publishing names repository `hraness/hra` and workflow `release.yml`");
     expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.5` became authoritative after");
@@ -528,11 +531,37 @@ describe("release workflow", () => {
       .filter((value): value is string => typeof value === "string"))
       .toEqual([reviewedActions.checkout, reviewedActions.setupBun]);
     const checkout = parsedSteps.find((step) => step.name === "Check out source");
+    const fetch = parsedSteps.find((step) => step.name === "Fetch only governed CI history");
     const install = parsedSteps.find((step) => step.name === "Install dependencies");
     const generated = parsedSteps.find((step) => step.name === "Verify generated public documents");
     const gate = parsedSteps.find((step) => step.name === "Run the repository gate");
 
-    expect(asRecord(checkout, "CI checkout step").with).toEqual({ "fetch-depth": 0 });
+    const checkoutIndex = parsedSteps.indexOf(asRecord(checkout, "CI checkout step"));
+    const fetchIndex = parsedSteps.indexOf(asRecord(fetch, "CI governed-history step"));
+    const installIndex = parsedSteps.indexOf(asRecord(install, "CI install step"));
+    expect(fetchIndex).toBe(checkoutIndex + 1);
+    expect(installIndex).toBeGreaterThan(fetchIndex);
+    expect(asRecord(checkout, "CI checkout step").with).toEqual({
+      "fetch-depth": 1,
+      "fetch-tags": false,
+      "persist-credentials": false,
+      ref: "${{ github.sha }}",
+    });
+    expect(asRecord(asRecord(fetch, "CI governed-history step").env, "CI governed-history environment").VERIFIED_SHA)
+      .toBe("${{ github.sha }}");
+    const governedHistory = String(asRecord(fetch, "CI governed-history step").run);
+    expect(governedHistory).toContain('[[ ! "$VERIFIED_SHA" =~ ^[0-9a-f]{40}$ ]]');
+    expect(governedHistory).toContain("git fetch --force --no-tags --unshallow origin");
+    expect(governedHistory).toContain('+$VERIFIED_SHA:refs/remotes/ci/verified');
+    expect(governedHistory).toContain("git rev-parse --is-shallow-repository");
+    expect(governedHistory).toContain("git rev-parse --verify 'HEAD^{commit}'");
+    expect(governedHistory).toContain("git rev-parse --verify 'refs/remotes/ci/verified^{commit}'");
+    expect(governedHistory).toContain("git for-each-ref --format='%(refname)'");
+    expect(governedHistory).toContain("Unexpected ref entered governed CI history");
+    expect(governedHistory).toContain("wc -l | tr -d ' '");
+    expect(governedHistory).not.toContain("refs/heads/*");
+    expect(governedHistory).not.toContain("github.head_ref");
+    expect(governedHistory).not.toContain("pull_request.head.sha");
     expect(asRecord(install, "CI install step").run).toBe("bun install --frozen-lockfile --ignore-scripts");
     expect(asRecord(generated, "CI generated-documents step").run).toBe("bun run build:site -- --check");
     expect(asRecord(gate, "CI gate step").run).toBe("bun run check");
