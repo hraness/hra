@@ -85,7 +85,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("Current V2 claims from `.11` onward");
     expect(releaseRecord).toContain("repository path `hraness/hra`, numeric owner ID");
     expect(releaseRecord).toContain("`307125679`, numeric repository ID `1343008607`");
-    expect(releaseRecord).toContain("ref `refs/tags/v0.1.1`");
+    expect(releaseRecord).toContain("ref `refs/tags/v0.1.2`");
   });
 
   test("gives GitHub publisher commands only their explicit non-OIDC environment", () => {
@@ -299,21 +299,21 @@ describe("release workflow", () => {
   test("binds residual draft identity to the exact same run and artifact authority", () => {
     const source = {
       GITHUB_EVENT_NAME: "push",
-      GITHUB_REF: "refs/tags/v0.1.1",
-      GITHUB_REF_NAME: "v0.1.1",
+      GITHUB_REF: "refs/tags/v0.1.2",
+      GITHUB_REF_NAME: "v0.1.2",
       GITHUB_REF_TYPE: "tag",
       GITHUB_REPOSITORY: "hraness/hra",
       GITHUB_REPOSITORY_ID: "1343008607",
       GITHUB_RUN_ATTEMPT: "2",
       GITHUB_RUN_ID: "123",
-      GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.1",
+      GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.2",
     };
-    const run = githubReleaseRun("v0.1.1", source);
+    const run = githubReleaseRun("v0.1.2", source);
     const input = {
       artifacts: [{ name: "hra.tgz", sha256: "c".repeat(64), size: 7 }],
       commitSha: "a".repeat(40),
       run,
-      tag: "v0.1.1",
+      tag: "v0.1.2",
       tagObjectSha: "b".repeat(40),
     } as const;
     const body = draftReleaseBody(input);
@@ -331,7 +331,7 @@ describe("release workflow", () => {
     });
     expect(() => parseReleaseBody(futureAttemptBody, input, "draft"))
       .toThrow("workflow-attempt ordering");
-    expect(() => githubReleaseRun("v0.1.1", { ...source, GITHUB_RUN_ATTEMPT: "3", GITHUB_RUN_ID: "124" }))
+    expect(() => githubReleaseRun("v0.1.2", { ...source, GITHUB_RUN_ATTEMPT: "3", GITHUB_RUN_ID: "124" }))
       .not.toThrow();
   });
 
@@ -385,7 +385,7 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: durable `v0.1.1` forward-release and retry contract.");
+    expect(releaseRecord).toContain("Status: durable `v0.1.2` forward-release and retry contract.");
     expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
     expect(releaseRecord).toContain("Release workflow run `33363290345`, attempt 1");
@@ -393,10 +393,16 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("before registry-only package policy, tarball or checksum creation");
     expect(releaseRecord).toContain("The unexpanded exact-artifact matrix and the publish job were skipped");
     expect(releaseRecord).toContain("The publication variable was deleted after the failure");
+    expect(releaseRecord).toContain("## Immutable v0.1.1 failure record");
+    expect(releaseRecord).toContain("Release workflow run `33368241909`, attempt 1");
+    expect(releaseRecord).toContain("artifact `9749194160`");
+    expect(releaseRecord).toContain("`artifacts/SHA256SUMS`");
+    expect(releaseRecord).toContain("rejected that extensionless workflow file as `UNREVIEWED_FILE_TYPE`");
+    expect(releaseRecord).toContain("stages generated and downloaded release bytes under `RUNNER_TEMP`");
     expect(releaseRecord).toContain("immutable public registry release `@hraness/oh@0.2.7`");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
     expect(releaseRecord).toContain("npm trusted publishing names repository `hraness/hra` and workflow `release.yml`");
-    expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.1` becomes authoritative only when");
+    expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.2` becomes authoritative only when");
     expect(releaseRecord).toContain("Immutable local CLI release; hosted sync not yet live.");
     expect(releaseRecord).toContain("tag remains `release-ready` until exact release admission");
     expect(releaseRecord).toContain("Neither phase claims that hosted sync is available.");
@@ -405,15 +411,15 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("`@hraness/hra@0.1.0-bootstrap.0`");
     expect(releaseRecord).toContain("npm also assigns `latest` to the first published version");
     expect(releaseRecord).toContain("resolves through both `bootstrap` and `latest`");
-    expect(releaseRecord).toContain("replaces the bootstrap seed as `latest` with exact stable `0.1.1`");
+    expect(releaseRecord).toContain("replaces the bootstrap seed as `latest` with exact stable `0.1.2`");
     expect(releaseRecord).toContain("every earlier attempt's bounded GitHub Jobs API record");
     expect(releaseRecord).toContain("again immediately before the POST");
-    expect(releaseRecord).toContain("`dist-tags.latest` to name `0.1.1`");
-    expect(releaseRecord).toContain("`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.1`");
+    expect(releaseRecord).toContain("`dist-tags.latest` to name `0.1.2`");
+    expect(releaseRecord).toContain("`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.2`");
     expect(releaseRecord).toContain("npm CLI 11.15.0 or newer");
     const workflow = await readFile(releaseWorkflow, "utf8");
     expect(workflow).toContain("id-token: write");
-    expect(workflow).toContain("npm pack --ignore-scripts --pack-destination artifacts .");
+    expect(workflow).toContain('npm pack --ignore-scripts --pack-destination "$release_artifacts" .');
     expect(workflow).toContain("release-artifact-checksum.ts");
     expect(workflow).toContain("check-release-package.ts");
     expect(workflow).toContain("check-npm-artifact-state.ts");
@@ -546,6 +552,7 @@ describe("release workflow", () => {
     expect(upload?.uses).toBe(reviewedActions.uploadArtifact);
     const uploadInputs = asRecord(upload?.with, "release artifact upload inputs");
     expect(uploadInputs.name).toBe("hra-release-${{ github.run_attempt }}");
+    expect(uploadInputs.path).toBe("${{ runner.temp }}/hra-release-artifacts/");
 
     for (const jobName of ["exact_artifact", "publish"] as const) {
       const job = asRecord(jobs[jobName], `${jobName} job`);
@@ -568,10 +575,89 @@ describe("release workflow", () => {
       expect(inputs).toEqual({
         "artifact-ids": "${{ needs.verify.outputs.artifact_id }}",
         "merge-multiple": true,
-        path: "artifacts",
+        path: "${{ runner.temp }}/hra-release-artifacts",
       });
       expect(inputs.name).toBeUndefined();
     }
+  });
+
+  test("keeps generated and downloaded release artifacts outside the checked-out public tree", async () => {
+    const workflowSource = await readFile(
+      join(import.meta.dir, "..", ".github", "workflows", "release.yml"),
+      "utf8",
+    );
+    const workflow = asRecord(Bun.YAML.parse(workflowSource), "release workflow");
+    const jobs = asRecord(workflow.jobs, "release workflow jobs");
+    const stepsFor = (jobName: string): readonly Record<string, unknown>[] => {
+      const job = asRecord(jobs[jobName], `${jobName} job`);
+      if (!Array.isArray(job.steps)) throw new TypeError(`${jobName} steps must be an array`);
+      return job.steps.map((step, index) => asRecord(step, `${jobName} step ${index}`));
+    };
+    const stepFor = (jobName: string, stepName: string): Record<string, unknown> => {
+      const matching = stepsFor(jobName).filter((step) => step.name === stepName);
+      expect(matching).toHaveLength(1);
+      return matching[0]!;
+    };
+    const runFor = (jobName: string, stepName: string): string => {
+      const run = stepFor(jobName, stepName).run;
+      if (typeof run !== "string") throw new TypeError(`${jobName} ${stepName} must have a run command`);
+      return run;
+    };
+    const exactShellRoot = "$RUNNER_TEMP/hra-release-artifacts";
+    const exactActionRoot = "${{ runner.temp }}/hra-release-artifacts";
+    const assertOutsideCheckout = (command: string): void => {
+      expect(command).not.toContain("$GITHUB_WORKSPACE");
+      expect(command).not.toContain("${{ github.workspace }}");
+      expect(command).not.toMatch(/(?:^|[\s"'=])artifacts(?:\/|[\s"']|$)/mu);
+      expect(command).toContain(exactShellRoot);
+    };
+
+    const producer = runFor("verify", "Create one exact npm tarball and checksum");
+    assertOutsideCheckout(producer);
+    expect(producer).toContain(`release_artifacts="${exactShellRoot}"`);
+    expect(producer).toContain('mkdir "$release_artifacts"');
+    expect(producer).not.toContain('mkdir -p "$release_artifacts"');
+    expect(producer).toContain('npm pack --ignore-scripts --pack-destination "$release_artifacts" .');
+    expect(producer).toContain('"$release_artifacts/SHA256SUMS"');
+
+    const preflight = runFor("verify", "Record exact npm registry preflight");
+    assertOutsideCheckout(preflight);
+    expect(preflight).toContain(`find "${exactShellRoot}"`);
+    expect(asRecord(
+      stepFor("verify", "Preserve exact release bytes").with,
+      "release artifact upload inputs",
+    ).path).toBe(`${exactActionRoot}/`);
+
+    const exactCheck = runFor("exact_artifact", "Verify checksum and complete installed-package behavior");
+    assertOutsideCheckout(exactCheck);
+    expect(exactCheck).toContain(`find "${exactShellRoot}"`);
+    expect(exactCheck).toContain(`"${exactShellRoot}/SHA256SUMS"`);
+    expect(exactCheck).toContain('bun run ./scripts/check-package.ts "$artifact"');
+
+    for (const stepName of [
+      "Revalidate remote authority and checksum",
+      "Create immutable GitHub Release from the same bytes",
+      "Publish exact tarball through npm trusted publishing",
+    ] as const) {
+      const command = runFor("publish", stepName);
+      assertOutsideCheckout(command);
+      expect(command).toContain(`find "${exactShellRoot}"`);
+    }
+    expect(runFor("publish", "Revalidate remote authority and checksum"))
+      .toContain(`"${exactShellRoot}/SHA256SUMS"`);
+    expect(runFor("publish", "Create immutable GitHub Release from the same bytes"))
+      .toContain(`"${exactShellRoot}/SHA256SUMS"`);
+
+    for (const [jobName, stepName] of [
+      ["exact_artifact", "Download exact release bytes"],
+      ["publish", "Download validated release bytes"],
+    ] as const) {
+      expect(asRecord(stepFor(jobName, stepName).with, `${jobName} artifact download inputs`).path)
+        .toBe(exactActionRoot);
+    }
+
+    expect(workflowSource).not.toContain("$GITHUB_WORKSPACE/artifacts");
+    expect(workflowSource).not.toContain("path: artifacts");
   });
 
   test("completes only one exact residual GitHub draft without substituting bytes", async () => {
