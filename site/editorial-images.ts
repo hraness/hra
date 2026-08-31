@@ -1,6 +1,6 @@
 export type EditorialImage = Readonly<{
   alt: string;
-  canonicalPath: "/reading/deepseek-harness/" | "/reading/headlong-microharness/";
+  canonicalPath: "/reading/deepseek-harness/" | "/reading/headlong-microharness/" | "/reading/oracle-and-firm/";
   caption: string;
   cardDescription: string;
   cardTitle: string;
@@ -54,6 +54,24 @@ export const editorialImages = [
     },
     src: "/images/editorial/headlong-microharness.webp",
     title: "A microharness for persistence is not a Codex account loop",
+    width: 1536,
+  },
+  {
+    alt: "One compacting serial thread contrasted with several windows handing summaries to a parent desk",
+    canonicalPath: "/reading/oracle-and-firm/",
+    caption: "An oracle keeps one thread; a firm splits work onto child windows that return summaries.",
+    cardDescription: "Reading HRA as a Codex account loop, an oracle thread rather than a firm of sub-agents.",
+    cardTitle: "A Codex account loop is an oracle thread, not a firm",
+    credit,
+    height: 864,
+    imageSha256: "9972242c35269f3f7ce7617b30079047163c04228ca80afe855d2e9f0ec6b4b6",
+    provenance: {
+      job: "editorial-provenance/oracle-and-firm/job.json",
+      prompt: "editorial-provenance/oracle-and-firm/prompt.txt",
+      receipt: "editorial-provenance/oracle-and-firm/receipt.json",
+    },
+    src: "/images/editorial/oracle-and-firm.webp",
+    title: "A Codex account loop is an oracle thread, not a firm",
     width: 1536,
   },
 ] as const satisfies readonly EditorialImage[];

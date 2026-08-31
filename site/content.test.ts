@@ -12,6 +12,7 @@ import {
 import {
   deepseekHarnessReading,
   headlongMicroharnessReading,
+  oracleAndFirmReading,
   publicContent,
   renderLlmsText,
   renderPrivacyMarkdown,
@@ -24,6 +25,7 @@ import {
   renderHeadlongMicroharnessReadingHtml,
   hraMailingListConfig,
   renderHraSiteFooter,
+  renderOracleAndFirmReadingHtml,
   renderPreviewHtml,
   renderPrivacyHtml,
   renderSiteHtml,
@@ -42,7 +44,7 @@ describe("public content contract", () => {
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init --yes",
       installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.1.1/hraness-hra-0.1.1.tgz",
+        "https://github.com/hraness/hra/releases/download/v0.1.3/hraness-hra-0.1.3.tgz",
       ),
       links: {
         github: "https://github.com/hraness/hra",
@@ -94,7 +96,7 @@ describe("public content contract", () => {
       expect(surface).toContain("once its GitHub Release exists");
       expect(surface).not.toContain("install command becomes usable");
       expect(surface).not.toContain("Beta not yet live");
-      expect(surface).not.toContain("No published `v0.1.1` tag currently exposes these commands");
+      expect(surface).not.toContain("No published `v0.1.3` tag currently exposes these commands");
     }
   });
 
@@ -384,7 +386,7 @@ describe("public content contract", () => {
     expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("| bun -e '");
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.1.1/hraness-hra-0.1.1.tgz",
+      "-- https://github.com/hraness/hra/releases/download/v0.1.3/hraness-hra-0.1.3.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");
@@ -399,7 +401,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra-install-safe");
       expect(surface).toContain("fresh random private staging root");
       expect(surface).toContain("GitHub repository ID 1343008607");
-      expect(surface).toContain("published immutable v0.1.1 release");
+      expect(surface).toContain("published immutable v0.1.3 release");
       expect(surface).toContain("immutable release metadata");
       expect(surface).toContain("verified in-memory snapshot");
       expect(surface).toContain("bounded package-file manifest");
@@ -417,7 +419,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
       expect(surface).toContain("Do not install a moving branch");
-      expect(surface).toContain("verified repair installation of v0.1.1");
+      expect(surface).toContain("verified repair installation of v0.1.3");
       expect(surface).toContain("replace the tagged preflight and release archive references together");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
@@ -592,6 +594,7 @@ describe("public content contract", () => {
       renderPrivacyHtml(),
       renderDeepseekHarnessReadingHtml(),
       renderHeadlongMicroharnessReadingHtml(),
+      renderOracleAndFirmReadingHtml(),
     ]) {
       expect(document.match(/<footer\b/gu)).toHaveLength(1);
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
@@ -700,6 +703,7 @@ describe("public content contract", () => {
       "https://github.com/deepseek-ai/deepseek-harness",
       "https://hraness.com/reading/deepseek-harness",
       "/reading/headlong-microharness/",
+      "/reading/oracle-and-firm/",
       "https://wrench.rip/provider-capabilities/",
     ];
     const absentHrefs = [
@@ -765,6 +769,7 @@ describe("public content contract", () => {
       "https://hraness.com/reading/headlong-a-microharness-for-persistent-agents",
       "https://hra.sh/",
       "/reading/deepseek-harness/",
+      "/reading/oracle-and-firm/",
       "https://hraness.com/writing/what-is-an-agent-harness",
       "https://hraness.com/writing/direct-wrench-hra",
       "https://wrench.rip/provider-capabilities/",
@@ -807,6 +812,76 @@ describe("public content contract", () => {
       expect(reading).toContain(`href="${href}"`);
     }
     for (const document of [home, reading, deepseek, llms, sitemap, markdown]) {
+      for (const href of absentHrefs) {
+        expect(document).not.toContain(href);
+      }
+      expect(document).not.toMatch(/<script(?! type="application\/ld\+json")/);
+    }
+    expect(reading).not.toMatch(/<script[^>]+src=/);
+    expect(reading).not.toContain("onclick=");
+    expect(reading).not.toContain("graphql");
+    expect(reading).not.toContain("GraphQL");
+    expect(reading).not.toContain("OAuth");
+    expect(reading).not.toContain("MCP");
+  });
+
+  test("ships one crawlable oracle-and-firm reading page without orphaning it", () => {
+    const home = renderSiteHtml();
+    const reading = renderOracleAndFirmReadingHtml();
+    const deepseek = renderDeepseekHarnessReadingHtml();
+    const headlong = renderHeadlongMicroharnessReadingHtml();
+    const llms = renderLlmsText();
+    const sitemap = renderSitemapXml();
+    const markdown = renderReadmeMarkdown();
+    const requiredHrefs = [
+      "https://calv.info/the-oracle-and-the-firm",
+      "https://hraness.com/reading/the-oracle-and-the-firm",
+      "https://hraness.com/writing/what-is-an-agent-harness",
+      "/reading/deepseek-harness/",
+      "/reading/headlong-microharness/",
+      "https://hra.sh/",
+      "https://hraness.com/writing/direct-wrench-hra",
+      "https://wrench.rip/provider-capabilities/",
+    ];
+    const absentHrefs = [
+      "/reading/headlong-always-on-loop",
+      "/reading/not-a-codex-tui",
+      "stripedex.com",
+      "spongeresearch.com",
+    ];
+
+    expect(home).toContain('href="/reading/oracle-and-firm/"');
+    expect(home).toContain("A Codex account loop is an oracle thread, not a firm");
+    expect(deepseek).toContain('href="/reading/oracle-and-firm/"');
+    expect(headlong).toContain('href="/reading/oracle-and-firm/"');
+    expect(reading).toContain(
+      `<link rel="canonical" href="https://hra.sh${oracleAndFirmReading.canonicalPath}">`,
+    );
+    expect(reading).toContain('<meta property="og:type" content="article">');
+    expect(reading).toContain('"@type":"Article"');
+    expect(reading).not.toContain('"@type":"SoftwareApplication"');
+    expect(reading).toContain(
+      `<h1 id="reading-oracle-and-firm-heading">${oracleAndFirmReading.heading}</h1>`,
+    );
+    expect(reading.match(/<h1\b/gu)).toHaveLength(1);
+    expect(reading).toContain(
+      '<h2 id="reading-oracle-and-firm-2-the-oracle-and-the-firm-as-published">',
+    );
+    expect(reading).toContain(oracleAndFirmReading.description);
+    expect(reading).toContain("This page is the HRA take, not that digest.");
+    expect(reading).toContain("HRA does not implement Claude Code");
+    expect(reading).toContain("oracle-shaped");
+    expect(llms).toContain(
+      `[${oracleAndFirmReading.title}](${publicContent.siteUrl}${oracleAndFirmReading.canonicalPath})`,
+    );
+    expect(sitemap).toContain(
+      `<loc>${publicContent.siteUrl}${oracleAndFirmReading.canonicalPath}</loc>`,
+    );
+    expect(markdown).not.toContain("/reading/oracle-and-firm/");
+    for (const href of requiredHrefs) {
+      expect(reading).toContain(`href="${href}"`);
+    }
+    for (const document of [home, reading, deepseek, headlong, llms, sitemap, markdown]) {
       for (const href of absentHrefs) {
         expect(document).not.toContain(href);
       }

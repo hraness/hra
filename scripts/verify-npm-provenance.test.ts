@@ -11,7 +11,7 @@ import {
 } from "./verify-npm-provenance";
 
 const sha = "a".repeat(40);
-const tag = "v0.1.1";
+const tag = "v0.1.3";
 
 function predicate(
   runId = "123",
@@ -26,6 +26,13 @@ function predicate(
           path: ".github/workflows/release.yml",
           ref: `refs/tags/${tag}`,
           repository: "https://github.com/hraness/hra",
+        },
+      },
+      internalParameters: {
+        github: {
+          event_name: "push",
+          repository_id: "1343008607",
+          repository_owner_id: "307125679",
         },
       },
       resolvedDependencies: [{
@@ -97,6 +104,15 @@ describe("npm provenance workflow attempt admission", () => {
       ...identity,
       attemptPolicy: "same_run_not_later",
     })).toThrow("workflow-run identity");
+
+    const wrongOwner = predicate() as {
+      buildDefinition: { internalParameters: { github: { repository_owner_id: string } } };
+    };
+    wrongOwner.buildDefinition.internalParameters.github.repository_owner_id = "1";
+    expect(() => assertNpmProvenanceBuildIdentity(wrongOwner, {
+      ...identity,
+      attemptPolicy: "exact",
+    })).toThrow("wrong release workflow identity");
   });
 });
 
@@ -106,7 +122,7 @@ describe("npm provenance package subject admission", () => {
   const exactStatement = {
     subject: [{
       digest: { sha512: archiveDigest.toString("hex") },
-      name: "pkg:npm/%40hraness/hra@0.1.1",
+      name: "pkg:npm/%40hraness/hra@0.1.3",
     }],
   };
 
@@ -116,7 +132,7 @@ describe("npm provenance package subject admission", () => {
     expect(() => assertNpmProvenanceSubject({
       subject: [{
         digest: { sha512: archiveDigest.toString("base64") },
-        name: "pkg:npm/%40hraness/hra@0.1.1",
+        name: "pkg:npm/%40hraness/hra@0.1.3",
       }],
     }, { integrity, tag })).toThrow("exact package bytes");
     expect(() => assertNpmProvenanceSubject({
@@ -127,7 +143,7 @@ describe("npm provenance package subject admission", () => {
     }, { integrity, tag })).toThrow("exact package bytes");
     expect(() => assertNpmProvenanceSubject(exactStatement, {
       integrity,
-      tag: "v0.1.2",
+      tag: "v0.1.4",
     })).toThrow("exact package bytes");
   });
 });
@@ -151,12 +167,12 @@ describe("npm provenance attestation-set and signer admission", () => {
     predicate: {
       name: "@hraness/hra",
       registry: "https://registry.npmjs.org",
-      version: "0.1.1",
+      version: "0.1.3",
     },
     predicateType: "https://github.com/npm/attestation/tree/main/specs/publish/v0.1",
     subject: [{
       digest: { sha512: archiveDigest.toString("hex") },
-      name: "pkg:npm/%40hraness/hra@0.1.1",
+      name: "pkg:npm/%40hraness/hra@0.1.3",
     }],
   };
   const publish = {
@@ -197,25 +213,25 @@ describe("npm provenance attestation-set and signer admission", () => {
     const repositorySubject = [
       "repo:hraness",
       "307125679/hra",
-      "1343008607:ref:refs/tags/v0.1.1",
+      "1343008607:ref:refs/tags/v0.1.3",
     ].join("@");
     const der = canonicalAsciiDerUtf8String;
     const policy = npmProvenanceSignerPolicy(tag, sha, invocation);
     expect(policy.certificateIdentityURI).toBe(
-      "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.1\\.1$",
+      "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.1\\.3$",
     );
     expect(policy.certificateOIDs).toEqual({
       "1.3.6.1.4.1.57264.1.2": "push",
       "1.3.6.1.4.1.57264.1.3": sha,
       "1.3.6.1.4.1.57264.1.5": "hraness/hra",
-      "1.3.6.1.4.1.57264.1.6": "refs/tags/v0.1.1",
+      "1.3.6.1.4.1.57264.1.6": "refs/tags/v0.1.3",
       "1.3.6.1.4.1.57264.1.11": der("github-hosted"),
       "1.3.6.1.4.1.57264.1.12": der("https://github.com/hraness/hra"),
       "1.3.6.1.4.1.57264.1.13": der(sha),
-      "1.3.6.1.4.1.57264.1.14": der("refs/tags/v0.1.1"),
+      "1.3.6.1.4.1.57264.1.14": der("refs/tags/v0.1.3"),
       "1.3.6.1.4.1.57264.1.15": der("1343008607"),
       "1.3.6.1.4.1.57264.1.18": der(
-        "https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.1",
+        "https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.3",
       ),
       "1.3.6.1.4.1.57264.1.19": der(sha),
       "1.3.6.1.4.1.57264.1.20": der("push"),

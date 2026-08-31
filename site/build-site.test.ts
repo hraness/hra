@@ -101,6 +101,7 @@ describe("static-site build", () => {
       "dist/site/reading/index.html",
       "dist/site/reading/deepseek-harness/index.html",
       "dist/site/reading/headlong-microharness/index.html",
+      "dist/site/reading/oracle-and-firm/index.html",
       "dist/site/robots.txt",
       "dist/site/sitemap.xml",
       "dist/site/llms.txt",
@@ -174,7 +175,7 @@ describe("static-site build", () => {
     ) as { version?: unknown };
 
     expect(identity.version).toBe("0.1.0");
-    expect(packageJson.version).toBe("0.1.1");
+    expect(packageJson.version).toBe("0.1.3");
     expect(identity.version).not.toBe(packageJson.version);
   });
 
@@ -215,6 +216,35 @@ describe("static-site build", () => {
     expect(home).toContain('href="/reading/headlong-microharness/"');
     expect(deepseek).toContain('href="/reading/headlong-microharness/"');
     expect(reading).toContain("A microharness for persistence is not a Codex account loop");
+    expect(reading).not.toContain("/reading/headlong-always-on-loop");
+    expect(reading).not.toContain("/reading/not-a-codex-tui");
+  });
+
+  test("lists the oracle-and-firm reading page in the built sitemap and llms index", async () => {
+    const root = await createFixtureRoot();
+    await buildSite({ check: false, repositoryRoot: root });
+    const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
+    const llms = await readFile(join(root, "dist/site/llms.txt"), "utf8");
+    const home = await readFile(join(root, "dist/site/index.html"), "utf8");
+    const reading = await readFile(
+      join(root, "dist/site/reading/oracle-and-firm/index.html"),
+      "utf8",
+    );
+    const deepseek = await readFile(
+      join(root, "dist/site/reading/deepseek-harness/index.html"),
+      "utf8",
+    );
+    const headlong = await readFile(
+      join(root, "dist/site/reading/headlong-microharness/index.html"),
+      "utf8",
+    );
+
+    expect(sitemap).toContain("<loc>https://hra.sh/reading/oracle-and-firm/</loc>");
+    expect(llms).toContain("https://hra.sh/reading/oracle-and-firm/");
+    expect(home).toContain('href="/reading/oracle-and-firm/"');
+    expect(deepseek).toContain('href="/reading/oracle-and-firm/"');
+    expect(headlong).toContain('href="/reading/oracle-and-firm/"');
+    expect(reading).toContain("A Codex account loop is an oracle thread, not a firm");
     expect(reading).not.toContain("/reading/headlong-always-on-loop");
     expect(reading).not.toContain("/reading/not-a-codex-tui");
   });

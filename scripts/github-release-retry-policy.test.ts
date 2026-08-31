@@ -8,7 +8,7 @@ import {
   priorAttemptProvesNoDraftCreation,
 } from "./github-release-retry-policy";
 
-const tag = "v0.1.1";
+const tag = "v0.1.3";
 const commitSha = "1".repeat(40);
 
 describe("bounded GitHub Release retry policy", () => {
