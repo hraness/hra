@@ -1,4 +1,7 @@
-import { renderHranessSiteFooter } from "@hraness/site-footer";
+import {
+  renderHranessSiteFooter,
+  type HranessMailingListConfig,
+} from "@hraness/site-footer";
 import { AskAiAboutThis } from "@hraness/ui";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -30,6 +33,47 @@ const escapeHtml = (value: string): string =>
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+
+export const HRA_MAILING_TURNSTILE_SITEKEY_ENV =
+  "NEXT_PUBLIC_HRANESS_MAILING_TURNSTILE_SITEKEY" as const;
+
+const turnstileSitekeyPattern = /^[A-Za-z0-9_-]{20,100}$/u;
+
+export const hraMailingListConfig = (
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): HranessMailingListConfig => {
+  const turnstileSitekey = environment[HRA_MAILING_TURNSTILE_SITEKEY_ENV];
+  if (turnstileSitekey === undefined || turnstileSitekey.length === 0) {
+    if (environment.VERCEL_ENV === "production") {
+      throw new Error(
+        `${HRA_MAILING_TURNSTILE_SITEKEY_ENV} must be configured for Vercel Production.`,
+      );
+    }
+    return { kind: "none" };
+  }
+  if (!turnstileSitekeyPattern.test(turnstileSitekey)) {
+    throw new Error(
+      `${HRA_MAILING_TURNSTILE_SITEKEY_ENV} must be a 20-100 character URL-safe public Cloudflare Turnstile sitekey.`,
+    );
+  }
+  return {
+    audience: "hra",
+    kind: "signup",
+    turnstileSitekey,
+  };
+};
+
+export const renderHraSiteFooter = (
+  turnstileSitekey = process.env[HRA_MAILING_TURNSTILE_SITEKEY_ENV],
+): string => {
+  const environment: Record<string, string | undefined> = {
+    [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+    VERCEL_ENV: process.env.VERCEL_ENV,
+  };
+  return renderHranessSiteFooter({
+    mailingList: hraMailingListConfig(environment),
+  });
+};
 
 export const renderAskAiAboutThis = (canonicalUrl: string): string =>
   renderToStaticMarkup(createElement(AskAiAboutThis, {
@@ -213,7 +257,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
-${renderHranessSiteFooter()}
+${renderHraSiteFooter()}
 </body>
 </html>
 `;
@@ -269,7 +313,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/privacy/`)}
 ${renderProjectResources(content)}
-${renderHranessSiteFooter()}
+${renderHraSiteFooter()}
 </body>
 </html>
 `;
@@ -339,7 +383,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(canonicalUrl)}
 ${renderProjectResources(content)}
-${renderHranessSiteFooter()}
+${renderHraSiteFooter()}
 </body>
 </html>
 `;
@@ -368,7 +412,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/reading/`)}
 ${renderProjectResources(content)}
-${renderHranessSiteFooter()}
+${renderHraSiteFooter()}
 </body>
 </html>
 `;

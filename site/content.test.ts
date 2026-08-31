@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import {
   HRANESS_HOME_URL,
-  HRANESS_NEWSLETTER_URL,
   hranessSocialLinks,
 } from "@hraness/site-footer";
 
@@ -21,8 +20,11 @@ import {
   renderSitemapXml,
 } from "./content.ts";
 import {
+  HRA_MAILING_TURNSTILE_SITEKEY_ENV,
   renderDeepseekHarnessReadingHtml,
   renderHeadlongMicroharnessReadingHtml,
+  hraMailingListConfig,
+  renderHraSiteFooter,
   renderOracleAndFirmReadingHtml,
   renderPreviewHtml,
   renderPrivacyHtml,
@@ -584,7 +586,6 @@ describe("public content contract", () => {
   test("renders the canonical Hraness network footer on every HTML page", () => {
     const expectedHrefs = [
       HRANESS_HOME_URL,
-      HRANESS_NEWSLETTER_URL,
       ...hranessSocialLinks.map(({ href }) => href),
     ];
 
@@ -600,6 +601,8 @@ describe("public content contract", () => {
       expect(footer).toContain('data-slot="hraness-site-footer"');
       expect(footer?.match(/data-slot="hraness-mark"/gu)).toHaveLength(1);
       expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(10);
+      expect(footer).toContain('data-mailing-list="none"');
+      expect(footer).not.toContain("substack.com");
       expect(
         [...(footer?.matchAll(/<a\b[^>]*\shref="([^"]+)"/gu) ?? [])]
           .map((match) => match[1]),
@@ -607,6 +610,59 @@ describe("public content contract", () => {
       expect(document.indexOf('class="project-resources"')).toBeLessThan(
         document.indexOf('data-slot="hraness-site-footer"'),
       );
+    }
+  });
+
+  test("renders only the HRA mailing audience when Turnstile is configured", () => {
+    const sitekey = "1x00000000000000000000AA";
+    expect(hraMailingListConfig({
+      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
+    })).toEqual({
+      audience: "hra",
+      kind: "signup",
+      turnstileSitekey: sitekey,
+    });
+    expect(hraMailingListConfig({})).toEqual({ kind: "none" });
+    expect(hraMailingListConfig({
+      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "",
+    })).toEqual({ kind: "none" });
+
+    const footer = renderHraSiteFooter(sitekey);
+    expect(footer).toContain('data-mailing-list="signup"');
+    expect(footer).toContain('name="audience" type="hidden" value="hra"');
+    expect(footer).toContain('data-action="mailing_hra"');
+    expect(footer).toContain(
+      'action="https://account.hraness.com/api/mailing/subscribe"',
+    );
+    expect(footer).toContain(
+      'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
+    );
+    expect(footer).not.toContain("substack.com");
+  });
+
+  test("fails production closed on missing or malformed Turnstile configuration", () => {
+    expect(hraMailingListConfig({ VERCEL_ENV: "preview" }))
+      .toEqual({ kind: "none" });
+    for (const turnstileSitekey of [undefined, ""]) {
+      expect(() => {
+        hraMailingListConfig({
+          [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+          VERCEL_ENV: "production",
+        });
+      })
+        .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
+    }
+    for (const turnstileSitekey of [
+      "too-short",
+      "1x00000000000000000000AA!",
+      "x".repeat(101),
+    ]) {
+      expect(() => {
+        hraMailingListConfig({
+          [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+        });
+      })
+        .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
     }
   });
 
