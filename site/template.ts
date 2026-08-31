@@ -7,6 +7,7 @@ import {
   deepseekHarnessReading,
   findSection,
   headlongMicroharnessReading,
+  oracleAndFirmReading,
   publicContent,
   type ContentBlock,
   type ContentSection,
@@ -379,3 +380,7 @@ export const renderDeepseekHarnessReadingHtml = (
 export const renderHeadlongMicroharnessReadingHtml = (
   content: PublicContent = publicContent,
 ): string => renderReadingHtml(headlongMicroharnessReading, content);
+
+export const renderOracleAndFirmReadingHtml = (
+  content: PublicContent = publicContent,
+): string => renderReadingHtml(oracleAndFirmReading, content);
