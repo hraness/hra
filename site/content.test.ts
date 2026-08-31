@@ -40,7 +40,7 @@ describe("public content contract", () => {
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init --yes",
       installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+        "https://github.com/hraness/hra/releases/download/v0.1.0/hraness-hra-0.1.0.tgz",
       ),
       links: {
         github: "https://github.com/hraness/hra",
@@ -372,7 +372,7 @@ describe("public content contract", () => {
     expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("| bun -e '");
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+      "-- https://github.com/hraness/hra/releases/download/v0.1.0/hraness-hra-0.1.0.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");

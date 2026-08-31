@@ -28,9 +28,9 @@ import { createGunzip } from "node:zlib";
 export const HRA_INSTALL_BUN_VERSION = "1.3.14";
 export const HRA_INSTALL_CLI_SHA256 = "4ec12b00de84a5c5e830fc8cac3f2303cb0dffa6d262dc2c51773bce5039f308";
 
-const expectedPackageName = "hra";
+const expectedPackageName = "@hraness/hra";
 const expectedPackageVersion = "0.1.0";
-const expectedArchiveUrl = "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz";
+const expectedArchiveUrl = "https://github.com/hraness/hra/releases/download/v0.1.0/hraness-hra-0.1.0.tgz";
 const cliRelativePath = join("src", "cli.ts");
 const cliMaximumBytes = 512 * 1024;
 const manifestMaximumBytes = 64 * 1024;
@@ -953,8 +953,8 @@ const fsyncDirectory = async (path: string): Promise<void> => {
 };
 
 const binLinkCandidates = (packageRoot: string): readonly string[] => [
-  resolve(packageRoot, "..", ".bin", "hra"),
-  resolve(packageRoot, "..", "..", "..", "..", "bin", "hra"),
+  resolve(packageRoot, "..", "..", ".bin", "hra"),
+  resolve(packageRoot, "..", "..", "..", "..", "..", "bin", "hra"),
 ];
 
 const disableCurrentUserPath = async (
@@ -1168,7 +1168,7 @@ type InstallCompleteReceipt = InstallArchiveIdentity & Readonly<{
   entryCount: number;
   id: string;
   normalizerSha256: string;
-  packageName: "hra";
+  packageName: "@hraness/hra";
   packageVersion: "0.1.0";
   totalBytes: number;
   treeSha256: string;
@@ -1974,7 +1974,7 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
     || dirname(versionRoot) !== join(authorityRoot, "versions")
     || relative(join(authorityRoot, "versions"), versionRoot) !== expectedVersionName
     || intentPath !== join(authorityRoot, "install-intent.json")
-    || packageRoot !== join(stagingRoot, "install", "global", "node_modules", "hra")
+    || packageRoot !== join(stagingRoot, "install", "global", "node_modules", "@hraness", "hra")
     || normalizerPath !== join(packageRoot, "src", "install-normalizer.ts")
   ) throw new InstallNormalizationError("The staged HRA install paths do not match their exact authority layout.");
   const custody = new DirectoryCustody(uid);
@@ -2025,7 +2025,7 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
       entryCount: normalizedTree.entryCount,
       id: input.intentId,
       normalizerSha256: input.normalizerSha256,
-      packageName: "hra",
+      packageName: "@hraness/hra",
       packageVersion: "0.1.0",
       totalBytes: normalizedTree.totalBytes,
       treeSha256: normalizedTree.treeSha256,

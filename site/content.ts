@@ -279,7 +279,7 @@ export const siteDocumentPaths: readonly string[] = [
 export const publicReleaseState: "release-ready" | "staged" = "staged";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+  "https://github.com/hraness/hra/releases/download/v0.1.0/hraness-hra-0.1.0.tgz",
 );
 
 export const publicContent: PublicContent = {

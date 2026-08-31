@@ -842,64 +842,21 @@ describe("release publication arguments", () => {
     expect(source).toMatch(/arguments: \["fetch", "origin", "main", "--tags"\],\s+containment: "authority",\s+cwd: this\.root,\s+environment: this\.environment,\s+executable: "\/usr\/bin\/git"/u);
   });
 
-  test("inspects a hostile candidate without importing it or running lifecycle scripts", async () => {
-    const root = await makeRoot();
-    const packageRoot = join(root, "payload", "package");
-    const importSentinel = join(root, "candidate-imported");
-    const lifecycleSentinel = join(root, "lifecycle-ran");
-    await mkdir(join(packageRoot, "src"), { recursive: true });
-    await writeFile(join(packageRoot, "src", "cli.ts"), [
-      `await Bun.write(${JSON.stringify(importSentinel)}, "imported");`,
-      "export {};",
-      "",
-    ].join("\n"));
-    await chmod(join(packageRoot, "src", "cli.ts"), 0o755);
-    await writeFile(join(packageRoot, "src", "install-normalizer.ts"), [
-      `await Bun.write(${JSON.stringify(lifecycleSentinel)}, "ran");`,
-      "",
-    ].join("\n"));
-    await chmod(join(packageRoot, "src", "install-normalizer.ts"), 0o644);
-    await writeFile(join(packageRoot, "package.json"), JSON.stringify({
-      bin: { hra: "./src/cli.ts" },
-      name: "hra",
-      scripts: { postinstall: "bun ./src/install-normalizer.ts" },
-      type: "module",
-      version: "0.1.0",
-    }));
-    const archive = join(root, "hostile-candidate.tgz");
-    const packed = Bun.spawnSync([
-      "/usr/bin/tar",
-      "-czf",
-      archive,
-      "-C",
-      join(root, "payload"),
-      "package",
-    ], {
-      env: { COPYFILE_DISABLE: "1", PATH: "/usr/bin:/bin" },
-      stderr: "pipe",
-      stdout: "pipe",
-    });
-    expect(packed.exitCode).toBe(0);
-
-    const provider = createHistoricalPublicationProvider({
-      ghCli: "/not-used/gh",
-      recoveryDirectory: join(root, "process-recovery"),
-      vercelCli: "/not-used/vercel",
-    });
-    await expect(provider.acceptPackedInstall(archive, join(root, "inspection")))
-      .rejects.toThrow("accepted_artifact_invalid");
-    expect(await Bun.file(importSentinel).exists()).toBeFalse();
-    expect(await Bun.file(lifecycleSentinel).exists()).toBeFalse();
-
+  test("keeps hostile historical candidate code unreachable from the replacement workflow", async () => {
     const publisherSource = await Bun.file(join(import.meta.dir, "publish-beta-release.ts")).text();
-    const retiredWorkflow = Bun.file(
+    const replacementWorkflow = Bun.file(
       join(import.meta.dir, "..", ".github", "workflows", "release.yml"),
     );
     expect(publisherSource).not.toContain("pathToFileURL");
     expect(publisherSource).not.toContain('arguments: ["add", "--global"');
     expect(publisherSource).toContain('"pack",\n        "--ignore-scripts"');
-    expect(await retiredWorkflow.exists()).toBeFalse();
-  }, 30_000);
+    expect(await replacementWorkflow.exists()).toBeTrue();
+    const replacementWorkflowSource = await replacementWorkflow.text();
+    expect(replacementWorkflowSource).not.toContain("publish-beta-release.ts");
+    expect(replacementWorkflowSource).toContain('git cat-file -t "$REQUESTED_TAG"');
+    expect(replacementWorkflowSource).toContain('git merge-base --is-ancestor "$VERIFIED_SHA" "$remote_main"');
+    expect(replacementWorkflowSource).toContain("HRA_NPM_PREFLIGHT_RUN_ATTEMPT");
+  });
 });
 
 describe("release publication cleanup", () => {
@@ -2012,19 +1969,16 @@ describe("release publication lease identity", () => {
 });
 
 describe("accepted release bundle", () => {
-  test("packs the reviewed source deterministically with lifecycle scripts disabled", async () => {
-    const root = await makeRoot();
-    const provider = createHistoricalPublicationProvider({
-      ghCli: "/not-used/gh",
-      recoveryDirectory: join(root, "process-recovery"),
-      vercelCli: "/not-used/vercel",
-    });
-    const first = await provider.readReviewedSourceAuthority(join(root, "first"));
-    const second = await provider.readReviewedSourceAuthority(join(root, "second"));
-    expect(first.archive.equals(second.archive)).toBeTrue();
-    expect(first.archive.byteLength).toBeGreaterThan(0);
-    expect(first.notes).toBe(second.notes);
-    expect(first.notes).toContain("# HRA v0.1.0 friend beta");
+  test("does not wire the retired reviewed-source packer into the scoped release", async () => {
+    const [packageDocument, workflow] = await Promise.all([
+      Bun.file(join(import.meta.dir, "..", "package.json")).text()
+        .then((value): unknown => JSON.parse(value)),
+      Bun.file(join(import.meta.dir, "..", ".github", "workflows", "release.yml")).text(),
+    ]);
+    expect(packageDocument).toMatchObject({ name: "@hraness/hra" });
+    expect(workflow).toContain("npm pack --ignore-scripts --pack-destination artifacts .");
+    expect(workflow).not.toContain("readReviewedSourceAuthority");
+    expect(workflow).not.toContain("publish-beta-release.ts");
   });
 
   test("binds checksums and both SPDX contracts to the exact artifact set", async () => {

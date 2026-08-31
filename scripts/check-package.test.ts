@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -8,11 +8,14 @@ import type { DaemonIdentity } from "../src/daemon/daemon-startup";
 import {
   assertCompleteGitHistoryPublic,
   buildGitHistoryEnvironment,
+  packageDependencyCacheDiscoveryEnvironment,
+  parsePackageDependencyCache,
   parseGitHistoryCommitList,
   projectGitHistorySpawnResult,
   requireGitHistoryOutput,
   runPackageCommand,
   waitForOwnedInstalledDaemonReady,
+  withPackageDependencyCacheCustody,
 } from "./check-package";
 import {
   assertPseudoTerminalSuccess,
@@ -145,6 +148,139 @@ describe("installed package daemon ownership", () => {
 });
 
 describe("installed package generic command ownership", () => {
+  test("admits only one canonical absolute Bun dependency cache path", () => {
+    const cache = resolve(join(tmpdir(), "hra-bun-cache"));
+    expect(parsePackageDependencyCache(cache)).toBe(cache);
+    expect(parsePackageDependencyCache(`${cache}\n`)).toBe(cache);
+    for (const value of [
+      "relative/cache\n",
+      `${cache}\n${cache}\n`,
+      `${cache}\n\n`,
+      `${cache}\r\n`,
+      `${cache}\0\n`,
+      `${cache}/../cache\n`,
+      `${"/".repeat(4_097)}\n`,
+    ]) expect(() => parsePackageDependencyCache(value)).toThrow("non-canonical dependency cache path");
+  });
+
+  test("shares only the validated dependency cache across private consumer roots", async () => {
+    const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
+    expect(source.indexOf("await resolvePackageDependencyCache(repositoryRoot)")).toBeLessThan(
+      source.indexOf('mkdtemp(join(tmpdir(), "hra-package-")'),
+    );
+    expect(source).toContain("BUN_INSTALL_CACHE_DIR: dependencyCacheRoot");
+    expect(source).not.toContain("BUN_INSTALL_CACHE_DIR: globalInstallRoot");
+    expect(source).toContain("delete discoveryEnvironment.BUN_INSTALL_CACHE_DIR;");
+    expect(source.match(/await withPackageDependencyCacheCustody\(dependencyCacheRoot/gu)).toHaveLength(2);
+    for (const isolated of [
+      "BUN_INSTALL: globalInstallRoot",
+      'BUN_INSTALL_BIN: join(globalInstallRoot, "bin")',
+      'BUN_INSTALL_GLOBAL_DIR: join(globalInstallRoot, "install", "global")',
+      "HOME: consumerHome",
+      "TMPDIR: consumerTemporaryDirectory",
+    ]) expect(source).toContain(isolated);
+  });
+
+  test("ignores a direct ambient cache override while retaining the configured Bun installation root", () => {
+    const environment = packageDependencyCacheDiscoveryEnvironment({
+      BUN_INSTALL: "/canonical-bun-root",
+      BUN_INSTALL_CACHE_DIR: "/untrusted-direct-cache-override",
+      HRA_UNRELATED_FIXTURE: "preserved",
+    });
+    expect(environment).toEqual({
+      BUN_INSTALL: "/canonical-bun-root",
+      HRA_UNRELATED_FIXTURE: "preserved",
+    });
+  });
+
+  test("holds the dependency cache descriptor and rejects path replacement", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-package-cache-custody-")));
+    const cache = join(root, "cache");
+    const displaced = join(root, "displaced");
+    const replacement = join(root, "replacement");
+    try {
+      await mkdir(cache, { mode: 0o700 });
+      await mkdir(replacement, { mode: 0o700 });
+      await expect(withPackageDependencyCacheCustody(cache, async () => {
+        await rename(cache, displaced);
+        await rename(replacement, cache);
+      })).rejects.toThrow("identity changed while in use");
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("fails closed when a cache consumer rejects with undefined", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-package-cache-undefined-error-")));
+    const cache = join(root, "cache");
+    try {
+      await mkdir(cache, { mode: 0o700 });
+      await expect(withPackageDependencyCacheCustody(cache, async () => await Promise.reject(undefined))).rejects.toThrow(
+        "Bun dependency cache operation failed with a non-error value.",
+      );
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("holds the dependency cache parent chain and rejects parent replacement", async () => {
+    const temporaryParent = await realpath(await mkdtemp(join(tmpdir(), "hra-package-cache-parent-custody-")));
+    const root = join(temporaryParent, "root");
+    const cache = join(root, "cache");
+    const displaced = join(temporaryParent, "displaced");
+    const replacement = join(temporaryParent, "replacement");
+    try {
+      await mkdir(cache, { mode: 0o700, recursive: true });
+      await mkdir(join(replacement, "cache"), { mode: 0o700, recursive: true });
+      await expect(withPackageDependencyCacheCustody(cache, async () => {
+        await rename(root, displaced);
+        await rename(replacement, root);
+      })).rejects.toThrow("path identity changed while in use");
+    } finally {
+      await rm(temporaryParent, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects a group-writable dependency cache parent", async () => {
+    const temporaryParent = await realpath(await mkdtemp(join(tmpdir(), "hra-package-cache-parent-mode-")));
+    const parent = join(temporaryParent, "parent");
+    const cache = join(parent, "cache");
+    try {
+      await mkdir(cache, { mode: 0o700, recursive: true });
+      await chmod(parent, 0o770);
+      await expect(withPackageDependencyCacheCustody(cache, async () => undefined)).rejects.toThrow(
+        "path custody is invalid",
+      );
+    } finally {
+      await rm(temporaryParent, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects a dangerous Darwin ACL on the dependency cache", async () => {
+    if (process.platform !== "darwin") return;
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-package-cache-acl-")));
+    const cache = join(root, "cache");
+    const runChmod = async (...arguments_: string[]): Promise<void> => {
+      const child = Bun.spawn(["/bin/chmod", ...arguments_], {
+        stderr: "pipe",
+        stdin: "ignore",
+        stdout: "pipe",
+      });
+      const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      if (exitCode !== 0) throw new Error(`ACL fixture chmod failed: ${stderr}`);
+    };
+    try {
+      await mkdir(cache, { mode: 0o700 });
+      await runChmod("+a", "everyone allow delete", cache);
+      await expect(withPackageDependencyCacheCustody(cache, async () => undefined)).rejects.toThrow(
+        "dangerous non-owner Darwin ALLOW ACL",
+      );
+    } finally {
+      await runChmod("-N", cache).catch(() => undefined);
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("scans complete Git history one bounded commit patch at a time", async () => {
     const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
     expect(source).toContain('["--no-replace-objects", "rev-list", "--max-count=100001", "--all"]');
@@ -369,10 +505,10 @@ describe("installed package generic command ownership", () => {
     const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
     expect(source).toContain("const run = runPackageCommand;");
     for (const command of [
-      '["pm", "pack", "--ignore-scripts"',
+      'await run("npm", ["pack", "--ignore-scripts", "--pack-destination"',
       '["-xzpf", archive, "-C", inspectionDirectory]',
       '["add", "--backend=copyfile", "--ignore-scripts", archive]',
-      '["-e", "await import(\'hra\')"]',
+      '["-e", "await import(\'@hraness/hra\')"]',
       'run(executable, ["--help"]',
       'run(executable, ["--version"]',
       'run(executable, ["doctor", "--offline", "--json"]',

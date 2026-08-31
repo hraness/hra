@@ -1,8 +1,12 @@
 {
-  "name": "hra",
+  "name": "@hraness/hra",
   "version": "0.1.0",
   "description": "A persistent Codex CLI for isolated accounts, live sessions, and encrypted device sync.",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -28,7 +32,7 @@
     "release:canonical-alias": "bun ./scripts/current-project-alias-release.ts",
     "lint": "eslint .",
     "start": "bun ./src/cli.ts",
-    "test": "bun test --isolate --max-concurrency=1",
+    "test": "bun test ./scripts --isolate --max-concurrency=1 && bun test ./src --isolate --max-concurrency=1 && bun test ./convex ./site --isolate --max-concurrency=1",
     "test:simulation": "bun test ./src/cloud/deterministic-authority-simulation.test.ts --isolate --max-concurrency=1",
     "test:package-policy": "sh -c 'umask 077; exec bun test ./scripts/package-policy.test.ts --isolate --max-concurrency=1'",
     "typecheck": "tsc --noEmit"
@@ -83,6 +87,7 @@
     "fast-check": "4.3.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "sigstore": "4.1.1",
     "typescript": "5.9.2",
     "typescript-eslint": "8.67.0"
   }
