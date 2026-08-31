@@ -9,15 +9,15 @@ import {
 const exactIdentity = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: "oidc-token",
   ACTIONS_ID_TOKEN_REQUEST_URL: [
-    "https://pipelinesghubeus13.actions.githubusercontent.com",
-    "/opaque/00000000-0000-0000-0000-000000000000",
-    "/_apis/distributedtask/hubs/Actions/plans/1/jobs/2/idtoken?api-version=2.0",
+    "https://run-actions-2-azure-eastus.actions.githubusercontent.com",
+    "/42//idtoken/baeb7e3d-e9ad-46b9-a14d-337ef0e89b86",
+    "/60484a81-4a45-58ac-ae75-cc1f68fcca0e/?api-version=2.0",
   ].join(""),
   GITHUB_ACTIONS: "true",
   GITHUB_EVENT_NAME: "push",
   GITHUB_JOB: "publish",
-  GITHUB_REF: "refs/tags/v0.1.3",
-  GITHUB_REF_NAME: "v0.1.3",
+  GITHUB_REF: "refs/tags/v0.1.4",
+  GITHUB_REF_NAME: "v0.1.4",
   GITHUB_REF_TYPE: "tag",
   GITHUB_REPOSITORY: "hraness/hra",
   GITHUB_REPOSITORY_ID: "1343008607",
@@ -26,7 +26,7 @@ const exactIdentity = {
   GITHUB_SERVER_URL: "https://github.com",
   GITHUB_SHA: "a".repeat(40),
   GITHUB_WORKFLOW: "Release",
-  GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.3",
+  GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.4",
   GITHUB_WORKFLOW_SHA: "a".repeat(40),
   RUNNER_ENVIRONMENT: "github-hosted",
 } as const;
@@ -56,20 +56,44 @@ function fixedSpawn(input: Readonly<{
 
 describe("npm trusted-publisher boundary", () => {
   test("requires the exact GitHub-hosted HRA release identity", () => {
-    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.3", "a".repeat(40)))
+    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.4", "a".repeat(40)))
       .not.toThrow();
     for (const key of Object.keys(exactIdentity)) {
       expect(() => assertNpmPublisherIdentity(
         { ...exactIdentity, [key]: undefined },
-        "v0.1.3",
+        "v0.1.4",
         "a".repeat(40),
       ), key).toThrow("exact GitHub-hosted release OIDC identity");
     }
-    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.4", "a".repeat(40))).toThrow();
-    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.3", "b".repeat(40))).toThrow();
+    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.5", "a".repeat(40))).toThrow();
+    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.4", "b".repeat(40))).toThrow();
+  });
+
+  test("accepts current and legacy GitHub-hosted OIDC endpoints", () => {
+    const workflowBackend = "baeb7e3d-e9ad-46b9-a14d-337ef0e89b86";
+    const jobBackend = "60484a81-4a45-58ac-ae75-cc1f68fcca0e";
+    for (const url of [
+      exactIdentity.ACTIONS_ID_TOKEN_REQUEST_URL,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/0//idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/1234567890//idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0`,
+      [
+        "https://pipelinesghubeus13.actions.githubusercontent.com",
+        "/opaque/00000000-0000-0000-0000-000000000000",
+        "/_apis/distributedtask/hubs/Actions/plans/1/jobs/2/idtoken?api-version=2.0",
+      ].join(""),
+    ]) {
+      expect(() => assertNpmPublisherIdentity(
+        { ...exactIdentity, ACTIONS_ID_TOKEN_REQUEST_URL: url },
+        "v0.1.4",
+        "a".repeat(40),
+      ), url).not.toThrow();
+    }
   });
 
   test("rejects OIDC bearer-token exfiltration URLs", () => {
+    const workflowBackend = "baeb7e3d-e9ad-46b9-a14d-337ef0e89b86";
+    const jobBackend = "60484a81-4a45-58ac-ae75-cc1f68fcca0e";
     for (const url of [
       "http://pipelines.actions.githubusercontent.com/opaque/_apis/distributedtask/hubs/Actions/idtoken?api-version=2.0",
       "https://actions.githubusercontent.com/opaque/_apis/distributedtask/hubs/Actions/idtoken?api-version=2.0",
@@ -79,10 +103,30 @@ describe("npm trusted-publisher boundary", () => {
       "https://user@pipelines.actions.githubusercontent.com/opaque/_apis/distributedtask/hubs/Actions/idtoken?api-version=2.0",
       "https://pipelines.actions.githubusercontent.com/opaque/_apis/distributedtask/hubs/Actions/idtoken?api-version=2.0&audience=evil",
       "https://evil.invalid/opaque/_apis/distributedtask/hubs/Actions/idtoken?api-version=2.0",
+      `https://actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com.evil.invalid/42//idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com:444/42//idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0`,
+      `https://user@run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42/idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42///idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42/%2Fidtoken/${workflowBackend}/${jobBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${jobBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/not-a-uuid/${jobBackend}/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/not-a-uuid/?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/extra?api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/?api-version=1.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0&api-version=2.0`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/?audience=evil`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/?%61udience=evil`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/?unknown=1`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0&extra=1`,
+      `https://run-actions-2-azure-eastus.actions.githubusercontent.com/42//idtoken/${workflowBackend}/${jobBackend}/?api-version=2.0#fragment`,
+      `https://pipelines.actions.githubusercontent.com/${"a".repeat(4_096)}/_apis/distributedtask/hubs/Actions/idtoken?api-version=2.0`,
     ]) {
       expect(() => assertNpmPublisherIdentity(
         { ...exactIdentity, ACTIONS_ID_TOKEN_REQUEST_URL: url },
-        "v0.1.3",
+        "v0.1.4",
         "a".repeat(40),
       ), url).toThrow("exact GitHub-hosted release OIDC identity");
     }
