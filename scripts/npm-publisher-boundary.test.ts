@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import {
   assertNpmPublisherIdentity,
@@ -16,8 +18,8 @@ const exactIdentity = {
   GITHUB_ACTIONS: "true",
   GITHUB_EVENT_NAME: "push",
   GITHUB_JOB: "publish",
-  GITHUB_REF: "refs/tags/v0.1.4",
-  GITHUB_REF_NAME: "v0.1.4",
+  GITHUB_REF: "refs/tags/v0.1.5",
+  GITHUB_REF_NAME: "v0.1.5",
   GITHUB_REF_TYPE: "tag",
   GITHUB_REPOSITORY: "hraness/hra",
   GITHUB_REPOSITORY_ID: "1343008607",
@@ -26,7 +28,7 @@ const exactIdentity = {
   GITHUB_SERVER_URL: "https://github.com",
   GITHUB_SHA: "a".repeat(40),
   GITHUB_WORKFLOW: "Release",
-  GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.4",
+  GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.5",
   GITHUB_WORKFLOW_SHA: "a".repeat(40),
   RUNNER_ENVIRONMENT: "github-hosted",
 } as const;
@@ -56,17 +58,17 @@ function fixedSpawn(input: Readonly<{
 
 describe("npm trusted-publisher boundary", () => {
   test("requires the exact GitHub-hosted HRA release identity", () => {
-    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.4", "a".repeat(40)))
+    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.5", "a".repeat(40)))
       .not.toThrow();
     for (const key of Object.keys(exactIdentity)) {
       expect(() => assertNpmPublisherIdentity(
         { ...exactIdentity, [key]: undefined },
-        "v0.1.4",
+        "v0.1.5",
         "a".repeat(40),
       ), key).toThrow("exact GitHub-hosted release OIDC identity");
     }
-    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.5", "a".repeat(40))).toThrow();
-    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.4", "b".repeat(40))).toThrow();
+    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.6", "a".repeat(40))).toThrow();
+    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.5", "b".repeat(40))).toThrow();
   });
 
   test("accepts current and legacy GitHub-hosted OIDC endpoints", () => {
@@ -85,7 +87,7 @@ describe("npm trusted-publisher boundary", () => {
     ]) {
       expect(() => assertNpmPublisherIdentity(
         { ...exactIdentity, ACTIONS_ID_TOKEN_REQUEST_URL: url },
-        "v0.1.4",
+        "v0.1.5",
         "a".repeat(40),
       ), url).not.toThrow();
     }
@@ -126,7 +128,7 @@ describe("npm trusted-publisher boundary", () => {
     ]) {
       expect(() => assertNpmPublisherIdentity(
         { ...exactIdentity, ACTIONS_ID_TOKEN_REQUEST_URL: url },
-        "v0.1.4",
+        "v0.1.5",
         "a".repeat(40),
       ), url).toThrow("exact GitHub-hosted release OIDC identity");
     }
@@ -138,6 +140,18 @@ describe("npm trusted-publisher boundary", () => {
       env: Record<string, string>;
     }> = [];
     const spawn: NpmPublisherSpawn = (argv, options) => {
+      const userConfig = options.env.NPM_CONFIG_USERCONFIG;
+      const globalConfig = options.env.NPM_CONFIG_GLOBALCONFIG;
+      expect(userConfig).toBeDefined();
+      expect(globalConfig).toBeDefined();
+      expect(userConfig).not.toBe(globalConfig);
+      expect(dirname(userConfig!)).toBe(dirname(globalConfig!));
+      expect(statSync(dirname(userConfig!)).mode & 0o777).toBe(0o700);
+      for (const config of [userConfig!, globalConfig!]) {
+        expect(statSync(config).isFile()).toBe(true);
+        expect(statSync(config).mode & 0o777).toBe(0o600);
+        expect(readFileSync(config, "utf8")).toBe("");
+      }
       invocations.push({ argv, env: options.env });
       return fixedSpawn({
         stderr: "npm verbose oidc Successfully retrieved and set token\n",
@@ -173,13 +187,58 @@ describe("npm trusted-publisher boundary", () => {
         expect(invocation.argv).toContain(argument);
       }
       expect(invocation.env.NPM_CONFIG_REGISTRY).toBe("https://registry.npmjs.org");
-      expect(invocation.env.NPM_CONFIG_USERCONFIG).toBe("/dev/null");
-      expect(invocation.env.NPM_CONFIG_GLOBALCONFIG).toBe("/dev/null");
+      expect(invocation.env.NPM_CONFIG_USERCONFIG).not.toBe("/dev/null");
+      expect(invocation.env.NPM_CONFIG_GLOBALCONFIG).not.toBe("/dev/null");
+      expect(invocation.env.NPM_CONFIG_USERCONFIG)
+        .not.toBe(invocation.env.NPM_CONFIG_GLOBALCONFIG);
+      expect(existsSync(invocation.env.NPM_CONFIG_USERCONFIG!)).toBe(false);
+      expect(existsSync(invocation.env.NPM_CONFIG_GLOBALCONFIG!)).toBe(false);
+      expect(existsSync(dirname(invocation.env.NPM_CONFIG_USERCONFIG!))).toBe(false);
       expect(invocation.env).not.toHaveProperty("GH_TOKEN");
       expect(invocation.env).not.toHaveProperty("NODE_AUTH_TOKEN");
       expect(invocation.env).not.toHaveProperty("NPM_TOKEN");
       expect(invocation.env).not.toHaveProperty("UNRELATED_SECRET");
     }
+    expect(invocations[0]?.env.NPM_CONFIG_USERCONFIG)
+      .not.toBe(invocations[1]?.env.NPM_CONFIG_USERCONFIG);
+  });
+
+  test("loads the distinct empty configs with the real npm client", async () => {
+    const version = Bun.spawnSync(["npm", "--version"], {
+      env: { PATH: process.env.PATH ?? "" },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    expect(version.exitCode).toBe(0);
+    expect(version.stdout.toString().trim()).toMatch(/^[0-9]+\.[0-9]+\.[0-9]+$/u);
+
+    let userConfig: string | undefined;
+    let globalConfig: string | undefined;
+    const spawn: NpmPublisherSpawn = (_argv, options) => {
+      userConfig = options.env.NPM_CONFIG_USERCONFIG;
+      globalConfig = options.env.NPM_CONFIG_GLOBALCONFIG;
+      return Bun.spawn(["npm", "--version"], options);
+    };
+    const result = await runNpmPublisher({
+      dryRun: true,
+      source: {
+        ...exactIdentity,
+        HOME: process.env.HOME,
+        PATH: process.env.PATH,
+      },
+      tarball: "/tmp/hra.tgz",
+    }, { spawn });
+    expect(result).toEqual({
+      exitCode: 0,
+      failure: "trusted_exchange_not_proven",
+      trustedExchangeProven: false,
+    });
+    expect(userConfig).toBeDefined();
+    expect(globalConfig).toBeDefined();
+    expect(userConfig).not.toBe(globalConfig);
+    expect(existsSync(userConfig!)).toBe(false);
+    expect(existsSync(globalConfig!)).toBe(false);
+    expect(existsSync(dirname(userConfig!))).toBe(false);
   });
 
   test("returns only allowlisted failure classes and never provider output", async () => {
@@ -193,6 +252,10 @@ describe("npm trusted-publisher boundary", () => {
       ["npm error code ETIMEDOUT", "network_failed"],
       ["You cannot publish over the previously published versions", "version_conflict"],
       ["sigstore failure", "provenance_failed"],
+      [
+        "Exit prior to config file resolving\ncause\ndouble-loading config \"PRIVATE_MESSAGE_BODY\"",
+        "publisher_configuration_failed",
+      ],
     ] as const;
     for (const [output, failure] of cases) {
       const result = await runNpmPublisher({
@@ -271,15 +334,54 @@ describe("npm trusted-publisher boundary", () => {
   });
 
   test("classifies a synchronous child-process launch failure", async () => {
+    let userConfig: string | undefined;
     const result = await runNpmPublisher({
       dryRun: false,
       source: exactIdentity,
       tarball: "/tmp/hra.tgz",
-    }, { spawn: () => { throw new Error("private launch failure"); } });
+    }, {
+      spawn: (_argv, options) => {
+        userConfig = options.env.NPM_CONFIG_USERCONFIG;
+        throw new Error("private launch failure");
+      },
+    });
     expect(result).toEqual({
       exitCode: 1,
       failure: "publisher_process_failed",
       trustedExchangeProven: false,
     });
+    expect(userConfig).toBeDefined();
+    expect(existsSync(userConfig!)).toBe(false);
+    expect(existsSync(dirname(userConfig!))).toBe(false);
+  });
+
+  test("classifies private configuration cleanup failure without leaking paths", async () => {
+    let directory: string | undefined;
+    const result = await runNpmPublisher({
+      dryRun: true,
+      source: exactIdentity,
+      tarball: "/tmp/hra.tgz",
+    }, {
+      spawn: (argv, options) => {
+        directory = dirname(options.env.NPM_CONFIG_USERCONFIG!);
+        writeFileSync(join(directory, "unexpected-private-file"), "private", {
+          flag: "wx",
+          mode: 0o600,
+        });
+        return fixedSpawn({
+          stderr: "npm verbose oidc Successfully retrieved and set token\n",
+        })(argv, options);
+      },
+    });
+    try {
+      expect(result).toEqual({
+        exitCode: 0,
+        failure: "publisher_configuration_cleanup_failed",
+        trustedExchangeProven: true,
+      });
+      expect(JSON.stringify(result)).not.toContain(directory!);
+    } finally {
+      if (directory !== undefined) rmSync(directory, { force: true, recursive: true });
+    }
   });
 });

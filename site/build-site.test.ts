@@ -176,7 +176,7 @@ describe("static-site build", () => {
     ) as { version?: unknown };
 
     expect(identity.version).toBe("0.1.0");
-    expect(packageJson.version).toBe("0.1.4");
+    expect(packageJson.version).toBe("0.1.5");
     expect(identity.version).not.toBe(packageJson.version);
   });
 

@@ -44,7 +44,7 @@ describe("public content contract", () => {
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init --yes",
       installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.1.4/hraness-hra-0.1.4.tgz",
+        "https://github.com/hraness/hra/releases/download/v0.1.5/hraness-hra-0.1.5.tgz",
       ),
       links: {
         github: "https://github.com/hraness/hra",
@@ -96,7 +96,7 @@ describe("public content contract", () => {
       expect(surface).toContain("once its GitHub Release exists");
       expect(surface).not.toContain("install command becomes usable");
       expect(surface).not.toContain("Beta not yet live");
-      expect(surface).not.toContain("No published `v0.1.4` tag currently exposes these commands");
+      expect(surface).not.toContain("No published `v0.1.5` tag currently exposes these commands");
     }
   });
 
@@ -386,7 +386,7 @@ describe("public content contract", () => {
     expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("| bun -e '");
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.1.4/hraness-hra-0.1.4.tgz",
+      "-- https://github.com/hraness/hra/releases/download/v0.1.5/hraness-hra-0.1.5.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");
@@ -401,7 +401,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra-install-safe");
       expect(surface).toContain("fresh random private staging root");
       expect(surface).toContain("GitHub repository ID 1343008607");
-      expect(surface).toContain("published immutable v0.1.4 release");
+      expect(surface).toContain("published immutable v0.1.5 release");
       expect(surface).toContain("immutable release metadata");
       expect(surface).toContain("verified in-memory snapshot");
       expect(surface).toContain("bounded package-file manifest");
@@ -419,7 +419,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
       expect(surface).toContain("Do not install a moving branch");
-      expect(surface).toContain("verified repair installation of v0.1.4");
+      expect(surface).toContain("verified repair installation of v0.1.5");
       expect(surface).toContain("replace the tagged preflight and release archive references together");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");

@@ -60,7 +60,7 @@ describe("HRA public release package policy", () => {
     expect(inspectReleasePackage(manifest)).toEqual({
       blockers: [],
       name: "@hraness/hra",
-      version: "0.1.4",
+      version: "0.1.5",
     });
     expect(assertReleasePackageReady(manifest).blockers).toEqual([]);
   });
