@@ -11,6 +11,22 @@ import { commandProgramLabel, containsControlCharacters, requireOperationLabel }
 
 export type ResourceMode = "shared" | "heavy" | "exclusive";
 
+export const hostAccessRequiredCode = "HRA_HOST_ACCESS_REQUIRED";
+export const hostAccessRequiredExitCode = 77;
+
+export class HostAccessRequiredError extends Error {
+  readonly code = hostAccessRequiredCode;
+
+  constructor() {
+    super(
+      "the machine-wide scheduler state is outside the active permission boundary; "
+      + "retry this identical hra-host-run invocation through reviewed host access, "
+      + "without running the child directly or removing scheduler state",
+    );
+    this.name = "HostAccessRequiredError";
+  }
+}
+
 type HostResourceLease = {
   readonly inheritedFileDescriptor: number;
 };
@@ -206,6 +222,25 @@ function spawnCommand(
   });
 }
 
+export function permissionBoundaryDenied(error: unknown): boolean {
+  let current = error;
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof current !== "object" || current === null || seen.has(current)) return false;
+    seen.add(current);
+    if (
+      "code" in current
+      && (current.code === "EACCES" || current.code === "EPERM")
+    ) return true;
+    try {
+      current = "cause" in current ? current.cause : undefined;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 export async function runHostCommand(options: HostRunOptions): Promise<number> {
   const environment = { ...(options.environment ?? process.env) };
   if (environment.HRA_LOCAL_EFFICIENCY_LEASE !== undefined) {
@@ -228,32 +263,41 @@ export async function runHostCommand(options: HostRunOptions): Promise<number> {
   console.error(
     `[hra-host-run] waiting for ${options.mode} ${options.label} (${permitCount}/${capacity} permits)`,
   );
-  return coordinator.withLease(
-    [{ resource: "cpu", amount: permitCount }],
-    async (lease) => {
-      const waitedSeconds = (performance.now() - queuedAt) / 1_000;
-      console.error(
-        `[hra-host-run] admitted ${options.label} after ${waitedSeconds.toFixed(1)}s`,
-      );
-      const childEnvironment = {
-        ...environment,
-        HRA_LOCAL_EFFICIENCY_LEASE: JSON.stringify({
-          capacity,
-          label: options.label,
-          mode: options.mode,
-          permits: permitCount,
-          version: 1,
-        }),
-      };
-      return spawnCommand(
-        options.command,
-        options.cwd,
-        childEnvironment,
-        lease.inheritedFileDescriptor,
-      );
-    },
-    { waitTimeoutMilliseconds: 24 * 60 * 60_000 },
-  );
+  const execution = { admitted: false };
+  try {
+    return await coordinator.withLease(
+      [{ resource: "cpu", amount: permitCount }],
+      async (lease) => {
+        execution.admitted = true;
+        const waitedSeconds = (performance.now() - queuedAt) / 1_000;
+        console.error(
+          `[hra-host-run] admitted ${options.label} after ${waitedSeconds.toFixed(1)}s`,
+        );
+        const childEnvironment = {
+          ...environment,
+          HRA_LOCAL_EFFICIENCY_LEASE: JSON.stringify({
+            capacity,
+            label: options.label,
+            mode: options.mode,
+            permits: permitCount,
+            version: 1,
+          }),
+        };
+        return spawnCommand(
+          options.command,
+          options.cwd,
+          childEnvironment,
+          lease.inheritedFileDescriptor,
+        );
+      },
+      { waitTimeoutMilliseconds: 24 * 60 * 60_000 },
+    );
+  } catch (error: unknown) {
+    if (!execution.admitted && permissionBoundaryDenied(error)) {
+      throw new HostAccessRequiredError();
+    }
+    throw error;
+  }
 }
 
 function usage(): string {
@@ -265,8 +309,13 @@ if (import.meta.main) {
     const parsed = parseHostRunArguments(process.argv.slice(2));
     process.exitCode = await runHostCommand({ ...parsed, cwd: process.cwd() });
   } catch (error) {
-    console.error(`[hra-host-run] ${error instanceof Error ? error.message : String(error)}`);
-    console.error(usage());
-    process.exitCode = 1;
+    if (error instanceof HostAccessRequiredError) {
+      console.error(`[hra-host-run] ${error.code}: ${error.message}`);
+      process.exitCode = hostAccessRequiredExitCode;
+    } else {
+      console.error(`[hra-host-run] ${error instanceof Error ? error.message : String(error)}`);
+      console.error(usage());
+      process.exitCode = 1;
+    }
   }
 }

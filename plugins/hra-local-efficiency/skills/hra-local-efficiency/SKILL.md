@@ -21,8 +21,10 @@ compute, stale state, and verified disposable disk use.
 - **Inspect this Mac:** run `bun run scripts/workspace-audit.ts` and
   `bun run scripts/session-audit.ts`. Both are read-only by default. Add
   `--sizes` only when the slower recursive worktree-size estimate is useful.
-- **Run heavyweight local work:** use `hra-host-run --mode=shared|heavy|exclusive
-  --label=LABEL -- COMMAND ...`.
+- **Run heavyweight local work:** resolve `hra-host-run` to its installed
+  absolute path and use `ABSOLUTE-HRA-HOST-RUN
+  --mode=shared|heavy|exclusive --label=LABEL -- COMMAND ...` through reviewed
+  host access. Keep the complete wrapper and child argv visible to Codex.
 - **Record or reuse deterministic focused validation:** use `hra-validate`.
   Reuse is opt-in and is never valid for a required final integration,
   merge-queue, deployment, release, authenticated-browser, or network-sensitive
@@ -77,6 +79,27 @@ Known mappings:
 The wrapper runs the original public command unchanged. It does not substitute
 a weaker check.
 
+## Host-access boundary
+
+The machine-wide scheduler state intentionally lives outside an ordinary
+repository sandbox. Request reviewed host access for the top-level absolute
+`hra-host-run` invocation on the first attempt. This also applies to focused
+HRA process-custody and recovery tests: they exercise machine-scoped identity
+and journal locks even when their CPU cost is small.
+
+If the wrapper reports `HRA_HOST_ACCESS_REQUIRED` and exits 77, retry the
+identical wrapper invocation once through Codex host-access approval or
+configured auto-review. Preserve the working directory and every argument. If
+the reviewed retry still returns 77, stop and diagnose the permission setup.
+Never bypass the wrapper by running its child directly, remove scheduler or
+recovery state, weaken fail-closed custody, or create an unconditional allow
+rule for `hra-host-run`; it can wrap arbitrary child commands.
+
+The bootstrap manages a prompt-only Codex rule for the absolute installed
+wrapper. The rule makes every complete invocation reviewable but grants no
+permission. Codex loads rule files at task startup, so start a new task after
+installing or updating the baseline.
+
 ## Validation receipts
 
 `hra-validate` fingerprints the Git HEAD, tracked diff, untracked file content
@@ -110,10 +133,10 @@ state. Never sweep a temporary-path prefix.
 ## Machine standard
 
 `bootstrap.ts` manages one marked block in the global Codex `AGENTS.md`, two
-optional CLI profiles, a minimal private scheduler runtime, and convenience
-commands. It preserves all content outside its markers, leaves exact profile
-symlinks intact, and refuses conflicting unmanaged targets. Use `--check` in
-automation and after plugin upgrades.
+optional CLI profiles, a prompt-only host-access rule, a minimal private
+scheduler runtime, and convenience commands. It preserves all content outside
+its markers, leaves exact profile symlinks intact, and refuses conflicting
+unmanaged targets. Use `--check` in automation and after plugin upgrades.
 
 The HRA repository marketplace is the cross-machine source of truth. Upgrade
 the marketplace and reinstall the plugin, then rerun bootstrap and start a new
