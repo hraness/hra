@@ -188,7 +188,9 @@ export const deepseekHarnessReading: ReadingPage = {
       paragraph(
         text("A sourced reading take: "),
         link("A microharness for persistence is not a Codex account loop", "/reading/headlong-microharness/"),
-        text(" reads Headlong as a persistence design, not as this host's isolated Codex account loop."),
+        text(" reads Headlong as a persistence design. "),
+        link("A Codex account loop is an oracle thread, not a firm", "/reading/oracle-and-firm/"),
+        text(" reads the account loop as an oracle thread, not a firm of Explore and review sub-agents."),
       ),
       paragraph(
         text("When those Codex sessions need an attested web operation rather than a plugin slot, the "),
@@ -253,7 +255,9 @@ export const headlongMicroharnessReading: ReadingPage = {
       paragraph(
         text("A sourced reading take: "),
         link("A plugin catalog is not a Codex account loop", "/reading/deepseek-harness/"),
-        text(" reads DeepSeek Harness as a plugin-first design reference. This page reads Headlong as a persistence design. Neither page is the other source's digest."),
+        text(" reads DeepSeek Harness as a plugin-first design reference. This page reads Headlong as a persistence design. "),
+        link("A Codex account loop is an oracle thread, not a firm", "/reading/oracle-and-firm/"),
+        text(" reads the account loop as an oracle thread, not a firm of Explore and review sub-agents."),
       ),
       paragraph(
         text("When those Codex sessions need an attested web operation rather than a thought stream, the "),
@@ -264,9 +268,77 @@ export const headlongMicroharnessReading: ReadingPage = {
   },
 };
 
+export const oracleAndFirmReading: ReadingPage = {
+  canonicalPath: "/reading/oracle-and-firm/",
+  datePublished: "2026-08-31",
+  description:
+    "Calvin French-Owen splits long-horizon work into an oracle thread and a firm of sub-agents. HRA is a Bun CLI and local daemon for isolated Codex accounts: one oracle loop, not a firm.",
+  heading: "A Codex account loop is an oracle thread, not a firm",
+  title: "A Codex account loop is an oracle thread, not a firm",
+  homeLink: paragraph(
+    text("A sourced reading take: "),
+    link("A Codex account loop is an oracle thread, not a firm", "/reading/oracle-and-firm/"),
+    text(" reads HRA as a Codex account loop, an oracle thread rather than a firm of Explore and review sub-agents."),
+  ),
+  section: {
+    id: "reading-oracle-and-firm",
+    heading: "A Codex account loop is an oracle thread, not a firm",
+    blocks: [
+      paragraph(text("Published 31 August 2026.")),
+      paragraph(
+        text("Calvin French-Owen splits frontier long-horizon work into two context strategies. An oracle keeps one long thread coherent. A firm splits Explore and review work onto clean windows that return summaries. HRA is a Bun CLI plus a local daemon. It keeps isolated Codex accounts, live sessions, and optional encrypted sync. That account loop is an oracle thread. It is not a firm of sub-agents."),
+      ),
+      { kind: "subheading", text: "The oracle and the firm as published" },
+      paragraph(
+        text("The essay "),
+        link("The Oracle and the Firm", "https://calv.info/the-oracle-and-the-firm"),
+        text(" by Calvin French-Owen describes Codex as an oracle: one long thread, server-side compaction in the responses API, coherent details, and serial tokens. Claude Code is a firm: Explore and review sub-agents on clean windows that return summaries. The firm looks faster and busier, but it can duplicate search and drop facts a child never reported up."),
+      ),
+      paragraph(
+        text("The "),
+        link("Reading digest", "https://hraness.com/reading/the-oracle-and-the-firm"),
+        text(" records the same source as a gist. This page is the HRA take, not that digest."),
+      ),
+      { kind: "subheading", text: "A vocabulary, not a second writer" },
+      paragraph(
+        text("HRA does not implement Claude Code's Explore or review sub-agents, and it does not claim to own Codex compaction. Compaction stays with Codex app-server. The essay is worth reading because it names the two strategies. It is not a product claim that this host trains models or fans out hidden child agents."),
+      ),
+      { kind: "subheading", text: "What HRA keeps on this host" },
+      paragraph(
+        text("The live product page is "),
+        link("HRA on hra.sh", "https://hra.sh/"),
+        text(". HRA owns isolated profiles, process generations, durable commands, local projections, optional encrypted sync, and recovery. Codex app-server owns login, transcripts, turns, tools, and approvals. One machine remains the fenced execution custodian for a session. Other paired devices may read or submit durable commands. They do not become a second provider writer."),
+      ),
+      paragraph(
+        text("Several Codex accounts stay independent subscriptions. HRA does not pool quota or replay a failed turn under another account. That is the account loop this host publishes: named profiles, live sessions, and a local daemon. The loop is oracle-shaped. One selected Codex thread remains the writer. HRA does not spawn a firm of Explore and review children to recover a limit or to parallelize one turn."),
+      ),
+      { kind: "subheading", text: "The harness noun stays on its own host" },
+      paragraph(
+        link("What is an agent harness?", "https://hraness.com/writing/what-is-an-agent-harness"),
+        text(" defines the noun and points at live surfaces. "),
+        link("Direct, Wrench, and Hra", "https://hraness.com/writing/direct-wrench-hra"),
+        text(" keeps the product split off this host: Direct owns application state, Wrench owns attested web operations, and Hra owns multi-subscription Codex parallelism. This generation-1 site publishes the Bun CLI and daemon that keep those isolated Codex accounts. It does not republish the comparison essay."),
+      ),
+      paragraph(
+        text("A sourced reading take: "),
+        link("A plugin catalog is not a Codex account loop", "/reading/deepseek-harness/"),
+        text(" reads DeepSeek Harness as a plugin-first design reference. "),
+        link("A microharness for persistence is not a Codex account loop", "/reading/headlong-microharness/"),
+        text(" reads Headlong as a persistence design. This page reads the oracle and the firm as a context strategy. None of these pages is another source's digest."),
+      ),
+      paragraph(
+        text("When those Codex sessions need an attested web operation rather than a child summary, the "),
+        link("Wrench provider capabilities", "https://wrench.rip/provider-capabilities/"),
+        text(" table names the operations a session can call on purpose."),
+      ),
+    ],
+  },
+};
+
 export const readingPages: readonly ReadingPage[] = [
   deepseekHarnessReading,
   headlongMicroharnessReading,
+  oracleAndFirmReading,
 ];
 
 export const siteDocumentPaths: readonly string[] = [
