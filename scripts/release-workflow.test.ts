@@ -393,7 +393,7 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: durable `v0.1.5` forward-release and retry contract.");
+    expect(releaseRecord).toContain("Status: immutable `v0.1.5` public CLI admitted; hosted sync remains beta-not-yet-live.");
     expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
     expect(releaseRecord).toContain("Release workflow run `33363290345`, attempt 1");
@@ -449,18 +449,40 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("`publisher_configuration_failed`");
     expect(releaseRecord).toContain("`publisher_configuration_cleanup_failed`");
     expect(releaseRecord).toContain("`Successfully retrieved and set token`");
+    expect(releaseRecord).toContain("## Immutable v0.1.5 successful release record");
+    expect(releaseRecord).toContain("tag object `2503c4cccd52f4de9e8fb966f8050a08d26a3d06`");
+    expect(releaseRecord).toContain("reviewed `main` commit `8e9b253bcebe07fc08289f033aaaeda6c574774d`");
+    expect(releaseRecord).toContain("Release workflow run `33427625936`, attempts 1 and 2");
+    expect(releaseRecord).toContain("Attempt 1 publish job `99607830579`");
+    expect(releaseRecord).toContain("bounded post-publication verification request ended with `TimeoutError`");
+    expect(releaseRecord).toContain("Attempt 2 publish job `99611394355`");
+    expect(releaseRecord).toContain("skipped the first-publication OIDC dry run");
+    expect(releaseRecord).toContain("Retained Actions artifact `9771995410`, named `hra-release-2`, is 652,272 bytes");
+    expect(releaseRecord).toContain("`sha256:5e52442c02ee3fb8abee520df41a19e48ef9047f24eb6f160ece1686b2331efb`");
+    expect(releaseRecord).toContain("expires at `2026-09-07T19:14:29Z`");
+    expect(releaseRecord).toContain("GitHub asset `538406590` is the 651,736-byte `hraness-hra-0.1.5.tgz`");
+    expect(releaseRecord).toContain("`48f579f8bee54dbf87ccd5f54ff5d4bf89abd9ba9025280344ad0fe9bfdc57c6`");
+    expect(releaseRecord).toContain("asset `538406604` is the 88-byte `SHA256SUMS` file");
+    expect(releaseRecord).toContain("`a947561b784a41473d5728dfcc96cc6e9d50ba7b542d0010faf3997a041a7091`");
+    expect(releaseRecord).toContain("`sha512-Kv5JY5hbijho5MW79s7bygLb120pQ6RM8EV7aHycETK/hImL0/UQQuC9f72Vtgt4NSF39Glh1EVBFQXdddeGTw==`");
+    expect(releaseRecord).toContain("`f598c36c331f87676382dfffd19907a8e9107b8f`");
+    expect(releaseRecord).toContain("isolated public installation returned `hra-install-safe`");
+    expect(releaseRecord).toContain("The publication variable remains absent");
+    expect(releaseRecord).toContain("Ordinary pull-request and `main` CI uses the same governed-history principle");
+    expect(releaseRecord).toContain("unshallows only that exact commit into `refs/remotes/ci/verified`");
+    expect(releaseRecord).toContain("The package gate still scans `rev-list --all`");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
     expect(releaseRecord).toContain("npm trusted publishing names repository `hraness/hra` and workflow `release.yml`");
-    expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.5` becomes authoritative only when");
+    expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.5` became authoritative after");
     expect(releaseRecord).toContain("Immutable local CLI release; hosted sync not yet live.");
-    expect(releaseRecord).toContain("tag remains `release-ready` until exact release admission");
-    expect(releaseRecord).toContain("Neither phase claims that hosted sync is available.");
+    expect(releaseRecord).toContain("website and local CLI tag are now live after exact release admission");
+    expect(releaseRecord).toContain("Hosted sync remains beta-not-yet-live.");
     expect(releaseRecord).toContain("may create\none annotated stable-semver tag before or after");
     expect(releaseRecord).toContain("outer digest is a transport assertion, not independent release authority");
     expect(releaseRecord).toContain("`@hraness/hra@0.1.0-bootstrap.0`");
     expect(releaseRecord).toContain("npm also assigns `latest` to the first published version");
     expect(releaseRecord).toContain("resolves through both `bootstrap` and `latest`");
-    expect(releaseRecord).toContain("replaces the bootstrap seed as `latest` with exact stable `0.1.5`");
+    expect(releaseRecord).toContain("replaced the bootstrap seed as `latest` with exact stable `0.1.5`");
     expect(releaseRecord).toContain("every earlier attempt's bounded GitHub Jobs API record");
     expect(releaseRecord).toContain("again immediately before the POST");
     expect(releaseRecord).toContain("`dist-tags.latest` to name `0.1.5`");
@@ -509,11 +531,37 @@ describe("release workflow", () => {
       .filter((value): value is string => typeof value === "string"))
       .toEqual([reviewedActions.checkout, reviewedActions.setupBun]);
     const checkout = parsedSteps.find((step) => step.name === "Check out source");
+    const fetch = parsedSteps.find((step) => step.name === "Fetch only governed CI history");
     const install = parsedSteps.find((step) => step.name === "Install dependencies");
     const generated = parsedSteps.find((step) => step.name === "Verify generated public documents");
     const gate = parsedSteps.find((step) => step.name === "Run the repository gate");
 
-    expect(asRecord(checkout, "CI checkout step").with).toEqual({ "fetch-depth": 0 });
+    const checkoutIndex = parsedSteps.indexOf(asRecord(checkout, "CI checkout step"));
+    const fetchIndex = parsedSteps.indexOf(asRecord(fetch, "CI governed-history step"));
+    const installIndex = parsedSteps.indexOf(asRecord(install, "CI install step"));
+    expect(fetchIndex).toBe(checkoutIndex + 1);
+    expect(installIndex).toBeGreaterThan(fetchIndex);
+    expect(asRecord(checkout, "CI checkout step").with).toEqual({
+      "fetch-depth": 1,
+      "fetch-tags": false,
+      "persist-credentials": false,
+      ref: "${{ github.sha }}",
+    });
+    expect(asRecord(asRecord(fetch, "CI governed-history step").env, "CI governed-history environment").VERIFIED_SHA)
+      .toBe("${{ github.sha }}");
+    const governedHistory = String(asRecord(fetch, "CI governed-history step").run);
+    expect(governedHistory).toContain('[[ ! "$VERIFIED_SHA" =~ ^[0-9a-f]{40}$ ]]');
+    expect(governedHistory).toContain("git fetch --force --no-tags --unshallow origin");
+    expect(governedHistory).toContain('+$VERIFIED_SHA:refs/remotes/ci/verified');
+    expect(governedHistory).toContain("git rev-parse --is-shallow-repository");
+    expect(governedHistory).toContain("git rev-parse --verify 'HEAD^{commit}'");
+    expect(governedHistory).toContain("git rev-parse --verify 'refs/remotes/ci/verified^{commit}'");
+    expect(governedHistory).toContain("git for-each-ref --format='%(refname)'");
+    expect(governedHistory).toContain("Unexpected ref entered governed CI history");
+    expect(governedHistory).toContain("wc -l | tr -d ' '");
+    expect(governedHistory).not.toContain("refs/heads/*");
+    expect(governedHistory).not.toContain("github.head_ref");
+    expect(governedHistory).not.toContain("pull_request.head.sha");
     expect(asRecord(install, "CI install step").run).toBe("bun install --frozen-lockfile --ignore-scripts");
     expect(asRecord(generated, "CI generated-documents step").run).toBe("bun run build:site -- --check");
     expect(asRecord(gate, "CI gate step").run).toBe("bun run check");

@@ -348,7 +348,7 @@ export const siteDocumentPaths: readonly string[] = [
   ...readingPages.map((page) => page.canonicalPath),
 ];
 
-export const publicReleaseState: "release-ready" | "staged" = "release-ready";
+export const publicReleaseState: "live" | "release-ready" | "staged" = "live";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
   "https://github.com/hraness/hra/releases/download/v0.1.5/hraness-hra-0.1.5.tgz",
@@ -362,7 +362,7 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-    betaTag: "release-ready",
+    betaTag: "live",
     githubRepository: "live",
     hostedSync: "beta-not-yet-live",
     website: "live",
@@ -373,9 +373,9 @@ export const publicContent: PublicContent = {
       kind: "notice",
       label: "Immutable local CLI release; hosted sync not yet live",
       content: [
-        text("The exact install command below works once GitHub exposes the immutable "),
+        text("The exact install command below is live from the immutable "),
         code("v0.1.5"),
-        text(" Release and its verified archive. The website is live; the public CLI stays immutable once admitted, and optional hosted sync remains beta-not-yet-live."),
+        text(" GitHub Release and its verified archive. npm exposes the same provenance-bearing bytes as latest. The public CLI is immutable and admitted; optional hosted sync remains beta-not-yet-live."),
       ],
     },
     paragraph(
@@ -589,7 +589,7 @@ export const publicContent: PublicContent = {
           content: [
             text("These commands are part of the immutable "),
             code("v0.1.5"),
-            text(" local CLI release and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol."),
+            text(" local CLI release and are installable through the exact command above. Hosted sync is not required for this local protocol."),
           ],
         },
         paragraph(
@@ -1270,7 +1270,7 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     "",
     `> ${content.description}`,
     "",
-    `Install after the v0.1.5 beta tag is live: ${content.installCommand}`,
+    `Install the live v0.1.5 beta: ${content.installCommand}`,
     `Initialize: ${content.initCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
     "",

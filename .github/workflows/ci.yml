@@ -28,7 +28,36 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Fetch only governed CI history
+        env:
+          VERIFIED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERIFIED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::CI source is not one exact commit"
+            exit 1
+          fi
+          test "$(git rev-parse --is-shallow-repository)" = "true"
+          git fetch --force --no-tags --unshallow origin \
+            "+$VERIFIED_SHA:refs/remotes/ci/verified"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          test "$(git rev-parse --verify 'HEAD^{commit}')" = "$VERIFIED_SHA"
+          test "$(git rev-parse --verify 'refs/remotes/ci/verified^{commit}')" = "$VERIFIED_SHA"
+          while IFS= read -r ci_ref; do
+            case "$ci_ref" in
+              refs/remotes/ci/verified) ;;
+              *)
+                echo "::error::Unexpected ref entered governed CI history"
+                exit 1
+                ;;
+            esac
+          done < <(git for-each-ref --format='%(refname)')
+          test "$(git for-each-ref --format='%(refname)' | wc -l | tr -d ' ')" = "1"
 
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
