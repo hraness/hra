@@ -19,6 +19,7 @@ import {
   executeCurrentProjectAliasReleaseWithExplicitCapability,
   observeCurrentAliasAuthority,
   parseArguments,
+  parseCurrentDeploymentReadback,
   parseCurrentProjectAliasReleasePlan,
   requiredAliasConfirmation,
   type CurrentAliasReadback,
@@ -78,6 +79,19 @@ const plan: CurrentProjectAliasReleasePlan = {
   version: HRA_RELEASE_VERSION,
 };
 
+const cliSourcePlan: CurrentProjectAliasReleasePlan = {
+  ...plan,
+  vercel: {
+    ...plan.vercel,
+    sourceProvenance: {
+      actor: "cursor-cli",
+      gitCommitRef: "HEAD",
+      gitRootDirectory: "",
+      kind: "vercel-cli-public-marker",
+    },
+  },
+};
+
 const withStateDirectory = async <Value>(
   operation: (directory: string) => Promise<Value>,
 ): Promise<Value> => {
@@ -104,6 +118,25 @@ const deploymentFor = (
   id: endpoint.deploymentId,
   projectId: HRA_VERCEL_PROJECT_ID,
   readyState: "READY",
+  source: "git",
+  target: "production",
+  url: endpoint.deploymentUrl,
+});
+
+const cliDeploymentFor = (
+  endpoint: CurrentProjectAliasEndpoint,
+): CurrentDeploymentReadback => ({
+  gitSource: null,
+  id: endpoint.deploymentId,
+  meta: {
+    actor: "cursor-cli",
+    gitCommitRef: "HEAD",
+    gitCommitSha: endpoint.sourceCommit,
+    gitRootDirectory: "",
+  },
+  projectId: HRA_VERCEL_PROJECT_ID,
+  readyState: "READY",
+  source: "cli",
   target: "production",
   url: endpoint.deploymentUrl,
 });
@@ -134,6 +167,7 @@ type AliasState = "source" | "target" | "unknown";
 type TargetSetBehavior = "commit" | "commit-and-throw" | "noop" | "throw";
 
 class FakeProvider implements CurrentProjectAliasReleaseProvider {
+  activePlan: CurrentProjectAliasReleasePlan = plan;
   aliasState: AliasState = "source";
   afterReadMarker?: () => Promise<void> | void;
   beforeSetAlias?: (endpoint: CurrentProjectAliasEndpoint) => Promise<void> | void;
@@ -143,8 +177,10 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
   failVerifyVercelAt = 0;
   mutationOldDeploymentIdOverride: string | undefined;
   readonly operations: string[] = [];
+  sourceDeploymentOverride: CurrentDeploymentReadback | undefined;
   sourceVisibilityLagReads = 0;
   sourceSetCommitAndThrow = false;
+  targetDeploymentOverride: CurrentDeploymentReadback | undefined;
   #staleAliasState: AliasState | undefined;
   #staleReadsRemaining = 0;
   targetVisibilityLagReads = 0;
@@ -171,8 +207,15 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
 
   async readDeployment(deploymentId: string): Promise<CurrentDeploymentReadback> {
     this.operations.push(`read-deployment:${deploymentId}`);
-    if (deploymentId === source.deploymentId) return deploymentFor(source);
-    const readback = deploymentFor(target);
+    if (deploymentId === source.deploymentId) {
+      if (this.sourceDeploymentOverride !== undefined) {
+        return this.sourceDeploymentOverride;
+      }
+      return this.activePlan.vercel.sourceProvenance === undefined
+        ? deploymentFor(source)
+        : cliDeploymentFor(source);
+    }
+    const readback = this.targetDeploymentOverride ?? deploymentFor(target);
     return this.breakTargetDeployment
       ? { ...readback, url: "hra-wrong-current-hraness.vercel.app" }
       : readback;
@@ -195,11 +238,11 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
 
   async readMarker(): Promise<unknown> {
     this.operations.push(`read-marker:${this.aliasState}`);
+    const marker = this.aliasState === "target"
+      ? this.breakTargetMarker ? markerFor(source) : markerFor(target)
+      : markerFor(source);
     await this.afterReadMarker?.();
-    if (this.aliasState === "target") {
-      return this.breakTargetMarker ? markerFor(source) : markerFor(target);
-    }
-    return markerFor(source);
+    return marker;
   }
 
   async setAlias(
@@ -224,7 +267,7 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
       uid: "alias_CurrentHra1234567890",
     };
     expect(idempotencyKey).toBe(currentAliasReleaseMutationKey(
-      plan,
+      this.activePlan,
       deploymentUrl === source.deploymentUrl ? "restore-source" : "assign-target",
     ));
     await this.beforeSetAlias?.(endpoint);
@@ -404,6 +447,55 @@ describe("current-project alias plan", () => {
     expect(currentAliasReleaseMutationKey(changedPlan, "restore-source")).not.toBe(sourceKey);
   });
 
+  test("binds the narrow current CLI source provenance into the plan digest", () => {
+    expect(parseCurrentProjectAliasReleasePlan(JSON.stringify(cliSourcePlan)))
+      .toEqual(cliSourcePlan);
+    expect(currentAliasReleasePlanDigest(cliSourcePlan))
+      .not.toBe(currentAliasReleasePlanDigest(plan));
+
+    for (const sourceProvenance of [
+      { ...cliSourcePlan.vercel.sourceProvenance, actor: "vercel-cli" },
+      { ...cliSourcePlan.vercel.sourceProvenance, gitCommitRef: "main" },
+      { ...cliSourcePlan.vercel.sourceProvenance, gitRootDirectory: "site" },
+      { ...cliSourcePlan.vercel.sourceProvenance, kind: "marker-only" },
+      { ...cliSourcePlan.vercel.sourceProvenance, extra: true },
+    ]) {
+      expect(() => parseCurrentProjectAliasReleasePlan(JSON.stringify({
+        ...cliSourcePlan,
+        vercel: { ...cliSourcePlan.vercel, sourceProvenance },
+      }))).toThrow("input_invalid");
+    }
+  });
+
+  test("parses only complete immutable deployment provenance records", () => {
+    expect(parseCurrentDeploymentReadback(deploymentFor(target)))
+      .toEqual(deploymentFor(target));
+    expect(parseCurrentDeploymentReadback(cliDeploymentFor(source)))
+      .toEqual(cliDeploymentFor(source));
+    expect(() => parseCurrentDeploymentReadback({
+      ...deploymentFor(target),
+      source: "cli",
+    })).toThrow("provider_readback_invalid");
+
+    const validCli = cliDeploymentFor(source) as Extract<
+      CurrentDeploymentReadback,
+      { gitSource: null }
+    >;
+    for (const invalid of [
+      { ...validCli, source: "git" },
+      { ...validCli, gitSource: undefined },
+      { ...validCli, meta: { ...validCli.meta, actor: "vercel-cli" } },
+      { ...validCli, meta: { ...validCli.meta, gitCommitRef: "main" } },
+      { ...validCli, meta: { ...validCli.meta, gitCommitSha: "not-a-commit" } },
+      { ...validCli, meta: { ...validCli.meta, gitRootDirectory: "site" } },
+      { ...validCli, readyState: "BUILDING" },
+      { ...validCli, target: null },
+    ]) {
+      expect(() => parseCurrentDeploymentReadback(invalid))
+        .toThrow("provider_readback_invalid");
+    }
+  });
+
   test("requires the exact reviewed Bun runtime before any authority work", async () => {
     expect(() => assertCurrentAliasReleaseBunVersion("1.3.14")).not.toThrow();
     expect(() => assertCurrentAliasReleaseBunVersion("1.3.15"))
@@ -443,6 +535,166 @@ describe("current-project alias authority", () => {
     ]);
     expect(provider.operations.some((operation) => operation.startsWith("set-alias:")))
       .toBeFalse();
+  });
+
+  test("admits only the explicitly bound current CLI source and rechecks its alias", async () => {
+    const provider = new FakeProvider();
+    provider.activePlan = cliSourcePlan;
+
+    expect(await observeCurrentAliasAuthority(cliSourcePlan, provider)).toEqual({
+      reason: "exact_source",
+      state: "source",
+    });
+    expect(provider.operations).toEqual([
+      "verify-vercel",
+      `verify-convex:${String(convex.deploymentId)}`,
+      "read-project",
+      `read-deployment:${source.deploymentId}`,
+      `read-deployment:${target.deploymentId}`,
+      "read-alias:source",
+      "read-marker:source",
+      "read-alias:source",
+    ]);
+
+    const unbound = new FakeProvider();
+    unbound.sourceDeploymentOverride = cliDeploymentFor(source);
+    await expect(observeCurrentAliasAuthority(plan, unbound))
+      .rejects.toThrow("provider_readback_invalid");
+
+    const wrongCommit = new FakeProvider();
+    wrongCommit.activePlan = cliSourcePlan;
+    const readback = cliDeploymentFor(source) as Extract<
+      CurrentDeploymentReadback,
+      { gitSource: null }
+    >;
+    wrongCommit.sourceDeploymentOverride = {
+      ...readback,
+      meta: { ...readback.meta, gitCommitSha: "4".repeat(40) },
+    };
+    await expect(observeCurrentAliasAuthority(cliSourcePlan, wrongCommit))
+      .rejects.toThrow("provider_readback_invalid");
+
+    const movedDuringMarkerRead = new FakeProvider();
+    movedDuringMarkerRead.activePlan = cliSourcePlan;
+    movedDuringMarkerRead.afterReadMarker = () => {
+      movedDuringMarkerRead.aliasState = "target";
+    };
+    expect(await observeCurrentAliasAuthority(cliSourcePlan, movedDuringMarkerRead))
+      .toEqual({ reason: "alias_not_planned", state: "blocked" });
+  });
+
+  test("keeps the target GitHub-main-only for a CLI-source plan", async () => {
+    const provider = new FakeProvider();
+    provider.activePlan = cliSourcePlan;
+    provider.targetDeploymentOverride = cliDeploymentFor(target);
+
+    await expect(observeCurrentAliasAuthority(cliSourcePlan, provider))
+      .rejects.toThrow("provider_readback_invalid");
+    expect(provider.operations.some((operation) => operation.startsWith("set-alias:")))
+      .toBeFalse();
+
+    const hybrid = new FakeProvider();
+    hybrid.activePlan = cliSourcePlan;
+    hybrid.targetDeploymentOverride = {
+      ...deploymentFor(target),
+      source: "cli",
+    } as unknown as CurrentDeploymentReadback;
+    await expect(observeCurrentAliasAuthority(cliSourcePlan, hybrid))
+      .rejects.toThrow("provider_readback_invalid");
+    expect(hybrid.operations.some((operation) => operation.startsWith("set-alias:")))
+      .toBeFalse();
+  });
+
+  test("moves from the proved CLI source to the exact GitHub target", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.activePlan = cliSourcePlan;
+      const paths = currentAliasReleaseStatePaths(cliSourcePlan, stateDirectory);
+
+      const result = await runExecuteCli(cliSourcePlan, provider, stateDirectory);
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout.join(""))).toMatchObject({
+        changed: true,
+        targetSourceCommit: target.sourceCommit,
+      });
+      expect(provider.aliasState).toBe("target");
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([`set-alias:${target.deploymentUrl}`]);
+      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema))
+        .toMatchObject({
+          finalAuthority: {
+            sourceProvenance: cliSourcePlan.vercel.sourceProvenance,
+          },
+          finalState: "target",
+        });
+
+      const writes = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
+      const replay = await runExecuteCli(cliSourcePlan, provider, stateDirectory);
+      expect(replay.exitCode).toBe(0);
+      expect(JSON.parse(replay.stdout.join(""))).toMatchObject({
+        replayed: true,
+        status: "committed",
+      });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual(writes);
+    });
+  });
+
+  test("restores and re-proves only the exact CLI source after target proof fails", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.activePlan = cliSourcePlan;
+      provider.breakTargetMarker = true;
+
+      const result = await runExecuteCli(cliSourcePlan, provider, stateDirectory);
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.stderr.join(""))).toMatchObject({
+        code: "alias_reverted",
+        status: "reverted",
+      });
+      expect(provider.aliasState).toBe("source");
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([
+          `set-alias:${target.deploymentUrl}`,
+          `set-alias:${source.deploymentUrl}`,
+        ]);
+      expect(provider.operations.slice(-2)).toEqual([
+        "read-marker:source",
+        "read-alias:source",
+      ]);
+    });
+  });
+
+  test("does not receipt a CLI source restoration when its marker sandwich loses the alias", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.activePlan = cliSourcePlan;
+      provider.breakTargetMarker = true;
+      let restoredSourceMarkers = 0;
+      provider.afterReadMarker = () => {
+        if (
+          provider.operations.includes(`set-alias:${source.deploymentUrl}`)
+          && provider.operations.at(-1) === "read-marker:source"
+        ) {
+          restoredSourceMarkers += 1;
+          if (restoredSourceMarkers === 2) provider.aliasState = "target";
+        }
+      };
+      const paths = currentAliasReleaseStatePaths(cliSourcePlan, stateDirectory);
+
+      const result = await runExecuteCli(cliSourcePlan, provider, stateDirectory);
+      expect(result.exitCode).toBe(75);
+      expect(JSON.parse(result.stderr.join(""))).toMatchObject({
+        code: "compensation_failed",
+        status: "recovery_required",
+      });
+      expect(provider.aliasState).toBe("target");
+      expect(await Bun.file(paths.intent).exists()).toBeTrue();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+      const racedMarker = provider.operations.findIndex((operation, index, operations) =>
+        operation === "read-marker:source" && operations[index + 1] === "read-alias:target");
+      expect(racedMarker).toBeGreaterThanOrEqual(0);
+    });
   });
 
   test("blocks an unknown alias and refuses target deployment drift before mutation", async () => {
@@ -1144,6 +1396,23 @@ describe("durable current-project alias execution", () => {
       };
       const changedProvider = new FakeProvider();
       const refused = await runExecuteCli(changedPlan, changedProvider, stateDirectory);
+      expect(refused.exitCode).toBe(75);
+      expect(JSON.parse(refused.stderr.join(""))).toMatchObject({
+        code: "durable_state_invalid",
+        status: "recovery_required",
+      });
+      expect(changedProvider.operations).toEqual([]);
+    });
+  });
+
+  test("refuses removing CLI source provenance from a completed plan before provider reads", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.activePlan = cliSourcePlan;
+      expect((await runExecuteCli(cliSourcePlan, provider, stateDirectory)).exitCode).toBe(0);
+
+      const changedProvider = new FakeProvider();
+      const refused = await runExecuteCli(plan, changedProvider, stateDirectory);
       expect(refused.exitCode).toBe(75);
       expect(JSON.parse(refused.stderr.join(""))).toMatchObject({
         code: "durable_state_invalid",
