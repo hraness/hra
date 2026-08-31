@@ -81,6 +81,13 @@ const endpointSchema = z.object({
   sourceCommit: commitSchema,
 }).strict();
 
+const currentCliSourceProvenanceSchema = z.object({
+  actor: z.literal("cursor-cli"),
+  gitCommitRef: z.literal("HEAD"),
+  gitRootDirectory: z.literal(""),
+  kind: z.literal("vercel-cli-public-marker"),
+}).strict();
+
 export const currentProjectAliasReleasePlanSchema = z.object({
   alias: z.literal(canonicalAlias),
   convex: z.object({
@@ -103,6 +110,7 @@ export const currentProjectAliasReleasePlanSchema = z.object({
   vercel: z.object({
     projectId: z.literal(HRA_VERCEL_PROJECT_ID),
     source: endpointSchema,
+    sourceProvenance: currentCliSourceProvenanceSchema.optional(),
     target: endpointSchema,
     teamId: z.literal(HRA_VERCEL_TEAM_ID),
   }).strict(),
@@ -145,19 +153,39 @@ const aliasMutationReadbackSchema = z.object({
   uid: z.string().min(1).max(256),
 });
 
-const deploymentReadbackSchema = z.object({
-  gitSource: z.object({
-    ref: z.literal("main"),
-    repoId: z.literal(HRA_REPOSITORY_ID),
-    sha: commitSchema,
-    type: z.literal("github"),
-  }),
+const deploymentReadbackBaseSchema = z.object({
   id: deploymentIdSchema,
   projectId: z.literal(HRA_VERCEL_PROJECT_ID),
   readyState: z.literal("READY"),
   target: z.literal("production"),
   url: deploymentUrlSchema,
 });
+
+const githubDeploymentReadbackSchema = deploymentReadbackBaseSchema.extend({
+  gitSource: z.object({
+    ref: z.literal("main"),
+    repoId: z.literal(HRA_REPOSITORY_ID),
+    sha: commitSchema,
+    type: z.literal("github"),
+  }),
+  source: z.literal("git"),
+});
+
+const currentCliDeploymentReadbackSchema = deploymentReadbackBaseSchema.extend({
+  gitSource: z.null(),
+  meta: z.object({
+    actor: z.literal("cursor-cli"),
+    gitCommitRef: z.literal("HEAD"),
+    gitCommitSha: commitSchema,
+    gitRootDirectory: z.literal(""),
+  }),
+  source: z.literal("cli"),
+});
+
+const deploymentReadbackSchema = z.union([
+  githubDeploymentReadbackSchema,
+  currentCliDeploymentReadbackSchema,
+]);
 
 const projectReadbackSchema = z.object({
   accountId: z.literal(HRA_VERCEL_TEAM_ID),
@@ -203,6 +231,7 @@ const normalizedAliasAuthoritySchema = z.object({
     name: z.literal(HRA_REPOSITORY),
   }).strict(),
   source: endpointSchema,
+  sourceProvenance: currentCliSourceProvenanceSchema.optional(),
   target: endpointSchema,
   version: z.literal(HRA_RELEASE_VERSION),
 }).strict();
@@ -230,6 +259,9 @@ export const currentAliasReleaseIntentSchema = z.object({
     vercel: {
       projectId: value.sourceAuthority.project.id,
       source: value.sourceAuthority.source,
+      ...(value.sourceAuthority.sourceProvenance === undefined
+        ? {}
+        : { sourceProvenance: value.sourceAuthority.sourceProvenance }),
       target: value.sourceAuthority.target,
       teamId: value.sourceAuthority.project.accountId,
     },
@@ -307,6 +339,14 @@ export type CurrentDeploymentReadback = z.infer<typeof deploymentReadbackSchema>
 export type CurrentProjectReadback = z.infer<typeof projectReadbackSchema>;
 export type CurrentAliasReleaseIntent = z.infer<typeof currentAliasReleaseIntentSchema>;
 export type CurrentAliasReleaseReceipt = z.infer<typeof currentAliasReleaseReceiptSchema>;
+
+export const parseCurrentDeploymentReadback = (
+  value: unknown,
+): CurrentDeploymentReadback => {
+  const parsed = deploymentReadbackSchema.safeParse(value);
+  if (!parsed.success) throw new CurrentAliasReleaseError("provider_readback_invalid");
+  return parsed.data;
+};
 
 type CurrentAliasReleaseFailureCode =
   | "alias_reverted"
@@ -611,6 +651,9 @@ const normalizedAliasAuthority = (
   },
   repository: plan.repository,
   source: plan.vercel.source,
+  ...(plan.vercel.sourceProvenance === undefined
+    ? {}
+    : { sourceProvenance: plan.vercel.sourceProvenance }),
   target: plan.vercel.target,
   version: plan.version,
 });
@@ -861,12 +904,26 @@ const aliasMatches = (
   && value.deployment.id === endpoint.deploymentId
   && value.deployment.url === endpoint.deploymentUrl;
 
-const deploymentMatches = (
+const githubDeploymentMatches = (
   value: CurrentDeploymentReadback,
   endpoint: CurrentProjectAliasEndpoint,
 ): boolean => value.id === endpoint.deploymentId
   && value.url === endpoint.deploymentUrl
+  && value.gitSource !== null
   && value.gitSource.sha === endpoint.sourceCommit;
+
+const sourceDeploymentMatches = (
+  value: CurrentDeploymentReadback,
+  plan: CurrentProjectAliasReleasePlan,
+): boolean => {
+  if (plan.vercel.sourceProvenance === undefined) {
+    return githubDeploymentMatches(value, plan.vercel.source);
+  }
+  return value.id === plan.vercel.source.deploymentId
+    && value.url === plan.vercel.source.deploymentUrl
+    && value.gitSource === null
+    && value.meta.gitCommitSha === plan.vercel.source.sourceCommit;
+};
 
 const markerMatches = (
   value: unknown,
@@ -897,12 +954,16 @@ export const observeCurrentAliasAuthority = async (
   await provider.verifyVercelVersion();
   await provider.verifyConvexTarget(parseConvexTarget(plan.convex));
   await provider.readProject();
-  const source = await provider.readDeployment(plan.vercel.source.deploymentId);
-  if (!deploymentMatches(source, plan.vercel.source)) {
+  const source = parseCurrentDeploymentReadback(
+    await provider.readDeployment(plan.vercel.source.deploymentId),
+  );
+  if (!sourceDeploymentMatches(source, plan)) {
     throw new CurrentAliasReleaseError("provider_readback_invalid");
   }
-  const target = await provider.readDeployment(plan.vercel.target.deploymentId);
-  if (!deploymentMatches(target, plan.vercel.target)) {
+  const target = parseCurrentDeploymentReadback(
+    await provider.readDeployment(plan.vercel.target.deploymentId),
+  );
+  if (!githubDeploymentMatches(target, plan.vercel.target)) {
     throw new CurrentAliasReleaseError("provider_readback_invalid");
   }
   const alias = await provider.readAlias();
@@ -916,6 +977,11 @@ export const observeCurrentAliasAuthority = async (
   if (!markerMatches(marker, plan.vercel[state])) {
     return { reason: "marker_mismatch", state: "blocked" };
   }
+  if (
+    state === "source"
+    && plan.vercel.sourceProvenance !== undefined
+    && !aliasMatches(await provider.readAlias(), plan.vercel.source)
+  ) return { reason: "alias_not_planned", state: "blocked" };
   return {
     reason: state === "source" ? "exact_source" : "exact_target",
     state,
