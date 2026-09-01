@@ -1,6 +1,6 @@
 # Public CLI release control
 
-Status: immutable `v0.1.5` public CLI admitted; hosted sync remains beta-not-yet-live.
+Status: durable `v0.1.6` forward-release and retry contract.
 
 The former `v0.1.0` beta process depended on the HRA v0 Vercel deployment, its public fallback, and its paired provider readbacks. That dependency became invalid when HRA v0's Vercel and Convex resources were permanently retired. At retirement, `hraness/hra` had no `v0.1.0` tag, no draft release for that tag, and no published `v0.1.0` release.
 
@@ -8,13 +8,13 @@ The former public `release:candidate` and `release:publish` package entries rema
 
 The replacement `.github/workflows/release.yml` is an artifact-only current-repository path. It does not read or mutate Vercel, Convex, DNS, hosted aliases, or any retired HRA v0 resource. It requires an immutable annotated stable version tag whose peeled commit is contained in reviewed `main`. Before the complete repository gate on Linux, it downloads and checksum-verifies the same pinned Zig toolchain as CI, rebuilds and verifies the native authority-supervisor artifacts, enables and proves an isolated user namespace, and runs the focused native custody test; an always-running cleanup restores the runner restriction. It then builds one npm tarball in the runner's temporary directory, outside the checked-out public tree, verifies that same tarball on macOS and Linux, and uses the pinned npm client to prove the package-specific trusted-publisher exchange with a non-publishing dry run. Only after that reversible proof may it create and prove an immutable GitHub Release from the tarball plus `SHA256SUMS`, publish the same tarball through npm trusted publishing, and admit the public bytes and provenance before success.
 
-The dependency and npm-authority prerequisites are satisfied: HRA pins the immutable public registry release `@hraness/oh@0.2.7`, the `@hraness/hra` coordinate completed its non-executable bootstrap, and npm trusted publishing names repository `hraness/hra` and workflow `release.yml`. Stable `@hraness/hra@0.1.5` became authoritative after reviewed source reached `main`, the clean single-branch release gate passed, the immutable annotated `v0.1.5` tag was created, and the trusted workflow admitted the exact npm and GitHub artifacts. A later workflow attempt completed that same exact release under the retry controls below without substituting another tag, commit, or tarball.
+The dependency and npm-authority prerequisites are satisfied: HRA pins the immutable public registry release `@hraness/oh@0.2.7`, the `@hraness/hra` coordinate completed its non-executable bootstrap, and npm trusted publishing names repository `hraness/hra` and workflow `release.yml`. Stable `@hraness/hra@0.1.6` becomes authoritative only when reviewed source reaches `main`, the clean single-branch release gate passes, an immutable annotated `v0.1.6` tag exists, and the trusted workflow admits the exact npm and GitHub artifacts. A later workflow attempt may complete that same exact release under the retry controls below; it may not substitute another tag, commit, or tarball.
 
 Every release job starts from a shallow checkout of only the requested tag or its verified commit, then explicitly unshallows only reviewed `main` and that exact annotated tag. It fails unless those are the only two refs in the runner. The unchanged package gate can therefore scan every local ref and every commit in the complete governed release ancestry without importing unrelated remote branches, deleted local-only tags, or automatic tag following.
 
 Ordinary pull-request and `main` CI uses the same governed-history principle without release-tag authority. It checks out exact `github.sha` shallowly with no tags or persisted credentials, validates that lowercase commit identity, unshallows only that exact commit into `refs/remotes/ci/verified`, and fails unless `HEAD` and the runner's sole ref resolve to it. For a pull request, that commit is GitHub's exact synthetic merge; for a push, it is the exact pushed commit. The package gate still scans `rev-list --all`, including the complete tested ancestry and its merge resolution, while unrelated concurrent branch heads cannot enter or race the check.
 
-The canonical README and website retain the public boundary “Immutable local CLI release; hosted sync not yet live.” The website and local CLI tag are now live after exact release admission, and the immutable install command is usable. This post-admission follow-up changes only later `main` public copy and its reviewed local package inventory; it does not alter the published `v0.1.5` tag, tarball, checksum, npm version, or provenance. Hosted sync remains beta-not-yet-live. Preserve old local receipts, intents, and evidence files as historical records; they do not authorize replay or any hosted-service mutation.
+The canonical README and website are the two-phase public surface: “Immutable local CLI release; hosted sync not yet live.” The website remains live and the `v0.1.6` local CLI tag stays `release-ready` until exact release admission; the install command is explicitly conditional on GitHub exposing the immutable `v0.1.6` Release and verified archive. A public-copy/package-inventory-only follow-up may mark that tag live after admission while leaving the published `v0.1.6` bytes immutable. The admitted `v0.1.5` tag, tarball, checksum, npm version, and provenance remain immutable historical evidence. Neither phase claims that hosted sync is available. Preserve old local receipts, intents, and evidence files as historical records; they do not authorize replay or any hosted-service mutation.
 
 ## Immutable v0.1.0 failure record
 
@@ -117,20 +117,20 @@ non-executable coordinate seed, `@hraness/hra@0.1.0-bootstrap.0`, while requesti
 `bootstrap` dist-tag. npm also assigns `latest` to the first published version of a new
 package coordinate even when the publication requests another tag, so the seed initially
 resolves through both `bootstrap` and `latest`; that registry invariant is not a stable
-promotion. The seed did not consume stable `0.1.0`, `0.1.1`, `0.1.2`, `0.1.3`, `0.1.4`, or `0.1.5`, expose the HRA executable, or reuse
+promotion. The seed did not consume stable `0.1.0`, `0.1.1`, `0.1.2`, `0.1.3`, `0.1.4`, `0.1.5`, or `0.1.6`, expose the HRA executable, or reuse
 any retained stable tarball. The completed ceremony required explicit operator approval and the
 repository variable
-`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.5` before stable publication.
+`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.6` before stable publication.
 
 After the coordinate existed, an operator using npm CLI 11.19.0 verified the sole
 trusted publisher as GitHub repository `hraness/hra`, workflow `release.yml`, publish-only,
 with no npm environment. Stable `0.1.5` is the first complete OIDC/provenance publication. The
-stable workflow never performs the bootstrap or grants a second publisher. Its successful
-publication replaced the bootstrap seed as `latest` with exact stable `0.1.5`, while the
+stable workflow never performs the bootstrap or grants a second publisher. Exact `0.1.6`
+publication will move `latest` from stable `0.1.5` to stable `0.1.6`, while the bootstrap
 seed remains available only as the explicitly named `bootstrap` version and dist-tag.
 Registry admission accepts either exact version metadata or a bounded full package document.
 Package documents must carry the exact package identity and own exact version entry; reads
-of `/latest` additionally require `dist-tags.latest` to name `0.1.5`. This keeps transient
+of `/latest` additionally require `dist-tags.latest` to name `0.1.6`. This keeps transient
 registry response shapes from weakening the distinction between version existence and
 stable latest promotion.
 
@@ -138,7 +138,7 @@ Fulcio signer admission preserves raw ASCII matching for legacy GitHub workflow 
 OIDs `.2` through `.6`. Current V2 claims from `.11` onward are matched as one canonical
 short-form DER UTF8String whose payload is bounded nonempty ASCII. The repository-subject
 claim remains mandatory and exact: repository path `hraness/hra`, numeric owner ID
-`307125679`, numeric repository ID `1343008607`, and ref `refs/tags/v0.1.5`. The generated SLSA
+`307125679`, numeric repository ID `1343008607`, and ref `refs/tags/v0.1.6`. The generated SLSA
 internal parameters must separately preserve exact event `push`, repository ID `1343008607`,
 and owner ID `307125679`. The encoding repair does not
 drop or weaken any workflow, commit, ref, run, visibility, owner, or repository claim.
