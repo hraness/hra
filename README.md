@@ -12,6 +12,19 @@ hra doctor --offline
 hra init --yes
 ```
 
+## Keep every Codex account and live session in one durable CLI.
+
+Give each account its own Codex home, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.
+
+macOS and Linux CLI · macOS desktop switching · local v0.1.5 live · hosted sync not yet live
+
+### One request, one exact account and session
+
+1. **Start:** `hra session start personal --preset high --json` — Create a session under one explicitly selected account profile.
+2. **Inspect:** `hra session status <session-id> --json` — Read the exact session and its contiguous event cursor.
+3. **Direct:** `hra session send <session-id> -- "Review this project."` — Send work to that session without switching account authority.
+4. **Observe:** `hra session watch <session-id> --cursor <status-cursor> --jsonl` — Follow safe live updates from the cursor returned by status.
+
 > **Immutable local CLI release; hosted sync not yet live.** The exact install command below is live from the immutable `v0.1.5` GitHub Release and its verified archive. npm exposes the same provenance-bearing bytes as latest. The public CLI is immutable and admitted; optional hosted sync remains beta-not-yet-live.
 
 HRA is one Bun CLI plus a local daemon. It keeps Codex accounts isolated, gives you a compact session interface, and optionally syncs encrypted session projections and commands across your enrolled machines.
