@@ -3975,8 +3975,12 @@ export class StateStore {
     const now = this.#now();
     const update = this.#database.transaction(() => {
       const current = this.#database.query(
-        "SELECT process_generation,state FROM profiles WHERE id=? AND state!='removed'",
-      ).get(profileId) as { process_generation: number; state: z.infer<typeof profileStateSchema> } | null;
+        "SELECT process_generation,state,provider_email FROM profiles WHERE id=? AND state!='removed'",
+      ).get(profileId) as {
+        process_generation: number;
+        provider_email: string | null;
+        state: z.infer<typeof profileStateSchema>;
+      } | null;
       if (
         current === null
         || current.process_generation !== expectedGeneration
@@ -3988,7 +3992,13 @@ export class StateStore {
       const nextAccountFingerprint = state === "signed_in" && identity?.email !== undefined
         ? canonicalAccountFingerprint(identity.email)
         : null;
-      const changedBoundIdentity = nextAccountFingerprint !== null
+      const previousProviderFingerprint = current.provider_email === null
+        ? null
+        : canonicalAccountFingerprint(current.provider_email);
+      const changedProviderIdentity = nextAccountFingerprint !== null
+        && previousProviderFingerprint !== null
+        && previousProviderFingerprint !== nextAccountFingerprint;
+      const changedPolicyIdentity = nextAccountFingerprint !== null
         && policy.accountFingerprint !== null
         && policy.accountFingerprint !== nextAccountFingerprint;
       const affectedWorkIds = state === "signed_in"
@@ -4004,23 +4014,32 @@ export class StateStore {
       )
       .run(state, identity?.email ?? null, identity?.plan ?? null, now, profileId, expectedGeneration, state);
       if (result.changes !== 1) throw new Error("Profile state authority changed.");
-      if (changedBoundIdentity) {
-        const previousAccountFingerprint = policy.accountFingerprint;
-        this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
-          profileId,
-          accountFingerprint: previousAccountFingerprint,
-          selection: "matching",
-          now,
-        });
+      if (changedProviderIdentity || changedPolicyIdentity) {
+        if (policy.accountFingerprint !== null) {
+          this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
+            profileId,
+            accountFingerprint: policy.accountFingerprint,
+            selection: "matching",
+            now,
+          });
+        }
         const policyChanged = this.#database.query(
           `UPDATE account_rate_limit_reset_policies
            SET state='reconciliation_required',account_fingerprint=NULL,
              weekly_window_resets_at=NULL,revision=revision+1,
              updated_at=MAX(updated_at,?)
            WHERE profile_id=? AND revision=?
-             AND state IN ('window_suppressed','active_bound')
-             AND account_fingerprint=?`,
-        ).run(now, profileId, policy.revision, previousAccountFingerprint);
+             AND state=?
+             AND account_fingerprint IS ?
+             AND weekly_window_resets_at IS ?`,
+        ).run(
+          now,
+          profileId,
+          policy.revision,
+          policy.state,
+          policy.accountFingerprint,
+          policy.weeklyWindowResetsAt,
+        );
         if (policyChanged.changes !== 1) {
           throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_CONFLICT");
         }

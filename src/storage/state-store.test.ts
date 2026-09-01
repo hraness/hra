@@ -4260,6 +4260,59 @@ describe("StateStore", () => {
       .not.toContain("Policy rollback");
   });
 
+  test("re-pends an unbound reset policy when the signed-in identity changes", async () => {
+    const { store } = await fixture();
+    const firstEmail = "unbound-first@example.com";
+    const profile = signInProfile(store, "Unbound identity drift", firstEmail);
+    expect(store.requireAccountRateLimitResetPolicy(profile.id)).toMatchObject({
+      state: "active_unbound",
+      accountFingerprint: null,
+      weeklyWindowResetsAt: null,
+      revision: 1,
+    });
+
+    const secondEmail = "unbound-second@example.com";
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: secondEmail, plan: "Plus" },
+    )).toBe(true);
+    expect(store.requireProfileById(profile.id)).toMatchObject({
+      providerEmail: secondEmail,
+    });
+    expect(store.requireAccountRateLimitResetPolicy(profile.id)).toMatchObject({
+      state: "reconciliation_required",
+      accountFingerprint: null,
+      weeklyWindowResetsAt: null,
+      revision: 2,
+    });
+
+    const secondFingerprint = resetAccountFingerprint(secondEmail);
+    expect(() => store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowResetsAt: 500_000_000,
+      observedUsedPercent: 99,
+    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: 500_000_000,
+    })).toMatchObject({
+      decision: "suppress",
+      reason: "reconciliation_window",
+      policy: {
+        accountFingerprint: secondFingerprint,
+        state: "window_suppressed",
+        weeklyWindowResetsAt: 500_000_000,
+      },
+    });
+  });
+
   test("migrates every nonremoved v27 profile into fail-closed reconciliation", async () => {
     const { store } = await fixture();
     const email = "legacy-policy@example.com";
@@ -4333,6 +4386,14 @@ describe("StateStore", () => {
       "signed_in",
       { email: replacementEmail, plan: "Plus" },
     )).toBe(true);
+    expect(migrated.readRecoverableAccountRateLimitReset(
+      signedIn.id,
+      accountFingerprint,
+    )).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      outcome: null,
+      state: "effect_started",
+    });
     const replacementFingerprint = resetAccountFingerprint(replacementEmail);
     expect(migrated.authorizeAccountRateLimitResetPolicy({
       profileId: signedIn.id,
@@ -4800,30 +4861,15 @@ describe("StateStore", () => {
 
   test("readonly open rejects reset policy authority outside the live profile set", async () => {
     const { store } = await fixture();
+    const profile = store.createProfile("Orphan reset policy");
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const damaged = new Database(paths.database, { create: false, strict: true });
     try {
-      const insertGuard = z.object({ sql: z.string() }).strict().parse(
-        damaged.query(
-          `SELECT sql FROM sqlite_master
-           WHERE type='trigger'
-             AND name='account_rate_limit_reset_policy_insert_guard'`,
-        ).get(),
-      ).sql;
-      damaged.exec(`
-        DROP TRIGGER account_rate_limit_reset_policy_insert_guard;
-        PRAGMA foreign_keys=OFF;
-      `);
-      damaged.query(
-        `INSERT INTO account_rate_limit_reset_policies(
-           profile_id,state,account_fingerprint,weekly_window_resets_at,
-           revision,created_at,updated_at
-         ) VALUES (?,'active_unbound',NULL,NULL,1,1000,1000)`,
-      ).run("acct_00000000000000000000000000000028");
-      damaged.exec(insertGuard);
-      damaged.exec("PRAGMA foreign_keys=ON");
+      expect(damaged.query(
+        "UPDATE profiles SET state='removed' WHERE id=?",
+      ).run(profile.id).changes).toBe(1);
     } finally {
       damaged.close(false);
     }

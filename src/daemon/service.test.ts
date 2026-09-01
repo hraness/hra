@@ -2202,6 +2202,11 @@ describe("HraService", () => {
     expect(codex.calls.slice(callsBefore)).toEqual(["readAccount"]);
     expect(store.latestUsage(added.account.id)).toBeNull();
     expect(codex.resetIdempotencyKeys).toEqual([]);
+    expect(store.requireAccountRateLimitResetPolicy(added.account.id)).toMatchObject({
+      state: "reconciliation_required",
+      accountFingerprint: null,
+      weeklyWindowResetsAt: null,
+    });
     await expect(service.execute({
       kind: "account.usage",
       account: added.account.id,
