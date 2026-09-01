@@ -14,6 +14,7 @@ import {
 } from "../domain/facts-memory";
 import type { FactsMemoryBrokerInspection } from "../daemon/facts-memory-lifecycle";
 import {
+  isTransientFactsMemorySidecarDisappearance,
   LocalFactsMemoryBroker,
   type LocalOhFactsMemoryEnginePort,
 } from "./local-facts-memory-broker";
@@ -108,6 +109,38 @@ const fixture = async () => {
 };
 
 describe("local Oh facts-memory custody", () => {
+  test("allows only an exact root SQLite sidecar to disappear during its own stat", () => {
+    const root = "/private/facts";
+    const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+    for (const name of ["oh.sqlite-shm", "oh.sqlite-wal"] as const) {
+      expect(isTransientFactsMemorySidecarDisappearance(
+        root,
+        join(root, name),
+        1,
+        missing,
+      )).toBe(true);
+    }
+    expect(isTransientFactsMemorySidecarDisappearance(root, root, 0, missing)).toBe(false);
+    expect(isTransientFactsMemorySidecarDisappearance(
+      root,
+      join(root, "oh.sqlite-shm", "nested"),
+      2,
+      missing,
+    )).toBe(false);
+    expect(isTransientFactsMemorySidecarDisappearance(
+      root,
+      join(root, "oh.sqlite"),
+      1,
+      missing,
+    )).toBe(false);
+    expect(isTransientFactsMemorySidecarDisappearance(
+      root,
+      join(root, "oh.sqlite-shm"),
+      1,
+      Object.assign(new Error("denied"), { code: "EACCES" }),
+    )).toBe(false);
+  });
+
   test("uses one host-derived directory and removes SQLite, WAL, SHM, and cache together", async () => {
     const { broker, engine, root } = await fixture();
     const binding = createFactsMemoryBinding({ ownerId, sessionId });

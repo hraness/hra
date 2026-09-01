@@ -38,6 +38,19 @@ const engineInspectionSchema = z.discriminatedUnion("status", [
   }).strict(),
 ]);
 
+/** @internal Exported only for exact boundary regression tests. */
+export const isTransientFactsMemorySidecarDisappearance = (
+  root: string,
+  path: string,
+  depth: number,
+  error: unknown,
+): boolean =>
+  depth === 1
+  && (path === join(root, "oh.sqlite-shm") || path === join(root, "oh.sqlite-wal"))
+  && error instanceof Error
+  && "code" in error
+  && error.code === "ENOENT";
+
 /** Host adapter seam for the immutable Oh package. It is never reachable from model tools. */
 export interface LocalOhFactsMemoryEnginePort {
   create(input: Readonly<{
@@ -300,10 +313,23 @@ export class LocalFactsMemoryBroker implements FactsMemoryBrokerPort {
   async #assertPrivateTree(root: string): Promise<void> {
     const owner = process.getuid?.();
     let observed = 0;
+    const readEntry = async (path: string, depth: number) => {
+      try {
+        return await lstat(path);
+      } catch (error: unknown) {
+        if (isTransientFactsMemorySidecarDisappearance(root, path, depth, error)) {
+          // Bun may unlink its root-level WAL/SHM after close(false) returns on Linux.
+          // A recreated sidecar is revalidated by the Oh engine before it opens SQLite.
+          return null;
+        }
+        throw error;
+      }
+    };
     const visit = async (path: string, depth: number): Promise<void> => {
       observed += 1;
       if (observed > 4_096 || depth > 16) throw new Error("FACTS_MEMORY_TREE_BOUND_EXCEEDED");
-      const before = await lstat(path);
+      const before = await readEntry(path, depth);
+      if (before === null) return;
       if (
         before.isSymbolicLink()
         || before.nlink < 1
@@ -317,7 +343,8 @@ export class LocalFactsMemoryBroker implements FactsMemoryBrokerPort {
       } else if (!before.isFile() || before.nlink !== 1) {
         throw new Error("FACTS_MEMORY_TREE_UNSAFE");
       }
-      const after = await lstat(path);
+      const after = await readEntry(path, depth);
+      if (after === null) return;
       if (
         before.dev !== after.dev
         || before.ino !== after.ino
