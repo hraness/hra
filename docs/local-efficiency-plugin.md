@@ -2,10 +2,10 @@
 
 The repository marketplace distributes `hra-local-efficiency`, a local-only Codex plugin for machine-wide heavyweight-command scheduling, capability lanes, privacy-safe throughput telemetry, validation ownership, complete-history CI ref audits, stale-task review, and guarded worktree cleanup. It preserves useful agent fan-out and every repository final gate while avoiding unnecessary checkout fan-out. It does not configure or route cloud execution.
 
-The plugin is separate from the published `@hraness/hra` package. Install the repository marketplace and plugin on each development machine:
+The plugin is separate from the published `@hraness/hra` package. Install the repository marketplace and plugin on each development machine. The marketplace checkout includes the complete `plugins/` directory so it can also distribute the separate [HRA Cloud efficiency plugin](cloud-efficiency-plugin.md):
 
 ```sh
-codex plugin marketplace add hraness/hra --ref main --sparse .agents/plugins --sparse plugins/hra-local-efficiency
+codex plugin marketplace add hraness/hra --ref main --sparse .agents/plugins --sparse plugins
 codex plugin add hra-local-efficiency@hraness
 ```
 
@@ -59,6 +59,14 @@ After a marketplace update, refresh the Git snapshot, reinstall the plugin, and 
 
 ```sh
 codex plugin marketplace upgrade hraness
+codex plugin add hra-local-efficiency@hraness
+```
+
+Machines that installed the earlier plugin-specific sparse checkout must replace that marketplace snapshot once before upgrading:
+
+```sh
+codex plugin marketplace remove hraness
+codex plugin marketplace add hraness/hra --ref main --sparse .agents/plugins --sparse plugins
 codex plugin add hra-local-efficiency@hraness
 ```
 

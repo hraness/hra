@@ -1,0 +1,6 @@
+interface:
+  display_name: "HRA Cloud Efficiency"
+  short_description: "Route safe repository work to Codex Cloud"
+  default_prompt: "Use $hra-cloud-efficiency to qualify and dispatch this Hraness task to Codex Cloud safely."
+policy:
+  allow_implicit_invocation: true

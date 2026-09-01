@@ -1,0 +1,39 @@
+{
+  "name": "hra-cloud-efficiency",
+  "version": "0.1.0",
+  "description": "Qualify and coordinate bounded Codex Cloud repository workers while preserving local model ownership and final delivery gates.",
+  "author": {
+    "name": "Hraness",
+    "url": "https://github.com/hraness"
+  },
+  "homepage": "https://github.com/hraness/hra/tree/main/plugins/hra-cloud-efficiency",
+  "repository": "https://github.com/hraness/hra",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "cloud",
+    "routing",
+    "validation",
+    "workers"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "HRA Cloud Efficiency",
+    "shortDescription": "Route safe repository work to Codex Cloud.",
+    "longDescription": "Qualifies exact pushed Git branches for bounded Codex Cloud repository workers, preserves the caller-selected local integrator, and keeps authenticated, Mac-native, secret-dependent, release, and final validation work on its authoritative lane.",
+    "developerName": "Hraness",
+    "category": "Productivity",
+    "capabilities": [
+      "Cloud routing",
+      "Git source qualification",
+      "Private CLI launch guard",
+      "Hybrid validation",
+      "Machine adoption"
+    ],
+    "defaultPrompt": [
+      "Qualify this repository task for Codex Cloud.",
+      "Install the HRA Cloud routing baseline on this machine.",
+      "Plan a safe local and Cloud validation split."
+    ]
+  }
+}
