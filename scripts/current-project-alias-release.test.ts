@@ -145,6 +145,14 @@ const cliDeploymentFor = (
   url: endpoint.deploymentUrl,
 });
 
+const cliDeploymentWithoutGitSourceFor = (
+  endpoint: CurrentProjectAliasEndpoint,
+): Readonly<Record<string, unknown>> => {
+  const readback: Record<string, unknown> = { ...cliDeploymentFor(endpoint) };
+  delete readback.gitSource;
+  return readback;
+};
+
 const aliasFor = (endpoint: CurrentProjectAliasEndpoint): CurrentAliasReadback => ({
   alias: "hra.sh",
   deployment: { id: endpoint.deploymentId, url: endpoint.deploymentUrl },
@@ -377,7 +385,7 @@ class FakeDirectVercelTransport {
       return json(projectReadback);
     }
     if (parsedUrl.pathname === `/v13/deployments/${source.deploymentId}`) {
-      return json(cliDeploymentFor(source));
+      return json(cliDeploymentWithoutGitSourceFor(source));
     }
     if (parsedUrl.pathname === `/v13/deployments/${target.deploymentId}`) {
       return json(deploymentFor(target));
@@ -619,6 +627,8 @@ describe("current-project alias plan", () => {
       .toEqual(deploymentFor(target));
     expect(parseCurrentDeploymentReadback(cliDeploymentFor(source)))
       .toEqual(cliDeploymentFor(source));
+    expect(parseCurrentDeploymentReadback(cliDeploymentWithoutGitSourceFor(source)))
+      .toEqual(cliDeploymentFor(source));
     expect(() => parseCurrentDeploymentReadback({
       ...deploymentFor(target),
       source: "cli",
@@ -630,7 +640,7 @@ describe("current-project alias plan", () => {
     >;
     for (const invalid of [
       { ...validCli, source: "git" },
-      { ...validCli, gitSource: undefined },
+      { ...validCli, gitSource: { ref: "HEAD" } },
       { ...validCli, meta: { ...validCli.meta, actor: "vercel-cli" } },
       { ...validCli, meta: { ...validCli.meta, gitCommitRef: "main" } },
       { ...validCli, meta: { ...validCli.meta, gitCommitSha: "not-a-commit" } },

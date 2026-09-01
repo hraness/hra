@@ -421,8 +421,9 @@ describe("domain cutover runbook", () => {
 
     expect(commands).toEqual([]);
     expect(runbook).not.toContain("hosted:domain-cutover preflight");
-    expect(runbook).toContain("release:canonical-alias preflight");
-    expect(runbook).toContain("release:canonical-alias --execute");
+    expect(runbook).toContain("bun ./scripts/current-project-alias-release.ts preflight");
+    expect(runbook).toContain("bun ./scripts/current-project-alias-release.ts --execute");
+    expect(runbook).not.toContain("bun run release:canonical-alias");
     expect(runbook).toContain("--confirm-exact");
     expect(runbook).toContain("approve both` do not authorize this alias change");
     expect(runbook).toContain("automatic restoration");
