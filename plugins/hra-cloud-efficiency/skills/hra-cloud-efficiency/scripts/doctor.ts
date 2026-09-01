@@ -5,7 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { bootstrapCurrent } from "./bootstrap";
-import { command, resolvedBunBin, resolvedCodexHome } from "./shared";
+import {
+  command,
+  resolvedBunBin,
+  resolvedCodexHome,
+  type CommandResult,
+} from "./shared";
 
 export type DoctorReport = {
   readonly baselineCurrent: boolean;
@@ -36,6 +41,14 @@ function privateCloudHelp(codex: string): boolean {
   }
 }
 
+export function chatgptLoginAvailable(login: CommandResult | null): boolean {
+  if (login?.exitCode !== 0) return false;
+  const expected = "Logged in using ChatGPT";
+  return [login.stdout, login.stderr].some((output) => (
+    output.split(/\r?\n/u).some((line) => line === expected)
+  ));
+}
+
 export function inspectDoctor(): DoctorReport {
   const codex = Bun.which("codex");
   const version = codex === null ? null : command([codex, "--version"]);
@@ -48,7 +61,7 @@ export function inspectDoctor(): DoctorReport {
       bunBin: resolvedBunBin(),
       codexHome: resolvedCodexHome(),
     }),
-    chatgptLogin: login?.exitCode === 0 && login.stdout === "Logged in using ChatGPT",
+    chatgptLogin: chatgptLoginAvailable(login),
     cloudCli: codex === null ? false : privateCloudHelp(codex),
     codexAvailable: codexVersion !== null,
     codexVersion,
