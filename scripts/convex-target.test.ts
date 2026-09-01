@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -9,6 +9,7 @@ import {
   HRA_CONVEX_TEAM_SLUG,
   HRA_V0_CONVEX_DEPLOYMENT_ID,
   HRA_V0_CONVEX_PROJECT_ID,
+  defaultConvexConfigPath,
   parseConvexTarget,
   parseConvexTargetArguments,
   readConvexAccessToken,
@@ -262,6 +263,29 @@ describe("numeric Convex target guard", () => {
     const link = join(protectedConfig.configPath, "..", "config-link.json");
     await symlink(protectedConfig.configPath, link);
     await expect(readConvexAccessToken(link)).rejects.toThrow("target_credentials_refused");
+  });
+
+  test("derives default credentials from the system account and rejects Darwin ACL grants", async () => {
+    const expected = join(userInfo({ encoding: "utf8" }).homedir, ".convex", "config.json");
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = join(tmpdir(), "poisoned-convex-home");
+      expect(defaultConvexConfigPath()).toBe(expected);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+    if (process.platform !== "darwin") return;
+    const protectedConfig = await makeConfig();
+    const chmod = Bun.spawnSync([
+      "/bin/chmod",
+      "+a",
+      "everyone allow read",
+      protectedConfig.configPath,
+    ]);
+    expect(chmod.exitCode).toBe(0);
+    await expect(readConvexAccessToken(protectedConfig.configPath))
+      .rejects.toThrow("target_credentials_refused");
   });
 
   test("accepts only a generated deployment name and all exact numeric flags", () => {

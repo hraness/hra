@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, link, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { constants, fstatSync, openSync } from "node:fs";
+import { chmod, link, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -9,6 +10,7 @@ import {
   assertCurrentAliasReleaseStateCapacity,
   buildVercelEnvironment,
   currentAliasReleaseApiArguments,
+  currentAliasReleaseVercelApiRequest,
   currentAliasReleaseIntentSchema,
   currentAliasReleasePlanDigest,
   currentAliasReleaseMutationKey,
@@ -16,11 +18,13 @@ import {
   currentAliasReleaseStateEntryMaximum,
   currentAliasReleaseStatePaths,
   CurrentAliasReleaseError,
+  executeCurrentProjectAliasReleaseWithExplicitApiCapability,
   executeCurrentProjectAliasReleaseWithExplicitCapability,
   observeCurrentAliasAuthority,
   parseArguments,
   parseCurrentDeploymentReadback,
   parseCurrentProjectAliasReleasePlan,
+  readProtectedVercelAccessToken,
   requiredAliasConfirmation,
   type CurrentAliasReadback,
   type CurrentDeploymentReadback,
@@ -293,6 +297,98 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
   }
 }
 
+type DirectTransportMode =
+  | "ok"
+  | "mutation-malformed"
+  | "mutation-rejected"
+  | "target-unprovable-restore-rejected";
+
+class FakeDirectVercelTransport {
+  aliasState: "source" | "target" = "source";
+  mode: DirectTransportMode = "ok";
+  readonly requests: Readonly<{ init: RequestInit; url: string }>[] = [];
+
+  readonly fetch = async (
+    input: string | URL | Request,
+    init: RequestInit = {},
+  ): Promise<Response> => {
+    const url = input instanceof Request
+      ? input.url
+      : input instanceof URL
+        ? input.href
+        : input;
+    this.requests.push({ init, url });
+    const json = (value: unknown, status = 200): Response => new Response(
+      JSON.stringify(value),
+      { headers: { "content-type": "application/json" }, status },
+    );
+    if (url.startsWith("https://hra.sh/.well-known/hra.json?release=")) {
+      const headers = new Headers(init.headers);
+      expect(headers.has("authorization")).toBeFalse();
+      expect(init.method).toBe("GET");
+      expect(init.redirect).toBe("error");
+      const endpoint = this.aliasState === "source"
+        || this.mode === "target-unprovable-restore-rejected"
+        ? source
+        : target;
+      return json(markerFor(endpoint));
+    }
+
+    const parsedUrl = new URL(url);
+    expect(parsedUrl.origin).toBe("https://api.vercel.com");
+    expect(parsedUrl.searchParams.get("teamId")).toBe(HRA_VERCEL_TEAM_ID);
+    expect([...parsedUrl.searchParams.keys()]).toEqual(["teamId"]);
+    const headers = new Headers(init.headers);
+    expect(headers.get("authorization")).toBe("Bearer fixture-vercel-token");
+    expect(headers.get("accept")).toBe("application/json");
+    expect(init.redirect).toBe("error");
+
+    if (init.method === "POST") {
+      const targetPath = `/v2/deployments/${target.deploymentId}/aliases`;
+      const sourcePath = `/v2/deployments/${source.deploymentId}/aliases`;
+      expect([sourcePath, targetPath]).toContain(parsedUrl.pathname);
+      expect(init.body).toBe(JSON.stringify({ alias: "hra.sh" }));
+      expect(headers.get("content-type")).toBe("application/json");
+      const assigningTarget = parsedUrl.pathname === targetPath;
+      expect(headers.get("idempotency-key")).toBe(currentAliasReleaseMutationKey(
+        cliSourcePlan,
+        assigningTarget ? "assign-target" : "restore-source",
+      ));
+      if (!assigningTarget) {
+        expect(this.mode).toBe("target-unprovable-restore-rejected");
+        return json({ error: "restore refused" }, 500);
+      }
+      if (this.mode === "mutation-rejected") return json({ error: "refused" }, 500);
+      if (this.mode === "mutation-malformed") {
+        this.aliasState = "target";
+        return json({ alias: "hra.sh" });
+      }
+      this.aliasState = "target";
+      return json({
+        alias: "hra.sh",
+        created: 1_787_961_600_000,
+        oldDeploymentId: source.deploymentId,
+        uid: "alias_CurrentHra1234567890",
+      });
+    }
+
+    expect(init.method).toBe("GET");
+    if (parsedUrl.pathname === `/v9/projects/${HRA_VERCEL_PROJECT_ID}`) {
+      return json(projectReadback);
+    }
+    if (parsedUrl.pathname === `/v13/deployments/${source.deploymentId}`) {
+      return json(cliDeploymentFor(source));
+    }
+    if (parsedUrl.pathname === `/v13/deployments/${target.deploymentId}`) {
+      return json(deploymentFor(target));
+    }
+    if (parsedUrl.pathname === "/v4/aliases/hra.sh") {
+      return json(aliasFor(this.aliasState === "source" ? source : target));
+    }
+    throw new Error(`unexpected_request:${url}`);
+  };
+}
+
 const immediateClock = () => {
   let now = 0;
   return {
@@ -329,8 +425,8 @@ const runExecuteCli = async (
     {
       arguments: [
         "--execute",
-        "--vercel-cli",
-        "/safe/bin/vercel",
+        "--vercel-auth-fd",
+        "3",
         "--confirm-exact",
         requiredAliasConfirmation(inputPlan),
       ],
@@ -360,7 +456,7 @@ const runPreflightCli = async (
   const exitCode = await executeCurrentProjectAliasReleaseWithExplicitCapability(
     { provider, stateDirectory },
     {
-      arguments: ["preflight", "--vercel-cli", "/safe/bin/vercel"],
+      arguments: ["preflight", "--vercel-auth-fd", "3"],
       inputDocument: JSON.stringify(inputPlan),
       stderr: { write: (value) => {
         stderr.push(String(value));
@@ -373,6 +469,57 @@ const runPreflightCli = async (
     },
   );
   return { exitCode, stderr, stdout };
+};
+
+const runDirectApiCli = async (
+  inputPlan: CurrentProjectAliasReleasePlan,
+  transport: FakeDirectVercelTransport,
+  stateDirectory: string,
+  operation: "execute" | "preflight",
+  confirmation = requiredAliasConfirmation(inputPlan),
+): Promise<Readonly<{
+  convexCalls: number;
+  exitCode: number;
+  stderr: string[];
+  stdout: string[];
+}>> => {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  let convexCalls = 0;
+  const exitCode = await executeCurrentProjectAliasReleaseWithExplicitApiCapability(
+    {
+      accessToken: "fixture-vercel-token",
+      convexVerifier: async (targetValue) => {
+        convexCalls += 1;
+        expect(targetValue).toEqual(convex);
+      },
+      fetcher: transport.fetch,
+      stateDirectory,
+    },
+    {
+      arguments: operation === "preflight"
+        ? ["preflight", "--vercel-auth-fd", "3"]
+        : [
+            "--execute",
+            "--vercel-auth-fd",
+            "3",
+            "--confirm-exact",
+            confirmation,
+          ],
+      clock: immediateClock(),
+      inputDocument: JSON.stringify(inputPlan),
+      stderr: { write: (value) => {
+        stderr.push(String(value));
+        return true;
+      } },
+      stdout: { write: (value) => {
+        stdout.push(String(value));
+        return true;
+      } },
+      timeoutMs: 1,
+    },
+  );
+  return { convexCalls, exitCode, stderr, stdout };
 };
 
 describe("current-project alias plan", () => {
@@ -509,9 +656,15 @@ describe("current-project alias plan", () => {
       "assertCurrentAliasReleaseBunVersion();",
       main,
     );
+    const credentialConsumption = implementation.indexOf(
+      "readProtectedVercelAccessToken(arguments_.vercelAuthFd)",
+      main,
+    );
     const journalRecovery = implementation.indexOf("recoverBoundedProcessJournal();", main);
     expect(main).toBeGreaterThanOrEqual(0);
     expect(runtimeGuard).toBeGreaterThan(main);
+    expect(credentialConsumption).toBeGreaterThan(runtimeGuard);
+    expect(journalRecovery).toBeGreaterThan(credentialConsumption);
     expect(journalRecovery).toBeGreaterThan(runtimeGuard);
   });
 });
@@ -718,7 +871,7 @@ describe("current-project alias authority", () => {
       for (const confirmation of [undefined, "approve both", "reassign hra.sh"] as const) {
         const provider = new FakeProvider();
         const stderr: string[] = [];
-        const arguments_ = ["--execute", "--vercel-cli", "/safe/bin/vercel"];
+        const arguments_ = ["--execute", "--vercel-auth-fd", "3"];
         if (confirmation !== undefined) arguments_.push("--confirm-exact", confirmation);
         const exitCode = await executeCurrentProjectAliasReleaseWithExplicitCapability(
           { provider, stateDirectory },
@@ -942,14 +1095,219 @@ describe("current-project Vercel provider", () => {
       HRA_VERCEL_TEAM_ID,
       "--raw",
     ]);
+    const request = currentAliasReleaseVercelApiRequest(
+      target,
+      key,
+      "fixture-vercel-token",
+    );
+    expect(request).toEqual({
+      body: JSON.stringify({ alias: "hra.sh" }),
+      headers: {
+        accept: "application/json",
+        authorization: "Bearer fixture-vercel-token",
+        "content-type": "application/json",
+        "idempotency-key": key,
+      },
+      method: "POST",
+      url: `https://api.vercel.com/v2/deployments/${target.deploymentId}/aliases?teamId=${HRA_VERCEL_TEAM_ID}`,
+    });
 
     const implementation = await readFile(
       join(import.meta.dir, "current-project-alias-release.ts"),
       "utf8",
     );
+    const directProviderStart = implementation.indexOf(
+      "class VercelCurrentProjectAliasApiProvider",
+    );
+    const directProviderEnd = implementation.indexOf("type ParsedArguments", directProviderStart);
+    const directProvider = implementation.slice(directProviderStart, directProviderEnd);
+    expect(directProviderStart).toBeGreaterThanOrEqual(0);
+    expect(directProviderEnd).toBeGreaterThan(directProviderStart);
+    expect(directProvider).not.toContain("runBoundedProcess");
+    expect(directProvider).not.toContain("#invoke(");
+    expect(directProvider).not.toContain("process.env");
     expect(implementation).not.toContain('"alias",\n      "set"');
     expect(implementation).not.toContain("/v4/domains");
     expect(implementation).not.toContain("certificates");
+  });
+
+  test("consumes only a stable private credential descriptor and closes it", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const path = join(stateDirectory, "vercel-auth.json");
+      await writeFile(path, JSON.stringify({
+        expiresAt: Math.floor(Date.now() / 1_000) + 3_600,
+        refreshToken: "must-not-be-retained",
+        token: "fixture-vercel-token",
+      }), { mode: 0o600 });
+      const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      expect(readProtectedVercelAccessToken(descriptor)).toBe("fixture-vercel-token");
+      expect(() => fstatSync(descriptor)).toThrow();
+    });
+  });
+
+  test("refuses permissive, linked, expired, and malformed credential descriptors", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const cases = [
+        { document: JSON.stringify({ token: "fixture-vercel-token" }), mode: 0o644 },
+        { document: JSON.stringify({ expiresAt: 1, token: "fixture-vercel-token" }), mode: 0o600 },
+        { document: JSON.stringify({ expiresAt: 901, token: "fixture-vercel-token" }), mode: 0o600 },
+        { document: JSON.stringify({ token: "contains whitespace" }), mode: 0o600 },
+        { document: "{", mode: 0o600 },
+      ] as const;
+      for (const [index, fixture] of cases.entries()) {
+        const path = join(stateDirectory, `vercel-auth-${String(index)}.json`);
+        await writeFile(path, fixture.document, { mode: fixture.mode });
+        const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        expect(() => readProtectedVercelAccessToken(descriptor, 2))
+          .toThrow("provider_credentials_refused");
+        expect(() => fstatSync(descriptor)).toThrow();
+      }
+
+      const path = join(stateDirectory, "vercel-auth-linked.json");
+      const other = join(stateDirectory, "vercel-auth-linked-copy.json");
+      await writeFile(path, JSON.stringify({ token: "fixture-vercel-token" }), { mode: 0o600 });
+      await link(path, other);
+      const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      expect(() => readProtectedVercelAccessToken(descriptor))
+        .toThrow("provider_credentials_refused");
+      expect(() => fstatSync(descriptor)).toThrow();
+    });
+  });
+
+  test("drives the exact CLI-source preflight and one target POST through direct REST", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const transport = new FakeDirectVercelTransport();
+      const preflight = await runDirectApiCli(
+        cliSourcePlan,
+        transport,
+        stateDirectory,
+        "preflight",
+      );
+      expect(preflight.exitCode).toBe(0);
+      expect(preflight.stderr).toEqual([]);
+      expect(preflight.convexCalls).toBe(1);
+      expect(JSON.parse(preflight.stdout.join(""))).toMatchObject({
+        observedState: "source",
+        status: "ready",
+      });
+      expect(transport.requests.map(({ url }) => new URL(url).pathname)).toEqual([
+        `/v9/projects/${HRA_VERCEL_PROJECT_ID}`,
+        `/v13/deployments/${source.deploymentId}`,
+        `/v13/deployments/${target.deploymentId}`,
+        "/v4/aliases/hra.sh",
+        "/.well-known/hra.json",
+        "/v4/aliases/hra.sh",
+      ]);
+
+      const executed = await runDirectApiCli(
+        cliSourcePlan,
+        transport,
+        stateDirectory,
+        "execute",
+      );
+      expect(executed.exitCode).toBe(0);
+      expect(executed.stderr).toEqual([]);
+      expect(executed.convexCalls).toBe(3);
+      expect(transport.aliasState).toBe("target");
+      const posts = transport.requests.filter(({ init }) => init.method === "POST");
+      expect(posts).toHaveLength(1);
+      expect(new URL(posts[0]!.url).pathname)
+        .toBe(`/v2/deployments/${target.deploymentId}/aliases`);
+      expect(JSON.parse(executed.stdout.join(""))).toMatchObject({
+        changed: true,
+        status: "committed",
+      });
+      const paths = currentAliasReleaseStatePaths(cliSourcePlan, stateDirectory);
+      for (const document of [
+        executed.stdout.join(""),
+        await readFile(paths.intent, "utf8"),
+        await readFile(paths.receipt, "utf8"),
+      ]) {
+        expect(document).not.toContain("fixture-vercel-token");
+        expect(document).not.toContain("must-not-be-retained");
+      }
+    });
+  });
+
+  test("freezes one direct target POST ambiguity behind its durable intent", async () => {
+    for (const [mode, expectedAliasState] of [
+      ["mutation-rejected", "source"],
+      ["mutation-malformed", "target"],
+    ] as const) {
+      await withStateDirectory(async (stateDirectory) => {
+        const transport = new FakeDirectVercelTransport();
+        transport.mode = mode;
+        const failed = await runDirectApiCli(
+          cliSourcePlan,
+          transport,
+          stateDirectory,
+          "execute",
+        );
+        expect(failed.exitCode).toBe(75);
+        expect(failed.stdout).toEqual([]);
+        expect(JSON.parse(failed.stderr.join(""))).toMatchObject({
+          code: "target_result_ambiguous",
+          status: "recovery_required",
+        });
+        expect(failed.stderr.join("")).not.toContain("fixture-vercel-token");
+        expect(transport.requests.filter(({ init }) => init.method === "POST"))
+          .toHaveLength(1);
+        expect(transport.aliasState).toBe(expectedAliasState);
+        const paths = currentAliasReleaseStatePaths(cliSourcePlan, stateDirectory);
+        expect(await Bun.file(paths.intent).exists()).toBeTrue();
+        expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+      });
+    }
+  });
+
+  test("rejects a wrong direct confirmation before lock, Convex, or fetch authority", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const transport = new FakeDirectVercelTransport();
+      const failed = await runDirectApiCli(
+        cliSourcePlan,
+        transport,
+        stateDirectory,
+        "execute",
+        "not-the-record",
+      );
+      expect(failed.exitCode).toBe(1);
+      expect(failed.convexCalls).toBe(0);
+      expect(transport.requests).toEqual([]);
+      expect(JSON.parse(failed.stderr.join(""))).toMatchObject({
+        code: "confirmation_required",
+        status: "refused",
+      });
+      expect(await Bun.file(
+        join(stateDirectory, ".canonical-alias-release.lock"),
+      ).exists()).toBeFalse();
+    });
+  });
+
+  test("normalizes a rejected direct restoration as compensation failure", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const transport = new FakeDirectVercelTransport();
+      transport.mode = "target-unprovable-restore-rejected";
+      const failed = await runDirectApiCli(
+        cliSourcePlan,
+        transport,
+        stateDirectory,
+        "execute",
+      );
+      expect(failed.exitCode).toBe(75);
+      expect(JSON.parse(failed.stderr.join(""))).toMatchObject({
+        code: "compensation_failed",
+        status: "recovery_required",
+      });
+      const posts = transport.requests.filter(({ init }) => init.method === "POST");
+      expect(posts.map(({ url }) => new URL(url).pathname)).toEqual([
+        `/v2/deployments/${target.deploymentId}/aliases`,
+        `/v2/deployments/${source.deploymentId}/aliases`,
+      ]);
+      expect(transport.aliasState).toBe("target");
+      const paths = currentAliasReleaseStatePaths(cliSourcePlan, stateDirectory);
+      expect(await Bun.file(paths.intent).exists()).toBeTrue();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+    });
   });
 
   test("keeps only the explicit non-secret child environment", () => {
@@ -972,12 +1330,14 @@ describe("current-project Vercel provider", () => {
     for (const name of [
       "currentProjectAliasReleaseTestHarness",
       "VercelCurrentProjectAliasProvider",
+      "VercelCurrentProjectAliasApiProvider",
       "runVercelCommand",
       "acquireCurrentAliasReleaseExecutionLock",
       "executeCurrentProjectAliasRelease",
       "executeCurrentAliasReleasePlan",
     ]) expect(name in module).toBeFalse();
     expect("executeCurrentProjectAliasReleaseWithExplicitCapability" in module).toBeTrue();
+    expect("executeCurrentProjectAliasReleaseWithExplicitApiCapability" in module).toBeTrue();
   });
 
   test("rejects JavaScript-shaped missing capabilities without ambient fallback", async () => {
@@ -999,7 +1359,7 @@ describe("current-project Vercel provider", () => {
             typeof executeCurrentProjectAliasReleaseWithExplicitCapability
           >[0],
           {
-            arguments: ["preflight", "--vercel-cli", "/provider/must-not-run"],
+            arguments: ["preflight", "--vercel-auth-fd", "3"],
             inputDocument: JSON.stringify(plan),
             stderr: { write: (value) => {
               stderr.push(String(value));
@@ -1446,7 +1806,7 @@ describe("current-project alias CLI", () => {
       const exitCode = await executeCurrentProjectAliasReleaseWithExplicitCapability(
         { provider, stateDirectory },
         {
-          arguments: ["preflight", "--vercel-cli", "/safe/bin/vercel"],
+          arguments: ["preflight", "--vercel-auth-fd", "3"],
           inputDocument: JSON.stringify(plan),
           stderr: { write: (value) => {
             stderr.push(String(value));
@@ -1490,8 +1850,8 @@ describe("current-project alias CLI", () => {
         {
           arguments: [
             "--execute",
-            "--vercel-cli",
-            "/safe/bin/vercel",
+            "--vercel-auth-fd",
+            "3",
             "--confirm-exact",
             requiredAliasConfirmation(plan),
           ],
@@ -1526,13 +1886,13 @@ describe("current-project alias CLI", () => {
   test("accepts only the closed preflight and execute argument surfaces", () => {
     expect(parseArguments([
       "preflight",
-      "--vercel-cli",
-      "/safe/bin/vercel",
-    ])).toEqual({ operation: "preflight", planFd: 0, vercelCli: "/safe/bin/vercel" });
+      "--vercel-auth-fd",
+      "3",
+    ])).toEqual({ operation: "preflight", planFd: 0, vercelAuthFd: 3 });
     expect(parseArguments([
       "--execute",
-      "--vercel-cli",
-      "/safe/bin/vercel",
+      "--vercel-auth-fd",
+      "4",
       "--confirm-exact",
       requiredAliasConfirmation(plan),
       "--plan-fd",
@@ -1541,14 +1901,22 @@ describe("current-project alias CLI", () => {
       confirmation: requiredAliasConfirmation(plan),
       operation: "execute",
       planFd: 3,
-      vercelCli: "/safe/bin/vercel",
+      vercelAuthFd: 4,
     });
+    expect(parseArguments([
+      "preflight",
+      "--vercel-cli",
+      "/safe/bin/vercel",
+    ])).toEqual({ operation: "preflight", planFd: 0, vercelCli: "/safe/bin/vercel" });
     for (const arguments_ of [
       ["preflight", "--vercel-cli", "vercel"],
-      ["preflight", "--vercel-cli", "/safe/bin/vercel", "--confirm-exact", "approve both"],
-      ["--execute", "--vercel-cli", "/safe/bin/vercel", "--force"],
-      ["--execute", "--vercel-cli", "/safe/bin/vercel", "--domain"],
-      ["--execute", "--vercel-cli", "/safe/bin/vercel", "--dns"],
+      ["preflight", "--vercel-auth-fd", "2"],
+      ["preflight", "--vercel-auth-fd", "3", "--plan-fd", "3"],
+      ["preflight", "--vercel-auth-fd", "3", "--vercel-cli", "/safe/bin/vercel"],
+      ["preflight", "--vercel-auth-fd", "3", "--confirm-exact", "approve both"],
+      ["--execute", "--vercel-auth-fd", "3", "--force"],
+      ["--execute", "--vercel-auth-fd", "3", "--domain"],
+      ["--execute", "--vercel-auth-fd", "3", "--dns"],
     ]) expect(() => parseArguments(arguments_)).toThrow("usage_invalid");
   });
 });
