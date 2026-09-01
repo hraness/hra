@@ -7,6 +7,7 @@ import {
   fsyncSync,
   lstatSync,
   openSync,
+  readSync,
   readdirSync,
   type Stats,
 } from "node:fs";
@@ -17,6 +18,7 @@ import { dlopen } from "bun:ffi";
 import { z } from "zod";
 
 import { assertSafeDarwinInstallAcl } from "../src/install-normalizer";
+import { proveDescriptorAclAbsence } from "../src/storage/descriptor-security";
 import { createBoundedAuthorityFetch } from "./bounded-authority-fetch";
 import {
   BoundedProcessInvocationGuard,
@@ -64,6 +66,10 @@ const convergenceTimeoutMs = 60_000;
 const outputMaximumBytes = 128 * 1024;
 const inputMaximumBytes = 32 * 1024;
 const markerMaximumBytes = 16 * 1024;
+const vercelAuthMaximumBytes = 8 * 1024;
+const vercelCredentialMinimumLifetimeSeconds = 15 * 60;
+const vercelRequestTimeoutMs = 15_000;
+const vercelApiOrigin = "https://api.vercel.com";
 
 const commitSchema = z.string().regex(/^[0-9a-f]{40}$/u);
 const idempotencyKeySchema = z.string().regex(
@@ -191,6 +197,25 @@ const projectReadbackSchema = z.object({
   accountId: z.literal(HRA_VERCEL_TEAM_ID),
   autoAssignCustomDomains: z.literal(false),
   id: z.literal(HRA_VERCEL_PROJECT_ID),
+});
+
+const hasControlCharacter = (value: string): boolean => {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 31 || code === 127) return true;
+  }
+  return false;
+};
+
+const vercelAccessTokenSchema = z.string()
+  .min(1)
+  .max(4_096)
+  .regex(/^[!-~]+$/u)
+  .refine((value) => !hasControlCharacter(value));
+
+const vercelAuthSchema = z.object({
+  expiresAt: z.number().int().positive().safe().optional(),
+  token: vercelAccessTokenSchema,
 });
 
 const markerSchema = z.object({
@@ -362,6 +387,7 @@ type CurrentAliasReleaseFailureCode =
   | "input_too_large"
   | "intent_write_failed"
   | "provider_command_failed"
+  | "provider_credentials_refused"
   | "provider_readback_invalid"
   | "receipt_authority_mismatch"
   | "receipt_write_failed"
@@ -632,6 +658,43 @@ export const currentAliasReleaseApiArguments = (
     HRA_VERCEL_TEAM_ID,
     "--raw",
   ];
+};
+
+export type CurrentAliasReleaseVercelApiRequest = Readonly<{
+  body: string;
+  headers: Readonly<Record<string, string>>;
+  method: "POST";
+  url: string;
+}>;
+
+export const currentAliasReleaseVercelApiRequest = (
+  endpoint: CurrentProjectAliasEndpoint,
+  idempotencyKey: string,
+  accessToken: string,
+): CurrentAliasReleaseVercelApiRequest => {
+  const parsedEndpoint = endpointSchema.safeParse(endpoint);
+  const parsedToken = vercelAccessTokenSchema.safeParse(accessToken);
+  if (
+    !parsedEndpoint.success
+    || !digestSchema.safeParse(idempotencyKey).success
+    || !parsedToken.success
+  ) throw new CurrentAliasReleaseError("usage_invalid");
+  const url = new URL(
+    `/v2/deployments/${parsedEndpoint.data.deploymentId}/aliases`,
+    vercelApiOrigin,
+  );
+  url.searchParams.set("teamId", HRA_VERCEL_TEAM_ID);
+  return {
+    body: JSON.stringify({ alias: canonicalAlias }),
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${parsedToken.data}`,
+      "content-type": "application/json",
+      "idempotency-key": idempotencyKey,
+    },
+    method: "POST",
+    url: url.href,
+  };
 };
 
 const normalizedAliasAuthority = (
@@ -994,7 +1057,7 @@ type ReleaseClock = Readonly<{
 }>;
 
 const defaultClock: ReleaseClock = {
-  now: Date.now,
+  now: () => performance.now(),
   sleep: async (milliseconds) => {
     await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, milliseconds));
   },
@@ -1050,7 +1113,6 @@ const restoreCurrentAliasReleaseSource = async (
     }
   } catch (error: unknown) {
     rethrowTerminalProviderError(error);
-    if (error instanceof CurrentAliasReleaseError) throw error;
     throw new CurrentAliasReleaseError("compensation_failed");
   }
   const sourceRestored = await probeAliasEndpoint(
@@ -1205,12 +1267,17 @@ export const buildVercelEnvironment = (
   return environment;
 };
 
-const readBoundedBody = async (response: Response): Promise<string> => {
-  if (response.status !== 200 || response.body === null) {
+const readBoundedBody = async (
+  response: Response,
+  maximumBytes = markerMaximumBytes,
+): Promise<string> => {
+  if (response.status !== 200 || response.body === null || response.redirected) {
+    await response.body?.cancel().catch(() => undefined);
     throw new CurrentAliasReleaseError("provider_readback_invalid");
   }
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
   if (!contentType.startsWith("application/json")) {
+    await response.body.cancel().catch(() => undefined);
     throw new CurrentAliasReleaseError("provider_readback_invalid");
   }
   const reader = response.body.getReader();
@@ -1221,7 +1288,7 @@ const readBoundedBody = async (response: Response): Promise<string> => {
       const result = await reader.read();
       if (result.done) break;
       bytes += result.value.byteLength;
-      if (bytes > markerMaximumBytes) {
+      if (bytes > maximumBytes) {
         throw new CurrentAliasReleaseError("provider_readback_invalid");
       }
       chunks.push(result.value);
@@ -1244,6 +1311,112 @@ const parseProviderJson = <Value>(document: string, schema: z.ZodType<Value>): V
   } catch {
     throw new CurrentAliasReleaseError("provider_readback_invalid");
   }
+};
+
+const sameCredentialIdentity = (left: Stats, right: Stats): boolean =>
+  left.dev === right.dev
+  && left.ino === right.ino
+  && left.uid === right.uid
+  && left.mode === right.mode
+  && left.nlink === right.nlink
+  && left.size === right.size
+  && left.ctimeMs === right.ctimeMs
+  && left.mtimeMs === right.mtimeMs;
+
+const readCredentialDescriptor = (descriptor: number, size: number): Buffer => {
+  const document = Buffer.alloc(size + 1);
+  let offset = 0;
+  while (offset < document.byteLength) {
+    const count = readSync(
+      descriptor,
+      document,
+      offset,
+      document.byteLength - offset,
+      offset,
+    );
+    if (count === 0) break;
+    offset += count;
+  }
+  if (offset !== size) {
+    document.fill(0);
+    throw new CurrentAliasReleaseError("provider_credentials_refused");
+  }
+  return document;
+};
+
+export const readProtectedVercelAccessToken = (
+  descriptor: number,
+  nowSeconds = Math.floor(Date.now() / 1_000),
+): string => {
+  let first: Buffer | undefined;
+  let second: Buffer | undefined;
+  let accessToken: string | undefined;
+  let refused = false;
+  try {
+    const uid = process.getuid?.();
+    if (
+      uid === undefined
+      || !Number.isSafeInteger(descriptor)
+      || descriptor < 3
+      || descriptor > 255
+      || isatty(descriptor)
+    ) throw new CurrentAliasReleaseError("provider_credentials_refused");
+    const initial = fstatSync(descriptor);
+    proveDescriptorAclAbsence(
+      descriptor,
+      {},
+      "provider_credentials_refused",
+    );
+    if (
+      !initial.isFile()
+      || initial.uid !== uid
+      || initial.nlink !== 1
+      || (initial.mode & 0o777) !== 0o600
+      || initial.size <= 0
+      || initial.size > vercelAuthMaximumBytes
+    ) throw new CurrentAliasReleaseError("provider_credentials_refused");
+
+    first = readCredentialDescriptor(descriptor, initial.size);
+    const afterFirstRead = fstatSync(descriptor);
+    if (!sameCredentialIdentity(initial, afterFirstRead)) {
+      throw new CurrentAliasReleaseError("provider_credentials_refused");
+    }
+    second = readCredentialDescriptor(descriptor, initial.size);
+    const final = fstatSync(descriptor);
+    proveDescriptorAclAbsence(
+      descriptor,
+      {},
+      "provider_credentials_refused",
+    );
+    if (
+      !sameCredentialIdentity(initial, final)
+      || !first.subarray(0, initial.size).equals(second.subarray(0, initial.size))
+    ) throw new CurrentAliasReleaseError("provider_credentials_refused");
+
+    const document = new TextDecoder("utf-8", { fatal: true })
+      .decode(first.subarray(0, initial.size));
+    const parsed = vercelAuthSchema.safeParse(JSON.parse(document) as unknown);
+    if (
+      !parsed.success
+      || parsed.data.expiresAt !== undefined
+        && parsed.data.expiresAt < nowSeconds + vercelCredentialMinimumLifetimeSeconds
+    ) throw new CurrentAliasReleaseError("provider_credentials_refused");
+    accessToken = parsed.data.token;
+  } catch {
+    refused = true;
+  } finally {
+    first?.fill(0);
+    second?.fill(0);
+    try {
+      closeSync(descriptor);
+    } catch {
+      refused = true;
+    }
+  }
+  if (refused || accessToken === undefined) {
+    throw new CurrentAliasReleaseError("provider_credentials_refused");
+  }
+  return accessToken;
 };
 
 type VercelCurrentProjectAliasProviderOptions = Readonly<{
@@ -1385,17 +1558,161 @@ implements CurrentProjectAliasReleaseProvider {
   }
 }
 
+type VercelCurrentProjectAliasApiProviderOptions = Readonly<{
+  accessToken: string;
+  convexVerifier?: ConvexTargetVerifier;
+  fetcher?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+}>;
+
+class VercelCurrentProjectAliasApiProvider
+implements CurrentProjectAliasReleaseProvider {
+  readonly #accessToken: string;
+  readonly #convexVerifier: ConvexTargetVerifier;
+  readonly #fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+  constructor(options: VercelCurrentProjectAliasApiProviderOptions) {
+    const token = vercelAccessTokenSchema.safeParse(options.accessToken);
+    if (!token.success) {
+      throw new CurrentAliasReleaseError("provider_credentials_refused");
+    }
+    this.#accessToken = token.data;
+    this.#convexVerifier = options.convexVerifier ?? verifyConvexDefaultTarget;
+    this.#fetcher = createBoundedAuthorityFetch(
+      options.fetcher ?? fetch,
+      vercelRequestTimeoutMs,
+      "vercel_api_timeout",
+    );
+  }
+
+  #apiUrl(path: string): URL {
+    const url = new URL(path, vercelApiOrigin);
+    if (url.origin !== vercelApiOrigin || !url.pathname.startsWith("/v")) {
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
+    }
+    url.searchParams.set("teamId", HRA_VERCEL_TEAM_ID);
+    return url;
+  }
+
+  async #read<Value>(path: string, schema: z.ZodType<Value>): Promise<Value> {
+    const url = this.#apiUrl(path);
+    try {
+      const response = await this.#fetcher(url, {
+        cache: "no-store",
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${this.#accessToken}`,
+          "cache-control": "no-cache",
+        },
+        method: "GET",
+        redirect: "error",
+      });
+      if (response.url !== "" && response.url !== url.href) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new CurrentAliasReleaseError("provider_readback_invalid");
+      }
+      return parseProviderJson(
+        await readBoundedBody(response, outputMaximumBytes),
+        schema,
+      );
+    } catch (error: unknown) {
+      if (error instanceof CurrentAliasReleaseError) throw error;
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
+    }
+  }
+
+  async verifyVercelVersion(): Promise<void> {
+    // The fixed REST endpoint versions and strict response schemas are this
+    // transport's compatibility boundary. No Vercel executable is launched.
+  }
+
+  async verifyConvexTarget(target: ConvexTarget): Promise<void> {
+    try {
+      await this.#convexVerifier(target);
+    } catch {
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
+    }
+  }
+
+  async readProject(): Promise<CurrentProjectReadback> {
+    return await this.#read(
+      `/v9/projects/${HRA_VERCEL_PROJECT_ID}`,
+      projectReadbackSchema,
+    );
+  }
+
+  async readDeployment(deploymentId: string): Promise<CurrentDeploymentReadback> {
+    if (!deploymentIdSchema.safeParse(deploymentId).success) {
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
+    }
+    return await this.#read(`/v13/deployments/${deploymentId}`, deploymentReadbackSchema);
+  }
+
+  async readAlias(): Promise<CurrentAliasReadback> {
+    return await this.#read(`/v4/aliases/${canonicalAlias}`, aliasReadbackSchema);
+  }
+
+  async readMarker(): Promise<unknown> {
+    try {
+      const response = await this.#fetcher(
+        `https://${canonicalAlias}/.well-known/hra.json?release=${randomUUID()}`,
+        {
+          cache: "no-store",
+          headers: { accept: "application/json", "cache-control": "no-cache" },
+          method: "GET",
+          redirect: "error",
+        },
+      );
+      return JSON.parse(await readBoundedBody(response)) as unknown;
+    } catch (error: unknown) {
+      if (error instanceof CurrentAliasReleaseError) throw error;
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
+    }
+  }
+
+  async setAlias(
+    endpoint: CurrentProjectAliasEndpoint,
+    idempotencyKey: string,
+  ): Promise<CurrentAliasMutationReadback> {
+    const request = currentAliasReleaseVercelApiRequest(
+      endpoint,
+      idempotencyKey,
+      this.#accessToken,
+    );
+    try {
+      const response = await this.#fetcher(request.url, {
+        body: request.body,
+        headers: request.headers,
+        method: request.method,
+        redirect: "error",
+      });
+      if (response.url !== "" && response.url !== request.url) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new CurrentAliasReleaseError("provider_readback_invalid");
+      }
+      return parseProviderJson(
+        await readBoundedBody(response, outputMaximumBytes),
+        aliasMutationReadbackSchema,
+      );
+    } catch (error: unknown) {
+      if (error instanceof CurrentAliasReleaseError) throw error;
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
+    }
+  }
+}
+
 type ParsedArguments = Readonly<{
   confirmation?: string;
   operation: "execute" | "preflight";
   planFd: number;
-  vercelCli: string;
+  vercelAuthFd?: number;
+  vercelCli?: string;
 }>;
 
 export const parseArguments = (arguments_: readonly string[]): ParsedArguments => {
   let confirmation: string | undefined;
   let operation: ParsedArguments["operation"] | undefined;
   let planFd = 0;
+  let vercelAuthFd: number | undefined;
   let vercelCli: string | undefined;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
@@ -1437,18 +1754,32 @@ export const parseArguments = (arguments_: readonly string[]): ParsedArguments =
       index += 1;
       continue;
     }
+    if (argument === "--vercel-auth-fd" && vercelAuthFd === undefined) {
+      const value = arguments_[index + 1];
+      if (value === undefined || !/^[0-9]+$/u.test(value)) {
+        throw new CurrentAliasReleaseError("usage_invalid");
+      }
+      vercelAuthFd = Number(value);
+      if (!Number.isSafeInteger(vercelAuthFd) || vercelAuthFd < 3 || vercelAuthFd > 255) {
+        throw new CurrentAliasReleaseError("usage_invalid");
+      }
+      index += 1;
+      continue;
+    }
     throw new CurrentAliasReleaseError("usage_invalid");
   }
   if (
     operation === undefined
-    || vercelCli === undefined
+    || (vercelCli === undefined) === (vercelAuthFd === undefined)
+    || vercelAuthFd !== undefined && planFd === vercelAuthFd
     || operation === "preflight" && confirmation !== undefined
   ) throw new CurrentAliasReleaseError("usage_invalid");
   return {
     ...(confirmation === undefined ? {} : { confirmation }),
     operation,
     planFd,
-    vercelCli,
+    ...(vercelAuthFd === undefined ? {} : { vercelAuthFd }),
+    ...(vercelCli === undefined ? {} : { vercelCli }),
   };
 };
 
@@ -1503,6 +1834,7 @@ type ExecuteOptions = Readonly<{
   stderr: Pick<NodeJS.WriteStream, "write">;
   stdout: Pick<NodeJS.WriteStream, "write">;
   timeoutMs?: number;
+  vercelAccessToken?: string;
 }>;
 
 const renderFailure = (
@@ -1637,16 +1969,25 @@ const executeCurrentProjectAliasRelease = async (
         for (const path of [lock.path, paths.intent, paths.receipt]) {
           guard.retainRecoveryPath(path);
         }
-        const provider = options.provider ?? new VercelCurrentProjectAliasProvider({
-          ...(options.convexVerifier === undefined
-            ? {}
-            : { convexVerifier: options.convexVerifier }),
-          ...(options.environment === undefined ? {} : { environment: options.environment }),
-          ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
-          guard,
-          ...(options.runner === undefined ? {} : { runner: options.runner }),
-          vercelCli: arguments_.vercelCli,
-        });
+        const provider = options.provider ?? (arguments_.vercelAuthFd === undefined
+          ? new VercelCurrentProjectAliasProvider({
+              ...(options.convexVerifier === undefined
+                ? {}
+                : { convexVerifier: options.convexVerifier }),
+              ...(options.environment === undefined ? {} : { environment: options.environment }),
+              ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+              guard,
+              ...(options.runner === undefined ? {} : { runner: options.runner }),
+              vercelCli: arguments_.vercelCli as string,
+            })
+          : new VercelCurrentProjectAliasApiProvider({
+              accessToken: options.vercelAccessToken
+                ?? readProtectedVercelAccessToken(arguments_.vercelAuthFd),
+              ...(options.convexVerifier === undefined
+                ? {}
+                : { convexVerifier: options.convexVerifier }),
+              ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+            }));
         const observation = await observeCurrentAliasAuthority(plan, provider);
         if (
           durableState.receipt !== null
@@ -1708,16 +2049,25 @@ const executeCurrentProjectAliasRelease = async (
         dirname(paths.intent),
       );
       unresolvedIntent = durableState.intent !== null && durableState.receipt === null;
-      const provider = options.provider ?? new VercelCurrentProjectAliasProvider({
-        ...(options.convexVerifier === undefined
-          ? {}
-          : { convexVerifier: options.convexVerifier }),
-        ...(options.environment === undefined ? {} : { environment: options.environment }),
-        ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
-        guard,
-        ...(options.runner === undefined ? {} : { runner: options.runner }),
-        vercelCli: arguments_.vercelCli,
-      });
+      const provider = options.provider ?? (arguments_.vercelAuthFd === undefined
+        ? new VercelCurrentProjectAliasProvider({
+            ...(options.convexVerifier === undefined
+              ? {}
+              : { convexVerifier: options.convexVerifier }),
+            ...(options.environment === undefined ? {} : { environment: options.environment }),
+            ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+            guard,
+            ...(options.runner === undefined ? {} : { runner: options.runner }),
+            vercelCli: arguments_.vercelCli as string,
+          })
+        : new VercelCurrentProjectAliasApiProvider({
+            accessToken: options.vercelAccessToken
+              ?? readProtectedVercelAccessToken(arguments_.vercelAuthFd),
+            ...(options.convexVerifier === undefined
+              ? {}
+              : { convexVerifier: options.convexVerifier }),
+            ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+          }));
       let initial: AliasAuthorityObservation;
       try {
         initial = await observeCurrentAliasAuthority(plan, provider);
@@ -1949,11 +2299,68 @@ export const executeCurrentProjectAliasReleaseWithExplicitCapability = async (
   });
 };
 
+export type CurrentProjectAliasReleaseExplicitApiCapability = Readonly<{
+  accessToken: string;
+  convexVerifier: ConvexTargetVerifier;
+  fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  stateDirectory: string;
+}>;
+
+// This deterministic seam supplies every authority capability explicitly. It
+// cannot discover a credential, fetch implementation, Convex session, or state
+// root and it still traverses the complete lock/intent/confirmation/receipt
+// state machine. Production invocation consumes the protected descriptor in
+// the executable wrapper instead.
+export const executeCurrentProjectAliasReleaseWithExplicitApiCapability = async (
+  capability: CurrentProjectAliasReleaseExplicitApiCapability,
+  request: CurrentProjectAliasReleaseExplicitRequest,
+): Promise<number> => {
+  assertCurrentAliasReleaseBunVersion();
+  const runtimeCapability: unknown = capability;
+  if (typeof runtimeCapability !== "object" || runtimeCapability === null) {
+    return renderFailure(new CurrentAliasReleaseError("usage_invalid"), request.stderr);
+  }
+  const accessToken = Reflect.get(runtimeCapability, "accessToken") as unknown;
+  const convexVerifier = Reflect.get(runtimeCapability, "convexVerifier") as unknown;
+  const fetcher = Reflect.get(runtimeCapability, "fetcher") as unknown;
+  const stateDirectory = Reflect.get(runtimeCapability, "stateDirectory") as unknown;
+  let parsedArguments: ParsedArguments | undefined;
+  try {
+    parsedArguments = parseArguments(request.arguments);
+  } catch {
+    // Render the same closed usage result as the executable surface.
+  }
+  if (
+    parsedArguments?.vercelAuthFd === undefined
+    ||
+    !vercelAccessTokenSchema.safeParse(accessToken).success
+    || typeof convexVerifier !== "function"
+    || typeof fetcher !== "function"
+    || typeof stateDirectory !== "string"
+    || !isAbsolute(stateDirectory)
+  ) return renderFailure(new CurrentAliasReleaseError("usage_invalid"), request.stderr);
+  return await executeCurrentProjectAliasRelease({
+    arguments: request.arguments,
+    ...(request.clock === undefined ? {} : { clock: request.clock }),
+    convexVerifier: convexVerifier as ConvexTargetVerifier,
+    fetcher: fetcher as NonNullable<VercelCurrentProjectAliasApiProviderOptions["fetcher"]>,
+    inputDocument: request.inputDocument,
+    stateDirectory,
+    stderr: request.stderr,
+    stdout: request.stdout,
+    ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+    vercelAccessToken: accessToken as string,
+  });
+};
+
 if (import.meta.main) {
   let exitCode = 75;
   try {
     assertCurrentAliasReleaseBunVersion();
     const arguments_ = parseArguments(process.argv.slice(2));
+    const vercelAccessToken = arguments_.vercelAuthFd === undefined
+      ? undefined
+      : readProtectedVercelAccessToken(arguments_.vercelAuthFd);
     await recoverBoundedProcessJournal();
     const inputDocument = await readPlanInput(arguments_.planFd);
     exitCode = await executeCurrentProjectAliasRelease({
@@ -1961,6 +2368,7 @@ if (import.meta.main) {
       inputDocument,
       stderr: process.stderr,
       stdout: process.stdout,
+      ...(vercelAccessToken === undefined ? {} : { vercelAccessToken }),
     });
   } catch (error: unknown) {
     exitCode = renderFailure(error, process.stderr);

@@ -1,9 +1,11 @@
 import { constants } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { userInfo } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 
 import { z } from "zod";
+
+import { proveDescriptorAclAbsence } from "../src/storage/descriptor-security";
 
 const configMaximumBytes = 8 * 1024;
 const responseMaximumBytes = 64 * 1024;
@@ -189,7 +191,7 @@ export function parseConvexTargetArguments(
   return { otherArguments, target: parsed.data };
 }
 
-type FileIdentity = Readonly<{ dev: number; ino: number }>;
+type FileIdentity = Readonly<{ dev: number; ino: number; uid: number }>;
 
 const matchingRegularPath = async (
   path: string,
@@ -200,6 +202,7 @@ const matchingRegularPath = async (
     return current.isFile()
       && current.dev === identity.dev
       && current.ino === identity.ino
+      && current.uid === identity.uid
       && current.nlink === 1
       && (current.mode & 0o777) === 0o600;
   } catch {
@@ -207,8 +210,23 @@ const matchingRegularPath = async (
   }
 };
 
+export function defaultConvexConfigPath(): string {
+  const uid = process.getuid?.();
+  let account: Readonly<{ homedir: string; uid: number }>;
+  try {
+    const systemAccount = userInfo({ encoding: "utf8" });
+    account = { homedir: systemAccount.homedir, uid: systemAccount.uid };
+  } catch {
+    throw new ConvexTargetError("target_credentials_refused");
+  }
+  if (uid === undefined || account.uid !== uid || !isAbsolute(account.homedir)) {
+    throw new ConvexTargetError("target_credentials_refused");
+  }
+  return join(account.homedir, ".convex", "config.json");
+}
+
 export async function readConvexAccessToken(
-  configPath = join(homedir(), ".convex", "config.json"),
+  configPath = defaultConvexConfigPath(),
 ): Promise<string> {
   let handle: FileHandle;
   try {
@@ -217,22 +235,43 @@ export async function readConvexAccessToken(
     throw new ConvexTargetError("target_credentials_refused");
   }
   try {
+    const uid = process.getuid?.();
     const identity = await handle.stat();
     if (
+      uid === undefined
+      ||
       !identity.isFile()
+      || identity.uid !== uid
       || identity.nlink !== 1
       || (identity.mode & 0o777) !== 0o600
       || identity.size <= 0
       || identity.size > configMaximumBytes
       || !await matchingRegularPath(configPath, identity)
     ) throw new ConvexTargetError("target_credentials_refused");
-    const document = await handle.readFile("utf8");
-    if (Buffer.byteLength(document, "utf8") !== identity.size) {
-      throw new ConvexTargetError("target_credentials_refused");
+    proveDescriptorAclAbsence(handle.fd, {}, "target_credentials_refused");
+    const document = await handle.readFile();
+    try {
+      const after = await handle.stat();
+      proveDescriptorAclAbsence(handle.fd, {}, "target_credentials_refused");
+      if (
+        document.byteLength !== identity.size
+        || after.dev !== identity.dev
+        || after.ino !== identity.ino
+        || after.uid !== identity.uid
+        || after.mode !== identity.mode
+        || after.nlink !== identity.nlink
+        || after.size !== identity.size
+        || after.ctimeMs !== identity.ctimeMs
+        || after.mtimeMs !== identity.mtimeMs
+        || !await matchingRegularPath(configPath, identity)
+      ) throw new ConvexTargetError("target_credentials_refused");
+      const decoded = new TextDecoder("utf-8", { fatal: true }).decode(document);
+      const parsed = configSchema.safeParse(JSON.parse(decoded) as unknown);
+      if (!parsed.success) throw new ConvexTargetError("target_credentials_refused");
+      return parsed.data.accessToken;
+    } finally {
+      document.fill(0);
     }
-    const parsed = configSchema.safeParse(JSON.parse(document) as unknown);
-    if (!parsed.success) throw new ConvexTargetError("target_credentials_refused");
-    return parsed.data.accessToken;
   } catch (error: unknown) {
     if (error instanceof ConvexTargetError) throw error;
     throw new ConvexTargetError("target_credentials_refused");
