@@ -1,6 +1,6 @@
 export type EditorialImage = Readonly<{
   alt: string;
-  canonicalPath: "/reading/deepseek-harness/" | "/reading/headlong-microharness/" | "/reading/oracle-and-firm/";
+  canonicalPath: "/reading/deepseek-harness/" | "/reading/hax/" | "/reading/headlong-microharness/" | "/reading/oracle-and-firm/";
   caption: string;
   cardDescription: string;
   cardTitle: string;
@@ -72,6 +72,24 @@ export const editorialImages = [
     },
     src: "/images/editorial/oracle-and-firm.webp",
     title: "A Codex account loop is an oracle thread, not a firm",
+    width: 1536,
+  },
+  {
+    alt: "One compact linear tool contrasted with three separately bounded account session loops",
+    canonicalPath: "/reading/hax/",
+    caption: "A terminal-native coding agent and an isolated account loop organize different kinds of work.",
+    cardDescription: "Reading hax as a Unix coding agent, not an isolated Codex account loop.",
+    cardTitle: "A terminal-native coding agent is not a Codex account loop",
+    credit,
+    height: 864,
+    imageSha256: "a4c1c180924564045da064dc7442309c48b2a92616c01a3d59d32932985add3a",
+    provenance: {
+      job: "editorial-provenance/hax/job.json",
+      prompt: "editorial-provenance/hax/prompt.txt",
+      receipt: "editorial-provenance/hax/receipt.json",
+    },
+    src: "/images/editorial/hax.webp",
+    title: "A terminal-native coding agent is not a Codex account loop",
     width: 1536,
   },
 ] as const satisfies readonly EditorialImage[];

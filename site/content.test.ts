@@ -11,6 +11,7 @@ import {
 } from "../src/install-preflight";
 import {
   deepseekHarnessReading,
+  haxReading,
   headlongMicroharnessReading,
   oracleAndFirmReading,
   publicContent,
@@ -23,6 +24,7 @@ import {
 import {
   HRA_MAILING_TURNSTILE_SITEKEY_ENV,
   renderDeepseekHarnessReadingHtml,
+  renderHaxReadingHtml,
   renderHeadlongMicroharnessReadingHtml,
   hraMailingListConfig,
   renderHraSiteFooter,
@@ -602,6 +604,7 @@ describe("public content contract", () => {
       renderDeepseekHarnessReadingHtml(),
       renderHeadlongMicroharnessReadingHtml(),
       renderOracleAndFirmReadingHtml(),
+      renderHaxReadingHtml(),
     ]) {
       expect(document.match(/<footer\b/gu)).toHaveLength(1);
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
@@ -711,6 +714,7 @@ describe("public content contract", () => {
       "https://hraness.com/reading/deepseek-harness",
       "/reading/headlong-microharness/",
       "/reading/oracle-and-firm/",
+      "/reading/hax/",
       "https://wrench.rip/provider-capabilities/",
     ];
     const absentHrefs = [
@@ -777,6 +781,7 @@ describe("public content contract", () => {
       "https://hra.sh/",
       "/reading/deepseek-harness/",
       "/reading/oracle-and-firm/",
+      "/reading/hax/",
       "https://hraness.com/writing/what-is-an-agent-harness",
       "https://hraness.com/writing/direct-wrench-hra",
       "https://wrench.rip/provider-capabilities/",
@@ -846,6 +851,7 @@ describe("public content contract", () => {
       "https://hraness.com/writing/what-is-an-agent-harness",
       "/reading/deepseek-harness/",
       "/reading/headlong-microharness/",
+      "/reading/hax/",
       "https://hra.sh/",
       "https://hraness.com/writing/direct-wrench-hra",
       "https://wrench.rip/provider-capabilities/",
@@ -889,6 +895,80 @@ describe("public content contract", () => {
       expect(reading).toContain(`href="${href}"`);
     }
     for (const document of [home, reading, deepseek, headlong, llms, sitemap, markdown]) {
+      for (const href of absentHrefs) {
+        expect(document).not.toContain(href);
+      }
+      expect(document).not.toMatch(/<script(?! type="application\/ld\+json")/);
+    }
+    expect(reading).not.toMatch(/<script[^>]+src=/);
+    expect(reading).not.toContain("onclick=");
+    expect(reading).not.toContain("graphql");
+    expect(reading).not.toContain("GraphQL");
+    expect(reading).not.toContain("OAuth");
+    expect(reading).not.toContain("MCP");
+  });
+
+  test("ships one crawlable hax reading page without orphaning it", () => {
+    const home = renderSiteHtml();
+    const reading = renderHaxReadingHtml();
+    const deepseek = renderDeepseekHarnessReadingHtml();
+    const headlong = renderHeadlongMicroharnessReadingHtml();
+    const oracle = renderOracleAndFirmReadingHtml();
+    const llms = renderLlmsText();
+    const sitemap = renderSitemapXml();
+    const markdown = renderReadmeMarkdown();
+    const requiredHrefs = [
+      "https://usehax.dev",
+      "https://github.com/OleksandrChekhovskyi/hax",
+      "https://hraness.com/reading/hax-a-minimalist-terminal-native-coding-agent",
+      "https://hraness.com/writing/what-is-an-agent-harness",
+      "/reading/oracle-and-firm/",
+      "/reading/deepseek-harness/",
+      "/reading/headlong-microharness/",
+      "https://hra.sh/",
+      "https://hraness.com/writing/direct-wrench-hra",
+      "https://wrench.rip/provider-capabilities/",
+    ];
+    const absentHrefs = [
+      "/reading/headlong-always-on-loop",
+      "/reading/not-a-codex-tui",
+      "stripedex.com",
+      "spongeresearch.com",
+    ];
+
+    expect(home).toContain('href="/reading/hax/"');
+    expect(home).toContain("A terminal-native coding agent is not a Codex account loop");
+    expect(deepseek).toContain('href="/reading/hax/"');
+    expect(headlong).toContain('href="/reading/hax/"');
+    expect(oracle).toContain('href="/reading/hax/"');
+    expect(reading).toContain(
+      `<link rel="canonical" href="https://hra.sh${haxReading.canonicalPath}">`,
+    );
+    expect(reading).toContain('<meta property="og:type" content="article">');
+    expect(reading).toContain('"@type":"Article"');
+    expect(reading).not.toContain('"@type":"SoftwareApplication"');
+    expect(reading).toContain(
+      `<h1 id="reading-hax-heading">${haxReading.heading}</h1>`,
+    );
+    expect(reading.match(/<h1\b/gu)).toHaveLength(1);
+    expect(reading).toContain(
+      '<h2 id="reading-hax-2-hax-as-published">',
+    );
+    expect(reading).toContain(haxReading.description);
+    expect(reading).toContain("This page is the HRA take, not that digest.");
+    expect(reading).toContain("HRA does not implement hax");
+    expect(reading).toContain("HRA is not a coding agent");
+    expect(llms).toContain(
+      `[${haxReading.title}](${publicContent.siteUrl}${haxReading.canonicalPath})`,
+    );
+    expect(sitemap).toContain(
+      `<loc>${publicContent.siteUrl}${haxReading.canonicalPath}</loc>`,
+    );
+    expect(markdown).not.toContain("/reading/hax/");
+    for (const href of requiredHrefs) {
+      expect(reading).toContain(`href="${href}"`);
+    }
+    for (const document of [home, reading, deepseek, headlong, oracle, llms, sitemap, markdown]) {
       for (const href of absentHrefs) {
         expect(document).not.toContain(href);
       }

@@ -1,0 +1,29 @@
+{
+  "createdAt": "2026-09-01T13:40:00.000Z",
+  "inputs": [],
+  "localValidation": {
+    "decodeValidatedOutputs": 1,
+    "signatureOnlyOutputs": 0,
+    "status": "decode-passed"
+  },
+  "operation": "image.generate",
+  "outputs": [
+    {
+      "bytes": 71252,
+      "file": "hax.webp",
+      "mediaType": "image/webp",
+      "sha256": "a4c1c180924564045da064dc7442309c48b2a92616c01a3d59d32932985add3a"
+    }
+  ],
+  "request": {
+    "promptCharacters": 1000,
+    "promptSha256": "5ac6f8e827cab31738786ab3f0675a93a287b1cb338dc59670f3c605272440bf",
+    "size": "1536x864"
+  },
+  "sampleFulfillment": {
+    "produced": 1,
+    "requested": 1,
+    "status": "complete"
+  },
+  "schemaVersion": 1
+}
