@@ -89,6 +89,8 @@ describe("machine bootstrap", () => {
     expect(guidance.match(/hra-local-efficiency:start/gu)).toHaveLength(1);
     expect(statSync(join(codexHome, "AGENTS.md")).mode & 0o777).toBe(0o600);
     expect(readlinkSync(join(bunBin, "hra-host-run"))).toContain("host-run.ts");
+    expect(readlinkSync(join(bunBin, "hra-throughput-report"))).toContain("throughput-report.ts");
+    expect(readlinkSync(join(bunBin, "hra-ci-ref-audit"))).toContain("ci-ref-audit.ts");
     let rules = readFileSync(rulesPath, "utf8");
     expect(rules).toContain("# Existing rule before the managed block.\n");
     expect(rules.match(/hra-local-efficiency:rules:start/gu)).toHaveLength(1);

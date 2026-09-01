@@ -47,6 +47,8 @@ const commandScripts = Object.freeze([
   "validation-run.ts",
   "workspace-audit.ts",
   "session-audit.ts",
+  "throughput-report.ts",
+  "ci-ref-audit.ts",
   "repo-adoption.ts",
   "doctor.ts",
 ]);
@@ -146,6 +148,8 @@ export function commandTargets(bunBin: string): readonly [string, string][] {
     ["hra-validate", "validation-run.ts"],
     ["hra-workspace-audit", "workspace-audit.ts"],
     ["hra-session-audit", "session-audit.ts"],
+    ["hra-throughput-report", "throughput-report.ts"],
+    ["hra-ci-ref-audit", "ci-ref-audit.ts"],
     ["hra-repo-adoption", "repo-adoption.ts"],
     ["hra-local-efficiency", "doctor.ts"],
   ].map(([name, script]) => [

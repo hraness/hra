@@ -443,6 +443,7 @@ export async function runValidation(
     cwd,
     environment,
     label: options.label,
+    lane: "compute",
     mode: options.mode,
   });
   const finishedAt = new Date();
