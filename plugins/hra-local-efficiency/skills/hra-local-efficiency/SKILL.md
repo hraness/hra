@@ -2,17 +2,19 @@
 name: hra-local-efficiency
 description: >-
   Install, audit, and operate the Hraness local Codex efficiency baseline across
-  repositories and Macs. Use for host-wide heavyweight-command scheduling,
+  repositories and Macs. Use for Codex swarm throughput, host-wide
+  heavyweight-command scheduling, capability lanes, privacy-safe telemetry,
   validation ownership and exact-tree receipts, stale-task reporting, guarded
-  Git worktree cleanup, model-lane setup, or checking whether a Hraness machine
-  follows the standard. Preserve useful agent fan-out and all repository final
-  gates. Do not use for cloud execution or cloud optimization.
+  Git worktree cleanup, complete-history CI ref isolation, model-lane setup, or
+  checking whether a Hraness machine follows the standard. Preserve useful
+  agent fan-out and all repository final gates. Do not use for cloud execution
+  or cloud optimization.
 ---
 
 # HRA local efficiency
 
-Keep parallel agents. Reduce only duplicated validation, conflicting local
-compute, stale state, and verified disposable disk use.
+Keep parallel reasoning. Reduce duplicated validation, conflicting local
+compute, unnecessary checkouts, stale state, and verified disposable disk use.
 
 ## Choose the mode
 
@@ -21,10 +23,15 @@ compute, stale state, and verified disposable disk use.
 - **Inspect this Mac:** run `bun run scripts/workspace-audit.ts` and
   `bun run scripts/session-audit.ts`. Both are read-only by default. Add
   `--sizes` only when the slower recursive worktree-size estimate is useful.
+- **Measure local throughput:** run `hra-throughput-report` for the bounded,
+  privacy-safe scheduler history. Treat repeat command digests and silent tasks
+  as review heuristics, never as proof of waste or abandonment.
 - **Run heavyweight local work:** resolve `hra-host-run` to its installed
   absolute path and use `ABSOLUTE-HRA-HOST-RUN
-  --mode=shared|heavy|exclusive --label=LABEL -- COMMAND ...` through reviewed
-  host access. Keep the complete wrapper and child argv visible to Codex.
+  --mode=shared|heavy|exclusive
+  --lane=compute|browser-auth|mac-native --label=LABEL -- COMMAND ...` through
+  reviewed host access. Keep the complete wrapper and child argv visible to
+  Codex.
 - **Record or reuse deterministic focused validation:** use `hra-validate`.
   Reuse is opt-in and is never valid for a required final integration,
   merge-queue, deployment, release, authenticated-browser, or network-sensitive
@@ -34,6 +41,9 @@ compute, stale state, and verified disposable disk use.
   absolute path named through `--remove`.
 - **Adopt or check repository guidance:** use `repo-adoption.ts --check` or
   `--apply`. It edits only the exact managed policy block in a root `AGENTS.md`.
+- **Audit CI ref isolation:** use `hra-ci-ref-audit --root ABSOLUTE-REPO`. Review
+  every candidate; fix only workflows whose complete-history gate can import
+  unrelated refs, and preserve the complete-history scan itself.
 
 Run scripts from the installed skill directory when the convenience commands
 are unavailable. `bootstrap.ts` installs or refreshes those commands under the
@@ -45,6 +55,10 @@ package or command.
 
 - Do not cap agent count merely to reduce fan-out. Parallel reasoning and
   independent implementation lanes remain desirable.
+- Prefer bounded subagents in the current task for research, review, diagnosis,
+  and focused checks when they can safely share one working tree. A separate
+  task or worktree is warranted for independently deliverable divergent edits,
+  an intentionally isolated verification tree, or a different environment.
 - Give each focused check one worker owner. The integrator reviews the diff and
   reported evidence, repeating a focused command only when the tree changed,
   evidence is missing, or a repair invalidated it.
@@ -62,11 +76,42 @@ package or command.
 - This baseline is local-only. Do not create, configure, or route work to Codex
   cloud through this skill.
 
+## Capability lanes
+
+- **Ordinary:** research, review, edits, and narrow checks. Share the current
+  task worktree when safe and normally do not acquire a host lease.
+- **Heavy compute:** broad builds and repository gates. Use the `compute` lane
+  with `heavy` or `exclusive` mode.
+- **Browser auth:** work that needs the user's signed-in browser, a fixed port,
+  a dev server, or Chromium. Keep it on this machine, assign one owner, and use
+  the `browser-auth` lane. Use `exclusive` mode for a fixed-port or heavyweight
+  suite.
+- **Mac native:** Xcode, Simulator, Keychain, signed-app, or other macOS-only
+  work. Keep it on a Mac, assign one owner, and use the `mac-native` lane.
+
+The browser and Mac lanes each serialize their scarce capability while still
+sharing the weighted compute capacity. A nested wrapper must be covered by the
+outer lane; choose the top-level lane correctly instead of escalating it inside
+an existing lease.
+
+For non-interactive macOS and Linux runs, the wrapper supervises a dedicated
+child process group and forwards `HUP`, `INT`, `QUIT`, and `TERM` to the whole
+group. An interactive TTY preserves its controlling terminal and receives
+best-effort leader signaling so an intentional 2FA prompt still works. Do not
+detach a background server from scheduler custody.
+
 ## Resource modes
 
 Use `shared` for one narrow check, `heavy` for production builds and ordinary
 repository-wide checks, and `exclusive` for full monorepo validation, native
 packaging, capture hardware, or fixed-port browser suites.
+
+Submit `exclusive` work only after its inputs converge. Strict FIFO prevents
+starvation but can strand spare permits behind a waiting all-permit claim. If
+that happens ahead of a known finite shared/heavy backlog, only the exclusive
+claim's owner may cancel it before admission and requeue the identical command
+after the backlog drains. Never interrupt an admitted command just to reorder
+the queue, and never run its child outside the scheduler.
 
 Known mappings:
 
@@ -78,6 +123,15 @@ Known mappings:
 
 The wrapper runs the original public command unchanged. It does not substitute
 a weaker check.
+
+Each top-level scheduler attempt appends one bounded local telemetry record when
+storage is available. A pre-admission scheduler error or catchable cancellation
+has no admission timestamp or run duration; cancellation is recorded before the
+waiting claim is released. Records contain timestamps, lane, mode, safe label, program
+label, permit counts, queue and run durations, an exit class, a hashed workspace
+identifier, and a command digest. They never contain raw argv, environment
+values, paths, transcripts, reasoning, or tool output. Telemetry is best effort
+and never changes the child command's result.
 
 ## Host-access boundary
 
@@ -116,6 +170,20 @@ Use `--reuse --ttl-minutes=N` only for deterministic focused commands. Force a
 real run after relevant environment or external state changes. Failed commands
 are reported for diagnosis but never reused as success.
 
+## Complete-history CI
+
+A complete-history policy is not permission to fetch every live branch. Start
+from the exact governed SHA, disable credential persistence, and explicitly
+fetch only the fully qualified branch, tag, or exact-SHA refs the policy owns.
+Enumerate refs immediately afterward and reject any unexpected ref before the
+history scan. Keep `rev-list --all` or the repository's equivalent complete
+scan over that governed ref set.
+
+Use `hra-ci-ref-audit` as a conservative review aid. A broad fetch without a
+complete-history consumer is informational, and a complete-history consumer
+with an explicit governed ref set is compliant. Do not rewrite release history
+fetches mechanically; tags and the stable branch may both be required inputs.
+
 ## Cleanup safety
 
 Size is a discovery signal, not deletion authority. A removable worktree must
@@ -129,6 +197,13 @@ forces removal or deletes branches.
 Treat unregistered temporary directories, Codex transcripts, application
 databases, credentials, private corpora, archives, and dirty worktrees as user
 state. Never sweep a temporary-path prefix.
+
+At task closeout, record the applicable final branch, pull request, checks,
+merge, release, deployment, and production readback. Archive only a
+conclusively finished task; silence is not completion evidence. In the Codex
+app, archiving a completed managed-worktree task lets the app snapshot and
+reclaim its managed checkout. Permanent worktrees still require their own
+guarded cleanup.
 
 ## Machine standard
 

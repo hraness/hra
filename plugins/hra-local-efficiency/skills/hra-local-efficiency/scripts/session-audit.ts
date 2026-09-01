@@ -23,6 +23,7 @@ type ThreadRow = {
 };
 
 export type SessionThread = ThreadRow & {
+  readonly reviewKind: "pinned-review-candidate" | "review-candidate";
   readonly silentHours: number;
 };
 
@@ -49,6 +50,7 @@ function publicThread(row: ThreadRow, now: number): SessionThread {
     id: boundedSingleLine(row.id, 80),
     source: boundedSingleLine(row.source, sourceLimit),
     title: boundedSingleLine(row.title, titleLimit),
+    reviewKind: row.is_pinned === 0 ? "review-candidate" : "pinned-review-candidate",
     silentHours: Math.round((now - row.updated_at_ms) / 3_600_000 * 10) / 10,
   };
 }
@@ -89,20 +91,39 @@ export function auditSessions(options: SessionOptions, now = Date.now()): {
   readonly silent: readonly SessionThread[];
   readonly silentCount: number;
   readonly supportTaskCount: number;
+  readonly statusAuthority: "heuristic-only";
   readonly userTaskCount: number;
+  readonly version: 2;
 } {
   const path = join(options.codexHome, "state_5.sqlite");
   const database = new Database(path, { readonly: true, strict: true });
   try {
+    const columns = new Set(database.query<{ readonly name: string }, []>(
+      "PRAGMA table_info(threads)",
+    ).all().map((column) => column.name));
+    const supportPredicate = columns.has("thread_source")
+      ? `(COALESCE(thread_source, '') NOT IN ('', 'user') OR source LIKE '{"subagent":%')`
+      : `source LIKE '{"subagent":%'`;
+    const pinnedTerms = [
+      ...(columns.has("is_pinned") ? ["is_pinned = 1"] : []),
+      ...(columns.has("thread_section_id") ? ["thread_section_id IS NOT NULL"] : []),
+    ];
+    const pinnedPredicate = pinnedTerms.length === 0 ? "0" : `(${pinnedTerms.join(" OR ")})`;
+    const updatedExpression = columns.has("updated_at_ms")
+      ? "updated_at_ms"
+      : columns.has("updated_at") ? "updated_at * 1000" : null;
+    if (updatedExpression === null) throw new Error("threads table lacks an update timestamp");
+    const visiblePredicate = columns.has("preview") ? "preview <> ''" : "1 = 1";
+    const agentRoleExpression = columns.has("agent_role") ? "agent_role" : "NULL AS agent_role";
     const totals = database.query<{
       readonly support_count: number;
       readonly user_count: number;
     }, []>(
       `SELECT
-         COALESCE(SUM(CASE WHEN source LIKE '{"subagent":%' THEN 1 ELSE 0 END), 0) AS support_count,
-         COALESCE(SUM(CASE WHEN source LIKE '{"subagent":%' THEN 0 ELSE 1 END), 0) AS user_count
+         COALESCE(SUM(CASE WHEN ${supportPredicate} THEN 1 ELSE 0 END), 0) AS support_count,
+         COALESCE(SUM(CASE WHEN ${supportPredicate} THEN 0 ELSE 1 END), 0) AS user_count
        FROM threads
-       WHERE archived = 0 AND preview <> ''`,
+       WHERE archived = 0 AND ${visiblePredicate}`,
     ).get() ?? { support_count: 0, user_count: 0 };
     const cutoffMs = now - options.staleHours * 60 * 60_000;
     const counts = database.query<{
@@ -111,23 +132,23 @@ export function auditSessions(options: SessionOptions, now = Date.now()): {
     }, [number]>(
       `SELECT
          COUNT(*) AS count,
-         COALESCE(SUM(CASE WHEN thread_section_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS pinned_count
+         COALESCE(SUM(CASE WHEN ${pinnedPredicate} THEN 1 ELSE 0 END), 0) AS pinned_count
        FROM threads
        WHERE archived = 0
-         AND preview <> ''
-         AND source NOT LIKE '{"subagent":%'
-         AND updated_at_ms < ?`,
+         AND ${visiblePredicate}
+         AND NOT (${supportPredicate})
+         AND ${updatedExpression} < ?`,
     ).get(cutoffMs) ?? { count: 0, pinned_count: 0 };
     const rows = database.query<ThreadRow, [number, number]>(
-      `SELECT id, title, cwd, source, agent_role,
-              CASE WHEN thread_section_id IS NULL THEN 0 ELSE 1 END AS is_pinned,
-              updated_at_ms
+      `SELECT id, title, cwd, source, ${agentRoleExpression},
+              CASE WHEN ${pinnedPredicate} THEN 1 ELSE 0 END AS is_pinned,
+              ${updatedExpression} AS updated_at_ms
        FROM threads
        WHERE archived = 0
-         AND preview <> ''
-         AND source NOT LIKE '{"subagent":%'
-         AND updated_at_ms < ?
-       ORDER BY updated_at_ms ASC
+         AND ${visiblePredicate}
+         AND NOT (${supportPredicate})
+         AND ${updatedExpression} < ?
+       ORDER BY ${updatedExpression} ASC
        LIMIT ?`,
     ).all(cutoffMs, options.limit);
     return {
@@ -136,7 +157,9 @@ export function auditSessions(options: SessionOptions, now = Date.now()): {
       silent: rows.map((row) => publicThread(row, now)),
       silentCount: counts.count,
       supportTaskCount: totals.support_count,
+      statusAuthority: "heuristic-only",
       userTaskCount: totals.user_count,
+      version: 2,
     };
   } finally {
     database.close();
@@ -156,11 +179,13 @@ if (import.meta.main) {
       );
       for (const thread of result.silent) {
         console.log(
-          (thread.is_pinned === 0 ? "SILENT" : "PINNED-SILENT")
+          (thread.is_pinned === 0 ? "REVIEW-CANDIDATE" : "PINNED-REVIEW-CANDIDATE")
           + `\t${thread.silentHours}h\t${thread.id}\t${thread.cwd}\t${thread.title}`,
         );
       }
-      console.log("NOTE\tSilence is a review heuristic, not proof that a task is running or abandoned.");
+      console.log("NOTE\tSilence is a review heuristic, not proof that a task is running, terminal, or abandoned.");
+      console.log("NOTE\tSupport-task rows are historical coordination metadata, not proof of active compute.");
+      console.log("NOTE\tVerify authoritative app task status before archiving; this audit never mutates SQLite.");
     }
   } catch (error) {
     console.error(`[hra-session-audit] ${error instanceof Error ? error.message : String(error)}`);
