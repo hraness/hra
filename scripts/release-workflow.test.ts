@@ -383,8 +383,7 @@ describe("release workflow", () => {
     expect(scripts["hosted:domain-cutover"]).toBeUndefined();
     expect(scripts["release:candidate"]).toBeUndefined();
     expect(scripts["release:publish"]).toBeUndefined();
-    expect(scripts["release:canonical-alias"])
-      .toBe("bun ./scripts/current-project-alias-release.ts");
+    expect(scripts["release:canonical-alias"]).toBeUndefined();
     expect(domainRecord).toContain("HRA v0 status: retired on 2026-08-27.");
     expect(domainRecord).toContain("current-project-only");
     expect(domainRecord).toContain("HRA v0 is never a fallback");

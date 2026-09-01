@@ -54,7 +54,7 @@ Preflight and execution read the following state from the providers instead of t
 
 1. Convex management API readback must prove the plan's exact numeric team, project, production deployment ID, generated name, canonical URL, `isDefault: true`, and matching project `prodDeploymentName`. The protected Convex CLI config path is derived from the operating-system account record rather than inherited `HOME`; its held file must be current-user-owned, single-link, regular, mode `0600`, stable across the bounded read, and free of any Darwin extended ACL.
 2. Vercel project readback from `/v9/projects/prj_8ciIt9t9foE3utG45frRN7cxckjS` must return the exact project and team IDs and `autoAssignCustomDomains: false`.
-3. Vercel deployment readback from `/v13/deployments/<deployment-id>` must prove each exact deployment ID, automatic hostname, current project ID, and `READY` production state. The target always proves Vercel `source: "git"`, GitHub repository ID `1343008607`, `main` ref, and the plan commit. The source proves the same GitHub tuple unless the plan explicitly carries the closed CLI source provenance object; only then must it instead prove null `gitSource`, Vercel `source: "cli"`, exact actor `cursor-cli`, exact ref `HEAD`, empty root directory, and `meta.gitCommitSha` equal to the source commit in the plan.
+3. Vercel deployment readback from `/v13/deployments/<deployment-id>` must prove each exact deployment ID, automatic hostname, current project ID, and `READY` production state. The target always proves Vercel `source: "git"`, GitHub repository ID `1343008607`, `main` ref, and the plan commit. The source proves the same GitHub tuple unless the plan explicitly carries the closed CLI source provenance object; only then must it instead prove Vercel `source: "cli"`, exact actor `cursor-cli`, exact ref `HEAD`, empty root directory, and `meta.gitCommitSha` equal to the source commit in the plan. Vercel's live CLI-deployment shape omits `gitSource`; the parser normalizes only that omission or an explicit JSON `null` to the internal null value and still rejects every non-null lookalike.
 4. Authenticated alias readback from `/v4/aliases/hra.sh` must return one exact `(alias, projectId, deploymentId, deployment.id, deployment.url)` tuple matching the plan source or target. When the source uses the narrow CLI form, the same exact source tuple must still hold after the public marker read.
 5. Public `https://hra.sh/.well-known/hra.json` readback must be strict schema version 2, generation 1, product `HRA`, repository ID `1343008607`, path `hraness/hra`, version `0.1.0`, and the commit belonging to that exact alias tuple.
 
@@ -64,10 +64,10 @@ Provider output is parsed from `unknown`, bounded, and reduced to closed result 
 
 ## Read-only preflight
 
-Run preflight as the designated Darwin or Linux writer custodian from a clean checkout containing the reviewed operator. Open the reviewed Vercel session and fresh private plan on separate descriptors:
+Run preflight as the designated Darwin or Linux writer custodian from a clean checkout containing the reviewed operator. Invoke the Bun entry point directly and open the reviewed Vercel session and fresh private plan on separate descriptors. Do not put this descriptor-bearing command behind `bun run` or another package-script runner: Bun's package runner does not preserve arbitrary inherited descriptors reliably on Darwin.
 
 ```sh
-bun run release:canonical-alias preflight \
+bun ./scripts/current-project-alias-release.ts preflight \
   --vercel-auth-fd 3 \
   --plan-fd 4 \
   3</absolute/path/to/reviewed-vercel-auth.json \
@@ -83,7 +83,7 @@ A preflight is a point-in-time observation, not a provider lock. Execution repea
 After, and only after, the user separately confirms the exact UUID-bound record printed by preflight, pass that exact value as one quoted argument:
 
 ```sh
-bun run release:canonical-alias --execute \
+bun ./scripts/current-project-alias-release.ts --execute \
   --vercel-auth-fd 3 \
   --plan-fd 4 \
   --confirm-exact '<exact requiredConfirmation from the immediately preceding preflight>' \

@@ -178,7 +178,10 @@ const githubDeploymentReadbackSchema = deploymentReadbackBaseSchema.extend({
 });
 
 const currentCliDeploymentReadbackSchema = deploymentReadbackBaseSchema.extend({
-  gitSource: z.null(),
+  gitSource: z.preprocess(
+    (value) => value === undefined ? null : value,
+    z.null(),
+  ),
   meta: z.object({
     actor: z.literal("cursor-cli"),
     gitCommitRef: z.literal("HEAD"),
