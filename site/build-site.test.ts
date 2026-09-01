@@ -103,6 +103,7 @@ describe("static-site build", () => {
       "dist/site/reading/deepseek-harness/index.html",
       "dist/site/reading/headlong-microharness/index.html",
       "dist/site/reading/oracle-and-firm/index.html",
+      "dist/site/reading/hax/index.html",
       "dist/site/robots.txt",
       "dist/site/sitemap.xml",
       "dist/site/llms.txt",
@@ -248,6 +249,35 @@ describe("static-site build", () => {
     expect(deepseek).toContain('href="/reading/oracle-and-firm/"');
     expect(headlong).toContain('href="/reading/oracle-and-firm/"');
     expect(reading).toContain("A Codex account loop is an oracle thread, not a firm");
+    expect(reading).not.toContain("/reading/headlong-always-on-loop");
+    expect(reading).not.toContain("/reading/not-a-codex-tui");
+  });
+
+  test("lists the hax reading page in the built sitemap and llms index", async () => {
+    const root = await createFixtureRoot();
+    await buildSite({ check: false, repositoryRoot: root });
+    const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
+    const llms = await readFile(join(root, "dist/site/llms.txt"), "utf8");
+    const home = await readFile(join(root, "dist/site/index.html"), "utf8");
+    const reading = await readFile(
+      join(root, "dist/site/reading/hax/index.html"),
+      "utf8",
+    );
+    const deepseek = await readFile(
+      join(root, "dist/site/reading/deepseek-harness/index.html"),
+      "utf8",
+    );
+    const oracle = await readFile(
+      join(root, "dist/site/reading/oracle-and-firm/index.html"),
+      "utf8",
+    );
+
+    expect(sitemap).toContain("<loc>https://hra.sh/reading/hax/</loc>");
+    expect(llms).toContain("https://hra.sh/reading/hax/");
+    expect(home).toContain('href="/reading/hax/"');
+    expect(deepseek).toContain('href="/reading/hax/"');
+    expect(oracle).toContain('href="/reading/hax/"');
+    expect(reading).toContain("A terminal-native coding agent is not a Codex account loop");
     expect(reading).not.toContain("/reading/headlong-always-on-loop");
     expect(reading).not.toContain("/reading/not-a-codex-tui");
   });

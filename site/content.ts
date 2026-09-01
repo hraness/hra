@@ -221,7 +221,9 @@ export const deepseekHarnessReading: ReadingPage = {
         link("A microharness for persistence is not a Codex account loop", "/reading/headlong-microharness/"),
         text(" reads Headlong as a persistence design. "),
         link("A Codex account loop is an oracle thread, not a firm", "/reading/oracle-and-firm/"),
-        text(" reads the account loop as an oracle thread, not a firm of Explore and review sub-agents."),
+        text(" reads the account loop as an oracle thread, not a firm of Explore and review sub-agents. "),
+        link("A terminal-native coding agent is not a Codex account loop", "/reading/hax/"),
+        text(" reads hax as a Unix coding agent."),
       ),
       paragraph(
         text("When those Codex sessions need an attested web operation rather than a plugin slot, the "),
@@ -288,7 +290,9 @@ export const headlongMicroharnessReading: ReadingPage = {
         link("A plugin catalog is not a Codex account loop", "/reading/deepseek-harness/"),
         text(" reads DeepSeek Harness as a plugin-first design reference. This page reads Headlong as a persistence design. "),
         link("A Codex account loop is an oracle thread, not a firm", "/reading/oracle-and-firm/"),
-        text(" reads the account loop as an oracle thread, not a firm of Explore and review sub-agents."),
+        text(" reads the account loop as an oracle thread, not a firm of Explore and review sub-agents. "),
+        link("A terminal-native coding agent is not a Codex account loop", "/reading/hax/"),
+        text(" reads hax as a Unix coding agent."),
       ),
       paragraph(
         text("When those Codex sessions need an attested web operation rather than a thought stream, the "),
@@ -355,10 +359,86 @@ export const oracleAndFirmReading: ReadingPage = {
         link("A plugin catalog is not a Codex account loop", "/reading/deepseek-harness/"),
         text(" reads DeepSeek Harness as a plugin-first design reference. "),
         link("A microharness for persistence is not a Codex account loop", "/reading/headlong-microharness/"),
-        text(" reads Headlong as a persistence design. This page reads the oracle and the firm as a context strategy. None of these pages is another source's digest."),
+        text(" reads Headlong as a persistence design. "),
+        link("A terminal-native coding agent is not a Codex account loop", "/reading/hax/"),
+        text(" reads hax as a Unix coding agent. This page reads the oracle and the firm as a context strategy. None of these pages is another source's digest."),
       ),
       paragraph(
         text("When those Codex sessions need an attested web operation rather than a child summary, the "),
+        link("Wrench provider capabilities", "https://wrench.rip/provider-capabilities/"),
+        text(" table names the operations a session can call on purpose."),
+      ),
+    ],
+  },
+};
+
+export const haxReading: ReadingPage = {
+  canonicalPath: "/reading/hax/",
+  datePublished: "2026-09-01",
+  description:
+    "hax is a native C coding agent for the terminal. HRA is a Bun CLI and local daemon for isolated Codex accounts, live sessions, and optional encrypted sync.",
+  heading: "A terminal-native coding agent is not a Codex account loop",
+  title: "A terminal-native coding agent is not a Codex account loop",
+  homeLink: paragraph(
+    text("A sourced reading take: "),
+    link("A terminal-native coding agent is not a Codex account loop", "/reading/hax/"),
+    text(" reads hax as a Unix coding agent, not as HRA's isolated Codex account job."),
+  ),
+  section: {
+    id: "reading-hax",
+    heading: "A terminal-native coding agent is not a Codex account loop",
+    blocks: [
+      paragraph(text("Published 1 September 2026.")),
+      paragraph(
+        text("hax is a native C coding agent for the terminal. Oleksandr Chekhovskyi publishes it as a small binary that starts instantly, leaves memory for local models, and composes through subprocesses. HRA is a Bun CLI plus a local daemon. It keeps isolated Codex accounts, live sessions, and optional encrypted sync. A terminal-native coding agent is not multi-subscription Codex parallelism."),
+      ),
+      { kind: "subheading", text: "hax as published" },
+      paragraph(
+        text("The "),
+        link("hax site", "https://usehax.dev"),
+        text(" and the "),
+        link("hax repository", "https://github.com/OleksandrChekhovskyi/hax"),
+        text(" describe one native C binary with a small dependency set. Local llama.cpp and Ollama runtimes are first-class beside OpenAI, Anthropic, OpenRouter, and Codex. The interface streams Markdown without seizing the terminal. A transcript view shows the exact request and reply."),
+      ),
+      paragraph(
+        text("The "),
+        link("Reading digest", "https://hraness.com/reading/hax-a-minimalist-terminal-native-coding-agent"),
+        text(" records the same source as a gist. This page is the HRA take, not that digest."),
+      ),
+      { kind: "subheading", text: "A coding agent, not a control plane" },
+      paragraph(
+        text("HRA does not implement hax, wrap its C binary, or treat a local-model REPL as a Codex provider. The published design is worth reading because it keeps the agent small and pushes orchestration outside the process. It is not a product claim about this host."),
+      ),
+      paragraph(
+        text("hax is the writer in its own loop. HRA is not a coding agent. It owns isolated profiles, process generations, durable commands, local projections, optional encrypted sync, and recovery around already-selected Codex accounts. That is a control plane, not a second model loop."),
+      ),
+      { kind: "subheading", text: "What HRA keeps on this host" },
+      paragraph(
+        text("The live product page is "),
+        link("HRA on hra.sh", "https://hra.sh/"),
+        text(". HRA owns isolated profiles, process generations, durable commands, local projections, optional encrypted sync, and recovery. Codex app-server owns login, transcripts, turns, tools, and approvals. One machine remains the fenced execution custodian for a session. Other paired devices may read or submit durable commands. They do not become a second provider writer."),
+      ),
+      paragraph(
+        text("Several Codex accounts stay independent subscriptions. HRA does not pool quota or replay a failed turn under another account. That is the account loop this host publishes: named profiles, live sessions, and a local daemon. It is not a terminal-native coding agent."),
+      ),
+      { kind: "subheading", text: "The harness noun stays on its own host" },
+      paragraph(
+        link("What is an agent harness?", "https://hraness.com/writing/what-is-an-agent-harness"),
+        text(" defines the noun and points at live surfaces. "),
+        link("Direct, Wrench, and Hra", "https://hraness.com/writing/direct-wrench-hra"),
+        text(" keeps the product split off this host: Direct owns application state, Wrench owns attested web operations, and Hra owns multi-subscription Codex parallelism. This generation-1 site publishes the Bun CLI and daemon that keep those isolated Codex accounts. It does not republish the comparison essay."),
+      ),
+      paragraph(
+        text("A sourced reading take: "),
+        link("A plugin catalog is not a Codex account loop", "/reading/deepseek-harness/"),
+        text(" reads DeepSeek Harness as a plugin-first design reference. "),
+        link("A Codex account loop is an oracle thread, not a firm", "/reading/oracle-and-firm/"),
+        text(" reads the account loop as an oracle thread, not a firm of Explore and review sub-agents. "),
+        link("A microharness for persistence is not a Codex account loop", "/reading/headlong-microharness/"),
+        text(" reads Headlong as a persistence design. This page reads hax as a Unix coding agent. None of these pages is another source's digest."),
+      ),
+      paragraph(
+        text("When those Codex sessions need an attested web operation rather than a local-model REPL, the "),
         link("Wrench provider capabilities", "https://wrench.rip/provider-capabilities/"),
         text(" table names the operations a session can call on purpose."),
       ),
@@ -370,6 +450,7 @@ export const readingPages: readonly ReadingPage[] = [
   deepseekHarnessReading,
   headlongMicroharnessReading,
   oracleAndFirmReading,
+  haxReading,
 ];
 
 export const siteDocumentPaths: readonly string[] = [

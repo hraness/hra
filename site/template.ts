@@ -9,6 +9,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   deepseekHarnessReading,
   findSection,
+  haxReading,
   headlongMicroharnessReading,
   oracleAndFirmReading,
   publicContent,
@@ -433,7 +434,7 @@ export const renderReadingIndexHtml = (
 <head>
 ${renderHead(content, {
   canonicalPath: "/reading/",
-  description: "Sourced HRA reading notes about persistent agent harnesses, plugin catalogs, and isolated Codex account loops.",
+  description: "Sourced HRA reading notes about adjacent agent designs, plugin catalogs, and isolated Codex account loops.",
   title: `Reading | ${content.productName}`,
 })}
 </head>
@@ -443,7 +444,7 @@ ${renderHead(content, {
   <p><a href="/">← ${escapeHtml(content.productName)}</a></p>
   <header>
     <h1>Reading</h1>
-    <p>Sourced notes on adjacent agent-harness designs and the boundary HRA keeps.</p>
+    <p>Sourced notes on adjacent agent designs and the boundary HRA keeps.</p>
   </header>
   <div class="reading-grid">${renderReadingCards()}</div>
 </main>
@@ -465,3 +466,7 @@ export const renderHeadlongMicroharnessReadingHtml = (
 export const renderOracleAndFirmReadingHtml = (
   content: PublicContent = publicContent,
 ): string => renderReadingHtml(oracleAndFirmReading, content);
+
+export const renderHaxReadingHtml = (
+  content: PublicContent = publicContent,
+): string => renderReadingHtml(haxReading, content);
