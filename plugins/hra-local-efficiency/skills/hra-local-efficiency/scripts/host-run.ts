@@ -3,8 +3,10 @@
 import { spawn } from "node:child_process";
 import {
   existsSync,
+  fstatSync,
+  readSync,
 } from "node:fs";
-import { availableParallelism, homedir } from "node:os";
+import { availableParallelism, constants as osConstants, homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
@@ -13,6 +15,7 @@ import {
   commandProgramLabel,
   containsControlCharacters,
   requireOperationLabel,
+  sha256,
 } from "./shared";
 import {
   appendThroughputEvent,
@@ -49,7 +52,10 @@ type HostResourceCoordinator = {
   withLease<T>(
     claims: readonly { readonly resource: string; readonly amount: number }[],
     callback: (lease: HostResourceLease) => T | Promise<T>,
-    options?: { readonly waitTimeoutMilliseconds?: number },
+    options?: {
+      readonly signal?: AbortSignal;
+      readonly waitTimeoutMilliseconds?: number;
+    },
   ): Promise<T>;
 };
 
@@ -243,6 +249,7 @@ function spawnCommand(
         ? "inherit"
         : ["inherit", "inherit", "inherit", ...inheritedLeaseDescriptors],
     });
+    let forcedCleanup: ReturnType<typeof setTimeout> | undefined;
     const signalChildTree = (signal: NodeJS.Signals): void => {
       if (child.pid === undefined) return;
       try {
@@ -262,8 +269,26 @@ function spawnCommand(
         }
       }
     };
+    const processGroupExists = (): boolean => {
+      if (!ownsProcessGroup || child.pid === undefined) return false;
+      try {
+        process.kill(-child.pid, 0);
+        return true;
+      } catch (error: unknown) {
+        if (
+          typeof error === "object"
+          && error !== null
+          && "code" in error
+          && error.code === "ESRCH"
+        ) return false;
+        return true;
+      }
+    };
     const forward = (signal: NodeJS.Signals): void => {
       signalChildTree(signal);
+      if (ownsProcessGroup && forcedCleanup === undefined) {
+        forcedCleanup = setTimeout(() => signalChildTree("SIGKILL"), 750);
+      }
     };
     const forwardedSignals = ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"] as const;
     for (const signal of forwardedSignals) process.on(signal, forward);
@@ -272,20 +297,55 @@ function spawnCommand(
     };
     child.once("error", (error) => {
       removeSignalHandlers();
+      if (forcedCleanup !== undefined) clearTimeout(forcedCleanup);
       reject(error);
     });
     child.once("exit", (code, signal) => {
       removeSignalHandlers();
-      if (ownsProcessGroup) signalChildTree("SIGTERM");
-      resolveExit(code ?? (signal === null ? 1 : 128));
+      if (forcedCleanup !== undefined) clearTimeout(forcedCleanup);
+      void (async () => {
+        if (processGroupExists()) {
+          signalChildTree("SIGTERM");
+          for (let attempt = 0; attempt < 10 && processGroupExists(); attempt += 1) {
+            await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+          }
+          if (processGroupExists()) signalChildTree("SIGKILL");
+        }
+        resolveExit(code ?? (signal === null ? 1 : signalExitCode(signal)));
+      })().catch(reject);
     });
   });
 }
 
 type InheritedLease = {
+  readonly capacity: number;
   readonly lane: CapabilityLane;
   readonly mode: ResourceMode;
+  readonly permits: number;
 };
+
+function hasExactKeys(value: Readonly<Record<string, unknown>>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
+}
+
+function parsedLeaseMode(value: unknown): ResourceMode | null {
+  return value === "shared" || value === "heavy" || value === "exclusive" ? value : null;
+}
+
+function parsedLeaseCapacity(value: unknown): number | null {
+  return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= 4
+    ? Number(value)
+    : null;
+}
+
+function expectedPermits(mode: ResourceMode, capacity: number): number {
+  if (mode === "shared") return 1;
+  if (mode === "heavy") return Math.min(2, capacity);
+  return capacity;
+}
 
 export function parseInheritedLease(value: string): InheritedLease {
   let parsed: unknown;
@@ -299,14 +359,149 @@ export function parseInheritedLease(value: string): InheritedLease {
   }
   const record = parsed as Record<string, unknown>;
   if (record.version === 1) {
-    return { lane: "compute", mode: "exclusive" };
+    if (!hasExactKeys(record, ["capacity", "label", "mode", "permits", "version"])) {
+      throw new Error("inherited HRA local-efficiency lease is malformed");
+    }
+    const capacity = parsedLeaseCapacity(record.capacity);
+    const mode = parsedLeaseMode(record.mode);
+    if (
+      capacity === null
+      || mode === null
+      || record.permits !== expectedPermits(mode, capacity)
+      || typeof record.label !== "string"
+    ) throw new Error("inherited HRA local-efficiency lease is malformed");
+    requireOperationLabel(record.label, "inherited lease label");
+    return { capacity, lane: "compute", mode, permits: record.permits };
   }
   if (
-    record.version !== 2
+    !hasExactKeys(record, ["capacity", "label", "lane", "mode", "permits", "version"])
+    || record.version !== 2
     || (record.lane !== "compute" && record.lane !== "browser-auth" && record.lane !== "mac-native")
-    || (record.mode !== "shared" && record.mode !== "heavy" && record.mode !== "exclusive")
+    || parsedLeaseMode(record.mode) === null
+    || parsedLeaseCapacity(record.capacity) === null
+    || typeof record.label !== "string"
   ) throw new Error("inherited HRA local-efficiency lease is malformed");
-  return { lane: record.lane, mode: record.mode };
+  const capacity = parsedLeaseCapacity(record.capacity);
+  const mode = parsedLeaseMode(record.mode);
+  if (
+    capacity === null
+    || mode === null
+    || record.permits !== expectedPermits(mode, capacity)
+  ) throw new Error("inherited HRA local-efficiency lease is malformed");
+  requireOperationLabel(record.label, "inherited lease label");
+  return { capacity, lane: record.lane, mode, permits: record.permits };
+}
+
+type InheritedMarker = {
+  readonly claims: readonly { readonly amount: number; readonly resource: string }[];
+  readonly owner: string;
+  readonly phase: "A";
+  readonly profileSha256: string;
+  readonly ticket: string;
+  readonly version: 1;
+};
+
+function inheritedMarker(descriptor: number): InheritedMarker {
+  let metadata;
+  try {
+    metadata = fstatSync(descriptor);
+  } catch {
+    throw new Error("inherited HRA local-efficiency lease descriptor is unavailable");
+  }
+  const owned = process.getuid === undefined || metadata.uid === process.getuid();
+  if (
+    !metadata.isFile()
+    || metadata.nlink !== 1
+    || !owned
+    || (metadata.mode & 0o777) !== 0o600
+    || metadata.size < 1
+    || metadata.size > 4_096
+  ) throw new Error("inherited HRA local-efficiency lease descriptor is invalid");
+  const bytes = Buffer.alloc(metadata.size);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset);
+    if (count === 0) break;
+    offset += count;
+  }
+  if (offset !== bytes.length) {
+    throw new Error("inherited HRA local-efficiency lease descriptor is incomplete");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8")) as unknown;
+  } catch {
+    throw new Error("inherited HRA local-efficiency lease descriptor is malformed");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("inherited HRA local-efficiency lease descriptor is malformed");
+  }
+  const record = parsed as Record<string, unknown>;
+  if (
+    !hasExactKeys(record, ["claims", "owner", "phase", "profileSha256", "ticket", "version"])
+    || record.version !== 1
+    || record.phase !== "A"
+    || typeof record.owner !== "string"
+    || !/^[0-9a-f]{32}$/u.test(record.owner)
+    || typeof record.ticket !== "string"
+    || !/^[1-9][0-9]{0,19}$/u.test(record.ticket)
+    || typeof record.profileSha256 !== "string"
+    || !/^[0-9a-f]{64}$/u.test(record.profileSha256)
+    || !Array.isArray(record.claims)
+  ) throw new Error("inherited HRA local-efficiency lease descriptor is malformed");
+  return parsed as InheritedMarker;
+}
+
+function expectedProfileDigest(profile: {
+  readonly capacities: readonly { readonly limit: number; readonly resource: string }[];
+  readonly id: string;
+}): string {
+  return sha256(JSON.stringify(profile));
+}
+
+function assertMarker(
+  descriptor: number,
+  profileDigest: string,
+  claims: readonly { readonly amount: number; readonly resource: string }[],
+): void {
+  const marker = inheritedMarker(descriptor);
+  if (
+    marker.profileSha256 !== profileDigest
+    || JSON.stringify(marker.claims) !== JSON.stringify(claims)
+  ) throw new Error("inherited HRA local-efficiency lease descriptor does not cover this request");
+}
+
+function assertInheritedLeaseDescriptors(inherited: InheritedLease): void {
+  if (inherited.capacity !== permitCapacity()) {
+    throw new Error("inherited HRA local-efficiency lease capacity changed");
+  }
+  let descriptor = 3;
+  if (inherited.lane !== "compute") {
+    assertMarker(
+      descriptor,
+      expectedProfileDigest({
+        id: "hra.local-efficiency/capabilities-v1",
+        capacities: [
+          { resource: "browser-auth", limit: 1 },
+          { resource: "mac-native", limit: 1 },
+        ],
+      }),
+      [{ resource: inherited.lane, amount: 1 }],
+    );
+    descriptor += 1;
+  }
+  assertMarker(
+    descriptor,
+    expectedProfileDigest({
+      id: `hra.local-efficiency/v1-${inherited.capacity}`,
+      capacities: [{ resource: "cpu", limit: inherited.capacity }],
+    }),
+    [{ resource: "cpu", amount: inherited.permits }],
+  );
+}
+
+function signalExitCode(signal: NodeJS.Signals): number {
+  return 128 + osConstants.signals[signal];
 }
 
 function modeRank(mode: ResourceMode): number {
@@ -360,34 +555,13 @@ export async function runHostCommand(options: HostRunOptions): Promise<number> {
     if (!inheritedLeaseCovers(inherited, options)) {
       throw new Error("nested hra-host-run cannot escalate its outer mode or capability lane");
     }
+    assertInheritedLeaseDescriptors(inherited);
     return spawnCommand(options.command, options.cwd, environment);
   }
   const capacity = permitCapacity();
   const permitCount = permitsForMode(options.mode);
   const stateRoot = options.stateRoot
     ?? resolveHostResourceStateRoot(environment);
-  const module = await hostResourceModule(environment);
-  const cpuCoordinator = module.createHostResourceCoordinator({
-    profile: {
-      id: `hra.local-efficiency/v1-${capacity}`,
-      capacities: [{ resource: "cpu", limit: capacity }],
-    },
-    stateRoot,
-    waitTimeoutMilliseconds: 24 * 60 * 60_000,
-  });
-  const capabilityCoordinator = options.lane === "compute"
-    ? null
-    : module.createHostResourceCoordinator({
-      profile: {
-        id: "hra.local-efficiency/capabilities-v1",
-        capacities: [
-          { resource: "browser-auth", limit: 1 },
-          { resource: "mac-native", limit: 1 },
-        ],
-      },
-      stateRoot: resolveCapabilityStateRoot(stateRoot),
-      waitTimeoutMilliseconds: 24 * 60 * 60_000,
-    });
   const queuedAtMonotonic = performance.now();
   const queuedAt = new Date();
   console.error(
@@ -403,7 +577,7 @@ export async function runHostCommand(options: HostRunOptions): Promise<number> {
   const digest = commandDigest(options.command, scope);
   const telemetryRoot = throughputTelemetryRoot(stateRoot);
   const record = (
-    outcome: "fail" | "pass" | "scheduler-error" | "spawn-error",
+    outcome: "canceled" | "fail" | "pass" | "scheduler-error" | "spawn-error",
     exitCode: number | null,
   ): void => {
     if (execution.recorded) return;
@@ -436,57 +610,99 @@ export async function runHostCommand(options: HostRunOptions): Promise<number> {
       console.error("[hra-host-run] throughput telemetry unavailable");
     }
   };
-  const runWithCpu = async (outerDescriptors: readonly number[]): Promise<number> => {
-    return cpuCoordinator.withLease(
-      [{ resource: "cpu", amount: permitCount }],
-      async (lease) => {
-        execution.admittedAt = new Date();
-        execution.runStartedAt = performance.now();
-        const waitedSeconds = (execution.runStartedAt - queuedAtMonotonic) / 1_000;
-        console.error(
-          `[hra-host-run] admitted ${options.label} after ${waitedSeconds.toFixed(1)}s`,
-        );
-        const childEnvironment = {
-          ...environment,
-          HRA_LOCAL_EFFICIENCY_LEASE: JSON.stringify({
-            capacity,
-            label: options.label,
-            lane: options.lane,
-            mode: options.mode,
-            permits: permitCount,
-            version: 2,
-          }),
-        };
-        try {
-          const exitCode = await spawnCommand(
-            options.command,
-            options.cwd,
-            childEnvironment,
-            [...outerDescriptors, lease.inheritedFileDescriptor],
-          );
-          record(exitCode === 0 ? "pass" : "fail", exitCode);
-          return exitCode;
-        } catch (error: unknown) {
-          record("spawn-error", null);
-          throw error;
-        }
-      },
-      { waitTimeoutMilliseconds: 24 * 60 * 60_000 },
-    );
+  const cancellation = new AbortController();
+  const cancellationState: { signal: NodeJS.Signals | null } = { signal: null };
+  const cancel = (signal: NodeJS.Signals): void => {
+    if (cancellationState.signal !== null) return;
+    cancellationState.signal = signal;
+    cancellation.abort();
+    record("canceled", signalExitCode(signal));
   };
+  const cancellationSignals = ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"] as const;
+  for (const signal of cancellationSignals) process.on(signal, cancel);
   try {
+    const module = await hostResourceModule(environment);
+    const cpuCoordinator = module.createHostResourceCoordinator({
+      profile: {
+        id: `hra.local-efficiency/v1-${capacity}`,
+        capacities: [{ resource: "cpu", limit: capacity }],
+      },
+      stateRoot,
+      waitTimeoutMilliseconds: 24 * 60 * 60_000,
+    });
+    const capabilityCoordinator = options.lane === "compute"
+      ? null
+      : module.createHostResourceCoordinator({
+        profile: {
+          id: "hra.local-efficiency/capabilities-v1",
+          capacities: [
+            { resource: "browser-auth", limit: 1 },
+            { resource: "mac-native", limit: 1 },
+          ],
+        },
+        stateRoot: resolveCapabilityStateRoot(stateRoot),
+        waitTimeoutMilliseconds: 24 * 60 * 60_000,
+      });
+    if (cancellationState.signal !== null) return signalExitCode(cancellationState.signal);
+    const runWithCpu = async (outerDescriptors: readonly number[]): Promise<number> => {
+      return cpuCoordinator.withLease(
+        [{ resource: "cpu", amount: permitCount }],
+        async (lease) => {
+          execution.admittedAt = new Date();
+          execution.runStartedAt = performance.now();
+          const waitedSeconds = (execution.runStartedAt - queuedAtMonotonic) / 1_000;
+          console.error(
+            `[hra-host-run] admitted ${options.label} after ${waitedSeconds.toFixed(1)}s`,
+          );
+          const childEnvironment = {
+            ...environment,
+            HRA_LOCAL_EFFICIENCY_LEASE: JSON.stringify({
+              capacity,
+              label: options.label,
+              lane: options.lane,
+              mode: options.mode,
+              permits: permitCount,
+              version: 2,
+            }),
+          };
+          try {
+            const exitCode = await spawnCommand(
+              options.command,
+              options.cwd,
+              childEnvironment,
+              [...outerDescriptors, lease.inheritedFileDescriptor],
+            );
+            record(exitCode === 0 ? "pass" : "fail", exitCode);
+            return exitCode;
+          } catch (error: unknown) {
+            record("spawn-error", null);
+            throw error;
+          }
+        },
+        {
+          signal: cancellation.signal,
+          waitTimeoutMilliseconds: 24 * 60 * 60_000,
+        },
+      );
+    };
     if (capabilityCoordinator === null) return await runWithCpu([]);
     return await capabilityCoordinator.withLease(
       [{ resource: options.lane, amount: 1 }],
       (lease) => runWithCpu([lease.inheritedFileDescriptor]),
-      { waitTimeoutMilliseconds: 24 * 60 * 60_000 },
+      {
+        signal: cancellation.signal,
+        waitTimeoutMilliseconds: 24 * 60 * 60_000,
+      },
     );
   } catch (error: unknown) {
+    if (cancellationState.signal !== null) return signalExitCode(cancellationState.signal);
     record("scheduler-error", null);
     if (execution.admittedAt === null && permissionBoundaryDenied(error)) {
       throw new HostAccessRequiredError();
     }
     throw error;
+  } finally {
+    for (const signal of cancellationSignals) process.off(signal, cancel);
   }
 }
 

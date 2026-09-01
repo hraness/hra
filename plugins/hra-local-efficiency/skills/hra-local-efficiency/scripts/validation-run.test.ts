@@ -44,6 +44,35 @@ function fixture(): string {
   return root;
 }
 
+function validationEnvironment(): NodeJS.ProcessEnv {
+  const root = mkdtempSync(join(tmpdir(), "hra-validation-scheduler-"));
+  temporary.push(root);
+  const modulePath = join(root, "host-resources.js");
+  writeFileSync(modulePath, `
+    import { closeSync, openSync } from "node:fs";
+    export function createHostResourceCoordinator() {
+      return {
+        async withLease(_claims, callback) {
+          const descriptor = openSync("/dev/null", "r");
+          try {
+            return await callback({ inheritedFileDescriptor: descriptor });
+          } finally {
+            closeSync(descriptor);
+          }
+        },
+      };
+    }
+  `);
+  const environment: NodeJS.ProcessEnv = {
+    ...process.env,
+    HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+    HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
+    HRA_LOCAL_EFFICIENCY_TELEMETRY: "off",
+  };
+  delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
+  return environment;
+}
+
 describe("validation receipts", () => {
   test("requires explicit argv boundaries and validates reuse controls", () => {
     expect(() => parseValidationArguments(["bun", "test"]))
@@ -202,10 +231,7 @@ describe("validation receipts", () => {
       "await Bun.write('tracked.txt', 'changed by validation\\n')",
     ]);
     const before = validationFingerprint(root, options.command, options.contexts);
-    expect(await runValidation(options, root, {
-      ...process.env,
-      HRA_LOCAL_EFFICIENCY_LEASE: '{"version":1}',
-    })).toBe(0);
+    expect(await runValidation(options, root, validationEnvironment())).toBe(0);
     expect(existsSync(validationReceiptPath(before))).toBe(false);
   });
 
@@ -226,10 +252,7 @@ describe("validation receipts", () => {
       lines.push(String(value));
     });
     try {
-      expect(await runValidation(options, root, {
-        ...process.env,
-        HRA_LOCAL_EFFICIENCY_LEASE: '{"version":1}',
-      })).toBe(0);
+      expect(await runValidation(options, root, validationEnvironment())).toBe(0);
     } finally {
       log.mockRestore();
     }
@@ -256,10 +279,7 @@ describe("validation receipts", () => {
     ]);
     const fingerprint = validationFingerprint(root, options.command, options.contexts);
     const path = validationReceiptPath(fingerprint);
-    const environment = {
-      ...process.env,
-      HRA_LOCAL_EFFICIENCY_LEASE: '{"version":1}',
-    };
+    const environment = validationEnvironment();
     expect(await runValidation(options, root, environment)).toBe(0);
     const safe = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     const sentinel = "foreign-receipt-secret";
@@ -299,10 +319,7 @@ describe("validation receipts", () => {
       "-e",
       `const path=${JSON.stringify(counter)}; const current=await Bun.file(path).exists()?Number(await Bun.file(path).text()):0; await Bun.write(path,String(current+1));`,
     ]);
-    const environment = {
-      ...process.env,
-      HRA_LOCAL_EFFICIENCY_LEASE: '{"version":1}',
-    };
+    const environment = validationEnvironment();
     const lines: string[] = [];
     const log = spyOn(console, "log").mockImplementation((value?: unknown) => {
       lines.push(String(value));
@@ -341,10 +358,7 @@ describe("validation receipts", () => {
       "--",
       ...command,
     ]);
-    const environment = {
-      ...process.env,
-      HRA_LOCAL_EFFICIENCY_LEASE: '{"version":1}',
-    };
+    const environment = validationEnvironment();
     expect(await runValidation(long, root, environment)).toBe(0);
     const path = validationReceiptPath(validationFingerprint(root, command, []));
     const receipt = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;

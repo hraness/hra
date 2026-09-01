@@ -125,8 +125,9 @@ The wrapper runs the original public command unchanged. It does not substitute
 a weaker check.
 
 Each top-level scheduler attempt appends one bounded local telemetry record when
-storage is available. A pre-admission scheduler error has no admission timestamp
-or run duration. Records contain timestamps, lane, mode, safe label, program
+storage is available. A pre-admission scheduler error or catchable cancellation
+has no admission timestamp or run duration; cancellation is recorded before the
+waiting claim is released. Records contain timestamps, lane, mode, safe label, program
 label, permit counts, queue and run durations, an exit class, a hashed workspace
 identifier, and a command digest. They never contain raw argv, environment
 values, paths, transcripts, reasoning, or tool output. Telemetry is best effort

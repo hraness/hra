@@ -128,6 +128,7 @@ export function buildThroughputReport(
   now = new Date(),
 ): ThroughputReport {
   const outcomes: Record<ThroughputEvent["outcome"], number> = {
+    canceled: 0,
     fail: 0,
     pass: 0,
     "scheduler-error": 0,
@@ -203,6 +204,7 @@ export function printThroughputReport(report: ThroughputReport, json: boolean): 
   console.log(
     `THROUGHPUT\tevents=${report.eventCount}\tdays=${report.days}`
     + `\tpass=${report.outcomes.pass}\tfail=${report.outcomes.fail}`
+    + `\tcanceled=${report.outcomes.canceled}`
     + `\tqueue-p95=${seconds(report.queueMilliseconds.p95)}`
     + `\trun-p95=${seconds(report.runMilliseconds.p95)}`
     + `\tmax-concurrent=${report.maxConcurrentRuns}`,

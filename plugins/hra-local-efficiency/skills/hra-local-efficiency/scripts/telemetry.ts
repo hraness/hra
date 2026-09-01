@@ -16,7 +16,7 @@ import { join, resolve } from "node:path";
 import { command, requireOperationLabel, sha256 } from "./shared";
 import type { CapabilityLane, ResourceMode } from "./host-run";
 
-export type ThroughputOutcome = "fail" | "pass" | "scheduler-error" | "spawn-error";
+export type ThroughputOutcome = "canceled" | "fail" | "pass" | "scheduler-error" | "spawn-error";
 
 export type ThroughputEvent = {
   readonly admittedAt: string | null;
@@ -161,7 +161,8 @@ export function validateThroughputEvent(value: unknown): ThroughputEvent {
     throw new Error("throughput event mode is invalid");
   }
   if (
-    record.outcome !== "pass"
+    record.outcome !== "canceled"
+    && record.outcome !== "pass"
     && record.outcome !== "fail"
     && record.outcome !== "spawn-error"
     && record.outcome !== "scheduler-error"

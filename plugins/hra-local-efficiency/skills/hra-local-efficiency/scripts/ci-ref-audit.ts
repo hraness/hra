@@ -144,6 +144,25 @@ function broadCheckout(step: Record<string, unknown>): boolean {
   return text(with_["fetch-depth"]) === "0";
 }
 
+function fetchCommands(scripts: string): string[] {
+  const normalized = scripts.replace(/\\\r?\n\s*/gu, " ");
+  return [...normalized.matchAll(/\bgit\s+fetch\b[^\n;]*/gu)]
+    .map((match) => match[0].trim())
+    .filter((value) => value !== "");
+}
+
+function governedFetch(command: string): boolean {
+  const unbounded = /(?:^|\s)--(?:all|mirror|prune-tags|tags)(?:\s|$)/u.test(command)
+    || /refs\/(?:heads|tags)\/\*/u.test(command)
+    || /:\S*\*/u.test(command);
+  const explicitDestination = /(?:^|\s)["']?\+(?:\$[A-Z_]+|refs\/(?:heads|tags)\/\$[A-Z_]+):refs\/(?:remotes|tags)\//u
+    .test(command);
+  const sourceOnlyFetchHead = /\borigin\s+["']?\$[A-Za-z_][A-Za-z0-9_]*["']?\s*$/u.test(command);
+  return !unbounded
+    && /(?:^|\s)--no-tags(?:\s|$)/u.test(command)
+    && (explicitDestination || sourceOnlyFetchHead);
+}
+
 export function classifyCiJob(input: {
   readonly completeHistoryConsumer: boolean;
   readonly job: Record<string, unknown>;
@@ -154,9 +173,10 @@ export function classifyCiJob(input: {
   const parsedSteps = steps.map((step, index) => record(step, `workflow step ${index}`));
   const checkout = parsedSteps.find((step) => /(?:^|\/)actions\/checkout@/u.test(text(step.uses)));
   const scripts = parsedSteps.map((step) => text(step.run)).filter((value) => value !== "").join("\n");
-  const fetchAll = /\bgit\s+fetch\b[^\n]{0,240}(?:\s--all(?:\s|$)|refs\/heads\/\*)/u.test(scripts);
+  const fetches = fetchCommands(scripts);
+  const unsafeFetch = fetches.some((command) => !governedFetch(command));
   const directCompleteScan = /\bgit\s+(?:rev-list|log|grep)\b[^\n]{0,240}\s--all(?:\s|$)/u.test(scripts);
-  if (fetchAll) return { kind: "unsafe", reasons: ["job fetches an unbounded ref set"] };
+  if (unsafeFetch) return { kind: "unsafe", reasons: ["job fetches a ref set that is not explicitly governed"] };
   if (checkout === undefined) {
     return input.completeHistoryConsumer && directCompleteScan
       ? { kind: "review", reasons: ["complete-history scan has no auditable checkout step"] }
@@ -174,13 +194,21 @@ export function classifyCiJob(input: {
   if (!input.completeHistoryConsumer && !directCompleteScan) {
     return { kind: "not-applicable", reasons: ["no complete-history consumer detected"] };
   }
-  const governedFetch = /\bgit\s+fetch\b/u.test(scripts)
-    && /(?:--unshallow|--depth)/u.test(scripts)
-    && /\+(?:\$[A-Z_]+|refs\/(?:heads|tags)\/\$[A-Z_]+):refs\//u.test(scripts)
-    && !/refs\/(?:heads|tags)\/\*/u.test(scripts);
+  const governedHistoryFetch = fetches.length > 0
+    && fetches.every((command) => governedFetch(command))
+    && /(?:--unshallow|--depth)/u.test(scripts);
   const enumeratesRefs = /git\s+for-each-ref\b/u.test(scripts);
-  const rejectsUnexpected = /Unexpected ref|unexpected ref/u.test(scripts);
-  if (exactCheckout(checkout) && governedFetch && enumeratesRefs && rejectsUnexpected) {
+  const rejectsUnexpected = /\*\)[\s\S]{0,240}(?:Unexpected ref|unexpected ref)[^\n]*\n\s*exit\s+1\b[\s\S]{0,80};;[\s\S]{0,80}esac/u
+    .test(scripts);
+  const countsRefs = /git\s+for-each-ref\b[^\n]{0,240}\|\s*wc\s+-l[^\n]{0,160}=\s*"[0-9]+"/u
+    .test(scripts);
+  if (
+    exactCheckout(checkout)
+    && governedHistoryFetch
+    && enumeratesRefs
+    && rejectsUnexpected
+    && countsRefs
+  ) {
     return {
       kind: "governed",
       reasons: ["exact shallow checkout expands only explicit refs and rejects unexpected refs"],

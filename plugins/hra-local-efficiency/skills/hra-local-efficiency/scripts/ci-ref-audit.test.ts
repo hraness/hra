@@ -46,11 +46,61 @@ describe("CI ref audit", () => {
         }, {
           run: `git fetch --force --no-tags --unshallow origin \\
             "+$VERIFIED_SHA:refs/remotes/ci/verified"
+            while IFS= read -r ci_ref; do
+              case "$ci_ref" in
+                refs/remotes/ci/verified) ;;
+                *)
+                  echo "Unexpected ref"
+                  exit 1
+                  ;;
+              esac
+            done < <(git for-each-ref --format='%(refname)')
+            test "$(git for-each-ref --format='%(refname)' | wc -l | tr -d ' ')" = "1"
+            git fetch --force --no-tags origin "$remote_main"`,
+        }],
+      },
+    }).kind).toBe("governed");
+
+    expect(classifyCiJob({
+      completeHistoryConsumer: true,
+      job: {
+        steps: [{
+          uses: "actions/checkout@sha",
+          with: {
+            "fetch-depth": 1,
+            "fetch-tags": false,
+            "persist-credentials": false,
+            ref: "${{ github.sha }}",
+          },
+        }, {
+          run: `git fetch --force --no-tags --unshallow origin \\
+            "+$VERIFIED_SHA:refs/remotes/ci/verified"
+            git fetch origin --tags
             git for-each-ref --format='%(refname)'
             echo "Unexpected ref"`,
         }],
       },
-    }).kind).toBe("governed");
+    }).kind).toBe("unsafe");
+
+    expect(classifyCiJob({
+      completeHistoryConsumer: true,
+      job: {
+        steps: [{
+          uses: "actions/checkout@sha",
+          with: {
+            "fetch-depth": 1,
+            "fetch-tags": false,
+            "persist-credentials": false,
+            ref: "${{ github.sha }}",
+          },
+        }, {
+          run: `git fetch --force --no-tags --unshallow origin \\
+            "+$VERIFIED_SHA:refs/remotes/ci/verified"
+            git for-each-ref --format='%(refname)'
+            echo "Unexpected ref"`,
+        }],
+      },
+    }).kind).toBe("review");
 
     expect(classifyCiJob({
       completeHistoryConsumer: false,

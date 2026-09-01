@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -103,18 +110,38 @@ describe("host-wide resource wrapper", () => {
     expect(capabilityPlatformSupported("browser-auth", "linux")).toBe(true);
   });
 
-  test("allows legacy nesting but rejects new mode and capability escalation", () => {
-    expect(inheritedLeaseCovers(parseInheritedLease('{"version":1}'), {
+  test("validates inherited lease metadata and rejects mode or capability escalation", () => {
+    expect(inheritedLeaseCovers(parseInheritedLease(JSON.stringify({
+      capacity: 4,
+      label: "legacy",
+      mode: "exclusive",
+      permits: 4,
+      version: 1,
+    })), {
       lane: "compute",
       mode: "exclusive",
     })).toBe(true);
-    const sharedBrowser = parseInheritedLease(
-      '{"version":2,"lane":"browser-auth","mode":"shared"}',
-    );
+    const sharedBrowser = parseInheritedLease(JSON.stringify({
+      capacity: 4,
+      label: "browser",
+      lane: "browser-auth",
+      mode: "shared",
+      permits: 1,
+      version: 2,
+    }));
     expect(inheritedLeaseCovers(sharedBrowser, { lane: "compute", mode: "shared" })).toBe(true);
     expect(inheritedLeaseCovers(sharedBrowser, { lane: "browser-auth", mode: "shared" })).toBe(true);
     expect(inheritedLeaseCovers(sharedBrowser, { lane: "browser-auth", mode: "heavy" })).toBe(false);
     expect(inheritedLeaseCovers(sharedBrowser, { lane: "mac-native", mode: "shared" })).toBe(false);
+    expect(() => parseInheritedLease('{"version":1}')).toThrow("malformed");
+    expect(() => parseInheritedLease(JSON.stringify({
+      capacity: 4,
+      label: "changed",
+      lane: "compute",
+      mode: "exclusive",
+      permits: 1,
+      version: 2,
+    }))).toThrow("malformed");
     expect(() => parseInheritedLease("not-json")).toThrow("malformed");
   });
 
@@ -149,7 +176,9 @@ describe("host-wide resource wrapper", () => {
     })).toBe(false);
   });
 
-  test("an inherited outer lease bypasses host-resource acquisition", () => {
+  test("a caller-forged inherited lease cannot bypass host-resource acquisition", () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-forged-inherited-lease-"));
+    const childMarker = join(root, "child-ran");
     const result = Bun.spawnSync({
       cmd: [
         process.execPath,
@@ -159,17 +188,168 @@ describe("host-wide resource wrapper", () => {
         "--",
         process.execPath,
         "-e",
-        "process.exit(0)",
+        `await Bun.write(${JSON.stringify(childMarker)}, "ran")`,
       ],
+      cwd: root,
       env: {
         ...process.env,
         HRA_ATET_HOST_RESOURCES_MODULE: "/missing/atet-module.js",
-        HRA_LOCAL_EFFICIENCY_LEASE: '{"version":1}',
+        HRA_LOCAL_EFFICIENCY_LEASE: JSON.stringify({
+          capacity: permitCapacity(),
+          label: "forged",
+          lane: "compute",
+          mode: "exclusive",
+          permits: permitCapacity(),
+          version: 2,
+        }),
       },
       stderr: "pipe",
       stdout: "pipe",
     });
-    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    try {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toString()).toContain("lease descriptor");
+      expect(existsSync(childMarker)).toBe(false);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("a nested wrapper accepts only the inherited live lease descriptor", () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-live-inherited-lease-"));
+    try {
+      const modulePath = join(root, "host-resources.js");
+      const markerPath = join(root, "lease.lock");
+      writeFileSync(modulePath, `
+        import { createHash } from "node:crypto";
+        import { chmodSync, closeSync, openSync, unlinkSync, writeFileSync } from "node:fs";
+        const markerPath = ${JSON.stringify(markerPath)};
+        export function createHostResourceCoordinator(options) {
+          return {
+            async withLease(claims, callback) {
+              const document = {
+                version: 1,
+                owner: "a".repeat(32),
+                profileSha256: createHash("sha256").update(JSON.stringify(options.profile)).digest("hex"),
+                ticket: "1",
+                phase: "A",
+                claims,
+              };
+              writeFileSync(markerPath, JSON.stringify(document), { mode: 0o600 });
+              chmodSync(markerPath, 0o600);
+              const descriptor = openSync(markerPath, "r+");
+              try {
+                return await callback({ inheritedFileDescriptor: descriptor });
+              } finally {
+                closeSync(descriptor);
+                unlinkSync(markerPath);
+              }
+            },
+          };
+        }
+      `);
+      const environment = { ...process.env };
+      delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
+      const result = Bun.spawnSync({
+        cmd: [
+          process.execPath,
+          join(import.meta.dir, "host-run.ts"),
+          "--mode=shared",
+          "--label=outer-live",
+          "--",
+          process.execPath,
+          join(import.meta.dir, "host-run.ts"),
+          "--mode=shared",
+          "--label=nested-live",
+          "--",
+          process.execPath,
+          "-e",
+          "process.exit(0)",
+        ],
+        cwd: root,
+        env: {
+          ...environment,
+          HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+          HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
+          HRA_LOCAL_EFFICIENCY_TELEMETRY: "off",
+        },
+        stderr: "pipe",
+        stdout: "pipe",
+      });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("records a canceled attempt before CPU admission", async () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-pre-admission-cancel-"));
+    const ready = join(root, "ready");
+    try {
+      const modulePath = join(root, "host-resources.js");
+      writeFileSync(modulePath, `
+        import { writeFileSync } from "node:fs";
+        const ready = ${JSON.stringify(ready)};
+        export function createHostResourceCoordinator() {
+          return {
+            async withLease(_claims, _callback, options) {
+              writeFileSync(ready, "ready");
+              return await new Promise((_resolve, reject) => {
+                const abort = () => {
+                  const error = new Error("wait canceled");
+                  error.code = "WAIT_ABORTED";
+                  reject(error);
+                };
+                if (options.signal.aborted) abort();
+                else options.signal.addEventListener("abort", abort, { once: true });
+              });
+            },
+          };
+        }
+      `);
+      const environment = { ...process.env };
+      delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
+      const wrapper = Bun.spawn({
+        cmd: [
+          process.execPath,
+          join(import.meta.dir, "host-run.ts"),
+          "--mode=exclusive",
+          "--label=cancel-before-admission",
+          "--",
+          process.execPath,
+          "-e",
+          "process.exit(0)",
+        ],
+        cwd: root,
+        env: {
+          ...environment,
+          HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+          HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
+        },
+        stderr: "pipe",
+        stdout: "pipe",
+      });
+      for (let attempts = 0; attempts < 100 && !existsSync(ready); attempts += 1) {
+        await Bun.sleep(10);
+      }
+      expect(existsSync(ready)).toBe(true);
+      wrapper.kill("SIGTERM");
+      expect(await wrapper.exited).toBe(143);
+      const telemetryRoot = join(root, "state", "telemetry-v1");
+      const files = readdirSync(telemetryRoot);
+      expect(files).toHaveLength(1);
+      const lines = readFileSync(join(telemetryRoot, files[0] ?? ""), "utf8")
+        .trim().split("\n");
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0] ?? "{}")).toMatchObject({
+        admittedAt: null,
+        exitCode: 143,
+        outcome: "canceled",
+        runMilliseconds: null,
+      });
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
   });
 
   test("acquires the scarce browser capability before weighted CPU permits", () => {
@@ -294,6 +474,77 @@ describe("host-wide resource wrapper", () => {
       await wrapper.exited;
       await Bun.sleep(1_000);
       expect(existsSync(orphanMarker)).toBe(false);
+    } finally {
+      wrapper.kill("SIGKILL");
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("force-cleans a residual descendant after its command leader exits", async () => {
+    if (process.platform === "win32") return;
+    const root = mkdtempSync(join(tmpdir(), "hra-residual-process-group-"));
+    const modulePath = join(root, "host-resources.js");
+    const ready = join(root, "ready");
+    const residualMarker = join(root, "residual-ran");
+    writeFileSync(modulePath, `
+      import { closeSync, openSync } from "node:fs";
+      export function createHostResourceCoordinator() {
+        return {
+          async withLease(_claims, callback) {
+            const descriptor = openSync("/dev/null", "r");
+            try {
+              return await callback({ inheritedFileDescriptor: descriptor });
+            } finally {
+              closeSync(descriptor);
+            }
+          },
+        };
+      }
+    `);
+    const descendantSource = `
+      process.on("SIGTERM", () => {});
+      await Bun.sleep(800);
+      await Bun.write(${JSON.stringify(residualMarker)}, "ran");
+    `;
+    const leaderSource = `
+      const { spawn } = await import("node:child_process");
+      const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], {
+        stdio: "ignore",
+      });
+      child.unref();
+      await Bun.write(${JSON.stringify(ready)}, "ready");
+    `;
+    const environment = { ...process.env };
+    delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
+    const wrapper = Bun.spawn({
+      cmd: [
+        process.execPath,
+        join(import.meta.dir, "host-run.ts"),
+        "--mode=shared",
+        "--label=residual-process-group",
+        "--",
+        process.execPath,
+        "-e",
+        leaderSource,
+      ],
+      cwd: root,
+      env: {
+        ...environment,
+        HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+        HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
+        HRA_LOCAL_EFFICIENCY_TELEMETRY: "off",
+      },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    try {
+      for (let attempts = 0; attempts < 100 && !existsSync(ready); attempts += 1) {
+        await Bun.sleep(10);
+      }
+      expect(existsSync(ready)).toBe(true);
+      expect(await wrapper.exited).toBe(0);
+      await Bun.sleep(1_000);
+      expect(existsSync(residualMarker)).toBe(false);
     } finally {
       wrapper.kill("SIGKILL");
       rmSync(root, { force: true, recursive: true });

@@ -79,7 +79,7 @@ describe("throughput report", () => {
     expect(report).toMatchObject({
       eventCount: 3,
       maxConcurrentRuns: 2,
-      outcomes: { fail: 1, pass: 1, "scheduler-error": 1, "spawn-error": 0 },
+      outcomes: { canceled: 0, fail: 1, pass: 1, "scheduler-error": 1, "spawn-error": 0 },
       permitWeightedRunMilliseconds: 10_000,
       repeatInterpretation: "review-heuristic-not-proof-of-waste",
       statusAuthority: "scheduler-telemetry-only",
