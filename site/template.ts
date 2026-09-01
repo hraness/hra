@@ -122,7 +122,7 @@ const renderSection = (
   headingLevel: "h1" | "h2" = "h2",
   afterHeading = "",
 ): string =>
-  `<section id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading">
+  `<section class="documentation-section" id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading">
   <${headingLevel} id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</${headingLevel}>
   ${afterHeading}
   ${section.blocks.map((block, index) => renderBlock(
@@ -227,6 +227,50 @@ const renderProjectResources = (content: PublicContent): string => `<aside aria-
   </nav>
 </aside>`;
 
+const renderProductHero = (content: PublicContent): string => `<header class="hraness-marketing-hero" data-hraness-marketing="hero" aria-labelledby="hra-title">
+  <div class="hraness-marketing-hero__copy">
+    <p class="hraness-marketing-hero__eyebrow">${escapeHtml(content.hero.eyebrow)}</p>
+    <p class="hraness-marketing-hero__name">${escapeHtml(content.productName)}</p>
+    <h1 class="hraness-marketing-hero__heading" id="hra-title">${escapeHtml(content.hero.heading)}</h1>
+    <p class="hraness-marketing-hero__summary">${escapeHtml(content.hero.summary)}</p>
+    <div class="hraness-marketing-hero__actions">
+      <a class="hraness-marketing-action" data-emphasis="primary" href="${escapeHtml(content.hero.primaryAction.href)}">${escapeHtml(content.hero.primaryAction.label)}</a>
+      <a class="hraness-marketing-action" data-emphasis="secondary" href="${escapeHtml(content.hero.secondaryAction.href)}">${escapeHtml(content.hero.secondaryAction.label)}</a>
+    </div>
+    <p class="hraness-marketing-hero__boundary">${escapeHtml(content.hero.boundary)}</p>
+  </div>
+  <aside class="hraness-marketing-proof" aria-labelledby="hero-proof-heading">
+    <p class="hraness-marketing-proof__kicker">How the first request moves</p>
+    <h2 class="hraness-marketing-proof__heading" id="hero-proof-heading">${escapeHtml(content.hero.proofLabel)}</h2>
+    <ol class="hraness-marketing-flow" data-hraness-marketing="flow" aria-label="First HRA request">
+      ${content.hero.steps.map((step, index) => `<li class="hraness-marketing-flow__step">
+        <span aria-hidden="true" class="hraness-marketing-flow__number">${String(index + 1).padStart(2, "0")}</span>
+        <div class="hraness-marketing-flow__body"><strong class="hraness-marketing-flow__label">${escapeHtml(step.label)}</strong><code class="hraness-marketing-flow__code">${escapeHtml(step.command)}</code><p class="hraness-marketing-flow__detail">${escapeHtml(step.detail)}</p></div>
+      </li>`).join("\n      ")}
+    </ol>
+  </aside>
+  <dl class="hraness-marketing-facts" data-hraness-marketing="facts">
+    ${content.hero.facts.map((fact) => `<div><dt>${escapeHtml(fact.label)}</dt><dd><strong>${escapeHtml(fact.value)}</strong><span>${escapeHtml(fact.detail)}</span></dd></div>`).join("\n    ")}
+  </dl>
+  </header>
+  <section class="hraness-marketing-install" data-hraness-marketing="install" id="install-command" aria-labelledby="install-command-heading">
+    <div class="hraness-marketing-install__heading-group">
+      <p class="hraness-marketing-install__eyebrow">Local release</p>
+      <h2 class="hraness-marketing-install__heading" id="install-command-heading">Install the verified CLI.</h2>
+    </div>
+    <div class="hraness-marketing-install__commands">
+      <pre class="install-command" tabindex="0"><code>${escapeHtml(content.installCommand)}</code></pre>
+      <div class="install-checks">
+        <pre class="doctor-command" tabindex="0"><code>${escapeHtml(content.doctorCommand)}</code></pre>
+        <pre class="init-command" tabindex="0"><code>${escapeHtml(content.initCommand)}</code></pre>
+      </div>
+    </div>
+  </section>
+  <div class="hero-notes">
+    ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n    ")}
+  </div>
+  ${renderHomeReading()}`;
+
 export const renderSiteHtml = (content: PublicContent = publicContent): string => {
   const navigation = content.sections
     .map((section) => `<a href="#${escapeHtml(section.id)}">${escapeHtml(section.heading)}</a>`)
@@ -244,14 +288,7 @@ ${renderHead(content, {
 <body>
 <a class="skip-link" href="#content">Skip to content</a>
 <main id="content">
-  <header class="hero">
-    <h1>${escapeHtml(content.productName)}</h1>
-    <pre class="install-command" tabindex="0"><code>${escapeHtml(content.installCommand)}</code></pre>
-    <pre class="doctor-command" tabindex="0"><code>${escapeHtml(content.doctorCommand)}</code></pre>
-    <pre class="init-command" tabindex="0"><code>${escapeHtml(content.initCommand)}</code></pre>
-    ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n    ")}
-    ${renderHomeReading()}
-  </header>
+  ${renderProductHero(content)}
   <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
   ${content.sections.map((section) => renderSection(section)).join("\n  ")}
 </main>

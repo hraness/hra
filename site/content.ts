@@ -28,6 +28,36 @@ export interface ContentSection {
   readonly id: string;
 }
 
+export interface HeroFact {
+  readonly detail: string;
+  readonly label: string;
+  readonly value: string;
+}
+
+export interface HeroStep {
+  readonly command: string;
+  readonly detail: string;
+  readonly label: string;
+}
+
+export interface HeroContent {
+  readonly boundary: string;
+  readonly eyebrow: string;
+  readonly facts: readonly HeroFact[];
+  readonly heading: string;
+  readonly primaryAction: {
+    readonly href: string;
+    readonly label: string;
+  };
+  readonly proofLabel: string;
+  readonly secondaryAction: {
+    readonly href: string;
+    readonly label: string;
+  };
+  readonly steps: readonly HeroStep[];
+  readonly summary: string;
+}
+
 export interface PublicContent {
   readonly description: string;
   readonly doctorCommand: string;
@@ -35,6 +65,7 @@ export interface PublicContent {
   readonly installCommand: string;
   readonly initCommand: string;
   readonly introduction: readonly ContentBlock[];
+  readonly hero: HeroContent;
   readonly links: {
     readonly contributing: string;
     readonly documentation: string;
@@ -368,6 +399,65 @@ export const publicContent: PublicContent = {
     website: "live",
   },
   links,
+  hero: {
+    eyebrow: "Persistent control for Codex",
+    heading: "Keep every Codex account and live session in one durable CLI.",
+    summary: "Give each account its own Codex home, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.",
+    boundary: "macOS and Linux CLI · macOS desktop switching · local v0.1.5 live · hosted sync not yet live",
+    primaryAction: {
+      href: "#install-command",
+      label: "Install HRA",
+    },
+    secondaryAction: {
+      href: "#first-session",
+      label: "Run the first session",
+    },
+    proofLabel: "One request, one exact account and session",
+    steps: [
+      {
+        label: "Start",
+        command: "hra session start personal --preset high --json",
+        detail: "Create a session under one explicitly selected account profile.",
+      },
+      {
+        label: "Inspect",
+        command: "hra session status <session-id> --json",
+        detail: "Read the exact session and its contiguous event cursor.",
+      },
+      {
+        label: "Direct",
+        command: "hra session send <session-id> -- \"Review this project.\"",
+        detail: "Send work to that session without switching account authority.",
+      },
+      {
+        label: "Observe",
+        command: "hra session watch <session-id> --cursor <status-cursor> --jsonl",
+        detail: "Follow safe live updates from the cursor returned by status.",
+      },
+    ],
+    facts: [
+      {
+        label: "Accounts",
+        value: "Isolated profiles",
+        detail: "Provider state stays inside each profile's own CODEX_HOME.",
+      },
+      {
+        label: "Sessions",
+        value: "Live and durable",
+        detail: "The local daemon remains available after a terminal exits.",
+      },
+      {
+        label: "Interfaces",
+        value: "Shell and JSON",
+        detail: "Humans and agents address the same exact account and session objects.",
+      },
+      {
+        label: "Sync",
+        value: "Optional, encrypted",
+        detail: "Local execution works without cloud service availability.",
+      },
+    ],
+  },
   introduction: [
     {
       kind: "notice",
@@ -1245,6 +1335,8 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
     `\`\`\`sh\n${content.initCommand}\n\`\`\``,
+    `## ${content.hero.heading}\n\n${content.hero.summary}\n\n${content.hero.boundary}`,
+    `### ${content.hero.proofLabel}\n\n${content.hero.steps.map((step, index) => `${index + 1}. **${step.label}:** \`${step.command}\` — ${step.detail}`).join("\n")}`,
     renderMarkdownBlocks(content.introduction, 3),
     sections,
   ].join("\n\n") + "\n";

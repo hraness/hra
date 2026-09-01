@@ -126,6 +126,8 @@ describe("static-site build", () => {
     expect(builtStyles).toContain("fixture:styles.css");
     expect(builtStyles).toContain('font-family: "Nebula Sans";');
     expect(builtStyles).toContain('./fonts/nebula-sans/NebulaSans-Book.woff2');
+    expect(builtStyles).toContain(".hraness-marketing-hero");
+    expect(builtStyles).toContain(".hraness-marketing-interface-grid");
     expect(builtStyles).toContain(".hraness-site-footer {");
 
     expect((await readFile(
