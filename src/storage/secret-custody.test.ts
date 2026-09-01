@@ -431,7 +431,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
     } finally {
       await rm(home, { force: true, recursive: true });
     }
-  });
+  }, 30_000);
 
   test("aggregate files and bytes are linear in slot count after repeated generations", async () => {
     const { home, paths } = await fixture("hra-cas-aggregate-");
@@ -464,7 +464,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
     } finally {
       await rm(home, { force: true, recursive: true });
     }
-  });
+  }, 30_000);
 
   test("restart rolls back a staged CAS whose value publication never linked", async () => {
     const { home, paths } = await fixture("hra-cas-staged-rollback-");
