@@ -108,6 +108,9 @@ const siteFooterStylesPath = fileURLToPath(
 const designKitFontsStylesPath = fileURLToPath(
   import.meta.resolve("@hraness/design-kit/fonts.css"),
 );
+const designKitProductMarketingStylesPath = fileURLToPath(
+  import.meta.resolve("@hraness/design-kit/product-marketing.css"),
+);
 const designKitFontsDirectory = join(dirname(designKitFontsStylesPath), "fonts");
 
 const readExisting = async (path: string): Promise<string | undefined> => {
@@ -161,9 +164,15 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     { recursive: true },
   );
 
-  const [productStyles, designKitFontsStyles, siteFooterStyles] = await Promise.all([
+  const [
+    productStyles,
+    designKitFontsStyles,
+    designKitProductMarketingStyles,
+    siteFooterStyles,
+  ] = await Promise.all([
     readFile(join(options.repositoryRoot, "site/styles.css"), "utf8"),
     readFile(designKitFontsStylesPath, "utf8"),
+    readFile(designKitProductMarketingStylesPath, "utf8"),
     readFile(siteFooterStylesPath, "utf8"),
   ]);
   await cp(designKitFontsDirectory, join(options.repositoryRoot, "dist/site/fonts"), {
@@ -172,7 +181,7 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   });
   await writeFile(
     join(options.repositoryRoot, "dist/site/styles.css"),
-    `${designKitFontsStyles.trim()}\n\n${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
+    `${designKitFontsStyles.trim()}\n\n${designKitProductMarketingStyles.trim()}\n\n${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
     "utf8",
   );
 

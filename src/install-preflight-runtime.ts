@@ -27,6 +27,7 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 
 export const HRA_INSTALL_BUN_VERSION = "1.3.14";
 export const HRA_INSTALL_PACKAGE_NAME = "@hraness/hra";
+const HRA_LEGACY_INSTALL_PACKAGE_NAME = "hra";
 export const HRA_INSTALL_PACKAGE_VERSION = "0.1.5";
 export const HRA_INSTALL_CLI_SHA256 = "4ec12b00de84a5c5e830fc8cac3f2303cb0dffa6d262dc2c51773bce5039f308";
 export const HRA_INSTALL_NORMALIZER_SHA256 = "43998f55c8b422d7783d5d252020c0c261dfd16e359e062aac25efea30803116";
@@ -106,11 +107,17 @@ type LocalArchiveIdentity = ArchiveIdentityBase & Readonly<{
 
 export type HraInstallArchiveIdentity = OfficialArchiveIdentity | LocalArchiveIdentity;
 
-type ReleaseIdentity = HraInstallArchiveIdentity & Readonly<{
+type VersionIdentity = HraInstallArchiveIdentity & Readonly<{
   cliSha256: string;
   normalizerSha256: string;
   packageVersion: string;
 }>;
+
+type ReleaseIdentity = VersionIdentity & Readonly<{
+  packageName: typeof HRA_INSTALL_PACKAGE_NAME;
+}>;
+
+type InstallPackageName = typeof HRA_INSTALL_PACKAGE_NAME | typeof HRA_LEGACY_INSTALL_PACKAGE_NAME;
 
 type InstallFetch = (input: string, init: RequestInit) => Promise<Response>;
 
@@ -118,16 +125,20 @@ const releaseIdentity = (archive: HraInstallArchiveIdentity): ReleaseIdentity =>
   ...archive,
   cliSha256: HRA_INSTALL_CLI_SHA256,
   normalizerSha256: HRA_INSTALL_NORMALIZER_SHA256,
+  packageName: HRA_INSTALL_PACKAGE_NAME,
   packageVersion: HRA_INSTALL_PACKAGE_VERSION,
 });
 
-const versionNameForArchive = (archive: HraInstallArchiveIdentity): string => [
-  `v${HRA_INSTALL_PACKAGE_VERSION}`,
-  archive.archiveSource,
-  archive.archiveSha256,
-  HRA_INSTALL_NORMALIZER_SHA256,
-  HRA_INSTALL_CLI_SHA256,
+const versionNameForIdentity = (identity: VersionIdentity): string => [
+  `v${identity.packageVersion}`,
+  identity.archiveSource,
+  identity.archiveSha256,
+  identity.normalizerSha256,
+  identity.cliSha256,
 ].join("-");
+
+const versionNameForArchive = (archive: HraInstallArchiveIdentity): string =>
+  versionNameForIdentity(releaseIdentity(archive));
 
 class InstallPreflightError extends Error {
   constructor(message: string) {
@@ -1172,6 +1183,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const sha256 = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const sha256Pattern = /^[0-9a-f]{64}$/u;
+const semverPattern = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
 const positiveSafeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 
@@ -1547,7 +1559,7 @@ type CompleteReceipt = HraInstallArchiveIdentity & Readonly<{
   entryCount: number;
   id: string;
   normalizerSha256: string;
-  packageName: "@hraness/hra";
+  packageName: InstallPackageName;
   packageVersion: string;
   totalBytes: number;
   treeSha256: string;
@@ -1596,6 +1608,7 @@ const receiptKeys = [
 const parseArchiveIdentityFields = (
   value: Record<string, unknown>,
   label: string,
+  expectedOfficialTag = HRA_INSTALL_RELEASE_TAG,
 ): HraInstallArchiveIdentity => {
   if (
     !positiveSafeInteger(value.archiveBytes)
@@ -1608,7 +1621,7 @@ const parseArchiveIdentityFields = (
     if (
       !positiveSafeInteger(value.archiveAssetId)
       || !positiveSafeInteger(value.archiveReleaseId)
-      || value.archiveReleaseTag !== HRA_INSTALL_RELEASE_TAG
+      || value.archiveReleaseTag !== expectedOfficialTag
       || value.archiveRepositoryId !== HRA_INSTALL_REPOSITORY_ID
     ) {
       throw new InstallPreflightError(`The ${label} official archive authority is invalid.`);
@@ -1617,7 +1630,7 @@ const parseArchiveIdentityFields = (
       archiveAssetId: value.archiveAssetId,
       archiveBytes: value.archiveBytes,
       archiveReleaseId: value.archiveReleaseId,
-      archiveReleaseTag: HRA_INSTALL_RELEASE_TAG,
+      archiveReleaseTag: expectedOfficialTag,
       archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
       archiveSha256: value.archiveSha256,
       archiveSource: "official",
@@ -1705,9 +1718,11 @@ const parseReceipt = (value: unknown): CompleteReceipt => {
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value.id)
     || typeof value.normalizerSha256 !== "string"
     || !/^[0-9a-f]{64}$/u.test(value.normalizerSha256)
-    || value.packageName !== HRA_INSTALL_PACKAGE_NAME
+    || (value.packageName !== HRA_INSTALL_PACKAGE_NAME
+      && value.packageName !== HRA_LEGACY_INSTALL_PACKAGE_NAME)
     || typeof value.packageVersion !== "string"
-    || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u.test(value.packageVersion)
+    || value.packageVersion.length > 128
+    || !semverPattern.test(value.packageVersion)
     || typeof value.totalBytes !== "number"
     || !Number.isSafeInteger(value.totalBytes)
     || value.totalBytes < 1
@@ -1716,15 +1731,25 @@ const parseReceipt = (value: unknown): CompleteReceipt => {
     || !/^[0-9a-f]{64}$/u.test(value.treeSha256)
     || value.version !== 2
   ) throw new InstallPreflightError("The complete HRA version receipt is invalid.");
+  const archiveIdentity = parseArchiveIdentityFields(
+    value,
+    "complete HRA version receipt",
+    `v${value.packageVersion}`,
+  );
+  if (
+    value.packageName === HRA_LEGACY_INSTALL_PACKAGE_NAME
+    && value.packageVersion !== "0.1.0"
+  ) throw new InstallPreflightError("The legacy HRA version receipt is invalid.");
   return {
     ...(value as Omit<CompleteReceipt, keyof HraInstallArchiveIdentity>),
-    ...parseArchiveIdentityFields(value, "complete HRA version receipt"),
+    ...archiveIdentity,
   };
 };
 
 const assertManifest = async (
   packageRoot: string,
   uid: number,
+  expectedName: InstallPackageName,
   expectedVersion: string,
 ): Promise<void> => {
   const bytes = await readExactFile(join(packageRoot, "package.json"), uid, authorityDocumentMaximumBytes, [0o600]);
@@ -1735,7 +1760,7 @@ const assertManifest = async (
     } catch {
       throw new InstallPreflightError("The installed HRA package manifest is not valid JSON.");
     }
-    if (!isRecord(value) || value.name !== HRA_INSTALL_PACKAGE_NAME || value.version !== expectedVersion) {
+    if (!isRecord(value) || value.name !== expectedName || value.version !== expectedVersion) {
       throw new InstallPreflightError("The installed HRA package identity is not exact.");
     }
     if (
@@ -1755,6 +1780,50 @@ type VerifiedVersion = Readonly<{
   receipt: CompleteReceipt;
 }>;
 
+type InstallPackageLayout = Readonly<{
+  cliSuffix: readonly string[];
+  packageName: InstallPackageName;
+  packageRootSuffix: readonly string[];
+}>;
+
+const installPackageLayouts: readonly InstallPackageLayout[] = [
+  {
+    cliSuffix: ["install", "global", "node_modules", "@hraness", "hra", "src", "cli.ts"],
+    packageName: HRA_INSTALL_PACKAGE_NAME,
+    packageRootSuffix: ["install", "global", "node_modules", "@hraness", "hra"],
+  },
+  {
+    cliSuffix: ["install", "global", "node_modules", "hra", "src", "cli.ts"],
+    packageName: HRA_LEGACY_INSTALL_PACKAGE_NAME,
+    packageRootSuffix: ["install", "global", "node_modules", "hra"],
+  },
+] as const;
+
+const requireInstallPackageLayout = (packageName: InstallPackageName): InstallPackageLayout => {
+  const layout = installPackageLayouts.find((candidate) => candidate.packageName === packageName);
+  if (layout === undefined) throw new InstallPreflightError("The installed HRA package layout is unsupported.");
+  return layout;
+};
+
+const locateActiveVersion = (
+  target: string,
+  authorityRoot: string,
+): Readonly<{ layout: InstallPackageLayout; versionRoot: string }> => {
+  const versionsRoot = join(authorityRoot, "versions");
+  const targetRelative = relative(versionsRoot, target);
+  if (!pathWithin(versionsRoot, target) || isAbsolute(targetRelative)) {
+    throw new InstallPreflightError("The active hra command is outside its protected version authority.");
+  }
+  const components = targetRelative.split(sep);
+  for (const layout of installPackageLayouts) {
+    if (
+      components.length === layout.cliSuffix.length + 1
+      && layout.cliSuffix.every((component, index) => components[index + 1] === component)
+    ) return { layout, versionRoot: join(versionsRoot, components[0] as string) };
+  }
+  throw new InstallPreflightError("The active hra command does not use a supported exact package layout.");
+};
+
 const verifyCompleteVersion = async (
   versionRoot: string,
   authorityRoot: string,
@@ -1765,12 +1834,15 @@ const verifyCompleteVersion = async (
   if (
     !pathWithin(join(authorityRoot, "versions"), versionRoot)
     || dirname(versionRoot) !== join(authorityRoot, "versions")
-    || !/^v[0-9A-Za-z.-]+-(?:official|local)-[0-9a-f]{64}-[0-9a-f]{64}-[0-9a-f]{64}$/u.test(versionName)
+    || !/^v[0-9A-Za-z.+-]+-(?:official|local)-[0-9a-f]{64}-[0-9a-f]{64}-[0-9a-f]{64}$/u.test(versionName)
   ) {
     throw new InstallPreflightError("The HRA version is outside its protected authority root.");
   }
+  if (await realpath(versionRoot) !== versionRoot) {
+    throw new InstallPreflightError("The HRA version root is not canonical.");
+  }
   const receipt = parseReceipt(await readSmallJson(join(versionRoot, ".hra-install-complete.json"), uid));
-  if (versionName !== versionNameForArchive(receipt)) {
+  if (versionName !== versionNameForIdentity(receipt)) {
     throw new InstallPreflightError("The complete HRA version namespace does not match its archive identity.");
   }
   if (
@@ -1778,6 +1850,7 @@ const verifyCompleteVersion = async (
     && (
       receipt.cliSha256 !== expectedRelease.cliSha256
       || receipt.normalizerSha256 !== expectedRelease.normalizerSha256
+      || receipt.packageName !== expectedRelease.packageName
       || receipt.packageVersion !== expectedRelease.packageVersion
       || receipt.archiveSource !== expectedRelease.archiveSource
       || receipt.archiveSha256 !== expectedRelease.archiveSha256
@@ -1794,8 +1867,24 @@ const verifyCompleteVersion = async (
   const record = (value: readonly (number | string)[]): void => {
     treeHasher.update(`${JSON.stringify(value)}\n`, "utf8");
   };
-  const cliPath = join(versionRoot, "install", "global", "node_modules", "@hraness", "hra", "src", "cli.ts");
+  const packageLayout = requireInstallPackageLayout(receipt.packageName);
+  const packageRoot = join(versionRoot, ...packageLayout.packageRootSuffix);
+  const cliPath = join(versionRoot, ...packageLayout.cliSuffix);
   const normalizerPath = join(dirname(cliPath), "install-normalizer.ts");
+  const alternatePackageRoot = join(
+    versionRoot,
+    ...requireInstallPackageLayout(
+      receipt.packageName === HRA_INSTALL_PACKAGE_NAME
+        ? HRA_LEGACY_INSTALL_PACKAGE_NAME
+        : HRA_INSTALL_PACKAGE_NAME,
+    ).packageRootSuffix,
+  );
+  try {
+    await lstat(alternatePackageRoot);
+    throw new InstallPreflightError("A complete HRA version contains a package layout that conflicts with its receipt.");
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const visit = async (directory: string): Promise<void> => {
     const directoryHandle = await open(
       directory,
@@ -1908,7 +1997,10 @@ const verifyCompleteVersion = async (
   ) {
     throw new InstallPreflightError("A complete HRA version does not match its durable tree receipt.");
   }
-  await assertManifest(dirname(dirname(cliPath)), uid, receipt.packageVersion);
+  if (await realpath(cliPath) !== cliPath) {
+    throw new InstallPreflightError("The complete HRA entry point is not canonical.");
+  }
+  await assertManifest(packageRoot, uid, receipt.packageName, receipt.packageVersion);
   const cliBytes = await readExactFile(cliPath, uid, 512 * 1024, [0o755]);
   try {
     if (sha256(cliBytes) !== receipt.cliSha256) throw new InstallPreflightError("The complete HRA CLI digest is invalid.");
@@ -1946,10 +2038,24 @@ const verifyActiveTarget = async (
   uid: number,
   expectedRelease?: ReleaseIdentity,
 ): Promise<VerifiedVersion> => {
-  const target = isAbsolute(rawTarget) ? resolve(rawTarget) : resolve(dirname(activePath), rawTarget);
-  const versionRoot = resolve(target, "..", "..", "..", "..", "..", "..", "..");
-  const verified = await verifyCompleteVersion(versionRoot, authorityRoot, uid, expectedRelease);
-  if (verified.cliPath !== target || await realpath(activePath) !== target) {
+  if (!isAbsolute(rawTarget) || resolve(rawTarget) !== rawTarget) {
+    throw new InstallPreflightError("The active hra command target is not canonical and absolute.");
+  }
+  const located = locateActiveVersion(rawTarget, authorityRoot);
+  let verified: VerifiedVersion;
+  try {
+    verified = await verifyCompleteVersion(located.versionRoot, authorityRoot, uid, expectedRelease);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new InstallPreflightError("The active hra command names a missing complete version.");
+    }
+    throw error;
+  }
+  if (
+    verified.receipt.packageName !== located.layout.packageName
+    || verified.cliPath !== rawTarget
+    || await realpath(activePath) !== rawTarget
+  ) {
     throw new InstallPreflightError("The active hra command does not resolve to its verified version entry point.");
   }
   return verified;
@@ -2838,6 +2944,28 @@ const recoverInterruptedInstall = async (input: Readonly<{
     || intent.archiveRepositoryId !== input.requestedRelease.archiveRepositoryId
   ) throw new InstallPreflightError("An interrupted HRA install has a different archive identity.");
   const current = await activeTarget(input.activePath);
+  const intendedCli = join(
+    intent.versionRoot,
+    "install",
+    "global",
+    "node_modules",
+    "@hraness",
+    "hra",
+    "src",
+    "cli.ts",
+  );
+  if (current !== intent.previousActiveTarget && current !== intendedCli) {
+    throw new InstallPreflightError("The active hra command drifted while an interrupted install awaited recovery.");
+  }
+  if (current !== null) {
+    await verifyActiveTarget(
+      input.activePath,
+      current,
+      input.authorityRoot,
+      input.uid,
+      current === intendedCli ? input.requestedRelease : undefined,
+    );
+  }
   let versionComplete = false;
   try {
     await verifyCompleteVersion(
@@ -2870,28 +2998,9 @@ const recoverInterruptedInstall = async (input: Readonly<{
       }
     }
   }
-  const intendedCli = join(
-    intent.versionRoot,
-    "install",
-    "global",
-    "node_modules",
-    "@hraness",
-    "hra",
-    "src",
-    "cli.ts",
-  );
   const alreadyPublished = versionComplete && current === intendedCli;
-  if (current !== intent.previousActiveTarget && !alreadyPublished) {
+  if (current === intendedCli && !alreadyPublished) {
     throw new InstallPreflightError("The active hra command drifted while an interrupted install awaited recovery.");
-  }
-  if (current !== null) {
-    await verifyActiveTarget(
-      input.activePath,
-      current,
-      input.authorityRoot,
-      input.uid,
-      alreadyPublished ? input.requestedRelease : undefined,
-    );
   }
   if (versionComplete) {
     await input.hooks?.afterNormalized?.();

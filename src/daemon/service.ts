@@ -40,6 +40,7 @@ import { sessionEventPageSchema, type SessionEventBody, type SessionEventPage } 
 import {
   AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT,
   AUTO_RATE_LIMIT_RESET_USED_PERCENT,
+  CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES,
   accountUsageHistoryEntrySchema,
   accountUsageHistoryPageSchema,
   accountUsageCounterSamples,
@@ -51,6 +52,7 @@ import {
   providerUsagePayload,
   storedAccountUsageSnapshotSchema,
   type AutomaticRateLimitResetLastAttempt,
+  type AutomaticRateLimitResetPolicyStatus,
   type AutomaticRateLimitResetRefreshStatus,
   type UsageVelocityWindow,
 } from "../domain/usage-metrics";
@@ -84,6 +86,7 @@ import {
   type MutationAttemptRecord,
   type MutationEffectEvidence,
   type AccountRateLimitResetAttemptRecord,
+  type AccountRateLimitResetPolicyRecord,
   type ProfileRecord,
   type SessionRecord,
   type StateStore,
@@ -463,6 +466,29 @@ type AutomaticRateLimitResetAttemptResult = Readonly<{
   authoritativeReread: boolean;
   refresh: AutomaticRateLimitResetRefreshStatus;
 }>;
+const publicAutomaticRateLimitResetPolicy = (
+  policy: AccountRateLimitResetPolicyRecord,
+  currentAccountFingerprint: string | null,
+): AutomaticRateLimitResetPolicyStatus => {
+  if (
+    policy.accountFingerprint !== null
+    && policy.accountFingerprint !== currentAccountFingerprint
+  ) return { state: "reconciliation_required" };
+  switch (policy.state) {
+    case "active_unbound":
+    case "active_bound": return { state: "active" };
+    case "reconciliation_required": return { state: "reconciliation_required" };
+    case "window_suppressed": {
+      if (policy.weeklyWindowResetsAt === null) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_WINDOW_MISSING");
+      }
+      return {
+        state: "window_suppressed",
+        weeklyWindowResetsAt: policy.weeklyWindowResetsAt,
+      };
+    }
+  }
+};
 const publicAutomaticRateLimitResetLastAttempt = (
   attempt: AccountRateLimitResetAttemptRecord | null,
 ): AutomaticRateLimitResetLastAttempt | null => {
@@ -1152,7 +1178,6 @@ export class HraService {
   async #recoverAdmitted(): Promise<void> {
     await this.#cloud.supersedeTerminalCompactProjectionRecoveries();
     await this.#daemonAuthority.assertCurrent();
-    this.#store.recoverAccountRateLimitResetAttempts();
     const recoveredMutations = this.#store.recoverEffectStartedMutations();
     if (recoveredMutations.unresolved.length > 0) {
       throw new Error(`Daemon recovery cannot resolve ${String(recoveredMutations.unresolved.length)} effect-started mutation authorities.`);
@@ -2812,11 +2837,12 @@ export class HraService {
       let automaticResetRefresh: AutomaticRateLimitResetRefreshStatus | undefined;
       if (refresh) {
         this.#assertSignedIn(profile);
-        const snapshot = await this.#readAndRecordUsage(profile, signal);
+        const observed = await this.#readAndRecordUsage(profile, signal);
         const refreshedProfile = this.#store.requireProfileById(profile.id);
         const reset = await this.#attemptAutomaticRateLimitReset(
           refreshedProfile,
-          snapshot.payload,
+          observed.accountFingerprint,
+          observed.snapshot.payload,
           signal,
         );
         automaticResetRefresh = reset.refresh;
@@ -2831,6 +2857,8 @@ export class HraService {
       }
       const now = this.#now();
       const currentProfile = this.#store.requireProfileById(profile.id);
+      const automaticResetPolicy = this.#store
+        .requireAccountRateLimitResetPolicy(profile.id);
       const currentFingerprint = accountFingerprintForProfile(currentProfile);
       const latestRecorded = currentFingerprint === null
         ? null
@@ -2875,6 +2903,10 @@ export class HraService {
       usage.push({
         account: this.#publicProfile(currentProfile),
         automaticReset: automaticRateLimitResetStatusSchema.parse({
+          policy: publicAutomaticRateLimitResetPolicy(
+            automaticResetPolicy,
+            currentFingerprint,
+          ),
           threshold: {
             remainingPercent: AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT,
             usedPercent: AUTO_RATE_LIMIT_RESET_USED_PERCENT,
@@ -2919,19 +2951,15 @@ export class HraService {
   async #readAndRecordUsage(
     profile: ProfileRecord,
     signal: AbortSignal,
-  ): Promise<Awaited<ReturnType<CodexRuntimePort["readUsage"]>>> {
+  ): Promise<Readonly<{
+    accountFingerprint: string;
+    snapshot: Awaited<ReturnType<CodexRuntimePort["readUsage"]>>;
+  }>> {
     let verifiedProfile = this.#store.requireProfileById(profile.id);
     const expectedFingerprint = accountFingerprintForProfile(verifiedProfile);
-    const priorAttempt = expectedFingerprint === null
-      ? null
-      : this.#store.readRecoverableAccountRateLimitReset(
-          profile.id,
-          expectedFingerprint,
-        );
     const accountFingerprint = await this.#proveUsageAccountIdentity({
       profile: verifiedProfile,
       expectedFingerprint,
-      attempt: priorAttempt,
       signal,
     });
     verifiedProfile = this.#store.requireProfileById(profile.id);
@@ -2956,14 +2984,9 @@ export class HraService {
       throw error;
     }
     const receivedAt = this.#now();
-    const attemptAfterRead = this.#store.readRecoverableAccountRateLimitReset(
-      profile.id,
-      accountFingerprint,
-    );
     const confirmedFingerprint = await this.#proveUsageAccountIdentity({
       profile: verifiedProfile,
       expectedFingerprint: accountFingerprint,
-      attempt: attemptAfterRead,
       signal,
     });
     if (confirmedFingerprint !== accountFingerprint) {
@@ -2985,22 +3008,66 @@ export class HraService {
       previousPayload: previous?.payload ?? null,
     });
     this.#store.recordUsage(profile.id, sourceSequence, snapshot.observedAt, stored);
-    return snapshot;
+    return { accountFingerprint, snapshot };
   }
 
   async #attemptAutomaticRateLimitReset(
     profile: ProfileRecord,
+    accountFingerprint: string,
     providerPayload: unknown,
     signal: AbortSignal,
   ): Promise<AutomaticRateLimitResetAttemptResult> {
     const now = this.#now();
-    const storedFingerprint = accountFingerprintForProfile(profile);
-    let attempt = storedFingerprint === null
-      ? null
-      : this.#store.readRecoverableAccountRateLimitReset(profile.id, storedFingerprint);
-    const decision = automaticRateLimitResetDecision({
+    const observation = automaticRateLimitResetObservation({
       providerPayload,
       now,
+    });
+    const policyDecision = this.#store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowDurationMinutes: observation.available
+        ? CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES
+        : null,
+      weeklyWindowResetsAt: observation.available
+        ? observation.weeklyWindowResetsAt
+        : null,
+    });
+    if (policyDecision.decision !== "allow") {
+      const reason = policyDecision.reason === "weekly_window_unavailable"
+        && policyDecision.policy.state === "reconciliation_required"
+        ? "reconciliation_required" as const
+        : policyDecision.reason;
+      return {
+        authoritativeReread: false,
+        refresh: { state: "suppressed", reason },
+      };
+    }
+    if (!observation.available) {
+      throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_OBSERVATION_MISMATCH");
+    }
+
+    this.#store.recoverAccountRateLimitResetAttempts({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: observation.weeklyWindowResetsAt,
+    });
+    let attempt = this.#store.readRecoverableAccountRateLimitReset(
+      profile.id,
+      accountFingerprint,
+    );
+    if (attempt?.state === "effect_started") {
+      return {
+        authoritativeReread: false,
+        refresh: { state: "recovery_pending" },
+      };
+    }
+
+    const decisionNow = this.#now();
+    const decision = automaticRateLimitResetDecision({
+      providerPayload,
+      now: decisionNow,
     });
     if (attempt === null && !decision.eligible) {
       return {
@@ -3008,95 +3075,39 @@ export class HraService {
         refresh: { state: "not_eligible", reason: decision.reason },
       };
     }
-
-    const accountFingerprint = await this.#proveUsageAccountIdentity({
-      profile,
-      expectedFingerprint: attempt?.accountFingerprint ?? storedFingerprint,
-      attempt,
-      signal,
-    });
-    attempt ??= this.#store.readRecoverableAccountRateLimitReset(
-      profile.id,
-      accountFingerprint,
-    );
-    if (
-      attempt !== null
-      && attempt.currentProcessGeneration !== profile.processGeneration
-    ) {
-      attempt = this.#store.rebindAccountRateLimitReset({
-        idempotencyKey: attempt.idempotencyKey,
-        expectedCurrentProcessGeneration: attempt.currentProcessGeneration,
-        nextProcessGeneration: profile.processGeneration,
-        accountFingerprint,
-      });
-    }
-
     if (attempt !== null) {
-      if (attempt.state === "settled") {
-        if (attempt.outcome === null) {
-          throw new Error("ACCOUNT_RATE_LIMIT_RESET_SETTLED_OUTCOME_MISSING");
+      // An ambiguous attempt represents an upstream effect that may already
+      // have succeeded. Reconcile only that durable idempotency key after the
+      // policy admits a fresh observation; current credits, usage, and window
+      // cannot prove whether the earlier dispatch committed.
+      if (attempt.state !== "ambiguous") {
+        if (
+          decisionNow >= attempt.weeklyWindowResetsAt
+          || observation.weeklyWindowResetsAt !== attempt.weeklyWindowResetsAt
+        ) {
+          this.#store.closeAccountRateLimitReset(
+            attempt.idempotencyKey,
+            "weekly_window_changed",
+          );
+          return {
+            authoritativeReread: false,
+            refresh: { state: "window_changed" },
+          };
         }
-        return {
-          authoritativeReread: false,
-          refresh: { state: "latched", outcome: attempt.outcome },
-        };
-      }
-      if (attempt.state === "closed") {
-        if (attempt.localResolution === null) {
-          throw new Error("ACCOUNT_RATE_LIMIT_RESET_CLOSED_RESOLUTION_MISSING");
-        }
-        return {
-          authoritativeReread: false,
-          refresh: { state: "latched", reason: attempt.localResolution },
-        };
-      }
-      const observation = automaticRateLimitResetObservation({
-        providerPayload,
-        now,
-      });
-      if (
-        now >= attempt.weeklyWindowResetsAt
-        || (
-          observation.available
-          && observation.weeklyWindowResetsAt !== attempt.weeklyWindowResetsAt
-        )
-      ) {
-        this.#store.closeAccountRateLimitReset(
-          attempt.idempotencyKey,
-          "weekly_window_changed",
-        );
-        return {
-          authoritativeReread: false,
-          refresh: { state: "window_changed" },
-        };
-      }
-      if (!observation.available) {
-        return {
-          authoritativeReread: false,
-          refresh: attempt.state === "ambiguous"
-            ? { state: "recovery_pending" }
-            : {
-                state: "not_eligible",
-                reason: "weekly_window_unavailable",
-              },
-        };
-      }
-      if (
-        attempt.state !== "ambiguous"
-        && (
+        if (
           observation.creditsAvailable < 1
           || observation.usedPercent < AUTO_RATE_LIMIT_RESET_USED_PERCENT
-        )
-      ) {
-        return {
-          authoritativeReread: false,
-          refresh: {
-            state: "waiting",
-            reason: observation.creditsAvailable < 1
-              ? "credits_unavailable"
-              : "below_threshold",
-          },
-        };
+        ) {
+          return {
+            authoritativeReread: false,
+            refresh: {
+              state: "waiting",
+              reason: observation.creditsAvailable < 1
+                ? "credits_unavailable"
+                : "below_threshold",
+            },
+          };
+        }
       }
     } else {
       if (!decision.eligible) {
@@ -3105,9 +3116,58 @@ export class HraService {
           refresh: { state: "not_eligible", reason: decision.reason },
         };
       }
+    }
+
+    await this.#daemonAuthority.assertCurrent();
+    if (signal.aborted) throw signal.reason;
+    const confirmedFingerprint = await this.#proveUsageAccountIdentity({
+      profile,
+      expectedFingerprint: accountFingerprint,
+      signal,
+    });
+    if (confirmedFingerprint !== accountFingerprint) {
+      throw new Error("ACCOUNT_RATE_LIMIT_RESET_IDENTITY_PROOF_CHANGED_WITHOUT_CONFLICT");
+    }
+    const dispatchProfile = this.#store.requireProfileById(profile.id);
+    if (
+      dispatchProfile.processGeneration !== profile.processGeneration
+      || accountFingerprintForProfile(dispatchProfile) !== accountFingerprint
+    ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
+    const dispatchPolicyDecision = this.#store.authorizeAccountRateLimitResetPolicy({
+      profileId: dispatchProfile.id,
+      processGeneration: dispatchProfile.processGeneration,
+      accountFingerprint,
+      weeklyWindowDurationMinutes: CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES,
+      weeklyWindowResetsAt: observation.weeklyWindowResetsAt,
+    });
+    if (dispatchPolicyDecision.decision !== "allow") {
+      const reason = dispatchPolicyDecision.reason === "weekly_window_unavailable"
+        && dispatchPolicyDecision.policy.state === "reconciliation_required"
+        ? "reconciliation_required" as const
+        : dispatchPolicyDecision.reason;
+      return {
+        authoritativeReread: false,
+        refresh: { state: "suppressed", reason },
+      };
+    }
+    if (
+      attempt !== null
+      && attempt.currentProcessGeneration !== dispatchProfile.processGeneration
+    ) {
+      attempt = this.#store.rebindAccountRateLimitReset({
+        idempotencyKey: attempt.idempotencyKey,
+        expectedCurrentProcessGeneration: attempt.currentProcessGeneration,
+        nextProcessGeneration: dispatchProfile.processGeneration,
+        accountFingerprint,
+      });
+    }
+    if (attempt === null) {
+      if (!decision.eligible) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_DECISION_CHANGED_WITHOUT_ASYNC_GAP");
+      }
       attempt = this.#store.prepareAccountRateLimitReset({
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
+        profileId: dispatchProfile.id,
+        processGeneration: dispatchProfile.processGeneration,
         accountFingerprint,
         weeklyWindowResetsAt: decision.weeklyWindowResetsAt,
         observedUsedPercent: decision.usedPercent,
@@ -3135,16 +3195,21 @@ export class HraService {
       };
     }
     if (attempt.state === "effect_started") {
-      throw new Error("ACCOUNT_RATE_LIMIT_RESET_EFFECT_ALREADY_STARTED");
+      return {
+        authoritativeReread: false,
+        refresh: { state: "recovery_pending" },
+      };
     }
 
-    await this.#daemonAuthority.assertCurrent();
-    if (signal.aborted) throw signal.reason;
-    this.#store.beginAccountRateLimitReset(attempt.idempotencyKey);
+    signal.throwIfAborted();
+    const begun = this.#store.beginAccountRateLimitReset(attempt.idempotencyKey);
+    if (begun.state !== "effect_started") {
+      throw new Error("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
+    }
     let outcome: Awaited<ReturnType<CodexRuntimePort["consumeRateLimitReset"]>>;
     try {
       outcome = await this.#codex.consumeRateLimitReset({
-        authority: authorityFor(this.#paths, profile),
+        authority: authorityFor(this.#paths, dispatchProfile),
         idempotencyKey: attempt.idempotencyKey,
         signal,
       });
@@ -3153,9 +3218,9 @@ export class HraService {
         ? "ambiguous"
         : "retryable";
       try {
-        // Only the client's explicit indeterminate-effect error can bypass a
-        // later eligibility recheck. Definite rejections and pre-dispatch
-        // failures retain the same key but return to the retryable gate.
+        // Every failure retains the original key. An indeterminate effect can
+        // bypass ordinary eligibility only after durable policy authorization;
+        // determinate failures return through the ordinary window gates.
         this.#store.deferAccountRateLimitReset(attempt.idempotencyKey, retryState);
       } catch (journalError: unknown) {
         this.#failStopAfterResetJournalFailure(
@@ -3166,8 +3231,8 @@ export class HraService {
           "An automatic reset may have reached Codex and its recovery state could not be committed.",
         );
       }
-      // A successful usage read remains successful. The next serialized poll
-      // retries this exact logical redemption with the same upstream key.
+      // A successful usage read remains successful. A later refresh can retry
+      // only this exact durable upstream key after policy authorization.
       return {
         authoritativeReread: false,
         refresh: {
@@ -3195,7 +3260,6 @@ export class HraService {
   async #proveUsageAccountIdentity(input: {
     profile: ProfileRecord;
     expectedFingerprint: string | null;
-    attempt: AccountRateLimitResetAttemptRecord | null;
     signal: AbortSignal;
   }): Promise<string> {
     const account = await this.#fencedEffect(async () =>
@@ -3222,12 +3286,6 @@ export class HraService {
       || (persistedFingerprint !== null
         && actualFingerprint !== persistedFingerprint);
     if (identityChanged) {
-      if (input.attempt !== null) {
-        this.#store.closeAccountRateLimitReset(
-          input.attempt.idempotencyKey,
-          "account_identity_changed",
-        );
-      }
       const stateChange = this.#store.setProfileStateWithWorkRetirement(
         input.profile.id,
         input.profile.processGeneration,

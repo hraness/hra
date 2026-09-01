@@ -102,8 +102,39 @@ main {
   padding-block: clamp(3rem, 8vw, 7rem);
 }
 
-.hero {
-  max-width: 60rem;
+:where(.hraness-marketing-hero, .hraness-marketing-install) {
+  --hraness-marketing-ink: var(--foreground);
+  --hraness-marketing-muted: var(--muted);
+  --hraness-marketing-line: var(--rule);
+  --hraness-marketing-surface: var(--background);
+  --hraness-marketing-inverse: var(--code-background);
+  --hraness-marketing-inverse-ink: var(--code-foreground);
+  --hraness-marketing-accent: var(--link);
+  --hraness-marketing-text-font: var(--font-sans);
+  --hraness-marketing-heading-font: var(--font-sans);
+  --hraness-marketing-mono-font: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
+  --hraness-marketing-measure: 74rem;
+}
+
+.hraness-marketing-hero__heading {
+  max-inline-size: 10.5ch;
+  letter-spacing: -0.07em;
+  line-height: 0.9;
+}
+
+.hraness-marketing-hero__summary {
+  font-size: clamp(1.15rem, 2.25vw, 1.55rem);
+  line-height: 1.35;
+}
+
+.hraness-marketing-proof__heading {
+  max-inline-size: 15ch;
+}
+
+.hraness-marketing-install,
+.hero-notes,
+.home-reading {
+  margin-block-start: 2.5rem;
 }
 
 .home-reading {
@@ -326,7 +357,7 @@ pre code {
   font-family: var(--font-sans);
 }
 
-section {
+.documentation-section {
   border-top: 1px solid var(--rule);
   display: grid;
   gap: 0 clamp(2rem, 5vw, 6rem);
@@ -334,20 +365,36 @@ section {
   padding-block: clamp(2.5rem, 6vw, 5rem);
 }
 
-section > h2 {
+.documentation-section > h2 {
   grid-column: 1;
 }
 
-section > :not(h2) {
+.documentation-section > :not(h2) {
   grid-column: 2;
 }
 
-section > h3 {
+.documentation-section > h3 {
   margin-top: 1.2rem;
 }
 
-section > h3 ~ :not(h2) {
+.documentation-section > h3 ~ :not(h2) {
   grid-column: 2;
+}
+
+.install-checks {
+  display: grid;
+  gap: 0.65rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.install-checks pre {
+  display: block;
+  margin: 0;
+  min-width: 0;
+}
+
+.hero-notes {
+  max-width: 72ch;
 }
 
 li + li {
@@ -363,7 +410,7 @@ li + li {
   max-width: 68rem;
 }
 
-.narrow-page section {
+.narrow-page .documentation-section {
   margin-top: 3rem;
 }
 
@@ -490,11 +537,15 @@ li + li {
 }
 
 @media (max-width: 48rem) {
-  section {
+  .install-checks {
+    grid-template-columns: 1fr;
+  }
+
+  .documentation-section {
     display: block;
   }
 
-  section > h2 {
+  .documentation-section > h2 {
     margin-bottom: 1.5rem;
   }
 

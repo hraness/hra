@@ -57,7 +57,7 @@ describe("public content contract", () => {
     });
   });
 
-  test("leads both public surfaces with the live immutable CLI install command", () => {
+  test("leads the site with the outcome and keeps the README install-first", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
     const encodedInstallCommand = htmlText(publicContent.installCommand);
@@ -65,7 +65,14 @@ describe("public content contract", () => {
     expect(markdown).toStartWith(
       `# ${publicContent.productName}\n\n\`\`\`sh\n${publicContent.installCommand}\n\`\`\``,
     );
-    expect(html.indexOf(`<h1>${publicContent.productName}</h1>`)).toBeLessThan(
+    expect(html.indexOf(`>${publicContent.hero.heading}</h1>`)).toBeLessThan(
+      html.indexOf(encodedInstallCommand),
+    );
+    expect(html).toContain('class="hraness-marketing-hero"');
+    expect(html).toContain('data-hraness-marketing="flow"');
+    expect(html).toContain('data-hraness-marketing="facts"');
+    expect(html).toContain('data-hraness-marketing="install"');
+    expect(html.indexOf(htmlText(publicContent.hero.steps[0]!.command))).toBeLessThan(
       html.indexOf(encodedInstallCommand),
     );
     expect(html.indexOf(encodedInstallCommand)).toBeLessThan(
@@ -80,6 +87,16 @@ describe("public content contract", () => {
     expect(markdown.indexOf(publicContent.doctorCommand)).toBeLessThan(
       markdown.indexOf(publicContent.initCommand),
     );
+    for (const surface of [markdown, html]) {
+      expect(surface).toContain(publicContent.hero.heading);
+      expect(surface).toContain(publicContent.hero.summary);
+      expect(surface).toContain(publicContent.hero.boundary);
+      expect(surface).toContain(publicContent.hero.proofLabel);
+      for (const step of publicContent.hero.steps) {
+        expect(surface).toContain(html === surface ? htmlText(step.command) : step.command);
+        expect(surface).toContain(step.detail);
+      }
+    }
   });
 
   test("marks the local release and website live while keeping hosted sync unavailable", () => {
@@ -692,7 +709,7 @@ describe("public content contract", () => {
 
   test("provides keyboard and landmark structure without inline presentation", () => {
     const html = renderSiteHtml();
-    expect(html.match(/<h1>/g)).toHaveLength(1);
+    expect(html.match(/<h1\b/g)).toHaveLength(1);
     expect(html).toContain('<a class="skip-link" href="#content">Skip to content</a>');
     expect(html).toContain('<main id="content">');
     expect(html).toContain('aria-label="Documentation"');
