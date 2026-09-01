@@ -7,13 +7,16 @@ import {
   mkdtemp,
   open,
   readFile,
+  readlink,
   readdir,
   realpath,
+  rename,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 import {
   buildHraGlobalInstallCommand,
@@ -178,6 +181,222 @@ const readJsonRecord = async (path: string): Promise<Record<string, unknown>> =>
     throw new Error(`Expected one JSON object fixture at ${path}.`);
   }
   return value as Record<string, unknown>;
+};
+
+type SyntheticInstallPackageName = "@hraness/hra" | "hra";
+type SyntheticPreviousInstall = Readonly<{
+  activePath: string;
+  authorityRoot: string;
+  cliPath: string;
+  packageManifestPath: string;
+  receiptPath: string;
+  root: string;
+  versionRoot: string;
+  versionsRoot: string;
+}>;
+
+const fixturePackageComponents = (
+  packageName: SyntheticInstallPackageName,
+): readonly string[] => packageName === "@hraness/hra"
+  ? ["@hraness", "hra"]
+  : ["hra"];
+
+const measureSyntheticVersion = async (
+  versionRoot: string,
+): Promise<Readonly<{ entryCount: number; totalBytes: number; treeSha256: string }>> => {
+  let entryCount = 0;
+  let totalBytes = 0;
+  const treeHasher = createHash("sha256");
+  const record = (value: readonly (number | string)[]): void => {
+    treeHasher.update(`${JSON.stringify(value)}\n`, "utf8");
+  };
+  const visit = async (directory: string): Promise<void> => {
+    const directoryMetadata = await lstat(directory);
+    if (!directoryMetadata.isDirectory() || (directoryMetadata.mode & 0o777) !== 0o700) {
+      throw new Error(`Synthetic HRA version directory is not private: ${directory}`);
+    }
+    record(["directory", relative(versionRoot, directory).replaceAll("\\", "/"), 0o700]);
+    const entries = (await readdir(directory, { withFileTypes: true }))
+      .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      const metadata = await lstat(path);
+      if (entry.isDirectory()) {
+        entryCount += 1;
+        await visit(path);
+        continue;
+      }
+      if (path === join(versionRoot, ".hra-install-complete.json")) continue;
+      entryCount += 1;
+      if (entry.isSymbolicLink()) {
+        record([
+          "symlink",
+          relative(versionRoot, path).replaceAll("\\", "/"),
+          await readlink(path),
+        ]);
+        continue;
+      }
+      if (!entry.isFile() || !metadata.isFile()) {
+        throw new Error(`Synthetic HRA version contains an unsupported entry: ${path}`);
+      }
+      const bytes = await readFile(path);
+      totalBytes += bytes.byteLength;
+      record([
+        "file",
+        relative(versionRoot, path).replaceAll("\\", "/"),
+        metadata.mode & 0o777,
+        bytes.byteLength,
+        createHash("sha256").update(bytes).digest("hex"),
+      ]);
+    }
+  };
+  await visit(versionRoot);
+  return { entryCount, totalBytes, treeSha256: treeHasher.digest("hex") };
+};
+
+const writePrivateJson = async (path: string, value: unknown): Promise<void> => {
+  await writeFile(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  await chmod(path, 0o600);
+};
+
+const resealSyntheticVersion = async (fixture: SyntheticPreviousInstall): Promise<void> => {
+  const receipt = await readJsonRecord(fixture.receiptPath);
+  Object.assign(receipt, await measureSyntheticVersion(fixture.versionRoot));
+  await writePrivateJson(fixture.receiptPath, receipt);
+};
+
+const createSyntheticPreviousInstall = async (
+  root: string,
+  input: Readonly<{
+    archiveSource?: "local" | "official";
+    layoutPackageName?: SyntheticInstallPackageName;
+    manifestPackageName?: SyntheticInstallPackageName;
+    packageName: SyntheticInstallPackageName;
+    packageVersion: string;
+  }>,
+): Promise<SyntheticPreviousInstall> => {
+  const archiveSource = input.archiveSource ?? "local";
+  const layoutPackageName = input.layoutPackageName ?? input.packageName;
+  const manifestPackageName = input.manifestPackageName ?? input.packageName;
+  const bunRoot = join(root, "bun root");
+  const authorityRoot = join(bunRoot, "install", "hra");
+  const versionsRoot = join(authorityRoot, "versions");
+  const archiveIdentity = {
+    archiveAssetId: archiveSource === "official" ? 8_675_308 : null,
+    archiveBytes: 123,
+    archiveReleaseId: archiveSource === "official" ? 9_715_112 : null,
+    archiveReleaseTag: archiveSource === "official" ? `v${input.packageVersion}` : null,
+    archiveRepositoryId: archiveSource === "official" ? HRA_INSTALL_REPOSITORY_ID : null,
+    archiveSha256: createHash("sha256")
+      .update(`synthetic archive:${input.packageName}:${input.packageVersion}:${archiveSource}`)
+      .digest("hex"),
+    archiveSource,
+  } as const;
+  const cliBytes = Buffer.from(`#!/usr/bin/env bun\n// synthetic ${layoutPackageName} ${input.packageVersion}\n`);
+  const normalizerBytes = Buffer.from(`// synthetic normalizer ${input.packageVersion}\n`);
+  const cliSha256 = createHash("sha256").update(cliBytes).digest("hex");
+  const normalizerSha256 = createHash("sha256").update(normalizerBytes).digest("hex");
+  const versionName = [
+    `v${input.packageVersion}`,
+    archiveSource,
+    archiveIdentity.archiveSha256,
+    normalizerSha256,
+    cliSha256,
+  ].join("-");
+  const versionRoot = join(versionsRoot, versionName);
+  const globalRoot = join(versionRoot, "install", "global");
+  const packageRoot = join(globalRoot, "node_modules", ...fixturePackageComponents(layoutPackageName));
+  const sourceRoot = join(packageRoot, "src");
+  const cliPath = join(sourceRoot, "cli.ts");
+  const packageManifestPath = join(packageRoot, "package.json");
+  const activePath = join(bunRoot, "bin", "hra");
+  for (const directory of [
+    bunRoot,
+    join(bunRoot, "bin"),
+    join(bunRoot, "install"),
+    authorityRoot,
+    versionsRoot,
+    versionRoot,
+    join(versionRoot, "install"),
+    globalRoot,
+    join(globalRoot, "node_modules"),
+    ...(layoutPackageName === "@hraness/hra" ? [join(globalRoot, "node_modules", "@hraness")] : []),
+    packageRoot,
+    sourceRoot,
+  ]) {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+  }
+  await writePrivateJson(join(globalRoot, "package.json"), {
+    dependencies: { [layoutPackageName]: input.packageVersion },
+  });
+  await writePrivateJson(packageManifestPath, {
+    bin: { hra: "./src/cli.ts" },
+    name: manifestPackageName,
+    scripts: { check: "bun test" },
+    version: input.packageVersion,
+  });
+  await writeFile(cliPath, cliBytes, { mode: 0o755 });
+  await chmod(cliPath, 0o755);
+  await writeFile(join(sourceRoot, "install-normalizer.ts"), normalizerBytes, { mode: 0o600 });
+  await chmod(join(sourceRoot, "install-normalizer.ts"), 0o600);
+  const receiptPath = join(versionRoot, ".hra-install-complete.json");
+  const tree = await measureSyntheticVersion(versionRoot);
+  await writePrivateJson(receiptPath, {
+    ...archiveIdentity,
+    cliSha256,
+    completedAt: 1_725_000_000_000,
+    dependencyProvenance: "bun-registry-exact-versions",
+    ...tree,
+    id: "00000000-0000-4000-8000-000000000001",
+    normalizerSha256,
+    packageName: input.packageName,
+    packageVersion: input.packageVersion,
+    version: 2,
+  });
+  await symlink(cliPath, activePath);
+  return {
+    activePath,
+    authorityRoot,
+    cliPath,
+    packageManifestPath,
+    receiptPath,
+    root,
+    versionRoot,
+    versionsRoot,
+  };
+};
+
+const replaceSyntheticActiveTarget = async (
+  fixture: SyntheticPreviousInstall,
+  target: string,
+): Promise<void> => {
+  await rm(fixture.activePath, { force: true });
+  await symlink(target, fixture.activePath);
+};
+
+const expectNoStartedInstall = async (fixture: SyntheticPreviousInstall): Promise<void> => {
+  expect(await Bun.file(join(fixture.authorityRoot, "install-intent.json")).exists()).toBeFalse();
+  expect((await readdir(fixture.authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeFalse();
+};
+
+const expectPreviousInstallRejectedBeforeStaging = async (
+  fixture: SyntheticPreviousInstall,
+  expectedMessage: string,
+): Promise<void> => {
+  const activeTargetBefore = await readlink(fixture.activePath);
+  const cliBefore = await readFile(fixture.cliPath);
+  const receiptBefore = await readFile(fixture.receiptPath);
+  const versionsBefore = (await readdir(fixture.versionsRoot)).sort();
+  const result = await runInstaller(fixture.root);
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr).toContain(expectedMessage);
+  expect(result.stdout).toBe("");
+  expect(await readlink(fixture.activePath)).toBe(activeTargetBefore);
+  expect(await readFile(fixture.cliPath)).toEqual(cliBefore);
+  expect(await readFile(fixture.receiptPath)).toEqual(receiptBefore);
+  expect((await readdir(fixture.versionsRoot)).sort()).toEqual(versionsBefore);
+  await expectNoStartedInstall(fixture);
 };
 
 const processIdentityExists = (pid: number, group = false): boolean => {
@@ -727,6 +946,249 @@ describe("transactional HRA installer", () => {
     expect(await realpath(activePath)).toBe(activeTarget);
     expect(await readdir(join(bunRoot, "install", "hra", "versions"))).toEqual(versions);
   }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
+
+  test("upgrades and recovers a verified legacy unscoped 0.1.0 installation", async () => {
+    const root = await makeRoot("hra-install-legacy-upgrade-");
+    const legacy = await createSyntheticPreviousInstall(root, {
+      packageName: "hra",
+      packageVersion: "0.1.0",
+    });
+    const legacyCliBefore = await readFile(legacy.cliPath);
+    const legacyReceiptBefore = await readFile(legacy.receiptPath);
+    const legacyTreeBefore = await measureSyntheticVersion(legacy.versionRoot);
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const interrupted = await run([
+      process.execPath,
+      "-e",
+      [
+        `const module = await import(${JSON.stringify(runtimePath)});`,
+        `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+        `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
+        '  afterNormalized: () => { throw new Error("test legacy normalized interruption"); },',
+        "});",
+      ].join("\n"),
+    ], { cwd: root, environment: installEnvironment(root) });
+    expect(interrupted.exitCode).not.toBe(0);
+    expect(interrupted.stderr).toContain("test legacy normalized interruption");
+    expect(interrupted.stdout).toBe("");
+    expect(await readlink(legacy.activePath)).toBe(legacy.cliPath);
+    expect(await readFile(legacy.cliPath)).toEqual(legacyCliBefore);
+    expect(await readFile(legacy.receiptPath)).toEqual(legacyReceiptBefore);
+    expect(await measureSyntheticVersion(legacy.versionRoot)).toEqual(legacyTreeBefore);
+    expect(await readJsonRecord(join(legacy.authorityRoot, "install-intent.json"))).toMatchObject({
+      phase: "normalized",
+      previousActiveTarget: legacy.cliPath,
+    });
+    expect((await readdir(legacy.authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeFalse();
+
+    const recovered = await runInstaller(root);
+    expect(recovered).toEqual({
+      exitCode: 0,
+      stderr: "",
+      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+    });
+    const activeTarget = await readlink(legacy.activePath);
+    expect(activeTarget).not.toBe(legacy.cliPath);
+    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/hra/src/cli.ts");
+    expect(await realpath(legacy.activePath)).toBe(activeTarget);
+    expect(await readFile(legacy.cliPath)).toEqual(legacyCliBefore);
+    expect(await readFile(legacy.receiptPath)).toEqual(legacyReceiptBefore);
+    expect(await measureSyntheticVersion(legacy.versionRoot)).toEqual(legacyTreeBefore);
+    expect(await readdir(legacy.versionsRoot)).toHaveLength(2);
+    await expectNoStartedInstall(legacy);
+  }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
+
+  test("accepts an older scoped official release as verified previous authority", async () => {
+    const root = await makeRoot("hra-install-older-scoped-");
+    const previous = await createSyntheticPreviousInstall(root, {
+      archiveSource: "official",
+      packageName: "@hraness/hra",
+      packageVersion: "0.1.4",
+    });
+    const receiptBefore = await readFile(previous.receiptPath);
+    const treeBefore = await measureSyntheticVersion(previous.versionRoot);
+    const result = await runInstaller(root);
+    expect(result).toEqual({
+      exitCode: 0,
+      stderr: "",
+      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+    });
+    const activeTarget = await readlink(previous.activePath);
+    expect(activeTarget).not.toBe(previous.cliPath);
+    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/hra/src/cli.ts");
+    expect(await readFile(previous.receiptPath)).toEqual(receiptBefore);
+    expect(await measureSyntheticVersion(previous.versionRoot)).toEqual(treeBefore);
+    expect(await readdir(previous.versionsRoot)).toHaveLength(2);
+    await expectNoStartedInstall(previous);
+  }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
+
+  test("rejects invalid previous package identities before staging", async () => {
+    const unsupportedRoot = await makeRoot("hra-install-legacy-version-refusal-");
+    const unsupported = await createSyntheticPreviousInstall(unsupportedRoot, {
+      packageName: "hra",
+      packageVersion: "0.1.1",
+    });
+    await expectPreviousInstallRejectedBeforeStaging(unsupported, "legacy HRA version receipt is invalid");
+
+    const invalidSemverRoot = await makeRoot("hra-install-semver-refusal-");
+    const invalidSemver = await createSyntheticPreviousInstall(invalidSemverRoot, {
+      packageName: "@hraness/hra",
+      packageVersion: "01.2.3",
+    });
+    await expectPreviousInstallRejectedBeforeStaging(invalidSemver, "complete HRA version receipt is invalid");
+
+    const officialTagRoot = await makeRoot("hra-install-old-tag-refusal-");
+    const officialTag = await createSyntheticPreviousInstall(officialTagRoot, {
+      archiveSource: "official",
+      packageName: "@hraness/hra",
+      packageVersion: "0.1.4",
+    });
+    const officialReceipt = await readJsonRecord(officialTag.receiptPath);
+    officialReceipt.archiveReleaseTag = "v0.1.3";
+    await writePrivateJson(officialTag.receiptPath, officialReceipt);
+    await expectPreviousInstallRejectedBeforeStaging(officialTag, "official archive authority is invalid");
+
+    const manifestRoot = await makeRoot("hra-install-old-manifest-refusal-");
+    const manifest = await createSyntheticPreviousInstall(manifestRoot, {
+      packageName: "hra",
+      packageVersion: "0.1.0",
+    });
+    const manifestValue = await readJsonRecord(manifest.packageManifestPath);
+    manifestValue.name = "@hraness/hra";
+    await writePrivateJson(manifest.packageManifestPath, manifestValue);
+    await resealSyntheticVersion(manifest);
+    await expectPreviousInstallRejectedBeforeStaging(manifest, "installed HRA package identity is not exact");
+
+    const layoutRoot = await makeRoot("hra-install-receipt-layout-refusal-");
+    const layout = await createSyntheticPreviousInstall(layoutRoot, {
+      layoutPackageName: "hra",
+      manifestPackageName: "hra",
+      packageName: "@hraness/hra",
+      packageVersion: "0.1.4",
+    });
+    await expectPreviousInstallRejectedBeforeStaging(layout, "package layout that conflicts with its receipt");
+
+    const mixedRoot = await makeRoot("hra-install-mixed-layout-refusal-");
+    const mixed = await createSyntheticPreviousInstall(mixedRoot, {
+      packageName: "hra",
+      packageVersion: "0.1.0",
+    });
+    const alternatePackageRoot = join(
+      mixed.versionRoot,
+      "install",
+      "global",
+      "node_modules",
+      "@hraness",
+      "hra",
+    );
+    await mkdir(alternatePackageRoot, { recursive: true, mode: 0o700 });
+    await chmod(join(mixed.versionRoot, "install", "global", "node_modules", "@hraness"), 0o700);
+    await chmod(alternatePackageRoot, 0o700);
+    await expectPreviousInstallRejectedBeforeStaging(mixed, "package layout that conflicts with its receipt");
+
+    const integrityRoot = await makeRoot("hra-install-legacy-integrity-refusal-");
+    const integrity = await createSyntheticPreviousInstall(integrityRoot, {
+      packageName: "hra",
+      packageVersion: "0.1.0",
+    });
+    const damagedCli = Buffer.from(await readFile(integrity.cliPath));
+    damagedCli[0] = (damagedCli[0] ?? 0) ^ 1;
+    await writeFile(integrity.cliPath, damagedCli, { mode: 0o755 });
+    await chmod(integrity.cliPath, 0o755);
+    await expectPreviousInstallRejectedBeforeStaging(integrity, "durable tree receipt");
+
+    const symlinkRoot = await makeRoot("hra-install-legacy-root-symlink-refusal-");
+    const symlinked = await createSyntheticPreviousInstall(symlinkRoot, {
+      packageName: "hra",
+      packageVersion: "0.1.0",
+    });
+    const heldVersionRoot = `${symlinked.versionRoot}-held`;
+    await rename(symlinked.versionRoot, heldVersionRoot);
+    await symlink(heldVersionRoot, symlinked.versionRoot);
+    await expectPreviousInstallRejectedBeforeStaging(symlinked, "version root is not canonical");
+  }, 60_000);
+
+  test("rejects noncanonical previous-active target layouts before staging", async () => {
+    const cases: readonly Readonly<{
+      label: string;
+      message: string;
+      target: (fixture: SyntheticPreviousInstall) => string;
+    }>[] = [
+      {
+        label: "relative target",
+        message: "target is not canonical and absolute",
+        target: () => "../install/hra/versions/relative/install/global/node_modules/hra/src/cli.ts",
+      },
+      {
+        label: "outside authority",
+        message: "outside its protected version authority",
+        target: (fixture) => join(fixture.root, "outside", "cli.ts"),
+      },
+      {
+        label: "arbitrary package",
+        message: "does not use a supported exact package layout",
+        target: (fixture) => join(
+          fixture.versionRoot,
+          "install",
+          "global",
+          "node_modules",
+          "attacker",
+          "src",
+          "cli.ts",
+        ),
+      },
+      {
+        label: "extra nesting",
+        message: "does not use a supported exact package layout",
+        target: (fixture) => join(
+          fixture.versionRoot,
+          "extra",
+          "install",
+          "global",
+          "node_modules",
+          "hra",
+          "src",
+          "cli.ts",
+        ),
+      },
+      {
+        label: "missing component",
+        message: "does not use a supported exact package layout",
+        target: (fixture) => join(
+          fixture.versionRoot,
+          "install",
+          "global",
+          "hra",
+          "src",
+          "cli.ts",
+        ),
+      },
+      {
+        label: "stale version",
+        message: "names a missing complete version",
+        target: (fixture) => join(
+          fixture.versionsRoot,
+          `v0.1.0-local-${"0".repeat(64)}-${"1".repeat(64)}-${"2".repeat(64)}`,
+          "install",
+          "global",
+          "node_modules",
+          "hra",
+          "src",
+          "cli.ts",
+        ),
+      },
+    ];
+    for (const testCase of cases) {
+      const root = await makeRoot(`hra-install-active-layout-${testCase.label.replaceAll(" ", "-")}-`);
+      const fixture = await createSyntheticPreviousInstall(root, {
+        packageName: "hra",
+        packageVersion: "0.1.0",
+      });
+      await replaceSyntheticActiveTarget(fixture, testCase.target(fixture));
+      await expectPreviousInstallRejectedBeforeStaging(fixture, testCase.message);
+    }
+  }, 60_000);
 
   test("keeps identical local and official archives in distinct namespaces and fetches the official asset", async () => {
     const root = await makeRoot("hra-install-source-classes-");
