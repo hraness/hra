@@ -47,7 +47,7 @@ describe("public content contract", () => {
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init --yes",
       installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.1.5/hraness-hra-0.1.5.tgz",
+        "https://github.com/hraness/hra/releases/download/v0.1.6/hraness-hra-0.1.6.tgz",
       ),
       links: {
         github: "https://github.com/hraness/hra",
@@ -99,31 +99,29 @@ describe("public content contract", () => {
     }
   });
 
-  test("marks the local release and website live while keeping hosted sync unavailable", () => {
-    expect(publicReleaseState).toBe("live");
+  test("marks the local release ready and website live while keeping hosted sync unavailable", () => {
+    expect(publicReleaseState).toBe("release-ready");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "live",
+      betaTag: "release-ready",
       githubRepository: "live",
       hostedSync: "beta-not-yet-live",
       website: "live",
     });
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
       expect(surface).toContain("Immutable local CLI release; hosted sync not yet live");
-      expect(surface).toContain("is live from the immutable");
-      expect(surface).toContain("npm exposes the same provenance-bearing bytes as latest");
-      expect(surface).toContain("public CLI is immutable and admitted");
+      expect(surface).toContain("works once GitHub exposes the immutable");
+      expect(surface).toContain("public CLI stays immutable once admitted");
       expect(surface).not.toContain("release tag is release-ready");
       expect(surface).toContain("optional hosted sync remains beta-not-yet-live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("are installable through the exact command above");
-      expect(surface).not.toContain("once its GitHub Release exists");
-      expect(surface).not.toContain("works once GitHub exposes the immutable");
+      expect(surface).toContain("become installable through the exact command above once its GitHub Release exists");
+      expect(surface).toContain("once its GitHub Release exists");
       expect(surface).not.toContain("install command becomes usable");
       expect(surface).not.toContain("Beta not yet live");
-      expect(surface).not.toContain("No published `v0.1.5` tag currently exposes these commands");
+      expect(surface).not.toContain("No published `v0.1.6` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Install the live v0.1.5 beta");
-    expect(renderLlmsText()).not.toContain("Install after the v0.1.5 beta tag is live");
+    expect(renderLlmsText()).toContain("Install after the v0.1.6 beta tag is live");
+    expect(renderLlmsText()).not.toContain("Install the live v0.1.6 beta");
   });
 
   test("publishes protected cloud auth and the exact device-pairing path", () => {
@@ -412,7 +410,7 @@ describe("public content contract", () => {
     expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("| bun -e '");
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.1.5/hraness-hra-0.1.5.tgz",
+      "-- https://github.com/hraness/hra/releases/download/v0.1.6/hraness-hra-0.1.6.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");
@@ -427,7 +425,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra-install-safe");
       expect(surface).toContain("fresh random private staging root");
       expect(surface).toContain("GitHub repository ID 1343008607");
-      expect(surface).toContain("published immutable v0.1.5 release");
+      expect(surface).toContain("published immutable v0.1.6 release");
       expect(surface).toContain("immutable release metadata");
       expect(surface).toContain("verified in-memory snapshot");
       expect(surface).toContain("bounded package-file manifest");
@@ -445,7 +443,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
       expect(surface).toContain("Do not install a moving branch");
-      expect(surface).toContain("verified repair installation of v0.1.5");
+      expect(surface).toContain("verified repair installation of v0.1.6");
       expect(surface).toContain("replace the tagged preflight and release archive references together");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");

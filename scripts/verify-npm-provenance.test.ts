@@ -11,7 +11,7 @@ import {
 } from "./verify-npm-provenance";
 
 const sha = "a".repeat(40);
-const tag = "v0.1.5";
+const tag = "v0.1.6";
 
 function predicate(
   runId = "123",
@@ -122,7 +122,7 @@ describe("npm provenance package subject admission", () => {
   const exactStatement = {
     subject: [{
       digest: { sha512: archiveDigest.toString("hex") },
-      name: "pkg:npm/%40hraness/hra@0.1.5",
+      name: "pkg:npm/%40hraness/hra@0.1.6",
     }],
   };
 
@@ -132,7 +132,7 @@ describe("npm provenance package subject admission", () => {
     expect(() => assertNpmProvenanceSubject({
       subject: [{
         digest: { sha512: archiveDigest.toString("base64") },
-        name: "pkg:npm/%40hraness/hra@0.1.5",
+        name: "pkg:npm/%40hraness/hra@0.1.6",
       }],
     }, { integrity, tag })).toThrow("exact package bytes");
     expect(() => assertNpmProvenanceSubject({
@@ -143,7 +143,7 @@ describe("npm provenance package subject admission", () => {
     }, { integrity, tag })).toThrow("exact package bytes");
     expect(() => assertNpmProvenanceSubject(exactStatement, {
       integrity,
-      tag: "v0.1.6",
+      tag: "v0.1.7",
     })).toThrow("exact package bytes");
   });
 });
@@ -167,12 +167,12 @@ describe("npm provenance attestation-set and signer admission", () => {
     predicate: {
       name: "@hraness/hra",
       registry: "https://registry.npmjs.org",
-      version: "0.1.5",
+      version: "0.1.6",
     },
     predicateType: "https://github.com/npm/attestation/tree/main/specs/publish/v0.1",
     subject: [{
       digest: { sha512: archiveDigest.toString("hex") },
-      name: "pkg:npm/%40hraness/hra@0.1.5",
+      name: "pkg:npm/%40hraness/hra@0.1.6",
     }],
   };
   const publish = {
@@ -213,25 +213,25 @@ describe("npm provenance attestation-set and signer admission", () => {
     const repositorySubject = [
       "repo:hraness",
       "307125679/hra",
-      "1343008607:ref:refs/tags/v0.1.5",
+      "1343008607:ref:refs/tags/v0.1.6",
     ].join("@");
     const der = canonicalAsciiDerUtf8String;
     const policy = npmProvenanceSignerPolicy(tag, sha, invocation);
     expect(policy.certificateIdentityURI).toBe(
-      "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.1\\.5$",
+      "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.1\\.6$",
     );
     expect(policy.certificateOIDs).toEqual({
       "1.3.6.1.4.1.57264.1.2": "push",
       "1.3.6.1.4.1.57264.1.3": sha,
       "1.3.6.1.4.1.57264.1.5": "hraness/hra",
-      "1.3.6.1.4.1.57264.1.6": "refs/tags/v0.1.5",
+      "1.3.6.1.4.1.57264.1.6": "refs/tags/v0.1.6",
       "1.3.6.1.4.1.57264.1.11": der("github-hosted"),
       "1.3.6.1.4.1.57264.1.12": der("https://github.com/hraness/hra"),
       "1.3.6.1.4.1.57264.1.13": der(sha),
-      "1.3.6.1.4.1.57264.1.14": der("refs/tags/v0.1.5"),
+      "1.3.6.1.4.1.57264.1.14": der("refs/tags/v0.1.6"),
       "1.3.6.1.4.1.57264.1.15": der("1343008607"),
       "1.3.6.1.4.1.57264.1.18": der(
-        "https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.5",
+        "https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.6",
       ),
       "1.3.6.1.4.1.57264.1.19": der(sha),
       "1.3.6.1.4.1.57264.1.20": der("push"),

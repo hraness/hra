@@ -1977,7 +1977,7 @@ describe("CLI entry point", () => {
   test("version is sourced from package metadata", async () => {
     const captured = capture();
     expect(await main(["--version"], captured.output)).toBe(0);
-    expect(captured.read()).toEqual({ stdout: "hra 0.1.5\n", stderr: "" });
+    expect(captured.read()).toEqual({ stdout: "hra 0.1.6\n", stderr: "" });
   });
 
   test("completes protected interaction input outside argv and never renders its value", async () => {
