@@ -2237,6 +2237,7 @@ describe("CLI rendering", () => {
           account: { id: "acct_00000000000000000000000000000000", label: "Work" },
           automaticReset: {
             threshold: { remainingPercent: 1, usedPercent: 99 },
+            policy: { state: "active" },
             observation: {
               state: "available",
               creditsAvailable: 1,
@@ -2274,6 +2275,7 @@ describe("CLI rendering", () => {
     expect(rendered).toContain("Work\n");
     expect(rendered).toContain("lifetime tokens: 12,345");
     expect(rendered).toContain("automatic reset policy: 99% used (1% remaining)");
+    expect(rendered).toContain("automatic reset reconciliation: active");
     expect(rendered).toContain("weekly Codex limit: 27.5% used; 72.5% remaining");
     expect(rendered).toContain("reset credits available: 1");
     expect(rendered).toContain("most recent automatic reset attempt: settled (reset)");
@@ -2294,6 +2296,7 @@ describe("CLI rendering", () => {
     };
     const base = {
       threshold: { remainingPercent: 1, usedPercent: 99 },
+      policy: { state: "active" },
       observation: {
         state: "unavailable",
         reason: "weekly_window_unavailable",
@@ -2302,6 +2305,14 @@ describe("CLI rendering", () => {
     };
     for (const automaticReset of [
       { ...base, idempotencyKey: "00000000-0000-4000-8000-000000000001" },
+      {
+        ...base,
+        policy: {
+          state: "window_suppressed",
+          weeklyWindowResetsAt: 2_000_000_000_000,
+          accountFingerprint: "a".repeat(64),
+        },
+      },
       {
         ...base,
         lastAttempt: {

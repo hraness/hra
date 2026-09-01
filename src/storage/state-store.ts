@@ -46,6 +46,7 @@ import {
 } from "../domain/runtime-profile";
 import {
   ACCOUNT_USAGE_HISTORY_PAGE_LIMIT,
+  CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES,
   accountRateLimitResetOutcomeSchema,
   storedAccountUsageSnapshotSchema,
   type AccountRateLimitResetOutcome,
@@ -353,6 +354,43 @@ export type AccountRateLimitResetRebindRecord = Readonly<{
   createdAt: number;
 }>;
 
+const accountRateLimitResetPolicyStateSchema = z.enum([
+  "active_unbound",
+  "reconciliation_required",
+  "window_suppressed",
+  "active_bound",
+]);
+
+export type AccountRateLimitResetPolicyRecord = Readonly<{
+  profileId: ProfileId;
+  state: z.infer<typeof accountRateLimitResetPolicyStateSchema>;
+  accountFingerprint: string | null;
+  weeklyWindowResetsAt: number | null;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+export type AccountRateLimitResetPolicyDecision =
+  | Readonly<{
+      decision: "allow";
+      reason: "active";
+      policy: AccountRateLimitResetPolicyRecord;
+    }>
+  | Readonly<{
+      decision: "suppress";
+      reason: "reconciliation_window";
+      policy: AccountRateLimitResetPolicyRecord;
+    }>
+  | Readonly<{
+      decision: "block";
+      reason:
+        | "weekly_window_unavailable"
+        | "weekly_window_nonmonotonic"
+        | "account_identity_changed";
+      policy: AccountRateLimitResetPolicyRecord;
+    }>;
+
 const accountRateLimitResetAttemptRowSchema = z.object({
   attempt_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   idempotency_key: z.string().uuid(),
@@ -376,6 +414,16 @@ const accountRateLimitResetRebindRowSchema = z.object({
   to_process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   account_fingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
   created_at: unixMillisecondsSchema,
+}).strict();
+
+const accountRateLimitResetPolicyRowSchema = z.object({
+  profile_id: profileIdSchema,
+  state: accountRateLimitResetPolicyStateSchema,
+  account_fingerprint: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  weekly_window_resets_at: unixMillisecondsSchema.nullable(),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
 }).strict();
 
 const mapAccountRateLimitResetAttempt = (
@@ -410,6 +458,32 @@ const mapAccountRateLimitResetRebind = (
     toProcessGeneration: row.to_process_generation,
     accountFingerprint: row.account_fingerprint,
     createdAt: row.created_at,
+  };
+};
+
+const mapAccountRateLimitResetPolicy = (
+  value: unknown,
+): AccountRateLimitResetPolicyRecord => {
+  const row = accountRateLimitResetPolicyRowSchema.parse(value);
+  const isUnbound = row.state === "active_unbound"
+    || row.state === "reconciliation_required";
+  const hasNoBinding = row.account_fingerprint === null
+    && row.weekly_window_resets_at === null;
+  const hasCompleteBinding = row.account_fingerprint !== null
+    && row.weekly_window_resets_at !== null;
+  if (
+    (isUnbound && !hasNoBinding)
+    || (!isUnbound && !hasCompleteBinding)
+    || row.updated_at < row.created_at
+  ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_SHAPE_INVALID");
+  return {
+    profileId: row.profile_id,
+    state: row.state,
+    accountFingerprint: row.account_fingerprint,
+    weeklyWindowResetsAt: row.weekly_window_resets_at,
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 };
 
@@ -616,7 +690,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 27;
+const currentSchemaVersion = 28;
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -1728,7 +1802,12 @@ WHEN NOT (
   (OLD.state='prepared' AND NEW.state='effect_started') OR
   (OLD.state='effect_started' AND NEW.state IN ('ambiguous','retryable','settled')) OR
   (OLD.state IN ('ambiguous','retryable') AND NEW.state='effect_started') OR
-  (OLD.state IN ('prepared','ambiguous','retryable') AND NEW.state='closed') OR
+  (OLD.state IN ('prepared','retryable') AND NEW.state='closed') OR
+  (
+    OLD.state='ambiguous'
+    AND NEW.state='closed'
+    AND NEW.local_resolution='account_identity_changed'
+  ) OR
   OLD.state=NEW.state
 )
 BEGIN SELECT RAISE(ABORT, 'illegal account rate-limit reset transition'); END;
@@ -1789,6 +1868,259 @@ WHEN EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'account rate-limit reset rebind evidence is append-only'); END;
 `;
+
+const schemaVersion28 = `
+CREATE TABLE IF NOT EXISTS account_rate_limit_reset_policies (
+  profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+  state TEXT NOT NULL CHECK(state IN (
+    'active_unbound','reconciliation_required','window_suppressed','active_bound'
+  )),
+  account_fingerprint TEXT CHECK(
+    account_fingerprint IS NULL OR (
+      length(account_fingerprint)=64
+      AND account_fingerprint NOT GLOB '*[^a-f0-9]*'
+    )
+  ),
+  weekly_window_resets_at INTEGER CHECK(
+    weekly_window_resets_at IS NULL
+    OR weekly_window_resets_at BETWEEN 0 AND 9007199254740991
+  ),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK(
+    (
+      state IN ('active_unbound','reconciliation_required')
+      AND account_fingerprint IS NULL
+      AND weekly_window_resets_at IS NULL
+    ) OR (
+      state IN ('window_suppressed','active_bound')
+      AND account_fingerprint IS NOT NULL
+      AND weekly_window_resets_at IS NOT NULL
+    )
+  )
+) STRICT;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_policy_insert_guard;
+CREATE TRIGGER account_rate_limit_reset_policy_insert_guard
+BEFORE INSERT ON account_rate_limit_reset_policies
+WHEN NEW.state NOT IN ('active_unbound','reconciliation_required')
+  OR NOT EXISTS (
+    SELECT 1 FROM profiles p
+    WHERE p.id=NEW.profile_id AND p.state!='removed'
+  )
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset policy insert is invalid'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_policy_transition_guard;
+CREATE TRIGGER account_rate_limit_reset_policy_transition_guard
+BEFORE UPDATE ON account_rate_limit_reset_policies
+WHEN NEW.profile_id!=OLD.profile_id
+  OR NEW.created_at!=OLD.created_at
+  OR NEW.revision!=OLD.revision+1
+  OR NEW.updated_at<OLD.updated_at
+  OR NOT (
+    (
+      OLD.state='active_unbound'
+      AND NEW.state='active_bound'
+    ) OR (
+      OLD.state='reconciliation_required'
+      AND NEW.state='window_suppressed'
+    ) OR (
+      OLD.state='window_suppressed'
+      AND NEW.state='active_bound'
+      AND NEW.account_fingerprint=OLD.account_fingerprint
+      AND NEW.weekly_window_resets_at>OLD.weekly_window_resets_at
+      AND NEW.updated_at>=OLD.weekly_window_resets_at
+    ) OR (
+      OLD.state IN (
+        'active_unbound','reconciliation_required','window_suppressed','active_bound'
+      )
+      AND NEW.state='reconciliation_required'
+    ) OR (
+      OLD.state='active_bound'
+      AND NEW.state='active_bound'
+      AND NEW.account_fingerprint=OLD.account_fingerprint
+      AND NEW.weekly_window_resets_at>OLD.weekly_window_resets_at
+    )
+  )
+BEGIN SELECT RAISE(ABORT, 'illegal account rate-limit reset policy transition'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_policy_delete_guard;
+CREATE TRIGGER account_rate_limit_reset_policy_delete_guard
+BEFORE DELETE ON account_rate_limit_reset_policies
+WHEN EXISTS (
+  SELECT 1 FROM profiles p WHERE p.id=OLD.profile_id AND p.state!='removed'
+)
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset policy is required'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_attempt_transition_guard;
+CREATE TRIGGER account_rate_limit_reset_attempt_transition_guard
+BEFORE UPDATE OF state ON account_rate_limit_reset_attempts
+WHEN NOT (
+  (OLD.state='prepared' AND NEW.state='effect_started') OR
+  (OLD.state='effect_started' AND NEW.state IN ('ambiguous','retryable','settled')) OR
+  (OLD.state IN ('ambiguous','retryable') AND NEW.state='effect_started') OR
+  (OLD.state IN ('prepared','retryable') AND NEW.state='closed') OR
+  (
+    OLD.state='ambiguous'
+    AND NEW.state='closed'
+    AND NEW.local_resolution='account_identity_changed'
+  ) OR
+  OLD.state=NEW.state
+)
+BEGIN SELECT RAISE(ABORT, 'illegal account rate-limit reset transition'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_attempt_policy_insert_guard;
+CREATE TRIGGER account_rate_limit_reset_attempt_policy_insert_guard
+BEFORE INSERT ON account_rate_limit_reset_attempts
+WHEN NOT EXISTS (
+  SELECT 1 FROM account_rate_limit_reset_policies p
+  WHERE p.profile_id=NEW.profile_id
+    AND p.state='active_bound'
+    AND p.account_fingerprint=NEW.account_fingerprint
+    AND p.weekly_window_resets_at=NEW.weekly_window_resets_at
+)
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset policy does not authorize preparation'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_attempt_policy_begin_guard;
+CREATE TRIGGER account_rate_limit_reset_attempt_policy_begin_guard
+BEFORE UPDATE OF state ON account_rate_limit_reset_attempts
+WHEN NEW.state='effect_started'
+  AND OLD.state!='effect_started'
+  AND NOT EXISTS (
+    SELECT 1 FROM account_rate_limit_reset_policies p
+    WHERE p.profile_id=OLD.profile_id
+      AND p.state='active_bound'
+      AND p.account_fingerprint=OLD.account_fingerprint
+      AND (
+        (
+          OLD.state IN ('prepared','retryable')
+          AND p.weekly_window_resets_at=OLD.weekly_window_resets_at
+        ) OR (
+          OLD.state='ambiguous'
+          AND p.weekly_window_resets_at>=OLD.weekly_window_resets_at
+        )
+      )
+  )
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset policy does not authorize dispatch'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_attempt_policy_close_guard;
+CREATE TRIGGER account_rate_limit_reset_attempt_policy_close_guard
+BEFORE UPDATE OF state ON account_rate_limit_reset_attempts
+WHEN NEW.state='closed'
+  AND OLD.state!='closed'
+  AND NOT EXISTS (
+    SELECT 1 FROM account_rate_limit_reset_policies p
+    WHERE p.profile_id=OLD.profile_id
+      AND (
+        (
+          p.state='active_bound'
+          AND p.account_fingerprint=OLD.account_fingerprint
+          AND p.weekly_window_resets_at>=OLD.weekly_window_resets_at
+        ) OR (
+          NEW.local_resolution='account_identity_changed'
+          AND p.state='window_suppressed'
+        ) OR (
+          NEW.local_resolution='weekly_window_changed'
+          AND p.state='window_suppressed'
+          AND p.account_fingerprint=OLD.account_fingerprint
+          AND p.weekly_window_resets_at>OLD.weekly_window_resets_at
+        )
+      )
+  )
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset policy does not authorize closure'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_rebind_policy_guard;
+CREATE TRIGGER account_rate_limit_reset_rebind_policy_guard
+BEFORE INSERT ON account_rate_limit_reset_rebinds
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM account_rate_limit_reset_attempts a
+  JOIN account_rate_limit_reset_policies p ON p.profile_id=a.profile_id
+  WHERE a.idempotency_key=NEW.idempotency_key
+    AND p.state='active_bound'
+    AND p.account_fingerprint=a.account_fingerprint
+    AND (
+      (
+        a.state IN ('prepared','retryable')
+        AND p.weekly_window_resets_at=a.weekly_window_resets_at
+      ) OR (
+        a.state='ambiguous'
+        AND p.weekly_window_resets_at>=a.weekly_window_resets_at
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset policy does not authorize rebind'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_rebind_insert_guard;
+CREATE TRIGGER account_rate_limit_reset_rebind_insert_guard
+BEFORE INSERT ON account_rate_limit_reset_rebinds
+WHEN NOT EXISTS (
+  SELECT 1 FROM account_rate_limit_reset_attempts a
+  WHERE a.idempotency_key=NEW.idempotency_key
+    AND a.current_process_generation=NEW.from_process_generation
+    AND a.account_fingerprint=NEW.account_fingerprint
+    AND a.state IN ('prepared','ambiguous','retryable')
+)
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset rebind authority is invalid'); END;
+`;
+
+const schemaVersion28Objects = [
+  {
+    name: "account_rate_limit_reset_policies",
+    table: "account_rate_limit_reset_policies",
+    type: "table",
+  },
+  {
+    name: "account_rate_limit_reset_policy_insert_guard",
+    table: "account_rate_limit_reset_policies",
+    type: "trigger",
+  },
+  {
+    name: "account_rate_limit_reset_policy_transition_guard",
+    table: "account_rate_limit_reset_policies",
+    type: "trigger",
+  },
+  {
+    name: "account_rate_limit_reset_policy_delete_guard",
+    table: "account_rate_limit_reset_policies",
+    type: "trigger",
+  },
+  {
+    name: "account_rate_limit_reset_attempt_transition_guard",
+    table: "account_rate_limit_reset_attempts",
+    type: "trigger",
+  },
+  {
+    name: "account_rate_limit_reset_attempt_policy_insert_guard",
+    table: "account_rate_limit_reset_attempts",
+    type: "trigger",
+  },
+  {
+    name: "account_rate_limit_reset_attempt_policy_begin_guard",
+    table: "account_rate_limit_reset_attempts",
+    type: "trigger",
+  },
+  {
+    name: "account_rate_limit_reset_attempt_policy_close_guard",
+    table: "account_rate_limit_reset_attempts",
+    type: "trigger",
+  },
+  {
+    name: "account_rate_limit_reset_rebind_policy_guard",
+    table: "account_rate_limit_reset_rebinds",
+    type: "trigger",
+  },
+  {
+    name: "account_rate_limit_reset_rebind_insert_guard",
+    table: "account_rate_limit_reset_rebinds",
+    type: "trigger",
+  },
+] as const;
+
+const schemaVersion28ObjectSql = (
+  object: (typeof schemaVersion28Objects)[number],
+): string => {
+  const marker = object.type === "table"
+    ? `CREATE TABLE IF NOT EXISTS ${object.name}`
+    : `CREATE TRIGGER ${object.name}`;
+  const start = schemaVersion28.indexOf(marker);
+  const terminator = object.type === "table" ? ") STRICT;" : "END;";
+  const end = schemaVersion28.indexOf(terminator, start);
+  if (start < 0 || end < 0) throw new Error("STATE_SCHEMA_V28_DEFINITION_INVALID");
+  return schemaVersion28.slice(start, end + terminator.length);
+};
 
 const schemaVersion24Objects = [
   {
@@ -1863,7 +2195,7 @@ const sqliteSchemaObjectRowSchema = z.object({
   name: z.string(),
   sql: z.string(),
   tbl_name: z.string(),
-  type: z.enum(["index", "trigger"]),
+  type: z.enum(["index", "table", "trigger"]),
 }).strict();
 
 const normalizeSqlStructure = (sql: string): string =>
@@ -1886,6 +2218,53 @@ const assertSchemaVersion24Objects = (database: Database): void => {
       || observed.tbl_name !== expected.table
       || normalizeSqlStructure(observed.sql) !== normalizeSqlStructure(expected.sql)
     ) throw new Error("STATE_SCHEMA_V24_STRUCTURE_INVALID");
+  }
+};
+
+const assertSchemaVersion28Objects = (database: Database): void => {
+  const names = schemaVersion28Objects.map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== schemaVersion28Objects.length) {
+    throw new Error("STATE_SCHEMA_V28_STRUCTURE_INVALID");
+  }
+  for (const expected of schemaVersion28Objects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    const observedSql = observed?.sql.replace(/\bIF NOT EXISTS\b/giu, "");
+    const expectedSql = schemaVersion28ObjectSql(expected)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observedSql ?? "")
+        !== normalizeSqlStructure(expectedSql)
+    ) throw new Error("STATE_SCHEMA_V28_STRUCTURE_INVALID");
+  }
+};
+
+const assertAccountRateLimitResetPolicies = (database: Database): void => {
+  assertSchemaVersion28Objects(database);
+  let policies: readonly AccountRateLimitResetPolicyRecord[];
+  try {
+    policies = database.query(
+      "SELECT * FROM account_rate_limit_reset_policies ORDER BY profile_id",
+    ).all().map(mapAccountRateLimitResetPolicy);
+  } catch (error: unknown) {
+    throw new Error("STATE_ACCOUNT_RATE_LIMIT_RESET_POLICY_INVALID", { cause: error });
+  }
+  const policyProfileIds = new Set(policies.map((policy) => policy.profileId));
+  const activeProfileIds = database.query(
+    "SELECT id FROM profiles WHERE state!='removed' ORDER BY id",
+  ).all().map((row) => z.object({ id: profileIdSchema }).strict().parse(row).id);
+  if (activeProfileIds.some((profileId) => !policyProfileIds.has(profileId))) {
+    throw new Error("STATE_ACCOUNT_RATE_LIMIT_RESET_POLICY_MISSING");
+  }
+  const activeProfileIdSet = new Set(activeProfileIds);
+  if (policies.some((policy) => !activeProfileIdSet.has(policy.profileId))) {
+    throw new Error("STATE_ACCOUNT_RATE_LIMIT_RESET_POLICY_ORPHANED");
   }
 };
 
@@ -2966,6 +3345,37 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
       version = 27;
     }
 
+    if (version < 28) {
+      database.exec(schemaVersion28);
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      database.query(
+        `INSERT INTO account_rate_limit_reset_policies(
+           profile_id,state,account_fingerprint,weekly_window_resets_at,
+           revision,created_at,updated_at
+         )
+         SELECT id,'reconciliation_required',NULL,NULL,1,?,?
+         FROM profiles WHERE state!='removed' ORDER BY id
+         ON CONFLICT(profile_id) DO UPDATE SET
+           state='reconciliation_required',
+           account_fingerprint=NULL,
+           weekly_window_resets_at=NULL,
+           revision=account_rate_limit_reset_policies.revision+1,
+           updated_at=MAX(account_rate_limit_reset_policies.updated_at,excluded.updated_at)`,
+      ).run(migratedAt, migratedAt);
+      database.query(
+        `DELETE FROM account_rate_limit_reset_policies
+         WHERE NOT EXISTS (
+           SELECT 1 FROM profiles p
+           WHERE p.id=account_rate_limit_reset_policies.profile_id
+             AND p.state!='removed'
+         )`,
+      ).run();
+      assertAccountRateLimitResetPolicies(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(28, migratedAt);
+      database.exec("PRAGMA user_version = 28");
+      version = 28;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -2996,6 +3406,8 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
     assertWorkSchema(database);
     database.exec(schemaVersion27);
     ensureUsagePollFailureAccountFingerprint(database);
+    database.exec(schemaVersion28);
+    assertAccountRateLimitResetPolicies(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -3355,6 +3767,7 @@ export class StateStore {
       assertSchemaVersion24Objects(this.#database);
       assertWorkSchema(this.#database);
       assertCanonicalLabelKeys(this.#database);
+      assertAccountRateLimitResetPolicies(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
@@ -3398,9 +3811,18 @@ export class StateStore {
     const id = createProfileId();
     const parsedLabel = labelSchema.parse(label);
     const labelKey = canonicalLabelIdentity(parsedLabel, "ACCOUNT").key;
-    const now = this.#now();
-    this.#database.query("INSERT INTO profiles(id,label,label_key,state,process_generation,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(id, parsedLabel, labelKey, "signed_out", 0, now, now);
-    return this.requireProfile(id);
+    const now = unixMillisecondsSchema.parse(this.#now());
+    const create = this.#database.transaction(() => {
+      this.#database.query("INSERT INTO profiles(id,label,label_key,state,process_generation,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(id, parsedLabel, labelKey, "signed_out", 0, now, now);
+      this.#database.query(
+        `INSERT INTO account_rate_limit_reset_policies(
+           profile_id,state,account_fingerprint,weekly_window_resets_at,
+           revision,created_at,updated_at
+         ) VALUES (?,'active_unbound',NULL,NULL,1,?,?)`,
+      ).run(id, now, now);
+      return mapProfile(this.#database.query("SELECT * FROM profiles WHERE id=?").get(id));
+    });
+    return create.immediate();
   }
 
   listProfiles(options: { includeRemoved?: boolean } = {}): readonly ProfileRecord[] {
@@ -3521,6 +3943,28 @@ export class StateStore {
     };
   }
 
+  #closeRecoverableAccountRateLimitResetIdentityAttempts(input: {
+    profileId: ProfileId;
+    accountFingerprint: string;
+    selection: "matching" | "different";
+    now: number;
+  }): void {
+    const fingerprintPredicate = input.selection === "matching" ? "=" : "!=";
+    this.#database.query(
+      `UPDATE account_rate_limit_reset_attempts
+       SET state='ambiguous',updated_at=MAX(updated_at,?)
+       WHERE profile_id=? AND account_fingerprint${fingerprintPredicate}?
+         AND state='effect_started'`,
+    ).run(input.now, input.profileId, input.accountFingerprint);
+    this.#database.query(
+      `UPDATE account_rate_limit_reset_attempts
+       SET state='closed',local_resolution='account_identity_changed',
+         updated_at=MAX(updated_at,?)
+       WHERE profile_id=? AND account_fingerprint${fingerprintPredicate}?
+         AND state IN ('prepared','ambiguous','retryable')`,
+    ).run(input.now, input.profileId, input.accountFingerprint);
+  }
+
   #setProfileState(
     profileId: ProfileId,
     expectedGeneration: number,
@@ -3531,8 +3975,12 @@ export class StateStore {
     const now = this.#now();
     const update = this.#database.transaction(() => {
       const current = this.#database.query(
-        "SELECT process_generation,state FROM profiles WHERE id=? AND state!='removed'",
-      ).get(profileId) as { process_generation: number; state: z.infer<typeof profileStateSchema> } | null;
+        "SELECT process_generation,state,provider_email FROM profiles WHERE id=? AND state!='removed'",
+      ).get(profileId) as {
+        process_generation: number;
+        provider_email: string | null;
+        state: z.infer<typeof profileStateSchema>;
+      } | null;
       if (
         current === null
         || current.process_generation !== expectedGeneration
@@ -3540,6 +3988,19 @@ export class StateStore {
       ) {
         return { affectedWorkIds: [] as string[], changed: false };
       }
+      const policy = this.requireAccountRateLimitResetPolicy(profileId);
+      const nextAccountFingerprint = state === "signed_in" && identity?.email !== undefined
+        ? canonicalAccountFingerprint(identity.email)
+        : null;
+      const previousProviderFingerprint = current.provider_email === null
+        ? null
+        : canonicalAccountFingerprint(current.provider_email);
+      const changedProviderIdentity = nextAccountFingerprint !== null
+        && previousProviderFingerprint !== null
+        && previousProviderFingerprint !== nextAccountFingerprint;
+      const changedPolicyIdentity = nextAccountFingerprint !== null
+        && policy.accountFingerprint !== null
+        && policy.accountFingerprint !== nextAccountFingerprint;
       const affectedWorkIds = state === "signed_in"
         ? []
         : [...(workStore?.prepareProfileAuthorityChange(profileId, expectedGeneration) ?? [])];
@@ -3552,7 +4013,38 @@ export class StateStore {
            AND (state!='recovery_required' OR ?='recovery_required')`,
       )
       .run(state, identity?.email ?? null, identity?.plan ?? null, now, profileId, expectedGeneration, state);
-      if (result.changes === 1 && (state === "signed_in" || state === "signed_out")) {
+      if (result.changes !== 1) throw new Error("Profile state authority changed.");
+      if (changedProviderIdentity || changedPolicyIdentity) {
+        if (policy.accountFingerprint !== null) {
+          this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
+            profileId,
+            accountFingerprint: policy.accountFingerprint,
+            selection: "matching",
+            now,
+          });
+        }
+        const policyChanged = this.#database.query(
+          `UPDATE account_rate_limit_reset_policies
+           SET state='reconciliation_required',account_fingerprint=NULL,
+             weekly_window_resets_at=NULL,revision=revision+1,
+             updated_at=MAX(updated_at,?)
+           WHERE profile_id=? AND revision=?
+             AND state=?
+             AND account_fingerprint IS ?
+             AND weekly_window_resets_at IS ?`,
+        ).run(
+          now,
+          profileId,
+          policy.revision,
+          policy.state,
+          policy.accountFingerprint,
+          policy.weeklyWindowResetsAt,
+        );
+        if (policyChanged.changes !== 1) {
+          throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_CONFLICT");
+        }
+      }
+      if (state === "signed_in" || state === "signed_out") {
         this.#database.query(`UPDATE provider_login_authorities
                               SET state='settled',settlement=?,updated_at=?
                               WHERE profile_id=? AND process_generation=? AND state='active'`).run(
@@ -3562,7 +4054,6 @@ export class StateStore {
           expectedGeneration,
         );
       }
-      if (result.changes !== 1) throw new Error("Profile state authority changed.");
       return { affectedWorkIds, changed: true };
     });
     return update.immediate();
@@ -3633,11 +4124,29 @@ export class StateStore {
   }
 
   removeProfile(profileId: ProfileId): void {
-    const active = this.#database.query("SELECT COUNT(*) AS count FROM sessions WHERE profile_id = ? AND state NOT IN ('terminal')").get(profileId) as { count: number } | null;
-    if ((active?.count ?? 0) !== 0) throw new Error("Profile still owns active sessions.");
-    const now = this.#now();
-    const result = this.#database.query("UPDATE profiles SET state='removed', provider_email=NULL, provider_plan=NULL, updated_at=? WHERE id=? AND state!='removed'").run(now, profileId);
-    if (result.changes !== 1) throw new SelectionError("NOT_FOUND");
+    const id = profileIdSchema.parse(profileId);
+    const remove = this.#database.transaction(() => {
+      const active = this.#database.query(
+        "SELECT COUNT(*) AS count FROM sessions WHERE profile_id=? AND state NOT IN ('terminal')",
+      ).get(id) as { count: number } | null;
+      if ((active?.count ?? 0) !== 0) {
+        throw new Error("Profile still owns active sessions.");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const result = this.#database.query(
+        `UPDATE profiles
+         SET state='removed',provider_email=NULL,provider_plan=NULL,updated_at=?
+         WHERE id=? AND state!='removed'`,
+      ).run(now, id);
+      if (result.changes !== 1) throw new SelectionError("NOT_FOUND");
+      const policy = this.#database.query(
+        "DELETE FROM account_rate_limit_reset_policies WHERE profile_id=?",
+      ).run(id);
+      if (policy.changes !== 1) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_MISSING");
+      }
+    });
+    remove.immediate();
   }
 
   async createProject(label: string, requestedRoot: string, makeDefault = false): Promise<ProjectRecord> {
@@ -7881,6 +8390,197 @@ export class StateStore {
     return terminalize.immediate();
   }
 
+  requireAccountRateLimitResetPolicy(
+    profileId: ProfileId,
+  ): AccountRateLimitResetPolicyRecord {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const row = this.#database.query(
+      "SELECT * FROM account_rate_limit_reset_policies WHERE profile_id=?",
+    ).get(parsedProfileId);
+    if (row === null) throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_MISSING");
+    try {
+      return mapAccountRateLimitResetPolicy(row);
+    } catch (error: unknown) {
+      throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_INVALID", { cause: error });
+    }
+  }
+
+  authorizeAccountRateLimitResetPolicy(input: {
+    profileId: ProfileId;
+    processGeneration: number;
+    accountFingerprint: string;
+    weeklyWindowDurationMinutes: number | null;
+    weeklyWindowResetsAt: number | null;
+  }): AccountRateLimitResetPolicyDecision {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const processGeneration = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.processGeneration);
+    const accountFingerprint = sha256Schema.parse(input.accountFingerprint);
+    const weeklyWindowDurationMinutes = input.weeklyWindowDurationMinutes === null
+      ? null
+      : z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+        .parse(input.weeklyWindowDurationMinutes);
+    const weeklyWindowResetsAt = input.weeklyWindowResetsAt === null
+      ? null
+      : unixMillisecondsSchema.parse(input.weeklyWindowResetsAt);
+    const authorize = this.#database.transaction((): AccountRateLimitResetPolicyDecision => {
+      const authority = z.object({
+        process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        state: z.literal("signed_in"),
+        provider_email: z.string().email(),
+      }).strict().parse(this.#database.query(
+        "SELECT process_generation,state,provider_email FROM profiles WHERE id=?",
+      ).get(profileId));
+      if (
+        authority.process_generation !== processGeneration
+        || canonicalAccountFingerprint(authority.provider_email) !== accountFingerprint
+      ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_AUTHORITY_CHANGED");
+
+      let policy = this.requireAccountRateLimitResetPolicy(profileId);
+      const transition = (input: {
+        state: AccountRateLimitResetPolicyRecord["state"];
+        accountFingerprint: string | null;
+        weeklyWindowResetsAt: number | null;
+      }): AccountRateLimitResetPolicyRecord => {
+        const changed = this.#database.query(
+          `UPDATE account_rate_limit_reset_policies
+           SET state=?,account_fingerprint=?,weekly_window_resets_at=?,
+             revision=revision+1,updated_at=MAX(updated_at,?)
+           WHERE profile_id=? AND revision=?`,
+        ).run(
+          input.state,
+          input.accountFingerprint,
+          input.weeklyWindowResetsAt,
+          unixMillisecondsSchema.parse(this.#now()),
+          profileId,
+          policy.revision,
+        );
+        if (changed.changes !== 1) {
+          throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_CONFLICT");
+        }
+        return this.requireAccountRateLimitResetPolicy(profileId);
+      };
+
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const weeklyWindowMaximum = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        now + CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES * 60_000,
+      );
+      const hasFreshExactWeeklyWindow = weeklyWindowDurationMinutes
+        === CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES
+        && weeklyWindowResetsAt !== null
+        && weeklyWindowResetsAt > now
+        && weeklyWindowResetsAt <= weeklyWindowMaximum;
+      if (
+        policy.accountFingerprint !== null
+        && policy.accountFingerprint !== accountFingerprint
+      ) {
+        this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
+          profileId,
+          accountFingerprint: policy.accountFingerprint,
+          selection: "matching",
+          now,
+        });
+        policy = transition({
+          state: "reconciliation_required",
+          accountFingerprint: null,
+          weeklyWindowResetsAt: null,
+        });
+        return { decision: "block", reason: "account_identity_changed", policy };
+      }
+
+      if (!hasFreshExactWeeklyWindow) {
+        return {
+          decision: "block",
+          reason: "weekly_window_unavailable",
+          policy,
+        };
+      }
+
+      switch (policy.state) {
+        case "active_unbound": {
+          policy = transition({
+            state: "active_bound",
+            accountFingerprint,
+            weeklyWindowResetsAt,
+          });
+          return { decision: "allow", reason: "active", policy };
+        }
+        case "reconciliation_required": {
+          policy = transition({
+            state: "window_suppressed",
+            accountFingerprint,
+            weeklyWindowResetsAt,
+          });
+          this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
+            profileId,
+            accountFingerprint,
+            selection: "different",
+            now,
+          });
+          return {
+            decision: "suppress",
+            reason: "reconciliation_window",
+            policy,
+          };
+        }
+        case "window_suppressed": {
+          if (policy.weeklyWindowResetsAt === null) {
+            throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_INVALID");
+          }
+          if (weeklyWindowResetsAt < policy.weeklyWindowResetsAt) {
+            return {
+              decision: "block",
+              reason: "weekly_window_nonmonotonic",
+              policy,
+            };
+          }
+          if (weeklyWindowResetsAt === policy.weeklyWindowResetsAt) {
+            return {
+              decision: "suppress",
+              reason: "reconciliation_window",
+              policy,
+            };
+          }
+          if (now < policy.weeklyWindowResetsAt) {
+            return {
+              decision: "block",
+              reason: "weekly_window_nonmonotonic",
+              policy,
+            };
+          }
+          policy = transition({
+            state: "active_bound",
+            accountFingerprint,
+            weeklyWindowResetsAt,
+          });
+          return { decision: "allow", reason: "active", policy };
+        }
+        case "active_bound": {
+          if (policy.weeklyWindowResetsAt === null) {
+            throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_INVALID");
+          }
+          if (weeklyWindowResetsAt < policy.weeklyWindowResetsAt) {
+            return {
+              decision: "block",
+              reason: "weekly_window_nonmonotonic",
+              policy,
+            };
+          }
+          if (weeklyWindowResetsAt > policy.weeklyWindowResetsAt) {
+            policy = transition({
+              state: "active_bound",
+              accountFingerprint,
+              weeklyWindowResetsAt,
+            });
+          }
+          return { decision: "allow", reason: "active", policy };
+        }
+      }
+    });
+    return authorize.immediate();
+  }
+
   prepareAccountRateLimitReset(input: {
     profileId: ProfileId;
     processGeneration: number;
@@ -7909,6 +8609,12 @@ export class StateStore {
       ) {
         throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
       }
+      const policy = this.requireAccountRateLimitResetPolicy(profileId);
+      if (
+        policy.state !== "active_bound"
+        || policy.accountFingerprint !== accountFingerprint
+        || policy.weeklyWindowResetsAt !== weeklyWindowResetsAt
+      ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
       const recoverable = this.#database.query(
         `SELECT * FROM account_rate_limit_reset_attempts
          WHERE profile_id=? AND account_fingerprint=?
@@ -8040,6 +8746,16 @@ export class StateStore {
       if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
         throw new Error("ACCOUNT_RATE_LIMIT_RESET_REBIND_STATE_INVALID");
       }
+      const policy = this.requireAccountRateLimitResetPolicy(row.profileId);
+      const policyWindowAuthorizesAttempt = policy.weeklyWindowResetsAt !== null
+        && (row.state === "ambiguous"
+          ? policy.weeklyWindowResetsAt >= row.weeklyWindowResetsAt
+          : policy.weeklyWindowResetsAt === row.weeklyWindowResetsAt);
+      if (
+        policy.state !== "active_bound"
+        || policy.accountFingerprint !== row.accountFingerprint
+        || !policyWindowAuthorizesAttempt
+      ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
       const authority = z.object({
         process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
         provider_email: z.string().email(),
@@ -8102,6 +8818,9 @@ export class StateStore {
       if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
         throw new Error("ACCOUNT_RATE_LIMIT_RESET_CLOSE_STATE_INVALID");
       }
+      if (row.state === "ambiguous" && resolution !== "account_identity_changed") {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_CLOSE_RESOLUTION_INVALID");
+      }
       const changed = this.#database.query(
         `UPDATE account_rate_limit_reset_attempts
          SET state='closed',local_resolution=?,updated_at=MAX(updated_at,?)
@@ -8135,10 +8854,39 @@ export class StateStore {
       const row = mapAccountRateLimitResetAttempt(this.#database.query(
         `SELECT r.* FROM account_rate_limit_reset_attempts r
          JOIN profiles p ON p.id=r.profile_id
+         JOIN account_rate_limit_reset_policies policy ON policy.profile_id=r.profile_id
          WHERE r.idempotency_key=? AND p.state='signed_in'
            AND p.process_generation=r.current_process_generation
            AND lower(trim(p.provider_email)) IS NOT NULL`,
       ).get(key));
+      if (row.state === "effect_started") {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_EFFECT_ALREADY_STARTED");
+      }
+      if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
+      }
+      const policy = this.requireAccountRateLimitResetPolicy(row.profileId);
+      const policyWindowAuthorizesAttempt = policy.weeklyWindowResetsAt !== null
+        && (row.state === "ambiguous"
+          ? policy.weeklyWindowResetsAt >= row.weeklyWindowResetsAt
+          : policy.weeklyWindowResetsAt === row.weeklyWindowResetsAt);
+      if (
+        policy.state !== "active_bound"
+        || policy.accountFingerprint !== row.accountFingerprint
+        || !policyWindowAuthorizesAttempt
+      ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const authorizedWindowResetsAt = row.state === "ambiguous"
+        ? policy.weeklyWindowResetsAt
+        : row.weeklyWindowResetsAt;
+      const weeklyWindowMaximum = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        now + CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES * 60_000,
+      );
+      if (
+        authorizedWindowResetsAt <= now
+        || authorizedWindowResetsAt > weeklyWindowMaximum
+      ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_WINDOW_NOT_FRESH");
       const identity = z.object({ provider_email: z.string().email() }).strict().parse(
         this.#database.query(
           `SELECT p.provider_email FROM account_rate_limit_reset_attempts r
@@ -8148,18 +8896,11 @@ export class StateStore {
       if (canonicalAccountFingerprint(identity.provider_email) !== row.accountFingerprint) {
         throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
       }
-      if (row.state === "settled") return row;
-      if (row.state === "effect_started") {
-        throw new Error("ACCOUNT_RATE_LIMIT_RESET_EFFECT_ALREADY_STARTED");
-      }
-      if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
-        throw new Error("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
-      }
       const changed = this.#database.query(
         `UPDATE account_rate_limit_reset_attempts
          SET state='effect_started',updated_at=MAX(updated_at,?)
          WHERE idempotency_key=? AND state=?`,
-      ).run(unixMillisecondsSchema.parse(this.#now()), key, row.state);
+      ).run(now, key, row.state);
       if (changed.changes !== 1) {
         throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
       }
@@ -8208,12 +8949,43 @@ export class StateStore {
     ).get(key));
   }
 
-  recoverAccountRateLimitResetAttempts(): readonly string[] {
+  recoverAccountRateLimitResetAttempts(input: {
+    profileId: ProfileId;
+    processGeneration: number;
+    accountFingerprint: string;
+    weeklyWindowResetsAt: number;
+  }): readonly string[] {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const processGeneration = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.processGeneration);
+    const accountFingerprint = sha256Schema.parse(input.accountFingerprint);
+    const weeklyWindowResetsAt = unixMillisecondsSchema
+      .parse(input.weeklyWindowResetsAt);
     const recover = this.#database.transaction(() => {
+      const authority = z.object({
+        process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        provider_email: z.string().email(),
+        state: z.literal("signed_in"),
+      }).strict().parse(this.#database.query(
+        "SELECT process_generation,provider_email,state FROM profiles WHERE id=?",
+      ).get(profileId));
+      if (
+        authority.process_generation !== processGeneration
+        || canonicalAccountFingerprint(authority.provider_email) !== accountFingerprint
+      ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_RECOVERY_AUTHORITY_CHANGED");
+      const policy = this.requireAccountRateLimitResetPolicy(profileId);
+      if (
+        policy.state !== "active_bound"
+        || policy.accountFingerprint !== accountFingerprint
+        || policy.weeklyWindowResetsAt !== weeklyWindowResetsAt
+      ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
       const keys = this.#database.query(
         `SELECT idempotency_key FROM account_rate_limit_reset_attempts
-         WHERE state='effect_started' ORDER BY attempt_sequence`,
-      ).all().map((row) => z.object({ idempotency_key: z.string().uuid() })
+         WHERE profile_id=? AND account_fingerprint=?
+           AND weekly_window_resets_at<=? AND state='effect_started'
+         ORDER BY attempt_sequence`,
+      ).all(profileId, accountFingerprint, weeklyWindowResetsAt)
+        .map((row) => z.object({ idempotency_key: z.string().uuid() })
         .strict().parse(row).idempotency_key);
       for (const key of keys) {
         const changed = this.#database.query(

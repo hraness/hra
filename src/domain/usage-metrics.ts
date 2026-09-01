@@ -86,6 +86,16 @@ export const automaticRateLimitResetRefreshStatusSchema = z.union([
   z.object({ state: z.literal("retry_pending") }).strict(),
   z.object({ state: z.literal("recovery_pending") }).strict(),
   z.object({
+    state: z.literal("suppressed"),
+    reason: z.enum([
+      "reconciliation_required",
+      "reconciliation_window",
+      "weekly_window_unavailable",
+      "weekly_window_nonmonotonic",
+      "account_identity_changed",
+    ]),
+  }).strict(),
+  z.object({
     state: z.literal("settled"),
     outcome: accountRateLimitResetOutcomeSchema,
   }).strict(),
@@ -95,11 +105,25 @@ export type AutomaticRateLimitResetRefreshStatus = z.infer<
   typeof automaticRateLimitResetRefreshStatusSchema
 >;
 
+export const automaticRateLimitResetPolicyStatusSchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("active") }).strict(),
+  z.object({ state: z.literal("reconciliation_required") }).strict(),
+  z.object({
+    state: z.literal("window_suppressed"),
+    weeklyWindowResetsAt: unixMillisecondsSchema,
+  }).strict(),
+]);
+
+export type AutomaticRateLimitResetPolicyStatus = z.infer<
+  typeof automaticRateLimitResetPolicyStatusSchema
+>;
+
 export const automaticRateLimitResetStatusSchema = z.object({
   threshold: z.object({
     remainingPercent: z.literal(AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT),
     usedPercent: z.literal(AUTO_RATE_LIMIT_RESET_USED_PERCENT),
   }).strict(),
+  policy: automaticRateLimitResetPolicyStatusSchema,
   observation: z.union([
     z.object({
       state: z.literal("available"),

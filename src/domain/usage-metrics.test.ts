@@ -177,6 +177,7 @@ describe("observedAccountTokenVelocity", () => {
 describe("automaticRateLimitResetStatusSchema", () => {
   const base = {
     threshold: { remainingPercent: 1, usedPercent: 99 },
+    policy: { state: "active" as const },
     observation: {
       state: "unavailable" as const,
       reason: "weekly_window_unavailable" as const,
@@ -199,6 +200,12 @@ describe("automaticRateLimitResetStatusSchema", () => {
         lastAttempt,
       }).success).toBe(true);
     }
+    expect(automaticRateLimitResetStatusSchema.safeParse({
+      ...base,
+      policy: { state: "window_suppressed", weeklyWindowResetsAt },
+      lastAttempt: null,
+      refresh: { state: "suppressed", reason: "reconciliation_window" },
+    }).success).toBe(true);
   });
 
   test("rejects private extras and invalid state-field combinations", () => {
@@ -245,6 +252,15 @@ describe("automaticRateLimitResetStatusSchema", () => {
         ...base,
         lastAttempt: null,
         refresh: { state: "settled", reason: "weekly_window_changed" },
+      },
+      {
+        ...base,
+        policy: {
+          state: "window_suppressed",
+          weeklyWindowResetsAt,
+          accountFingerprint: digest,
+        },
+        lastAttempt: null,
       },
     ]) {
       expect(automaticRateLimitResetStatusSchema.safeParse(value).success).toBe(false);
