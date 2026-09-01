@@ -1,6 +1,6 @@
 {
   "name": "hra-cloud-efficiency",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Qualify and coordinate bounded Codex Cloud repository workers while preserving local model ownership and final delivery gates.",
   "author": {
     "name": "Hraness",
