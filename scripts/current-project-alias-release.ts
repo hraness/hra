@@ -234,6 +234,17 @@ const markerSchema = z.object({
 }).strict();
 
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+const currentAliasReleaseRollbackDiagnosticSchema = z.object({
+  phase: z.enum(["target_probe", "target_authority"]),
+  reason: z.enum([
+    "alias_not_planned",
+    "marker_mismatch",
+    "provider_command_failed",
+    "provider_readback_invalid",
+    "stability_not_proven",
+    "vercel_version_unsupported",
+  ]),
+}).strict();
 const mutationKeyForIdentity = (
   idempotencyKey: string,
   planDigest: string,
@@ -346,6 +357,7 @@ export const currentAliasReleaseReceiptSchema = z.object({
   intentDigest: digestSchema,
   kind: z.literal("current-project-canonical-alias-receipt"),
   planDigest: digestSchema,
+  rollbackDiagnostic: currentAliasReleaseRollbackDiagnosticSchema.optional(),
   schemaVersion: z.literal(1),
   selfDigest: digestSchema,
   targetDeploymentId: deploymentIdSchema,
@@ -358,6 +370,10 @@ export const currentAliasReleaseReceiptSchema = z.object({
         ? value.finalAuthority.source.sourceCommit
         : value.finalAuthority.target.sourceCommit
     )
+    || (
+      value.rollbackDiagnostic !== undefined
+      && (value.finalState !== "source" || !value.changed)
+    )
   ) context.addIssue({ code: "custom", message: "final_authority_digest_invalid" });
 });
 
@@ -367,6 +383,9 @@ export type CurrentDeploymentReadback = z.infer<typeof deploymentReadbackSchema>
 export type CurrentProjectReadback = z.infer<typeof projectReadbackSchema>;
 export type CurrentAliasReleaseIntent = z.infer<typeof currentAliasReleaseIntentSchema>;
 export type CurrentAliasReleaseReceipt = z.infer<typeof currentAliasReleaseReceiptSchema>;
+type CurrentAliasReleaseRollbackDiagnostic = z.infer<
+  typeof currentAliasReleaseRollbackDiagnosticSchema
+>;
 
 export const parseCurrentDeploymentReadback = (
   value: unknown,
@@ -415,6 +434,13 @@ export class CurrentAliasReleaseError extends Error {
   ) {
     super(code);
     this.name = "CurrentAliasReleaseError";
+  }
+}
+
+class CurrentAliasReleaseRevertedError extends CurrentAliasReleaseError {
+  constructor(readonly rollbackDiagnostic: CurrentAliasReleaseRollbackDiagnostic) {
+    super("alias_reverted");
+    this.name = "CurrentAliasReleaseRevertedError";
   }
 }
 
@@ -800,6 +826,7 @@ const currentAliasReleaseReceiptFor = (
   intent: CurrentAliasReleaseIntent,
   changed: boolean,
   finalState: "source" | "target",
+  rollbackDiagnostic?: CurrentAliasReleaseRollbackDiagnostic,
 ): CurrentAliasReleaseReceipt => currentAliasReleaseReceiptSchema.parse(withSelfDigest({
   changed,
   finalAuthority: normalizedAliasAuthority(plan, finalState),
@@ -809,6 +836,7 @@ const currentAliasReleaseReceiptFor = (
   intentDigest: intent.selfDigest,
   kind: "current-project-canonical-alias-receipt" as const,
   planDigest: intent.planDigest,
+  ...(rollbackDiagnostic === undefined ? {} : { rollbackDiagnostic }),
   schemaVersion: 1 as const,
   targetDeploymentId: plan.vercel.target.deploymentId,
   targetSourceCommit: plan.vercel.target.sourceCommit,
@@ -955,6 +983,7 @@ const inspectCurrentAliasReleaseDurableState = (
       intent,
       receipt.changed,
       receipt.finalState,
+      receipt.rollbackDiagnostic,
     );
     if (receipt.selfDigest !== expected.selfDigest) {
       throw new CurrentAliasReleaseError("durable_state_invalid");
@@ -1071,24 +1100,108 @@ const rethrowTerminalProviderError = (error: unknown): void => {
   rethrowBoundedProcessTerminalError(error);
 };
 
-const probeAliasEndpoint = async (
+type AliasAuthorityProofDiagnostic = Readonly<{
+  phase:
+    | CurrentAliasReleaseRollbackDiagnostic["phase"]
+    | "source_probe"
+    | "source_authority";
+  reason: CurrentAliasReleaseRollbackDiagnostic["reason"];
+}>;
+
+type AliasAuthorityProof =
+  | Readonly<{ proved: true }>
+  | Readonly<{ diagnostic: AliasAuthorityProofDiagnostic; proved: false }>;
+
+const nonterminalAuthorityReason = (
+  error: unknown,
+): CurrentAliasReleaseRollbackDiagnostic["reason"] => {
+  rethrowTerminalProviderError(error);
+  if (error instanceof CurrentAliasReleaseError) {
+    if (
+      error.code === "provider_command_failed"
+      || error.code === "provider_readback_invalid"
+      || error.code === "vercel_version_unsupported"
+    ) return error.code;
+  }
+  return "provider_readback_invalid";
+};
+
+const proveStableAliasAuthority = async (
+  plan: CurrentProjectAliasReleasePlan,
   provider: CurrentProjectAliasReleaseProvider,
-  expected: CurrentProjectAliasEndpoint,
+  expectedState: "source" | "target",
   clock: ReleaseClock,
-  timeoutMs: number,
-): Promise<boolean> => {
-  const deadline = clock.now() + timeoutMs;
+  deadline: number,
+): Promise<AliasAuthorityProof> => {
+  const expected = plan.vercel[expectedState];
+  const probePhase = expectedState === "target" ? "target_probe" : "source_probe";
+  const authorityPhase = expectedState === "target"
+    ? "target_authority"
+    : "source_authority";
+  let consecutiveExactObservations = 0;
+  let attempted = false;
+  let lastDiagnostic: AliasAuthorityProofDiagnostic = {
+    phase: probePhase,
+    reason: "stability_not_proven",
+  };
   for (;;) {
+    if (attempted && clock.now() >= deadline) {
+      return { diagnostic: lastDiagnostic, proved: false };
+    }
+    attempted = true;
+    let probeReason: CurrentAliasReleaseRollbackDiagnostic["reason"] | undefined;
     try {
       const alias = await provider.readAlias();
-      if (aliasMatches(alias, expected) && markerMatches(await provider.readMarker(), expected)) {
-        return true;
+      if (!aliasMatches(alias, expected)) probeReason = "alias_not_planned";
+      else if (!markerMatches(await provider.readMarker(), expected)) {
+        probeReason = "marker_mismatch";
       }
     } catch (error: unknown) {
-      rethrowTerminalProviderError(error);
+      probeReason = nonterminalAuthorityReason(error);
+    }
+    if (probeReason === undefined) {
+      if (clock.now() >= deadline) {
+        return {
+          diagnostic: { phase: authorityPhase, reason: "stability_not_proven" },
+          proved: false,
+        };
+      }
+      try {
+        const observation = await observeCurrentAliasAuthority(plan, provider);
+        if (observation.state === expectedState) {
+          if (clock.now() >= deadline) {
+            return {
+              diagnostic: { phase: authorityPhase, reason: "stability_not_proven" },
+              proved: false,
+            };
+          }
+          consecutiveExactObservations += 1;
+          if (consecutiveExactObservations >= 2) return { proved: true };
+          lastDiagnostic = { phase: authorityPhase, reason: "stability_not_proven" };
+          continue;
+        }
+        consecutiveExactObservations = 0;
+        lastDiagnostic = {
+          phase: authorityPhase,
+          reason: observation.state === "blocked"
+            ? observation.reason === "marker_mismatch"
+              ? "marker_mismatch"
+              : "alias_not_planned"
+            : "alias_not_planned",
+        };
+      } catch (error: unknown) {
+        consecutiveExactObservations = 0;
+        lastDiagnostic = {
+          phase: authorityPhase,
+          reason: nonterminalAuthorityReason(error),
+        };
+      }
+    } else {
+      consecutiveExactObservations = 0;
+      lastDiagnostic = { phase: probePhase, reason: probeReason };
     }
     const remaining = deadline - clock.now();
-    if (remaining <= 0) return false;
+    if (remaining <= 0) return { diagnostic: lastDiagnostic, proved: false };
     await clock.sleep(Math.min(250, remaining));
   }
 };
@@ -1104,6 +1217,7 @@ const restoreCurrentAliasReleaseSource = async (
   clock: ReleaseClock,
   timeoutMs: number,
   assertMutationAuthority: () => void,
+  rollbackDiagnostic: CurrentAliasReleaseRollbackDiagnostic,
 ): Promise<never> => {
   assertMutationAuthority();
   try {
@@ -1118,24 +1232,15 @@ const restoreCurrentAliasReleaseSource = async (
     rethrowTerminalProviderError(error);
     throw new CurrentAliasReleaseError("compensation_failed");
   }
-  const sourceRestored = await probeAliasEndpoint(
+  const sourceRestored = await proveStableAliasAuthority(
+    plan,
     provider,
-    plan.vercel.source,
+    "source",
     clock,
-    timeoutMs,
+    clock.now() + timeoutMs,
   );
-  if (sourceRestored) {
-    try {
-      const recovered = await observeCurrentAliasAuthority(plan, provider);
-      if (recovered.state === "source") {
-        throw new CurrentAliasReleaseError("alias_reverted");
-      }
-    } catch (error: unknown) {
-      if (error instanceof CurrentAliasReleaseError && error.code === "alias_reverted") {
-        throw error;
-      }
-      rethrowTerminalProviderError(error);
-    }
+  if (sourceRestored.proved) {
+    throw new CurrentAliasReleaseRevertedError(rollbackDiagnostic);
   }
   throw new CurrentAliasReleaseError("compensation_failed");
 };
@@ -1172,20 +1277,14 @@ const executeCurrentAliasReleasePlan = async (
     throw new CurrentAliasReleaseError("provider_readback_invalid");
   }
 
-  const targetConverged = await probeAliasEndpoint(
+  const targetAuthority = await proveStableAliasAuthority(
+    plan,
     provider,
-    plan.vercel.target,
+    "target",
     clock,
-    timeoutMs,
+    clock.now() + timeoutMs,
   );
-  if (targetConverged) {
-    try {
-      const postflight = await observeCurrentAliasAuthority(plan, provider);
-      if (postflight.state === "target") return { changed: true, replayed: false };
-    } catch (error: unknown) {
-      rethrowTerminalProviderError(error);
-    }
-  }
+  if (targetAuthority.proved) return { changed: true, replayed: false };
 
   return await restoreCurrentAliasReleaseSource(
     plan,
@@ -1193,6 +1292,7 @@ const executeCurrentAliasReleasePlan = async (
     clock,
     timeoutMs,
     assertMutationAuthority,
+    currentAliasReleaseRollbackDiagnosticSchema.parse(targetAuthority.diagnostic),
   );
 };
 
@@ -2144,11 +2244,17 @@ const executeCurrentProjectAliasRelease = async (
                 lock.assertHeld,
               );
         } catch (error: unknown) {
-          if (!(error instanceof CurrentAliasReleaseError) || error.code !== "alias_reverted") {
+          if (!(error instanceof CurrentAliasReleaseRevertedError)) {
             throw error;
           }
           lock.assertHeld();
-          const reverted = currentAliasReleaseReceiptFor(plan, intent, true, "source");
+          const reverted = currentAliasReleaseReceiptFor(
+            plan,
+            intent,
+            true,
+            "source",
+            error.rollbackDiagnostic,
+          );
           try {
             (options.receiptWriter ?? writeCurrentAliasReleaseReceipt)(
               paths.receipt,
