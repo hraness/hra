@@ -12,7 +12,7 @@
 - State beta, platform, provider, privacy, and account-switch compatibility limits beside the relevant feature.
 - Do not add analytics, cookies, remote fonts, or a build-time network dependency in v1.
 - Keep `hra.sh` focused on the HRA product. Do not publish adjacent tool summaries, comparison-shaped pages, or generic search-targeted essays unless a named reader job and a non-obvious HRA-specific answer justify a durable indexable route.
-- Before admitting an editorial route, score reader utility, factual evidence, confidence, host fit, original contribution, voice integrity, and maintenance ownership from 0–2. Require at least 9 total and no zero; traffic potential, word count, and a content quota do not count as value.
+- Before admitting an editorial route, score reader utility, original evidence, factual confidence, host fit, voice integrity, and maintenance value from 0–2. Require at least 9/12 and no zero; traffic potential, word count, and a content quota do not count as value.
 - Ground factual claims in checked primary sources or exact HRA release evidence. Do not synthesize a first-person opinion, experience, endorsement, or certainty that no named human supplied.
 - Every admitted editorial route must record an owner, source-check date, reassessment date within 60 days, and an explicit keep, revise, redirect, or remove lifecycle decision. Remove a route cleanly from navigation, discovery, structured data, and generated artifacts when it no longer clears the gate.
 - Images follow an admitted reader job; they never justify one. Use the `editorial-image-seo` skill for future editorial imagery and keep visible figures, captions, responsive assets, metadata, schema, feeds, sitemaps, and provenance synchronized.
