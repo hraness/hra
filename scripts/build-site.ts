@@ -1,4 +1,4 @@
-import { copyFile, cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -135,6 +135,10 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   if (releaseCommit !== "local" && !/^[0-9a-f]{40}$/u.test(releaseCommit)) {
     throw new Error("Release commit must be a lowercase 40-character Git SHA.");
   }
+  await rm(join(options.repositoryRoot, "dist", "site"), {
+    force: true,
+    recursive: true,
+  });
   for (const output of siteTextOutputs(options.repositoryRoot, releaseCommit)) {
     const content = withFinalNewline(output.content);
     await mkdir(dirname(output.path), { recursive: true });

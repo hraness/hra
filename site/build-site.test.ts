@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { buildSite } from "../scripts/build-site.ts";
 import {
@@ -181,6 +181,27 @@ describe("static-site build", () => {
       await expect(readFile(join(root, "dist/site", route, "index.html"), "utf8"))
         .rejects.toThrow();
     }
+  });
+
+  test("reconstructs the owned site output without stale retired artifacts", async () => {
+    const root = await createFixtureRoot();
+    const stalePaths = [
+      "dist/site/reading/index.html",
+      "dist/site/reading/deepseek-harness/index.html",
+      "dist/site/images/editorial/deepseek-harness.webp",
+    ] as const;
+    for (const path of stalePaths) {
+      await mkdir(dirname(join(root, path)), { recursive: true });
+      await writeFile(join(root, path), "stale retired artifact\n", "utf8");
+    }
+
+    await buildSite({ check: false, repositoryRoot: root });
+
+    for (const path of stalePaths) {
+      await expect(readFile(join(root, path), "utf8")).rejects.toThrow();
+    }
+    expect(await readFile(join(root, "dist/site/index.html"), "utf8"))
+      .toBe(renderSiteHtml());
   });
 
   test("generates the inert preview without publishing it as an indexable document", async () => {
