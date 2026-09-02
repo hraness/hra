@@ -1,18 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { buildSite } from "../scripts/build-site.ts";
-import { readingPages } from "./content.ts";
-import { editorialImages } from "./editorial-images.ts";
 import {
   renderAskAiAboutThis,
   renderHraSiteFooter,
   renderPreviewHtml,
   renderPrivacyHtml,
-  renderReadingIndexHtml,
-  renderReadingHtml,
   renderSiteHtml,
 } from "./template.ts";
 
@@ -22,18 +18,11 @@ const createFixtureRoot = async (): Promise<string> => {
   const root = await mkdtemp(join(tmpdir(), "hra-site-test-"));
   temporaryRoots.push(root);
   await mkdir(join(root, "site"), { recursive: true });
-  await mkdir(join(root, "site/images/editorial"), { recursive: true });
   await Promise.all(
     ["favicon.svg", "social-card.svg", "styles.css"].map(async (asset) => {
       await writeFile(join(root, "site", asset), `fixture:${asset}\n`, "utf8");
     }),
   );
-  await Promise.all(editorialImages.map(async (image) => {
-    await writeFile(
-      join(root, "site", image.src),
-      new Uint8Array([82, 73, 70, 70, 87, 69, 66, 80]),
-    );
-  }));
   return root;
 };
 
@@ -72,11 +61,6 @@ describe("static-site build", () => {
     const publicPages = [
       [renderSiteHtml(), "https://hra.sh/"],
       [renderPrivacyHtml(), subjectUrl],
-      [renderReadingIndexHtml(), "https://hra.sh/reading/"],
-      ...readingPages.map((page) => [
-        renderReadingHtml(page),
-        `https://hra.sh${page.canonicalPath}`,
-      ] as const),
     ] as const;
     for (const [html, canonicalUrl] of publicPages) {
       const destination = new URL("https://chatgpt.com/");
@@ -99,11 +83,6 @@ describe("static-site build", () => {
       "dist/site/index.html",
       "dist/site/preview/index.html",
       "dist/site/privacy/index.html",
-      "dist/site/reading/index.html",
-      "dist/site/reading/deepseek-harness/index.html",
-      "dist/site/reading/headlong-microharness/index.html",
-      "dist/site/reading/oracle-and-firm/index.html",
-      "dist/site/reading/hax/index.html",
       "dist/site/robots.txt",
       "dist/site/sitemap.xml",
       "dist/site/llms.txt",
@@ -118,9 +97,6 @@ describe("static-site build", () => {
 
     for (const path of expectedPaths) {
       expect((await readFile(join(root, path), "utf8")).length).toBeGreaterThan(0);
-    }
-    for (const image of editorialImages) {
-      expect((await readFile(join(root, "dist/site", image.src))).byteLength).toBeGreaterThan(0);
     }
 
     const builtStyles = await readFile(join(root, "dist/site/styles.css"), "utf8");
@@ -183,103 +159,49 @@ describe("static-site build", () => {
     expect(identity.version).not.toBe(packageJson.version);
   });
 
-  test("lists the DeepSeek Harness reading page in the built sitemap and llms index", async () => {
+  test("does not publish the retired adjacent-reading cluster", async () => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root });
-    const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
-    const llms = await readFile(join(root, "dist/site/llms.txt"), "utf8");
-    const home = await readFile(join(root, "dist/site/index.html"), "utf8");
-    const reading = await readFile(
-      join(root, "dist/site/reading/deepseek-harness/index.html"),
-      "utf8",
-    );
+    const publicDocuments = await Promise.all([
+      "dist/site/index.html",
+      "dist/site/llms.txt",
+      "dist/site/sitemap.xml",
+    ].map(async (path) => readFile(join(root, path), "utf8")));
+    const retiredRoutes = [
+      "/reading/deepseek-harness/",
+      "/reading/hax/",
+      "/reading/headlong-microharness/",
+      "/reading/oracle-and-firm/",
+    ] as const;
 
-    expect(sitemap).toContain("<loc>https://hra.sh/reading/deepseek-harness/</loc>");
-    expect(llms).toContain("https://hra.sh/reading/deepseek-harness/");
-    expect(home).toContain('href="/reading/deepseek-harness/"');
-    expect(reading).toContain("A plugin catalog is not a Codex account loop");
+    for (const route of retiredRoutes) {
+      for (const document of publicDocuments) {
+        expect(document).not.toContain(route);
+      }
+      await expect(readFile(join(root, "dist/site", route, "index.html"), "utf8"))
+        .rejects.toThrow();
+    }
   });
 
-  test("lists the Headlong reading page in the built sitemap and llms index", async () => {
+  test("reconstructs the owned site output without stale retired artifacts", async () => {
     const root = await createFixtureRoot();
+    const stalePaths = [
+      "dist/site/reading/index.html",
+      "dist/site/reading/deepseek-harness/index.html",
+      "dist/site/images/editorial/deepseek-harness.webp",
+    ] as const;
+    for (const path of stalePaths) {
+      await mkdir(dirname(join(root, path)), { recursive: true });
+      await writeFile(join(root, path), "stale retired artifact\n", "utf8");
+    }
+
     await buildSite({ check: false, repositoryRoot: root });
-    const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
-    const llms = await readFile(join(root, "dist/site/llms.txt"), "utf8");
-    const home = await readFile(join(root, "dist/site/index.html"), "utf8");
-    const reading = await readFile(
-      join(root, "dist/site/reading/headlong-microharness/index.html"),
-      "utf8",
-    );
-    const deepseek = await readFile(
-      join(root, "dist/site/reading/deepseek-harness/index.html"),
-      "utf8",
-    );
 
-    expect(sitemap).toContain("<loc>https://hra.sh/reading/headlong-microharness/</loc>");
-    expect(llms).toContain("https://hra.sh/reading/headlong-microharness/");
-    expect(home).toContain('href="/reading/headlong-microharness/"');
-    expect(deepseek).toContain('href="/reading/headlong-microharness/"');
-    expect(reading).toContain("A microharness for persistence is not a Codex account loop");
-    expect(reading).not.toContain("/reading/headlong-always-on-loop");
-    expect(reading).not.toContain("/reading/not-a-codex-tui");
-  });
-
-  test("lists the oracle-and-firm reading page in the built sitemap and llms index", async () => {
-    const root = await createFixtureRoot();
-    await buildSite({ check: false, repositoryRoot: root });
-    const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
-    const llms = await readFile(join(root, "dist/site/llms.txt"), "utf8");
-    const home = await readFile(join(root, "dist/site/index.html"), "utf8");
-    const reading = await readFile(
-      join(root, "dist/site/reading/oracle-and-firm/index.html"),
-      "utf8",
-    );
-    const deepseek = await readFile(
-      join(root, "dist/site/reading/deepseek-harness/index.html"),
-      "utf8",
-    );
-    const headlong = await readFile(
-      join(root, "dist/site/reading/headlong-microharness/index.html"),
-      "utf8",
-    );
-
-    expect(sitemap).toContain("<loc>https://hra.sh/reading/oracle-and-firm/</loc>");
-    expect(llms).toContain("https://hra.sh/reading/oracle-and-firm/");
-    expect(home).toContain('href="/reading/oracle-and-firm/"');
-    expect(deepseek).toContain('href="/reading/oracle-and-firm/"');
-    expect(headlong).toContain('href="/reading/oracle-and-firm/"');
-    expect(reading).toContain("A Codex account loop is an oracle thread, not a firm");
-    expect(reading).not.toContain("/reading/headlong-always-on-loop");
-    expect(reading).not.toContain("/reading/not-a-codex-tui");
-  });
-
-  test("lists the hax reading page in the built sitemap and llms index", async () => {
-    const root = await createFixtureRoot();
-    await buildSite({ check: false, repositoryRoot: root });
-    const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
-    const llms = await readFile(join(root, "dist/site/llms.txt"), "utf8");
-    const home = await readFile(join(root, "dist/site/index.html"), "utf8");
-    const reading = await readFile(
-      join(root, "dist/site/reading/hax/index.html"),
-      "utf8",
-    );
-    const deepseek = await readFile(
-      join(root, "dist/site/reading/deepseek-harness/index.html"),
-      "utf8",
-    );
-    const oracle = await readFile(
-      join(root, "dist/site/reading/oracle-and-firm/index.html"),
-      "utf8",
-    );
-
-    expect(sitemap).toContain("<loc>https://hra.sh/reading/hax/</loc>");
-    expect(llms).toContain("https://hra.sh/reading/hax/");
-    expect(home).toContain('href="/reading/hax/"');
-    expect(deepseek).toContain('href="/reading/hax/"');
-    expect(oracle).toContain('href="/reading/hax/"');
-    expect(reading).toContain("A terminal-native coding agent is not a Codex account loop");
-    expect(reading).not.toContain("/reading/headlong-always-on-loop");
-    expect(reading).not.toContain("/reading/not-a-codex-tui");
+    for (const path of stalePaths) {
+      await expect(readFile(join(root, path), "utf8")).rejects.toThrow();
+    }
+    expect(await readFile(join(root, "dist/site/index.html"), "utf8"))
+      .toBe(renderSiteHtml());
   });
 
   test("generates the inert preview without publishing it as an indexable document", async () => {

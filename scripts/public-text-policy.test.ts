@@ -132,17 +132,14 @@ describe("public text policy", () => {
 
   test("admits only bounded, structurally valid editorial WebP files", async () => {
     const root = await mkdtemp(join(tmpdir(), "hra-public-policy-webp-"));
-    const repositoryRoot = join(import.meta.dir, "..");
     const editorialDirectory = join(root, "site", "images", "editorial");
     try {
       await mkdir(editorialDirectory, { recursive: true });
-      const reviewed = await readFile(join(
-        repositoryRoot,
-        "site",
-        "images",
-        "editorial",
-        "deepseek-harness-384.webp",
-      ));
+      const reviewed = Buffer.alloc(20);
+      reviewed.write("RIFF", 0, "ascii");
+      reviewed.writeUInt32LE(reviewed.byteLength - 8, 4);
+      reviewed.write("WEBP", 8, "ascii");
+      reviewed.write("VP8 ", 12, "ascii");
       await writeFile(join(editorialDirectory, "reviewed-384.webp"), reviewed);
       await expect(assertPublicTree(root)).resolves.toBeUndefined();
 

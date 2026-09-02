@@ -1,10 +1,7 @@
 # Contents
 
 - `content.ts` is the shared public content contract for README and website generation.
-- `editorial-images.ts` is the typed registry for reading banners, cards, metadata, schema, and image sitemap entries.
-- `editorial-provenance/` retains reviewed generation prompts, completed Atet jobs, and immutable receipts; it is never copied to the public site.
-- `images/editorial/` contains the promoted, visually reviewed reading images.
-- `template.ts` renders the homepage, privacy page, and standalone reading pages.
+- `template.ts` renders the homepage and privacy page.
 - Tests enforce semantic and command parity.
 
 # Guidelines
@@ -14,7 +11,9 @@
 - Render the canonical `@hraness/site-footer` markup and styles on every navigable HTML page. Keep the inert iframe preview free of links and other actions, and keep HRA project resources outside the footer.
 - State beta, platform, provider, privacy, and account-switch compatibility limits beside the relevant feature.
 - Do not add analytics, cookies, remote fonts, or a build-time network dependency in v1.
-- Use the `editorial-image-seo` skill for every new reading image. Generate through its pinned retry-disabled Atet helper, make at most one paid call per distinct brief, and stop rather than retrying an ambiguous result.
-- Review each candidate at original size and at its smallest card size before promotion. Prefer semantic editorial metaphors to generated factual architecture, capability, or security diagrams.
-- Add reading imagery only through `editorial-images.ts`; keep the provenance-bound 1536-pixel original canonical for Open Graph, Twitter, schema, and sitemap use, and serve locally derived 384- and 768-pixel WebP files through `srcset` in visible figures and cards. Keep the visible figure and caption, homepage and `/reading/` cards, Open Graph and Twitter tags, `Article.image`, and image sitemap synchronized from that registry. Retain the exact prompt, completed job, receipt, and output SHA-256 in repository evidence without exposing provenance paths or job IDs in public output.
-- Keep the product homepage's command-line social card. Editorial banners belong to reading pages and reading-card surfaces, not ordinary product documentation.
+- Keep `hra.sh` focused on the HRA product. Do not publish adjacent tool summaries, comparison-shaped pages, or generic search-targeted essays unless a named reader job and a non-obvious HRA-specific answer justify a durable indexable route.
+- Before admitting an editorial route, score reader utility, original evidence, factual confidence, host fit, voice integrity, and maintenance value from 0–2. Require at least 9/12 and no zero; traffic potential, word count, and a content quota do not count as value.
+- Ground factual claims in checked primary sources or exact HRA release evidence. Do not synthesize a first-person opinion, experience, endorsement, or certainty that no named human supplied.
+- Every admitted editorial route must record an owner, source-check date, reassessment date within 60 days, and an explicit keep, revise, redirect, or remove lifecycle decision. Remove a route cleanly from navigation, discovery, structured data, and generated artifacts when it no longer clears the gate.
+- Images follow an admitted reader job; they never justify one. Use the `editorial-image-seo` skill for future editorial imagery and keep visible figures, captions, responsive assets, metadata, schema, feeds, sitemaps, and provenance synchronized.
+- Keep the product homepage's command-line social card.
