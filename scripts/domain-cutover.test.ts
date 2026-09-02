@@ -425,7 +425,27 @@ describe("domain cutover runbook", () => {
     expect(runbook).toContain("bun ./scripts/current-project-alias-release.ts --execute");
     expect(runbook).not.toContain("bun run release:canonical-alias");
     expect(runbook).toContain("--confirm-exact");
+    expect(runbook).toContain("ordinary conversational language");
+    expect(runbook).toContain("in a separate conversational turn");
+    expect(runbook).toContain("they do not need to repeat the machine-generated record");
+    expect(runbook).toContain("immediately preceding presentation of one plan");
+    expect(runbook).toContain("General or standing release approval");
+    expect(runbook).toContain("the user does not need to see, copy, or reproduce it");
+    expect(runbook).toContain(
+      "the designated custodian passes the exact `requiredConfirmation` value",
+    );
+    expect(runbook).toContain(
+      "the user's literal approval is never passed as the command argument",
+    );
+    expect(runbook).toContain(
+      "If another plan has entered the conversation, the plan changed, or the response is ambiguous",
+    );
     expect(runbook).toContain("approve both` do not authorize this alias change");
+    expect(runbook).toContain(
+      '`nextAction: "obtain_conversational_plan_approval_then_execute_with_machine_token"`',
+    );
+    expect(runbook).toContain("Its result uses `schemaVersion: 2`");
+    expect(runbook).not.toContain("confirm_exact_record_then_execute");
     expect(runbook).toContain("automatic restoration");
     expect(runbook).toContain("compensation_failed");
     expect(runbook).toContain("HRA v0 is never a fallback");

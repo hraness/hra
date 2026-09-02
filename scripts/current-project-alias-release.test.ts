@@ -882,9 +882,14 @@ describe("current-project alias authority", () => {
       .toBeFalse();
   });
 
-  test("requires the exact user-confirmed record before any alias write", async () => {
+  test("requires the exact plan-bound machine token before any alias write", async () => {
     await withStateDirectory(async (stateDirectory) => {
-      for (const confirmation of [undefined, "approve both", "reassign hra.sh"] as const) {
+      for (const confirmation of [
+        undefined,
+        "approve both",
+        "confirmed do it",
+        "reassign hra.sh",
+      ] as const) {
         const provider = new FakeProvider();
         const stderr: string[] = [];
         const arguments_ = ["--execute", "--vercel-auth-fd", "3"];
@@ -1988,11 +1993,11 @@ describe("current-project alias CLI", () => {
       expect(JSON.parse(stdout.join(""))).toEqual({
         alias: "hra.sh",
         idempotencyKey: plan.idempotencyKey,
-        nextAction: "confirm_exact_record_then_execute",
+        nextAction: "obtain_conversational_plan_approval_then_execute_with_machine_token",
         observedState: "source",
         reason: "exact_source",
         requiredConfirmation: requiredAliasConfirmation(plan),
-        schemaVersion: 1,
+        schemaVersion: 2,
         sourceDeploymentId: source.deploymentId,
         status: "ready",
         targetDeploymentId: target.deploymentId,

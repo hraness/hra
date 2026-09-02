@@ -19,11 +19,11 @@ type: index
 
 ### Notes
 
-- [[notes/agent-first-coordination|Agent-first coordination substrate]] — Clean-room design record for HRA's bounded local work protocol, exact session and account authority, recovery, and storage boundary.
+- [[notes/agent-first-coordination|Agent-first coordination substrate]] — The durable, bounded HRA protocol for coordinating parallel Codex sessions.
 - [[notes/hra-seed-prompt|HRA seed prompt]] — The written product seed for a minimal multi-account Codex CLI.
 
 ### Plans
 
-- [[plans/hra-v1|HRA v1]] — Status: in-progress. Release plan for a persistent Codex control plane for humans and agents, with isolated accounts, bounded work coordination, durable interactions and event streams…
+- [[plans/hra-v1|HRA v1]] — Status: in-progress. Release plan for a persistent Codex control plane for humans and agents, with isolated accounts, bounded work coordination, durable interactions and event streams, device…
 
 <!-- kb:catalog:end -->
