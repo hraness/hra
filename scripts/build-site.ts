@@ -17,6 +17,7 @@ import {
 
 interface BuildOptions {
   readonly check: boolean;
+  readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly releaseCommit?: string;
   readonly repositoryRoot: string;
 }
@@ -28,6 +29,30 @@ interface TextOutput {
 
 const withFinalNewline = (value: string): string =>
   value.endsWith("\n") ? value : `${value}\n`;
+
+export const HRA_POSTHOG_PROJECT_TOKEN_ENV =
+  "NEXT_PUBLIC_POSTHOG_KEY" as const;
+
+const postHogProjectTokenPattern = /^phc_[A-Za-z0-9_-]{8,512}$/u;
+
+export function resolveHraAnalyticsProjectToken(
+  environment: Readonly<Record<string, string | undefined>>,
+): string {
+  if (environment.VERCEL_ENV !== "production") return "";
+
+  const projectToken = environment[HRA_POSTHOG_PROJECT_TOKEN_ENV]?.trim();
+  if (projectToken === undefined || projectToken.length === 0) {
+    throw new Error(
+      `${HRA_POSTHOG_PROJECT_TOKEN_ENV} must be configured for Vercel Production.`,
+    );
+  }
+  if (!postHogProjectTokenPattern.test(projectToken)) {
+    throw new Error(
+      `${HRA_POSTHOG_PROJECT_TOKEN_ENV} must be a valid public phc_ project token.`,
+    );
+  }
+  return projectToken;
+}
 
 const trackedTextOutputs = (repositoryRoot: string): readonly TextOutput[] => [
   {
@@ -91,6 +116,9 @@ const siteTextOutputs = (
 ];
 
 const staticAssets = ["favicon.svg", "social-card.svg"] as const;
+const analyticsEntryPath = fileURLToPath(
+  new URL("../site/analytics-entry.ts", import.meta.url),
+);
 const siteFooterStylesPath = fileURLToPath(
   import.meta.resolve("@hraness/site-footer/styles.css"),
 );
@@ -112,6 +140,29 @@ const readExisting = async (path: string): Promise<string | undefined> => {
     throw error;
   }
 };
+
+async function buildAnalyticsBundle(
+  repositoryRoot: string,
+  projectToken: string,
+): Promise<void> {
+  const result = await Bun.build({
+    define: {
+      __HRA_POSTHOG_PROJECT_TOKEN__: JSON.stringify(projectToken),
+      "process.env.NODE_ENV": JSON.stringify("production"),
+    },
+    entrypoints: [analyticsEntryPath],
+    format: "esm",
+    minify: true,
+    naming: "analytics.js",
+    outdir: join(repositoryRoot, "dist/site"),
+    sourcemap: "none",
+    target: "browser",
+  });
+  if (!result.success) {
+    const details = result.logs.map((log) => log.message).join("\n");
+    throw new Error(`HRA analytics bundle failed.${details.length > 0 ? `\n${details}` : ""}`);
+  }
+}
 
 export const buildSite = async (options: BuildOptions): Promise<readonly string[]> => {
   const mismatches: string[] = [];
@@ -135,6 +186,9 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   if (releaseCommit !== "local" && !/^[0-9a-f]{40}$/u.test(releaseCommit)) {
     throw new Error("Release commit must be a lowercase 40-character Git SHA.");
   }
+  const analyticsProjectToken = resolveHraAnalyticsProjectToken(
+    options.environment ?? process.env,
+  );
   await rm(join(options.repositoryRoot, "dist", "site"), {
     force: true,
     recursive: true,
@@ -144,6 +198,7 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     await mkdir(dirname(output.path), { recursive: true });
     await writeFile(output.path, content, { encoding: "utf8" });
   }
+  await buildAnalyticsBundle(options.repositoryRoot, analyticsProjectToken);
 
   for (const asset of staticAssets) {
     const source = join(options.repositoryRoot, "site", asset);
