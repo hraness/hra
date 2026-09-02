@@ -45,6 +45,7 @@ import {
   HRA_VERCEL_PROJECT_ID,
   HRA_VERCEL_TEAM_ID,
   readProtectedJson,
+  withSelfDigest,
 } from "./release-evidence";
 
 const source: CurrentProjectAliasEndpoint = {
@@ -187,6 +188,7 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
   breakTargetMarker = false;
   failSourceSet = false;
   failVerifyVercelAt = 0;
+  failVerifyVercelWhileTarget = false;
   mutationOldDeploymentIdOverride: string | undefined;
   readonly operations: string[] = [];
   sourceDeploymentOverride: CurrentDeploymentReadback | undefined;
@@ -202,7 +204,10 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
   async verifyVercelVersion(): Promise<void> {
     this.#verifyVercelReads += 1;
     this.operations.push("verify-vercel");
-    if (this.#verifyVercelReads === this.failVerifyVercelAt) {
+    if (
+      this.#verifyVercelReads === this.failVerifyVercelAt
+      || this.failVerifyVercelWhileTarget && this.aliasState === "target"
+    ) {
       throw new CurrentAliasReleaseError("provider_command_failed");
     }
   }
@@ -413,6 +418,7 @@ const runExecuteCli = async (
   stateDirectory: string,
   options: Readonly<{
     afterIntentPublication?: () => void;
+    clock?: ReturnType<typeof immediateClock>;
     receiptWriter?: () => void;
     timeoutMs?: number;
   }> = {},
@@ -438,7 +444,7 @@ const runExecuteCli = async (
         "--confirm-exact",
         requiredAliasConfirmation(inputPlan),
       ],
-      clock: immediateClock(),
+      clock: options.clock ?? immediateClock(),
       inputDocument: JSON.stringify(inputPlan),
       stderr: { write: (value) => {
         stderr.push(String(value));
@@ -916,10 +922,94 @@ describe("current-project alias authority", () => {
       expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
         .toEqual([`set-alias:${target.deploymentUrl}`]);
       expect(provider.operations.filter((operation) => operation === "verify-vercel"))
-        .toHaveLength(3);
+        .toHaveLength(4);
       expect(provider.operations.filter((operation) =>
         operation === `verify-convex:${String(convex.deploymentId)}`))
-        .toHaveLength(3);
+        .toHaveLength(4);
+      expect(provider.operations.filter((operation) => operation === "read-marker:target"))
+        .toHaveLength(4);
+    });
+  });
+
+  test("resets stability after a transient target-authority failure without rolling back", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.failVerifyVercelAt = 4;
+
+      const result = await runExecuteCli(plan, provider, stateDirectory, {
+        timeoutMs: 1_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(provider.aliasState).toBe("target");
+      expect(provider.operations.filter((operation) => operation === "verify-vercel"))
+        .toHaveLength(6);
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([`set-alias:${target.deploymentUrl}`]);
+    });
+  });
+
+  test("shares one target deadline and receipts the persistent closed failure", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      const clock = immediateClock();
+      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      provider.targetVisibilityLagReads = 1;
+      provider.failVerifyVercelWhileTarget = true;
+
+      const result = await runExecuteCli(plan, provider, stateDirectory, {
+        clock,
+        timeoutMs: 750,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(clock.now()).toBe(750);
+      expect(provider.aliasState).toBe("source");
+      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema))
+        .toMatchObject({
+          finalState: "source",
+          rollbackDiagnostic: {
+            phase: "target_authority",
+            reason: "provider_command_failed",
+          },
+        });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([
+          `set-alias:${target.deploymentUrl}`,
+          `set-alias:${source.deploymentUrl}`,
+        ]);
+    });
+  });
+
+  test("starts no complete target sample after the fast probe consumes its deadline", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      const clock = immediateClock();
+      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      provider.afterReadMarker = async () => {
+        if (provider.aliasState === "target" && clock.now() === 0) {
+          await clock.sleep(750);
+        }
+      };
+
+      const result = await runExecuteCli(plan, provider, stateDirectory, {
+        clock,
+        timeoutMs: 750,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(clock.now()).toBe(750);
+      expect(provider.aliasState).toBe("source");
+      expect(provider.operations.filter((operation) => operation === "verify-vercel"))
+        .toHaveLength(4);
+      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema))
+        .toMatchObject({
+          finalState: "source",
+          rollbackDiagnostic: {
+            phase: "target_authority",
+            reason: "stability_not_proven",
+          },
+        });
     });
   });
 
@@ -1017,11 +1107,42 @@ describe("current-project alias authority", () => {
     await withStateDirectory(async (stateDirectory) => {
       const provider = new FakeProvider();
       provider.breakTargetMarker = true;
+      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
 
       const result = await runExecuteCli(plan, provider, stateDirectory);
       expect(result.exitCode).toBe(1);
       expect(JSON.parse(result.stderr.join(""))).toMatchObject({ code: "alias_reverted" });
       expect(provider.aliasState).toBe("source");
+      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema))
+        .toMatchObject({
+          finalState: "source",
+          rollbackDiagnostic: {
+            phase: "target_probe",
+            reason: "marker_mismatch",
+          },
+        });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([
+          `set-alias:${target.deploymentUrl}`,
+          `set-alias:${source.deploymentUrl}`,
+        ]);
+    });
+  });
+
+  test("retries a transient complete source-authority failure after exact restoration", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.breakTargetMarker = true;
+      provider.failVerifyVercelAt = 4;
+
+      const result = await runExecuteCli(plan, provider, stateDirectory, {
+        timeoutMs: 1_000,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(provider.aliasState).toBe("source");
+      expect(provider.operations.filter((operation) => operation === "verify-vercel"))
+        .toHaveLength(6);
       expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
         .toEqual([
           `set-alias:${target.deploymentUrl}`,
@@ -1217,7 +1338,7 @@ describe("current-project Vercel provider", () => {
       );
       expect(executed.exitCode).toBe(0);
       expect(executed.stderr).toEqual([]);
-      expect(executed.convexCalls).toBe(3);
+      expect(executed.convexCalls).toBe(4);
       expect(transport.aliasState).toBe("target");
       const posts = transport.requests.filter(({ init }) => init.method === "POST");
       expect(posts).toHaveLength(1);
@@ -1683,6 +1804,39 @@ describe("durable current-project alias execution", () => {
       });
       expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
         .toEqual(writes);
+    });
+  });
+
+  test("continues to parse self-digested source receipts from before diagnostics", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.breakTargetMarker = true;
+      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      expect((await runExecuteCli(plan, provider, stateDirectory)).exitCode).toBe(1);
+      const current = readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema);
+      const {
+        rollbackDiagnostic: omittedRollbackDiagnostic,
+        selfDigest: omittedSelfDigest,
+        ...legacyFields
+      } = current;
+      void omittedRollbackDiagnostic;
+      void omittedSelfDigest;
+
+      const legacy = currentAliasReleaseReceiptSchema.parse(withSelfDigest(legacyFields));
+      await writeFile(paths.receipt, `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+      const writesBeforeReplay = provider.operations.filter((operation) =>
+        operation.startsWith("set-alias:"));
+      const replay = await runExecuteCli(plan, provider, stateDirectory);
+
+      expect(legacy.finalState).toBe("source");
+      expect(legacy.rollbackDiagnostic).toBeUndefined();
+      expect(replay.exitCode).toBe(1);
+      expect(JSON.parse(replay.stderr.join(""))).toMatchObject({
+        code: "alias_reverted",
+        status: "reverted",
+      });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual(writesBeforeReplay);
     });
   });
 
