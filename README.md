@@ -1,4 +1,8 @@
 # HRA
+[![npm version](https://img.shields.io/npm/v/%40hraness%2Fhra)](https://www.npmjs.com/package/@hraness/hra) [![provenance: sigstore](https://img.shields.io/badge/provenance-sigstore-2e7d32)](https://www.npmjs.com/package/@hraness/hra#provenance) [![CI](https://img.shields.io/github/actions/workflow/status/hraness/hra/ci.yml?branch=main&label=CI)](https://github.com/hraness/hra/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/npm/l/%40hraness%2Fhra)](https://github.com/hraness/hra/blob/main/LICENSE) [![Bun 1.3.14](https://img.shields.io/badge/Bun-1.3.14-14151a)](https://bun.sh) [![runtimes: Codex 0.149.0](https://img.shields.io/badge/runtimes-Codex%200.149.0-0b5fa5)](https://www.npmjs.com/package/@openai/codex/v/0.149.0)\
+HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.
+
+Status: public beta. The local CLI v0.1.6 is live for macOS and Linux; hosted sync is not yet live.
 
 ```sh
 test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.6/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.6/hraness-hra-0.1.6.tgz 285ecf156c8de8a9b71c8d40ac7de6205816982c597dd5c19d3e2465fe9f4247)" = hra-install-safe
@@ -20,14 +24,16 @@ macOS and Linux CLI · macOS desktop switching · local v0.1.6 live · hosted sy
 
 ### One request, one exact account and session
 
-1. **Start:** `hra session start personal --preset high --json` — Create a session under one explicitly selected account profile.
-2. **Inspect:** `hra session status <session-id> --json` — Read the exact session and its contiguous event cursor.
-3. **Direct:** `hra session send <session-id> -- "Review this project."` — Send work to that session without switching account authority.
-4. **Observe:** `hra session watch <session-id> --cursor <status-cursor> --jsonl` — Follow safe live updates from the cursor returned by status.
+1. **Start:** `hra session start personal --preset high --json`. Create a session under one explicitly selected account profile.
+2. **Inspect:** `hra session status <session-id> --json`. Read the exact session and its contiguous event cursor.
+3. **Direct:** `hra session send <session-id> -- "Review this project."`. Send work to that session without switching account authority.
+4. **Observe:** `hra session watch <session-id> --cursor <status-cursor> --jsonl`. Follow safe live updates from the cursor returned by status.
 
 > **Immutable local CLI release; hosted sync not yet live.** The exact install command below is live from the immutable `v0.1.6` GitHub Release and its verified archive. npm exposes the same provenance-bearing bytes as latest. The public CLI is immutable and admitted; optional hosted sync remains beta-not-yet-live.
 
 HRA is one Bun CLI plus a local daemon. It keeps Codex accounts isolated, gives you a compact session interface, and optionally syncs encrypted session projections and commands across your enrolled machines.
+
+HRA is short for harness: the control plane that keeps your coding-agent subscriptions working together, and [hraness.com](https://hraness.com/) explains the parent brand. The Hraness organization maintains HRA and publishes it under the MIT license.
 
 [GitHub](https://github.com/hraness/hra) · [Documentation](https://github.com/hraness/hra#command-reference) · [Security](https://github.com/hraness/hra/blob/main/SECURITY.md) · [Privacy](https://github.com/hraness/hra/blob/main/PRIVACY.md)
 

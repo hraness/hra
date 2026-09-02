@@ -6,8 +6,12 @@ import { dirname, join } from "node:path";
 import {
   buildSite,
   HRA_POSTHOG_PROJECT_TOKEN_ENV,
+  readPackageVersion,
   resolveHraAnalyticsProjectToken,
 } from "../scripts/build-site.ts";
+import { publicContent } from "./content.ts";
+import { renderSocialCardPng, renderSocialCardSvg } from "./social-card.ts";
+import { readPngDimensions } from "./social-card-raster.ts";
 import {
   renderAskAiAboutThis,
   renderHraAnalyticsScript,
@@ -24,7 +28,7 @@ const createFixtureRoot = async (): Promise<string> => {
   temporaryRoots.push(root);
   await mkdir(join(root, "site"), { recursive: true });
   await Promise.all(
-    ["favicon.svg", "social-card.svg", "styles.css"].map(async (asset) => {
+    ["favicon.svg", "styles.css"].map(async (asset) => {
       await writeFile(join(root, "site", asset), `fixture:${asset}\n`, "utf8");
     }),
   );
@@ -96,6 +100,7 @@ describe("static-site build", () => {
       "dist/site/analytics.js",
       "dist/site/favicon.svg",
       "dist/site/social-card.svg",
+      "dist/site/social-card.png",
       "dist/site/styles.css",
       "dist/site/fonts/nebula-sans/LICENSE.txt",
       "dist/site/fonts/nebula-sans/PROVENANCE.md",
@@ -130,8 +135,23 @@ describe("static-site build", () => {
       source: {
         commit: "local",
       },
-      version: "0.1.0",
+      version: await readPackageVersion(),
     });
+  });
+
+  test("renders the social card as a 1200x630 PNG plus the legacy SVG path from one composition", async () => {
+    const root = await createFixtureRoot();
+    await buildSite({ check: false, repositoryRoot: root });
+    const png = new Uint8Array(await readFile(join(root, "dist/site/social-card.png")));
+    const svg = await readFile(join(root, "dist/site/social-card.svg"), "utf8");
+
+    expect(readPngDimensions(png)).toEqual({ height: 630, width: 1200 });
+    expect(Buffer.from(png).equals(Buffer.from(renderSocialCardPng()))).toBe(true);
+    expect(svg).toBe(renderSocialCardSvg());
+    expect(svg).toContain(publicContent.socialCard.alt);
+    expect(renderSiteHtml()).toContain(
+      `<meta property="og:image" content="${publicContent.siteUrl}/social-card.png">`,
+    );
   });
 
   test("binds hosted identity to one exact source commit", async () => {
@@ -193,7 +213,7 @@ describe("static-site build", () => {
     expect(analytics).not.toContain("POSTHOG_API_KEY");
   });
 
-  test("keeps immutable hosted deployment identity separate from the forward CLI version", async () => {
+  test("derives the hosted identity marker version from the package manifest", async () => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root });
     const identity = JSON.parse(
@@ -203,9 +223,11 @@ describe("static-site build", () => {
       await readFile(join(import.meta.dir, "..", "package.json"), "utf8"),
     ) as { version?: unknown };
 
-    expect(identity.version).toBe("0.1.0");
-    expect(packageJson.version).toBe("0.1.6");
-    expect(identity.version).not.toBe(packageJson.version);
+    expect(identity.version).toBe(packageJson.version);
+    expect(identity.version).toBe(await readPackageVersion());
+    await mkdir(join(root, "broken"));
+    await writeFile(join(root, "broken", "package.json"), '{"version":"latest"}\n', "utf8");
+    await expect(readPackageVersion(join(root, "broken"))).rejects.toThrow();
   });
 
   test("does not publish the retired adjacent-reading cluster", async () => {
@@ -306,7 +328,7 @@ describe("static-site build", () => {
     expect(css).toContain("font-family: var(--font-sans);");
     expect(css).not.toMatch(/font-family:\s*ui-sans-serif/u);
     expect(css).toContain('font-family: ui-monospace, "SFMono-Regular"');
-    expect(await readFile(join(repositoryRoot, "site/social-card.svg"), "utf8"))
+    expect(renderSocialCardSvg())
       .toContain('font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif"');
     expect(vercel.headers).toEqual([
       {

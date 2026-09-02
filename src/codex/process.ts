@@ -15,7 +15,7 @@ export interface SpawnCodexProcessOptions {
   readonly environment?: Readonly<Record<string, string | undefined>>;
 }
 
-const SAFE_ENVIRONMENT_KEYS = new Set([
+export const SAFE_ENVIRONMENT_KEYS: ReadonlySet<string> = new Set([
   "HOME",
   "LANG",
   "LC_ALL",
@@ -27,11 +27,23 @@ const SAFE_ENVIRONMENT_KEYS = new Set([
   "USER",
 ]);
 
-export function spawnBunCodexProcess(options: SpawnCodexProcessOptions): CodexProcess {
+// Every child HRA spawns receives this allowlist plus the caller's named
+// extra keys. Nothing else from the parent environment crosses the boundary.
+export function allowlistedEnvironment(
+  environment: Readonly<Record<string, string | undefined>>,
+  extraKeys: ReadonlySet<string> = new Set(),
+): Record<string, string> {
   const env: Record<string, string> = Object.create(null) as Record<string, string>;
-  for (const [key, value] of Object.entries(options.environment ?? process.env)) {
-    if (SAFE_ENVIRONMENT_KEYS.has(key) && value !== undefined) env[key] = value;
+  for (const [key, value] of Object.entries(environment)) {
+    if ((SAFE_ENVIRONMENT_KEYS.has(key) || extraKeys.has(key)) && value !== undefined) {
+      env[key] = value;
+    }
   }
+  return env;
+}
+
+export function spawnBunCodexProcess(options: SpawnCodexProcessOptions): CodexProcess {
+  const env = allowlistedEnvironment(options.environment ?? process.env);
   env.CODEX_HOME = options.codexHome;
   env.NO_COLOR = "1";
 

@@ -5,7 +5,7 @@ import { z } from "zod";
 import {
   containsAbsolutePath,
   containsUnsafeTerminalScalar,
-} from "./cloud/contracts";
+} from "./domain/text-safety";
 import {
   redactCompleteSensitiveText,
 } from "./sensitive-text";

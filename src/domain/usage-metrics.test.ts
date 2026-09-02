@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 
 import {
+  ACCOUNT_USAGE_SCHEMA_DIGEST,
+  ACCOUNT_USAGE_SCHEMA_ID,
   AUTO_RATE_LIMIT_RESET_USED_PERCENT,
   CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES,
   accountUsageCounterSamples,
@@ -9,6 +12,7 @@ import {
   createStoredAccountUsageSnapshot,
   observedAccountTokenVelocity,
   providerUsagePayload,
+  rederiveAccountUsageSchemaDigest,
   type AccountUsageCounterSample,
 } from "./usage-metrics";
 
@@ -441,5 +445,78 @@ describe("automaticRateLimitResetDecision", () => {
       },
       now,
     })).toEqual({ eligible: false, reason: "weekly_window_unavailable" });
+  });
+});
+
+describe("account usage schema digest", () => {
+  const retiredDigest = createHash("sha256")
+    .update("hra:codex-account-usage:0.149.0:lifetimeTokens:v1")
+    .digest("hex");
+
+  test("is derived from a stable domain and schema id, not the Codex pin", () => {
+    expect(ACCOUNT_USAGE_SCHEMA_ID).toBe("lifetimeTokens:v1");
+    expect(ACCOUNT_USAGE_SCHEMA_DIGEST).toBe(
+      createHash("sha256").update(`hra:codex-account-usage:v2:${ACCOUNT_USAGE_SCHEMA_ID}`).digest("hex"),
+    );
+    expect(ACCOUNT_USAGE_SCHEMA_DIGEST).toBe("a562dbf3053074aa570c194d3caa812c28640dd615c4d5a0c334b8b50f5ebd46");
+    expect(ACCOUNT_USAGE_SCHEMA_DIGEST).not.toBe(retiredDigest);
+  });
+
+  test("re-derives the retired pin-bound digest and leaves foreign digests alone", () => {
+    expect(retiredDigest).toBe("327b3f456c3200e91b3215d4030cb74e1e1c8911b3f1311687134dd9d9c8144d");
+    expect(rederiveAccountUsageSchemaDigest(retiredDigest)).toBe(ACCOUNT_USAGE_SCHEMA_DIGEST);
+    expect(rederiveAccountUsageSchemaDigest(ACCOUNT_USAGE_SCHEMA_DIGEST)).toBe(ACCOUNT_USAGE_SCHEMA_DIGEST);
+    expect(rederiveAccountUsageSchemaDigest("f".repeat(64))).toBe("f".repeat(64));
+  });
+
+  test("continues the usage epoch across a snapshot stored under the retired digest", () => {
+    const previous = createStoredAccountUsageSnapshot({
+      providerPayload: usagePayload(100),
+      sourceSequence: 1,
+      observedAt: 1_000,
+      receivedAt: 1_000,
+      accountFingerprint: digest,
+      providerGeneration: 1,
+      daemonGeneration: 1,
+      previousPayload: null,
+    });
+    const retired = {
+      ...previous,
+      observation: { ...previous.observation, schemaDigest: retiredDigest },
+    };
+    const next = createStoredAccountUsageSnapshot({
+      providerPayload: usagePayload(160),
+      sourceSequence: 2,
+      observedAt: 61_000,
+      receivedAt: 61_000,
+      accountFingerprint: digest,
+      providerGeneration: 1,
+      daemonGeneration: 1,
+      previousPayload: retired,
+    });
+    expect(next.observation.usageEpoch).toBe(previous.observation.usageEpoch);
+    expect(next.observation.schemaDigest).toBe(ACCOUNT_USAGE_SCHEMA_DIGEST);
+    expect(next.observation.gapBefore).toBe(false);
+
+    const samples = accountUsageCounterSamples([{ payload: retired }, { payload: next }]);
+    expect(samples.map((entry) => entry.schemaDigest)).toEqual([ACCOUNT_USAGE_SCHEMA_DIGEST, ACCOUNT_USAGE_SCHEMA_DIGEST]);
+    const velocity = observedAccountTokenVelocity({ samples, window: "1m", now: 61_000 });
+    expect(velocity.available).toBe(true);
+
+    const foreign = {
+      ...previous,
+      observation: { ...previous.observation, schemaDigest: "f".repeat(64) },
+    };
+    const restarted = createStoredAccountUsageSnapshot({
+      providerPayload: usagePayload(160),
+      sourceSequence: 2,
+      observedAt: 31_000,
+      receivedAt: 31_000,
+      accountFingerprint: digest,
+      providerGeneration: 1,
+      daemonGeneration: 1,
+      previousPayload: foreign,
+    });
+    expect(restarted.observation.usageEpoch).not.toBe(previous.observation.usageEpoch);
   });
 });

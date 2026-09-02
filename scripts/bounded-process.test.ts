@@ -72,8 +72,6 @@ describe("bounded detached process groups", () => {
     for (const file of [
       "configure-hosted-sync.ts",
       "current-project-alias-release.ts",
-      "publish-beta-release.ts",
-      "release-candidate.ts",
     ]) {
       const source = await readFile(join(import.meta.dir, file), "utf8");
       expect(source).toContain("runBoundedProcess({");

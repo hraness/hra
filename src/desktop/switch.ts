@@ -1,36 +1,25 @@
+import type {
+  DesktopProfilePaths,
+  DesktopSwitchGeneration,
+  DesktopSwitchJournalEntry,
+  DesktopSwitchStage,
+} from "../domain/desktop-switch.ts";
 import type { ChatGptBundleCapability } from "./bundle.ts";
 import { CODEX_ELECTRON_USER_DATA_PATH, CODEX_HOME } from "./bundle.ts";
 import { DesktopSwitchError } from "./errors.ts";
-import { deriveDesktopProfilePaths, type DesktopProfilePaths } from "./profile.ts";
+import { deriveDesktopProfilePaths } from "./profile.ts";
+
+// The journal shapes live in the domain so storage can persist them without
+// importing this state machine.
+export type {
+  DesktopSwitchGeneration,
+  DesktopSwitchJournalEntry,
+  DesktopSwitchStage,
+} from "../domain/desktop-switch.ts";
 
 export interface DesktopProcessIdentity {
   readonly pid: number;
   readonly executablePath: string;
-}
-
-export interface DesktopSwitchGeneration {
-  readonly switchGeneration: number;
-  readonly sourceProfileId: string | null;
-  readonly sourceProcessGeneration: number | null;
-  readonly targetProfileId: string;
-  readonly targetProcessGeneration: number;
-}
-
-export type DesktopSwitchStage =
-  | "prepared"
-  | "quit-requested"
-  | "source-quiesced"
-  | "launch-requested"
-  | "target-observed"
-  | "verified"
-  | "recovery-required";
-
-export interface DesktopSwitchJournalEntry extends DesktopSwitchGeneration {
-  readonly idempotencyKey: string;
-  readonly bundleCdHash: string;
-  readonly sourcePid: number | null;
-  readonly targetPaths: DesktopProfilePaths;
-  readonly expectedAccountKey: string;
 }
 
 export interface DesktopSwitchJournalPort {

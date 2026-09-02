@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import type { Database } from "bun:sqlite";
 
-import { isUuidV7 } from "../cloud/contracts";
+import { isUuidV7 } from "../domain/uuid-v7";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
 import { workPreparedEffectMessage } from "../domain/work-message";
 import { MESSAGE_MAX_BYTES } from "../domain/values";
@@ -982,7 +982,7 @@ const requiredWorkTriggers = [
   "work_nested_effect_settlements_no_delete",
 ] as const;
 
-export function assertWorkSchema(database: Database): void {
+const assertWorkSchemaShape = (database: Database): void => {
   const foreignKeys = database.query("PRAGMA foreign_keys").get() as { foreign_keys?: unknown } | null;
   if (foreignKeys?.foreign_keys !== 1) throw new Error("WORK_SCHEMA_FOREIGN_KEYS_DISABLED");
   const rows = database.query("PRAGMA table_list").all() as Array<{
@@ -1049,8 +1049,23 @@ export function assertWorkSchema(database: Database): void {
   if (!Number.isSafeInteger(clock?.logical_time) || (clock?.logical_time as number) < 0) {
     throw new Error("WORK_SCHEMA_CLOCK_MISSING");
   }
+};
+
+// Writable opens verify schema identity and row-level referential integrity.
+// The foreign_key_check scans every child row, so it belongs only on the
+// connection that can repair or refuse the database.
+export function assertWorkSchema(database: Database): void {
+  assertWorkSchemaShape(database);
   const integrity = database.query("PRAGMA foreign_key_check").all();
   if (integrity.length !== 0) throw new Error("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
+}
+
+// Readonly opens (`hra status`, `hra doctor --offline`) verify the same table,
+// trigger, column, and clock identity but skip the O(rows) foreign_key_check.
+// A long readonly scan pins a WAL snapshot, and the writer's queue scrub
+// checkpoint must wait for that snapshot before it can truncate the WAL.
+export function assertReadonlyWorkSchema(database: Database): void {
+  assertWorkSchemaShape(database);
 }
 
 export type WorkStoreErrorCode =

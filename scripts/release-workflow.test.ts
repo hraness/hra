@@ -39,6 +39,7 @@ describe("release workflow", () => {
       "/scripts/github-release-identity.ts",
       "/scripts/github-release-retry-policy.ts",
       "/scripts/bounded-json-response.ts",
+      "/scripts/check-commit-ci-run.ts",
       "/scripts/check-npm-trusted-publisher-oidc.ts",
       "/scripts/npm-publisher-boundary.ts",
       "/scripts/publish-github-release.ts",
@@ -184,9 +185,9 @@ describe("release workflow", () => {
       "Download pinned Zig 0.16.0 for authority supervisor (Linux)",
       "Rebuild and verify authority-supervisor artifacts (Linux)",
       "Enable isolated user namespaces for native custody checks",
-      "Run Linux authority-supervisor custody test",
       "Restore Ubuntu user-namespace restriction",
     ] as const;
+    const custodyTestName = "Run Linux authority-supervisor custody test";
 
     const exactlyOneStep = (
       steps: readonly Record<string, unknown>[],
@@ -248,11 +249,12 @@ describe("release workflow", () => {
     expect(enableNamespaces).toContain(
       "/usr/bin/unshare --user --map-root-user --fork /usr/bin/true",
     );
-    expect(String(exactlyOneStep(
-      ciSteps,
-      "Run Linux authority-supervisor custody test",
-      "CI check",
-    ).run)).toBe(
+    // CI runs the custody test once, inside `bun run check`; only the release
+    // verifier, which no longer reruns the gate, keeps the focused step.
+    expect(ciSteps.filter((step) => step.name === custodyTestName)).toHaveLength(0);
+    const releaseCustodyTest = exactlyOneStep(releaseSteps, custodyTestName, "release verify");
+    expect(releaseCustodyTest.if).toBe("runner.os == 'Linux'");
+    expect(String(releaseCustodyTest.run)).toBe(
       "bun test scripts/authority-supervisor-runtime.test.ts --isolate --max-concurrency=1",
     );
     const restoreNamespaces = String(exactlyOneStep(
@@ -269,11 +271,11 @@ describe("release workflow", () => {
 
     const verifyOrder = [
       "Install exact locked dependencies without lifecycle scripts",
+      "Require the exact commit's successful CI run",
       "Download pinned Zig 0.16.0 for authority supervisor (Linux)",
       "Rebuild and verify authority-supervisor artifacts (Linux)",
       "Enable isolated user namespaces for native custody checks",
-      "Run Linux authority-supervisor custody test",
-      "Run complete repository gate",
+      custodyTestName,
       "Restore Ubuntu user-namespace restriction",
       "Create one exact npm tarball and checksum",
     ] as const;
@@ -282,9 +284,11 @@ describe("release workflow", () => {
       return releaseSteps.findIndex((step) => step.name === name);
     });
     expect(verifyIndexes).toEqual([...verifyIndexes].sort((left, right) => left - right));
-    const releaseGateIndex = verifyIndexes[5];
+    const custodyTestIndex = verifyIndexes[5];
     const restoreIndex = verifyIndexes[6];
-    expect(restoreIndex).toBe((releaseGateIndex ?? -2) + 1);
+    expect(restoreIndex).toBe((custodyTestIndex ?? -2) + 1);
+    expect(releaseSteps.filter((step) => step.name === "Run complete repository gate")).toHaveLength(0);
+    expect(releaseSource).not.toContain("bun run check");
 
     for (const name of [
       "Enable isolated user namespaces for native custody checks",
@@ -545,6 +549,12 @@ describe("release workflow", () => {
     expect(workflow).toContain("HRA_NPM_PREFLIGHT_RUN_ATTEMPT");
     expect(workflow).not.toContain("release-candidate.ts");
     expect(workflow).not.toContain("publish-beta-release.ts");
+    for (const retired of [
+      "publish-beta-release.ts",
+      "publish-beta-release.test.ts",
+      "release-candidate.ts",
+      "release-candidate.test.ts",
+    ]) expect(await Bun.file(join(import.meta.dir, retired)).exists()).toBeFalse();
     expect(workflow).not.toContain("hra-weld.vercel.app");
     expect(workflow).not.toContain("try-hra.vercel.app");
     expect(workflow).not.toContain("convex");
@@ -570,10 +580,20 @@ describe("release workflow", () => {
       .map((step) => step.uses)
       .filter((value): value is string => typeof value === "string"))
       .toEqual([reviewedActions.checkout, reviewedActions.setupBun]);
+    expect(parsedSteps.map((step) => step.name)).toEqual([
+      "Check out source",
+      "Fetch only governed CI history",
+      "Install Bun",
+      "Install dependencies",
+      "Download pinned Zig 0.16.0 for authority supervisor (Linux)",
+      "Rebuild and verify authority-supervisor artifacts (Linux)",
+      "Enable isolated user namespaces for native custody checks",
+      "Run the repository gate",
+      "Restore Ubuntu user-namespace restriction",
+    ]);
     const checkout = parsedSteps.find((step) => step.name === "Check out source");
     const fetch = parsedSteps.find((step) => step.name === "Fetch only governed CI history");
     const install = parsedSteps.find((step) => step.name === "Install dependencies");
-    const generated = parsedSteps.find((step) => step.name === "Verify generated public documents");
     const gate = parsedSteps.find((step) => step.name === "Run the repository gate");
 
     const checkoutIndex = parsedSteps.indexOf(asRecord(checkout, "CI checkout step"));
@@ -603,8 +623,18 @@ describe("release workflow", () => {
     expect(governedHistory).not.toContain("github.head_ref");
     expect(governedHistory).not.toContain("pull_request.head.sha");
     expect(asRecord(install, "CI install step").run).toBe("bun install --frozen-lockfile --ignore-scripts");
-    expect(asRecord(generated, "CI generated-documents step").run).toBe("bun run build:site -- --check");
     expect(asRecord(gate, "CI gate step").run).toBe("bun run check");
+    // The gate already verifies generated public documents and runs the
+    // Linux custody test through `bun test ./scripts`; CI does not repeat them.
+    const packageScripts = asRecord(asRecord(
+      JSON.parse(await readFile(join(import.meta.dir, "..", "package.json"), "utf8")),
+      "package manifest",
+    ).scripts, "package scripts");
+    expect(String(packageScripts.check)).toContain("bun run build:site -- --check");
+    expect(String(packageScripts.check)).toContain("bun run test");
+    expect(String(packageScripts.test)).toContain("bun test ./scripts --isolate --max-concurrency=1");
+    expect(workflow).not.toContain("build:site -- --check");
+    expect(workflow).not.toContain("authority-supervisor-runtime.test.ts");
 
     expect(required.name).toBe("Required");
     expect(required.needs).toBe("check");
@@ -617,6 +647,51 @@ describe("release workflow", () => {
     expect(asRecord(requiredStep.env, "CI required environment").CHECK_RESULT)
       .toBe("${{ needs.check.result }}");
     expect(requiredStep.run).toBe('test "$CHECK_RESULT" = "success"');
+  });
+
+  test("admits only a tagged commit whose CI run concluded success before packaging", async () => {
+    const source = await readFile(join(import.meta.dir, "..", ".github", "workflows", "release.yml"), "utf8");
+    const workflow = asRecord(Bun.YAML.parse(source), "release workflow");
+    const jobs = asRecord(workflow.jobs, "release workflow jobs");
+    const verify = asRecord(jobs.verify, "release verify job");
+    expect(asRecord(verify.permissions, "release verify permissions")).toEqual({
+      actions: "read",
+      contents: "read",
+    });
+    expect(verify.env).toBeUndefined();
+    if (!Array.isArray(verify.steps)) throw new TypeError("release verify steps must be an array");
+    const steps = verify.steps.map((step, index) => asRecord(step, `verify step ${index}`));
+    const identityIndex = steps.findIndex((step) => step.id === "identity");
+    const readbackIndex = steps.findIndex((step) => step.name === "Require the exact commit's successful CI run");
+    const packageIndex = steps.findIndex((step) => step.name === "Create one exact npm tarball and checksum");
+    expect(identityIndex).toBeGreaterThanOrEqual(0);
+    expect(readbackIndex).toBeGreaterThan(identityIndex);
+    expect(packageIndex).toBeGreaterThan(readbackIndex);
+    const readback = steps[readbackIndex];
+    expect(readback?.if).toBeUndefined();
+    expect(readback?.run).toBe("bun run ./scripts/check-commit-ci-run.ts");
+    expect(asRecord(readback?.env, "CI readback environment")).toEqual({
+      DEFAULT_BRANCH: "${{ github.event.repository.default_branch }}",
+      GITHUB_TOKEN: "${{ github.token }}",
+      VERIFIED_SHA: "${{ steps.identity.outputs.sha }}",
+    });
+    for (const step of steps) {
+      if (step === readback) continue;
+      const environment = step.env === undefined ? {} : asRecord(step.env, `${String(step.name)} environment`);
+      expect(environment.GH_TOKEN, String(step.name)).toBeUndefined();
+      expect(environment.GITHUB_TOKEN, String(step.name)).toBeUndefined();
+    }
+
+    const readbackSource = await readFile(join(import.meta.dir, "check-commit-ci-run.ts"), "utf8");
+    expect(readbackSource).toContain('export const ciWorkflowPath = ".github/workflows/ci.yml"');
+    expect(readbackSource).toContain('export const ciRequiredJobName = "Required"');
+    expect(readbackSource).toContain("/actions/workflows/ci.yml/runs?");
+    expect(readbackSource).toContain('run.status !== "completed"');
+    expect(readbackSource).toContain('run.conclusion !== "success"');
+    expect(readbackSource).toContain('job.conclusion !== "success"');
+    expect(readbackSource).toContain("readBoundedJsonResponse(response, label, MAXIMUM_JSON_BYTES)");
+    expect(readbackSource).not.toContain("gh api");
+    expect(readbackSource).not.toContain("response.json()");
   });
 
   test("pins the privileged release TCB and scopes GitHub tokens to exact steps", async () => {

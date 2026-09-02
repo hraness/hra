@@ -4,8 +4,11 @@ import {
   cloudMutations,
   cloudQueries,
   CloudRequestDeadlineError,
+  CloudResponseTooLargeError,
   createConvexCloudTransport,
+  maximumCloudResponseBytes,
 } from "./client";
+import { cloudLimits } from "./contracts";
 
 const deploymentUrl = "https://quiet-otter-123.convex.cloud";
 
@@ -122,5 +125,77 @@ describe("bounded Convex transport", () => {
       deploymentUrl,
       requestTimeoutMs: 0,
     })).toThrow("Cloud request timeout must be an integer from 1ms through 120000ms.");
+  });
+
+  test("bounds the response body by bytes before the Convex client parses it", async () => {
+    const successBody = JSON.stringify({ logLines: [], status: "success", value: { ok: true } });
+    const oversized = JSON.stringify({
+      logLines: [],
+      status: "success",
+      value: { padding: "x".repeat(successBody.length + 64) },
+    });
+    const responses = new Map<string, () => Response>([
+      ["small", () => new Response(successBody, { status: 200 })],
+      // The declared length alone rejects, even though the delivered body is small.
+      ["oversized-declared", () => new Response(
+        successBody,
+        { headers: { "content-length": String(oversized.length) }, status: 200 },
+      )],
+      ["oversized-streamed", () => new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            const bytes = new TextEncoder().encode(oversized);
+            for (let offset = 0; offset < bytes.byteLength; offset += 7) {
+              controller.enqueue(bytes.subarray(offset, Math.min(offset + 7, bytes.byteLength)));
+            }
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      )],
+    ]);
+    let selected = "small";
+    const transport = createConvexCloudTransport({
+      accessToken: async () => null,
+      deploymentUrl,
+      fetch: fakeFetch(async () => {
+        const build = responses.get(selected);
+        if (build === undefined) throw new Error("unexpected fixture");
+        return build();
+      }),
+      maximumResponseBytes: successBody.length + 32,
+      requestTimeoutMs: 1_000,
+    });
+
+    await expect(transport.query("account:current", {})).resolves.toEqual({ ok: true });
+
+    selected = "oversized-declared";
+    await expect(transport.query("account:current", {})).rejects.toBeInstanceOf(
+      CloudResponseTooLargeError,
+    );
+
+    selected = "oversized-streamed";
+    await expect(transport.query("account:current", {})).rejects.toMatchObject({
+      code: "CLOUD_RESPONSE_TOO_LARGE",
+      maximumBytes: successBody.length + 32,
+      name: "CloudResponseTooLargeError",
+    });
+  });
+
+  test("derives the default response bound from one full detail-chunk page", () => {
+    expect(maximumCloudResponseBytes).toBeGreaterThan(
+      cloudLimits.pageSize * cloudLimits.ciphertextCharacters,
+    );
+    expect(maximumCloudResponseBytes).toBeLessThan(64 * 1_048_576);
+    expect(() => createConvexCloudTransport({
+      accessToken: async () => null,
+      deploymentUrl,
+      maximumResponseBytes: maximumCloudResponseBytes + 1,
+    })).toThrow(/response bound/u);
+    expect(() => createConvexCloudTransport({
+      accessToken: async () => null,
+      deploymentUrl,
+      maximumResponseBytes: 0,
+    })).toThrow(/response bound/u);
   });
 });

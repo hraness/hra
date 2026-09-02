@@ -46,7 +46,7 @@ const gitTagReferencePackageShape = ["@refs", "tags"].join("/");
 
 export class PublicTextPolicyError extends Error {
   constructor(
-    readonly code: "ABSOLUTE_USER_PATH" | "PRIVATE_SCOPE" | "SECRET_SHAPE" | "UNREVIEWED_FILE_TYPE",
+    readonly code: "ABSOLUTE_USER_PATH" | "EM_DASH" | "PRIVATE_SCOPE" | "SECRET_SHAPE" | "UNREVIEWED_FILE_TYPE",
     readonly label: string,
   ) {
     super(`Public text policy rejected ${label}: ${code}.`);
@@ -73,6 +73,18 @@ export function assertPublicText(value: string, label: string): void {
   }
 }
 
+/**
+ * Public copy follows STYLE.md and WRITING.md, which both ban the em dash.
+ * The check is separate from `assertPublicText` because that function also
+ * scans historical commit patches and vendored text that this rule does not
+ * govern.
+ */
+export function assertPublicCopyText(value: string, label: string): void {
+  if (value.includes("\u2014")) {
+    throw new PublicTextPolicyError("EM_DASH", label);
+  }
+}
+
 export function assertPublicSensitiveText(value: string, label: string): void {
   for (const pattern of absoluteUserPaths) {
     if (pattern.test(value)) {
@@ -88,6 +100,11 @@ export function assertPublicSensitiveText(value: string, label: string): void {
 }
 
 const excludedDirectories = new Set([".git", "dist", "node_modules"]);
+/**
+ * Files whose prose is public copy: root Markdown, the package manifest, the
+ * generated-site source, published docs, and the GitHub issue templates.
+ */
+const publicCopyFile = /^(?:[A-Z_]+\.md|package\.json|site\/.+|docs\/.+\.md|\.github\/ISSUE_TEMPLATE\/.+)$/u;
 const textFile = /(?:^|\/)(?:CODEOWNERS|LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|toml|ts|tsx|txt|xml|yaml|yml|zig)$/u;
 const editorialWebp = /^site\/images\/editorial\/[a-z0-9]+(?:-[a-z0-9]+)*(?:-384|-768)?\.webp$/u;
 const webpChunkTypes = new Set(["VP8 ", "VP8L", "VP8X"]);
@@ -125,6 +142,7 @@ export async function assertPublicTree(root: string): Promise<void> {
         const value = await readFile(child, "utf8");
         if (entry.name === "bun.lock") assertPublicSensitiveText(value, label);
         else assertPublicText(value, label);
+        if (publicCopyFile.test(label)) assertPublicCopyText(value, label);
       } else {
         throw new PublicTextPolicyError("UNREVIEWED_FILE_TYPE", label);
       }

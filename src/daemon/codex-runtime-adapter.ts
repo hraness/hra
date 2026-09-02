@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, relative } from "node:path";
 
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- D4 extracts the provider port; this file is the Codex adapter and loads the pinned runtime.
 import {
   CodexError,
   CodexRemoteError,
@@ -16,7 +17,7 @@ import {
   type ResolvedPreset,
   type ThreadStartResult,
 } from "../codex/index";
-import { redactAbsolutePaths } from "../cloud/contracts";
+import { redactAbsolutePaths } from "../domain/text-safety";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import { redactCompleteSensitiveText } from "../sensitive-text";
 import type {

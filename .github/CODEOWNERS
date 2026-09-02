@@ -2,6 +2,7 @@
 /.github/ @0thernet
 /package.json @0thernet
 /bun.lock @0thernet
+/scripts/check-commit-ci-run.ts @0thernet
 /scripts/check-package.ts @0thernet
 /scripts/check-public-release.ts @0thernet
 /scripts/check-release-package.ts @0thernet

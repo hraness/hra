@@ -26,7 +26,7 @@ import { finished } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 
 export const HRA_INSTALL_BUN_VERSION = "1.3.14";
-export const HRA_INSTALL_CLI_SHA256 = "4ec12b00de84a5c5e830fc8cac3f2303cb0dffa6d262dc2c51773bce5039f308";
+export const HRA_INSTALL_CLI_SHA256 = "84549efeb9161fabd7ed26dba38c283684732743aec5e5803ca9666b5bd8505a";
 
 const expectedPackageName = "@hraness/hra";
 const expectedPackageVersion = "0.1.6";

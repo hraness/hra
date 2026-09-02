@@ -330,9 +330,30 @@ const WINDOW_MS: Readonly<Record<UsageVelocityWindow, number>> = {
 
 export const USAGE_SAMPLE_MAX_GAP_MS = 90_000;
 export const USAGE_LATEST_STALE_MS = 90_000;
+/**
+ * Identity of the stored `lifetimeTokens` counter semantics. The domain is
+ * stable across Codex pins; bump `ACCOUNT_USAGE_SCHEMA_ID` by hand only when
+ * a new pin changes what the counter means, which starts a new usage epoch.
+ */
+const ACCOUNT_USAGE_DIGEST_DOMAIN = "hra:codex-account-usage:v2";
+export const ACCOUNT_USAGE_SCHEMA_ID = "lifetimeTokens:v1";
 export const ACCOUNT_USAGE_SCHEMA_DIGEST = createHash("sha256")
-  .update("hra:codex-account-usage:0.149.0:lifetimeTokens:v1")
+  .update(`${ACCOUNT_USAGE_DIGEST_DOMAIN}:${ACCOUNT_USAGE_SCHEMA_ID}`)
   .digest("hex");
+
+/**
+ * Digests written by releases whose domain embedded the then-pinned Codex
+ * version. Their counter semantics equal the current schema id, so stored
+ * observations carrying one are re-derived to the current digest on read
+ * instead of forcing a new usage epoch or a `schema_changed` gap.
+ */
+const RETIRED_ACCOUNT_USAGE_SCHEMA_DIGESTS: ReadonlySet<string> = new Set([
+  "327b3f456c3200e91b3215d4030cb74e1e1c8911b3f1311687134dd9d9c8144d",
+]);
+
+/** Maps a stored digest to the current schema identity when it is compatible. */
+export const rederiveAccountUsageSchemaDigest = (stored: string): string =>
+  RETIRED_ACCOUNT_USAGE_SCHEMA_DIGESTS.has(stored) ? ACCOUNT_USAGE_SCHEMA_DIGEST : stored;
 
 export const accountUsageCounterSampleSchema = z.object({
   sourceSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
@@ -460,7 +481,7 @@ export function createStoredAccountUsageSnapshot(input: {
   const comparable = previousObservation !== null
     && accountFingerprint !== null
     && previousObservation.accountFingerprint === accountFingerprint
-    && previousObservation.schemaDigest === ACCOUNT_USAGE_SCHEMA_DIGEST
+    && rederiveAccountUsageSchemaDigest(previousObservation.schemaDigest) === ACCOUNT_USAGE_SCHEMA_DIGEST
     && previousObservation.lifetimeTokens !== null
     && lifetimeTokens !== null
     && lifetimeTokens >= previousObservation.lifetimeTokens;
@@ -510,7 +531,7 @@ export function accountUsageCounterSamples(
       sourceSequence: observation.sourceSequence,
       accountFingerprint: observation.accountFingerprint,
       usageEpoch: observation.usageEpoch,
-      schemaDigest: observation.schemaDigest,
+      schemaDigest: rederiveAccountUsageSchemaDigest(observation.schemaDigest),
       counterName: observation.counterName,
       clock: observation.clock,
       observedAt: observation.observedAt,

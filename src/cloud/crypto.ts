@@ -1,3 +1,5 @@
+import { KeyRotationRequiredError } from "../domain/cloud-outcomes";
+export { KeyRotationRequiredError } from "../domain/cloud-outcomes";
 import {
   isBase64Url,
   isRecord,
@@ -92,6 +94,90 @@ export async function hmacSha256Hex(
 
 export function randomKeyBytes(): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(32));
+}
+
+// AES-GCM with random 96-bit nonces stays below the NIST SP 800-38D collision
+// bound only while one key encrypts fewer than 2^32 messages. HRA stops at
+// half that and requires a key-version rotation before encrypting more.
+export const gcmMessageBudgetPerKey = 2 ** 31;
+// Callers persist a high-water mark that leads the count by up to two
+// intervals and advance it once per interval. One admitted operation never
+// encrypts this many messages, and each process start spends at most two
+// intervals of the budget by resuming from the mark.
+export const gcmMessageBudgetCheckpointInterval = 2 ** 14;
+// One process holds a handful of account keys; tests and long-lived daemons
+// stay far below this bound, and reaching it fails closed instead of evicting
+// a count.
+export const maximumTrackedGcmKeys = 65_536;
+const gcmFingerprintPattern = /^[0-9a-f]{32}$/u;
+
+
+export type GcmMessageBudgetKey = Readonly<{
+  fingerprint: string;
+  keyVersion: number;
+}>;
+
+function requireGcmMessageBudgetKey(key: GcmMessageBudgetKey): string {
+  if (
+    !Number.isSafeInteger(key.keyVersion)
+    || key.keyVersion < 1
+    || !gcmFingerprintPattern.test(key.fingerprint)
+  ) throw new Error("Invalid GCM message budget key.");
+  return `${key.keyVersion}:${key.fingerprint}`;
+}
+
+// Counts messages encrypted per (account key, key version) in this process.
+// Counts only rise; `restore` seeds a key the process has not counted yet
+// from its persisted high-water mark, and the map is bounded so an unexpected
+// key set fails closed instead of growing.
+export class GcmMessageBudget {
+  readonly #messages = new Map<string, number>();
+
+  #count(id: string): number {
+    const current = this.#messages.get(id);
+    if (current !== undefined) return current;
+    if (this.#messages.size >= maximumTrackedGcmKeys) {
+      throw new Error(`GCM message budget tracks at most ${maximumTrackedGcmKeys} account keys.`);
+    }
+    return 0;
+  }
+
+  observe(key: GcmMessageBudgetKey): number {
+    return this.#count(requireGcmMessageBudgetKey(key));
+  }
+
+  restore(key: GcmMessageBudgetKey, messages: number): number {
+    const id = requireGcmMessageBudgetKey(key);
+    if (!Number.isSafeInteger(messages) || messages < 0 || messages > gcmMessageBudgetPerKey) {
+      throw new Error("Invalid GCM message budget high-water mark.");
+    }
+    const current = this.#messages.get(id);
+    if (current !== undefined) return current;
+    const next = Math.max(this.#count(id), messages);
+    this.#messages.set(id, next);
+    return next;
+  }
+
+  consume(key: GcmMessageBudgetKey): number {
+    const id = requireGcmMessageBudgetKey(key);
+    const current = this.#count(id);
+    if (current >= gcmMessageBudgetPerKey) throw new KeyRotationRequiredError(key.keyVersion);
+    this.#messages.set(id, current + 1);
+    return current + 1;
+  }
+}
+
+export const processGcmMessageBudget = new GcmMessageBudget();
+
+export async function gcmMessageBudgetKey(
+  accountKey: Uint8Array,
+  keyVersion: number,
+): Promise<GcmMessageBudgetKey> {
+  if (!Number.isSafeInteger(keyVersion) || keyVersion < 1) {
+    throw new Error("Invalid account data key.");
+  }
+  const digest = await hmacSha256Hex(accountKey, "gcm-message-budget", String(keyVersion));
+  return { fingerprint: digest.slice(0, 32), keyVersion };
 }
 
 export function randomNonce(): Uint8Array {
@@ -297,10 +383,12 @@ export async function encryptBytes(
   accountKey: Uint8Array,
   keyVersion: number,
   aad: Uint8Array,
+  budget: GcmMessageBudget = processGcmMessageBudget,
 ): Promise<EncryptedEnvelope> {
   if (accountKey.byteLength !== 32 || !Number.isSafeInteger(keyVersion) || keyVersion < 1) {
     throw new Error("Invalid account data key.");
   }
+  budget.consume(await gcmMessageBudgetKey(accountKey, keyVersion));
   const nonce = randomNonce();
   const key = await crypto.subtle.importKey("raw", ownedBuffer(accountKey), "AES-GCM", false, [
     "encrypt",

@@ -18,7 +18,7 @@ export type { CodexFailureCode } from "./errors.ts";
 export { JsonLineDecoder } from "./jsonl.ts";
 export type { JsonLineDecoderOptions } from "./jsonl.ts";
 export type { CodexProcess, SpawnCodexProcessOptions } from "./process.ts";
-export { spawnBunCodexProcess } from "./process.ts";
+export { SAFE_ENVIRONMENT_KEYS, allowlistedEnvironment, spawnBunCodexProcess } from "./process.ts";
 export {
   OPERATIONS,
   PINNED_CODEX_VERSION,

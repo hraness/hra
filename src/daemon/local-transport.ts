@@ -22,8 +22,55 @@ const maximumResponseBytes = 4_194_304;
 // seconds lets the adapter settle cancellation and durable effect authority.
 export const DEFAULT_LOCAL_REQUEST_DEADLINE_MS =
   10_000 + 10_000 + 2 * (10_000 + 40_000) + 30_000 + 30_000;
+// A client must deliver its complete newline-terminated request frame within
+// the header timeout. Once the response is queued, it must drain and the
+// connection must close within the idle timeout. Neither depends on the request
+// deadline above, which bounds handler execution between those two phases.
+export const DEFAULT_LOCAL_REQUEST_HEADER_TIMEOUT_MS = 5_000;
+export const DEFAULT_LOCAL_CONNECTION_IDLE_TIMEOUT_MS = 10_000;
+const maximumTransportTimeoutMs = 3_600_000;
+// The 32 connection slots split into 16 ordinary command slots and 16 long-poll
+// slots so waiting pollers can never starve `daemon.stop` or `daemon.status`.
+// A connection holds a pending slot until its frame is parsed, because the
+// closed saturation response must carry the client's own request id.
+export const LOCAL_TRANSPORT_COMMAND_SLOTS = 16;
+export const LOCAL_TRANSPORT_LONG_POLL_SLOTS = 16;
+export const LOCAL_TRANSPORT_PENDING_CONNECTION_LIMIT = 32;
 
 type Handler = (command: LocalCommand, context: { requestId: string; signal: AbortSignal; afterResponse(callback: () => void): void }) => Promise<unknown>;
+
+type SlotClass = "command" | "longPoll";
+
+type ConnectionState = {
+  admission: SlotClass | "pending";
+  idleTimer?: ReturnType<typeof setTimeout>;
+};
+
+export type LocalTransportStats = Readonly<{
+  commandSlots: Readonly<{ inUse: number; capacity: number }>;
+  longPollSlots: Readonly<{ inUse: number; capacity: number }>;
+  pendingConnections: Readonly<{ inUse: number; capacity: number }>;
+  rejectedSinceStart: Readonly<{ command: number; longPoll: number; pending: number }>;
+}>;
+
+// Every command that carries `waitMs` is a bounded long poll when the wait is
+// positive; the service parks it on a waiter until events arrive or the wait
+// expires. A zero wait is an ordinary read and takes a command slot.
+const longPollCommand = (command: LocalCommand): boolean => "waitMs" in command && command.waitMs > 0;
+
+const slotCapacity = (slotClass: SlotClass): number =>
+  slotClass === "command" ? LOCAL_TRANSPORT_COMMAND_SLOTS : LOCAL_TRANSPORT_LONG_POLL_SLOTS;
+
+const saturatingIncrement = (value: number): number =>
+  value >= Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : value + 1;
+
+const boundedTimeoutMs = (value: number | undefined, fallback: number): number => {
+  const candidate = value ?? fallback;
+  if (!Number.isSafeInteger(candidate) || candidate < 1 || candidate > maximumTransportTimeoutMs) {
+    throw new Error("Local transport timeouts must be positive integers within one hour.");
+  }
+  return candidate;
+};
 
 const currentUid = (): number | undefined => (typeof process.getuid === "function" ? process.getuid() : undefined);
 
@@ -141,6 +188,14 @@ const closedFailureReasonMessages = {
     code: "UNAVAILABLE",
     message: "The pinned Codex runtime does not support a capability required for this operation. Run `hra doctor --json` and update or reconfigure HRA before retrying.",
   },
+  local_command_slots_exhausted: {
+    code: "UNAVAILABLE",
+    message: "The local daemon has no free command slot. The command was not started; wait briefly and run the same command again.",
+  },
+  local_long_poll_slots_exhausted: {
+    code: "UNAVAILABLE",
+    message: "The local daemon has no free long-poll slot. The poll was not started; wait briefly and poll again from the same cursor.",
+  },
 } as const satisfies Readonly<Record<string, Readonly<{
   code: PublicFailureCode;
   message: string;
@@ -197,38 +252,97 @@ const safeResponse = (requestId: string, error: unknown): CommandResponse => {
   };
 };
 
+const slotsExhaustedFailure = (slotClass: SlotClass): DeclaredCommandFailure => Object.assign(
+  new Error("The local transport slot pool is exhausted."),
+  {
+    [commandFailureBrand]: true as const,
+    code: "UNAVAILABLE" as const,
+    details: {
+      reason: slotClass === "command" ? "local_command_slots_exhausted" : "local_long_poll_slots_exhausted",
+      requestState: "not_started",
+    },
+  },
+);
+
+type CommandEnvelope = ReturnType<typeof commandEnvelopeSchema.parse>;
+
+type DecodedFrame =
+  | Readonly<{ requestId: string; envelope: CommandEnvelope }>
+  | Readonly<{ requestId: string; envelope: undefined; error: unknown }>;
+
+const requestIdPattern = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
+
+// Decoding runs synchronously inside the data listener so the request buffer
+// is unreachable once the handler owns the parsed command.
+const decodeFrame = (frame: Buffer): DecodedFrame => {
+  let requestId: string = randomUUID();
+  try {
+    const parsedJson = JSON.parse(frame.toString("utf8")) as unknown;
+    if (
+      typeof parsedJson === "object"
+      && parsedJson !== null
+      && "requestId" in parsedJson
+      && typeof parsedJson.requestId === "string"
+      && requestIdPattern.test(parsedJson.requestId)
+    ) {
+      requestId = parsedJson.requestId;
+    }
+    const envelope = commandEnvelopeSchema.parse(parsedJson);
+    return { requestId: envelope.requestId, envelope };
+  } catch (error: unknown) {
+    return { requestId, envelope: undefined, error };
+  }
+};
+
 export class LocalDaemonServer {
   readonly #paths: StatePaths;
   readonly #capability: string;
   readonly #server: Server;
   readonly #handler: Handler;
   readonly #deadlineMs: number;
+  readonly #headerTimeoutMs: number;
+  readonly #idleTimeoutMs: number;
   readonly #inFlight = new Set<Promise<void>>();
   readonly #sockets = new Set<Socket>();
   readonly #controllers = new Set<AbortController>();
+  readonly #slots: Record<SlotClass, number> = { command: 0, longPoll: 0 };
+  readonly #rejected: Record<SlotClass | "pending", number> = { command: 0, longPoll: 0, pending: 0 };
+  #pending = 0;
   #accepting = true;
   #listenerClosed: Promise<void> | undefined;
 
-  private constructor(paths: StatePaths, capability: string, handler: Handler, deadlineMs: number) {
+  private constructor(
+    paths: StatePaths,
+    capability: string,
+    handler: Handler,
+    timeouts: Readonly<{ deadlineMs: number; headerTimeoutMs: number; idleTimeoutMs: number }>,
+  ) {
     this.#paths = paths;
     this.#capability = capability;
     this.#handler = handler;
-    this.#deadlineMs = deadlineMs;
+    this.#deadlineMs = timeouts.deadlineMs;
+    this.#headerTimeoutMs = timeouts.headerTimeoutMs;
+    this.#idleTimeoutMs = timeouts.idleTimeoutMs;
     this.#server = createServer((socket) => this.#accept(socket));
-    this.#server.maxConnections = 32;
   }
 
-  static async start(input: { paths: StatePaths; handler: Handler; deadlineMs?: number }): Promise<LocalDaemonServer> {
+  static async start(input: {
+    paths: StatePaths;
+    handler: Handler;
+    deadlineMs?: number;
+    headerTimeoutMs?: number;
+    idleTimeoutMs?: number;
+  }): Promise<LocalDaemonServer> {
+    const timeouts = {
+      deadlineMs: boundedTimeoutMs(input.deadlineMs, DEFAULT_LOCAL_REQUEST_DEADLINE_MS),
+      headerTimeoutMs: boundedTimeoutMs(input.headerTimeoutMs, DEFAULT_LOCAL_REQUEST_HEADER_TIMEOUT_MS),
+      idleTimeoutMs: boundedTimeoutMs(input.idleTimeoutMs, DEFAULT_LOCAL_CONNECTION_IDLE_TIMEOUT_MS),
+    };
     await ensurePrivateDirectory(input.paths.runtime);
     await removeStaleEndpoint(input.paths);
     const capability = randomBytes(32).toString("base64url");
     await publishCapability(input.paths, capability);
-    const owned = new LocalDaemonServer(
-      input.paths,
-      capability,
-      input.handler,
-      input.deadlineMs ?? DEFAULT_LOCAL_REQUEST_DEADLINE_MS,
-    );
+    const owned = new LocalDaemonServer(input.paths, capability, input.handler, timeouts);
     try {
       await new Promise<void>((resolve, reject) => {
         owned.#server.once("error", reject);
@@ -246,11 +360,34 @@ export class LocalDaemonServer {
     }
   }
 
+  stats(): LocalTransportStats {
+    return {
+      commandSlots: { inUse: this.#slots.command, capacity: LOCAL_TRANSPORT_COMMAND_SLOTS },
+      longPollSlots: { inUse: this.#slots.longPoll, capacity: LOCAL_TRANSPORT_LONG_POLL_SLOTS },
+      pendingConnections: { inUse: this.#pending, capacity: LOCAL_TRANSPORT_PENDING_CONNECTION_LIMIT },
+      rejectedSinceStart: {
+        command: this.#rejected.command,
+        longPoll: this.#rejected.longPoll,
+        pending: this.#rejected.pending,
+      },
+    };
+  }
+
   #accept(socket: Socket): void {
     if (!this.#accepting) {
       socket.destroy();
       return;
     }
+    if (this.#pending >= LOCAL_TRANSPORT_PENDING_CONNECTION_LIMIT) {
+      // No request id exists yet, so no bound envelope can be written. The
+      // client observes a pre-response close; every earlier pending connection
+      // still settles within the header timeout.
+      this.#rejected.pending = saturatingIncrement(this.#rejected.pending);
+      socket.destroy();
+      return;
+    }
+    this.#pending += 1;
+    const connection: ConnectionState = { admission: "pending" };
     this.#sockets.add(socket);
     const controller = new AbortController();
     this.#controllers.add(controller);
@@ -261,9 +398,17 @@ export class LocalDaemonServer {
       socket.destroy();
     }, this.#deadlineMs);
     deadline.unref();
+    const headerTimer = setTimeout(() => {
+      controller.abort(new Error("Local request header timeout exceeded."));
+      socket.destroy();
+    }, this.#headerTimeoutMs);
+    headerTimer.unref();
     const settleSocket = () => {
       clearTimeout(deadline);
+      clearTimeout(headerTimer);
+      if (connection.idleTimer !== undefined) clearTimeout(connection.idleTimer);
       controller.abort(new Error("Local client disconnected."));
+      this.#release(connection);
       this.#sockets.delete(socket);
       this.#controllers.delete(controller);
     };
@@ -286,18 +431,23 @@ export class LocalDaemonServer {
       }
       received = Buffer.concat([received, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
       if (received.byteLength > maximumRequestBytes) {
+        received = Buffer.alloc(0);
         socket.destroy(new Error("Local request exceeds the byte limit."));
         return;
       }
       const newline = received.indexOf(0x0a);
       if (newline < 0) return;
       handled = true;
+      clearTimeout(headerTimer);
       const trailing = received.subarray(newline + 1);
       if (trailing.some((byte) => byte !== 0x0a && byte !== 0x0d && byte !== 0x20 && byte !== 0x09)) {
+        received = Buffer.alloc(0);
         socket.destroy(new Error("Local connection must carry exactly one request."));
         return;
       }
-      const task = this.#handleFrame(socket, received.subarray(0, newline), controller.signal);
+      const decoded = decodeFrame(received.subarray(0, newline));
+      received = Buffer.alloc(0);
+      const task = this.#handleFrame(socket, decoded, controller.signal, connection);
       this.#inFlight.add(task);
       void task.then(
         () => this.#inFlight.delete(task),
@@ -306,8 +456,32 @@ export class LocalDaemonServer {
     });
   }
 
-  async #handleFrame(socket: Socket, frame: Buffer, signal: AbortSignal): Promise<void> {
-    let requestId: string = randomUUID();
+  #admit(connection: ConnectionState, command: LocalCommand): void {
+    const slotClass: SlotClass = longPollCommand(command) ? "longPoll" : "command";
+    if (this.#slots[slotClass] >= slotCapacity(slotClass)) {
+      this.#rejected[slotClass] = saturatingIncrement(this.#rejected[slotClass]);
+      throw slotsExhaustedFailure(slotClass);
+    }
+    this.#pending -= 1;
+    this.#slots[slotClass] += 1;
+    connection.admission = slotClass;
+  }
+
+  #release(connection: ConnectionState): void {
+    if (connection.admission === "pending") this.#pending -= 1;
+    else this.#slots[connection.admission] -= 1;
+  }
+
+  // Only the transport knows its own slot occupancy, so it appends that
+  // snapshot to the `daemon.status` payload instead of routing it through the
+  // service. The field is additive and free of paths, ids, and credentials.
+  #withTransportStats(data: unknown): unknown {
+    if (typeof data !== "object" || data === null || Array.isArray(data)) return data;
+    return { ...data, transport: this.stats() };
+  }
+
+  async #handleFrame(socket: Socket, decoded: DecodedFrame, signal: AbortSignal, connection: ConnectionState): Promise<void> {
+    const requestId = decoded.requestId;
     let response: CommandResponse;
     const afterResponse: Array<() => void> = [];
     let afterResponseFinished = false;
@@ -316,22 +490,27 @@ export class LocalDaemonServer {
       afterResponseFinished = true;
       for (const callback of afterResponse) callback();
     };
-    try {
-      const parsedJson = JSON.parse(frame.toString("utf8")) as unknown;
-      if (typeof parsedJson === "object" && parsedJson !== null && "requestId" in parsedJson && typeof parsedJson.requestId === "string") {
-        requestId = parsedJson.requestId;
+    if (decoded.envelope === undefined) {
+      response = safeResponse(requestId, decoded.error);
+    } else {
+      const envelope = decoded.envelope;
+      try {
+        const expected = Buffer.from(this.#capability);
+        const provided = Buffer.from(envelope.capability);
+        if (expected.byteLength !== provided.byteLength || !timingSafeEqual(expected, provided)) {
+          throw new Error("Local capability was rejected.");
+        }
+        this.#admit(connection, envelope.command);
+        const data = await this.#handler(envelope.command, { requestId, signal, afterResponse: (callback) => afterResponse.push(callback) });
+        response = {
+          ok: true,
+          version: 1,
+          requestId,
+          data: envelope.command.kind === "daemon.status" ? this.#withTransportStats(data) : data,
+        };
+      } catch (error: unknown) {
+        response = safeResponse(requestId, error);
       }
-      const envelope = commandEnvelopeSchema.parse(parsedJson);
-      requestId = envelope.requestId;
-      const expected = Buffer.from(this.#capability);
-      const provided = Buffer.from(envelope.capability);
-      if (expected.byteLength !== provided.byteLength || !timingSafeEqual(expected, provided)) {
-        throw new Error("Local capability was rejected.");
-      }
-      const data = await this.#handler(envelope.command, { requestId, signal, afterResponse: (callback) => afterResponse.push(callback) });
-      response = { ok: true, version: 1, requestId, data };
-    } catch (error: unknown) {
-      response = safeResponse(requestId, error);
     }
     const bytes = Buffer.from(`${JSON.stringify(response)}\n`, "utf8");
     if (bytes.byteLength > maximumResponseBytes) {
@@ -348,6 +527,13 @@ export class LocalDaemonServer {
       socket.off("close", finishAfterResponse);
       finishAfterResponse();
     });
+    // The response is queued. A client that stops reading would otherwise hold
+    // the slot and the response buffer until the request deadline.
+    if (!this.#sockets.has(socket)) return;
+    connection.idleTimer = setTimeout(() => {
+      socket.destroy();
+    }, this.#idleTimeoutMs);
+    connection.idleTimer.unref();
   }
 
   beginShutdown(reason: Error = new Error("Local daemon transport is closing.")): void {

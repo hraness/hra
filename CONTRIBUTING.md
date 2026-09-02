@@ -18,3 +18,7 @@ HRA is in public beta development. Open an issue before a large change so the au
 - Do not commit credentials, account identifiers, local paths, transcripts, or provider payloads.
 
 By contributing, you agree that your contribution is licensed under the MIT License.
+
+## Agent-authored changes
+
+Many changes in this repository are drafted by coding agents (Codex and Claude Code) working from `AGENTS.md` and `kb/plans/`. They are reviewed the same way as any other change: a maintainer reads the full diff, the deterministic gate (`bun run check`) must pass on the exact tree, and no phase of a plan is marked complete without the acceptance evidence the plan names. Agent-authored commits carry a `Co-Authored-By` trailer naming the agent. Prose in an agent-authored change follows `WRITING.md` and `STYLE.md` like any other prose.

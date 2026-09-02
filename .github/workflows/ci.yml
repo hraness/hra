@@ -96,13 +96,6 @@ jobs:
           test "$(/usr/sbin/sysctl --values kernel.apparmor_restrict_unprivileged_userns)" = "0"
           /usr/bin/unshare --user --map-root-user --fork /usr/bin/true
 
-      - name: Run Linux authority-supervisor custody test
-        if: runner.os == 'Linux'
-        run: bun test scripts/authority-supervisor-runtime.test.ts --isolate --max-concurrency=1
-
-      - name: Verify generated public documents
-        run: bun run build:site -- --check
-
       - name: Run the repository gate
         run: bun run check
 

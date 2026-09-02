@@ -1,7 +1,16 @@
 import { createHash } from "node:crypto";
 
 import { hasExactKeys, isOpaqueIdentifier, isRecord } from "./contracts";
-import type { CloudSecretCustodyPort } from "./local-control";
+
+export interface CloudSecretCustodyPort {
+  read(slot: string): Promise<Readonly<{ generation: number; value: string }> | null>;
+  compareAndSwap(
+    slot: string,
+    expectedGeneration: number | null,
+    value: string,
+  ): Promise<Readonly<{ generation: number; value: string }> | null>;
+  clearIfGeneration(slot: string, expectedGeneration: number): Promise<boolean>;
+}
 
 const activeIdentitySlot = "cloud-active-identity";
 const deploymentAuthoritySlot = "cloud-deployment-authority";

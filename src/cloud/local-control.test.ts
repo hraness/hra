@@ -9,7 +9,15 @@ import {
   type EncryptedEnvelope,
   type WrappedKeyEnvelope,
 } from "./contracts";
-import { decodeBase64Url, encodeBase64Url } from "./crypto";
+import {
+  decodeBase64Url,
+  encodeBase64Url,
+  GcmMessageBudget,
+  gcmMessageBudgetCheckpointInterval,
+  gcmMessageBudgetKey,
+  gcmMessageBudgetPerKey,
+  KeyRotationRequiredError,
+} from "./crypto";
 import {
   cloudDeploymentAuthorityFromEnvironment,
   IdentityScopedCloudSecretCustody,
@@ -2090,6 +2098,77 @@ describe("local cloud control", () => {
         expect.objectContaining({ publicId: secondPair.device.publicId, status: "revoked" }),
       ]),
     });
+  });
+
+  test("persists a per-key AES-GCM high-water mark and refuses a spent key with KEY_ROTATION_REQUIRED", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const slot = "cloud-gcm-message-budget";
+    const interval = gcmMessageBudgetCheckpointInterval;
+    const process = (budget: GcmMessageBudget): LocalCloudControl => new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      gcmMessageBudget: budget,
+      now: () => fixedNow,
+      secretCustody: custody,
+      transport: cloud.connect(),
+    });
+    const firstBudget = new GcmMessageBudget();
+    const first = process(firstBudget);
+    await authenticate(first);
+    await first.pairDevice(signal);
+    const budgetKey = await gcmMessageBudgetKey(accountKey(custody), 1);
+    expect(custody.values.get(slot)).toBeUndefined();
+
+    // First admission persists a mark that leads the count by two intervals.
+    await first.listDevices(signal);
+    const persisted = custody.values.get(slot);
+    expect(JSON.parse(persisted?.value ?? "null")).toEqual({
+      keys: [{ fingerprint: budgetKey.fingerprint, keyVersion: 1, messages: 2 * interval }],
+      version: 1,
+    });
+    await first.listDevices(signal);
+    const sameProcess = process(firstBudget);
+    await sameProcess.pairDevice(signal);
+    await sameProcess.listDevices(signal);
+    expect(custody.values.get(slot)?.generation).toBe(persisted?.generation);
+    expect(firstBudget.observe(budgetKey)).toBe(0);
+
+    // A restarted process resumes from the mark and advances it once.
+    const restartedBudget = new GcmMessageBudget();
+    const restarted = process(restartedBudget);
+    await restarted.pairDevice(signal);
+    await restarted.listDevices(signal);
+    expect(restartedBudget.observe(budgetKey)).toBe(2 * interval);
+    expect(JSON.parse(custody.values.get(slot)?.value ?? "null")).toEqual({
+      keys: [{ fingerprint: budgetKey.fingerprint, keyVersion: 1, messages: 4 * interval }],
+      version: 1,
+    });
+
+    // A spent key is refused before any transport or encryption effect.
+    custody.values.set(slot, {
+      generation: 7,
+      value: JSON.stringify({
+        keys: [
+          { fingerprint: "a".repeat(32), keyVersion: 3, messages: 12 },
+          { fingerprint: budgetKey.fingerprint, keyVersion: 1, messages: gcmMessageBudgetPerKey },
+        ],
+        version: 1,
+      }),
+    });
+    const spent = process(new GcmMessageBudget());
+    await spent.pairDevice(signal);
+    const refused = await spent.listDevices(signal).catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(KeyRotationRequiredError);
+    expect(refused).toMatchObject({ code: "KEY_ROTATION_REQUIRED", keyVersion: 1 });
+    expect(custody.values.get(slot)?.generation).toBe(7);
+
+    // Corrupt custody fails closed instead of assuming a zero count.
+    custody.values.set(slot, { generation: 8, value: "{\"version\":2}" });
+    const corrupt = process(new GcmMessageBudget());
+    await corrupt.pairDevice(signal);
+    await expect(corrupt.listDevices(signal))
+      .rejects.toThrow("Cloud GCM message budget custody is corrupt.");
   });
 
   test("recovers a lost approval response before settlement and replays its receipt after restart", async () => {

@@ -9,8 +9,10 @@ import {
   buildHraGlobalInstallCommand,
   HRA_INSTALL_PREFLIGHT_SOURCE_URL,
 } from "../src/install-preflight";
+import packageJson from "../package.json";
 import {
   publicContent,
+  publicPins,
   publicReleaseState,
   renderLlmsText,
   renderPrivacyMarkdown,
@@ -51,14 +53,136 @@ describe("public content contract", () => {
     });
   });
 
+  test("opens the README with the H1, one badge line, the thesis on line 3, the status line, then install", () => {
+    const markdown = renderReadmeMarkdown();
+    const lines = markdown.split("\n");
+    const badgeLine = publicContent.badges
+      .map((badge) => `[![${badge.alt}](${badge.image})](${badge.href})`)
+      .join(" ");
+
+    expect(lines[0]).toBe(`# ${publicContent.productName}`);
+    expect(lines[1]).toBe(`${badgeLine}\\`);
+    expect(lines[2]).toBe(publicContent.thesis);
+    expect(lines[3]).toBe("");
+    expect(lines[4]).toBe(publicContent.statusLine);
+    expect(lines[5]).toBe("");
+    expect(lines[6]).toBe("```sh");
+    expect(lines[7]).toBe(publicContent.installCommand);
+    expect(publicContent.thesis).toBe(
+      "HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.",
+    );
+    expect(publicContent.statusLine).toContain(`v${publicContent.releaseVersion}`);
+    expect(publicContent.statusLine).toContain("hosted sync is not yet live");
+    expect(markdown.indexOf(publicContent.thesis)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
+    expect(markdown.indexOf(publicContent.statusLine)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
+    expect(markdown).toContain(`## ${publicContent.hero.heading}`);
+    expect(markdown.indexOf(publicContent.initCommand)).toBeLessThan(markdown.indexOf(`## ${publicContent.hero.heading}`));
+    expect(markdown).toContain(`1. **Start:** \`${publicContent.hero.steps[0]!.command}\`. ${publicContent.hero.steps[0]!.detail}`);
+  });
+
+  test("publishes trust-signal badges pinned to the package manifest", () => {
+    expect(publicContent.badges.map((badge) => badge.alt)).toEqual([
+      "npm version",
+      "provenance: sigstore",
+      "CI",
+      "license: MIT",
+      `Bun ${packageJson.engines.bun}`,
+      `runtimes: Codex ${packageJson.dependencies["@openai/codex"]}`,
+    ]);
+    expect(publicPins).toEqual({
+      bun: packageJson.engines.bun,
+      codex: packageJson.dependencies["@openai/codex"],
+    });
+    for (const badge of publicContent.badges) {
+      expect(badge.image).toMatch(/^https:\/\/img\.shields\.io\//u);
+      expect(badge.href).toMatch(/^https:\/\//u);
+    }
+    expect(publicContent.badges[2]?.image).toContain("/hraness/hra/ci.yml?branch=main");
+    expect(publicContent.badges[4]?.image).toBe("https://img.shields.io/badge/Bun-1.3.14-14151a");
+    expect(publicContent.badges[5]?.image).toBe("https://img.shields.io/badge/runtimes-Codex%200.149.0-0b5fa5");
+    expect(renderSiteHtml()).not.toContain("img.shields.io");
+  });
+
+  test("states one neutral positioning in the manifest, JSON-LD, social card, and llms.txt", () => {
+    const html = renderSiteHtml();
+    const jsonLd = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/u.exec(html)?.[1];
+    expect(jsonLd).toBeDefined();
+    const structured = JSON.parse(jsonLd ?? "{}") as Record<string, unknown>;
+
+    expect(publicContent.tagline).toBe("Control plane for coding-agent subscriptions");
+    expect(publicContent.providerRoadmap).toBe("Codex today, Claude next.");
+    expect(packageJson.description).toBe(publicContent.description);
+    expect(publicContent.description).toStartWith(`${publicContent.tagline}:`);
+    expect(publicContent.description).toEndWith(publicContent.providerRoadmap);
+    expect(structured).toMatchObject({
+      "@type": "SoftwareApplication",
+      applicationSubCategory: publicContent.tagline,
+      author: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
+      description: publicContent.description,
+      maintainer: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
+      softwareVersion: publicContent.releaseVersion,
+    });
+    expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
+    expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
+    expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
+    expect(publicContent.socialCard).toEqual({
+      alt: "HRA · control plane for coding-agent subscriptions · hra.sh",
+      height: 630,
+      path: "/social-card.png",
+      width: 1200,
+    });
+    for (const document of [html, renderPrivacyHtml(), renderPreviewHtml()]) {
+      expect(document).toContain('<meta property="og:image" content="https://hra.sh/social-card.png">');
+      expect(document).toContain('<meta property="og:image:type" content="image/png">');
+      expect(document).toContain('<meta property="og:image:width" content="1200">');
+      expect(document).toContain('<meta property="og:image:height" content="630">');
+      expect(document).toContain(`<meta property="og:image:alt" content="${publicContent.socialCard.alt}">`);
+      expect(document).toContain('<meta name="twitter:card" content="summary_large_image">');
+      expect(document).toContain('<meta name="twitter:image" content="https://hra.sh/social-card.png">');
+      expect(document).not.toContain("social-card.svg");
+    }
+    const llms = renderLlmsText();
+    expect(llms.split("\n")[2]).toBe(`> ${publicContent.description}`);
+    expect(llms).toContain(publicContent.thesis);
+    expect(llms).toContain(publicContent.statusLine);
+    expect(llms.indexOf(publicContent.thesis)).toBeLessThan(llms.indexOf(publicContent.installCommand));
+  });
+
+  test("names the product and its maintainer once, beside what HRA does", () => {
+    const nameSentence = "HRA is short for harness: the control plane that keeps your coding-agent subscriptions working together, and ";
+    const maintainerSentence = "The Hraness organization maintains HRA and publishes it under the MIT license.";
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+
+    expect(markdown).toContain(`${nameSentence}[hraness.com](https://hraness.com/) explains the parent brand. ${maintainerSentence}`);
+    expect(html).toContain(`${nameSentence}<a href="https://hraness.com/">hraness.com</a> explains the parent brand. ${maintainerSentence}`);
+    expect(markdown.match(/short for harness/gu)).toHaveLength(1);
+    const maintainerParagraph = markdown.split("\n").find((line) => line.includes("short for harness")) ?? "";
+    expect(maintainerParagraph).not.toMatch(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/u);
+    expect(publicContent.maintainer).toEqual({ name: "Hraness", url: "https://hraness.com/" });
+  });
+
+  test("publishes no em dash on any generated public surface", () => {
+    for (const [label, surface] of [
+      ["README", renderReadmeMarkdown()],
+      ["PRIVACY", renderPrivacyMarkdown()],
+      ["llms.txt", renderLlmsText()],
+      ["site", renderSiteHtml()],
+      ["privacy page", renderPrivacyHtml()],
+      ["preview", renderPreviewHtml()],
+      ["package description", packageJson.description],
+    ] as const) {
+      expect(surface, label).not.toContain("\u2014");
+    }
+  });
+
   test("leads the site with the outcome and keeps the README install-first", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
     const encodedInstallCommand = htmlText(publicContent.installCommand);
 
-    expect(markdown).toStartWith(
-      `# ${publicContent.productName}\n\n\`\`\`sh\n${publicContent.installCommand}\n\`\`\``,
-    );
+    expect(markdown).toStartWith(`# ${publicContent.productName}\n`);
+    expect(markdown.indexOf("```sh")).toBeLessThan(markdown.indexOf(`## ${publicContent.hero.heading}`));
     expect(html.indexOf(`>${publicContent.hero.heading}</h1>`)).toBeLessThan(
       html.indexOf(encodedInstallCommand),
     );

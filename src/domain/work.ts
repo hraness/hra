@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
-import { isUuidV7 } from "../cloud/contracts";
+import { isUuidV7 } from "./uuid-v7";
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import { presetSchema } from "./presets";
 import { workReadSuccessWireBytes } from "./terminal-json";

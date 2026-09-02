@@ -146,18 +146,33 @@ const renderHead = (
 ): string => {
   const canonicalUrl = `${content.siteUrl}${options.canonicalPath}`;
   const image = options.image ?? {
-    alt: "HRA command line prompt",
-    src: `${content.siteUrl}/social-card.svg`,
+    alt: content.socialCard.alt,
+    height: content.socialCard.height,
+    src: `${content.siteUrl}${content.socialCard.path}`,
+    type: "image/png",
+    width: content.socialCard.width,
   };
   const jsonLd = JSON.stringify(options.jsonLd ?? {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     applicationCategory: "DeveloperApplication",
+    applicationSubCategory: content.tagline,
+    author: {
+      "@type": "Organization",
+      name: content.maintainer.name,
+      url: content.maintainer.url,
+    },
     codeRepository: content.links.github,
     description: options.description,
     license: "https://opensource.org/license/mit",
+    maintainer: {
+      "@type": "Organization",
+      name: content.maintainer.name,
+      url: content.maintainer.url,
+    },
     name: content.productName,
     operatingSystem: "macOS, Linux",
+    softwareVersion: content.releaseVersion,
     url: canonicalUrl,
   }).replaceAll("<", "\\u003c");
   const robots = options.robots === undefined
@@ -251,7 +266,7 @@ export const renderSiteHtml = (content: PublicContent = publicContent): string =
 ${renderHead(content, {
   canonicalPath: "/",
   description: content.description,
-  title: `${content.productName} | Multi-account Codex CLI`,
+  title: `${content.productName} | ${content.tagline}`,
 })}
 </head>
 <body>
@@ -279,13 +294,13 @@ ${renderHead(content, {
   description: content.description,
   includeStructuredData: false,
   robots: "noindex, nofollow",
-  title: `${content.productName} | Multi-account Codex CLI`,
+  title: `${content.productName} | ${content.tagline}`,
 })}
 </head>
 <body class="preview-page">
 <main id="content" class="preview-shell">
   <article class="preview-card" aria-labelledby="preview-title">
-    <p class="preview-eyebrow">Persistent Codex workspace</p>
+    <p class="preview-eyebrow">${escapeHtml(content.tagline)}</p>
     <h1 id="preview-title">${escapeHtml(content.productName)}</h1>
     <p class="preview-summary">${escapeHtml(content.description)}</p>
     <ul class="preview-capabilities" aria-label="HRA capabilities">

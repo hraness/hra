@@ -4,6 +4,7 @@ import {
   AccountUsagePoller,
   sleepForUsagePolling,
   USAGE_POLL_BACKOFF_MAX_MS,
+  USAGE_POLL_INITIAL_STAGGER_MAX_MS,
   usagePollInitialStagger,
   usagePollInterval,
 } from "./usage-poller";
@@ -77,6 +78,69 @@ describe("AccountUsagePoller", () => {
     } finally {
       add.mockRestore();
       remove.mockRestore();
+    }
+  });
+
+  test("keeps polling and reports a diagnostic when the account list read throws", async () => {
+    let now = 0;
+    let listFailures = 2;
+    const diagnostics: number[] = [];
+    const polled: string[] = [];
+    const sleeps: number[] = [];
+    const poller = new AccountUsagePoller({
+      listAccountIds: () => {
+        if (listFailures > 0) {
+          listFailures -= 1;
+          throw new Error("store busy");
+        }
+        return ["account-a"];
+      },
+      poll: async (accountId) => { polled.push(accountId); },
+      onTickFailure: (_error, failures) => { diagnostics.push(failures); },
+      now: () => now,
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+        now += Math.max(milliseconds, USAGE_POLL_INITIAL_STAGGER_MAX_MS + 1);
+        await Bun.sleep(0);
+      },
+    });
+    poller.start();
+    try {
+      for (let attempt = 0; attempt < 200 && polled.length === 0; attempt += 1) await Bun.sleep(1);
+      expect(diagnostics).toEqual([1, 2]);
+      expect(sleeps.slice(0, 2)).toEqual([2_000, 4_000]);
+      expect(polled[0]).toBe("account-a");
+    } finally {
+      await poller.close();
+    }
+  });
+
+  test("a throwing diagnostic hook does not stop the poll loop", async () => {
+    let now = 0;
+    let listFailures = 1;
+    const polled: string[] = [];
+    const poller = new AccountUsagePoller({
+      listAccountIds: () => {
+        if (listFailures > 0) {
+          listFailures -= 1;
+          throw new Error("store busy");
+        }
+        return ["account-a"];
+      },
+      poll: async (accountId) => { polled.push(accountId); },
+      onTickFailure: () => { throw new Error("diagnostic sink offline"); },
+      now: () => now,
+      sleep: async (milliseconds) => {
+        now += Math.max(milliseconds, USAGE_POLL_INITIAL_STAGGER_MAX_MS + 1);
+        await Bun.sleep(0);
+      },
+    });
+    poller.start();
+    try {
+      for (let attempt = 0; attempt < 200 && polled.length === 0; attempt += 1) await Bun.sleep(1);
+      expect(polled[0]).toBe("account-a");
+    } finally {
+      await poller.close();
     }
   });
 });

@@ -22,6 +22,7 @@ import {
   requestsJsonOutput,
   requestsJsonlOutput,
   requestsWorkApplyProtocol,
+  resolveUsage,
   usageForGroup,
   type CliInvocation,
   type ProjectionRecoveryCliInvocation,
@@ -80,7 +81,7 @@ import {
   type CloudProjectionRecoveryStatus,
   type CloudSecretCustodyPort,
 } from "./cloud/index";
-import { resolvePinnedCodexRuntime } from "./codex/index";
+import { allowlistedEnvironment, resolvePinnedCodexRuntime } from "./codex/index";
 import { localCommandSchema, type CommandResponse, type LocalCommand } from "./domain/contracts";
 import {
   PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES,
@@ -94,6 +95,7 @@ import {
   workProtocolRequestSchema,
 } from "./domain/work";
 import {
+  describeWorkProtocol,
   workAgentProtocolResponseSchema,
   type WorkAgentProtocolError,
 } from "./domain/work-protocol";
@@ -2032,10 +2034,17 @@ export const daemonRunProcessArguments = (
   "run",
 ];
 
-export const daemonRunProcessOptions = (cwd: string) => ({
+// The detached daemon receives the Codex child allowlist plus the one HRA
+// variable it reads at boot: the explicit cloud deployment selection.
+export const DAEMON_ENVIRONMENT_KEYS: ReadonlySet<string> = new Set(["HRA_CONVEX_URL"]);
+
+export const daemonRunProcessOptions = (
+  cwd: string,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+) => ({
   cwd,
   detached: true,
-  env: process.env,
+  env: allowlistedEnvironment(environment, DAEMON_ENVIRONMENT_KEYS),
   stdin: "ignore" as const,
   stdout: "ignore" as const,
   stderr: "ignore" as const,
@@ -2373,7 +2382,11 @@ async function offlineDoctor(
     networkChecks: "skipped",
     problems,
   };
-  if (json) output.writeStdout(`${safeJson({ ok: true, version: 1, data })}\n`);
+  if (json) {
+    output.writeStdout(`${safeJson(data.healthy
+      ? { ok: true, version: 1, data }
+      : unhealthyDoctorEnvelope(data, doctorVerdict(data).message))}\n`);
+  }
   else if (data.healthy) {
     const daemonAuthoritySummary = (() => {
       switch (daemonAuthority.state) {
@@ -2398,6 +2411,20 @@ async function offlineDoctor(
   return data.healthy ? 0 : 1;
 }
 
+// An interactive editor needs its terminal description and its own editor
+// selection on top of the Codex child allowlist. It gets nothing else.
+export const EDITOR_ENVIRONMENT_KEYS: ReadonlySet<string> = new Set([
+  "COLORTERM",
+  "COLUMNS",
+  "EDITOR",
+  "LINES",
+  "NO_COLOR",
+  "TERM",
+  "TERMINFO",
+  "TERMINFO_DIRS",
+  "VISUAL",
+]);
+
 async function editSessionNote(
   session: string,
   json: boolean,
@@ -2417,7 +2444,12 @@ async function editSessionNote(
     const editorName = process.env.VISUAL ?? process.env.EDITOR ?? "vi";
     const editor = Bun.which(editorName);
     if (editor === null) throw new Error(`Editor is unavailable: ${editorName}`);
-    const child = Bun.spawn([editor, file], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: process.env });
+    const child = Bun.spawn([editor, file], {
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+      env: allowlistedEnvironment(process.env, EDITOR_ENVIRONMENT_KEYS),
+    });
     const exitCode = await child.exited;
     if (exitCode !== 0) throw new Error(`Editor exited with status ${exitCode}.`);
     const edited = await readFile(file, "utf8");
@@ -2839,6 +2871,15 @@ export async function runDaemon(
   const onSignal = () => requestStop();
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
+  // A rejection nobody awaited is a lost owned task. Stop through the normal
+  // shutdown path and publish a closed failure receipt instead of letting the
+  // runtime print the raw error and exit without one.
+  let unhandledRejectionError: Error | undefined;
+  const onUnhandledRejection = () => {
+    unhandledRejectionError ??= new Error("The daemon stopped after an unhandled promise rejection in an owned background task.");
+    requestStop();
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
   const cleanupErrors: unknown[] = [];
   let runError: unknown;
   const checkpointBoot = () => {
@@ -3078,6 +3119,12 @@ export async function runDaemon(
           { signal },
         );
       },
+      onFailure: (_accountId, error) => {
+        activeService.recordBackgroundDiagnostic("usage_poll_account_failed", error);
+      },
+      onTickFailure: (error) => {
+        activeService.recordBackgroundDiagnostic("usage_poll_tick_failed", error);
+      },
     });
     usagePoller.start();
     cloudLifecycle?.start();
@@ -3111,12 +3158,14 @@ export async function runDaemon(
   } catch (error: unknown) {
     if (!(error instanceof DaemonBootInterruptedError)) runError = error;
   } finally {
+    runError ??= unhandledRejectionError;
     if (usagePoller !== undefined) usagePollerShutdown ??= usagePoller.close();
     if (service !== undefined) serviceShutdown ??= service.close();
     else daemonAuthority?.close();
     server?.beginShutdown(new Error("Daemon lifetime ended."));
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
+    process.off("unhandledRejection", onUnhandledRejection);
 
     const forceReason = runError instanceof DaemonJoinDeadlineError || runError instanceof LocalDaemonShutdownTimeoutError
       ? runError
@@ -3173,7 +3222,11 @@ export async function runDaemon(
       }
       try { store.close(); } catch (error: unknown) { cleanupErrors.push(error); }
     }
-    const normalizedRunError = runError === undefined ? undefined : safeDaemonFailure(runError);
+    const normalizedRunError = runError === undefined
+      ? undefined
+      : unhandledRejectionError !== undefined && runError === unhandledRejectionError
+        ? unhandledRejectionError.message
+        : safeDaemonFailure(runError);
     await daemonLock.release(normalizedRunError === undefined
       ? { state: "stopped" }
       : { state: "failed", failure: normalizedRunError }).catch((error: unknown) => cleanupErrors.push(error));
@@ -4645,6 +4698,72 @@ async function executeUsageRefreshAll(
   return 0;
 }
 
+function renderHelp(invocation: Extract<CliInvocation, { kind: "help" }>, output: Output): number {
+  const resolved = resolveUsage(invocation.group, invocation.leaf);
+  output.writeStdout(invocation.json
+    ? `${safeJson({ ok: true, version: 1, command: "help", data: resolved })}\n`
+    : `${resolved.usage}\n`);
+  return 0;
+}
+
+function renderVersion(invocation: Extract<CliInvocation, { kind: "version" }>, output: Output): number {
+  output.writeStdout(invocation.json
+    ? `${safeJson({ ok: true, version: 1, command: "version", data: { version: HRA_VERSION } })}\n`
+    : `hra ${HRA_VERSION}\n`);
+  return 0;
+}
+
+// One verdict decides both the doctor exit code and its JSON envelope. Any result that is
+// not an exact healthy shape exits 1 and reports `UNHEALTHY`, so `ok` never disagrees with
+// the exit code. The validated data stays beside the error for callers that read problems.
+function doctorVerdict(data: unknown): Readonly<{ healthy: boolean; message: string }> {
+  const doctor = isRecord(data) ? data : null;
+  const problems = Array.isArray(doctor?.problems)
+    && doctor.problems.every((value) => typeof value === "string")
+    ? (doctor.problems as readonly string[])
+    : null;
+  if (doctor === null || typeof doctor.healthy !== "boolean" || problems === null) {
+    return { healthy: false, message: "HRA checks returned an invalid local result." };
+  }
+  if (doctor.healthy && problems.length === 0) return { healthy: true, message: "HRA checks passed." };
+  const count = problems.length;
+  return {
+    healthy: false,
+    message: count === 0
+      ? "HRA checks did not pass, but no safe diagnostic was available."
+      : `HRA checks found ${String(count)} problem${count === 1 ? "" : "s"}.`,
+  };
+}
+
+function unhealthyDoctorEnvelope(
+  data: unknown,
+  message: string,
+  command?: "doctor",
+): Readonly<Record<string, unknown>> {
+  return {
+    ok: false,
+    version: 1,
+    ...(command === undefined ? {} : { command }),
+    data,
+    error: { code: "UNHEALTHY", message },
+  };
+}
+
+function renderDoctorOutcome(
+  command: Extract<LocalCommand, { kind: "doctor" }>,
+  data: unknown,
+  json: boolean,
+  output: Output,
+): number {
+  const verdict = doctorVerdict(data);
+  if (verdict.healthy || !json) {
+    renderSuccess(command, data, json, output);
+    return verdict.healthy ? 0 : 1;
+  }
+  output.writeStdout(`${safeJson(unhealthyDoctorEnvelope(data, verdict.message, "doctor"))}\n`);
+  return 1;
+}
+
 async function executeInvocation(
   invocation: CliInvocation,
   output: Output,
@@ -4652,9 +4771,15 @@ async function executeInvocation(
 ): Promise<number> {
   const installation = input.installation ?? createProductionInstallation();
   assertInstallationHome(installation);
+  if (invocation.kind === "help") return renderHelp(invocation, output);
+  if (invocation.kind === "version") return renderVersion(invocation, output);
+  if (invocation.kind === "command" && invocation.command.kind === "work.protocol") {
+    // The protocol document is a pure function of the query, so it is served without
+    // initialized state or a daemon. The daemon keeps the same operation for parity.
+    renderSuccess(invocation.command, describeWorkProtocol(invocation.command.query), true, output);
+    return 0;
+  }
   const callDaemon = commandCaller({ ...input, installation });
-  if (invocation.kind === "help") { output.writeStdout(`${usageForGroup(invocation.group)}\n`); return 0; }
-  if (invocation.kind === "version") { output.writeStdout(`hra ${HRA_VERSION}\n`); return 0; }
   if (invocation.kind === "status") {
     return await executeRootStatus(invocation, output, { ...input, installation });
   }
@@ -4801,14 +4926,9 @@ async function executeInvocation(
   if (command.kind === "sync.now") {
     return renderSyncNowSuccess(response.data, invocation.json, output);
   }
+  if (command.kind === "doctor") return renderDoctorOutcome(command, response.data, invocation.json, output);
   renderSuccess(command, response.data, invocation.json, output);
-  if (command.kind !== "doctor") return 0;
-  const doctor = isRecord(response.data) ? response.data : null;
-  return doctor?.healthy === true
-    && Array.isArray(doctor.problems)
-    && doctor.problems.length === 0
-    ? 0
-    : 1;
+  return 0;
 }
 
 export async function main(

@@ -35,6 +35,7 @@ import {
   WORK_SCHEMA_SQL,
   WorkStore,
   WorkStoreError,
+  assertReadonlyWorkSchema,
   assertWorkSchema,
   workPreparedEffectMessage,
 } from "./work-store";
@@ -474,11 +475,33 @@ describe("WorkStore schema and atomic plans", () => {
     expect(() => assertWorkSchema(value.database)).toThrow(
       "WORK_SCHEMA_MISSING_TRIGGER:work_events_no_update",
     );
+    expect(() => assertReadonlyWorkSchema(value.database)).toThrow(
+      "WORK_SCHEMA_MISSING_TRIGGER:work_events_no_update",
+    );
     value.database.query(
       "UPDATE work_events SET payload_json='{}' WHERE work_id=? AND sequence=1",
     ).run(created.work.id);
     expect(() => value.store.events(created.work.id, 0, 20)).toThrow(
       "WORK_EVENT_CHAIN_CORRUPT",
+    );
+  });
+
+  test("scans foreign keys on writable schema checks and skips the scan on readonly ones", () => {
+    const value = fixture();
+    expect(() => assertWorkSchema(value.database)).not.toThrow();
+    expect(() => assertReadonlyWorkSchema(value.database)).not.toThrow();
+    value.database.exec("PRAGMA foreign_keys=OFF");
+    value.database.query(
+      `INSERT INTO sessions(id,profile_id,project_id,preset,fast_enabled,state)
+       VALUES (?,?,?,'high',0,'active')`,
+    ).run(createSessionId(), createProfileId(), value.projectId);
+    value.database.exec("PRAGMA foreign_keys=ON");
+    expect(value.database.query("PRAGMA foreign_key_check").all()).toHaveLength(1);
+    expect(() => assertWorkSchema(value.database)).toThrow("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
+    expect(() => assertReadonlyWorkSchema(value.database)).not.toThrow();
+    value.database.exec("PRAGMA foreign_keys=OFF");
+    expect(() => assertReadonlyWorkSchema(value.database)).toThrow(
+      "WORK_SCHEMA_FOREIGN_KEYS_DISABLED",
     );
   });
 

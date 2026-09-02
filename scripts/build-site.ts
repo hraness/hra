@@ -2,6 +2,8 @@ import { copyFile, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { z } from "zod";
+
 import {
   publicContent,
   renderLlmsText,
@@ -9,6 +11,13 @@ import {
   renderReadmeMarkdown,
   renderSitemapXml,
 } from "../site/content.ts";
+import {
+  renderSocialCardPng,
+  renderSocialCardSvg,
+  SOCIAL_CARD_HEIGHT,
+  SOCIAL_CARD_WIDTH,
+} from "../site/social-card.ts";
+import { readPngDimensions } from "../site/social-card-raster.ts";
 import {
   renderPreviewHtml,
   renderPrivacyHtml,
@@ -29,6 +38,18 @@ interface TextOutput {
 
 const withFinalNewline = (value: string): string =>
   value.endsWith("\n") ? value : `${value}\n`;
+
+const packageManifestSchema = z.object({
+  version: z.string().regex(/^0\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u),
+}).passthrough();
+
+/** The hosted identity marker reports the version of the source tree that built it. */
+export const readPackageVersion = async (
+  repositoryRoot: string = resolve(import.meta.dir, ".."),
+): Promise<string> => {
+  const manifest: unknown = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8"));
+  return packageManifestSchema.parse(manifest).version;
+};
 
 export const HRA_POSTHOG_PROJECT_TOKEN_ENV =
   "NEXT_PUBLIC_POSTHOG_KEY" as const;
@@ -68,6 +89,7 @@ const trackedTextOutputs = (repositoryRoot: string): readonly TextOutput[] => [
 const siteTextOutputs = (
   repositoryRoot: string,
   releaseCommit: string,
+  packageVersion: string,
 ): readonly TextOutput[] => [
   {
     path: join(repositoryRoot, "dist/site/index.html"),
@@ -94,6 +116,10 @@ const siteTextOutputs = (
     content: renderLlmsText(),
   },
   {
+    path: join(repositoryRoot, "dist/site/social-card.svg"),
+    content: renderSocialCardSvg(),
+  },
+  {
     path: join(repositoryRoot, "dist/site/.well-known/security.txt"),
     content: `Contact: ${publicContent.links.privateSecurityReport}\nCanonical: ${publicContent.siteUrl}/.well-known/security.txt\nPolicy: ${publicContent.links.security}\nExpires: 2027-08-22T23:59:59Z\nPreferred-Languages: en\n`,
   },
@@ -110,12 +136,12 @@ const siteTextOutputs = (
       source: {
         commit: releaseCommit,
       },
-      version: "0.1.0",
+      version: packageVersion,
     }, null, 2),
   },
 ];
 
-const staticAssets = ["favicon.svg", "social-card.svg"] as const;
+const staticAssets = ["favicon.svg"] as const;
 const analyticsEntryPath = fileURLToPath(
   new URL("../site/analytics-entry.ts", import.meta.url),
 );
@@ -193,11 +219,23 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     force: true,
     recursive: true,
   });
-  for (const output of siteTextOutputs(options.repositoryRoot, releaseCommit)) {
+  const packageVersion = await readPackageVersion();
+  for (const output of siteTextOutputs(options.repositoryRoot, releaseCommit, packageVersion)) {
     const content = withFinalNewline(output.content);
     await mkdir(dirname(output.path), { recursive: true });
     await writeFile(output.path, content, { encoding: "utf8" });
   }
+  const socialCardPng = renderSocialCardPng();
+  const socialCardDimensions = readPngDimensions(socialCardPng);
+  if (
+    socialCardDimensions.width !== SOCIAL_CARD_WIDTH
+    || socialCardDimensions.height !== SOCIAL_CARD_HEIGHT
+    || socialCardDimensions.width !== publicContent.socialCard.width
+    || socialCardDimensions.height !== publicContent.socialCard.height
+  ) {
+    throw new Error("The social card PNG must be 1200x630 and match the published Open Graph size.");
+  }
+  await writeFile(join(options.repositoryRoot, "dist/site", publicContent.socialCard.path), socialCardPng);
   await buildAnalyticsBundle(options.repositoryRoot, analyticsProjectToken);
 
   for (const asset of staticAssets) {

@@ -72,7 +72,8 @@ describe("agent-first work apply boundary", () => {
         });
       },
     })).toBe(0);
-    expect(commands).toEqual([{ kind: "work.protocol", query: { kind: "index" } }]);
+    // `work protocol` is a pure description served before any daemon call.
+    expect(commands).toEqual([]);
     expect(success.read().stderr).toBe("");
     expect(success.read().stdout.trim().split("\n")).toHaveLength(1);
     expect(JSON.parse(success.read().stdout)).toEqual({

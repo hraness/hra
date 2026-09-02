@@ -14,6 +14,7 @@ import {
   requireBoundIdentityInvite,
 } from "./authInvites";
 import { requireAuthAdmissionsOpen } from "./admissionControl";
+import { timingSafeEqualAuthDigest } from "./authEmail";
 import {
   adjustParentAttributedQuotaForPatch,
   adjustQuotaForPatch,
@@ -265,7 +266,8 @@ export const storeOtpChallenge = internalMutation({
       challenge.accountId !== args.accountId || challenge.userId !== args.userId)) {
       rejectAuthentication();
     }
-    const duplicate = live.find((challenge) => challenge.codeDigest === args.codeDigest);
+    const duplicate = live.find((challenge) =>
+      timingSafeEqualAuthDigest(challenge.codeDigest, args.codeDigest));
     if (duplicate !== undefined) {
       await adjustQuotaForPatch(ctx, duplicate.userId, "identity", duplicate, {});
       return duplicate._id;
@@ -334,7 +336,7 @@ export const consumeOtpChallenge = internalMutation({
       .take(maximumLiveOtpChallenges + 1);
     if (challenges.length > maximumLiveOtpChallenges) rejectAuthentication();
     const matches = challenges.filter((challenge) =>
-      challenge.codeDigest === args.codeDigest
+      timingSafeEqualAuthDigest(challenge.codeDigest, args.codeDigest)
       && challenge.authEpoch === args.authEpoch
       && challenge.expiresAt > now);
     const challenge = matches[0];
