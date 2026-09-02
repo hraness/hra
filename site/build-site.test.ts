@@ -3,9 +3,14 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { buildSite } from "../scripts/build-site.ts";
+import {
+  buildSite,
+  HRA_POSTHOG_PROJECT_TOKEN_ENV,
+  resolveHraAnalyticsProjectToken,
+} from "../scripts/build-site.ts";
 import {
   renderAskAiAboutThis,
+  renderHraAnalyticsScript,
   renderHraSiteFooter,
   renderPreviewHtml,
   renderPrivacyHtml,
@@ -88,6 +93,7 @@ describe("static-site build", () => {
       "dist/site/llms.txt",
       "dist/site/.well-known/security.txt",
       "dist/site/.well-known/hra.json",
+      "dist/site/analytics.js",
       "dist/site/favicon.svg",
       "dist/site/social-card.svg",
       "dist/site/styles.css",
@@ -142,6 +148,49 @@ describe("static-site build", () => {
       releaseCommit: "not-a-commit",
       repositoryRoot: root,
     })).rejects.toThrow("Release commit");
+  });
+
+  test("fails Production closed without one valid public PostHog token", async () => {
+    const validToken = "phc_public_production_token";
+    expect(resolveHraAnalyticsProjectToken({ VERCEL_ENV: "preview" })).toBe("");
+    expect(resolveHraAnalyticsProjectToken({
+      [HRA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
+      VERCEL_ENV: "preview",
+    })).toBe("");
+    expect(resolveHraAnalyticsProjectToken({
+      [HRA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
+      VERCEL_ENV: "production",
+    })).toBe(validToken);
+
+    for (const projectToken of [undefined, "", "phx_private", "not-a-token"]) {
+      const root = await createFixtureRoot();
+      await expect(buildSite({
+        check: false,
+        environment: {
+          [HRA_POSTHOG_PROJECT_TOKEN_ENV]: projectToken,
+          VERCEL_ENV: "production",
+        },
+        repositoryRoot: root,
+      })).rejects.toThrow(HRA_POSTHOG_PROJECT_TOKEN_ENV);
+    }
+  });
+
+  test("embeds only the public token in the self-hosted Production bundle", async () => {
+    const root = await createFixtureRoot();
+    const publicToken = "phc_public_production_token";
+    await buildSite({
+      check: false,
+      environment: {
+        [HRA_POSTHOG_PROJECT_TOKEN_ENV]: publicToken,
+        VERCEL_ENV: "production",
+      },
+      repositoryRoot: root,
+    });
+
+    const analytics = await readFile(join(root, "dist/site/analytics.js"), "utf8");
+    expect(analytics).toContain(publicToken);
+    expect(analytics).not.toMatch(/\bphx_[A-Za-z0-9_-]+\b/u);
+    expect(analytics).not.toContain("POSTHOG_API_KEY");
   });
 
   test("keeps immutable hosted deployment identity separate from the forward CLI version", async () => {
@@ -213,6 +262,7 @@ describe("static-site build", () => {
     expect(preview).toBe(renderPreviewHtml());
     expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
     expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
+    expect(preview).not.toContain("/analytics.js");
     expect(sitemap).not.toContain("/preview");
   });
 
@@ -236,7 +286,7 @@ describe("static-site build", () => {
     expect(await readFile(join(root, "dist/site/styles.css"), "utf8")).toBe("stale\n");
   });
 
-  test("admits only the configured Turnstile runtime and restrictive response headers", async () => {
+  test("admits only owned analytics, configured Turnstile, and restrictive response headers", async () => {
     const repositoryRoot = join(import.meta.dir, "..");
     const html = renderSiteHtml();
     const css = await readFile(join(repositoryRoot, "site/styles.css"), "utf8");
@@ -244,7 +294,9 @@ describe("static-site build", () => {
       await readFile(join(repositoryRoot, "vercel.json"), "utf8"),
     ) as { headers?: unknown };
 
-    expect(html).not.toMatch(/<script[^>]+src=/);
+    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(1);
+    expect(html).toContain(renderHraAnalyticsScript());
+    expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
     expect(renderHraSiteFooter("1x00000000000000000000AA")).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
@@ -279,7 +331,7 @@ describe("static-site build", () => {
         headers: [
           {
             key: "Content-Security-Policy",
-            value: "default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'self'; form-action https://account.hraness.com; frame-ancestors 'none'; frame-src https://challenges.cloudflare.com; img-src 'self' data:; manifest-src 'self'; script-src https://challenges.cloudflare.com; style-src 'self'",
+            value: "default-src 'none'; base-uri 'none'; connect-src https://us.i.posthog.com; font-src 'self'; form-action https://account.hraness.com; frame-ancestors 'none'; frame-src https://challenges.cloudflare.com; img-src 'self' data:; manifest-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'",
           },
           { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
           {

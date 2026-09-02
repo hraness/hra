@@ -70,6 +70,9 @@ export const renderAskAiAboutThis = (canonicalUrl: string): string =>
     url: canonicalUrl,
   }));
 
+export const renderHraAnalyticsScript = (): string =>
+  '<script src="/analytics.js" type="module"></script>';
+
 const renderInline = (content: readonly InlineContent[]): string =>
   content
     .map((part) => {
@@ -261,6 +264,7 @@ ${renderHead(content, {
 ${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
 ${renderHraSiteFooter()}
+${renderHraAnalyticsScript()}
 </body>
 </html>
 `;
@@ -317,6 +321,7 @@ ${renderHead(content, {
 ${renderAskAiAboutThis(`${content.siteUrl}/privacy/`)}
 ${renderProjectResources(content)}
 ${renderHraSiteFooter()}
+${renderHraAnalyticsScript()}
 </body>
 </html>
 `;

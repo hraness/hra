@@ -70,6 +70,8 @@ describe("public text policy", () => {
       .not.toThrow();
     expect(() => assertPublicText("@hraness/oh", "public dependency"))
       .not.toThrow();
+    expect(() => assertPublicText("@hraness/posthog", "public dependency"))
+      .not.toThrow();
     expect(() => assertPublicText("@hraness/site-footer", "public dependency"))
       .not.toThrow();
     expect(() => assertPublicText("@hraness/ui", "public dependency"))

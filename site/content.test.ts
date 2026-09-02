@@ -21,6 +21,7 @@ import {
 import {
   HRA_MAILING_TURNSTILE_SITEKEY_ENV,
   hraMailingListConfig,
+  renderHraAnalyticsScript,
   renderHraSiteFooter,
   renderPreviewHtml,
   renderPrivacyHtml,
@@ -380,9 +381,13 @@ describe("public content contract", () => {
       "HRA uses Convex to authenticate the HRA identity",
       "HRA uses Resend to deliver verification email.",
       "one-time verification code and message content",
-      "Vercel serves hra.sh.",
-      "GitHub hosts the source repository, releases, and release downloads.",
-      "HRA does not add analytics, cookies, remote fonts, or executable JavaScript to the site.",
+      "anonymous, cookieless PostHog analytics",
+      "Collection runs only on the canonical production host",
+      "honors Do Not Track",
+      "disables person profiles, autocapture, heatmaps, feature flags, surveys, conversations, and session recording",
+      "HRA sends no form values, account identity, Codex data, URL query, or fragment.",
+      "Vercel serves hra.sh",
+      "GitHub hosts the source repository, releases, and release downloads",
     ];
     const surfaces = [
       renderReadmeMarkdown(),
@@ -592,13 +597,18 @@ describe("public content contract", () => {
     }
   });
 
-  test("contains JSON-LD and no executable scripts", () => {
+  test("contains JSON-LD and one owned analytics module on public pages", () => {
     const html = renderSiteHtml();
+    const privacy = renderPrivacyHtml();
     expect(html).toContain('<link rel="canonical" href="https://hra.sh/">');
     expect(html).toContain('<meta property="og:type" content="website">');
     expect(html).toContain('<link rel="stylesheet" href="/styles.css">');
     expect(html).toContain('<script type="application/ld+json">');
-    expect(html).not.toMatch(/<script(?! type="application\/ld\+json")/);
+    expect(html.match(/<script\b/gu)).toHaveLength(2);
+    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(1);
+    expect(html).toContain(renderHraAnalyticsScript());
+    expect(privacy).toContain(renderHraAnalyticsScript());
+    expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
     expect(html).not.toContain("onclick=");
   });
 
