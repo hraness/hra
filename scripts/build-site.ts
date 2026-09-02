@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 
 import {
   publicContent,
-  readingPages,
   renderLlmsText,
   renderPrivacyMarkdown,
   renderReadmeMarkdown,
@@ -13,8 +12,6 @@ import {
 import {
   renderPreviewHtml,
   renderPrivacyHtml,
-  renderReadingIndexHtml,
-  renderReadingHtml,
   renderSiteHtml,
 } from "../site/template.ts";
 
@@ -59,14 +56,6 @@ const siteTextOutputs = (
     path: join(repositoryRoot, "dist/site/preview/index.html"),
     content: renderPreviewHtml(),
   },
-  {
-    path: join(repositoryRoot, "dist/site/reading/index.html"),
-    content: renderReadingIndexHtml(),
-  },
-  ...readingPages.map((page) => ({
-    path: join(repositoryRoot, `dist/site${page.canonicalPath}index.html`),
-    content: renderReadingHtml(page),
-  })),
   {
     path: join(repositoryRoot, "dist/site/robots.txt"),
     content: `User-agent: *\nAllow: /\nSitemap: ${publicContent.siteUrl}/sitemap.xml\n`,
@@ -158,12 +147,6 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     await mkdir(dirname(destination), { recursive: true });
     await copyFile(source, destination);
   }
-  await cp(
-    join(options.repositoryRoot, "site/images"),
-    join(options.repositoryRoot, "dist/site/images"),
-    { recursive: true },
-  );
-
   const [
     productStyles,
     designKitFontsStyles,
