@@ -14,7 +14,7 @@ The lifecycle control database may contain only:
 - their binding digest;
 - fixed create, fork, cleanup, and expiry state;
 - an opaque handle hash;
-- exact public store heads—sequence, Oh operation SHA-256, and an HRA head digest—and receipt digests;
+- exact public store heads (sequence, Oh operation SHA-256, and an HRA head digest) and receipt digests;
 - an exact parent binding and head for a fork;
 - the current epoch, one fixed-size digest chaining the preceding expired-purge boundary, and bounded timestamps, reasons, and revisions.
 

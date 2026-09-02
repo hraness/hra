@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 
+import { CODEX_PIN } from "../codex/pin";
 import type { LocalCommand } from "../domain/contracts";
 import { localCommandSchema } from "../domain/contracts";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
-import { isUuidV7 } from "../cloud/contracts";
+import { createCloudUuidV7, isUuidV7 } from "../domain/uuid-v7";
 import { parseAuthCredentials } from "../cloud/authCredentials";
-import { createCloudUuidV7 } from "../cloud/local-control";
 import {
   WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
   WORK_TASK_HISTORY_ITEM_LIMIT,
@@ -100,8 +100,8 @@ export type AccountLoginCliInvocation = Readonly<{
 export type InteractionResolveCommand = Extract<LocalCommand, { kind: "interaction.resolve" }>;
 
 export type CliInvocation =
-  | { group?: string; kind: "help" }
-  | { kind: "version" }
+  | { group?: string; json: boolean; kind: "help"; leaf?: string }
+  | { json: boolean; kind: "version" }
   | { kind: "status"; json: boolean }
   | { kind: "init"; yes: boolean; json: boolean }
   | { kind: "daemon.start"; json: boolean }
@@ -139,6 +139,7 @@ export const usage = `HRA
 
 Usage:
   hra
+  hra help [<group> [<command>]]
   hra status [--json]
   hra init [--yes] [--json]
   hra doctor [--offline] [--json]
@@ -179,7 +180,7 @@ Recommended profiles:
   high    Sol Max
   ultra   Sol Ultra
 
-Run ‘hra <group> --help’ for command examples.`;
+Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
 
 const groupUsage = {
   status: `HRA status
@@ -375,12 +376,59 @@ Examples:
   hra sync projection recover my-session --acknowledge-gap`,
 } as const satisfies Readonly<Record<string, string>>;
 
-export function usageForGroup(group: string | undefined): string {
-  if (group === undefined) return usage;
+export const helpGroupNames: readonly string[] = Object.keys(groupUsage);
+
+export type ResolvedUsage = Readonly<{ group?: string; leaf?: string; usage: string }>;
+
+const helpSectionSeparator = "\n\n";
+const usageSectionHeading = "Usage:";
+const exampleSectionHeadings: ReadonlySet<string> = new Set(["Examples:", "Example:"]);
+
+const commandLineNamesLeaf = (line: string, group: string, leaf: string): boolean => {
+  const tokens = line.trim().split(/\s+/u);
+  return tokens[0] === "hra"
+    && tokens[1] === group
+    && (tokens[2]?.split("|").includes(leaf) ?? false);
+};
+
+// Leaf help is carved from the group text until the command descriptor replaces both.
+// It keeps the leaf's usage and example lines and every shared note section of the group.
+const leafUsage = (group: string, groupText: string, leaf: string): string | undefined => {
+  const sections = groupText.split(helpSectionSeparator);
+  const usageSection = sections.find((section) => section.startsWith(`${usageSectionHeading}\n`));
+  if (usageSection === undefined) return undefined;
+  const usageLines = usageSection.split("\n").slice(1)
+    .filter((line) => commandLineNamesLeaf(line, group, leaf));
+  if (usageLines.length === 0) return undefined;
+  const parts = [`HRA ${group} ${leaf}`, [usageSectionHeading, ...usageLines].join("\n")];
+  for (const section of sections.slice(1)) {
+    const [heading = "", ...lines] = section.split("\n");
+    if (heading === usageSectionHeading) continue;
+    if (exampleSectionHeadings.has(heading)) {
+      const examples = lines.filter((line) => commandLineNamesLeaf(line, group, leaf));
+      if (examples.length > 0) parts.push([heading, ...examples].join("\n"));
+      continue;
+    }
+    parts.push(section);
+  }
+  return parts.join(helpSectionSeparator);
+};
+
+export function resolveUsage(group: string | undefined, leaf?: string): ResolvedUsage {
+  if (group === undefined) return { usage };
   const selected: string | undefined = (
     groupUsage as Readonly<Partial<Record<string, string>>>
   )[group];
-  return selected ?? usage;
+  if (selected === undefined) return { usage };
+  if (leaf === undefined) return { group, usage: selected };
+  const leafText = leafUsage(group, selected, leaf);
+  return leafText === undefined
+    ? { group, usage: selected }
+    : { group, leaf, usage: leafText };
+}
+
+export function usageForGroup(group: string | undefined, leaf?: string): string {
+  return resolveUsage(group, leaf).usage;
 }
 
 const outputModeCommandArguments = (argv: readonly string[]): readonly string[] => {
@@ -769,7 +817,7 @@ const parsePlugin = (cursor: Cursor): LocalCommand => {
     || action === "authorize"
   ) {
     throw new CliUsageError(
-      "Pinned Codex 0.149.0 has no safe separated plugin lifecycle effect. Use `plugin list` or `plugin show` to inspect the exact boundary.",
+      `Pinned Codex ${CODEX_PIN} has no safe separated plugin lifecycle effect. Use \`plugin list\` or \`plugin show\` to inspect the exact boundary.`,
     );
   }
   throw new CliUsageError("Unknown plugin action. Run `hra plugin --help` for supported actions.");
@@ -1224,11 +1272,18 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     throw new CliUsageError("--json and --jsonl are mutually exclusive output modes.");
   }
   const idempotencyKey = option(cursor, "--idempotency-key");
-  if (flag(cursor, "--help") || flag(cursor, "-h") || (cursor.values.length === 0 && literalTail.length === 0)) {
-    const group = cursor.values[0];
-    return { kind: "help", ...(group === undefined ? {} : { group }) };
+  const helpFlag = flag(cursor, "--help") || flag(cursor, "-h");
+  const helpAlias = !helpFlag && cursor.values[0] === "help";
+  if (helpFlag || helpAlias || (cursor.values.length === 0 && literalTail.length === 0)) {
+    const [group, leaf] = helpAlias ? cursor.values.slice(1, 3) : cursor.values.slice(0, 2);
+    return {
+      kind: "help",
+      json,
+      ...(group === undefined ? {} : { group }),
+      ...(leaf === undefined ? {} : { leaf }),
+    };
   }
-  if (flag(cursor, "--version") || flag(cursor, "-v")) { finish(cursor); return { kind: "version" }; }
+  if (flag(cursor, "--version") || flag(cursor, "-v")) { finish(cursor); return { json, kind: "version" }; }
   cursor.values.push(...literalTail);
   const group = take(cursor, "command");
   if (jsonl && group !== "session" && group !== "work") {

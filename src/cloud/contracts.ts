@@ -1,3 +1,22 @@
+import { hasExactKeys, isRecord } from "../domain/guards";
+import { containsAbsolutePath } from "../domain/text-safety";
+
+// These helpers moved to src/domain. The re-exports keep cloud callers stable
+// until B5 consolidates the cloud wire parsers.
+export {
+  AccountKeyLossPreconditionError,
+  CloudProjectionRecoveryAdmissionError,
+  type AccountKeyLossPreconditionFailure,
+  type CloudProjectionRecoveryAdmissionFailure,
+} from "../domain/cloud-outcomes";
+export { assertNever, hasExactKeys, isRecord } from "../domain/guards";
+export {
+  containsAbsolutePath,
+  containsUnsafeTerminalScalar,
+  redactAbsolutePaths,
+} from "../domain/text-safety";
+export { isUuidV7 } from "../domain/uuid-v7";
+
 export const cloudLimits = Object.freeze({
   ciphertextCharacters: 350_000,
   detailChunkBytes: 256 * 1024,
@@ -84,50 +103,9 @@ export type CloudDeviceList = Readonly<{
   devices: readonly CloudDeviceListEntry[];
 }>;
 
-export type CloudProjectionRecoveryAdmissionFailure =
-  | "identity_or_session_conflict"
-  | "idempotency_authority_invalid"
-  | "journal_capacity"
-  | "unsettled_session";
-
-export class CloudProjectionRecoveryAdmissionError extends Error {
-  readonly code: CloudProjectionRecoveryAdmissionFailure;
-
-  constructor(code: CloudProjectionRecoveryAdmissionFailure) {
-    super(`Cloud projection recovery admission failed: ${code}.`);
-    this.name = "CloudProjectionRecoveryAdmissionError";
-    this.code = code;
-  }
-}
-
 const base64UrlPattern = /^[A-Za-z0-9_-]+$/u;
 const digestPattern = /^[0-9a-f]{64}$/u;
 const opaqueIdentifierPattern = /^[A-Za-z0-9_-]{8,96}$/u;
-const uuidV7Pattern =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-
-export function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  try {
-    const prototype: unknown = Object.getPrototypeOf(value);
-    return prototype === Object.prototype || prototype === null;
-  } catch {
-    return false;
-  }
-}
-
-export function hasExactKeys(
-  value: Readonly<Record<string, unknown>>,
-  expected: readonly string[],
-): boolean {
-  try {
-    const keys = Reflect.ownKeys(value);
-    return keys.length === expected.length
-      && keys.every((key) => typeof key === "string" && expected.includes(key));
-  } catch {
-    return false;
-  }
-}
 
 export function isSafePositiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && typeof value === "number" && value > 0;
@@ -219,36 +197,6 @@ export function parseCloudDeviceList(value: unknown): CloudDeviceList | null {
   }
   if (currentCount !== 1) return null;
   return { currentDevicePublicId: value.currentDevicePublicId, devices };
-}
-
-export function isUuidV7(value: unknown): value is string {
-  return typeof value === "string" && uuidV7Pattern.test(value);
-}
-
-const absolutePathTokenPattern = /(^|[^\p{L}\p{N}_/\\])((?:file:\/\/+|~\/|[A-Za-z]:[\\/]|\\\\[^\\/\s"'`<>{}[\](),;]+[\\/]|\/(?!\/))[^\s"'`<>{}[\](),;]*)/iu;
-const absolutePathTokenGlobalPattern = /(^|[^\p{L}\p{N}_/\\])((?:file:\/\/+|~\/|[A-Za-z]:[\\/]|\\\\[^\\/\s"'`<>{}[\](),;]+[\\/]|\/(?!\/))[^\s"'`<>{}[\](),;]*)/giu;
-const repeatedLeadingSlashPathPattern = /(^|[\s"'`<>{}[\](),;])\/{2,}[^\s"'`<>{}[\](),;]*/u;
-const repeatedLeadingSlashPathGlobalPattern = /(^|[\s"'`<>{}[\](),;])\/{2,}[^\s"'`<>{}[\](),;]*/gu;
-const unsafeTerminalScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}]/u;
-
-export function containsAbsolutePath(value: string): boolean {
-  return absolutePathTokenPattern.test(value) || repeatedLeadingSlashPathPattern.test(value);
-}
-
-export function redactAbsolutePaths(value: string): string {
-  return value
-    .replace(repeatedLeadingSlashPathGlobalPattern, (_match, prefix: string) =>
-      `${prefix}[local-path]`)
-    .replace(absolutePathTokenGlobalPattern, (_match, prefix: string) =>
-      `${prefix}[local-path]`);
-}
-
-export function containsUnsafeTerminalScalar(value: string, allowLineFeeds = false): boolean {
-  for (const scalar of value) {
-    if (allowLineFeeds && scalar === "\n") continue;
-    if (unsafeTerminalScalarPattern.test(scalar)) return true;
-  }
-  return false;
 }
 
 export function isBase64Url(
@@ -354,8 +302,4 @@ export function parseAuthorityTuple(value: unknown): AuthorityTuple | null {
     bootId: value.bootId,
     fence: value.fence,
   };
-}
-
-export function assertNever(value: never): never {
-  throw new Error(`Unexpected closed-union value: ${String(value)}`);
 }

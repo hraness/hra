@@ -8,6 +8,7 @@ import {
   admitExactDaemonStop,
   daemonRunProcessArguments,
   daemonRunProcessOptions,
+  EDITOR_ENVIRONMENT_KEYS,
   HUMAN_SESSION_WATCH_BOOTSTRAP_MAXIMUM_BYTES,
   initialize,
   main,
@@ -22,6 +23,7 @@ import {
   withProtectedTerminalLifecycle,
   type DaemonStopDependencies,
 } from "./cli";
+import { allowlistedEnvironment, SAFE_ENVIRONMENT_KEYS } from "./codex/index";
 import { ShellTerminalCoordinator } from "./cli/shell-terminal";
 import {
   CloudDaemonJournalRecoveryBlocker,
@@ -36,11 +38,13 @@ import {
 } from "./cloud/identity-custody";
 import type { CloudSecretCustodyPort } from "./cloud/local-control";
 import type { CommandResponse, LocalCommand } from "./domain/contracts";
+import { describeWorkProtocol } from "./domain/work-protocol";
 import {
   PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES,
   type ProtectedInteractionDetailDocument,
 } from "./domain/interactions";
 import type { RootStatus } from "./domain/observation";
+import { usageForGroup } from "./cli/parser";
 import { renderProtectedInteractionDetail } from "./cli/render";
 import {
   DAEMON_PROTOCOL,
@@ -1336,9 +1340,132 @@ describe("CLI entry point", () => {
     const protectedGroup = capture();
     expect(await main(["interaction", "answer", "--help"], protectedGroup.output)).toBe(0);
     expect(protectedGroup.read().stdout).toContain("--input-stdin|--input-fd");
-    expect(protectedGroup.read().stdout).toContain("hra interaction list [session] [--pending] [--limit <1..100>] [--cursor <cursor>]");
+    expect(protectedGroup.read().stdout).not.toContain("hra interaction list [session] [--pending] [--limit <1..100>] [--cursor <cursor>]");
     expect(protectedGroup.read().stdout).toContain("Protected values");
     expect(protectedGroup.read().stderr).toBe("");
+  });
+
+  test("leaf help prints only that leaf and the help alias matches --help byte for byte", async () => {
+    const leafHelp = [
+      "HRA session events",
+      "",
+      "Usage:",
+      "  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
+      "",
+      "Examples:",
+      "  hra session events my-session --wait-ms 30000 --jsonl",
+      "",
+    ].join("\n");
+    for (const argv of [
+      ["session", "events", "--help"],
+      ["help", "session", "events"],
+      ["session", "events", "my-session", "-h"],
+    ]) {
+      const captured = capture();
+      expect(await main(argv, captured.output)).toBe(0);
+      expect(captured.read()).toEqual({ stdout: leafHelp, stderr: "" });
+    }
+    const root = capture();
+    expect(await main(["help"], root.output)).toBe(0);
+    expect(root.read()).toEqual({ stdout: `${usageForGroup(undefined)}\n`, stderr: "" });
+    expect(root.read().stdout).toContain("Run `hra <group> --help` or `hra help <group> [<command>]` for command examples.");
+    const group = capture();
+    expect(await main(["help", "session"], group.output)).toBe(0);
+    expect(group.read()).toEqual({ stdout: `${usageForGroup("session")}\n`, stderr: "" });
+  });
+
+  test("help and version honor --json with one versioned envelope", async () => {
+    const rootHelp = capture();
+    expect(await main(["--json", "--help"], rootHelp.output)).toBe(0);
+    expect(JSON.parse(rootHelp.read().stdout)).toEqual({
+      ok: true,
+      version: 1,
+      command: "help",
+      data: { usage: usageForGroup(undefined) },
+    });
+    expect(rootHelp.read().stderr).toBe("");
+
+    const leafHelp = capture();
+    expect(await main(["--json", "help", "session", "events"], leafHelp.output)).toBe(0);
+    expect(JSON.parse(leafHelp.read().stdout)).toEqual({
+      ok: true,
+      version: 1,
+      command: "help",
+      data: { group: "session", leaf: "events", usage: usageForGroup("session", "events") },
+    });
+
+    const unknown = capture();
+    expect(await main(["--json", "help", "bogus-group", "bogus-leaf"], unknown.output)).toBe(0);
+    expect(JSON.parse(unknown.read().stdout)).toEqual({
+      ok: true,
+      version: 1,
+      command: "help",
+      data: { usage: usageForGroup(undefined) },
+    });
+    expect(unknown.read().stdout).not.toContain("bogus");
+
+    for (const argv of [["--version", "--json"], ["--json", "-v"]]) {
+      const version = capture();
+      expect(await main(argv, version.output)).toBe(0);
+      expect(JSON.parse(version.read().stdout)).toEqual({
+        ok: true,
+        version: 1,
+        command: "version",
+        data: { version: "0.1.6" },
+      });
+      expect(version.read().stderr).toBe("");
+    }
+  });
+
+  test("work protocol is served locally before initialization and matches the daemon document", async () => {
+    const runId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd4e";
+    const runRoot = await realpath(await mkdtemp(join(tmpdir(), `hra-live-acceptance-${runId}-`)));
+    const installation = createAcceptanceInstallation({
+      device: "a",
+      documentsDirectory: join(runRoot, "project-a-first-run"),
+      expectedHomeDirectory: process.env.HOME ?? "/missing-home",
+      rootDirectory: join(runRoot, "device-a-first-run"),
+      runId,
+      type: "hra-live-acceptance-device",
+      version: 1,
+    });
+    let daemonStarts = 0;
+    let daemonCalls = 0;
+    const input = {
+      installation,
+      callDaemon: () => {
+        daemonCalls += 1;
+        return Promise.reject(new Error("work protocol must not reach the daemon"));
+      },
+      startDaemon: async () => {
+        daemonStarts += 1;
+        return readyDaemonStatus();
+      },
+    };
+    try {
+      for (const entry of [
+        { argv: ["--json", "work", "protocol"], query: { kind: "index" } },
+        { argv: ["work", "protocol", "--topic", "errors"], query: { kind: "topic", topic: "errors" } },
+        { argv: ["work", "protocol", "--operation", "attempt.dispatch"], query: { kind: "operation", operation: "attempt.dispatch" } },
+      ] as const) {
+        const captured = capture();
+        expect(await main([...entry.argv], captured.output, input)).toBe(0);
+        // The daemon answers `work.protocol` with the same pure function (service.ts), so this
+        // equality is the local-versus-daemon parity check for the index and one shard.
+        expect(JSON.parse(captured.read().stdout)).toEqual({
+          ok: true,
+          version: 1,
+          command: "work.protocol",
+          data: JSON.parse(JSON.stringify(describeWorkProtocol(entry.query))),
+        });
+        expect(captured.read().stderr).toBe("");
+      }
+      expect(daemonStarts).toBe(0);
+      expect(daemonCalls).toBe(0);
+      await expect(lstat(installation.paths.root)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
   });
 
   test("offline doctor returns one JSON value", async () => {
@@ -1444,7 +1571,8 @@ describe("CLI entry point", () => {
             },
           },
         },
-        ok: true,
+        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        ok: false,
       });
       expect(captured.read().stderr).toBe("");
     } finally {
@@ -1480,7 +1608,8 @@ describe("CLI entry point", () => {
             healthy: false,
             state: { daemonAuthority: { state: scenario } },
           },
-          ok: true,
+          error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+          ok: false,
         });
         expect(JSON.stringify(result)).not.toContain(temporary);
         expect(captured.read().stderr).toBe("");
@@ -1502,7 +1631,8 @@ describe("CLI entry point", () => {
         statePaths,
       })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
-        ok: true,
+        ok: false,
+        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
           problems: ["The state root is not a private canonical directory."],
@@ -1528,7 +1658,8 @@ describe("CLI entry point", () => {
         statePaths,
       })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
-        ok: true,
+        ok: false,
+        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
           problems: ["The state root is not a private canonical directory."],
@@ -1553,7 +1684,8 @@ describe("CLI entry point", () => {
         statePaths,
       })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
-        ok: true,
+        ok: false,
+        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
           problems: ["The local database check failed without exposing its runtime diagnostic."],
@@ -1576,7 +1708,8 @@ describe("CLI entry point", () => {
         statePaths,
       })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
-        ok: true,
+        ok: false,
+        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
           problems: ["The state root is not a private canonical directory."],
@@ -4303,13 +4436,39 @@ describe("CLI entry point", () => {
       "daemon",
       "run",
     ]);
-    expect(daemonRunProcessOptions("/var/lib/hra-control-plane-v1")).toEqual({
+    const environment = {
+      AWS_SECRET_ACCESS_KEY: "parent-secret",
+      HOME: "/Users/example",
+      HRA_CONVEX_URL: "https://example.convex.cloud",
+      LANG: "en_US.UTF-8",
+      OPENAI_API_KEY: "parent-secret",
+      PATH: "/usr/bin:/bin",
+      TMPDIR: "/private/tmp",
+      UNDEFINED_VALUE: undefined,
+    };
+    expect(daemonRunProcessOptions("/var/lib/hra-control-plane-v1", environment)).toEqual({
       cwd: "/var/lib/hra-control-plane-v1",
       detached: true,
-      env: process.env,
+      env: {
+        HOME: "/Users/example",
+        HRA_CONVEX_URL: "https://example.convex.cloud",
+        LANG: "en_US.UTF-8",
+        PATH: "/usr/bin:/bin",
+        TMPDIR: "/private/tmp",
+      },
       stderr: "ignore",
       stdin: "ignore",
       stdout: "ignore",
+    });
+    const defaulted = daemonRunProcessOptions("/var/lib/hra-control-plane-v1");
+    expect(Object.keys(defaulted.env).every((key) =>
+      key === "HRA_CONVEX_URL" || SAFE_ENVIRONMENT_KEYS.has(key))).toBe(true);
+    expect(EDITOR_ENVIRONMENT_KEYS.has("TERM")).toBe(true);
+    expect(allowlistedEnvironment(environment, EDITOR_ENVIRONMENT_KEYS)).toEqual({
+      HOME: "/Users/example",
+      LANG: "en_US.UTF-8",
+      PATH: "/usr/bin:/bin",
+      TMPDIR: "/private/tmp",
     });
   });
 
@@ -5084,7 +5243,8 @@ describe("CLI entry point", () => {
       const captured = capture();
       expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths: paths })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
-        ok: true,
+        ok: false,
+        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
           problems: ["No project directory is configured. Run `hra init --yes`."],
@@ -5121,7 +5281,8 @@ describe("CLI entry point", () => {
         const captured = capture();
         expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths: paths })).toBe(1);
         expect(JSON.parse(captured.read().stdout)).toMatchObject({
-          ok: true,
+          ok: false,
+          error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
           data: {
             healthy: false,
             problems: [problem],
@@ -5139,14 +5300,16 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("online doctor preserves one success envelope while its exit code follows validated health", async () => {
+  test("online doctor keeps its envelope and exit code in agreement over validated health", async () => {
+    const invalid = "HRA checks returned an invalid local result.";
     for (const entry of [
       { data: { healthy: true, problems: [] }, exitCode: 0 },
-      { data: { healthy: false, problems: ["Cloud projection recovery is unsettled."] }, exitCode: 1 },
-      { data: { healthy: "yes", problems: [] }, exitCode: 1 },
-      { data: { healthy: true, problems: ["Cloud status is inconsistent."] }, exitCode: 1 },
-      { data: { healthy: true, problems: "none" }, exitCode: 1 },
-      { data: { healthy: true, problems: [1] }, exitCode: 1 },
+      { data: { healthy: false, problems: ["Cloud projection recovery is unsettled."] }, exitCode: 1, message: "HRA checks found 1 problem." },
+      { data: { healthy: false, problems: [] }, exitCode: 1, message: "HRA checks did not pass, but no safe diagnostic was available." },
+      { data: { healthy: "yes", problems: [] }, exitCode: 1, message: invalid },
+      { data: { healthy: true, problems: ["Cloud status is inconsistent.", "Cloud device is stale."] }, exitCode: 1, message: "HRA checks found 2 problems." },
+      { data: { healthy: true, problems: "none" }, exitCode: 1, message: invalid },
+      { data: { healthy: true, problems: [1] }, exitCode: 1, message: invalid },
     ] as const) {
       const captured = capture();
       expect(await main(["doctor", "--json"], captured.output, {
@@ -5160,13 +5323,27 @@ describe("CLI entry point", () => {
           });
         },
       })).toBe(entry.exitCode);
-      expect(JSON.parse(captured.read().stdout)).toMatchObject({
-        ok: true,
-        command: "doctor",
-        data: entry.data,
-      });
+      expect(JSON.parse(captured.read().stdout)).toEqual(entry.exitCode === 0
+        ? { ok: true, version: 1, command: "doctor", data: entry.data }
+        : {
+            ok: false,
+            version: 1,
+            command: "doctor",
+            data: entry.data,
+            error: { code: "UNHEALTHY", message: "message" in entry ? entry.message : "" },
+          });
       expect(captured.read().stderr).toBe("");
     }
+    const human = capture();
+    expect(await main(["doctor"], human.output, {
+      callDaemon: () => Promise.resolve({
+        ok: true,
+        version: 1,
+        requestId: crypto.randomUUID(),
+        data: { healthy: false, problems: ["Cloud status is inconsistent."] },
+      }),
+    })).toBe(1);
+    expect(human.read()).toEqual({ stdout: "HRA checks found 1 problem:\n- Cloud status is inconsistent.\n", stderr: "" });
   });
 
   test("init never opens or migrates the state database outside exclusive authority", async () => {

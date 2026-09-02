@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { redactAbsolutePaths } from "../cloud/contracts";
+import { redactAbsolutePaths } from "../domain/text-safety";
 import type { CommandResponse, LocalCommand } from "../domain/contracts";
 import { interactionDisplaySchema } from "../domain/interactions";
 import {

@@ -14,7 +14,7 @@ import { resolve } from "node:path";
 import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
 
-import { redactAbsolutePaths } from "../cloud/contracts";
+import { redactAbsolutePaths } from "../domain/text-safety";
 import {
   INTERACTION_MAX_PENDING_MS,
   interactionDisplaySchema,
@@ -108,6 +108,7 @@ import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
 import {
   WORK_SCHEMA_SQL,
   WorkStore,
+  assertReadonlyWorkSchema,
   assertWorkSchema,
   type WorkCapabilityIssuer,
   type WorkCapabilityVerifier,
@@ -115,14 +116,12 @@ import {
 } from "./work-store";
 import type { StatePaths } from "./paths";
 import type {
+  DesktopRecoveryBinding,
+  DesktopRecoveryResolution,
   DesktopSwitchGeneration,
   DesktopSwitchJournalEntry,
   DesktopSwitchStage,
-} from "../desktop/switch";
-import type {
-  DesktopRecoveryBinding,
-  DesktopRecoveryResolution,
-} from "../desktop/recovery";
+} from "../domain/desktop-switch";
 
 const processLocalPublicProviderIdentifierProjector =
   createEphemeralPublicProviderIdentifierProjector();
@@ -532,7 +531,8 @@ export type MutationEffectEvidence =
   | { kind: "session.rename"; providerThreadId: string; baseline: SessionProviderBaseline; requestedName: string }
   | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: EffectiveRuntimeProfile }
   | { kind: "account.login"; method: "browser" | "device_code" }
-  | { kind: "account.logout"; baselineSignedIn: boolean };
+  | { kind: "account.logout"; baselineSignedIn: boolean }
+  | { kind: "account.login-cancel"; loginId: string };
 
 export type MutationEffectEvidenceRecord = {
   attemptId: AttemptId;
@@ -623,6 +623,7 @@ const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: effectiveRuntimeProfileSchema.optional() }).strict(),
   z.object({ kind: z.literal("account.login"), method: z.enum(["browser", "device_code"]) }).strict(),
   z.object({ kind: z.literal("account.logout"), baselineSignedIn: z.boolean() }).strict(),
+  z.object({ kind: z.literal("account.login-cancel"), loginId: providerLoginIdSchema }).strict(),
 ]);
 const queueEffectEvidenceSchema = z.object({
   kind: z.literal("queue.dispatch"),
@@ -709,7 +710,27 @@ const safeObservationTitle = (value: string): string => {
   return titleSchema.parse(`${prefix.trimEnd()}${marker}`);
 };
 const stateBusyTimeoutMs = 5_000;
-const securityScrubBusyTimeoutMs = 250;
+
+// The scrub checkpoint waits inside SQLite's busy handler for readers that
+// still hold an older WAL snapshot, then retries with doubling backoff. The
+// default uses the connection's normal 5 s wait for each of three attempts.
+// Only tests pass a shorter policy; CLI and daemon composition never do, and
+// the schema forbids a longer wait or more attempts than the default.
+export type SecurityScrubCheckpointPolicy = Readonly<{
+  busyTimeoutMs: number;
+  attempts: number;
+  backoffMs: number;
+}>;
+const securityScrubCheckpointPolicySchema = z.object({
+  busyTimeoutMs: z.number().int().min(1).max(stateBusyTimeoutMs),
+  attempts: z.number().int().min(1).max(3),
+  backoffMs: z.number().int().min(0).max(1_000),
+}).strict();
+const defaultSecurityScrubCheckpointPolicy: SecurityScrubCheckpointPolicy = {
+  busyTimeoutMs: stateBusyTimeoutMs,
+  attempts: 3,
+  backoffMs: 100,
+};
 
 type StateDatabaseFileIdentity = Readonly<{ device: number; inode: number }>;
 
@@ -2389,17 +2410,25 @@ const requireQueueMessageScrub = (
 const completePendingSecurityScrub = (
   database: Database,
   operationCommitted = false,
+  policy: SecurityScrubCheckpointPolicy = defaultSecurityScrubCheckpointPolicy,
 ): void => {
   if (!hasPendingSecurityScrub(database)) return;
-  database.exec(`PRAGMA busy_timeout = ${securityScrubBusyTimeoutMs}`);
+  database.exec(`PRAGMA busy_timeout = ${policy.busyTimeoutMs}`);
   try {
     const truncateWal = (): void => {
-      requireWalMode(database);
-      const checkpoint = walCheckpointRowSchema.parse(
-        database.query("PRAGMA wal_checkpoint(TRUNCATE)").get(),
-      );
-      if (checkpoint.busy !== 0 || checkpoint.log !== 0 || checkpoint.checkpointed !== 0) {
-        throw new Error("SQLite could not truncate every WAL frame.");
+      // A readonly status read releases its snapshot well inside one attempt.
+      // A reader that outlives the whole bounded schedule still fails the
+      // scrub, so a settled body is never reported purged while frames remain.
+      for (let attempt = 1; ; attempt += 1) {
+        requireWalMode(database);
+        const checkpoint = walCheckpointRowSchema.parse(
+          database.query("PRAGMA wal_checkpoint(TRUNCATE)").get(),
+        );
+        if (checkpoint.busy === 0 && checkpoint.log === 0 && checkpoint.checkpointed === 0) return;
+        if (attempt >= policy.attempts) {
+          throw new Error("SQLite could not truncate every WAL frame.");
+        }
+        Bun.sleepSync(policy.backoffMs * 2 ** (attempt - 1));
       }
     };
 
@@ -3008,7 +3037,11 @@ const pruneAllUsageHistory = (database: Database, now: number): void => {
   }
 };
 
-const migrateWritableDatabase = (database: Database, now: () => number): void => {
+const migrateWritableDatabase = (
+  database: Database,
+  now: () => number,
+  securityScrubCheckpoint: SecurityScrubCheckpointPolicy = defaultSecurityScrubCheckpointPolicy,
+): void => {
   const initialVersion = readUserVersion(database);
   if (initialVersion > currentSchemaVersion) {
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
@@ -3414,7 +3447,7 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
     pruneAllUsageHistory(database, now());
     return hasPendingSecurityScrub(database);
   })();
-  if (securityScrubPending) completePendingSecurityScrub(database);
+  if (securityScrubPending) completePendingSecurityScrub(database, false, securityScrubCheckpoint);
 };
 
 const mapProfile = (row: unknown): ProfileRecord => {
@@ -3729,6 +3762,7 @@ export class StateStore {
   readonly #database: Database;
   readonly #now: () => number;
   readonly #readonly: boolean;
+  readonly #securityScrubCheckpoint: SecurityScrubCheckpointPolicy;
   #publicProviderIdentifierProjector: PublicProviderIdentifierProjector;
   readonly paths: StatePaths;
 
@@ -3737,10 +3771,16 @@ export class StateStore {
     now?: () => number;
     beforeDatabaseOpen?: (input: Readonly<{ flags: number; path: string }>) => void;
     publicProviderIdentifierProjector?: PublicProviderIdentifierProjector;
+    // Test-only. Shortens the scrub checkpoint wait so a pinned-reader test
+    // does not spend the production 5 s budget. Never passed by the CLI or daemon.
+    securityScrubCheckpoint?: SecurityScrubCheckpointPolicy;
   } = {}) {
     this.paths = paths;
     this.#now = options.now ?? Date.now;
     this.#readonly = options.readonly === true;
+    this.#securityScrubCheckpoint = options.securityScrubCheckpoint === undefined
+      ? defaultSecurityScrubCheckpointPolicy
+      : securityScrubCheckpointPolicySchema.parse(options.securityScrubCheckpoint);
     this.#publicProviderIdentifierProjector = options.publicProviderIdentifierProjector
       ?? processLocalPublicProviderIdentifierProjector;
     const databaseFile = prepareStateDatabaseFile(paths.database, this.#readonly);
@@ -3757,7 +3797,7 @@ export class StateStore {
       if (!options.readonly) {
         requireWalMode(this.#database, true);
         this.#database.exec("PRAGMA synchronous = FULL;");
-        migrateWritableDatabase(this.#database, this.#now);
+        migrateWritableDatabase(this.#database, this.#now, this.#securityScrubCheckpoint);
       } else {
         const version = readUserVersion(this.#database);
         if (version > currentSchemaVersion) throw new Error(`STATE_SCHEMA_NEWER:${version}:${currentSchemaVersion}`);
@@ -3765,7 +3805,10 @@ export class StateStore {
         if (hasPendingSecurityScrub(this.#database)) throw new Error("STATE_SECURITY_SCRUB_REQUIRED");
       }
       assertSchemaVersion24Objects(this.#database);
-      assertWorkSchema(this.#database);
+      // A readonly open skips the O(rows) foreign_key_check so `hra status`
+      // never pins a WAL snapshot long enough to block the writer's scrub.
+      if (this.#readonly) assertReadonlyWorkSchema(this.#database);
+      else assertWorkSchema(this.#database);
       assertCanonicalLabelKeys(this.#database);
       assertAccountRateLimitResetPolicies(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
@@ -4656,7 +4699,7 @@ export class StateStore {
     interactions: readonly InteractionRecord[];
     session: SessionRecord;
   }> {
-    completePendingSecurityScrub(this.#database);
+    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const accountId = profileIdSchema.parse(input.accountId);
     const providerGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
@@ -4753,7 +4796,7 @@ export class StateStore {
       };
     });
     const result = terminalize.immediate();
-    completePendingSecurityScrub(this.#database, true);
+    completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
     return result;
   }
 
@@ -4788,7 +4831,7 @@ export class StateStore {
       expectedRevision: number;
       resolution: "abandoned";
     }): SessionRecord {
-    completePendingSecurityScrub(this.#database);
+    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const expectedRevision = z.number().int().positive().parse(input.expectedRevision);
     const now = this.#now();
@@ -4857,7 +4900,7 @@ export class StateStore {
       if (changed.changes !== 1) throw new Error("SESSION_STATUS_RECOVERY_CAS_CONFLICT");
     });
     resolveRecovery.immediate();
-    completePendingSecurityScrub(this.#database, true);
+    completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
     return this.requireSession(sessionId);
   }
 
@@ -4978,7 +5021,7 @@ export class StateStore {
   }
 
   transitionQueue(id: QueueId, from: QueueState, to: QueueState): boolean {
-    completePendingSecurityScrub(this.#database);
+    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const parsedFrom = queueStateSchema.parse(from);
     const parsedTo = queueStateSchema.parse(to);
     if (!canTransitionQueue(parsedFrom, parsedTo)) {
@@ -4991,7 +5034,7 @@ export class StateStore {
       ).get(parsedTo, now, id, parsedFrom),
     );
     if (changed !== null && (parsedTo === "applied" || parsedTo === "failed" || parsedTo === "cancelled")) {
-      completePendingSecurityScrub(this.#database, true);
+      completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
     }
     return changed !== null;
   }
@@ -5134,7 +5177,7 @@ export class StateStore {
     runtimeProfile: EffectiveRuntimeProfile;
     receipt: unknown;
   }): void {
-    completePendingSecurityScrub(this.#database);
+    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const queueId = queueIdSchema.parse(input.queueId);
     const evidenceDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const profile = effectiveRuntimeProfileSchema.parse(input.runtimeProfile);
@@ -5175,7 +5218,7 @@ export class StateStore {
       }
     });
     complete.immediate();
-    completePendingSecurityScrub(this.#database, true);
+    completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
   }
 
   failQueueEffect(queueId: QueueId): boolean {
@@ -5212,7 +5255,7 @@ export class StateStore {
     receipt?: unknown;
     provider: { providerThreadId: string; title: string; status: "active" | "idle" | "terminal"; activeTurnId?: string; providerUpdatedAt?: number };
   }): SessionRecord {
-    completePendingSecurityScrub(this.#database);
+    completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const queueId = queueIdSchema.parse(input.queueId);
     const expectedDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const now = this.#now();
@@ -5261,7 +5304,7 @@ export class StateStore {
       );
     });
     resolve.immediate();
-    completePendingSecurityScrub(this.#database, true);
+    completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
     if (sessionId === undefined) throw new Error("Queue recovery lost its session authority.");
     return this.requireSession(sessionId);
   }
@@ -5488,6 +5531,93 @@ export class StateStore {
       return mapProfile(this.#database.query("SELECT * FROM profiles WHERE id=?").get(profileId));
     });
     return settle.immediate();
+  }
+
+  /**
+   * Records the effect evidence for an `account.login-cancel` attempt and moves
+   * it to `effect_started` in one transaction, bound to the exact pending login
+   * it will cancel. Restart recovery reads this evidence like every other kind.
+   */
+  beginLoginCancelMutationEffect(input: {
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    processGeneration: number;
+    loginId: string;
+  }): void {
+    const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
+    const parsedProfileId = profileIdSchema.parse(input.profileId);
+    const parsedGeneration = z.number().int().nonnegative().parse(input.processGeneration);
+    const evidence = mutationEffectEvidenceSchema.parse({
+      kind: "account.login-cancel",
+      loginId: input.loginId,
+    } satisfies MutationEffectEvidence) as Extract<MutationEffectEvidence, { kind: "account.login-cancel" }>;
+    const canonical = JSON.stringify(evidence);
+    const digest = createHash("sha256").update(canonical).digest("hex");
+    const now = this.#now();
+    const begin = this.#database.transaction(() => {
+      const row = z.object({
+        kind: z.literal("account.login-cancel"),
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative(),
+        state: z.literal("prepared"),
+        process_generation: z.number().int().nonnegative(),
+        profile_state: z.literal("login_pending"),
+      }).strict().parse(
+        this.#database.query(`SELECT m.kind,m.authority_id,m.authority_generation,m.state,p.process_generation,p.state AS profile_state
+                              FROM mutation_attempts m JOIN profiles p ON p.id=m.authority_id WHERE m.id=?`).get(parsedAttemptId),
+      );
+      if (
+        row.authority_id !== parsedProfileId
+        || row.authority_generation !== parsedGeneration
+        || row.process_generation !== parsedGeneration
+      ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      const authority = this.readPendingLoginAuthority(parsedProfileId, parsedGeneration);
+      if (authority === null || authority.loginId !== evidence.loginId) {
+        throw new Error("LOGIN_CANCEL_AUTHORITY_MISMATCH");
+      }
+      this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
+      const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
+      if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+    });
+    begin.immediate();
+  }
+
+  /**
+   * Resolves an indeterminate `account.login-cancel` attempt from an exact
+   * provider account read. The cancellation changes no local state on its
+   * own: a signed-in read proves the login completed, and a signed-out read
+   * leaves the pending login where a fresh cancellation can settle it. The
+   * attempt is never replayed.
+   */
+  resolveLoginCancelMutation(input: {
+    attemptId: AttemptId;
+    expectedOriginalState: "effect_started" | "ambiguous";
+    provider: { signedIn: boolean };
+  }): void {
+    const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
+    const expectedState = z.enum(["effect_started", "ambiguous"]).parse(input.expectedOriginalState);
+    const provider = z.object({ signedIn: z.boolean() }).strict().parse(input.provider);
+    const now = this.#now();
+    const resolveAttempt = this.#database.transaction(() => {
+      const row = z.object({
+        kind: z.literal("account.login-cancel"),
+        state: z.enum(["effect_started", "ambiguous"]),
+      }).strict().parse(
+        this.#database.query(`SELECT m.kind,m.state FROM mutation_attempts m
+                              LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+                              WHERE m.id=? AND r.attempt_id IS NULL`).get(parsedAttemptId),
+      );
+      if (row.state !== expectedState) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
+      const inserted = this.#database.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(
+        parsedAttemptId,
+        "provider_state_reconciled",
+        JSON.stringify({ source: "account/read", signedIn: provider.signedIn }),
+        null,
+        now,
+      );
+      if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
+    });
+    resolveAttempt.immediate();
   }
 
   prepareMutation(input: { kind: string; authorityId: string; authorityGeneration: number; request: unknown; idempotencyKey?: string | undefined }): { id: AttemptId; state: MutationState; replay: boolean; result?: unknown } {
@@ -6005,7 +6135,7 @@ export class StateStore {
               authorityResolved = true;
             }
           }
-        } else if (["account.login", "account.logout"].includes(kind)) {
+        } else if (["account.login", "account.logout", "account.login-cancel"].includes(kind)) {
           const parsedProfile = profileIdSchema.safeParse(authorityId);
           if (parsedProfile.success) {
             const profile = this.#database

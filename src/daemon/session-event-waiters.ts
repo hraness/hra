@@ -63,17 +63,30 @@ export class SessionEventWaiters {
     this.#waiters.add(waiter);
     try {
       if (input.readObservedThrough() !== input.expectedObservedThrough) return "changed";
-      const outcome = await new Promise<"changed" | "timeout">((resolve, reject) => {
-        const timer = setTimeout(() => resolve("timeout"), input.waitMs);
-        timer.unref();
-        const onAbort = () => reject(input.signal.reason);
-        input.signal.addEventListener("abort", onAbort, { once: true });
-        void changed.then(() => resolve("changed")).finally(() => {
+      return await new Promise<"changed" | "timeout">((resolve, reject) => {
+        // Every exit releases the timer and the abort listener. The timeout
+        // and abort branches used to leave them behind until the session
+        // changed, which leaked one listener per expired long poll.
+        let completed = false;
+        const finish = (outcome: "changed" | "timeout") => {
+          if (completed) return;
+          completed = true;
           clearTimeout(timer);
           input.signal.removeEventListener("abort", onAbort);
-        });
+          resolve(outcome);
+        };
+        const timer = setTimeout(() => finish("timeout"), input.waitMs);
+        timer.unref();
+        const onAbort = () => {
+          if (completed) return;
+          completed = true;
+          clearTimeout(timer);
+          input.signal.removeEventListener("abort", onAbort);
+          reject(input.signal.reason);
+        };
+        input.signal.addEventListener("abort", onAbort, { once: true });
+        void changed.then(() => finish("changed"));
       });
-      return outcome;
     } finally {
       resolved = true;
       this.#waiters.delete(waiter);

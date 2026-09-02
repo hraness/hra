@@ -6,8 +6,12 @@ import {
   CliUsageError,
   completeProtectedAuthLogin,
   completeProtectedInteraction,
+  helpGroupNames,
   parseCli,
   requestsJsonlOutput,
+  resolveUsage,
+  usage,
+  usageForGroup,
 } from "./parser";
 
 describe("CLI parser", () => {
@@ -1098,5 +1102,102 @@ describe("CLI parser", () => {
       }),
       { numRuns: 1_000 },
     );
+  });
+});
+
+describe("CLI help", () => {
+  const sessionEventsHelp = [
+    "HRA session events",
+    "",
+    "Usage:",
+    "  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
+    "",
+    "Examples:",
+    "  hra session events my-session --wait-ms 30000 --jsonl",
+  ].join("\n");
+
+  test("parses --help, -h, and the help alias at root, group, and leaf depth", () => {
+    expect(parseCli([])).toEqual({ json: false, kind: "help" });
+    expect(parseCli(["--help"])).toEqual({ json: false, kind: "help" });
+    expect(parseCli(["-h"])).toEqual({ json: false, kind: "help" });
+    expect(parseCli(["help"])).toEqual({ json: false, kind: "help" });
+    expect(parseCli(["session", "--help"])).toEqual({ group: "session", json: false, kind: "help" });
+    expect(parseCli(["help", "session"])).toEqual({ group: "session", json: false, kind: "help" });
+    expect(parseCli(["session", "events", "--help"])).toEqual({ group: "session", json: false, kind: "help", leaf: "events" });
+    expect(parseCli(["session", "events", "my-session", "--help"])).toEqual({ group: "session", json: false, kind: "help", leaf: "events" });
+    expect(parseCli(["help", "session", "events"])).toEqual({ group: "session", json: false, kind: "help", leaf: "events" });
+    expect(parseCli(["--json", "--help"])).toEqual({ json: true, kind: "help" });
+    expect(parseCli(["--json", "help", "work", "protocol"])).toEqual({ group: "work", json: true, kind: "help", leaf: "protocol" });
+  });
+
+  test("parses --version with and without --json", () => {
+    expect(parseCli(["--version"])).toEqual({ json: false, kind: "version" });
+    expect(parseCli(["-v"])).toEqual({ json: false, kind: "version" });
+    expect(parseCli(["--version", "--json"])).toEqual({ json: true, kind: "version" });
+    expect(parseCli(["--json", "--version"])).toEqual({ json: true, kind: "version" });
+    expect(() => parseCli(["--version", "extra"])).toThrow(CliUsageError);
+  });
+
+  test("resolves leaf help to only that leaf plus the group's shared notes", () => {
+    expect(resolveUsage("session", "events")).toEqual({ group: "session", leaf: "events", usage: sessionEventsHelp });
+    expect(usageForGroup("session", "events")).toBe(sessionEventsHelp);
+    expect(usageForGroup("session", "events")).not.toContain("hra session watch");
+    expect(usageForGroup("session", "events")).not.toContain("hra session start");
+
+    const decide = resolveUsage("interaction", "decide");
+    expect(decide).toMatchObject({ group: "interaction", leaf: "decide" });
+    expect(decide.usage).toContain("Usage:\n  hra interaction decide <interaction-id> --revision <n> --decision <once|session|decline|cancel>\n\n");
+    expect(decide.usage).toContain("Protected values are accepted only through stdin or an explicit file descriptor.");
+    expect(decide.usage).toContain("Examples:\n  hra interaction decide <id> --revision 1 --decision once");
+    expect(decide.usage).not.toContain("hra interaction answer <id>");
+    expect(decide.usage).not.toContain("hra interaction list");
+
+    const send = resolveUsage("session", "send");
+    expect(send.usage).toContain("  hra session send|queue|steer <session> <message>");
+    expect(send.usage).toContain('  hra session send my-session -- "run --help exactly"');
+    expect(send.usage).not.toContain("hra session events");
+
+    const note = resolveUsage("session", "note");
+    expect(note.usage).toContain("  hra session note get|edit|clear <session>\n  hra session note set <session> <note>");
+    expect(note.usage).not.toContain("Examples:");
+  });
+
+  test("falls back without echoing unknown groups or leaves", () => {
+    expect(resolveUsage(undefined)).toEqual({ usage });
+    expect(resolveUsage("bogus")).toEqual({ usage });
+    expect(resolveUsage("bogus", "events")).toEqual({ usage });
+    expect(resolveUsage("session", "bogus")).toEqual({ group: "session", usage: usageForGroup("session") });
+    expect(resolveUsage("session", "")).toEqual({ group: "session", usage: usageForGroup("session") });
+    expect(resolveUsage("session", "hra")).toEqual({ group: "session", usage: usageForGroup("session") });
+    expect(resolveUsage("session", "session")).toEqual({ group: "session", usage: usageForGroup("session") });
+  });
+
+  test("root help uses ASCII quotes and names the help alias", () => {
+    expect(usage).not.toMatch(/[\u2018\u2019\u201c\u201d]/u);
+    expect(usage).toContain("  hra help [<group> [<command>]]\n");
+    expect(usage).toContain("Run `hra <group> --help` or `hra help <group> [<command>]` for command examples.");
+    for (const group of helpGroupNames) expect(usage).toContain(`hra ${group}`);
+  });
+
+  test("every group leaf named in a usage line resolves to help holding exactly its own usage lines", () => {
+    let leaves = 0;
+    for (const group of helpGroupNames) {
+      const groupHelp = usageForGroup(group);
+      const usageLines = groupHelp.split("\n").filter((line) => line.startsWith(`  hra ${group} `));
+      const leafNames = new Set(usageLines.flatMap((line) => line.trim().split(/\s+/u)[2]?.split("|") ?? []));
+      for (const leaf of leafNames) {
+        if (leaf.startsWith("<") || leaf.startsWith("[") || leaf.startsWith("-")) continue;
+        leaves += 1;
+        const resolved = resolveUsage(group, leaf);
+        expect(resolved).toMatchObject({ group, leaf });
+        expect(resolved.usage.startsWith(`HRA ${group} ${leaf}\n\nUsage:\n  hra ${group} `)).toBe(true);
+        const resolvedLines = new Set(resolved.usage.split("\n"));
+        for (const line of usageLines) {
+          const named = line.trim().split(/\s+/u)[2]?.split("|").includes(leaf) ?? false;
+          expect(resolvedLines.has(line)).toBe(named);
+        }
+      }
+    }
+    expect(leaves).toBeGreaterThan(60);
   });
 });

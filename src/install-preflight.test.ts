@@ -438,9 +438,17 @@ const runInstaller = async (root: string): Promise<Readonly<{
   });
 };
 
+// The local runtime is verified against its own bytes, the way the public
+// command verifies the tagged runtime against the digest it carries. Release
+// consistency between the two is proven by scripts/check-install-pins.ts under
+// a tag ref.
+const localRuntimeSha256 = createHash("sha256")
+  .update(await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts")))
+  .digest("hex");
+
 const runTrustedLoader = async (
   root: string,
-  sourceSha256 = HRA_INSTALL_PREFLIGHT_SOURCE_SHA256,
+  sourceSha256 = localRuntimeSha256,
 ): Promise<Readonly<{
   exitCode: number;
   stderr: string;
@@ -451,7 +459,7 @@ const runTrustedLoader = async (
   const child = trackDirectTestChild(Bun.spawn([
     process.execPath,
     "-e",
-    sourceSha256 === HRA_INSTALL_PREFLIGHT_SOURCE_SHA256
+    sourceSha256 === localRuntimeSha256
       ? BOUNDED_TEST_PREFLIGHT_LOADER
       : HRA_INSTALL_PREFLIGHT_LOADER,
     "--",
@@ -691,9 +699,10 @@ describe("transactional HRA installer", () => {
       "https://github.com/hraness/hra/releases/download/v0.1.6/hraness-hra-0.1.6.tgz",
     );
     const runtimeBytes = await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts"));
-    expect(createHash("sha256").update(runtimeBytes).digest("hex")).toBe(
-      HRA_INSTALL_PREFLIGHT_SOURCE_SHA256,
-    );
+    // The public digest names the runtime at the released tag; the working
+    // tree may differ between releases. check-install-pins.ts proves equality
+    // under a tag ref.
+    expect(HRA_INSTALL_PREFLIGHT_SOURCE_SHA256).toMatch(/^[0-9a-f]{64}$/u);
     const runtimeSource = runtimeBytes.toString("utf8");
     expect(runtimeSource).not.toContain('"libc.so.6"');
     expect(runtimeSource).not.toContain('"libc.musl-x86_64.so.1"');

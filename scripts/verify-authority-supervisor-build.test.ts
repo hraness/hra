@@ -61,7 +61,14 @@ describe("authority supervisor build verifier", () => {
     expect(workflow).toContain("70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00");
     expect(workflow).toContain("sha256sum --check --status");
     expect(workflow).toMatch(/verify-authority-supervisor-build\.ts\s+--zig/u);
-    expect(workflow).toContain("authority-supervisor-runtime.test.ts --isolate --max-concurrency=1");
+    // The runtime custody test runs once, inside the gate's `bun test ./scripts`.
+    expect(workflow).not.toContain("authority-supervisor-runtime.test.ts");
+    const packageScripts = (JSON.parse(await readFile(
+      join(import.meta.dir, "..", "package.json"),
+      "utf8",
+    )) as { scripts: Record<string, string> }).scripts;
+    expect(packageScripts.check).toContain("bun run test");
+    expect(packageScripts.test).toContain("bun test ./scripts --isolate --max-concurrency=1");
     expect(workflow).not.toContain("setup-zig");
     const enable = workflow.indexOf(
       "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=0",
@@ -69,17 +76,13 @@ describe("authority supervisor build verifier", () => {
     const probe = workflow.indexOf(
       "/usr/bin/unshare --user --map-root-user --fork /usr/bin/true",
     );
-    const runtime = workflow.indexOf(
-      "authority-supervisor-runtime.test.ts --isolate --max-concurrency=1",
-    );
     const repositoryGate = workflow.indexOf("run: bun run check");
     const restore = workflow.indexOf(
       "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=1",
     );
     expect(enable).toBeGreaterThan(-1);
     expect(enable).toBeLessThan(probe);
-    expect(probe).toBeLessThan(runtime);
-    expect(runtime).toBeLessThan(repositoryGate);
+    expect(probe).toBeLessThan(repositoryGate);
     expect(repositoryGate).toBeLessThan(restore);
   });
 });

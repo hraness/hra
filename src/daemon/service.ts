@@ -3,8 +3,12 @@ import { resolve } from "node:path";
 
 import { z } from "zod";
 
-import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
-import { AccountKeyLossPreconditionError } from "../cloud/local-control";
+import {
+  AccountKeyLossPreconditionError,
+  CloudProjectionRecoveryAdmissionError,
+  KeyRotationRequiredError,
+} from "../domain/cloud-outcomes";
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- D4 extracts the provider port; until then the daemon composes the pinned Codex runtime directly.
 import {
   CodexError,
   IndeterminateCodexEffectError,
@@ -428,6 +432,15 @@ const loginReceiptSchema = z.discriminatedUnion("status", [
   }).strict(),
 ]);
 const logoutReceiptSchema = z.object({ loggedOut: z.literal(true) }).strict();
+const loginCancelReceiptSchema = z.object({
+  loginId: z.string().min(1).max(512).refine((value) => !/\p{Cc}/u.test(value)),
+  providerStatus: z.enum(["canceled", "not_found"]),
+  provider: z.object({
+    signedIn: z.boolean(),
+    email: z.string().max(1_024).optional(),
+    plan: z.string().max(128).optional(),
+  }).strict(),
+}).strict();
 const sessionStartReceiptSchema = z.object({
   sessionId: sessionIdSchema,
   sourceId: z.string().min(1).max(200).optional(),
@@ -537,6 +550,43 @@ const restoreLoginReceipt = (value: unknown): LoginOutcome => {
   };
 };
 
+/** Background tasks that swallow their own rejection record one of these closed codes. */
+export const BACKGROUND_DIAGNOSTIC_CODES = [
+  "account_fact_apply_failed",
+  "queue_dispatch_failed",
+  "queue_pre_effect_retry_failed",
+  "recovery_observation_failed",
+  "usage_refresh_failed",
+  "usage_poll_account_failed",
+  "usage_poll_tick_failed",
+] as const;
+export type BackgroundDiagnosticCode = (typeof BACKGROUND_DIAGNOSTIC_CODES)[number];
+export type BackgroundDiagnosticCause =
+  | "aborted"
+  | "authority_unsafe"
+  | "command_failure"
+  | "indeterminate"
+  | "scrub_required"
+  | "error";
+export type BackgroundDiagnostic = Readonly<{
+  code: BackgroundDiagnosticCode;
+  cause: BackgroundDiagnosticCause;
+  count: number;
+  observedAt: number;
+}>;
+
+const classifyBackgroundDiagnosticCause = (error: unknown): BackgroundDiagnosticCause => {
+  if (error instanceof StateSecurityScrubRequiredError) return "scrub_required";
+  if (error instanceof DaemonAuthoritySafetyError) return "authority_unsafe";
+  if (error instanceof IndeterminateCodexEffectError || error instanceof IndeterminateLocalCommitError) return "indeterminate";
+  if (error instanceof CommandFailure) return "command_failure";
+  if (error instanceof Error && error.name === "AbortError") return "aborted";
+  return "error";
+};
+
+/** Upper bound on remembered per-session fact epochs; oldest entries are dropped first. */
+const SESSION_FACT_EPOCH_LIMIT = 4_096;
+
 export class HraService {
   readonly #store: StateStore;
   readonly #paths: StatePaths;
@@ -559,6 +609,8 @@ export class HraService {
   readonly #operations = new Set<Promise<void>>();
   readonly #projectionRecoveriesInFlight = new Set<string>();
   readonly #sessionFactEpochs = new Map<string, number>();
+  readonly #backgroundDiagnostics = new Map<BackgroundDiagnosticCode, BackgroundDiagnostic>();
+  #lastBackgroundDiagnostic: BackgroundDiagnostic | null = null;
   readonly #sessionProviderConnections = new Map<string, string>();
   readonly #sessionObservationFailures = new Map<string, string>();
   readonly #sessionResubscriptionConnections = new Map<string, string>();
@@ -705,7 +757,7 @@ export class HraService {
         case "account.add": return await this.#addAccount(command.label);
         case "account.show": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#showAccount(profile.id, context.signal)); }
         case "account.login": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#login(profile.id, command.deviceCode, command.idempotencyKey, context.signal)); }
-        case "account.login-cancel": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#cancelLogin(profile.id, context.signal)); }
+        case "account.login-cancel": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#cancelLogin(profile.id, command.idempotencyKey, context.signal)); }
         case "account.logout": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#logout(profile.id, command.idempotencyKey, context.signal)); }
         case "account.usage": {
           if (command.account === undefined) return await this.#usage(undefined, command.refresh, context.signal);
@@ -971,6 +1023,13 @@ export class HraService {
           case "WORK_NOT_ACTIVE":
             throw new CommandFailure("CONFLICT", error.message, details);
         }
+      }
+      if (error instanceof KeyRotationRequiredError) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          `${error.message} Inspect the account key with \`hra auth status\` and rotate it through the account-key recovery flow it names.`,
+          { nextCommand: "hra auth status", reason: error.code },
+        );
       }
       if (error instanceof AccountKeyLossPreconditionError) {
         switch (error.code) {
@@ -1280,6 +1339,67 @@ export class HraService {
     }
   }
 
+  /**
+   * Records that a background task failed. Only the closed code and a closed
+   * cause class are kept; error text never enters the record.
+   */
+  recordBackgroundDiagnostic(code: BackgroundDiagnosticCode, error?: unknown): void {
+    if (this.#state !== "open") return;
+    const previous = this.#backgroundDiagnostics.get(code);
+    const diagnostic: BackgroundDiagnostic = {
+      code,
+      cause: classifyBackgroundDiagnosticCause(error),
+      count: Math.min((previous?.count ?? 0) + 1, Number.MAX_SAFE_INTEGER),
+      observedAt: this.#now(),
+    };
+    this.#backgroundDiagnostics.set(code, diagnostic);
+    this.#lastBackgroundDiagnostic = diagnostic;
+  }
+
+  backgroundDiagnostics(): Readonly<{
+    last: BackgroundDiagnostic | null;
+    byCode: readonly BackgroundDiagnostic[];
+  }> {
+    return {
+      last: this.#lastBackgroundDiagnostic,
+      byCode: [...this.#backgroundDiagnostics.values()]
+        .sort((left, right) => left.code.localeCompare(right.code)),
+    };
+  }
+
+  #bumpSessionFactEpoch(sessionId: string): void {
+    const next = (this.#sessionFactEpochs.get(sessionId) ?? 0) + 1;
+    this.#sessionFactEpochs.delete(sessionId);
+    this.#sessionFactEpochs.set(sessionId, next);
+    this.#boundSessionFactEpochs();
+  }
+
+  /** Snapshots the epoch before a dispatch. The entry is created so a later absence reads as a change. */
+  #snapshotSessionFactEpoch(sessionId: string): number {
+    const current = this.#sessionFactEpochs.get(sessionId);
+    if (current !== undefined) return current;
+    this.#sessionFactEpochs.set(sessionId, 0);
+    this.#boundSessionFactEpochs();
+    return this.#sessionFactEpochs.get(sessionId) ?? -1;
+  }
+
+  /** Reads the epoch after a dispatch. A pruned or evicted entry never matches a snapshot. */
+  #currentSessionFactEpoch(sessionId: string): number {
+    return this.#sessionFactEpochs.get(sessionId) ?? -1;
+  }
+
+  #forgetSessionFactEpoch(sessionId: string): void {
+    this.#sessionFactEpochs.delete(sessionId);
+  }
+
+  #boundSessionFactEpochs(): void {
+    while (this.#sessionFactEpochs.size > SESSION_FACT_EPOCH_LIMIT) {
+      const oldest = this.#sessionFactEpochs.keys().next();
+      if (oldest.done === true) return;
+      this.#sessionFactEpochs.delete(oldest.value);
+    }
+  }
+
   /** Runs one bounded deadline batch. Exposed for deterministic daemon tests. */
   async maintainInteractionDeadlines(): Promise<{ examined: number; failed: number }> {
     if (this.#interactionDeadlineMaintenanceStopped()) {
@@ -1496,7 +1616,13 @@ export class HraService {
       await this.#daemonAuthority.assertCurrent();
       if (recoveryUnsettled || this.#profileHasProjectionRecoveryInFlight(profile.id)) return;
       const apply = async (): Promise<void> => {
-        const current = this.#store.requireProfileById(profile.id);
+        let current: ProfileRecord;
+        try {
+          current = this.#store.requireProfileById(profile.id);
+        } catch (error: unknown) {
+          if (error instanceof SelectionError && error.code === "NOT_FOUND") return;
+          throw error;
+        }
         if (
           current.processGeneration !== authority.generation
           || this.#profileHasProjectionRecoveryInFlight(profile.id)
@@ -1518,8 +1644,27 @@ export class HraService {
         );
         this.#notifyAffectedWork(stateChange.affectedWorkIds);
       };
-      if (this.#mutationTails.has(`account:${profile.id}`)) await apply();
-      else await this.#serialize(`account:${profile.id}`, apply);
+      const accountKey = `account:${profile.id}`;
+      if (!this.#mutationTails.has(accountKey)) {
+        await this.#serialize(accountKey, apply);
+        return;
+      }
+      // An account mutation holds the tail, and this callback may be awaited
+      // inside that mutation's own provider call, so it cannot wait its turn.
+      // Queue the fact behind the tail instead of applying it now: a signed-in
+      // fact written mid-login would move the profile out of `login_pending`
+      // under a commit that requires that exact state, which quarantined the
+      // account for a login that succeeded.
+      const queued = this.#serialize(accountKey, apply);
+      const tracked = queued.then(
+        () => undefined,
+        (error: unknown) => {
+          if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+          else this.recordBackgroundDiagnostic("account_fact_apply_failed", error);
+        },
+      );
+      this.#background.add(tracked);
+      void tracked.then(() => this.#background.delete(tracked));
     } catch (error: unknown) {
       if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
       throw error;
@@ -1733,7 +1878,7 @@ export class HraService {
       const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, authority));
       const tracked = task.then(
         () => undefined,
-        () => undefined,
+        (error: unknown) => this.recordBackgroundDiagnostic("queue_dispatch_failed", error),
       );
       this.#background.add(tracked);
       void tracked.then(() => this.#background.delete(tracked));
@@ -1753,7 +1898,7 @@ export class HraService {
       providerGeneration: authority.generation,
       providerConnectionId: fact.connectionId ?? null,
     }));
-    this.#sessionFactEpochs.set(current.id, (this.#sessionFactEpochs.get(current.id) ?? 0) + 1);
+    this.#bumpSessionFactEpoch(current.id);
     const terminal = this.#store.terminalizeSessionFromProviderDeletion({
       accountId: authority.id,
       providerConnectionId: fact.connectionId ?? null,
@@ -2054,7 +2199,7 @@ export class HraService {
       || (current.state === "recovery_required" && fact.type !== "threadDeleted")
       || this.#projectionRecoveriesInFlight.has(current.id)
     ) return false;
-    this.#sessionFactEpochs.set(current.id, (this.#sessionFactEpochs.get(current.id) ?? 0) + 1);
+    this.#bumpSessionFactEpoch(current.id);
     if (fact.type === "threadDeleted") return false;
     if (fact.type === "turnStarted") {
       this.#store.reconcileSessionFromProvider({ sessionId: current.id, state: "active", activeTurnId: fact.turn.id });
@@ -2499,6 +2644,9 @@ export class HraService {
         },
       };
     }
+    if (profile.state === "recovery_required" || profile.state === "login_pending") {
+      this.#resolveUnsettledLoginCancellations(profile, account);
+    }
     if (profile.state === "recovery_required") {
       const unsettled = this.#store.listUnsettledMutations({ authorityId: profile.id })
         .filter((attempt) => attempt.authorityGeneration === profile.processGeneration && (attempt.kind === "account.login" || attempt.kind === "account.logout"));
@@ -2579,6 +2727,24 @@ export class HraService {
       throw new CommandFailure("CONFLICT", "Account generation changed during reconciliation.");
     }
     return { account: this.#publicProfile(this.#store.requireProfile(profile.id)) };
+  }
+
+  /**
+   * An indeterminate login cancellation changes no local state on its own. The
+   * exact account read settles it: a signed-in read proves the login finished,
+   * and a signed-out read leaves the pending login for a fresh cancellation.
+   */
+  #resolveUnsettledLoginCancellations(profile: ProfileRecord, account: CodexAccountProjection): void {
+    for (const attempt of this.#store.listUnsettledMutations({ authorityId: profile.id })) {
+      if (attempt.kind !== "account.login-cancel" || attempt.authorityGeneration !== profile.processGeneration) continue;
+      const originalState = attempt.originalState ?? attempt.state;
+      if (originalState !== "effect_started" && originalState !== "ambiguous") continue;
+      this.#store.resolveLoginCancelMutation({
+        attemptId: attempt.id,
+        expectedOriginalState: originalState,
+        provider: { signedIn: account.signedIn },
+      });
+    }
   }
 
   async #login(selector: string, deviceCode: boolean, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
@@ -2704,9 +2870,25 @@ export class HraService {
     }
   }
 
-  async #cancelLogin(selector: string, signal: AbortSignal): Promise<unknown> {
+  async #cancelLogin(selector: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(selector);
     await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
+    const key = idempotencyKey ?? randomUUID();
+    const prior = this.#store.readMutation(key);
+    if (prior !== null && (prior.kind !== "account.login-cancel" || prior.authorityId !== profile.id)) {
+      throw new CommandFailure("CONFLICT", "The idempotency key belongs to another mutation authority.");
+    }
+    if (prior?.state === "applied") {
+      // A replay returns the recorded settlement without another provider call.
+      const receipt = loginCancelReceiptSchema.parse(prior.result);
+      return {
+        account: this.#publicProfile(profile),
+        loginId: receipt.loginId,
+        providerStatus: receipt.providerStatus,
+        status: receipt.provider.signedIn ? "signed_in" : "canceled",
+        idempotencyKey: key,
+      };
+    }
     if (profile.state === "recovery_required") {
       throw new CommandFailure(
         "RECOVERY_REQUIRED",
@@ -2729,46 +2911,78 @@ export class HraService {
         "The pending login has no exact durable provider login authority and cannot be canceled automatically.",
       );
     }
-    const authority = authorityFor(this.#paths, profile);
-    const canceled = await this.#fencedEffect(async () => await this.#codex.cancelLogin({
-      authority,
-      loginId: login.loginId,
-      signal,
-    }));
-    const provider = await this.#fencedEffect(async () => await this.#codex.readAccount({
-      authority,
-      signal,
-    }));
-    const observed = this.#store.requireProfileById(profile.id);
-    if (observed.processGeneration !== profile.processGeneration) {
-      throw new CommandFailure("CONFLICT", "The login cancellation belongs to a stale account generation.");
-    }
-    if (observed.state === "signed_in") {
-      return { account: this.#publicProfile(observed), loginId: login.loginId, status: "signed_in" };
-    }
-    if (observed.state === "signed_out") {
-      return { account: this.#publicProfile(observed), loginId: login.loginId, status: "already_settled" };
-    }
-    let settled: ProfileRecord;
-    try {
-      settled = this.#store.settlePendingLogin({
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-        loginId: login.loginId,
-        providerStatus: canceled.status,
-        provider,
-      });
-    } catch {
+    const unsettledCancellations = this.#store.listUnsettledMutations({ authorityId: profile.id })
+      .filter((attempt) => attempt.kind === "account.login-cancel" && attempt.authorityGeneration === profile.processGeneration);
+    if (unsettledCancellations.length > 0) {
       throw new CommandFailure(
         "RECOVERY_REQUIRED",
-        "The exact login cancellation could not be committed under its original authority.",
+        "An earlier cancellation of this login is indeterminate. Run `hra account show` to reconcile it before canceling again.",
+        { idempotencyKey: key },
       );
     }
+    const authority = authorityFor(this.#paths, profile);
+    // The attempt is recorded before the provider call, like every other Codex
+    // mutation, so a crash between dispatch and settlement is visible to
+    // restart recovery instead of leaving an unledgered cancellation.
+    const receipt = await this.#effect({
+      kind: "account.login-cancel",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+      request: { loginId: login.loginId },
+      idempotencyKey: key,
+      beginEffect: (attemptId) => {
+        this.#store.beginLoginCancelMutationEffect({
+          attemptId,
+          profileId: profile.id,
+          processGeneration: profile.processGeneration,
+          loginId: login.loginId,
+        });
+      },
+      effect: async () => {
+        const canceled = await this.#fencedEffect(async () => await this.#codex.cancelLogin({
+          authority,
+          loginId: login.loginId,
+          signal,
+        }));
+        const provider = await this.#fencedEffect(async () => await this.#codex.readAccount({
+          authority,
+          signal,
+        }));
+        return loginCancelReceiptSchema.parse({
+          loginId: login.loginId,
+          providerStatus: canceled.status,
+          provider: {
+            signedIn: provider.signedIn,
+            ...(provider.email === undefined ? {} : { email: provider.email }),
+            ...(provider.plan === undefined ? {} : { plan: provider.plan }),
+          },
+        });
+      },
+      receipt: (value) => loginCancelReceiptSchema.parse(value),
+      restore: (value) => loginCancelReceiptSchema.parse(value),
+      commit: (attemptId, value, recorded) => {
+        this.#store.settlePendingLogin({
+          profileId: profile.id,
+          processGeneration: profile.processGeneration,
+          loginId: value.loginId,
+          providerStatus: value.providerStatus,
+          provider: {
+            signedIn: value.provider.signedIn,
+            ...(value.provider.email === undefined ? {} : { email: value.provider.email }),
+            ...(value.provider.plan === undefined ? {} : { plan: value.provider.plan }),
+          },
+        });
+        if (!this.#store.transitionMutation(attemptId, "effect_started", "applied", recorded)) {
+          throw new Error("LOGIN_CANCEL_MUTATION_CAS_CONFLICT");
+        }
+      },
+    });
     return {
-      account: this.#publicProfile(settled),
-      loginId: login.loginId,
-      providerStatus: canceled.status,
-      status: provider.signedIn ? "signed_in" : "canceled",
+      account: this.#publicProfile(this.#store.requireProfileById(profile.id)),
+      loginId: receipt.loginId,
+      providerStatus: receipt.providerStatus,
+      status: receipt.provider.signedIn ? "signed_in" : "canceled",
+      idempotencyKey: key,
     };
   }
 
@@ -3566,6 +3780,9 @@ export class HraService {
     session: SessionRecord,
     reason: "abandon" | "archive" = "archive",
   ): Promise<void> {
+    // A terminal session dispatches nothing more, so its fact epoch is no
+    // longer consulted. Dropping it keeps the map bounded by live sessions.
+    this.#forgetSessionFactEpoch(session.id);
     this.#terminalFactsMemoryRevision += 1;
     await this.#cleanupFactsMemory(session, reason);
   }
@@ -3643,7 +3860,7 @@ export class HraService {
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettled(session.id);
     await this.#daemonAuthority.assertCurrent();
-    const observationFactEpoch = this.#sessionFactEpochs.get(session.id) ?? 0;
+    const observationFactEpoch = this.#snapshotSessionFactEpoch(session.id);
     const providerThreadId = session.providerThreadId;
     const authority = authorityFor(this.#paths, profile);
     let observation: CodexSessionObservation;
@@ -3723,7 +3940,7 @@ export class HraService {
     if (
       !projectionRecoveryUnsettled
       && !this.#projectionRecoveriesInFlight.has(session.id)
-      && (this.#sessionFactEpochs.get(session.id) ?? 0) === observationFactEpoch
+      && this.#currentSessionFactEpoch(session.id) === observationFactEpoch
     ) {
       const beforeState = session.state;
       const beforeActiveTurnId = session.activeTurnId ?? null;
@@ -5395,14 +5612,14 @@ export class HraService {
         },
       });
       dispatchSessionRevision = this.#store.requireSession(session.id).revision;
-      dispatchFactEpoch = this.#sessionFactEpochs.get(session.id) ?? 0;
+      dispatchFactEpoch = this.#snapshotSessionFactEpoch(session.id);
     }, receipt: (value) => turnStartReceiptSchema.parse(value), restore: (value) => turnStartReceiptSchema.parse(value), commit: (attemptId, _value, receipt) => {
       if (startedResult === undefined || dispatchSessionRevision === undefined || dispatchFactEpoch === undefined) throw new Error("Session turn commit lost its exact provider result, local revision, or fact epoch.");
       this.#store.completeSessionTurnEffect({
         attemptId,
         sessionId: session.id,
         expectedSessionRevision: dispatchSessionRevision,
-        applyResponseState: (this.#sessionFactEpochs.get(session.id) ?? 0) === dispatchFactEpoch,
+        applyResponseState: this.#currentSessionFactEpoch(session.id) === dispatchFactEpoch,
         turnId: startedResult.turnId,
         turnStatus: startedResult.status,
         runtimeProfile: startedResult.effectiveRuntimeProfile,
@@ -5483,7 +5700,7 @@ export class HraService {
     const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, authorityFor(this.#paths, profile)));
     const tracked = task.then(
       () => undefined,
-      () => undefined,
+      (error: unknown) => this.recordBackgroundDiagnostic("queue_dispatch_failed", error),
     );
     this.#background.add(tracked);
     void tracked.then(() => this.#background.delete(tracked));
@@ -5503,12 +5720,12 @@ export class HraService {
             );
           },
           { allowDuringProjectionRecovery: true },
-        ).catch(() => undefined);
+        ).catch((error: unknown) => this.recordBackgroundDiagnostic("recovery_observation_failed", error));
       }
     })();
     const tracked = task.then(
       () => undefined,
-      () => undefined,
+      (error: unknown) => this.recordBackgroundDiagnostic("recovery_observation_failed", error),
     );
     this.#background.add(tracked);
     void tracked.then(() => this.#background.delete(tracked));
@@ -5548,7 +5765,7 @@ export class HraService {
     })();
     const tracked = task.then(
       () => undefined,
-      () => undefined,
+      (error: unknown) => this.recordBackgroundDiagnostic("queue_pre_effect_retry_failed", error),
     );
     this.#background.add(tracked);
     void tracked.then(() => this.#background.delete(tracked));
@@ -6055,7 +6272,7 @@ export class HraService {
       });
       this.#queuePreEffectRetryCounts.delete(queued.id);
       const dispatchRevision = this.#store.requireSession(session.id).revision;
-      const dispatchFactEpoch = this.#sessionFactEpochs.get(session.id) ?? 0;
+      const dispatchFactEpoch = this.#snapshotSessionFactEpoch(session.id);
       const result = await this.#fencedEffect(async () => {
         const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
         return await this.#codex.startTurn({
@@ -6073,7 +6290,7 @@ export class HraService {
         queueId: queued.id,
         expectedEvidenceDigest: evidence.digest,
         expectedSessionRevision: dispatchRevision,
-        applyResponseState: (this.#sessionFactEpochs.get(session.id) ?? 0) === dispatchFactEpoch,
+        applyResponseState: this.#currentSessionFactEpoch(session.id) === dispatchFactEpoch,
         turnId: result.turnId,
         turnStatus: result.status,
         runtimeProfile: result.effectiveRuntimeProfile,
@@ -6146,6 +6363,7 @@ export class HraService {
     });
     const tracked = task.catch((error: unknown) => {
       if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+      else this.recordBackgroundDiagnostic("usage_refresh_failed", error);
     });
     this.#usageRefreshes.set(authority.id, tracked);
     this.#background.add(tracked);
@@ -6253,10 +6471,16 @@ export class HraService {
     try {
       result = await input.effect(attempt.id);
     } catch (error: unknown) {
-      await this.#daemonAuthority.assertCurrent();
+      // A fence loss reported by the fenced effect itself leaves the provider
+      // outcome unknown; restart recovery owns that row. Every other rejection
+      // is classified and recorded before the fence is rechecked, so a
+      // determinate provider rejection is never stranded as `effect_started`
+      // when the fence closed during the call.
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
       const terminal = error instanceof IndeterminateCodexEffectError || error instanceof IndeterminateLocalCommitError ? "ambiguous" : "failed";
       if (terminal === "ambiguous") input.onAmbiguous?.(undefined);
       this.#store.transitionMutation(attempt.id, "effect_started", terminal, { code: error instanceof Error ? error.name : "error" });
+      await this.#daemonAuthority.assertCurrent();
       if (terminal === "ambiguous") throw new CommandFailure("RECOVERY_REQUIRED", `${input.kind} has an indeterminate provider or local commit outcome and will not be replayed.`, { idempotencyKey: input.idempotencyKey });
       throw error;
     }

@@ -127,9 +127,9 @@ export async function assertProductionPackageOnly(
 
 export async function assertReviewedReleaseInventory(packageRoot: string): Promise<void> {
   const expected = Object.freeze({
-    count: 104,
-    jsonBytes: 4_651,
-    sha256: "5205b8edb2d5d4318248ea7e8eeb90728a5cdaf2005bd768adcc66cb5d99b963",
+    count: 110,
+    jsonBytes: 4_913,
+    sha256: "acb79866f330ab0871cdad4b4cf2f1b3da5c41f11e0b8982b54b13a5bf118826",
   });
   const inventory: Array<readonly [string, "directory" | "file", number, number]> = [];
   const visit = async (path: string): Promise<void> => {

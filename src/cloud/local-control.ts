@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 
 import type { CloudControlPort } from "../daemon/ports";
+import { AccountKeyLossPreconditionError } from "../domain/cloud-outcomes";
+import { createCloudUuidV7 } from "../domain/uuid-v7";
 import { parseAuthCredentials } from "./authCredentials";
 import { parseAuthSignInResult } from "./authSession";
 import {
@@ -16,6 +18,7 @@ import {
   IdentityScopedCloudSecretCustody,
   isIdentityScopedCloudCustody,
   type CloudDeploymentAuthority,
+  type CloudSecretCustodyPort,
 } from "./identity-custody";
 import {
   cloudLimits,
@@ -47,10 +50,17 @@ import {
   encryptBytes,
   exportDevicePrivateKey,
   exportDevicePublicKey,
+  gcmMessageBudgetCheckpointInterval,
+  gcmMessageBudgetKey,
+  gcmMessageBudgetPerKey,
   generateDeviceSigningKeyPair,
   generateDeviceWrappingKeyPair,
   hmacSha256Hex,
   importP256PrivateKey,
+  KeyRotationRequiredError,
+  processGcmMessageBudget,
+  type GcmMessageBudget,
+  type GcmMessageBudgetKey,
   parseDevicePrivateKeyJson,
   parseDevicePublicKeyJson,
   randomKeyBytes,
@@ -71,12 +81,22 @@ import {
   type CompactSessionEvent,
 } from "./projection";
 
+// These symbols moved out of this file. The re-exports keep existing callers
+// stable until B5 splits the cloud control module.
+export {
+  AccountKeyLossPreconditionError,
+  type AccountKeyLossPreconditionFailure,
+} from "../domain/cloud-outcomes";
+export { createCloudUuidV7 } from "../domain/uuid-v7";
+export type { CloudSecretCustodyPort } from "./identity-custody";
+
 const authSlot = "cloud-auth";
 const authIdentitySlot = "cloud-auth-identity";
 const authLogoutSlot = "cloud-auth-logout";
 const accountDeletionSlot = "cloud-account-deletion";
 const deviceSlot = "cloud-device";
 const accountKeySlot = "cloud-account-key";
+const gcmMessageBudgetSlot = "cloud-gcm-message-budget";
 const stateSlot = "cloud-state";
 const registrationSlot = "cloud-device-registration";
 const mutationSlot = "cloud-device-mutation";
@@ -100,32 +120,7 @@ class AccountDeletionStatusUnavailableError extends Error {
   }
 }
 
-export type AccountKeyLossPreconditionFailure =
-  | "already_ready"
-  | "auth_identity_unbound"
-  | "authority_changed"
-  | "device_unregistered"
-  | "observation_missing"
-  | "signed_out";
-
-export class AccountKeyLossPreconditionError extends Error {
-  constructor(readonly code: AccountKeyLossPreconditionFailure) {
-    super(`Account-key loss acknowledgement precondition failed: ${code}.`);
-    this.name = "AccountKeyLossPreconditionError";
-  }
-}
-
 type DeviceStatus = "pending" | "active" | "revoked";
-
-export interface CloudSecretCustodyPort {
-  read(slot: string): Promise<Readonly<{ generation: number; value: string }> | null>;
-  compareAndSwap(
-    slot: string,
-    expectedGeneration: number | null,
-    value: string,
-  ): Promise<Readonly<{ generation: number; value: string }> | null>;
-  clearIfGeneration(slot: string, expectedGeneration: number): Promise<boolean>;
-}
 
 export interface CloudDeviceRegistrationPort {
   ensureDeviceRegistered(signal: AbortSignal): Promise<unknown>;
@@ -210,6 +205,9 @@ export type LocalCloudControlOptions = Readonly<{
   deploymentAuthority: CloudDeploymentAuthority;
   deploymentUrl: string;
   deviceLabel?: string;
+  // Tests inject a fresh budget to model a restarted process; production
+  // uses the process-wide budget that `encryptBytes` counts against.
+  gcmMessageBudget?: GcmMessageBudget;
   lifetimeSignal?: AbortSignal;
   now?: () => number;
   secretCustody: CloudSecretCustodyPort;
@@ -433,6 +431,21 @@ type AccountKeySecret = Readonly<{
   userPublicId: string;
   version: 1;
 }>;
+
+// Persisted AES-GCM message high-water marks, one per account key, so the
+// per-key budget survives daemon restarts. Marks only rise and lead the true
+// count by up to two checkpoint intervals. The slot is keyed by key
+// fingerprint, not identity, so it is not identity-scoped custody.
+type GcmMessageBudgetCustody = Readonly<{
+  keys: readonly Readonly<{
+    fingerprint: string;
+    keyVersion: number;
+    messages: number;
+  }>[];
+  version: 1;
+}>;
+
+const maximumGcmMessageBudgetKeys = 16;
 
 type AccountKeyRecoveryAuthority = Readonly<{
   authEpoch: number;
@@ -1169,6 +1182,43 @@ function parseAccountKeyRecoveryObservation(
     }
   }
   throw new Error("Cloud account-key recovery evidence is corrupt.");
+}
+
+function parseGcmMessageBudgetCustody(value: string): GcmMessageBudgetCustody {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error("Cloud GCM message budget custody is corrupt.");
+  }
+  if (
+    !isRecord(decoded)
+    || decoded.version !== 1
+    || !hasExactKeys(decoded, ["keys", "version"])
+    || !Array.isArray(decoded.keys)
+    || decoded.keys.length > maximumGcmMessageBudgetKeys
+  ) throw new Error("Cloud GCM message budget custody is corrupt.");
+  const keys: Array<GcmMessageBudgetCustody["keys"][number]> = [];
+  const seen = new Set<string>();
+  for (const entry of decoded.keys) {
+    if (
+      !isRecord(entry)
+      || !hasExactKeys(entry, ["fingerprint", "keyVersion", "messages"])
+      || typeof entry.fingerprint !== "string"
+      || !/^[0-9a-f]{32}$/u.test(entry.fingerprint)
+      || !isSafePositiveInteger(entry.keyVersion)
+      || !isSafeNonNegativeInteger(entry.messages)
+      || entry.messages > gcmMessageBudgetPerKey
+      || seen.has(`${entry.keyVersion}:${entry.fingerprint}`)
+    ) throw new Error("Cloud GCM message budget custody is corrupt.");
+    seen.add(`${entry.keyVersion}:${entry.fingerprint}`);
+    keys.push({
+      fingerprint: entry.fingerprint,
+      keyVersion: entry.keyVersion,
+      messages: entry.messages,
+    });
+  }
+  return { keys, version: 1 };
 }
 
 function parseLocalState(value: string): LocalCloudState {
@@ -2052,6 +2102,7 @@ function serializeSecret(
     | DeviceReplacement
     | RetiredDeviceHistory
     | AccountKeySecret
+    | GcmMessageBudgetCustody
     | LocalCloudState
     | DeviceMutationCustody
     | PendingDeviceMutation
@@ -2101,27 +2152,6 @@ function randomOpaqueId(prefix: "bind" | "device"): string {
   return `${prefix}_${encodeBase64Url(crypto.getRandomValues(new Uint8Array(18)))}`;
 }
 
-export function createCloudUuidV7(now: number = Date.now()): string {
-  if (!Number.isSafeInteger(now) || now < 0 || now >= 2 ** 48) {
-    throw new Error("System clock cannot produce a cloud idempotency key.");
-  }
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  let timestamp = now;
-  for (let index = 5; index >= 0; index -= 1) {
-    bytes[index] = timestamp % 256;
-    timestamp = Math.floor(timestamp / 256);
-  }
-  const randomSix = bytes[6];
-  const randomEight = bytes[8];
-  if (randomSix === undefined || randomEight === undefined) {
-    throw new Error("Cryptographic randomness is unavailable.");
-  }
-  bytes[6] = 0x70 | (randomSix & 0x0f);
-  bytes[8] = 0x80 | (randomEight & 0x3f);
-  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
 function uuidV7Timestamp(value: string): number | null {
   if (!isUuidV7(value)) return null;
   const timestamp = Number.parseInt(value.replaceAll("-", "").slice(0, 12), 16);
@@ -2167,6 +2197,7 @@ export function deploymentUrlFromEnvironment(
 export class LocalCloudControl implements CloudControlPort {
   readonly #deploymentAuthority: CloudDeploymentAuthority;
   readonly #deviceLabel: string | null;
+  readonly #gcmMessageBudget: GcmMessageBudget;
   readonly #identityCustody: IdentityScopedCloudSecretCustody | null;
   readonly #now: () => number;
   readonly #secrets: CloudSecretCustodyPort;
@@ -2188,6 +2219,7 @@ export class LocalCloudControl implements CloudControlPort {
     this.#identityCustody = isIdentityScopedCloudCustody(options.secretCustody)
       ? options.secretCustody
       : null;
+    this.#gcmMessageBudget = options.gcmMessageBudget ?? processGcmMessageBudget;
     this.#now = options.now ?? Date.now;
     this.#secrets = deploymentFencedSecretCustody(
       options.secretCustody,
@@ -5106,7 +5138,45 @@ export class LocalCloudControl implements CloudControlPort {
     if (key === null || key.userPublicId !== userPublicId || key.provisional) {
       throw new Error("The cloud account key is unavailable.");
     }
-    return { bytes: decodeBase64Url(key.key), keyVersion: key.keyVersion };
+    const bytes = decodeBase64Url(key.key);
+    await this.#admitGcmMessageBudget(bytes, key.keyVersion);
+    return { bytes, keyVersion: key.keyVersion };
+  }
+
+  // Every encryption under this key passes through `encryptBytes`, which
+  // counts it in the process-wide budget. This admission restores the
+  // persisted high-water mark for the key, refuses the key once its budget
+  // is spent, and advances the persisted mark once per checkpoint interval
+  // so a restart can never undercount.
+  async #admitGcmMessageBudget(bytes: Uint8Array, keyVersion: number): Promise<void> {
+    const budgetKey: GcmMessageBudgetKey = await gcmMessageBudgetKey(bytes, keyVersion);
+    const observation = await this.#secrets.read(gcmMessageBudgetSlot);
+    const custody = observation === null
+      ? { keys: [], version: 1 } as const
+      : parseGcmMessageBudgetCustody(observation.value);
+    const persisted = custody.keys.find((entry) =>
+      entry.keyVersion === budgetKey.keyVersion && entry.fingerprint === budgetKey.fingerprint);
+    const messages = this.#gcmMessageBudget.restore(budgetKey, persisted?.messages ?? 0);
+    if (messages >= gcmMessageBudgetPerKey) throw new KeyRotationRequiredError(keyVersion);
+    const covered = Math.min(messages + gcmMessageBudgetCheckpointInterval, gcmMessageBudgetPerKey);
+    if ((persisted?.messages ?? 0) >= covered) return;
+    if (persisted === undefined && custody.keys.length >= maximumGcmMessageBudgetKeys) {
+      throw new Error("Cloud GCM message budget custody is full.");
+    }
+    const mark = Math.min(messages + 2 * gcmMessageBudgetCheckpointInterval, gcmMessageBudgetPerKey);
+    const next: GcmMessageBudgetCustody = {
+      keys: [
+        ...custody.keys.filter((entry) => entry !== persisted),
+        { fingerprint: budgetKey.fingerprint, keyVersion: budgetKey.keyVersion, messages: mark },
+      ],
+      version: 1,
+    };
+    const committed = await this.#secrets.compareAndSwap(
+      gcmMessageBudgetSlot,
+      observation?.generation ?? null,
+      serializeSecret(next),
+    );
+    if (committed === null) throw new Error("Cloud secret state changed concurrently.");
   }
 
   async #writeAccountKey(value: AccountKeySecret): Promise<void> {

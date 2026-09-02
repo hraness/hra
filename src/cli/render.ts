@@ -61,6 +61,7 @@ import {
   terminalSafeJson,
   workReadSuccessWireDocument,
 } from "../domain/terminal-json";
+import { CODEX_PIN } from "../codex/pin";
 import { isSensitiveDiagnosticKey, redactCompleteSensitiveText } from "./sensitive-text";
 
 export type Output = {
@@ -1282,7 +1283,7 @@ export function renderRootStatus(data: unknown, json: boolean, output: Output): 
 }
 
 const pluginLifecycleNotice =
-  "Lifecycle: discovery only. Pinned Codex 0.149.0 combines install, enablement, and browser-capable OAuth, so HRA blocks that compound effect.";
+  `Lifecycle: discovery only. Pinned Codex ${CODEX_PIN} combines install, enablement, and browser-capable OAuth, so HRA blocks that compound effect.`;
 
 const renderPluginList = (data: unknown): string => {
   const root = object(data);

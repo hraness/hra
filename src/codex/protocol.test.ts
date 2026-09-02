@@ -9,6 +9,7 @@ import fc from "fast-check";
 import { INTERACTION_MAX_PENDING_MS } from "../domain/interactions.ts";
 
 import { CodexError } from "./errors.ts";
+import { CODEX_PIN, PINNED_CODEX_MATRIX_DIGESTS, PINNED_CODEX_SCHEMA_DIGESTS } from "./pin.ts";
 import { resolvePinnedCodexRuntime } from "./runtime.ts";
 import {
   OPERATIONS,
@@ -16,6 +17,7 @@ import {
   PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST,
   PINNED_CODEX_SERVER_REQUEST_MATRIX,
   PINNED_CODEX_SERVER_REQUEST_SCHEMA_DIGEST,
+  codexMatrixDigest,
   assertPinnedCodexNotificationMatrix,
   assertPinnedCodexServerRequestMatrix,
   codexNotificationDisposition,
@@ -144,41 +146,31 @@ describe("pinned server requests and safe notifications", () => {
         join(outputDirectory, "ClientRequest.ts"),
         "utf8",
       );
-      const resetParamsSource = await readFile(
-        join(outputDirectory, "v2", "ConsumeAccountRateLimitResetCreditParams.ts"),
-        "utf8",
-      );
-      const resetResponseSource = await readFile(
-        join(outputDirectory, "v2", "ConsumeAccountRateLimitResetCreditResponse.ts"),
-        "utf8",
-      );
-      const resetOutcomeSource = await readFile(
-        join(outputDirectory, "v2", "ConsumeAccountRateLimitResetCreditOutcome.ts"),
-        "utf8",
-      );
       const methods = (source: string): readonly string[] =>
         [...source.matchAll(/\{ "method": "([^"]+)"/gu)].map((match) => match[1]!);
       const digest = (source: string): string =>
         createHash("sha256").update(source).digest("hex");
 
       expect(methods(notificationSource)).toEqual(Object.keys(PINNED_CODEX_NOTIFICATION_MATRIX));
-      expect(digest(notificationSource)).toBe(PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST);
+      expect(PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST).toBe(PINNED_CODEX_SCHEMA_DIGESTS["ServerNotification.ts"]);
       expect(methods(requestSource)).toEqual(Object.keys(PINNED_CODEX_SERVER_REQUEST_MATRIX));
-      expect(digest(requestSource)).toBe(PINNED_CODEX_SERVER_REQUEST_SCHEMA_DIGEST);
+      expect(PINNED_CODEX_SERVER_REQUEST_SCHEMA_DIGEST).toBe(PINNED_CODEX_SCHEMA_DIGESTS["ServerRequest.ts"]);
       expect(clientRequestSource).toContain(
         '{ "method": "account/rateLimitResetCredit/consume", id: RequestId, params: ConsumeAccountRateLimitResetCreditParams, }',
       );
-      expect(digest(clientRequestSource)).toBe(
-        "40dcb766794599f1a91c03c945ee21450c676faed7b5c7eae8152d3c10c5c585",
+      expect(Object.keys(PINNED_CODEX_SCHEMA_DIGESTS)).toHaveLength(6);
+      for (const [relativePath, expected] of Object.entries(PINNED_CODEX_SCHEMA_DIGESTS)) {
+        const source = await readFile(join(outputDirectory, relativePath), "utf8");
+        expect({ relativePath, digest: digest(source) }).toEqual({ relativePath, digest: expected });
+      }
+      expect(codexMatrixDigest(CODEX_PIN, PINNED_CODEX_NOTIFICATION_MATRIX)).toBe(
+        PINNED_CODEX_MATRIX_DIGESTS.notification,
       );
-      expect(digest(resetParamsSource)).toBe(
-        "f5f79c58b90a126b7620b38bc88d09a3b096543f71cdd949d19bac3c2b03399d",
+      expect(codexMatrixDigest(CODEX_PIN, PINNED_CODEX_SERVER_REQUEST_MATRIX)).toBe(
+        PINNED_CODEX_MATRIX_DIGESTS.serverRequest,
       );
-      expect(digest(resetResponseSource)).toBe(
-        "3240fe476768362847266693ffdfb4fdd8d8f0d7b628962255b229a182d76682",
-      );
-      expect(digest(resetOutcomeSource)).toBe(
-        "2fc33514e9745ffeeefada2c51362dc66e6f9c5f6f76d28b0a9a8cf278a2e8fe",
+      expect(codexMatrixDigest("0.0.0", PINNED_CODEX_SERVER_REQUEST_MATRIX)).not.toBe(
+        PINNED_CODEX_MATRIX_DIGESTS.serverRequest,
       );
     } finally {
       await rm(outputDirectory, { recursive: true, force: true });
@@ -310,7 +302,7 @@ describe("pinned server requests and safe notifications", () => {
     }
   });
 
-  test("covers the exact generated 0.149.0 ServerNotification union", () => {
+  test("covers the exact generated pinned ServerNotification union", () => {
     expect(Object.keys(PINNED_CODEX_NOTIFICATION_MATRIX)).toEqual([
       "error",
       "thread/started",
@@ -390,9 +382,7 @@ describe("pinned server requests and safe notifications", () => {
       "windowsSandbox/setupCompleted",
       "account/login/completed",
     ]);
-    expect(PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST).toBe(
-      "e00fcc3b3c376e808a5feefaa233fdd49ea50acfa15cb629eb40fcf27b706777",
-    );
+    expect(PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST).toMatch(/^[a-f0-9]{64}$/u);
     expect(() => assertPinnedCodexNotificationMatrix()).not.toThrow();
     expect(codexNotificationDisposition("thread/deleted")).toBe("routed");
     expect(codexNotificationDisposition("account/rateLimits/updated")).toBe("routed");
@@ -500,7 +490,7 @@ describe("pinned server requests and safe notifications", () => {
     expect(JSON.stringify(catalog)).not.toContain("failed at");
   });
 
-  test("covers the exact generated 0.149.0 ServerRequest union with a reviewed schema digest", () => {
+  test("covers the exact generated pinned ServerRequest union with a reviewed schema digest", () => {
     expect(Object.entries(PINNED_CODEX_SERVER_REQUEST_MATRIX)).toEqual([
       ["item/commandExecution/requestApproval", "brokered_interaction"],
       ["item/fileChange/requestApproval", "brokered_interaction"],
@@ -514,9 +504,7 @@ describe("pinned server requests and safe notifications", () => {
       ["applyPatchApproval", "unsupported"],
       ["execCommandApproval", "unsupported"],
     ]);
-    expect(PINNED_CODEX_SERVER_REQUEST_SCHEMA_DIGEST).toBe(
-      "1c5837adbfbdd005f387478ba87840808d1353b47b82dcf63739a78bb1c8d3be",
-    );
+    expect(PINNED_CODEX_SERVER_REQUEST_SCHEMA_DIGEST).toMatch(/^[a-f0-9]{64}$/u);
     expect(() => assertPinnedCodexServerRequestMatrix()).not.toThrow();
     expect(codexServerRequestDisposition("future/request")).toBeNull();
   });

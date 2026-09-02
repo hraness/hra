@@ -1,4 +1,4 @@
-import { redactAbsolutePaths } from "../cloud/contracts";
+import { redactAbsolutePaths } from "../domain/text-safety";
 import type { InteractionDisplay } from "../domain/interactions";
 import type { SessionEvent, SessionEventBody } from "../domain/session-events";
 import {

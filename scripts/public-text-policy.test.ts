@@ -2,9 +2,10 @@ import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
 import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
+  assertPublicCopyText,
   assertPublicSensitiveText,
   assertPublicText,
   assertPublicTree,
@@ -152,6 +153,43 @@ describe("public text policy", () => {
       await unlink(join(editorialDirectory, "reviewed-384.webp"));
       await writeFile(join(root, "unreviewed.webp"), reviewed);
       await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects an em dash in public copy but not in internal notes or history text", async () => {
+    const emDash = String.fromCodePoint(0x2014);
+    expect(() => assertPublicCopyText(`plain ${emDash} prose`, "public copy"))
+      .toThrow(PublicTextPolicyError);
+    try {
+      assertPublicCopyText(`plain ${emDash} prose`, "public copy");
+    } catch (error: unknown) {
+      expect(error).toMatchObject({ code: "EM_DASH" });
+    }
+    expect(() => assertPublicCopyText("plain prose, an en dash 0\u20132, and -- flags", "public copy"))
+      .not.toThrow();
+    expect(() => assertPublicText(`history ${emDash} patch`, "commit patch")).not.toThrow();
+
+    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-em-dash-"));
+    try {
+      await mkdir(join(root, "kb"));
+      await writeFile(join(root, "kb", "note.md"), `internal ${emDash} note\n`, "utf8");
+      await expect(assertPublicTree(root)).resolves.toBeUndefined();
+
+      for (const publicCopy of [
+        "README.md",
+        "package.json",
+        join("site", "content.ts"),
+        join("docs", "roadmap.md"),
+        join(".github", "ISSUE_TEMPLATE", "bug_report.yml"),
+      ]) {
+        await mkdir(dirname(join(root, publicCopy)), { recursive: true });
+        await writeFile(join(root, publicCopy), `copy ${emDash} text\n`, "utf8");
+        await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "EM_DASH" });
+        await writeFile(join(root, publicCopy), "copy text\n", "utf8");
+        await expect(assertPublicTree(root)).resolves.toBeUndefined();
+      }
     } finally {
       await rm(root, { force: true, recursive: true });
     }

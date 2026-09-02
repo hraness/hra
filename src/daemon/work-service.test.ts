@@ -597,6 +597,8 @@ describe("HraService work protocol", () => {
     const actor = await createActor(value);
     expect(await value.service.execute({ kind: "work.protocol", query: { kind: "index" } }, { signal }))
       .toEqual(describeWorkProtocol({ kind: "index" }));
+    expect(await value.service.execute({ kind: "work.protocol", query: { kind: "topic", topic: "errors" } }, { signal }))
+      .toEqual(describeWorkProtocol({ kind: "topic", topic: "errors" }));
 
     const { created, claimed } = await createJoinClaim(value, actor);
     const beforeDispatch = workSnapshotSchema.parse(await value.service.execute({

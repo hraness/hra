@@ -1,4 +1,5 @@
 import type { CodexCapabilitySnapshot, ResolvedPreset } from "../codex/index";
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- D4 extracts the provider port; the capability check still recognises the Codex error class directly.
 import { CodexError } from "../codex/index";
 import { effectiveRuntimeProfileSchema, type EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import type { ProfileAuthority } from "./ports";

@@ -4,6 +4,8 @@ export const USAGE_POLL_MIN_INTERVAL_MS = 50_000;
 export const USAGE_POLL_MAX_INTERVAL_MS = 70_000;
 export const USAGE_POLL_BACKOFF_MAX_MS = 15 * 60_000;
 export const USAGE_POLL_INITIAL_STAGGER_MAX_MS = 20_000;
+export const USAGE_POLL_TICK_FAILURE_BACKOFF_MAX_MS = 60_000;
+const USAGE_POLL_TICK_FAILURE_BACKOFF_STEPS = 6;
 
 const stableOffset = (accountId: string, range: number): number => {
   const digest = createHash("sha256").update(accountId).digest();
@@ -48,6 +50,7 @@ export class AccountUsagePoller {
   readonly #listAccountIds: () => readonly string[];
   readonly #poll: (accountId: string, signal: AbortSignal) => Promise<void>;
   readonly #onFailure: (accountId: string, error: unknown, failures: number) => void | Promise<void>;
+  readonly #onTickFailure: (error: unknown, failures: number) => void | Promise<void>;
   readonly #now: () => number;
   readonly #sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly #states = new Map<string, PollState>();
@@ -58,12 +61,14 @@ export class AccountUsagePoller {
     listAccountIds: () => readonly string[];
     poll: (accountId: string, signal: AbortSignal) => Promise<void>;
     onFailure?: (accountId: string, error: unknown, failures: number) => void | Promise<void>;
+    onTickFailure?: (error: unknown, failures: number) => void | Promise<void>;
     now?: () => number;
     sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   }) {
     this.#listAccountIds = input.listAccountIds;
     this.#poll = input.poll;
     this.#onFailure = input.onFailure ?? (() => undefined);
+    this.#onTickFailure = input.onTickFailure ?? (() => undefined);
     this.#now = input.now ?? Date.now;
     this.#sleep = input.sleep ?? sleepForUsagePolling;
   }
@@ -117,9 +122,27 @@ export class AccountUsagePoller {
   }
 
   async #run(): Promise<void> {
-    while (!this.#controller.signal.aborted) {
-      const waitMs = await this.tick(this.#controller.signal);
-      if (waitMs > 0) await this.#sleep(waitMs, this.#controller.signal);
+    const signal = this.#controller.signal;
+    let failures = 0;
+    while (!signal.aborted) {
+      let waitMs: number;
+      try {
+        waitMs = await this.tick(signal);
+        failures = 0;
+      } catch (error: unknown) {
+        // The account list read or a failure hook threw outside the
+        // per-account path. Report it and keep polling behind a bounded
+        // backoff so one bad read never halts every account silently.
+        signal.throwIfAborted();
+        failures = Math.min(failures + 1, USAGE_POLL_TICK_FAILURE_BACKOFF_STEPS);
+        try {
+          await this.#onTickFailure(error, failures);
+        } catch {
+          // The diagnostic hook must not stop the loop.
+        }
+        waitMs = Math.min(1_000 * 2 ** failures, USAGE_POLL_TICK_FAILURE_BACKOFF_MAX_MS);
+      }
+      if (waitMs > 0) await this.#sleep(waitMs, signal);
     }
   }
 }

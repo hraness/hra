@@ -3,6 +3,10 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import type { CodexAccountProjection, ProfileAuthority } from "../daemon/ports.ts";
+import type {
+  DesktopRecoveryBinding,
+  DesktopRecoveryResolution,
+} from "../domain/desktop-switch.ts";
 import { profileIdSchema } from "../domain/values.ts";
 import { CODEX_ELECTRON_USER_DATA_PATH, CODEX_HOME } from "./bundle.ts";
 import { deriveDesktopProfilePaths } from "./profile.ts";
@@ -111,18 +115,13 @@ const recoveryPlanSchema = z.union([
   resolvedPlanSchema,
 ]);
 
-export type DesktopRecoveryBinding = Pick<
-  z.infer<typeof recoveryRequiredPlanSchema>,
-  | "attemptId"
-  | "idempotencyKey"
-  | "switchGeneration"
-  | "sourceProfileId"
-  | "sourceProcessGeneration"
-  | "targetProfileId"
-  | "targetProcessGeneration"
->;
-
-export type DesktopRecoveryResolution = "resolved_applied" | "resolved_not_applied";
+// The binding and resolution shapes live in the domain so storage can persist
+// them without importing this controller. `binding()` below keeps the plan
+// schema assignable to the domain shape at compile time.
+export type {
+  DesktopRecoveryBinding,
+  DesktopRecoveryResolution,
+} from "../domain/desktop-switch.ts";
 
 export interface DesktopRecoveryStorePort {
   readCurrentDesktopSwitchRecovery(): unknown;

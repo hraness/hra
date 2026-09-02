@@ -2,6 +2,8 @@ import { ConvexHttpClient } from "convex/browser";
 import { makeFunctionReference } from "convex/server";
 import type { Value } from "convex/values";
 
+import { cloudLimits } from "./contracts";
+
 export const cloudQueries = [
   "accountDeletion:status",
   "account:current",
@@ -75,6 +77,16 @@ export interface CloudTransport {
 
 export const defaultCloudRequestTimeoutMs = 15_000;
 
+// The largest legitimate response is one full page of detail chunks: each
+// chunk carries a ciphertext at the ciphertext bound plus its envelope,
+// identifiers, and timestamps (allowed 4 KiB), and the Convex wrapper around
+// the page gets 1 MiB. Every other query and mutation returns far less.
+const cloudResponseEnvelopeBytes = 4_096;
+const cloudResponseWrapperBytes = 1_048_576;
+export const maximumCloudResponseBytes =
+  cloudLimits.pageSize * (cloudLimits.ciphertextCharacters + cloudResponseEnvelopeBytes)
+  + cloudResponseWrapperBytes;
+
 export class CloudRequestDeadlineError extends Error {
   readonly timeoutMs: number;
 
@@ -85,11 +97,73 @@ export class CloudRequestDeadlineError extends Error {
   }
 }
 
+export class CloudResponseTooLargeError extends Error {
+  readonly code = "CLOUD_RESPONSE_TOO_LARGE" as const;
+  readonly maximumBytes: number;
+
+  constructor(maximumBytes: number) {
+    super(`Cloud response exceeded ${maximumBytes} bytes.`);
+    this.name = "CloudResponseTooLargeError";
+    this.maximumBytes = maximumBytes;
+  }
+}
+
 function requireRequestTimeout(value: number): number {
   if (!Number.isSafeInteger(value) || value < 1 || value > 120_000) {
     throw new Error("Cloud request timeout must be an integer from 1ms through 120000ms.");
   }
   return value;
+}
+
+function requireResponseBound(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximumCloudResponseBytes) {
+    throw new Error(
+      `Cloud response bound must be an integer from 1 through ${maximumCloudResponseBytes} bytes.`,
+    );
+  }
+  return value;
+}
+
+const bodylessStatuses = new Set([101, 103, 204, 205, 304]);
+
+// Reads the body through a hard byte cap before the Convex client parses it.
+// A declared length over the cap fails before any body byte is read; an
+// undeclared or understated length fails at the first byte over the cap.
+async function boundResponseBody(response: Response, maximumBytes: number): Promise<Response> {
+  const declared = response.headers.get("content-length");
+  if (declared !== null && /^[0-9]{1,15}$/u.test(declared) && Number(declared) > maximumBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new CloudResponseTooLargeError(maximumBytes);
+  }
+  if (response.body === null || bodylessStatuses.has(response.status)) return response;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > maximumBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new CloudResponseTooLargeError(maximumBytes);
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new Response(body, {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
 }
 
 function signalReason(signal: AbortSignal): Error {
@@ -101,6 +175,7 @@ function signalReason(signal: AbortSignal): Error {
 function boundedFetch(
   implementation: typeof globalThis.fetch,
   timeoutMs: number,
+  maximumResponseBytes: number,
   lifetimeSignal?: AbortSignal,
 ): typeof globalThis.fetch {
   const execute = async (
@@ -137,7 +212,9 @@ function boundedFetch(
     });
 
     try {
-      const request = implementation(resource, { ...init, signal: controller.signal });
+      // The deadline covers the body read as well as the headers.
+      const request = implementation(resource, { ...init, signal: controller.signal })
+        .then((response) => boundResponseBody(response, maximumResponseBytes));
       return await Promise.race([request, boundary]);
     } finally {
       clearTimeout(deadline);
@@ -161,15 +238,20 @@ export function createConvexCloudTransport(input: Readonly<{
   deploymentUrl: string;
   fetch?: typeof globalThis.fetch;
   lifetimeSignal?: AbortSignal;
+  maximumResponseBytes?: number;
   requestTimeoutMs?: number;
 }>): CloudTransport {
   const requestTimeoutMs = requireRequestTimeout(
     input.requestTimeoutMs ?? defaultCloudRequestTimeoutMs,
   );
+  const maximumResponseBytes = requireResponseBound(
+    input.maximumResponseBytes ?? maximumCloudResponseBytes,
+  );
   const client = new ConvexHttpClient(input.deploymentUrl, {
     fetch: boundedFetch(
       input.fetch ?? globalThis.fetch,
       requestTimeoutMs,
+      maximumResponseBytes,
       input.lifetimeSignal,
     ),
     logger: false,

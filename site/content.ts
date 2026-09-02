@@ -1,3 +1,4 @@
+import packageJson from "../package.json";
 import { buildHraGlobalInstallCommand } from "../src/install-preflight";
 
 export type EndpointAvailability = "beta-not-yet-live" | "live" | "release-ready";
@@ -57,7 +58,24 @@ export interface HeroContent {
   readonly summary: string;
 }
 
+export interface Badge {
+  readonly alt: string;
+  readonly href: string;
+  readonly image: string;
+}
+
+export interface SocialCard {
+  /** Rendered card text; also the `og:image:alt` value. */
+  readonly alt: string;
+  readonly height: number;
+  readonly path: string;
+  readonly width: number;
+}
+
 export interface PublicContent {
+  /** README trust-signal badges, rendered on one line under the H1. */
+  readonly badges: readonly Badge[];
+  /** Short positioning line for `package.json`, meta description, JSON-LD, and llms.txt. */
   readonly description: string;
   readonly doctorCommand: string;
   readonly endpoints: PublicEndpoints;
@@ -69,13 +87,29 @@ export interface PublicContent {
     readonly contributing: string;
     readonly documentation: string;
     readonly github: string;
+    readonly hraness: string;
     readonly privateSecurityReport: string;
     readonly privacy: string;
     readonly security: string;
   };
+  readonly maintainer: {
+    readonly name: string;
+    readonly url: string;
+  };
   readonly productName: string;
+  /** Provider order stated the same way everywhere. */
+  readonly providerRoadmap: string;
+  /** The exact CLI release the public surfaces describe. */
+  readonly releaseVersion: string;
   readonly sections: readonly ContentSection[];
   readonly siteUrl: string;
+  readonly socialCard: SocialCard;
+  /** One-line release status shown directly under the thesis. */
+  readonly statusLine: string;
+  /** Category label used in the page title, hero eyebrow, and social card. */
+  readonly tagline: string;
+  /** The README thesis: what HRA does, stated once, before any command. */
+  readonly thesis: string;
 }
 
 const text = (value: string): InlineContent => ({ kind: "text", value });
@@ -94,6 +128,7 @@ const links = {
   contributing: "https://github.com/hraness/hra/blob/main/CONTRIBUTING.md",
   documentation: "https://github.com/hraness/hra#command-reference",
   github: "https://github.com/hraness/hra",
+  hraness: "https://hraness.com/",
   privateSecurityReport: "https://github.com/hraness/hra/security/advisories/new",
   privacy: "https://github.com/hraness/hra/blob/main/PRIVACY.md",
   security: "https://github.com/hraness/hra/blob/main/SECURITY.md",
@@ -162,9 +197,74 @@ const betaInstallCommand = buildHraGlobalInstallCommand(
   "https://github.com/hraness/hra/releases/download/v0.1.6/hraness-hra-0.1.6.tgz",
 );
 
+const productName = "HRA";
+const tagline = "Control plane for coding-agent subscriptions";
+const providerRoadmap = "Codex today, Claude next.";
+const releaseVersion = "0.1.6";
+
+/** Toolchain and runtime pins come from `package.json`, so badges cannot drift from the manifest. */
+export const publicPins = {
+  bun: packageJson.engines.bun,
+  codex: packageJson.dependencies["@openai/codex"],
+} as const;
+
+const shieldsLabel = (value: string): string =>
+  encodeURIComponent(value.replaceAll("-", "--").replaceAll("_", "__"));
+const staticBadge = (label: string, message: string, color: string): string =>
+  `https://img.shields.io/badge/${shieldsLabel(label)}-${shieldsLabel(message)}-${color}`;
+
+const badges: readonly Badge[] = [
+  {
+    alt: "npm version",
+    href: "https://www.npmjs.com/package/@hraness/hra",
+    image: "https://img.shields.io/npm/v/%40hraness%2Fhra",
+  },
+  {
+    alt: "provenance: sigstore",
+    href: "https://www.npmjs.com/package/@hraness/hra#provenance",
+    image: staticBadge("provenance", "sigstore", "2e7d32"),
+  },
+  {
+    alt: "CI",
+    href: "https://github.com/hraness/hra/actions/workflows/ci.yml",
+    image: "https://img.shields.io/github/actions/workflow/status/hraness/hra/ci.yml?branch=main&label=CI",
+  },
+  {
+    alt: "license: MIT",
+    href: "https://github.com/hraness/hra/blob/main/LICENSE",
+    image: "https://img.shields.io/npm/l/%40hraness%2Fhra",
+  },
+  {
+    alt: `Bun ${publicPins.bun}`,
+    href: "https://bun.sh",
+    image: staticBadge("Bun", publicPins.bun, "14151a"),
+  },
+  {
+    alt: `runtimes: Codex ${publicPins.codex}`,
+    href: `https://www.npmjs.com/package/@openai/codex/v/${publicPins.codex}`,
+    image: staticBadge("runtimes", `Codex ${publicPins.codex}`, "0b5fa5"),
+  },
+];
+
 export const publicContent: PublicContent = {
-  productName: "HRA",
-  description: "A persistent Bun CLI for isolated Codex accounts, live sessions, safe macOS account switching, and optional encrypted sync.",
+  productName,
+  tagline,
+  providerRoadmap,
+  releaseVersion,
+  thesis: `${productName} runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.`,
+  description: `${tagline}: run several accounts side by side, keep their sessions alive in a local daemon, and drive them from a shell or JSON. ${providerRoadmap}`,
+  statusLine: `Status: public beta. The local CLI v${releaseVersion} is live for macOS and Linux; hosted sync is not yet live.`,
+  badges,
+  maintainer: {
+    name: "Hraness",
+    url: links.hraness,
+  },
+  socialCard: {
+    alt: `${productName} · ${tagline.charAt(0).toLowerCase()}${tagline.slice(1)} · hra.sh`,
+    height: 630,
+    path: "/social-card.png",
+    width: 1200,
+  },
   siteUrl: "https://hra.sh",
   installCommand: betaInstallCommand,
   initCommand: "hra init --yes",
@@ -177,7 +277,7 @@ export const publicContent: PublicContent = {
   },
   links,
   hero: {
-    eyebrow: "Persistent control for Codex",
+    eyebrow: tagline,
     heading: "Keep every Codex account and live session in one durable CLI.",
     summary: "Give each account its own Codex home, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.",
     boundary: "macOS and Linux CLI · macOS desktop switching · local v0.1.6 live · hosted sync not yet live",
@@ -247,6 +347,11 @@ export const publicContent: PublicContent = {
     },
     paragraph(
       text("HRA is one Bun CLI plus a local daemon. It keeps Codex accounts isolated, gives you a compact session interface, and optionally syncs encrypted session projections and commands across your enrolled machines."),
+    ),
+    paragraph(
+      text("HRA is short for harness: the control plane that keeps your coding-agent subscriptions working together, and "),
+      link("hraness.com", links.hraness),
+      text(" explains the parent brand. The Hraness organization maintains HRA and publishes it under the MIT license."),
     ),
     paragraph(
       link("GitHub", links.github),
@@ -1107,13 +1212,20 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
     )
     .join("\n\n");
 
+  const badgeLine = content.badges
+    .map((badge) => `[![${badge.alt}](${badge.image})](${badge.href})`)
+    .join(" ");
+
+  // The badge line ends with a hard line break so the thesis is line 3 of the
+  // README and still renders as its own line under the badges.
   return [
-    `# ${content.productName}`,
+    `# ${content.productName}\n${badgeLine}\\\n${content.thesis}`,
+    content.statusLine,
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
     `\`\`\`sh\n${content.initCommand}\n\`\`\``,
     `## ${content.hero.heading}\n\n${content.hero.summary}\n\n${content.hero.boundary}`,
-    `### ${content.hero.proofLabel}\n\n${content.hero.steps.map((step, index) => `${index + 1}. **${step.label}:** \`${step.command}\` — ${step.detail}`).join("\n")}`,
+    `### ${content.hero.proofLabel}\n\n${content.hero.steps.map((step, index) => `${index + 1}. **${step.label}:** \`${step.command}\`. ${step.detail}`).join("\n")}`,
     renderMarkdownBlocks(content.introduction, 3),
     sections,
   ].join("\n\n") + "\n";
@@ -1138,6 +1250,9 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     `# ${content.productName}`,
     "",
     `> ${content.description}`,
+    "",
+    content.thesis,
+    content.statusLine,
     "",
     `Install the live v0.1.6 beta: ${content.installCommand}`,
     `Initialize: ${content.initCommand}`,

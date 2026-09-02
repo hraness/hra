@@ -1,12 +1,9 @@
 import { isAbsolute, join, relative, resolve } from "node:path";
 
+import type { DesktopProfilePaths } from "../domain/desktop-switch.ts";
 import { DesktopSwitchError } from "./errors.ts";
 
-export interface DesktopProfilePaths {
-  readonly profileRoot: string;
-  readonly codexHome: string;
-  readonly desktopUserData: string;
-}
+export type { DesktopProfilePaths } from "../domain/desktop-switch.ts";
 
 export function deriveDesktopProfilePaths(
   stateRoot: string,

@@ -185,7 +185,7 @@ class FakeCodex implements CodexRuntimePort {
   loginResult: CodexLoginOutcome = { status: "signed_in", account: { signedIn: true, email: "person@example.com", plan: "Plus" } };
   cancelLoginResult: { status: "canceled" | "not_found" } = { status: "canceled" };
   beforeLoginReturn?: (input: { authority: ProfileAuthority; method: "browser" | "device_code" }) => Promise<void>;
-  beforeCancelLoginReturn?: () => Promise<void>;
+  beforeCancelLoginReturn: (() => Promise<void>) | undefined = undefined;
   beforeReadAccountReturn?: () => Promise<void>;
   async login(input: { authority: ProfileAuthority; method: "browser" | "device_code" }): Promise<CodexLoginOutcome> { this.calls.push(`login:${input.authority.id}:${input.authority.generation}:${input.method}`); await this.beforeLoginReturn?.(input); return this.loginResult; }
   async cancelLogin(input: { authority: ProfileAuthority; loginId: string }): Promise<{ status: "canceled" | "not_found" }> { this.calls.push(`login-cancel:${input.authority.id}:${input.authority.generation}:${input.loginId}`); await this.beforeCancelLoginReturn?.(); return this.cancelLoginResult; }
@@ -5610,6 +5610,255 @@ describe("HraService", () => {
     expect(JSON.stringify(replay)).not.toContain("STOP-CODE");
     expect(JSON.stringify(replay)).not.toContain("secret=canceled");
     expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+  });
+
+  test("records the login cancellation before dispatch and replays it under the same key without another provider call", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Ledgered cancel" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-ledger" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    codex.accountProjection = { signedIn: false };
+    codex.cancelLoginResult = { status: "canceled" };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000131";
+    let recordedBeforeDispatch: unknown;
+    codex.beforeCancelLoginReturn = async () => {
+      recordedBeforeDispatch = store.readMutation(idempotencyKey);
+    };
+    const first = await service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+      idempotencyKey,
+    }, { signal });
+    expect(recordedBeforeDispatch).toMatchObject({
+      kind: "account.login-cancel",
+      authorityId: added.account.id,
+      authorityGeneration: 1,
+      state: "effect_started",
+    });
+    expect(first).toMatchObject({
+      account: { processGeneration: 1, state: "signed_out" },
+      loginId: "provider-login-ledger",
+      providerStatus: "canceled",
+      status: "canceled",
+      idempotencyKey,
+    });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({
+      state: "applied",
+      result: { loginId: "provider-login-ledger", providerStatus: "canceled", provider: { signedIn: false } },
+    });
+    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    const cancelCalls = codex.calls.filter((call) => call.startsWith("login-cancel:")).length;
+    const readCalls = codex.calls.filter((call) => call === "readAccount").length;
+
+    const replay = await service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+      idempotencyKey,
+    }, { signal });
+    expect(replay).toEqual(first);
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(cancelCalls);
+    expect(codex.calls.filter((call) => call === "readAccount")).toHaveLength(readCalls);
+    expect(cancelCalls).toBe(1);
+
+    const other = await service.execute({ kind: "account.add", label: "Other authority" }, { signal }) as { account: { id: `acct_${string}` } };
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: other.account.id,
+      idempotencyKey,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  test("resolves an indeterminate login cancellation from an exact account read and admits a fresh cancellation", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Indeterminate cancel" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-indeterminate" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    codex.accountProjection = { signedIn: false };
+    codex.beforeCancelLoginReturn = async () => {
+      throw new IndeterminateCodexEffectError("account/cancelLogin", 7);
+    };
+    const firstKey = "00000000-0000-4000-8000-000000000132";
+    const secondKey = "00000000-0000-4000-8000-000000000133";
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+      idempotencyKey: firstKey,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(store.readMutation(firstKey)).toMatchObject({ state: "ambiguous", kind: "account.login-cancel" });
+    expect(store.requireProfile(added.account.id)).toMatchObject({ processGeneration: 1, state: "login_pending" });
+
+    codex.beforeCancelLoginReturn = undefined;
+    codex.cancelLoginResult = { status: "not_found" };
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+      idempotencyKey: secondKey,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+    expect(store.readMutation(secondKey)).toBeNull();
+
+    const shown = await service.execute({ kind: "account.show", account: added.account.id }, { signal });
+    expect(shown).toMatchObject({
+      account: { state: "login_pending" },
+      login: { status: "pending", loginId: "provider-login-indeterminate" },
+    });
+    expect(store.readMutation(firstKey)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "provider_state_reconciled", evidence: { source: "account/read", signedIn: false } },
+    });
+    expect(store.listUnsettledMutations({ authorityId: added.account.id })).toEqual([]);
+
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+      idempotencyKey: secondKey,
+    }, { signal })).resolves.toMatchObject({
+      account: { state: "signed_out" },
+      providerStatus: "not_found",
+      status: "canceled",
+    });
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(2);
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+      idempotencyKey: firstKey,
+    }, { signal })).resolves.toMatchObject({ status: "already_settled" });
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(2);
+  });
+
+  test("quarantines an effect-started login cancellation at restart and reconciles it from the account read", async () => {
+    const value = await fixture();
+    const { service, codex, store } = value;
+    const added = await service.execute({ kind: "account.add", label: "Crashed cancel" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-crashed-cancel" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    const idempotencyKey = "00000000-0000-4000-8000-000000000134";
+    const attempt = store.prepareMutation({
+      kind: "account.login-cancel",
+      authorityId: added.account.id,
+      authorityGeneration: 1,
+      request: { loginId: "provider-login-crashed-cancel" },
+      idempotencyKey,
+    });
+    store.beginLoginCancelMutationEffect({
+      attemptId: attempt.id,
+      profileId: added.account.id,
+      processGeneration: 1,
+      loginId: "provider-login-crashed-cancel",
+    });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({
+      state: "effect_started",
+      evidence: { evidence: { kind: "account.login-cancel", loginId: "provider-login-crashed-cancel" } },
+    });
+    // A crash leaves the effect-started attempt behind without the graceful
+    // close that retires the profile generation, so the first service is not
+    // closed before the restarted one recovers over the same store.
+    const restartedCodex = new FakeCodex();
+    restartedCodex.accountProjection = { signedIn: false };
+    const restarted = new HraService({
+      store,
+      paths: value.paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(store.requireProfile(added.account.id)).toMatchObject({ processGeneration: 1, state: "recovery_required" });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous", result: { code: "DAEMON_RESTART" } });
+
+    const shown = await restarted.execute({ kind: "account.show", account: added.account.id }, { signal });
+    expect(shown).toMatchObject({
+      account: { processGeneration: 1, state: "signed_out" },
+      recovery: { cleared: true, required: false, resolution: "provider_state_reconciled" },
+    });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "reconciled", originalState: "ambiguous" });
+    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+    await restarted.close();
+    await service.close();
+  });
+
+  test("records a determinate provider rejection as failed when the daemon fence closes during the effect", async () => {
+    const { service, codex, store, daemonAuthority } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Fence loss" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    codex.logoutError = new Error("provider rejected the logout");
+    codex.beforeLogoutReturn = async () => {
+      daemonAuthority.invalidate();
+    };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000141";
+    await expect(service.execute({
+      kind: "account.logout",
+      account: added.account.id,
+      idempotencyKey,
+    }, { signal })).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "failed", result: { code: "Error" } });
+    expect(store.listUnsettledMutations({ authorityId: added.account.id })).toEqual([]);
+    expect(store.recoverEffectStartedMutations()).toEqual({ recovered: [], unresolved: [] });
+  });
+
+  test("leaves a fenced effect that lost the daemon fence to restart recovery", async () => {
+    const { service, codex, store, daemonAuthority } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Fence loss after effect" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    codex.beforeLogoutReturn = async () => {
+      daemonAuthority.invalidate();
+    };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000142";
+    await expect(service.execute({
+      kind: "account.logout",
+      account: added.account.id,
+      idempotencyKey,
+    }, { signal })).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "effect_started" });
+  });
+
+  test("commits a login whose signed-in account fact arrives before the receipt commit without quarantining the profile", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Early account fact" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "signed_in", account: { signedIn: true, email: "person@example.com", plan: "Plus" } };
+    let factReturned = false;
+    codex.beforeLoginReturn = async ({ authority }) => {
+      await service.observeCodexAccount(authority, { signedIn: true, email: "person@example.com", plan: "Plus" });
+      factReturned = true;
+    };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000151";
+    const result = await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+      idempotencyKey,
+    }, { signal });
+    expect(factReturned).toBe(true);
+    expect(result).toMatchObject({
+      account: { processGeneration: 1, state: "signed_in" },
+      login: { status: "signed_in" },
+    });
+    await service.settled();
+    expect(store.requireProfile(added.account.id)).toMatchObject({
+      processGeneration: 1,
+      state: "signed_in",
+      providerEmail: "person@example.com",
+    });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "applied" });
+    expect(service.backgroundDiagnostics()).toEqual({ last: null, byCode: [] });
+  });
+
+  test("keeps only closed codes and cause classes in background diagnostics", async () => {
+    const { service } = await fixture();
+    service.recordBackgroundDiagnostic("usage_poll_tick_failed", new Error("secret provider text /Users/private"));
+    service.recordBackgroundDiagnostic("usage_poll_tick_failed", new CommandFailure("CONFLICT", "conflict"));
+    service.recordBackgroundDiagnostic("queue_dispatch_failed", new DaemonAuthoritySafetyError("stale"));
+    const diagnostics = service.backgroundDiagnostics();
+    expect(diagnostics.last).toMatchObject({ code: "queue_dispatch_failed", cause: "authority_unsafe", count: 1 });
+    expect(diagnostics.byCode).toEqual([
+      expect.objectContaining({ code: "queue_dispatch_failed", cause: "authority_unsafe", count: 1 }),
+      expect.objectContaining({ code: "usage_poll_tick_failed", cause: "command_failure", count: 2 }),
+    ]);
+    expect(JSON.stringify(diagnostics)).not.toContain("secret provider text");
+    expect(JSON.stringify(diagnostics)).not.toContain("/Users/private");
   });
 
   test("settles only the exact failed provider login completion and permits a fresh login", async () => {

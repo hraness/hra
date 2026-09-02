@@ -44,8 +44,6 @@ describe("authority containment refusal rendering", () => {
       ["hosted-status.ts", 2],
       ["current-project-alias-release.ts", 1],
       ["domain-cutover.ts", 1],
-      ["release-candidate.ts", 1],
-      ["publish-beta-release.ts", 1],
     ] as const;
     for (const [name, expectedReferences] of operatorEntryPoints) {
       const source = await Bun.file(join(import.meta.dir, name)).text();

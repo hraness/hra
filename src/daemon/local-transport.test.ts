@@ -7,11 +7,17 @@ import { join } from "node:path";
 
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { renderFailure } from "../cli/render";
+import type { CommandResponse } from "../domain/contracts";
 import {
   callLocalDaemon,
   callWithSafeAutostart,
   commandFailureBrand,
+  DEFAULT_LOCAL_CONNECTION_IDLE_TIMEOUT_MS,
   DEFAULT_LOCAL_REQUEST_DEADLINE_MS,
+  DEFAULT_LOCAL_REQUEST_HEADER_TIMEOUT_MS,
+  LOCAL_TRANSPORT_COMMAND_SLOTS,
+  LOCAL_TRANSPORT_LONG_POLL_SLOTS,
+  LOCAL_TRANSPORT_PENDING_CONNECTION_LIMIT,
   LocalDaemonIndeterminateError,
   LocalDaemonServer,
   LocalDaemonShutdownTimeoutError,
@@ -24,10 +30,15 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map(async (server) => server.close()));
 });
 
-async function fixture(deadlineMs = 200): Promise<{ paths: ReturnType<typeof resolveStatePaths>; server: LocalDaemonServer }> {
+async function statePaths(): Promise<ReturnType<typeof resolveStatePaths>> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
+  return paths;
+}
+
+async function fixture(deadlineMs = 200): Promise<{ paths: ReturnType<typeof resolveStatePaths>; server: LocalDaemonServer }> {
+  const paths = await statePaths();
   const server = await LocalDaemonServer.start({
     paths,
     deadlineMs,
@@ -37,6 +48,50 @@ async function fixture(deadlineMs = 200): Promise<{ paths: ReturnType<typeof res
   return { paths, server };
 }
 
+async function until(predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error(`Timed out waiting for ${label}.`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+// Long polls and `doctor` block until the gate opens or the request aborts.
+// `daemon.status` and `daemon.stop` answer immediately, as the real service does.
+async function gatedFixture(): Promise<{
+  paths: ReturnType<typeof resolveStatePaths>;
+  server: LocalDaemonServer;
+  entered: () => number;
+  release: () => void;
+}> {
+  const paths = await statePaths();
+  let entered = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const server = await LocalDaemonServer.start({
+    paths,
+    handler: async (command, context) => {
+      if (!("waitMs" in command && command.waitMs > 0) && command.kind !== "doctor") {
+        return { command: command.kind };
+      }
+      entered += 1;
+      await Promise.race([
+        gate,
+        new Promise<void>((resolve) => {
+          if (context.signal.aborted) resolve();
+          else context.signal.addEventListener("abort", () => resolve(), { once: true });
+        }),
+      ]);
+      return { command: command.kind };
+    },
+  });
+  servers.push(server);
+  return { paths, server, entered: () => entered, release };
+}
+
+const longPoll = { kind: "session.events", session: "sess_a", limit: 1, waitMs: 30_000 } as const;
+const blockingCommand = { kind: "doctor", offline: false } as const;
+
 describe("local daemon transport", () => {
   test("keeps the default deadline above the complete cold-session budget", () => {
     expect(DEFAULT_LOCAL_REQUEST_DEADLINE_MS).toBe(
@@ -44,15 +99,247 @@ describe("local daemon transport", () => {
     );
   });
 
-  test("accepts one authenticated bounded command", async () => {
+  test("publishes the 16 command and 16 long-poll partition with bounded phase timeouts", () => {
+    expect(LOCAL_TRANSPORT_COMMAND_SLOTS).toBe(16);
+    expect(LOCAL_TRANSPORT_LONG_POLL_SLOTS).toBe(16);
+    expect(LOCAL_TRANSPORT_COMMAND_SLOTS + LOCAL_TRANSPORT_LONG_POLL_SLOTS).toBe(32);
+    expect(LOCAL_TRANSPORT_PENDING_CONNECTION_LIMIT).toBe(32);
+    expect(DEFAULT_LOCAL_REQUEST_HEADER_TIMEOUT_MS).toBe(5_000);
+    expect(DEFAULT_LOCAL_CONNECTION_IDLE_TIMEOUT_MS).toBe(10_000);
+    expect(DEFAULT_LOCAL_REQUEST_HEADER_TIMEOUT_MS).toBeLessThan(DEFAULT_LOCAL_REQUEST_DEADLINE_MS);
+    expect(DEFAULT_LOCAL_CONNECTION_IDLE_TIMEOUT_MS).toBeLessThan(DEFAULT_LOCAL_REQUEST_DEADLINE_MS);
+  });
+
+  test("rejects out-of-bound transport timeouts before publishing an endpoint", async () => {
+    const paths = await statePaths();
+    const handler = async () => ({});
+    await expect(LocalDaemonServer.start({ paths, handler, headerTimeoutMs: 0 })).rejects.toThrow(
+      "Local transport timeouts must be positive integers within one hour.",
+    );
+    await expect(LocalDaemonServer.start({ paths, handler, idleTimeoutMs: 3_600_001 })).rejects.toThrow(
+      "Local transport timeouts must be positive integers within one hour.",
+    );
+    await expect(LocalDaemonServer.start({ paths, handler, deadlineMs: 1.5 })).rejects.toThrow(
+      "Local transport timeouts must be positive integers within one hour.",
+    );
+    await expect(callLocalDaemon({ paths, command: { kind: "daemon.status" }, deadlineMs: 20 })).rejects.toBeInstanceOf(LocalDaemonUnavailableError);
+  });
+
+  test("accepts one authenticated bounded command and reports transport occupancy in daemon.status", async () => {
     const { paths } = await fixture();
     expect(await callLocalDaemon({ paths, command: { kind: "daemon.status" } })).toEqual({
       ok: true,
       version: 1,
       requestId: expect.any(String),
-      data: { command: "daemon.status" },
+      data: {
+        command: "daemon.status",
+        transport: {
+          commandSlots: { inUse: 1, capacity: 16 },
+          longPollSlots: { inUse: 0, capacity: 16 },
+          pendingConnections: { inUse: 0, capacity: 32 },
+          rejectedSinceStart: { command: 0, longPoll: 0, pending: 0 },
+        },
+      },
+    });
+    expect(await callLocalDaemon({ paths, command: { kind: "account.list" } })).toMatchObject({
+      ok: true,
+      data: { command: "account.list" },
     });
     expect((await readFile(paths.capability, "utf8")).trim()).toHaveLength(43);
+  });
+
+  test("keeps daemon.status, daemon.stop, and shutdown admissible under 32 concurrent long polls", async () => {
+    const { paths, server, entered } = await gatedFixture();
+    const settled: CommandResponse[] = [];
+    const polls = Array.from({ length: 32 }, async () => {
+      try {
+        const response = await callLocalDaemon({ paths, command: longPoll, deadlineMs: 5_000 });
+        settled.push(response);
+        return { status: "fulfilled" as const, response };
+      } catch (error: unknown) {
+        return { status: "rejected" as const, error };
+      }
+    });
+    await until(() => entered() === 16 && settled.length === 16, "16 admitted and 16 rejected long polls");
+    for (const response of settled) {
+      expect(response).toEqual({
+        ok: false,
+        version: 1,
+        requestId: expect.any(String),
+        error: {
+          code: "UNAVAILABLE",
+          message: "The local daemon has no free long-poll slot. The poll was not started; wait briefly and poll again from the same cursor.",
+          details: { reason: "local_long_poll_slots_exhausted", requestState: "not_started" },
+        },
+      });
+    }
+    expect(server.stats()).toMatchObject({
+      commandSlots: { inUse: 0, capacity: 16 },
+      longPollSlots: { inUse: 16, capacity: 16 },
+      rejectedSinceStart: { command: 0, longPoll: 16, pending: 0 },
+    });
+
+    const started = Date.now();
+    const status = await callLocalDaemon({ paths, command: { kind: "daemon.status" }, deadlineMs: 5_000 });
+    expect(status).toMatchObject({
+      ok: true,
+      data: {
+        command: "daemon.status",
+        transport: { commandSlots: { inUse: 1 }, longPollSlots: { inUse: 16 }, rejectedSinceStart: { longPoll: 16 } },
+      },
+    });
+    const stop = await callLocalDaemon({ paths, command: { kind: "daemon.stop" }, deadlineMs: 5_000 });
+    expect(stop).toMatchObject({ ok: true, data: { command: "daemon.stop" } });
+    if (!stop.ok) throw new Error("Expected daemon.stop to be admitted.");
+    expect(stop.data).toEqual({ command: "daemon.stop" });
+    expect(Date.now() - started).toBeLessThan(1_000);
+
+    // Shutdown aborts the 16 parked long polls instead of waiting for them.
+    const closing = Date.now();
+    servers.splice(servers.indexOf(server), 1);
+    await server.close({ deadlineMs: 2_000 });
+    expect(Date.now() - closing).toBeLessThan(1_500);
+    const outcomes = await Promise.all(polls);
+    expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(16);
+    expect(server.stats()).toMatchObject({ commandSlots: { inUse: 0 }, longPollSlots: { inUse: 0 }, pendingConnections: { inUse: 0 } });
+  });
+
+  test("answers the 17th concurrent command with a closed UNAVAILABLE while long polls stay admissible", async () => {
+    const { paths, server, entered, release } = await gatedFixture();
+    const commands = Array.from({ length: 16 }, async () => await callLocalDaemon({ paths, command: blockingCommand, deadlineMs: 5_000 }));
+    await until(() => entered() === 16, "16 admitted commands");
+
+    const seventeenth = await callLocalDaemon({ paths, command: blockingCommand, deadlineMs: 5_000 });
+    expect(seventeenth).toEqual({
+      ok: false,
+      version: 1,
+      requestId: expect.any(String),
+      error: {
+        code: "UNAVAILABLE",
+        message: "The local daemon has no free command slot. The command was not started; wait briefly and run the same command again.",
+        details: { reason: "local_command_slots_exhausted", requestState: "not_started" },
+      },
+    });
+    if (seventeenth.ok) throw new Error("Expected the closed saturation failure.");
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    expect(renderFailure(seventeenth.error, false, {
+      writeStdout: (value) => { stdout.push(value); },
+      writeStderr: (value) => { stderr.push(value); },
+    })).toBe(5);
+    expect(stdout).toEqual([]);
+    expect(stderr.join("")).toContain("hra: The local daemon has no free command slot.");
+    expect(stderr.join("")).not.toContain("uncertain");
+    expect(stderr.join("")).not.toContain("replay");
+
+    // A zero-wait read of a pollable kind is an ordinary command and shares the full pool.
+    const zeroWait = await callLocalDaemon({ paths, command: { ...longPoll, waitMs: 0 }, deadlineMs: 5_000 });
+    expect(zeroWait).toMatchObject({ ok: false, error: { code: "UNAVAILABLE", details: { reason: "local_command_slots_exhausted" } } });
+
+    const poll = callLocalDaemon({ paths, command: longPoll, deadlineMs: 5_000 });
+    await until(() => entered() === 17, "one long poll admitted beside full command slots");
+    expect(server.stats()).toMatchObject({
+      commandSlots: { inUse: 16, capacity: 16 },
+      longPollSlots: { inUse: 1, capacity: 16 },
+      rejectedSinceStart: { command: 2, longPoll: 0, pending: 0 },
+    });
+
+    release();
+    const responses = await Promise.all([...commands, poll]);
+    expect(responses.every((response) => response.ok)).toBe(true);
+    await until(
+      () => server.stats().commandSlots.inUse === 0 && server.stats().longPollSlots.inUse === 0,
+      "slot release after the clients close",
+    );
+  });
+
+  test("destroys a connection that does not complete its request frame within the header timeout", async () => {
+    const paths = await statePaths();
+    let handlerCalls = 0;
+    const server = await LocalDaemonServer.start({
+      paths,
+      deadlineMs: 5_000,
+      headerTimeoutMs: 50,
+      handler: async () => {
+        handlerCalls += 1;
+        return {};
+      },
+    });
+    servers.push(server);
+    const socket = createConnection(paths.socket);
+    socket.on("error", () => undefined);
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.write("{\"version\":2,\"capability\":\"");
+    await until(() => server.stats().pendingConnections.inUse === 1, "the pending connection");
+    const started = Date.now();
+    await new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(handlerCalls).toBe(0);
+    await until(() => server.stats().pendingConnections.inUse === 0, "pending release after the header timeout");
+    expect(server.stats().rejectedSinceStart).toEqual({ command: 0, longPoll: 0, pending: 0 });
+  });
+
+  test("destroys a connection whose client stops reading the response past the idle timeout", async () => {
+    const paths = await statePaths();
+    let responded = 0;
+    const server = await LocalDaemonServer.start({
+      paths,
+      deadlineMs: 5_000,
+      idleTimeoutMs: 200,
+      handler: async () => {
+        responded += 1;
+        // Larger than the kernel socket buffers, so the drain cannot finish
+        // while the client is paused.
+        return { payload: "x".repeat(3_500_000) };
+      },
+    });
+    servers.push(server);
+    const capability = (await readFile(paths.capability, "utf8")).trim();
+    const socket = createConnection(paths.socket);
+    socket.on("error", () => undefined);
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.pause();
+    socket.write(`${JSON.stringify({ version: 2, capability, requestId: randomUUID(), command: { kind: "daemon.stop" } })}\n`);
+    await until(() => responded === 1, "the handler response");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The response is queued but undeliverable; the slot is still held before the idle timeout.
+    expect(server.stats().commandSlots.inUse).toBe(1);
+    const started = Date.now();
+    await until(() => server.stats().commandSlots.inUse === 0, "slot release after the idle timeout");
+    expect(Date.now() - started).toBeLessThan(1_500);
+    socket.destroy();
+  });
+
+  test("closes connections beyond the pending pool immediately while earlier ones keep their header window", async () => {
+    const paths = await statePaths();
+    const server = await LocalDaemonServer.start({
+      paths,
+      deadlineMs: 5_000,
+      headerTimeoutMs: 2_000,
+      handler: async () => ({}),
+    });
+    servers.push(server);
+    const sockets = await Promise.all(Array.from({ length: LOCAL_TRANSPORT_PENDING_CONNECTION_LIMIT }, async () => {
+      const socket = createConnection(paths.socket);
+      socket.on("error", () => undefined);
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      return socket;
+    }));
+    try {
+      await until(() => server.stats().pendingConnections.inUse === 32, "32 pending connections");
+      const extra = createConnection(paths.socket);
+      extra.on("error", () => undefined);
+      const started = Date.now();
+      await new Promise<void>((resolve) => extra.once("close", () => resolve()));
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(server.stats()).toMatchObject({
+        pendingConnections: { inUse: 32, capacity: 32 },
+        rejectedSinceStart: { command: 0, longPoll: 0, pending: 1 },
+      });
+    } finally {
+      for (const socket of sockets) socket.destroy();
+    }
+    await until(() => server.stats().pendingConnections.inUse === 0, "pending release after the clients close");
   });
 
   test("rejects a syntactically valid response bound to another request", async () => {

@@ -39,6 +39,7 @@ import {
   SelectionError,
   StateSecurityScrubRequiredError,
   StateStore,
+  type SecurityScrubCheckpointPolicy,
 } from "./state-store";
 
 const stores: StateStore[] = [];
@@ -51,14 +52,134 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
 });
 
-async function fixture(): Promise<{ store: StateStore; home: string }> {
+async function fixture(
+  options: Readonly<{ securityScrubCheckpoint?: SecurityScrubCheckpointPolicy }> = {},
+): Promise<{ store: StateStore; home: string }> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
-  const store = new StateStore(paths, { now: (() => { let value = 1_000; return () => value++; })() });
+  const store = new StateStore(paths, {
+    now: (() => { let value = 1_000; return () => value++; })(),
+    ...options,
+  });
   stores.push(store);
   return { store, home };
 }
+
+// Pinned-reader tests prove the scrub fails once a reader outlives the whole
+// checkpoint budget. The production budget is three 5 s attempts; this policy
+// keeps the same shape and the same failure at a test-sized wait.
+const shortScrubCheckpoint: SecurityScrubCheckpointPolicy = {
+  busyTimeoutMs: 50,
+  attempts: 2,
+  backoffMs: 10,
+};
+
+// Runs readonly reads in a second Bun process so the main thread's synchronous
+// settlement meets a concurrent reader, as the daemon does when `hra status`
+// opens the same state directory. The script is written into the fixture home
+// and reports one line per event on stdout.
+type ReaderProcess = Readonly<{
+  nextLine: () => Promise<string>;
+  exited: Promise<number>;
+  kill: () => void;
+}>;
+
+async function spawnReaderProcess(
+  home: string,
+  name: string,
+  source: string,
+  args: readonly string[],
+): Promise<ReaderProcess> {
+  const script = join(home, `${name}.ts`);
+  await writeFile(script, source, { mode: 0o600 });
+  const child = Bun.spawn([process.execPath, script, ...args], {
+    env: process.env,
+    stderr: "pipe",
+    stdin: "ignore",
+    stdout: "pipe",
+  });
+  const reader = child.stdout.getReader();
+  const decoder = new TextDecoder();
+  const lines: string[] = [];
+  let buffered = "";
+  const nextLine = async (): Promise<string> => {
+    for (;;) {
+      const line = lines.shift();
+      if (line !== undefined) return line;
+      const chunk = await reader.read();
+      if (chunk.done) {
+        throw new Error(`reader process ended early: ${await new Response(child.stderr).text()}`);
+      }
+      buffered += decoder.decode(chunk.value, { stream: true });
+      const parts = buffered.split("\n");
+      buffered = parts.pop() ?? "";
+      lines.push(...parts.filter((part) => part.length > 0));
+    }
+  };
+  return { nextLine, exited: child.exited, kill: () => child.kill() };
+}
+
+// Pins one WAL snapshot on a raw readonly connection for argv[3] milliseconds.
+// Synchronous fd writes keep each report line ahead of the blocking sleep.
+const pinnedReaderSource = `
+import { writeSync } from "node:fs";
+import { Database } from "bun:sqlite";
+const [databasePath, holdMs] = Bun.argv.slice(2);
+const reader = new Database(databasePath, { readonly: true, strict: true });
+reader.exec("BEGIN");
+reader.query("SELECT count(*) AS total FROM queue_entries").get();
+writeSync(1, "pinned\\n");
+Bun.sleepSync(Number(holdMs));
+reader.exec("COMMIT");
+reader.close(false);
+writeSync(1, "released\\n");
+`;
+
+// Repeats readonly StateStore opens plus status-shaped reads until the stop
+// file exists. A readonly open that lands between the writer's scrub marker
+// and its checkpoint is refused by design; the loop retries it like a user
+// rerunning hra status.
+const statusReaderSource = `
+import { existsSync, writeSync } from "node:fs";
+import { resolveStatePaths } from ${JSON.stringify(join(import.meta.dir, "paths.ts"))};
+import { StateStore } from ${JSON.stringify(join(import.meta.dir, "state-store.ts"))};
+const [homeDirectory, stopFile] = Bun.argv.slice(2);
+const paths = resolveStatePaths({ homeDirectory, platform: "darwin" });
+let opens = 0;
+let scrubBlockedOpens = 0;
+let started = false;
+while (!existsSync(stopFile) && opens + scrubBlockedOpens < 10_000) {
+  try {
+    const store = new StateStore(paths, { readonly: true });
+    try {
+      store.listProjects();
+      store.listProfiles();
+      store.listSessions();
+    } finally {
+      store.close();
+    }
+    opens += 1;
+  } catch (error) {
+    if (error instanceof Error && error.message === "STATE_SECURITY_SCRUB_REQUIRED") {
+      scrubBlockedOpens += 1;
+    } else {
+      writeSync(1, JSON.stringify({ error: error instanceof Error ? error.message : "UNKNOWN" }) + "\\n");
+      process.exit(1);
+    }
+  }
+  if (!started) {
+    started = true;
+    writeSync(1, "started\\n");
+  }
+}
+writeSync(1, JSON.stringify({ opens, scrubBlockedOpens }) + "\\n");
+`;
+
+const statusReaderReportSchema = z.object({
+  opens: z.number().int().nonnegative(),
+  scrubBlockedOpens: z.number().int().nonnegative(),
+}).strict();
 
 function signInProfile(store: StateStore, label: string, email: string) {
   const created = store.createProfile(label);
@@ -1592,7 +1713,7 @@ describe("StateStore", () => {
   });
 
   test("keeps a pinned-reader queue scrub unavailable until restart can truncate its WAL", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ securityScrubCheckpoint: shortScrubCheckpoint });
     const profile = signInProfile(store, "Pinned queue scrub", "pinned-queue@example.com");
     const session = store.createSession({
       profileId: profile.id,
@@ -1659,6 +1780,118 @@ describe("StateStore", () => {
     expect(await stateFileSuffixesContaining(paths.database, "PINNED_QUEUE_BODY_SENTINEL"))
       .toEqual([]);
   }, 20_000);
+
+  test("completes a queue scrub after a brief reader releases its WAL snapshot", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(store, "Brief reader queue scrub", "brief-reader@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const sentinel = `BRIEF_READER_QUEUE_BODY_SENTINEL_${"x".repeat(8_192)}`;
+    const queued = store.enqueue(session.id, sentinel);
+    const paths = store.paths;
+    // 750 ms outlives the retired 250 ms single attempt and sits well inside
+    // one 5 s attempt of the production policy.
+    const reader = await spawnReaderProcess(home, "pinned-reader", pinnedReaderSource, [
+      paths.database,
+      "750",
+    ]);
+    try {
+      expect(await reader.nextLine()).toBe("pinned");
+      const startedAt = performance.now();
+      expect(store.transitionQueue(queued.id, "pending", "cancelled")).toBe(true);
+      // The checkpoint waited on the pinned snapshot rather than passing vacuously.
+      expect(performance.now() - startedAt).toBeGreaterThanOrEqual(400);
+      expect(await reader.nextLine()).toBe("released");
+      expect(await reader.exited).toBe(0);
+    } finally {
+      reader.kill();
+    }
+    expect(store.requireQueue(queued.id)).toMatchObject({
+      message: "[queue message removed after settlement]",
+      state: "cancelled",
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT required_at FROM queue_message_scrub_authority WHERE singleton=1",
+      ).get()).toBeNull();
+    } finally {
+      inspector.close(false);
+    }
+    expect(await stateFileSuffixesContaining(paths.database, "BRIEF_READER_QUEUE_BODY_SENTINEL"))
+      .toEqual([]);
+    const readonly = new StateStore(paths, { readonly: true });
+    stores.push(readonly);
+    expect(readonly.requireQueue(queued.id).state).toBe("cancelled");
+  }, 20_000);
+
+  test("settles queue messages while a readonly status reader reopens the same state directory", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(store, "Status reader settlement", "status-reader@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    const stopFile = join(home, "stop-status-reader");
+    const reader = await spawnReaderProcess(home, "status-reader", statusReaderSource, [
+      home,
+      stopFile,
+    ]);
+    let settled = 0;
+    try {
+      expect(await reader.nextLine()).toBe("started");
+      const deadline = performance.now() + 1_500;
+      while ((settled < 25 || performance.now() < deadline) && settled < 200) {
+        const queued = store.enqueue(
+          session.id,
+          `STATUS_READER_QUEUE_BODY_${settled}_${"y".repeat(4_096)}`,
+        );
+        expect(store.transitionQueue(queued.id, "pending", "cancelled")).toBe(true);
+        settled += 1;
+      }
+      await writeFile(stopFile, "stop\n", { mode: 0o600 });
+      const report = statusReaderReportSchema.parse(JSON.parse(await reader.nextLine()));
+      expect(report.opens).toBeGreaterThanOrEqual(2);
+      expect(await reader.exited).toBe(0);
+    } finally {
+      reader.kill();
+    }
+    expect(settled).toBeGreaterThanOrEqual(25);
+    expect(await stateFileSuffixesContaining(paths.database, "STATUS_READER_QUEUE_BODY_"))
+      .toEqual([]);
+  }, 30_000);
+
+  test("skips the foreign key scan on readonly opens and keeps it on writable opens", async () => {
+    const { store } = await fixture();
+    signInProfile(store, "Readonly integrity", "readonly-integrity@example.com");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    // A dangling child row passes every identity check and is visible only to
+    // PRAGMA foreign_key_check, so it separates the two open paths exactly.
+    const raw = new Database(paths.database, { strict: true });
+    try {
+      raw.exec("PRAGMA foreign_keys=OFF");
+      raw.query(
+        "INSERT INTO usage_cloud_upload_anchors(profile_id,source_revision,received_at) VALUES (?,1,1)",
+      ).run(`acct_${"f".repeat(32)}`);
+      expect(raw.query("PRAGMA foreign_key_check").all()).toHaveLength(1);
+    } finally {
+      raw.close(false);
+    }
+    const readonly = new StateStore(paths, { readonly: true });
+    stores.push(readonly);
+    expect(readonly.listProfiles()).toHaveLength(1);
+    expect(() => {
+      const writable = new StateStore(paths);
+      writable.close();
+    }).toThrow("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
+  });
 
   test("repairs stale current-version queue triggers before accepting more state", async () => {
     const { store } = await fixture();
@@ -6810,7 +7043,10 @@ describe("StateStore", () => {
       buggyMigration.close(false);
 
       expect(() => {
-        const unexpectedlyOpened = new StateStore(paths, { now: () => 9_000 });
+        const unexpectedlyOpened = new StateStore(paths, {
+          now: () => 9_000,
+          securityScrubCheckpoint: shortScrubCheckpoint,
+        });
         unexpectedlyOpened.close();
       }).toThrow("STATE_SECURITY_SCRUB_REQUIRED");
 

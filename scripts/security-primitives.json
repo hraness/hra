@@ -1,0 +1,134 @@
+{
+  "src/cli/protected-output.ts": {
+    "O_NOFOLLOW": 2,
+    "fsync": 2,
+    "mode0600": 1,
+    "mode0700": 1
+  },
+  "src/cli/render.ts": {
+    "redactCompleteSensitiveText": 1
+  },
+  "src/cli.ts": {
+    "mode0600": 2,
+    "mode0700": 3,
+    "assertCurrent": 3,
+    "redactCompleteSensitiveText": 1
+  },
+  "src/cloud/daemon-adapters.ts": {
+    "O_NOFOLLOW": 5,
+    "fsync": 2,
+    "mode0600": 4,
+    "immediateTransaction": 9,
+    "synchronousFull": 1
+  },
+  "src/cloud/daemon-bridge.ts": {
+    "assertCurrent": 8
+  },
+  "src/cloud/identity-custody.ts": {
+    "assertCurrent": 8
+  },
+  "src/cloud/local-control.ts": {
+    "assertCurrent": 20
+  },
+  "src/codex/index.ts": {
+    "safeEnvironmentKeys": 1
+  },
+  "src/codex/process.ts": {
+    "safeEnvironmentKeys": 2
+  },
+  "src/daemon/codex-runtime-adapter.ts": {
+    "redactCompleteSensitiveText": 1
+  },
+  "src/daemon/daemon-lock.ts": {
+    "O_NOFOLLOW": 3,
+    "mode0600": 7,
+    "assertCurrent": 3
+  },
+  "src/daemon/local-transport.ts": {
+    "timingSafeEqual": 1,
+    "O_NOFOLLOW": 2,
+    "mode0600": 6,
+    "validateOwnedFile": 6
+  },
+  "src/daemon/service.ts": {
+    "assertCurrent": 52
+  },
+  "src/daemon/session-event-cursor.ts": {
+    "timingSafeEqual": 1
+  },
+  "src/daemon/streaming-redaction.ts": {
+    "redactCompleteSensitiveText": 1
+  },
+  "src/daemon/usage-history-cursor.ts": {
+    "timingSafeEqual": 2
+  },
+  "src/desktop/local-switch.ts": {
+    "O_NOFOLLOW": 2,
+    "mode0600": 2
+  },
+  "src/desktop/switch.ts": {
+    "assertCurrent": 4
+  },
+  "src/install-normalizer.ts": {
+    "O_NOFOLLOW": 13,
+    "fsync": 9,
+    "mode0600": 13,
+    "mode0700": 4
+  },
+  "src/install-preflight-runtime.ts": {
+    "O_NOFOLLOW": 18,
+    "fsync": 10,
+    "mode0600": 20,
+    "mode0700": 8
+  },
+  "src/public-provider-identifier.ts": {
+    "redactCompleteSensitiveText": 1
+  },
+  "src/storage/facts-memory-control.ts": {
+    "O_NOFOLLOW": 2,
+    "mode0600": 3,
+    "immediateTransaction": 1,
+    "synchronousFull": 1
+  },
+  "src/storage/legacy-secret-migration.ts": {
+    "O_NOFOLLOW": 2,
+    "mode0600": 1,
+    "mode0700": 1,
+    "assertCurrent": 12
+  },
+  "src/storage/oh-facts-memory-engine.ts": {
+    "O_NOFOLLOW": 10,
+    "fsync": 4,
+    "mode0600": 5
+  },
+  "src/storage/paths.ts": {
+    "mode0700": 2
+  },
+  "src/storage/secret-custody.ts": {
+    "O_NOFOLLOW": 2,
+    "fsync": 4,
+    "mode0600": 13,
+    "mode0700": 1
+  },
+  "src/storage/state-store.ts": {
+    "O_NOFOLLOW": 2,
+    "mode0600": 3,
+    "immediateTransaction": 66,
+    "secureDelete": 2,
+    "synchronousFull": 1,
+    "redactCompleteSensitiveText": 2
+  },
+  "src/storage/work-capability.ts": {
+    "timingSafeEqual": 1
+  },
+  "src/storage/work-evidence.ts": {
+    "O_NOFOLLOW": 1
+  },
+  "src/storage/work-store.ts": {
+    "assertFence": 6,
+    "immediateTransaction": 7
+  },
+  "src/streaming-sensitive-text.ts": {
+    "redactCompleteSensitiveText": 2
+  }
+}

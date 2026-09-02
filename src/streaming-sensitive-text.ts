@@ -6,6 +6,8 @@ import {
   sensitiveHeaderLabelSource,
   sensitiveHorizontalWhitespaceSource,
   sensitiveQuotedKeyCloseSource,
+  unlabelledSecretPattern,
+  unlabelledSecretPatterns,
 } from "./sensitive-text";
 
 type SensitiveMode =
@@ -64,11 +66,10 @@ const secretIntroducerPatterns: readonly Readonly<{
   pattern: RegExp;
 }>[] = [
   { kind: "pem", pattern: /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/iu },
-  { kind: "token", pattern: /(?<![\p{L}\p{N}_])(?:sk|re)_[A-Za-z0-9_-]{8,}/iu },
-  { kind: "token", pattern: /(?<![\p{L}\p{N}_])(?:sk|re)-(?:proj-|svcacct-)?[A-Za-z0-9_-]{8,}/iu },
-  { kind: "token", pattern: /(?<![\p{L}\p{N}_])(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{8,}/iu },
-  { kind: "token", pattern: /(?<![\p{L}\p{N}_])xox[baprs]-[A-Za-z0-9-]{8,}/iu },
-  { kind: "token", pattern: /(?<![A-Z0-9])AKIA[A-Z0-9]{12,}/u },
+  ...unlabelledSecretPatterns.map((entry) => ({
+    kind: "token" as const,
+    pattern: unlabelledSecretPattern(entry, false),
+  })),
   { kind: "token", pattern: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}/u },
   { kind: "credential", pattern: standaloneAuthorizationSchemePattern },
   {

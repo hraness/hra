@@ -4,6 +4,7 @@
 - Reducers model profile, process, session, turn, queue, switch, sync, and recovery states.
 - Presets compile user aliases against observed provider capabilities.
 - Encryption models account-data keys, device envelopes, and encrypted projections.
+- Leaf utilities (`guards.ts`, `uuid-v7.ts`, `text-safety.ts`, `cloud-outcomes.ts`, `desktop-switch.ts`) hold the shapes and guards that storage, the daemon, and every adapter share without importing each other.
 
 # Guidelines
 

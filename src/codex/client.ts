@@ -587,7 +587,7 @@ export class CodexAppServerClient {
     );
   }
 
-  /** Exact pinned 0.149.0 experimental shape. Callers must keep pages bounded. */
+  /** Exact pinned (`CODEX_PIN`) experimental shape. Callers must keep pages bounded. */
   async listThreadTurns(options: ThreadTurnsListOptions): Promise<FencedCodexValue<TurnPage>> {
     const limit = boundedPageLimit(options.limit);
     return this.#closedRequest(
@@ -609,7 +609,7 @@ export class CodexAppServerClient {
     );
   }
 
-  /** Exact pinned 0.149.0 experimental shape. A turn filter avoids whole-thread hydration. */
+  /** Exact pinned (`CODEX_PIN`) experimental shape. A turn filter avoids whole-thread hydration. */
   async listThreadItems(options: ThreadItemsListOptions): Promise<FencedCodexValue<ThreadItemPage>> {
     const limit = boundedPageLimit(options.limit);
     return this.#closedRequest(
