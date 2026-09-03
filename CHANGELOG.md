@@ -2,6 +2,10 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## Unreleased
+
+- The hosted identity marker at `/.well-known/hra.json` keeps its fixed release-evidence version (`0.1.0`), which the canonical-alias operator proves after every cutover; wave 0 had switched it to the package version, which made the first v0.2.0 cutover proof fail.
+
 ## v0.2.0
 
 HRA v2 wave 0. Admitted 2026-09-03 as immutable GitHub Release `v0.2.0` and npm `latest`.

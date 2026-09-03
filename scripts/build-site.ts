@@ -23,6 +23,7 @@ import {
   renderPrivacyHtml,
   renderSiteHtml,
 } from "../site/template.ts";
+import { HRA_RELEASE_VERSION } from "./release-evidence";
 
 interface BuildOptions {
   readonly check: boolean;
@@ -43,7 +44,12 @@ const packageManifestSchema = z.object({
   version: z.string().regex(/^0\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u),
 }).passthrough();
 
-/** The hosted identity marker reports the version of the source tree that built it. */
+/**
+ * The hosted identity marker carries the fixed release-evidence identity
+ * version that the canonical-alias operator proves after every cutover, not
+ * the package version. The package version is read for other generated
+ * surfaces.
+ */
 export const readPackageVersion = async (
   repositoryRoot: string = resolve(import.meta.dir, ".."),
 ): Promise<string> => {
@@ -89,7 +95,6 @@ const trackedTextOutputs = (repositoryRoot: string): readonly TextOutput[] => [
 const siteTextOutputs = (
   repositoryRoot: string,
   releaseCommit: string,
-  packageVersion: string,
 ): readonly TextOutput[] => [
   {
     path: join(repositoryRoot, "dist/site/index.html"),
@@ -136,7 +141,7 @@ const siteTextOutputs = (
       source: {
         commit: releaseCommit,
       },
-      version: packageVersion,
+      version: HRA_RELEASE_VERSION,
     }, null, 2),
   },
 ];
@@ -219,8 +224,7 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     force: true,
     recursive: true,
   });
-  const packageVersion = await readPackageVersion();
-  for (const output of siteTextOutputs(options.repositoryRoot, releaseCommit, packageVersion)) {
+  for (const output of siteTextOutputs(options.repositoryRoot, releaseCommit)) {
     const content = withFinalNewline(output.content);
     await mkdir(dirname(output.path), { recursive: true });
     await writeFile(output.path, content, { encoding: "utf8" });

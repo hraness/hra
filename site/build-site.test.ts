@@ -20,6 +20,7 @@ import {
   renderPrivacyHtml,
   renderSiteHtml,
 } from "./template.ts";
+import { HRA_RELEASE_VERSION } from "../scripts/release-evidence";
 
 const temporaryRoots: string[] = [];
 
@@ -135,7 +136,7 @@ describe("static-site build", () => {
       source: {
         commit: "local",
       },
-      version: await readPackageVersion(),
+      version: HRA_RELEASE_VERSION,
     });
   });
 
@@ -213,21 +214,17 @@ describe("static-site build", () => {
     expect(analytics).not.toContain("POSTHOG_API_KEY");
   });
 
-  test("derives the hosted identity marker version from the package manifest", async () => {
+  test("keeps the hosted identity marker at the fixed release-evidence version", async () => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root });
     const identity = JSON.parse(
       await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
     ) as { version?: unknown };
-    const packageJson = JSON.parse(
-      await readFile(join(import.meta.dir, "..", "package.json"), "utf8"),
-    ) as { version?: unknown };
-
-    expect(identity.version).toBe(packageJson.version);
-    expect(identity.version).toBe(await readPackageVersion());
-    await mkdir(join(root, "broken"));
-    await writeFile(join(root, "broken", "package.json"), '{"version":"latest"}\n', "utf8");
-    await expect(readPackageVersion(join(root, "broken"))).rejects.toThrow();
+    // The canonical-alias operator proves this literal after every cutover;
+    // it is independent of the package version in package.json.
+    expect(identity.version).toBe(HRA_RELEASE_VERSION);
+    expect(identity.version).toBe("0.1.0");
+    expect(await readPackageVersion()).not.toBe(identity.version);
   });
 
   test("does not publish the retired adjacent-reading cluster", async () => {
