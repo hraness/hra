@@ -72,7 +72,7 @@ describe("public content contract", () => {
       "HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.",
     );
     expect(publicContent.statusLine).toContain(`v${publicContent.releaseVersion}`);
-    expect(publicContent.statusLine).toContain("hosted sync is not yet live");
+    expect(publicContent.statusLine).toContain("hosted sync is live as an invite-only beta");
     expect(markdown.indexOf(publicContent.thesis)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
     expect(markdown.indexOf(publicContent.statusLine)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
     expect(markdown).toContain(`## ${publicContent.hero.heading}`);
@@ -217,21 +217,23 @@ describe("public content contract", () => {
     }
   });
 
-  test("marks the local release and website live while keeping hosted sync unavailable", () => {
+  test("marks the local release, website, and invite-only hosted sync live", () => {
     expect(publicReleaseState).toBe("live");
     expect(publicContent.endpoints).toEqual({
       betaTag: "live",
       githubRepository: "live",
-      hostedSync: "beta-not-yet-live",
+      hostedSync: "live",
       website: "live",
     });
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Immutable local CLI release; hosted sync not yet live");
+      expect(surface).toContain("Immutable local CLI release; hosted sync live as an invite-only beta");
       expect(surface).toContain("is live from the immutable");
       expect(surface).toContain("npm exposes the same provenance-bearing bytes as latest");
       expect(surface).toContain("public CLI is immutable and admitted");
       expect(surface).not.toContain("release tag is release-ready");
-      expect(surface).toContain("optional hosted sync remains beta-not-yet-live");
+      expect(surface).toContain("optional hosted sync is live as an invite-only beta");
+      expect(surface).not.toContain("beta-not-yet-live");
+      expect(surface).not.toContain("not yet live");
       expect(surface).toContain("Local release boundary");
       expect(surface).toContain("are installable through the exact command above");
       expect(surface).not.toContain("once its GitHub Release exists");
@@ -479,7 +481,7 @@ describe("public content contract", () => {
       expect(surface).toContain("preserves every older encrypted cloud chunk");
       expect(surface).toContain("recovery gap");
     }
-    expect(publicContent.endpoints.hostedSync).toBe("beta-not-yet-live");
+    expect(publicContent.endpoints.hostedSync).toBe("live");
   });
 
   test("renders every shared section on both primary surfaces", () => {
