@@ -77,7 +77,51 @@ const readyBootstrap = JSON.stringify({
   state: "ready",
 });
 
+const acceptedBootstrap = JSON.stringify({
+  occupiedTableCount: 18,
+  serviceControlCount: 1,
+  state: "accepted",
+});
+
 describe("hosted preflight status operator", () => {
+  test("reports an accepted deployment with open admission as live", async () => {
+    for (const scenario of [
+      {
+        admission: '{"generation":2,"state":"open","updatedAt":1}',
+        expected: { admission: { generation: 2, state: "open" }, nextAction: "operate_hosted_sync", status: "live" },
+        exitCode: 0,
+      },
+      {
+        admission: '{"generation":1,"state":"frozen","updatedAt":1}',
+        expected: { admission: { generation: 1, state: "frozen" }, nextAction: "resume_admissions", status: "preflight_incomplete" },
+        exitCode: 1,
+      },
+    ] as const) {
+      const runner = statusRunner([
+        { exitCode: 0, stderr: "", stdout: `${requiredEnvironmentNames.join("\n")}\n` },
+        { exitCode: 0, stderr: "", stdout: `${acceptedBootstrap}\n` },
+        { exitCode: 0, stderr: "", stdout: `${scenario.admission}\n` },
+      ]);
+      const stdout: string[] = [];
+      const exitCode = await executeHostedStatus({
+        arguments: [...targetArguments, "--source-commit", sourceCommit, "--require-passed"],
+        readAttestation: async () => ({ runtimeSourceCommit: sourceCommit, state: "bound" }),
+        runner,
+        stderr: { write: () => true },
+        stdout: { write: (chunk) => { stdout.push(String(chunk)); return true; } },
+        verifyTarget: exactTargetVerifier([]),
+      });
+      expect(exitCode).toBe(scenario.exitCode);
+      expect(JSON.parse(stdout.join(""))).toEqual({
+        ...scenario.expected,
+        bootstrap: { occupiedTableCount: 18, state: "accepted" },
+        environment: { requiredNamesPresent: true, missingRequiredNames: [] },
+        releaseAttestation: { state: "current" },
+        version: 1,
+      });
+    }
+  });
+
   test("requires exactly one complete fixed Convex target tuple", () => {
     expect(parseHostedStatusArguments(statusArguments)).toEqual({
       requirePassed: false,

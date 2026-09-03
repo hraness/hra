@@ -37,7 +37,7 @@ type HostedGenesisResult = Readonly<{
 type HostedBootstrapStatus = Readonly<{
   occupiedTableCount: number;
   serviceControlCount: 0 | 1 | 2;
-  state: "inconsistent" | "ready" | "uninitialized";
+  state: "accepted" | "inconsistent" | "ready" | "uninitialized";
 }>;
 
 const hostedGenesis = makeFunctionReference<"mutation", Args, HostedGenesisResult>(
@@ -54,6 +54,9 @@ const recordIssue = makeFunctionReference<"mutation", Args, unknown>(
 );
 const admissionStatus = makeFunctionReference<"query", Args, unknown>(
   "admissionControl:status",
+);
+const admissionTransition = makeFunctionReference<"mutation", Args, unknown>(
+  "admissionControl:transition",
 );
 
 const prepare = async () => {
@@ -348,14 +351,33 @@ describe("atomic hosted authority bootstrap", () => {
     expect(await runtime.run(async (ctx) =>
       (await ctx.db.query("authInvites").collect()).map((invite) => invite.publicId)))
       .toEqual([friend.publicId]);
+    expect(await runtime.query(hostedBootstrapStatus, {})).toMatchObject({
+      serviceControlCount: 1,
+      state: "accepted",
+    });
+    await runtime.mutation(admissionTransition, {
+      expectedGeneration: 0,
+      mutationId: "01912345-6789-7abc-8def-0123456789ad",
+      state: "frozen",
+    });
+    expect(await runtime.query(hostedBootstrapStatus, {})).toMatchObject({ state: "accepted" });
+  });
+
+  test("does not report accepted from a forged acceptance timestamp", async () => {
+    const runtime = convexTest(schema, modules);
+    const authority = await prepare();
+    await runtime.mutation(hostedGenesis, genesisArguments(authority));
+    await runtime.run(async (ctx) => {
+      const control = await ctx.db.query("serviceControl").unique();
+      if (control === null) throw new Error("missing hosted bootstrap fixture");
+      await ctx.db.patch(control._id, { bootstrapAcceptedAt: control.updatedAt + 1 });
+    });
+    expect(await runtime.query(hostedBootstrapStatus, {})).toMatchObject({ state: "inconsistent" });
   });
 });
 
 const reissueBootstrapInvite = makeFunctionReference<"mutation", Args, HostedGenesisResult>(
   "quota:reissueHostedBootstrapInvite",
-);
-const admissionTransition = makeFunctionReference<"mutation", Args, unknown>(
-  "admissionControl:transition",
 );
 
 const expireBootstrapInvite = async (runtime: TestConvex<typeof schema>): Promise<void> => {

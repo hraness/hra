@@ -1394,10 +1394,36 @@ export const hostedBootstrapStatus = internalQuery({
       && service.serviceLogicalBytes === inviteBytes
     );
     const ready = occupiedTableCount === 3 && quotaValid && controlValid && inviteValid;
+    /*
+     * After the first invitation is consumed the deployment is live: the
+     * control row carries a durable accepted timestamp that is ordered after
+     * bootstrap completion and no later than its last update, and the hard
+     * quota singleton is still coherent. Admission generation and state are
+     * reported separately and may have moved.
+     */
+    const accepted = (
+      control.length === 1
+      && controlRow !== undefined
+      && quota.length === 1
+      && service !== undefined
+      && service.enforcement === "hard"
+      && isSafeNonNegativeInteger(service.identities)
+      && isSafeNonNegativeInteger(service.records)
+      && isFiniteTimestamp(controlRow.updatedAt)
+      && isFiniteTimestamp(controlRow.bootstrapCompletedAt)
+      && isFiniteTimestamp(controlRow.bootstrapAcceptedAt)
+      && controlRow.bootstrapCompletedAt <= controlRow.bootstrapAcceptedAt
+      && controlRow.bootstrapAcceptedAt <= controlRow.updatedAt
+      && isAuthDigest(controlRow.bootstrapInviteCapabilityDigest)
+      && isInvitePublicId(controlRow.bootstrapInvitePublicId)
+      && controlRow.bootstrapInviteLifetimeMs === identityInviteLifetimeMs
+      && invitePublicIdFromCapabilityDigest(controlRow.bootstrapInviteCapabilityDigest)
+        === controlRow.bootstrapInvitePublicId
+    );
     return {
       occupiedTableCount,
       serviceControlCount,
-      state: ready ? "ready" as const : "inconsistent" as const,
+      state: ready ? "ready" as const : accepted ? "accepted" as const : "inconsistent" as const,
     };
   },
 });
