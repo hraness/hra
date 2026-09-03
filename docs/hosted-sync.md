@@ -213,7 +213,7 @@ before and after every provider read, and emits one JSON line. It does not
 prove that the caller's checkout is clean or that the supplied commit is the
 intended release. Every valid observation exits zero. Add `--require-passed`
 when an agent needs a shell gate: it still emits the record but exits one
-unless the status is `preflight_passed`.
+unless the status is `preflight_passed` or `live`.
 Malformed, unavailable, or ambiguous provider reads exit one; unresolved local
 custody exits 75.
 
@@ -229,6 +229,14 @@ is intentionally neither required nor reported by this command.
 `preflight_passed` means the bound release attestation names the supplied
 source commit, the six managed names are present, and the deployment presents
 the exact first-bootstrap authority frame with open generation-zero admission.
+`live` means the same runtime and environment facts hold, the first invitation
+was accepted (the control row carries a durable accepted timestamp ordered
+after bootstrap completion), and admission is open at any generation. An
+accepted deployment with frozen admission is `preflight_incomplete` with
+`resume_admissions` as guidance. A bootstrapped deployment whose first
+invitation is unaccepted but no longer in the exact first frame, for example
+after a reissue or an admission transition, is `preflight_inconsistent`; the
+reissue section describes the only reviewed recovery.
 The JSON `releaseAttestation.state` is `current`, `other`, or `unbound`; HRA
 does not print the deployed commit. Its closed `nextAction` is guidance only,
 not authorization for a mutation. This does not validate environment values or

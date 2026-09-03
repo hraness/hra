@@ -48,7 +48,7 @@ const boundedCountSchema = z.union([z.literal(0), z.literal(1), z.literal(2)]);
 const bootstrapReadSchema = z.object({
   occupiedTableCount: z.number().int().min(0).max(maximumBootstrapTableCount),
   serviceControlCount: boundedCountSchema,
-  state: z.enum(["inconsistent", "ready", "uninitialized"]),
+  state: z.enum(["accepted", "inconsistent", "ready", "uninitialized"]),
 }).strict().superRefine((value, context) => {
   if (
     (value.state === "uninitialized" && (
@@ -56,6 +56,9 @@ const bootstrapReadSchema = z.object({
     ))
     || (value.state === "ready" && (
       value.occupiedTableCount !== 3 || value.serviceControlCount !== 1
+    ))
+    || (value.state === "accepted" && (
+      value.occupiedTableCount < 2 || value.serviceControlCount !== 1
     ))
     || (value.state === "inconsistent" && value.occupiedTableCount === 0)
   ) context.addIssue({ code: "custom", message: "bootstrap_status_incoherent" });
@@ -99,7 +102,7 @@ export type HostedStatusResult = Readonly<{
   >;
   bootstrap: Readonly<{
     occupiedTableCount: number;
-    state: "inconsistent" | "ready" | "uninitialized";
+    state: "accepted" | "inconsistent" | "ready" | "uninitialized";
   }>;
   environment: Readonly<{
     requiredNamesPresent: boolean;
@@ -107,8 +110,9 @@ export type HostedStatusResult = Readonly<{
   }>;
   releaseAttestation: ReleaseAttestationState;
   nextAction: "bootstrap_hosted_sync" | "configure_hosted_sync" | "inspect_preflight"
-    | "inspect_release_attestation" | "run_live_acceptance";
-  status: "preflight_incomplete" | "preflight_inconsistent" | "preflight_passed";
+    | "inspect_release_attestation" | "operate_hosted_sync" | "resume_admissions"
+    | "run_live_acceptance";
+  status: "live" | "preflight_incomplete" | "preflight_inconsistent" | "preflight_passed";
 }>;
 
 type HostedStatusArguments = Readonly<{
@@ -355,11 +359,15 @@ export async function readHostedStatus(options: HostedStatusOptions): Promise<Ho
     admission = { state: "inconsistent" };
   }
 
-  const preflightPassed = releaseAttestation.state === "current"
-    && missingRequiredNames.length === 0
+  const runtimeCurrent = releaseAttestation.state === "current"
+    && missingRequiredNames.length === 0;
+  const preflightPassed = runtimeCurrent
     && bootstrapRead.state === "ready"
     && admission.state === "open"
     && admission.generation === 0;
+  const live = runtimeCurrent
+    && bootstrapRead.state === "accepted"
+    && admission.state === "open";
   const inconsistent = bootstrapRead.state === "inconsistent"
     || admission.state === "inconsistent"
     || (bootstrapRead.state === "ready" && (
@@ -367,20 +375,26 @@ export async function readHostedStatus(options: HostedStatusOptions): Promise<Ho
     ));
   const status = preflightPassed
     ? "preflight_passed"
-    : inconsistent
-      ? "preflight_inconsistent"
-      : "preflight_incomplete";
+    : live
+      ? "live"
+      : inconsistent
+        ? "preflight_inconsistent"
+        : "preflight_incomplete";
   const nextAction: HostedStatusResult["nextAction"] = status === "preflight_passed"
     ? "run_live_acceptance"
-    : status === "preflight_inconsistent"
-      ? "inspect_preflight"
-      : releaseAttestation.state !== "current"
-        ? "inspect_release_attestation"
-        : missingRequiredNames.length !== 0
-          ? "configure_hosted_sync"
-          : bootstrapRead.state === "uninitialized"
-            ? "bootstrap_hosted_sync"
-            : "inspect_preflight";
+    : status === "live"
+      ? "operate_hosted_sync"
+      : status === "preflight_inconsistent"
+        ? "inspect_preflight"
+        : releaseAttestation.state !== "current"
+          ? "inspect_release_attestation"
+          : missingRequiredNames.length !== 0
+            ? "configure_hosted_sync"
+            : bootstrapRead.state === "uninitialized"
+              ? "bootstrap_hosted_sync"
+              : bootstrapRead.state === "accepted" && admission.state === "frozen"
+                ? "resume_admissions"
+                : "inspect_preflight";
   return {
     admission,
     bootstrap: {
@@ -421,7 +435,11 @@ export async function executeHostedStatus(options: ExecuteHostedStatusOptions): 
       ...(options.verifyTarget === undefined ? {} : { verifyTarget: options.verifyTarget }),
     });
     options.stdout.write(`${JSON.stringify({ ...status, version: 1 })}\n`);
-    return parsed.requirePassed && status.status !== "preflight_passed" ? 1 : 0;
+    return parsed.requirePassed
+      && status.status !== "preflight_passed"
+      && status.status !== "live"
+      ? 1
+      : 0;
   } catch (error: unknown) {
     const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
     if (authorityUnavailable !== undefined) {
