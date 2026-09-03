@@ -240,6 +240,7 @@ const currentAliasReleaseRollbackDiagnosticSchema = z.object({
     "alias_not_planned",
     "marker_mismatch",
     "provider_command_failed",
+    "receiptless_intent",
     "provider_readback_invalid",
     "stability_not_proven",
     "vercel_version_unsupported",
@@ -1296,18 +1297,79 @@ const executeCurrentAliasReleasePlan = async (
   );
 };
 
+/**
+ * Phase-aware recovery for one receipt-less intent of the exact same plan.
+ *
+ * A receipt-less intent proves only that the plan was approved and its intent
+ * published; it cannot say whether the target request was sent, acknowledged,
+ * or proved. The reviewed recovery therefore never performs the forward
+ * (target) write. It reads the current alias tuple and finishes the plan on
+ * the only automatic recovery target the runbook allows, the plan's exact
+ * source:
+ *
+ * - alias exactly at the target: dispatch the plan's own restore-source effect
+ *   under its recorded mutation key, prove the source stable, and receipt the
+ *   plan as reverted with the `receiptless_intent` diagnostic;
+ * - alias exactly at the source: prove the source stable without any write and
+ *   receipt the plan as reverted;
+ * - anything else: leave the intent untouched and stop.
+ *
+ * It runs only when the operator explicitly requests
+ * `--reconcile-receiptless-intent` together with the plan's exact machine
+ * confirmation, so an ordinary replay of a receipt-less plan still stops.
+ */
 const reconcileCurrentAliasReleaseIntent = async (
   plan: CurrentProjectAliasReleasePlan,
   provider: CurrentProjectAliasReleaseProvider,
   clock: ReleaseClock,
   timeoutMs: number,
   assertMutationAuthority: () => void,
+  confirmation: string | undefined,
+  reconcileRequested: boolean,
 ): Promise<CurrentAliasReleaseOutcome> => {
-  void plan;
-  void provider;
-  void clock;
-  void timeoutMs;
-  void assertMutationAuthority;
+  if (!reconcileRequested) {
+    throw new CurrentAliasReleaseError("unresolved_current_intent");
+  }
+  if (confirmation !== requiredAliasConfirmation(plan)) {
+    throw new CurrentAliasReleaseError("confirmation_required");
+  }
+  await provider.verifyVercelVersion();
+  await provider.verifyConvexTarget(parseConvexTarget(plan.convex));
+  await provider.readProject();
+  const sourceDeployment = parseCurrentDeploymentReadback(
+    await provider.readDeployment(plan.vercel.source.deploymentId),
+  );
+  if (!sourceDeploymentMatches(sourceDeployment, plan)) {
+    throw new CurrentAliasReleaseError("provider_readback_invalid");
+  }
+  const alias = await provider.readAlias();
+  const diagnostic: CurrentAliasReleaseRollbackDiagnostic = {
+    phase: "target_authority",
+    reason: "receiptless_intent",
+  };
+  if (aliasMatches(alias, plan.vercel.target)) {
+    return await restoreCurrentAliasReleaseSource(
+      plan,
+      provider,
+      clock,
+      timeoutMs,
+      assertMutationAuthority,
+      diagnostic,
+    );
+  }
+  if (aliasMatches(alias, plan.vercel.source)) {
+    const sourceProved = await proveStableAliasAuthority(
+      plan,
+      provider,
+      "source",
+      clock,
+      clock.now() + timeoutMs,
+    );
+    if (sourceProved.proved) {
+      throw new CurrentAliasReleaseRevertedError(diagnostic);
+    }
+    throw new CurrentAliasReleaseError("compensation_failed");
+  }
   throw new CurrentAliasReleaseError("unresolved_current_intent");
 };
 
@@ -1807,6 +1869,7 @@ type ParsedArguments = Readonly<{
   confirmation?: string;
   operation: "execute" | "preflight";
   planFd: number;
+  reconcileReceiptlessIntent?: true;
   vercelAuthFd?: number;
   vercelCli?: string;
 }>;
@@ -1815,10 +1878,15 @@ export const parseArguments = (arguments_: readonly string[]): ParsedArguments =
   let confirmation: string | undefined;
   let operation: ParsedArguments["operation"] | undefined;
   let planFd = 0;
+  let reconcileReceiptlessIntent = false;
   let vercelAuthFd: number | undefined;
   let vercelCli: string | undefined;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
+    if (argument === "--reconcile-receiptless-intent" && !reconcileReceiptlessIntent) {
+      reconcileReceiptlessIntent = true;
+      continue;
+    }
     if (argument === "preflight" && operation === undefined) {
       operation = "preflight";
       continue;
@@ -1876,11 +1944,13 @@ export const parseArguments = (arguments_: readonly string[]): ParsedArguments =
     || (vercelCli === undefined) === (vercelAuthFd === undefined)
     || vercelAuthFd !== undefined && planFd === vercelAuthFd
     || operation === "preflight" && confirmation !== undefined
+    || operation === "preflight" && reconcileReceiptlessIntent
   ) throw new CurrentAliasReleaseError("usage_invalid");
   return {
     ...(confirmation === undefined ? {} : { confirmation }),
     operation,
     planFd,
+    ...(reconcileReceiptlessIntent ? { reconcileReceiptlessIntent: true as const } : {}),
     ...(vercelAuthFd === undefined ? {} : { vercelAuthFd }),
     ...(vercelCli === undefined ? {} : { vercelCli }),
   };
@@ -2234,6 +2304,8 @@ const executeCurrentProjectAliasRelease = async (
                 options.clock ?? defaultClock,
                 options.timeoutMs ?? convergenceTimeoutMs,
                 lock.assertHeld,
+                arguments_.confirmation,
+                arguments_.reconcileReceiptlessIntent === true,
               )
             : await executeCurrentAliasReleasePlan(
                 plan,
