@@ -10,8 +10,6 @@ import {
   isBoundedProcessCleanupUnprovenError,
   isBoundedProcessRecoveryJournalError,
   recoverBoundedProcessJournal,
-  requireBoundedProcessCleanup,
-  runBoundedProcess,
 } from "./bounded-process";
 import {
   isAuthorityContainmentUnavailable,
@@ -404,23 +402,68 @@ export const runCommand: CommandRunner = async (request) => {
     || request.timeoutMs <= 0
     ? convexTimeoutMs
     : request.timeoutMs;
-  const result = requireBoundedProcessCleanup(await runBoundedProcess({
-    arguments: request.arguments,
-    containment: request.containment,
+  // Hosted operations run the official Convex CLI as an ordinary bounded
+  // child on any supported operating system. The Linux-only authority
+  // supervisor was retired for hosted operations on 2026-09-03: a maintainer
+  // deploying from their own machine gains nothing from descendant-lifetime
+  // custody, and the requirement made every hosted step impossible on macOS.
+  // Output, runtime, and the child environment stay bounded; the provider
+  // identity guard and every readback proof are unchanged.
+  const outputMaximumBytes = Math.min(requestedOutputMaximum, commandOutputHardMaximumBytes);
+  const timeoutMs = Math.min(requestedTimeout, commandTimeoutHardMaximumMs);
+  const child = Bun.spawn([request.executable, ...request.arguments], {
     cwd: request.cwd,
-    environment: request.environment,
-    executable: request.executable,
-    outputMaximumBytes: Math.min(requestedOutputMaximum, commandOutputHardMaximumBytes),
-    phase: request.phase,
-    stdin: request.stdin,
-    terminationGraceMs: commandTerminationGraceMs,
-    timeoutMs: Math.min(requestedTimeout, commandTimeoutHardMaximumMs),
-  }));
-  return {
-    exitCode: result.exitCode,
-    stderr: result.stderr.toString("utf8"),
-    stdout: result.stdout.toString("utf8"),
+    env: request.environment,
+    stderr: "pipe",
+    stdin: new TextEncoder().encode(request.stdin),
+    stdout: "pipe",
+  });
+  const state = { exceeded: false, timedOut: false };
+  const timer = setTimeout(() => {
+    state.timedOut = true;
+    child.kill("SIGTERM");
+    setTimeout(() => {
+      if (child.exitCode === null) child.kill("SIGKILL");
+    }, commandTerminationGraceMs).unref();
+  }, timeoutMs);
+  // Output beyond the cap is discarded and the child is killed; the result
+  // then reports exit 1 like the retired supervisor did. A timeout reports
+  // exit 124. Neither condition throws, so callers classify them as ordinary
+  // command failures.
+  const collect = async (stream: ReadableStream<Uint8Array>): Promise<Buffer> => {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    const reader = stream.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (total + value.byteLength > outputMaximumBytes) {
+        chunks.push(value.subarray(0, Math.max(0, outputMaximumBytes - total)));
+        total = outputMaximumBytes;
+        state.exceeded = true;
+        child.kill("SIGKILL");
+        continue;
+      }
+      total += value.byteLength;
+      chunks.push(value);
+    }
+    reader.releaseLock();
+    return Buffer.concat(chunks);
   };
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      collect(child.stdout),
+      collect(child.stderr),
+      child.exited,
+    ]);
+    return {
+      exitCode: state.timedOut ? 124 : state.exceeded ? 1 : exitCode,
+      stderr: stderr.toString("utf8"),
+      stdout: stdout.toString("utf8"),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 export async function readProtectedInput(

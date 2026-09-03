@@ -1,8 +1,6 @@
 # Hosted sync deployment
 
-Do not perform any provider write in this runbook until the user supplies the exact authorization phrase `approve both`. That phrase authorizes only the paired hosted setup: Resend GitHub OAuth and creation of the sending-only Resend key, the checked hosted secret and bootstrap writes described here, and the guarded fresh-target replacement transaction in the existing current Convex project.
-
-`approve both` does not authorize DNS. Do not add, change, or remove any DNS record, domain assignment, or production alias until the user separately confirms the exact record-level change. This runbook targets current HRA only. The retired HRA v0 Vercel and Convex resources are not fallback or rollback authorities.
+Hosted operations run the official Convex CLI as an ordinary bounded child process and work from macOS or Linux with only Bun and an authenticated Convex CLI session. The Linux-only authority supervisor requirement and the separate authorization phrase were retired on 2026-09-03 by the owner's decision to run hosted sync as a beta; every identity guard, readback proof, and denylist below still applies. DNS records, domain assignments, and the production alias are separate procedures (see `docs/domain-cutover.md`). This runbook targets current HRA only. The retired HRA v0 Vercel and Convex resources are not fallback or rollback authorities.
 
 Use this sequence only in the existing current HRA Convex project. A recovery creates one distinct, non-default production deployment in that project; it never creates a replacement project. The setup helper refuses an existing HRA environment by default and does not support overwrite.
 
@@ -10,13 +8,7 @@ Never copy retired HRA v0 data, deployment URLs, deploy keys, authentication key
 
 The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. Retired HRA v0 Convex project ID `2680173` and production deployment ID `4677913` remain permanent denylisted safety tombstones; neither may be recreated, renamed into, or selected by this runbook. The current source repository has GitHub repository ID `1343008607`, and the current web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Provider names may change. The team identity and numeric resource IDs do not.
 
-Local hosted preparation can use a process-group recovery journal in the operating-system account's fixed `~/.local/state/hra/process-recovery/` directory. Mutable `HOME` and XDG values cannot redirect it. A private lock serializes startup recovery with launch; a durable pending intent remains behind a private child gate until an active process-group journal has been atomically published, synced, and read back. Protected ancestry, exact ownership and modes, descriptor identity, and macOS ACL authority are rechecked. An active journal is cleared only after the operating system proves that the exact process group is absent. A pending journal proves the child never crossed its gate, while an incomplete promotion is a hard stop.
-
-This local custody covers only its recorded process group. A descendant can escape with a new session or a double fork. It is not a sandbox and it cannot authorize a Convex subprocess.
-
-Convex subprocesses are `authority` work. They require the supported Linux native authority backend for descendant-lifetime custody. It verifies the pinned helper, materializes a sealed in-memory executable, journals exact host, boot, PID-namespace, mount-namespace, outer-process, and namespace-init identity before `GO`, rejects inherited recovery-directory mount aliases, and relies on a private PID-namespace reaper rather than a process group. The outer supervisor and namespace PID 1 independently enforce the same authenticated monotonic deadline. Any unavailable or unproven backend refuses before it starts the Convex target or retains recovery evidence. macOS and other unsupported platforms refuse as unsupported. There is no local-process-group fallback. The commands below describe the guarded hosted procedure, not authorization to perform a provider action.
-
-For local work, `process_cleanup_unproven` and `process_recovery_journal_blocked` are terminal recovery states and exit `75`. Preserve every sorted `recoveryPaths` entry and do not retry the associated local operation while its recorded group may still be live. Hosted bootstrap and invitation results retain the protected invite file after capability commit; attested deploy results retain the final evidence path, its `.intent`, and every child-reachable source or binding root whose cleanup is unproven. A deployment-binding filesystem removal failure is reported separately as `deployment_binding_cleanup_failed`; an archived-source removal failure is `source_cleanup_failed`. Both exit `75`, preserve the earlier static failure code and containment reason when one exists, and report every failed temporary root. For an attested source cleanup, the sorted recovery paths also include the evidence destination and its `.intent`; when both temporary removals fail, `source_cleanup_failed` composes both roots rather than discarding the first cleanup failure. A filesystem-only state requires manual recovery of its paths and does not claim that a process remains live. If the same result carries `primaryCode: "process_recovery_journal_blocked"`, its journal uncertainty remains authoritative: resolve that journal first, and do not remove or retry any retained path while its recorded group may still be live. Even after authority custody is accepted, it will not be a sandbox or prove that a remote effect did not occur. Durable intents and receipts, provider idempotency, and exact reconciliation remain mandatory for every ambiguous Convex result.
+Each Convex CLI invocation is bounded in runtime and output and receives only an allowlisted child environment. A timeout reports exit 124 and an output overflow reports exit 1; both are ordinary command failures that the helpers classify without a provider retry. Hosted bootstrap and invitation results retain the protected invite file after capability commit, and attested deploy results retain the final evidence path and its `.intent`. Durable intents and receipts, provider idempotency, and exact reconciliation remain mandatory for every ambiguous Convex result; no local custody claim proves that a remote effect did not occur.
 
 ## Migrate staged prerelease secret pointers
 
@@ -245,11 +237,10 @@ encrypted-sync path. The reads are sequential and do not acquire a provider
 lock or snapshot, so treat the result only as a bounded non-atomic prerequisite
 for the controlled live-acceptance scenario.
 
-This is provider-read-only, not filesystem-pure: its contained Convex CLI
-reads use the Linux authority backend and startup may reconcile the local
-process-recovery journal. It must not be run on macOS or another platform
-without that backend, and it must not be used as an authorization shortcut for
-configure, bootstrap, DNS, or alias changes.
+This is provider-read-only, not filesystem-pure: it runs bounded Convex CLI
+reads through the authenticated CLI session on macOS or Linux, and it must not
+be used as an authorization shortcut for configure, bootstrap, DNS, or alias
+changes.
 
 ## Establish hosted authority and issue the first invite
 

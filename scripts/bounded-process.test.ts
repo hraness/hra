@@ -68,16 +68,19 @@ afterEach(async () => {
 });
 
 describe("bounded detached process groups", () => {
-  test("every release and hosted runner delegates to the same owned group boundary", async () => {
-    for (const file of [
-      "configure-hosted-sync.ts",
-      "current-project-alias-release.ts",
-    ]) {
-      const source = await readFile(join(import.meta.dir, file), "utf8");
-      expect(source).toContain("runBoundedProcess({");
-      expect(source).not.toContain("child.kill(");
-      expect(source).not.toContain("spawn(request.executable");
-    }
+  test("the alias release runner delegates to the owned group boundary", async () => {
+    const source = await readFile(join(import.meta.dir, "current-project-alias-release.ts"), "utf8");
+    expect(source).toContain("runBoundedProcess({");
+    expect(source).not.toContain("child.kill(");
+    expect(source).not.toContain("spawn(request.executable");
+  });
+
+  test("the hosted runner is a plain bounded child on every supported platform", async () => {
+    // Hosted operations retired the Linux-only authority supervisor on
+    // 2026-09-03 so a maintainer can deploy from macOS or Linux alike.
+    const source = await readFile(join(import.meta.dir, "configure-hosted-sync.ts"), "utf8");
+    expect(source).not.toContain("runBoundedProcess({");
+    expect(source).toContain("Bun.spawn([request.executable, ...request.arguments]");
   });
 
   test("authority proof consumes CLEAN before treating the direct helper exit as terminal", async () => {
