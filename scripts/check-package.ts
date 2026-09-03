@@ -58,7 +58,7 @@ const packageSchema = z.object({
     url: z.literal("git+https://github.com/hraness/hra.git"),
   }).strict(),
   scripts: z.record(z.string(), z.string()),
-  version: z.literal("0.2.0"),
+  version: z.literal("0.2.1"),
 }).passthrough();
 
 type ProcessResult = Readonly<{
