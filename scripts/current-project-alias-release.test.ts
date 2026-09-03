@@ -419,6 +419,7 @@ const runExecuteCli = async (
   options: Readonly<{
     afterIntentPublication?: () => void;
     clock?: ReturnType<typeof immediateClock>;
+    extraArguments?: readonly string[];
     receiptWriter?: () => void;
     timeoutMs?: number;
   }> = {},
@@ -439,6 +440,7 @@ const runExecuteCli = async (
     {
       arguments: [
         "--execute",
+        ...(options.extraArguments ?? []),
         "--vercel-auth-fd",
         "3",
         "--confirm-exact",
@@ -1054,6 +1056,88 @@ describe("current-project alias authority", () => {
       });
       expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
         .toEqual(writes);
+    });
+  });
+
+  test("reconciles a receipt-less intent by restoring the exact source when the alias sits at the target", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.targetSetBehavior = "commit-and-throw";
+      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      const ambiguous = await runExecuteCli(plan, provider, stateDirectory);
+      expect(ambiguous.exitCode).toBe(75);
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+      expect(provider.aliasState).toBe("target");
+      const writesBefore = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
+
+      const reconcile = await runExecuteCli(plan, provider, stateDirectory, {
+        extraArguments: ["--reconcile-receiptless-intent"],
+      });
+      expect(reconcile.exitCode).toBe(1);
+      expect(JSON.parse(reconcile.stderr.join(""))).toMatchObject({ code: "alias_reverted" });
+      expect(provider.aliasState).toBe("source");
+      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema))
+        .toMatchObject({
+          finalState: "source",
+          rollbackDiagnostic: { phase: "target_authority", reason: "receiptless_intent" },
+        });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([...writesBefore, `set-alias:${source.deploymentUrl}`]);
+
+      const replay = await runExecuteCli(plan, provider, stateDirectory);
+      expect(replay.exitCode).toBe(1);
+      expect(JSON.parse(replay.stderr.join(""))).toMatchObject({ code: "alias_reverted" });
+    });
+  });
+
+  test("reconciles a receipt-less intent without any write when the alias already sits at the source", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.targetSetBehavior = "throw";
+      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      const ambiguous = await runExecuteCli(plan, provider, stateDirectory);
+      expect(ambiguous.exitCode).toBe(75);
+      expect(provider.aliasState).toBe("source");
+      const writesBefore = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
+
+      const reconcile = await runExecuteCli(plan, provider, stateDirectory, {
+        extraArguments: ["--reconcile-receiptless-intent"],
+      });
+      expect(reconcile.exitCode).toBe(1);
+      expect(JSON.parse(reconcile.stderr.join(""))).toMatchObject({ code: "alias_reverted" });
+      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema))
+        .toMatchObject({
+          finalState: "source",
+          rollbackDiagnostic: { phase: "target_authority", reason: "receiptless_intent" },
+        });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual(writesBefore);
+    });
+  });
+
+  test("refuses to reconcile a receipt-less intent without the explicit flag, the exact token, or a planned alias", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const provider = new FakeProvider();
+      provider.targetSetBehavior = "commit-and-throw";
+      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      await runExecuteCli(plan, provider, stateDirectory);
+      const writesBefore = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
+
+      const withoutFlag = await runExecuteCli(plan, provider, stateDirectory);
+      expect(JSON.parse(withoutFlag.stderr.join(""))).toMatchObject({ code: "unresolved_current_intent" });
+
+      provider.aliasState = "unknown";
+      const unplanned = await runExecuteCli(plan, provider, stateDirectory, {
+        extraArguments: ["--reconcile-receiptless-intent"],
+      });
+      expect(unplanned.exitCode).toBe(75);
+      expect(JSON.parse(unplanned.stderr.join(""))).toMatchObject({ code: "unresolved_current_intent" });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual(writesBefore);
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+
+      expect(() => parseArguments(["preflight", "--reconcile-receiptless-intent", "--vercel-auth-fd", "3", "--plan-fd", "4"]))
+        .toThrow();
     });
   });
 
