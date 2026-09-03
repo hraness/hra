@@ -281,7 +281,23 @@ bun run hosted:bootstrap -- recover \
 
 Recovery accepts only an invoking-user-owned, single-link, mode-`0600` regular file inside the same owned mode-`0700` directory. It rederives the full request binding, invokes only `quota:genesisHostedAuthority`, and requires the same exact three-row readback. It can finish a crash that happened after local custody but before the mutation, and it can reconcile a lost mutation response through exact durable state. It never calls ordinary `authInvites:recordIssue`. A different winner returns `bootstrap_authority_conflict`; the losing file remains intact and must never be passed to `hosted:invites recover`.
 
-If no populated capability file exists and every pre-bootstrap authority remains empty, replace the still-unlaunched deployment and repeat the full fresh-state sequence. Any other state is an incident and must remain quarantined for inspection.
+If no populated capability file exists and every pre-bootstrap authority remains empty, replace the still-unlaunched deployment and repeat the full fresh-state sequence.
+
+One further state has a reviewed recovery: bootstrap completed, nobody accepted the first invitation before its 24-hour lifetime ended, and the protected capability file is gone. The deployment then holds valid quota and admission authority but no identity, and friend issuance stays locked forever because acceptance never happened. Reissue the first invitation instead of replacing the deployment:
+
+```sh
+bun run hosted:bootstrap -- reissue \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud \
+  --invite-output /absolute/private/path/identity-invite-2
+```
+
+The reissue pre-read must positively show one bootstrapped service-control row without an accepted timestamp, at most one invitation, and that invitation must be the bound first invitation and already expired. Scheduled maintenance may already have removed the expired row; then the quota counters must read zero records. Any admission generation is accepted, frozen or open, because admission is unrelated to the first invitation. Every other shape, including an invitation that is still active, refuses before a capability is generated or an output path is reserved. Custody then follows the same protected-file sequence as bootstrap. The operator runs only `quota:reissueHostedBootstrapInvite`, which in one Convex transaction requires zero identities and zero users, releases the expired invitation and its quota charge, inserts the new charged first invitation, and rebinds service control to the new digest, public ID, and lifetime. Replaying the exact request while the reissued invitation is active is neutral; a different digest while it is active is refused. The readback requires the same exact three-row binding as genesis except that the control row keeps its current admission generation, state, and mutation ID. A crash after custody recovers with `reissue --invite-file` and the same protected file. Reissue never unlocks friend issuance; only acceptance does.
+
+Any other state is an incident and must remain quarantined for inspection.
 
 ## Accept the first invite
 
