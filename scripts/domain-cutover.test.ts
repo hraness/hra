@@ -423,6 +423,8 @@ describe("domain cutover runbook", () => {
     expect(runbook).not.toContain("hosted:domain-cutover preflight");
     expect(runbook).toContain("bun ./scripts/current-project-alias-release.ts preflight");
     expect(runbook).toContain("bun ./scripts/current-project-alias-release.ts --execute");
+    expect(runbook).toContain("bun ./scripts/current-project-alias-release.ts recover-source");
+    expect(runbook).toContain("--recovery-evidence-fd 5");
     expect(runbook).not.toContain("bun run release:canonical-alias");
     expect(runbook).toContain("--confirm-exact");
     expect(runbook).toContain("ordinary conversational language");
@@ -448,8 +450,40 @@ describe("domain cutover runbook", () => {
     expect(runbook).not.toContain("confirm_exact_record_then_execute");
     expect(runbook).toContain("automatic restoration");
     expect(runbook).toContain("compensation_failed");
+    expect(runbook).toContain("self-digested target phase record");
+    expect(runbook).toContain("self-digested source-recovery intent");
+    expect(runbook).toContain("never dispatches the target assignment");
+    expect(runbook).toContain("exact original machine confirmation");
+    expect(runbook).toContain("provider `aliases-assigned` Activity event");
+    expect(runbook).toContain("it is not represented as an `oldDeploymentId` response");
+    expect(runbook).toContain("The only admitted target-authority defect is `marker_mismatch`");
+    expect(runbook).toContain("recovery refuses rather than undoing a proved release");
+    expect(runbook).toContain("Two consecutive full source-authority samples");
+    expect(runbook).toContain('status: "recovered_source"');
+    expect(runbook).toContain("target_phase_write_failed");
+    expect(runbook).toContain("source_recovery_write_failed");
+    expect(runbook).toContain("recovery_evidence_invalid");
+    expect(runbook).toContain("recovery_not_permitted");
+    expect(runbook).toContain("unresolved_source_recovery");
+    expect(runbook).toContain("8,193 persistent-entry bound");
+    expect(runbook).toContain("transient 8,194th hardlink");
+    expect(runbook).toContain("obtain its own separate conversational approval");
     expect(runbook).toContain("HRA v0 is never a fallback");
     expect(runbook).not.toContain("/move");
+  });
+
+  test("keeps the active plan aligned with phase-aware source recovery", async () => {
+    const plan = await readFile(
+      join(import.meta.dir, "..", "kb", "plans", "hra-v1.md"),
+      "utf8",
+    );
+
+    expect(plan).toContain("self-digested target phase record");
+    expect(plan).toContain("self-digested source-recovery intent");
+    expect(plan).toContain("The explicit `recover-source` operation never redispatches target");
+    expect(plan).toContain("It never treats an Activity record as a substitute for `oldDeploymentId`");
+    expect(plan).toContain("persistent bound of 8,193 entries");
+    expect(plan).toContain("Fresh forward transitions retain the separate conversational-plan approval boundary");
   });
 });
 
