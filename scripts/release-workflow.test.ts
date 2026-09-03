@@ -396,7 +396,7 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: `v0.2.1` release-ready; immutable public `v0.2.0` remains the admitted release until exact `v0.2.1` admission.");
+    expect(releaseRecord).toContain("Status: immutable public `v0.2.1` release admitted through the durable retry contract.");
     expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
     expect(releaseRecord).toContain("Release workflow run `33363290345`, attempt 1");
@@ -515,8 +515,8 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("npm trusted publishing names repository `hraness/hra` and workflow `release.yml`");
     expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.6` is authoritative after");
     expect(releaseRecord).toContain("Immutable local CLI release; hosted sync not yet live.");
-    expect(releaseRecord).toContain("The website remains live and the `v0.2.1` local CLI tag stays release-ready until exact release admission");
-    expect(releaseRecord).toContain("the install command names the `v0.2.1` GitHub Release and verified archive that admission will publish");
+    expect(releaseRecord).toContain("The website and the `v0.2.1` local CLI are live");
+    expect(releaseRecord).toContain("without changing the published `v0.2.1` bytes");
     expect(releaseRecord).toContain("Neither phase claimed that hosted sync was available; the hosted invite-only beta went live separately on 2026-09-03");
     expect(releaseRecord).toContain("may create\none annotated stable-semver tag before or after");
     expect(releaseRecord).toContain("outer digest is a transport assertion, not independent release authority");
