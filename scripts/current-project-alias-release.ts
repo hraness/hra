@@ -521,6 +521,49 @@ export const currentAliasReleaseReceiptSchema = z.object({
   ) context.addIssue({ code: "custom", message: "final_authority_digest_invalid" });
 });
 
+// Read compatibility is intentionally bound to the one terminal receipt emitted by
+// the short-lived receipt-less reconciliation implementation. Current writers keep
+// using currentAliasReleaseReceiptSchema and therefore cannot emit this diagnostic.
+const legacyReceiptlessIntentReceiptSchema = z.object({
+  changed: z.literal(true),
+  finalAuthority: normalizedAliasAuthoritySchema,
+  finalAuthorityDigest: z.literal(
+    "385da6f82d30dd40369d2f95b0c20565865c3c5b3c51c337cdedad0a4591d3fd",
+  ),
+  finalState: z.literal("source"),
+  idempotencyKey: z.literal("1a27c773-2ddd-4fa9-913f-e806826984e0"),
+  intentDigest: z.literal(
+    "0829823d77f1acb1f8e93210ec2117e9a764c0b82692402180db295e732e6f8c",
+  ),
+  kind: z.literal("current-project-canonical-alias-receipt"),
+  planDigest: z.literal(
+    "beac2e091f0ac8ad788ae201c03fb58af2b7524b1e3779fed434dce207260ed3",
+  ),
+  rollbackDiagnostic: z.object({
+    phase: z.literal("target_authority"),
+    reason: z.literal("receiptless_intent"),
+  }).strict(),
+  schemaVersion: z.literal(1),
+  selfDigest: z.literal(
+    "85c0e06922f0c1b9ebc4828feff616dc5ab596ea983cce5d707292f1582c0878",
+  ),
+  sourceRecoveryDigest: z.never().optional(),
+  targetDeploymentId: z.literal("dpl_CKw276hGrZsRJhFUwMyKCJ6tFApM"),
+  targetPhaseDigest: z.never().optional(),
+  targetSourceCommit: z.literal("ab6f3d66cce5d505769907f29f66eef83133b0f2"),
+}).strict().superRefine((value, context) => {
+  if (
+    canonicalDigest(value.finalAuthority) !== value.finalAuthorityDigest
+    || value.finalAuthority.marker.sourceCommit
+      !== value.finalAuthority.source.sourceCommit
+  ) context.addIssue({ code: "custom", message: "legacy_final_authority_invalid" });
+});
+
+const readableCurrentAliasReleaseReceiptSchema = z.union([
+  currentAliasReleaseReceiptSchema,
+  legacyReceiptlessIntentReceiptSchema,
+]);
+
 export type CurrentAliasReadback = z.infer<typeof aliasReadbackSchema>;
 export type CurrentAliasMutationReadback = z.infer<typeof aliasMutationReadbackSchema>;
 export type CurrentDeploymentReadback = z.infer<typeof deploymentReadbackSchema>;
@@ -533,6 +576,9 @@ export type CurrentAliasReleaseSourceRecovery = z.infer<
   typeof currentAliasReleaseSourceRecoverySchema
 >;
 export type CurrentAliasReleaseReceipt = z.infer<typeof currentAliasReleaseReceiptSchema>;
+type ReadableCurrentAliasReleaseReceipt = z.infer<
+  typeof readableCurrentAliasReleaseReceiptSchema
+>;
 export type ProviderActivityTargetEvidence = z.infer<
   typeof currentAliasReleaseProviderActivityEvidenceSchema
 >;
@@ -1119,7 +1165,7 @@ const currentAliasReleaseReceiptFor = (
 
 type CurrentAliasReleaseDurableState = Readonly<{
   intent: CurrentAliasReleaseIntent | null;
-  receipt: CurrentAliasReleaseReceipt | null;
+  receipt: ReadableCurrentAliasReleaseReceipt | null;
   sourceRecovery: CurrentAliasReleaseSourceRecovery | null;
   targetPhase: CurrentAliasReleaseTargetPhase | null;
 }>;
@@ -1162,7 +1208,7 @@ const inspectCurrentAliasReleaseDurableState = (
   // reading the one record a prior process was publishing when it stopped.
   assertCurrentAliasReleaseScanCapacity(names.length);
   const intents = new Map<string, CurrentAliasReleaseIntent>();
-  const receipts = new Map<string, CurrentAliasReleaseReceipt>();
+  const receipts = new Map<string, ReadableCurrentAliasReleaseReceipt>();
   const sourceRecoveries = new Map<string, CurrentAliasReleaseSourceRecovery>();
   const targetPhases = new Map<string, CurrentAliasReleaseTargetPhase>();
   for (const name of names) {
@@ -1187,7 +1233,7 @@ const inspectCurrentAliasReleaseDurableState = (
       } else if (kind === "receipt") {
         const receipt = readProtectedJson(
           join(stateDirectory, name),
-          currentAliasReleaseReceiptSchema,
+          readableCurrentAliasReleaseReceiptSchema,
           { recoverInterruptedPublication: true },
         );
         if (receipt.idempotencyKey !== idempotencyKey) {
@@ -1319,20 +1365,25 @@ const inspectCurrentAliasReleaseDurableState = (
     }
   }
   if (receipt !== null && intent !== null) {
-    const expected = currentAliasReleaseReceiptFor(
-      plan,
-      intent,
-      receipt.changed,
-      receipt.finalState,
-      {
-        ...(receipt.rollbackDiagnostic === undefined
-          ? {}
-          : { rollbackDiagnostic: receipt.rollbackDiagnostic }),
-        ...(sourceRecovery === null ? {} : { sourceRecovery }),
-        ...(targetPhase === null ? {} : { targetPhase }),
-      },
-    );
-    if (receipt.selfDigest !== expected.selfDigest) {
+    const currentReceipt = currentAliasReleaseReceiptSchema.safeParse(receipt);
+    if (currentReceipt.success) {
+      const expected = currentAliasReleaseReceiptFor(
+        plan,
+        intent,
+        currentReceipt.data.changed,
+        currentReceipt.data.finalState,
+        {
+          ...(currentReceipt.data.rollbackDiagnostic === undefined
+            ? {}
+            : { rollbackDiagnostic: currentReceipt.data.rollbackDiagnostic }),
+          ...(sourceRecovery === null ? {} : { sourceRecovery }),
+          ...(targetPhase === null ? {} : { targetPhase }),
+        },
+      );
+      if (currentReceipt.data.selfDigest !== expected.selfDigest) {
+        throw new CurrentAliasReleaseError("durable_state_invalid");
+      }
+    } else if (!legacyReceiptlessIntentReceiptSchema.safeParse(receipt).success) {
       throw new CurrentAliasReleaseError("durable_state_invalid");
     }
   }
