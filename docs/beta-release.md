@@ -1,6 +1,6 @@
 # Public CLI release control
 
-Status: `v0.1.7` release-ready; immutable public `v0.1.6` remains the admitted release until exact `v0.1.7` admission.
+Status: `v0.2.0` release-ready; immutable public `v0.1.6` remains the admitted release until exact `v0.2.0` admission.
 
 The former `v0.1.0` beta process depended on the HRA v0 Vercel deployment, its public fallback, and its paired provider readbacks. That dependency became invalid when HRA v0's Vercel and Convex resources were permanently retired. At retirement, `hraness/hra` had no `v0.1.0` tag, no draft release for that tag, and no published `v0.1.0` release.
 
@@ -14,7 +14,7 @@ Every release job starts from a shallow checkout of only the requested tag or it
 
 Ordinary pull-request and `main` CI uses the same governed-history principle without release-tag authority. It checks out exact `github.sha` shallowly with no tags or persisted credentials, validates that lowercase commit identity, unshallows only that exact commit into `refs/remotes/ci/verified`, and fails unless `HEAD` and the runner's sole ref resolve to it. For a pull request, that commit is GitHub's exact synthetic merge; for a push, it is the exact pushed commit. The package gate still scans `rev-list --all`, including the complete tested ancestry and its merge resolution, while unrelated concurrent branch heads cannot enter or race the check.
 
-The canonical README and website are the two-phase public surface: “Immutable local CLI release; hosted sync not yet live.” The website remains live and the `v0.1.7` local CLI tag stays release-ready until exact release admission; the install command names the `v0.1.7` GitHub Release and verified archive that admission will publish. The admitted `v0.1.6` tag, tarball, checksum, npm version, and provenance remain immutable historical evidence until `v0.1.7` replaces `latest`. Neither phase claims that hosted sync is available. Preserve old local receipts, intents, and evidence files as historical records; they do not authorize replay or any hosted-service mutation.
+The canonical README and website are the two-phase public surface: “Immutable local CLI release; hosted sync not yet live.” The website remains live and the `v0.2.0` local CLI tag stays release-ready until exact release admission; the install command names the `v0.2.0` GitHub Release and verified archive that admission will publish. The admitted `v0.1.6` tag, tarball, checksum, npm version, and provenance remain immutable historical evidence until `v0.2.0` replaces `latest`. Neither phase claims that hosted sync is available. Preserve old local receipts, intents, and evidence files as historical records; they do not authorize replay or any hosted-service mutation.
 
 ## Immutable v0.1.0 failure record
 
@@ -59,6 +59,10 @@ Annotated `v0.1.6` tag object `f125f3dc3d77d41d905327faa1cf825e8f3b0b92` peels t
 Attempt 2 used verifier job `100043256132`, macOS job `100043256791`, Ubuntu job `100043256627`, and publish job `100043256070`; the publisher preflight stopped with `version_conflict` after the exact npm version already existed. Attempt 3 verifier job `100043668390`, macOS job `100045311262`, Ubuntu job `100045311412`, and publish job `100045528708` observed the exact existing registry state, skipped the first-publication OIDC dry run, re-proved the GitHub Release, npm package, and provenance, and completed final public admission.
 
 Retained Actions artifact `9822648569`, named `hra-release-3`, is 658,170 bytes with digest `sha256:4a4b8f796b3facba97b2ef1a92be916d21637060df48451044ac6b736cb464b3` and expires at `2026-09-08T22:08:27Z`. Immutable GitHub Release `380848789`, node `RE_kwDOUAyvX84Ws0qV`, contains asset `540202136`, the 657,619-byte `hraness-hra-0.1.6.tgz` with SHA-256 `c26a9352a8cefd032794a94c0c05c11319897890a78fa4c6e0eb6f2506635aca`, and asset `540202181`, the 88-byte `SHA256SUMS` file with SHA-256 `de24d6c71005c7528562fff09200e529adfa119d4c1f469f46562931ceaf96c9`. npm `latest` names `@hraness/hra@0.1.6` and exposes those same tarball bytes with integrity `sha512-Olb/QneV4Qy4oRabwINocuhakrJLOsm0omCHcFK5bkFqnzCNn5vYd0LplXTEtPxNe+yWqiSBHi+98v+6bLtbZQ==` and SHA-1 `a36bc66b0c727741c0306e695da8a13ce2104704`; provenance is present and independent download comparison is byte-identical. The publication variable remains absent. `v0.1.6` is the supported public CLI beta; hosted sync remains unavailable.
+
+## Reserved version tag names
+
+GitHub immutable releases reserve a tag name forever once an immutable release used it, and that reservation survives deleting the release and even deleting and recreating a repository with the same name. The retired HRA v0 repository published immutable releases `v0.1.7`, `v0.1.8`, `v0.1.9`, and `v0.1.10` under the `hraness/hra` name, so those tags cannot be created in this repository: a push is refused with `Cannot create ref due to creations being restricted` even for an actor who bypasses every repository ruleset. The first release after `v0.1.6` is therefore `v0.2.0`. Before preparing any release, probe the intended tag name with a throwaway lightweight tag that is deleted immediately, and keep the `Immutable version tags` ruleset's bypass list empty except during that governed creation.
 
 ## Repository release governance
 
@@ -125,10 +129,10 @@ non-executable coordinate seed, `@hraness/hra@0.1.0-bootstrap.0`, while requesti
 `bootstrap` dist-tag. npm also assigns `latest` to the first published version of a new
 package coordinate even when the publication requests another tag, so the seed initially
 resolves through both `bootstrap` and `latest`; that registry invariant is not a stable
-promotion. The seed did not consume stable `0.1.0`, `0.1.1`, `0.1.2`, `0.1.3`, `0.1.4`, `0.1.5`, `0.1.6`, or `0.1.7`, expose the HRA executable, or reuse
+promotion. The seed did not consume stable `0.1.0`, `0.1.1`, `0.1.2`, `0.1.3`, `0.1.4`, `0.1.5`, `0.1.6`, or `0.2.0`, expose the HRA executable, or reuse
 any retained stable tarball. The completed ceremony required explicit operator approval and the
 repository variable
-`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.7` before stable publication.
+`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.2.0` before stable publication.
 
 After the coordinate existed, an operator using npm CLI 11.19.0 verified the sole
 trusted publisher as GitHub repository `hraness/hra`, workflow `release.yml`, publish-only,
