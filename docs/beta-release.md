@@ -1,6 +1,6 @@
 # Public CLI release control
 
-Status: immutable public `v0.2.0` release admitted through the durable retry contract.
+Status: `v0.2.1` release-ready; immutable public `v0.2.0` remains the admitted release until exact `v0.2.1` admission.
 
 The former `v0.1.0` beta process depended on the HRA v0 Vercel deployment, its public fallback, and its paired provider readbacks. That dependency became invalid when HRA v0's Vercel and Convex resources were permanently retired. At retirement, `hraness/hra` had no `v0.1.0` tag, no draft release for that tag, and no published `v0.1.0` release.
 
@@ -14,7 +14,7 @@ Every release job starts from a shallow checkout of only the requested tag or it
 
 Ordinary pull-request and `main` CI uses the same governed-history principle without release-tag authority. It checks out exact `github.sha` shallowly with no tags or persisted credentials, validates that lowercase commit identity, unshallows only that exact commit into `refs/remotes/ci/verified`, and fails unless `HEAD` and the runner's sole ref resolve to it. For a pull request, that commit is GitHub's exact synthetic merge; for a push, it is the exact pushed commit. The package gate still scans `rev-list --all`, including the complete tested ancestry and its merge resolution, while unrelated concurrent branch heads cannot enter or race the check.
 
-The canonical README and website are the two-phase public surface: “Immutable local CLI release; hosted sync not yet live.” The website and the `v0.2.0` local CLI are live; the install command names the immutable `v0.2.0` GitHub Release and verified archive. This public-copy follow-up marks the tag live without changing the published `v0.2.0` bytes. The admitted `v0.1.6` tag, tarball, checksum, npm version, and provenance remain immutable historical evidence. Neither phase claimed that hosted sync was available; the hosted invite-only beta went live separately on 2026-09-03 and the public copy now says so. Preserve old local receipts, intents, and evidence files as historical records; they do not authorize replay or any hosted-service mutation.
+The canonical README and website are the two-phase public surface: “Immutable local CLI release; hosted sync not yet live.” The website remains live and the `v0.2.1` local CLI tag stays release-ready until exact release admission; the install command names the `v0.2.1` GitHub Release and verified archive that admission will publish. The admitted `v0.2.0` tag, tarball, checksum, npm version, and provenance remain the public CLI until then and immutable historical evidence afterwards. Neither phase claimed that hosted sync was available; the hosted invite-only beta went live separately on 2026-09-03 and the public copy now says so. Preserve old local receipts, intents, and evidence files as historical records; they do not authorize replay or any hosted-service mutation.
 
 ## Immutable v0.1.0 failure record
 
@@ -137,10 +137,10 @@ non-executable coordinate seed, `@hraness/hra@0.1.0-bootstrap.0`, while requesti
 `bootstrap` dist-tag. npm also assigns `latest` to the first published version of a new
 package coordinate even when the publication requests another tag, so the seed initially
 resolves through both `bootstrap` and `latest`; that registry invariant is not a stable
-promotion. The seed did not consume stable `0.1.0`, `0.1.1`, `0.1.2`, `0.1.3`, `0.1.4`, `0.1.5`, `0.1.6`, or `0.2.0`, expose the HRA executable, or reuse
+promotion. The seed did not consume stable `0.1.0`, `0.1.1`, `0.1.2`, `0.1.3`, `0.1.4`, `0.1.5`, `0.1.6`, `0.2.0`, or `0.2.1`, expose the HRA executable, or reuse
 any retained stable tarball. The completed ceremony required explicit operator approval and the
 repository variable
-`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.2.0` before stable publication.
+`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.2.1` before stable publication.
 
 After the coordinate existed, an operator using npm CLI 11.19.0 verified the sole
 trusted publisher as GitHub repository `hraness/hra`, workflow `release.yml`, publish-only,
