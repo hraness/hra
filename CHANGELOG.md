@@ -4,6 +4,7 @@ Every entry names the release or the plan wave it belongs to. Unreleased work si
 
 ## Unreleased
 
+- The cloud transport no longer presents an expired access token to Convex. The daemon refreshes tokens lazily, and Convex rejects an expired bearer token even on the refresh-token sign-in that replaces it, so after fifteen idle minutes every hosted command failed with `INTERNAL` until a fresh login. The transport now reads the token's `exp` claim for this decision only and proceeds unauthenticated when it has passed.
 - The hosted identity marker at `/.well-known/hra.json` keeps its fixed release-evidence version (`0.1.0`), which the canonical-alias operator proves after every cutover; wave 0 had switched it to the package version, which made the first v0.2.0 cutover proof fail.
 
 ## v0.2.0
