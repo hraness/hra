@@ -181,7 +181,7 @@ const privacyBlocks: readonly ContentBlock[] = [
     kind: "notice",
     label: "Hosted sync status",
     content: [
-      text("The hosted sync endpoint is beta-not-yet-live. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. Fresh-deployment and live completion acceptance remain launch gates."),
+      text("The hosted sync endpoint is live as an invite-only beta. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. The first identity and device were admitted on the production deployment on 2026-09-03; new identities need an invitation from an existing member."),
     ],
   },
 ];
@@ -253,7 +253,7 @@ export const publicContent: PublicContent = {
   releaseVersion,
   thesis: `${productName} runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.`,
   description: `${tagline}: run several accounts side by side, keep their sessions alive in a local daemon, and drive them from a shell or JSON. ${providerRoadmap}`,
-  statusLine: `Status: public beta. The local CLI v${releaseVersion} is live for macOS and Linux; hosted sync is not yet live.`,
+  statusLine: `Status: public beta. The local CLI v${releaseVersion} is live for macOS and Linux; hosted sync is live as an invite-only beta.`,
   badges,
   maintainer: {
     name: "Hraness",
@@ -272,7 +272,7 @@ export const publicContent: PublicContent = {
   endpoints: {
     betaTag: "live",
     githubRepository: "live",
-    hostedSync: "beta-not-yet-live",
+    hostedSync: "live",
     website: "live",
   },
   links,
@@ -280,7 +280,7 @@ export const publicContent: PublicContent = {
     eyebrow: tagline,
     heading: "Keep every Codex account and live session in one durable CLI.",
     summary: "Give each account its own Codex home, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.",
-    boundary: "macOS and Linux CLI · macOS desktop switching · local v0.2.0 live · hosted sync not yet live",
+    boundary: "macOS and Linux CLI · macOS desktop switching · local v0.2.0 live · hosted sync live (invite-only beta)",
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
@@ -338,11 +338,11 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: "Immutable local CLI release; hosted sync not yet live",
+      label: "Immutable local CLI release; hosted sync live as an invite-only beta",
       content: [
         text("The exact install command below is live from the immutable "),
         code("v0.2.0"),
-        text(" GitHub Release and its verified archive. npm exposes the same provenance-bearing bytes as latest. The public CLI is immutable and admitted; optional hosted sync remains beta-not-yet-live."),
+        text(" GitHub Release and its verified archive. npm exposes the same provenance-bearing bytes as latest. The public CLI is immutable and admitted; optional hosted sync is live as an invite-only beta."),
       ],
     },
     paragraph(
@@ -657,7 +657,7 @@ export const publicContent: PublicContent = {
       heading: "Cloud sign-in and device pairing",
       blocks: [
         paragraph(
-          text("The hosted endpoint is beta-not-yet-live. An unset "),
+          text("The hosted endpoint is live as an invite-only beta. An unset "),
           code("HRA_CONVEX_URL"),
           text(" selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. After deliberately disabling a bound state root, "),
           code("hra sync status"),
@@ -1239,7 +1239,7 @@ export const renderPrivacyMarkdown = (content: PublicContent = publicContent): s
 
   return [
     "# Privacy",
-    "This policy describes the HRA v0.1 beta data boundary. The hosted sync service is beta-not-yet-live.",
+    "This policy describes the HRA beta data boundary. The hosted sync service is live as an invite-only beta.",
     renderMarkdownBlocks(privacy.blocks, 2),
     `Report a suspected boundary violation through [private vulnerability reporting](${content.links.privateSecurityReport}).`,
   ].join("\n\n") + "\n";

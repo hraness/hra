@@ -1,6 +1,6 @@
 # HRA v0.2.0 local CLI beta
 
-HRA is a persistent Codex CLI for isolated accounts and live local session control. Optional hosted encrypted sync is not yet live.
+HRA is a persistent Codex CLI for isolated accounts and live local session control. Optional hosted encrypted sync is live as an invite-only beta since 2026-09-03.
 
 ## Install
 
@@ -29,7 +29,7 @@ This release admits the local CLI only. Do not treat its cloud-auth commands as 
 
 ## Known limits
 
-- Hosted sync, identity enrollment, device pairing, and remote commands are not yet live.
+- Hosted sync, identity enrollment, device pairing, and remote commands are live as an invite-only beta; new identities need an invitation from an existing member.
 - Resolve approvals, questions, and forms on the device executing the session. Remote interaction resolution is not enabled.
 - Plugin and connector discovery is read-only. HRA does not install, enable, authorize, or open OAuth flows.
 - Desktop account switching is macOS-only in this release.
