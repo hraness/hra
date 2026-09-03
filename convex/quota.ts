@@ -1053,6 +1053,144 @@ export const genesisHostedAuthority = internalMutation({
 });
 
 /*
+ * Reviewed recovery for one specific launch failure: the bootstrap invitation
+ * expired before anyone accepted it and its protected capability file is gone.
+ * The deployment keeps its quota and admission authority; only the unaccepted
+ * first invitation is replaced. Nothing else may exist yet, so the mutation
+ * refuses once any identity, acceptance, or foreign invitation is present.
+ */
+export const reissueHostedBootstrapInvite = internalMutation({
+  args: {
+    capabilityDigest: v.string(),
+    lifetimeMs: v.number(),
+    publicId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    if (
+      !isAuthDigest(args.capabilityDigest)
+      || args.lifetimeMs !== identityInviteLifetimeMs
+      || !isInvitePublicId(args.publicId)
+      || invitePublicIdFromCapabilityDigest(args.capabilityDigest) !== args.publicId
+    ) return refuseHostedBootstrap();
+
+    const [serviceRows, controlRows, invites, users] = await Promise.all([
+      ctx.db.query("storageUsageService")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .take(2),
+      ctx.db.query("serviceControl")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .take(2),
+      ctx.db.query("authInvites").take(3),
+      ctx.db.query("users").take(1),
+    ]);
+    const service = serviceRows[0];
+    const control = controlRows[0];
+    if (
+      serviceRows.length !== 1
+      || controlRows.length !== 1
+      || service === undefined
+      || control === undefined
+      || users.length !== 0
+      || invites.length > 1
+      || control.bootstrapAcceptedAt !== undefined
+      || control.bootstrapCompletedAt === undefined
+      || control.bootstrapInviteLifetimeMs !== identityInviteLifetimeMs
+      || !isAuthDigest(control.bootstrapInviteCapabilityDigest)
+      || !isInvitePublicId(control.bootstrapInvitePublicId)
+      || invitePublicIdFromCapabilityDigest(control.bootstrapInviteCapabilityDigest)
+        !== control.bootstrapInvitePublicId
+    ) return refuseHostedBootstrap();
+    requireHardServiceAuthority(service);
+    const invite = invites[0];
+    const inviteBytes = invite === undefined ? 0 : logicalDocumentBytes(invite);
+    if (
+      service.identities !== 0
+      || service.records !== invites.length
+      || service.logicalBytes !== inviteBytes
+      || service.serviceRecords !== invites.length
+      || service.serviceLogicalBytes !== inviteBytes
+      || service.userRecords !== 0
+      || service.userLogicalBytes !== 0
+      || (
+        invite !== undefined
+        && (
+          invite.capabilityDigest !== control.bootstrapInviteCapabilityDigest
+          || invite.publicId !== control.bootstrapInvitePublicId
+          || invite.purpose !== "identity"
+          || invite.state !== "issued"
+          || invite.issuedByUserId !== undefined
+          || invite.boundAt !== undefined
+          || invite.boundEmailDigest !== undefined
+          || invite.consumedAt !== undefined
+          || invite.revokedAt !== undefined
+          || invite.requestedLifetimeMs !== identityInviteLifetimeMs
+          || invite.admissionExpiresAt !== invite.expiresAt
+          || invite.expiresAt - invite.createdAt !== identityInviteLifetimeMs
+          || invite.updatedAt !== invite.createdAt
+        )
+      )
+    ) return refuseHostedBootstrap();
+
+    const now = Date.now();
+    if (control.bootstrapInviteCapabilityDigest === args.capabilityDigest) {
+      if (
+        invite === undefined
+        || control.bootstrapInvitePublicId !== args.publicId
+        || control.bootstrapCompletedAt > control.updatedAt
+        || invite.expiresAt <= now
+      ) return refuseHostedBootstrap();
+      return {
+        enforcement: "hard" as const,
+        invite: {
+          expiresAt: invite.expiresAt,
+          publicId: invite.publicId,
+          purpose: invite.purpose,
+          state: invite.state,
+        },
+        replay: true,
+      };
+    }
+    if (invite !== undefined) {
+      if (invite.expiresAt > now) return refuseHostedBootstrap();
+      await releaseServiceQuotaForDelete(ctx, invite);
+      await ctx.db.delete(invite._id);
+    }
+    const expiresAt = now + args.lifetimeMs;
+    const inviteId = await ctx.db.insert("authInvites", {
+      admissionExpiresAt: expiresAt,
+      capabilityDigest: args.capabilityDigest,
+      createdAt: now,
+      expiresAt,
+      publicId: args.publicId,
+      purpose: "identity",
+      requestedLifetimeMs: args.lifetimeMs,
+      state: "issued",
+      updatedAt: now,
+    });
+    const reissued = await ctx.db.get(inviteId);
+    if (reissued === null) return refuseHostedBootstrap();
+    await reserveServiceQuotaForInsert(ctx, reissued);
+    await ctx.db.patch(control._id, {
+      bootstrapCompletedAt: now,
+      bootstrapInviteCapabilityDigest: args.capabilityDigest,
+      bootstrapInviteLifetimeMs: args.lifetimeMs,
+      bootstrapInvitePublicId: args.publicId,
+      updatedAt: now,
+    });
+    return {
+      enforcement: "hard" as const,
+      invite: {
+        expiresAt,
+        publicId: args.publicId,
+        purpose: "identity" as const,
+        state: "issued" as const,
+      },
+      replay: false,
+    };
+  },
+});
+
+/*
  * This bounded, non-secret projection is deliberately narrower than the
  * bootstrap mutation's recovery readback. It lets an operator distinguish an
  * untouched deployment from the exact first hosted-bootstrap frame without

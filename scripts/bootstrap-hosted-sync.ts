@@ -106,6 +106,32 @@ const bootstrapInviteRowSchema = z.object({
   updatedAt: z.number().finite().nonnegative(),
 }).strict();
 
+/*
+ * A reissue keeps whatever admission generation the deployment reached, so its
+ * control row may carry a frozen or reopened generation and its mutation ID.
+ * Everything else about the bootstrap binding stays as strict as genesis.
+ */
+const reissuedControlRowSchema = controlRowSchema.extend({
+  authAdmissionGeneration: z.number().int().nonnegative().safe(),
+  authAdmissions: z.enum(["frozen", "open"]),
+  lastMutationId: z.string().min(1).max(64).optional(),
+}).strict();
+
+const staleBootstrapInviteRowSchema = bootstrapInviteRowSchema.extend({
+  expiresAt: z.number().finite().positive(),
+}).strict();
+
+const staleAuthoritySchema = z.object({
+  control: z.tuple([reissuedControlRowSchema]),
+  invites: z.array(staleBootstrapInviteRowSchema).max(1),
+  quota: z.tuple([authorityRowSchema.extend({
+    logicalBytes: z.number().int().nonnegative().safe(),
+    records: z.union([z.literal(0), z.literal(1)]),
+    serviceLogicalBytes: z.number().int().nonnegative().safe(),
+    serviceRecords: z.union([z.literal(0), z.literal(1)]),
+  }).strict()]),
+}).strict();
+
 const emptyAuthoritySchema = z.object({
   control: z.array(z.unknown()).max(2),
   invites: z.array(z.unknown()).max(2),
@@ -117,6 +143,10 @@ const hostedAuthoritySchema = z.object({
   control: z.tuple([controlRowSchema]),
   invites: z.tuple([bootstrapInviteRowSchema]),
   quota: z.tuple([authorityRowSchema]),
+}).strict();
+
+const reissuedAuthoritySchema = hostedAuthoritySchema.extend({
+  control: z.tuple([reissuedControlRowSchema]),
 }).strict();
 
 const identityInviteCapabilitySchema = z.string()
@@ -147,6 +177,7 @@ type BootstrapFailureCode =
   | "invite_input_refused"
   | "invite_output_refused"
   | "invite_result_invalid"
+  | "reissue_refused"
   | "convex_target_refused"
   | "usage_invalid";
 
@@ -162,7 +193,14 @@ class BootstrapError extends Error {
 
 type BootstrapOperation =
   | Readonly<{ inviteOutput: string; kind: "initialize" }>
-  | Readonly<{ inviteFile: string; kind: "recover" }>;
+  | Readonly<{ inviteFile: string; kind: "recover" }>
+  | Readonly<{ inviteOutput: string; kind: "reissue" }>
+  | Readonly<{ inviteFile: string; kind: "reissue-recover" }>;
+
+export const bootstrapOperationPath = (operation: BootstrapOperation): string =>
+  operation.kind === "initialize" || operation.kind === "reissue"
+    ? operation.inviteOutput
+    : operation.inviteFile;
 
 type BootstrapArguments = Readonly<{
   operation: BootstrapOperation;
@@ -212,6 +250,24 @@ export function parseBootstrapArguments(arguments_: readonly string[]): Bootstra
       target: parsedTarget.target,
     };
   }
+  if (commandOrFlag === "reissue" && flagOrValue === "--invite-output") {
+    return {
+      operation: {
+        inviteOutput: parseProtectedAbsolutePath(maybeValue),
+        kind: "reissue",
+      },
+      target: parsedTarget.target,
+    };
+  }
+  if (commandOrFlag === "reissue" && flagOrValue === "--invite-file") {
+    return {
+      operation: {
+        inviteFile: parseProtectedAbsolutePath(maybeValue),
+        kind: "reissue-recover",
+      },
+      target: parsedTarget.target,
+    };
+  }
   throw new BootstrapError("usage_invalid");
 }
 
@@ -243,12 +299,13 @@ const preGenesisArguments = (deployment: string): readonly string[] => [
   deployment,
 ];
 
-const genesisArguments = (
+const authorityMutationArguments = (
+  mutation: "quota:genesisHostedAuthority" | "quota:reissueHostedBootstrapInvite",
   deployment: string,
   authority: Pick<LocalAuthority, "capabilityDigest" | "publicId">,
 ): readonly string[] => [
   "run",
-  "quota:genesisHostedAuthority",
+  mutation,
   JSON.stringify({
     capabilityDigest: authority.capabilityDigest,
     lifetimeMs: identityInviteLifetimeMs,
@@ -257,6 +314,18 @@ const genesisArguments = (
   "--deployment",
   deployment,
 ];
+
+const genesisArguments = (
+  deployment: string,
+  authority: Pick<LocalAuthority, "capabilityDigest" | "publicId">,
+): readonly string[] =>
+  authorityMutationArguments("quota:genesisHostedAuthority", deployment, authority);
+
+const reissueArguments = (
+  deployment: string,
+  authority: Pick<LocalAuthority, "capabilityDigest" | "publicId">,
+): readonly string[] =>
+  authorityMutationArguments("quota:reissueHostedBootstrapInvite", deployment, authority);
 
 const convexCli = resolve(import.meta.dir, "..", "node_modules", "convex", "bin", "main.js");
 const repositoryRoot = resolve(import.meta.dir, "..");
@@ -594,7 +663,7 @@ type BootstrapRecoveryOptions = BootstrapRuntimeOptions & Readonly<{
 
 export type HostedBootstrapResult = Readonly<{
   invite: z.infer<typeof inviteResultSchema>;
-  operation: "bootstrap" | "recover";
+  operation: "bootstrap" | "recover" | "reissue" | "reissue-recover";
 }>;
 
 const validateLocalAuthority = async (value: unknown): Promise<LocalAuthority> => {
@@ -608,11 +677,17 @@ const validateLocalAuthority = async (value: unknown): Promise<LocalAuthority> =
   return parsed.data;
 };
 
-const readHostedAuthority = (
+type AuthorityReader = (
+  value: unknown,
+  authority: LocalAuthority,
+) => z.infer<typeof bootstrapInviteRowSchema>;
+
+const readBoundAuthority = (
+  schema: typeof hostedAuthoritySchema | typeof reissuedAuthoritySchema,
   value: unknown,
   authority: LocalAuthority,
 ): z.infer<typeof bootstrapInviteRowSchema> => {
-  const parsed = hostedAuthoritySchema.safeParse(value);
+  const parsed = schema.safeParse(value);
   if (!parsed.success) throw new BootstrapError("authority_readback_invalid");
   const control = parsed.data.control[0];
   const invite = parsed.data.invites[0];
@@ -631,6 +706,45 @@ const readHostedAuthority = (
     || quota.serviceLogicalBytes !== inviteLogicalBytes
   ) throw new BootstrapError("bootstrap_authority_conflict");
   return invite;
+};
+
+const readHostedAuthority: AuthorityReader = (value, authority) =>
+  readBoundAuthority(hostedAuthoritySchema, value, authority);
+
+const readReissuedAuthority: AuthorityReader = (value, authority) =>
+  readBoundAuthority(reissuedAuthoritySchema, value, authority);
+
+/*
+ * The reissue pre-read must positively show one bootstrapped, unaccepted
+ * deployment whose only invitation (if maintenance has not removed it yet) is
+ * the bound first invitation and already expired. Anything else is refused
+ * before a capability is generated or a file is reserved.
+ */
+const requireStaleBootstrapAuthority = (value: unknown, now: number): void => {
+  const parsed = staleAuthoritySchema.safeParse(value);
+  if (!parsed.success) throw new BootstrapError("reissue_refused");
+  const control = parsed.data.control[0];
+  const invite = parsed.data.invites[0];
+  const quota = parsed.data.quota[0];
+  const inviteBytes = invite === undefined ? 0 : getDocumentSize(invite);
+  if (
+    control.bootstrapCompletedAt > control.updatedAt
+    || quota.records !== parsed.data.invites.length
+    || quota.serviceRecords !== parsed.data.invites.length
+    || quota.logicalBytes !== inviteBytes
+    || quota.serviceLogicalBytes !== inviteBytes
+    || (
+      invite !== undefined
+      && (
+        invite.capabilityDigest !== control.bootstrapInviteCapabilityDigest
+        || invite.publicId !== control.bootstrapInvitePublicId
+        || invite.admissionExpiresAt !== invite.expiresAt
+        || invite.expiresAt - invite.createdAt !== identityInviteLifetimeMs
+        || invite.updatedAt !== invite.createdAt
+        || invite.expiresAt > now
+      )
+    )
+  ) throw new BootstrapError("reissue_refused");
 };
 
 const authorityRowsSchema = z.object({
@@ -705,16 +819,35 @@ const createBootstrapInvoker = async (
   };
 };
 
-const runHostedGenesis = async (
+type AuthorityMutation = Readonly<{
+  arguments: (deployment: string, authority: LocalAuthority) => readonly string[];
+  phase: string;
+  read: AuthorityReader;
+}>;
+
+const genesisMutation: AuthorityMutation = {
+  arguments: genesisArguments,
+  phase: "hosted-bootstrap-genesis",
+  read: readHostedAuthority,
+};
+
+const reissueMutation: AuthorityMutation = {
+  arguments: reissueArguments,
+  phase: "hosted-bootstrap-reissue",
+  read: readReissuedAuthority,
+};
+
+const runHostedAuthorityMutation = async (
   invoker: BootstrapInvoker,
   authority: LocalAuthority,
+  mutation: AuthorityMutation,
 ): Promise<z.infer<typeof inviteResultSchema>> => {
   let mutationReplay: boolean | undefined;
   let mutationFailure: Error | undefined;
   try {
     const genesis = await invoker.invokeMutation(
-      genesisArguments(invoker.target.deploymentName, authority),
-      "hosted-bootstrap-genesis",
+      mutation.arguments(invoker.target.deploymentName, authority),
+      mutation.phase,
     );
     if (genesis.exitCode !== 0) {
       mutationFailure = new BootstrapError("genesis_failed");
@@ -752,7 +885,7 @@ const runHostedGenesis = async (
   const afterValue = parseJson(after.stdout);
   let invite: z.infer<typeof bootstrapInviteRowSchema>;
   try {
-    invite = readHostedAuthority(afterValue, authority);
+    invite = mutation.read(afterValue, authority);
   } catch (error: unknown) {
     const rows = authorityRowsSchema.safeParse(afterValue);
     if (
@@ -820,7 +953,7 @@ export async function bootstrapHostedSync(
   }
   invoker.retainRecoveryPath(options.inviteOutput);
   return {
-    invite: await runHostedGenesis(invoker, authority),
+    invite: await runHostedAuthorityMutation(invoker, authority, genesisMutation),
     operation: "bootstrap",
   };
 }
@@ -829,6 +962,17 @@ export async function recoverHostedBootstrap(
   options: BootstrapRecoveryOptions,
 ): Promise<HostedBootstrapResult> {
   const invoker = await createBootstrapInvoker(options);
+  const authority = await readLocalAuthorityFile(options);
+  invoker.retainRecoveryPath(options.inviteFile);
+  return {
+    invite: await runHostedAuthorityMutation(invoker, authority, genesisMutation),
+    operation: "recover",
+  };
+}
+
+const readLocalAuthorityFile = async (
+  options: BootstrapRecoveryOptions,
+): Promise<LocalAuthority> => {
   let capability: string;
   try {
     capability = await (options.readCapability ?? readProtectedInviteCapability)(
@@ -838,15 +982,64 @@ export async function recoverHostedBootstrap(
     throw new BootstrapError("invite_input_refused");
   }
   const capabilityDigest = await digestInviteCapability(capability, "identity");
-  const authority = await validateLocalAuthority({
+  return await validateLocalAuthority({
     capability,
     capabilityDigest,
     publicId: invitePublicIdFromCapabilityDigest(capabilityDigest),
   });
+};
+
+const readStaleAuthority = async (
+  invoker: BootstrapInvoker,
+  now: number,
+): Promise<void> => {
+  const before = await invoker.invoke(
+    authorityArguments(invoker.target.deploymentName),
+    "hosted-bootstrap-reissue-preflight-read",
+  );
+  if (before.exitCode !== 0) throw new BootstrapError("authority_readback_invalid");
+  requireStaleBootstrapAuthority(parseJson(before.stdout), now);
+};
+
+export async function reissueHostedBootstrapInvite(
+  options: BootstrapOptions & Readonly<{ now?: () => number }>,
+): Promise<HostedBootstrapResult> {
+  const invoker = await createBootstrapInvoker(options);
+  await readStaleAuthority(invoker, (options.now ?? Date.now)());
+
+  const sink = await (options.reserve ?? reserveCapabilityFile)(options.inviteOutput);
+  let authority: LocalAuthority;
+  try {
+    authority = await validateLocalAuthority(
+      await (options.authorityFactory ?? (async () =>
+        await generateInviteAuthority("identity")))(),
+    );
+  } catch (error: unknown) {
+    await sink.abort();
+    throw error;
+  }
+  try {
+    await sink.commit(authority.capability);
+  } catch {
+    await sink.abort();
+    throw new BootstrapError("invite_output_refused");
+  }
+  invoker.retainRecoveryPath(options.inviteOutput);
+  return {
+    invite: await runHostedAuthorityMutation(invoker, authority, reissueMutation),
+    operation: "reissue",
+  };
+}
+
+export async function recoverHostedBootstrapReissue(
+  options: BootstrapRecoveryOptions,
+): Promise<HostedBootstrapResult> {
+  const invoker = await createBootstrapInvoker(options);
+  const authority = await readLocalAuthorityFile(options);
   invoker.retainRecoveryPath(options.inviteFile);
   return {
-    invite: await runHostedGenesis(invoker, authority),
-    operation: "recover",
+    invite: await runHostedAuthorityMutation(invoker, authority, reissueMutation),
+    operation: "reissue-recover",
   };
 }
 
@@ -854,6 +1047,7 @@ type ExecuteOptions = Readonly<{
   arguments: readonly string[];
   authorityFactory?: () => Promise<LocalAuthority>;
   environment?: Readonly<NodeJS.ProcessEnv>;
+  now?: () => number;
   readCapability?: (path: string) => Promise<string>;
   reserve?: (path: string) => Promise<CapabilitySink>;
   runner?: CommandRunner;
@@ -871,22 +1065,34 @@ export async function executeHostedBootstrap(options: ExecuteOptions): Promise<n
       target: arguments_.target,
       ...(options.verifyTarget === undefined ? {} : { verifyTarget: options.verifyTarget }),
     } as const;
-    const result = arguments_.operation.kind === "initialize"
-      ? await bootstrapHostedSync({
-          ...runtimeOptions,
-          ...(options.authorityFactory === undefined
-            ? {}
-            : { authorityFactory: options.authorityFactory }),
-          inviteOutput: arguments_.operation.inviteOutput,
-          ...(options.reserve === undefined ? {} : { reserve: options.reserve }),
-        })
-      : await recoverHostedBootstrap({
-          ...runtimeOptions,
-          inviteFile: arguments_.operation.inviteFile,
-          ...(options.readCapability === undefined
-            ? {}
-            : { readCapability: options.readCapability }),
-        });
+    const operation = arguments_.operation;
+    const issueOptions = {
+      ...runtimeOptions,
+      ...(options.authorityFactory === undefined
+        ? {}
+        : { authorityFactory: options.authorityFactory }),
+      ...(options.reserve === undefined ? {} : { reserve: options.reserve }),
+    } as const;
+    const recoveryOptions = {
+      ...runtimeOptions,
+      ...(options.readCapability === undefined
+        ? {}
+        : { readCapability: options.readCapability }),
+    } as const;
+    const result = operation.kind === "initialize"
+      ? await bootstrapHostedSync({ ...issueOptions, inviteOutput: operation.inviteOutput })
+      : operation.kind === "reissue"
+        ? await reissueHostedBootstrapInvite({
+            ...issueOptions,
+            inviteOutput: operation.inviteOutput,
+            ...(options.now === undefined ? {} : { now: options.now }),
+          })
+        : operation.kind === "recover"
+          ? await recoverHostedBootstrap({ ...recoveryOptions, inviteFile: operation.inviteFile })
+          : await recoverHostedBootstrapReissue({
+              ...recoveryOptions,
+              inviteFile: operation.inviteFile,
+            });
     options.stdout.write(`${JSON.stringify(result)}\n`);
     return 0;
   } catch (error: unknown) {
@@ -934,9 +1140,7 @@ if (import.meta.main) {
     let operatorRecoveryPath: string | undefined;
     try {
       const parsed = parseBootstrapArguments(rawArguments);
-      operatorRecoveryPath = parsed.operation.kind === "initialize"
-        ? parsed.operation.inviteOutput
-        : parsed.operation.inviteFile;
+      operatorRecoveryPath = bootstrapOperationPath(parsed.operation);
     } catch {
       // Recovery remains authoritative even when a later argument parse would
       // refuse this invocation. Only validated absolute paths are retained.

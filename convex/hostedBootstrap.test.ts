@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { makeFunctionReference } from "convex/server";
 import type { GenericId as Id, Value } from "convex/values";
-import { convexTest } from "convex-test";
+import { convexTest, type TestConvex } from "convex-test";
 
 import {
   digestInviteCapability,
@@ -18,6 +18,7 @@ import {
   adjustServiceQuotaForPatch,
   logicalDocumentBytes,
   releaseServiceQuotaForDelete,
+  reserveServiceQuotaForInsert,
 } from "./quota";
 import schema from "./schema";
 import { modules } from "./test.setup";
@@ -347,5 +348,219 @@ describe("atomic hosted authority bootstrap", () => {
     expect(await runtime.run(async (ctx) =>
       (await ctx.db.query("authInvites").collect()).map((invite) => invite.publicId)))
       .toEqual([friend.publicId]);
+  });
+});
+
+const reissueBootstrapInvite = makeFunctionReference<"mutation", Args, HostedGenesisResult>(
+  "quota:reissueHostedBootstrapInvite",
+);
+const admissionTransition = makeFunctionReference<"mutation", Args, unknown>(
+  "admissionControl:transition",
+);
+
+const expireBootstrapInvite = async (runtime: TestConvex<typeof schema>): Promise<void> => {
+  await runtime.run(async (ctx) => {
+    const [control, invite] = await Promise.all([
+      ctx.db.query("serviceControl").unique(),
+      ctx.db.query("authInvites").unique(),
+    ]);
+    if (control === null || invite === null) throw new Error("missing hosted bootstrap fixture");
+    const createdAt = Date.now() - identityInviteLifetimeMs - 10_000;
+    const expiresAt = createdAt + identityInviteLifetimeMs;
+    await Promise.all([
+      ctx.db.patch(control._id, {
+        bootstrapCompletedAt: createdAt,
+        updatedAt: Math.max(control.updatedAt, createdAt),
+      }),
+      ctx.db.patch(invite._id, {
+        admissionExpiresAt: expiresAt,
+        createdAt,
+        expiresAt,
+        updatedAt: createdAt,
+      }),
+    ]);
+  });
+};
+
+const readAuthorityRows = async (runtime: TestConvex<typeof schema>) =>
+  await runtime.run(async (ctx) => ({
+    control: await ctx.db.query("serviceControl").collect(),
+    invites: await ctx.db.query("authInvites").collect(),
+    quota: await ctx.db.query("storageUsageService").collect(),
+  }));
+
+describe("hosted bootstrap invite reissue", () => {
+  test("refuses while the bound first invite is still active", async () => {
+    const runtime = convexTest(schema, modules);
+    const original = await prepare();
+    const replacement = await prepare();
+    await runtime.mutation(hostedGenesis, genesisArguments(original));
+    const before = await readAuthorityRows(runtime);
+
+    await expect(runtime.mutation(reissueBootstrapInvite, genesisArguments(replacement)))
+      .rejects.toThrow("HOSTED_BOOTSTRAP_AUTHORITY_REFUSED");
+    expect(await readAuthorityRows(runtime)).toEqual(before);
+  });
+
+  test("replaces an expired unaccepted invite under frozen admission with exact quota", async () => {
+    const runtime = convexTest(schema, modules);
+    const original = await prepare();
+    const replacement = await prepare();
+    const friend = await prepare();
+    await runtime.mutation(hostedGenesis, genesisArguments(original));
+    await runtime.mutation(admissionTransition, {
+      expectedGeneration: 0,
+      mutationId: "01912345-6789-7abc-8def-0123456789ab",
+      state: "frozen",
+    });
+    await expireBootstrapInvite(runtime);
+
+    const result = await runtime.mutation(
+      reissueBootstrapInvite,
+      genesisArguments(replacement),
+    );
+    expect(result).toMatchObject({
+      enforcement: "hard",
+      invite: { publicId: replacement.publicId, purpose: "identity", state: "issued" },
+      replay: false,
+    });
+
+    const rows = await readAuthorityRows(runtime);
+    expect(rows.invites.map((invite) => invite.publicId)).toEqual([replacement.publicId]);
+    const invite = rows.invites[0];
+    if (invite === undefined) throw new Error("missing reissued invite");
+    expect(invite.expiresAt - invite.createdAt).toBe(identityInviteLifetimeMs);
+    expect(invite.expiresAt).toBeGreaterThan(Date.now());
+    expect(invite.admissionExpiresAt).toBe(invite.expiresAt);
+    expect(rows.control).toHaveLength(1);
+    expect(rows.control[0]).toMatchObject({
+      authAdmissionGeneration: 1,
+      authAdmissions: "frozen",
+      bootstrapCompletedAt: invite.createdAt,
+      bootstrapInviteCapabilityDigest: replacement.capabilityDigest,
+      bootstrapInviteLifetimeMs: identityInviteLifetimeMs,
+      bootstrapInvitePublicId: replacement.publicId,
+      lastMutationId: "01912345-6789-7abc-8def-0123456789ab",
+      updatedAt: invite.createdAt,
+    });
+    expect(rows.control[0]?.bootstrapAcceptedAt).toBeUndefined();
+    const inviteBytes = logicalDocumentBytes(invite);
+    expect(rows.quota[0]).toMatchObject({
+      identities: 0,
+      logicalBytes: inviteBytes,
+      records: 1,
+      serviceLogicalBytes: inviteBytes,
+      serviceRecords: 1,
+      userLogicalBytes: 0,
+      userRecords: 0,
+    });
+
+    expect(await runtime.mutation(reissueBootstrapInvite, genesisArguments(replacement)))
+      .toMatchObject({ invite: { publicId: replacement.publicId }, replay: true });
+    await expect(runtime.mutation(reissueBootstrapInvite, genesisArguments(friend)))
+      .rejects.toThrow("HOSTED_BOOTSTRAP_AUTHORITY_REFUSED");
+    expect(await readAuthorityRows(runtime)).toEqual(rows);
+
+    await runtime.mutation(admissionTransition, {
+      expectedGeneration: 1,
+      mutationId: "01912345-6789-7abc-8def-0123456789ac",
+      state: "open",
+    });
+    await expect(runtime.mutation(recordIssue, {
+      capabilityDigest: friend.capabilityDigest,
+      lifetimeMs: minimumInviteLifetimeMs,
+      publicId: friend.publicId,
+      purpose: "identity",
+    })).rejects.toThrow("Invite operation could not be completed.");
+    expect(await runtime.mutation(reissueBootstrapInvite, genesisArguments(replacement)))
+      .toMatchObject({ invite: { publicId: replacement.publicId }, replay: true });
+    expect((await readAuthorityRows(runtime)).invites.map((invite) => invite.publicId))
+      .toEqual([replacement.publicId]);
+  });
+
+  test("reissues after maintenance already removed the expired invite", async () => {
+    const runtime = convexTest(schema, modules);
+    const original = await prepare();
+    const replacement = await prepare();
+    await runtime.mutation(hostedGenesis, genesisArguments(original));
+    await expireBootstrapInvite(runtime);
+    await runtime.run(async (ctx) => {
+      const invite = await ctx.db.query("authInvites").unique();
+      if (invite === null) throw new Error("missing bootstrap invite");
+      await releaseServiceQuotaForDelete(ctx, invite);
+      await ctx.db.delete(invite._id);
+    });
+    expect((await readAuthorityRows(runtime)).quota[0]).toMatchObject({
+      logicalBytes: 0,
+      records: 0,
+      serviceLogicalBytes: 0,
+      serviceRecords: 0,
+    });
+
+    const result = await runtime.mutation(
+      reissueBootstrapInvite,
+      genesisArguments(replacement),
+    );
+    expect(result.replay).toBe(false);
+    const rows = await readAuthorityRows(runtime);
+    expect(rows.invites.map((invite) => invite.publicId)).toEqual([replacement.publicId]);
+    const invite = rows.invites[0];
+    if (invite === undefined) throw new Error("missing reissued invite");
+    expect(rows.quota[0]).toMatchObject({
+      logicalBytes: logicalDocumentBytes(invite),
+      records: 1,
+      serviceLogicalBytes: logicalDocumentBytes(invite),
+      serviceRecords: 1,
+    });
+    expect(rows.control[0]).toMatchObject({
+      bootstrapInviteCapabilityDigest: replacement.capabilityDigest,
+      bootstrapInvitePublicId: replacement.publicId,
+    });
+  });
+
+  test("refuses once the bootstrap was accepted, an identity exists, or another invite exists", async () => {
+    for (const scenario of ["accepted", "identity", "foreign_invite"] as const) {
+      const runtime = convexTest(schema, modules);
+      const original = await prepare();
+      const replacement = await prepare();
+      const other = await prepare();
+      await runtime.mutation(hostedGenesis, genesisArguments(original));
+      await expireBootstrapInvite(runtime);
+      await runtime.run(async (ctx) => {
+        const [control, service, invite] = await Promise.all([
+          ctx.db.query("serviceControl").unique(),
+          ctx.db.query("storageUsageService").unique(),
+          ctx.db.query("authInvites").unique(),
+        ]);
+        if (control === null || service === null || invite === null) {
+          throw new Error("missing hosted bootstrap fixture");
+        }
+        if (scenario === "accepted") {
+          await ctx.db.patch(control._id, {
+            bootstrapAcceptedAt: control.updatedAt,
+          });
+        } else if (scenario === "identity") {
+          await ctx.db.patch(service._id, { identities: 1 });
+        } else {
+          const now = Date.now();
+          const foreignId = await ctx.db.insert("authInvites", {
+            capabilityDigest: other.capabilityDigest,
+            createdAt: now,
+            expiresAt: now + identityInviteLifetimeMs,
+            publicId: other.publicId,
+            purpose: "identity",
+            state: "issued",
+            updatedAt: now,
+          });
+          const foreign = await ctx.db.get(foreignId);
+          if (foreign === null) throw new Error("missing foreign invite");
+          await reserveServiceQuotaForInsert(ctx, foreign);
+        }
+      });
+      const before = await readAuthorityRows(runtime);
+      await expect(runtime.mutation(reissueBootstrapInvite, genesisArguments(replacement)))
+        .rejects.toThrow(/HOSTED_BOOTSTRAP_AUTHORITY_REFUSED|QUOTA_AUTHORITY_CORRUPT/u);
+      expect(await readAuthorityRows(runtime)).toEqual(before);
+    }
   });
 });

@@ -21,10 +21,13 @@ import {
 
 import {
   bootstrapHostedSync,
+  bootstrapOperationPath,
   executeHostedBootstrap,
   parseBootstrapArguments,
   readProtectedInviteCapability,
   recoverHostedBootstrap,
+  recoverHostedBootstrapReissue,
+  reissueHostedBootstrapInvite,
   reserveCapabilityFile,
   type CapabilitySink,
 } from "./bootstrap-hosted-sync";
@@ -706,5 +709,281 @@ describe("bootstrap command grammar", () => {
       "/protected/new-invite",
       "--force",
     ])).toThrow("usage_invalid");
+  });
+});
+
+describe("bootstrap invite reissue", () => {
+  const staleDigest = "a".repeat(64);
+  const stalePublicId = invitePublicIdFromCapabilityDigest(staleDigest);
+  const now = bootstrapAt;
+  const staleAt = now - 3 * identityInviteLifetimeMs;
+  const staleExpiresAt = staleAt + identityInviteLifetimeMs;
+  const frozenAt = staleAt + 60_000;
+  const mutationId = "01912345-6789-7abc-8def-0123456789ab";
+  const staleInvite = {
+    ...bootstrapInvite,
+    _id: "bootstrap_invite_row_stale",
+    admissionExpiresAt: staleExpiresAt,
+    capabilityDigest: staleDigest,
+    createdAt: staleAt,
+    expiresAt: staleExpiresAt,
+    publicId: stalePublicId,
+    updatedAt: staleAt,
+  } as const;
+  const staleBytes = getDocumentSize(staleInvite);
+  const staleControl = {
+    ...hostedControl,
+    authAdmissionGeneration: 1,
+    authAdmissions: "frozen",
+    bootstrapCompletedAt: staleAt,
+    bootstrapInviteCapabilityDigest: staleDigest,
+    bootstrapInvitePublicId: stalePublicId,
+    lastMutationId: mutationId,
+    updatedAt: frozenAt,
+  } as const;
+  const staleQuota = {
+    ...hostedAuthority,
+    logicalBytes: staleBytes,
+    serviceLogicalBytes: staleBytes,
+  } as const;
+  const staleReadback = {
+    control: [staleControl],
+    invites: [staleInvite],
+    quota: [staleQuota],
+  } as const;
+  const reissuedInvite = {
+    ...bootstrapInvite,
+    _id: "bootstrap_invite_row_2",
+    admissionExpiresAt: now + identityInviteLifetimeMs,
+    createdAt: now,
+    expiresAt: now + identityInviteLifetimeMs,
+    updatedAt: now,
+  } as const;
+  const reissuedBytes = getDocumentSize(reissuedInvite);
+  const reissuedReadback = {
+    control: [{
+      ...staleControl,
+      bootstrapCompletedAt: now,
+      bootstrapInviteCapabilityDigest: capabilityDigest,
+      bootstrapInvitePublicId: publicId,
+      updatedAt: now,
+    }],
+    invites: [reissuedInvite],
+    quota: [{
+      ...hostedAuthority,
+      logicalBytes: reissuedBytes,
+      serviceLogicalBytes: reissuedBytes,
+    }],
+  } as const;
+  const reissueResult = {
+    ...genesisResult,
+    invite: { ...genesisResult.invite, expiresAt: reissuedInvite.expiresAt },
+  } as const;
+
+  test("parses reissue and reissue recovery operations", () => {
+    const issue = parseBootstrapArguments([
+      "reissue", ...targetArguments, "--invite-output", "/protected/second-invite",
+    ]);
+    expect(issue.operation).toEqual({
+      inviteOutput: "/protected/second-invite",
+      kind: "reissue",
+    });
+    expect(bootstrapOperationPath(issue.operation)).toBe("/protected/second-invite");
+    const recover = parseBootstrapArguments([
+      "reissue", ...targetArguments, "--invite-file", "/protected/second-invite",
+    ]);
+    expect(recover.operation).toEqual({
+      inviteFile: "/protected/second-invite",
+      kind: "reissue-recover",
+    });
+    expect(bootstrapOperationPath(recover.operation)).toBe("/protected/second-invite");
+    for (const invalid of [
+      ["reissue", ...targetArguments],
+      ["reissue", ...targetArguments, "--invite-output", "relative"],
+      ["reissue", ...targetArguments, "--invite-file"],
+      ["reissue", "--invite-output", "/protected/second-invite", ...targetArguments, "extra"],
+    ]) {
+      expect(() => parseBootstrapArguments(invalid)).toThrow("usage_invalid");
+    }
+  });
+
+  test("replaces an expired unaccepted first invite under frozen admission", async () => {
+    const { requests, runner } = sequenceRunner([
+      { exitCode: 0, stderr: capability, stdout: `${JSON.stringify(staleReadback)}\n` },
+      { exitCode: 0, stderr: capability, stdout: `${JSON.stringify(reissueResult)}\n` },
+      { exitCode: 0, stderr: capability, stdout: `${JSON.stringify(reissuedReadback)}\n` },
+    ]);
+    const fakeSink = makeFakeSink();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let verifications = 0;
+
+    const exitCode = await executeHostedBootstrap({
+      arguments: ["reissue", ...targetArguments, "--invite-output", "/protected/second-invite"],
+      authorityFactory: async () => authority,
+      now: () => now,
+      reserve: async (path) => {
+        expect(path).toBe("/protected/second-invite");
+        return fakeSink.sink;
+      },
+      runner,
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async (value) => {
+        await exactTargetVerifier(value);
+        verifications += 1;
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(fakeSink.commits()).toEqual([capability]);
+    expect(fakeSink.aborts()).toBe(0);
+    expect(verifications).toBe(3);
+    expect(requests.map((request) => request.arguments.slice(1))).toEqual([
+      ["run", "--inline-query", authorityQuery, "--deployment", target.deploymentName],
+      [
+        "run",
+        "quota:reissueHostedBootstrapInvite",
+        JSON.stringify({
+          capabilityDigest,
+          lifetimeMs: identityInviteLifetimeMs,
+          publicId,
+        }),
+        "--deployment",
+        target.deploymentName,
+      ],
+      ["run", "--inline-query", authorityQuery, "--deployment", target.deploymentName],
+    ]);
+    expect(requests.every((request) => request.containment === "authority")).toBe(true);
+    expect(JSON.stringify({ requests, stderr, stdout })).not.toContain(capability);
+    expect(JSON.parse(stdout.join(""))).toEqual({
+      invite: { ...publicInviteResult, expiresAt: reissuedInvite.expiresAt },
+      operation: "reissue",
+    });
+    expect(stderr).toEqual([]);
+  });
+
+  test("accepts a deployment whose expired invite maintenance already removed", async () => {
+    const { runner } = sequenceRunner([
+      {
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify({
+          control: [staleControl],
+          invites: [],
+          quota: [{
+            ...hostedAuthority,
+            logicalBytes: 0,
+            records: 0,
+            serviceLogicalBytes: 0,
+            serviceRecords: 0,
+          }],
+        }),
+      },
+      { exitCode: 0, stderr: "", stdout: JSON.stringify(reissueResult) },
+      { exitCode: 0, stderr: "", stdout: JSON.stringify(reissuedReadback) },
+    ]);
+    const fakeSink = makeFakeSink();
+    const result = await reissueHostedBootstrapInvite({
+      authorityFactory: async () => authority,
+      inviteOutput: "/protected/second-invite",
+      now: () => now,
+      reserve: async () => fakeSink.sink,
+      runner,
+      target,
+      verifyTarget: exactTargetVerifier,
+    });
+    expect(result.operation).toBe("reissue");
+    expect(result.invite.replay).toBe(false);
+    expect(fakeSink.commits()).toEqual([capability]);
+  });
+
+  test("refuses an active, accepted, empty, or foreign state before reserving custody", async () => {
+    const scenarios = [
+      { readback: authorityReadback, reason: "active invite" },
+      {
+        readback: {
+          ...staleReadback,
+          control: [{ ...staleControl, bootstrapAcceptedAt: frozenAt }],
+        },
+        reason: "accepted bootstrap",
+      },
+      { readback: { control: [], invites: [], quota: [] }, reason: "uninitialized" },
+      {
+        readback: {
+          ...staleReadback,
+          invites: [{ ...staleInvite, publicId, capabilityDigest }],
+        },
+        reason: "foreign invite",
+      },
+      {
+        readback: {
+          ...staleReadback,
+          quota: [{ ...staleQuota, logicalBytes: staleBytes + 1 }],
+        },
+        reason: "quota drift",
+      },
+      {
+        readback: { ...staleReadback, control: [{ ...staleControl, updatedAt: staleAt - 1 }] },
+        reason: "control clock drift",
+      },
+    ] as const;
+    for (const scenario of scenarios) {
+      const { requests, runner } = sequenceRunner([
+        { exitCode: 0, stderr: "", stdout: JSON.stringify(scenario.readback) },
+      ]);
+      let reserved = false;
+      await expect(reissueHostedBootstrapInvite({
+        authorityFactory: async () => authority,
+        inviteOutput: "/protected/second-invite",
+        now: () => now,
+        reserve: async () => {
+          reserved = true;
+          throw new Error("must not reserve");
+        },
+        runner,
+        target,
+        verifyTarget: exactTargetVerifier,
+      })).rejects.toThrow("reissue_refused");
+      expect(reserved).toBe(false);
+      expect(requests).toHaveLength(1);
+    }
+  });
+
+  test("recovers a reissue from the protected file and refuses a different winner", async () => {
+    const { requests, runner } = sequenceRunner([
+      { exitCode: 1, stderr: "transport lost", stdout: "" },
+      { exitCode: 0, stderr: "", stdout: JSON.stringify(reissuedReadback) },
+    ]);
+    const stdout: string[] = [];
+    const exitCode = await executeHostedBootstrap({
+      arguments: ["reissue", ...targetArguments, "--invite-file", "/protected/second-invite"],
+      readCapability: async (value) => {
+        expect(value).toBe("/protected/second-invite");
+        return capability;
+      },
+      runner,
+      stderr: outputWriter([]),
+      stdout: outputWriter(stdout),
+      verifyTarget: exactTargetVerifier,
+    });
+    expect(exitCode).toBe(0);
+    expect(requests[0]?.arguments).toContain("quota:reissueHostedBootstrapInvite");
+    expect(JSON.parse(stdout.join(""))).toEqual({
+      invite: { ...publicInviteResult, expiresAt: reissuedInvite.expiresAt, replay: true },
+      operation: "reissue-recover",
+    });
+
+    const loser = sequenceRunner([
+      { exitCode: 1, stderr: "refused", stdout: "" },
+      { exitCode: 0, stderr: "", stdout: JSON.stringify(staleReadback) },
+    ]);
+    await expect(recoverHostedBootstrapReissue({
+      inviteFile: "/protected/second-invite",
+      readCapability: async () => capability,
+      runner: loser.runner,
+      target,
+      verifyTarget: exactTargetVerifier,
+    })).rejects.toThrow("bootstrap_authority_conflict");
   });
 });
