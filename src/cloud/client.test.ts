@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  accessTokenExpiresAt,
+  accessTokenExpirySkewMs,
   cloudMutations,
   cloudQueries,
   CloudRequestDeadlineError,
   CloudResponseTooLargeError,
   createConvexCloudTransport,
+  isExpiredAccessToken,
   maximumCloudResponseBytes,
 } from "./client";
 import { cloudLimits } from "./contracts";
@@ -197,5 +200,57 @@ describe("bounded Convex transport", () => {
       deploymentUrl,
       maximumResponseBytes: 0,
     })).toThrow(/response bound/u);
+  });
+});
+
+describe("expired access tokens", () => {
+  const encode = (payload: unknown): string =>
+    Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const header = encode({ alg: "RS256", typ: "JWT" });
+  const jwt = (payload: unknown): string => `${header}.${encode(payload)}.${"s".repeat(43)}`;
+  const now = 1_800_000_000_000;
+
+  test("reads the exp claim without trusting anything else", () => {
+    expect(accessTokenExpiresAt(jwt({ exp: 1_800_000_900, sub: "user|session" })))
+      .toBe(1_800_000_900_000);
+    for (const opaque of [
+      "a".repeat(64),
+      `${header}.${encode({ sub: "user" })}.sig`,
+      `${header}.${encode([])}.sig`,
+      `${header}.${encode({ exp: "soon" })}.sig`,
+      `${header}.${encode({ exp: -1 })}.sig`,
+      `${header}.not-json.sig`,
+      "x.y",
+    ]) {
+      expect(accessTokenExpiresAt(opaque)).toBeNull();
+      expect(isExpiredAccessToken(opaque, now)).toBe(false);
+    }
+    expect(isExpiredAccessToken(jwt({ exp: (now + accessTokenExpirySkewMs) / 1_000 }), now))
+      .toBe(true);
+    expect(isExpiredAccessToken(jwt({ exp: (now + accessTokenExpirySkewMs + 1_000) / 1_000 }), now))
+      .toBe(false);
+  });
+
+  test("never presents an expired token, so a refresh-token sign-in can proceed", async () => {
+    const authorizations: (string | null)[] = [];
+    const fetchImplementation = fakeFetch(async (_resource, init) => {
+      const headers = new Headers(init?.headers);
+      authorizations.push(headers.get("authorization"));
+      return new Response(JSON.stringify({ status: "success", value: null, logLines: [] }), {
+        headers: { "content-type": "application/json" },
+        status: 200,
+      });
+    });
+    let token = jwt({ exp: (now - 60_000) / 1_000 });
+    const transport = createConvexCloudTransport({
+      accessToken: async () => token,
+      deploymentUrl,
+      fetch: fetchImplementation,
+      now: () => now,
+    });
+    await transport.action("auth:signIn", { refreshToken: "refresh" });
+    token = jwt({ exp: (now + 14 * 60_000) / 1_000 });
+    await transport.query("account:current", {});
+    expect(authorizations).toEqual([null, `Bearer ${token}`]);
   });
 });

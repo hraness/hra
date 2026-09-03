@@ -233,14 +233,47 @@ function requireAccessToken(value: string): string {
   return value;
 }
 
+/*
+ * Convex verifies a presented bearer token before it runs any function, and it
+ * rejects an expired one with an authentication error even for calls that need
+ * no identity, such as the refresh-token sign-in that replaces that very token.
+ * A token whose `exp` claim has passed (with a small skew) is therefore never
+ * presented; the call proceeds unauthenticated instead.
+ */
+export const accessTokenExpirySkewMs = 30_000;
+
+export function accessTokenExpiresAt(token: string): number | null {
+  const segments = token.split(".");
+  if (segments.length !== 3) return null;
+  const payload = segments[1];
+  if (payload === undefined || payload.length === 0 || payload.length > 8_192) return null;
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (typeof decoded !== "object" || decoded === null || !("exp" in decoded)) return null;
+  const exp = decoded.exp;
+  if (typeof exp !== "number" || !Number.isFinite(exp) || exp <= 0) return null;
+  return exp * 1_000;
+}
+
+export function isExpiredAccessToken(token: string, now: number): boolean {
+  const expiresAt = accessTokenExpiresAt(token);
+  return expiresAt !== null && expiresAt <= now + accessTokenExpirySkewMs;
+}
+
 export function createConvexCloudTransport(input: Readonly<{
   accessToken: AccessTokenProvider;
   deploymentUrl: string;
   fetch?: typeof globalThis.fetch;
   lifetimeSignal?: AbortSignal;
   maximumResponseBytes?: number;
+  now?: () => number;
   requestTimeoutMs?: number;
 }>): CloudTransport {
+  const now = input.now ?? Date.now;
   const requestTimeoutMs = requireRequestTimeout(
     input.requestTimeoutMs ?? defaultCloudRequestTimeoutMs,
   );
@@ -259,7 +292,7 @@ export function createConvexCloudTransport(input: Readonly<{
 
   async function authenticate(): Promise<void> {
     const token = await input.accessToken();
-    if (token === null) {
+    if (token === null || isExpiredAccessToken(token, now())) {
       client.clearAuth();
       return;
     }
