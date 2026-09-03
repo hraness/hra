@@ -249,7 +249,7 @@ Owner commitment: from wave 2b onward, HRA's own development runs through `hra w
 | Convex: `sessionCommands.kind` into ciphertext, idempotency index re-key | F8 | idle |
 | Work protocol `hra-work-local-v2` (required class, examples topic) | C9 | when E1 defaults have been dogfooded |
 | Public envelope: additive fields, `version` unchanged | C3 | 1 |
-| Semver: 0.2.0 at the end of wave 2b (first Claude release); migrations are forward-only and the CHANGELOG states how to downgrade by reinstalling the prior version against a backup of the state directory | - | 2b |
+| Semver: 0.2.0 ships wave 0 because GitHub reserves the v0.1.7 to v0.1.10 names used by the retired v0 repository; the first Claude release takes the next minor; migrations are forward-only and the CHANGELOG states how to downgrade by reinstalling the prior version against a backup of the state directory | - | 2b |
 
 ### Invariant registry changes
 

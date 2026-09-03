@@ -2,7 +2,7 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
-## v0.1.7
+## v0.2.0
 
 HRA v2 wave 0. Release candidate until the release workflow admits the tag.
 

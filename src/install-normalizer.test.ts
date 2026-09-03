@@ -44,7 +44,7 @@ const manifest = (scripts: Record<string, string> = {
   bin: { hra: "./src/cli.ts" },
   name: "@hraness/hra",
   scripts,
-  version: "0.1.7",
+  version: "0.2.0",
 });
 
 type UstarFixtureEntry = Readonly<{
@@ -539,7 +539,7 @@ describe("lifecycle-free Bun install normalizer", () => {
       { cwd: packageSource, environment },
     );
     expect(hraPack.exitCode).toBe(0);
-    const hraArchive = join(archiveDirectory, "hraness-hra-0.1.7.tgz");
+    const hraArchive = join(archiveDirectory, "hraness-hra-0.2.0.tgz");
     let installedCli: string | undefined;
     const installAndNormalize = async (): Promise<void> => {
       const installation = await run(
@@ -604,7 +604,7 @@ describe("lifecycle-free Bun install normalizer", () => {
       { cwd: packageSource },
     );
     expect(packed.exitCode).toBe(0);
-    const archive = join(archiveDirectory, "hraness-hra-0.1.7.tgz");
+    const archive = join(archiveDirectory, "hraness-hra-0.2.0.tgz");
     const environment = {
       ...process.env,
       BUN_INSTALL: globalInstall,

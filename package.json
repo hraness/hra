@@ -1,6 +1,6 @@
 {
   "name": "@hraness/hra",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Control plane for coding-agent subscriptions: run several accounts side by side, keep their sessions alive in a local daemon, and drive them from a shell or JSON. Codex today, Claude next.",
   "license": "MIT",
   "publishConfig": {

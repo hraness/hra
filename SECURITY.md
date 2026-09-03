@@ -10,8 +10,8 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's private v
 
 | Version | Status |
 | --- | --- |
-| `v0.1.7` | Release candidate. Supported once the release workflow admits it. |
-| `v0.1.6` | Supported beta until `v0.1.7` is admitted. Receives security fixes. |
+| `v0.2.0` | Release candidate. Supported once the release workflow admits it. |
+| `v0.1.6` | Supported beta until `v0.2.0` is admitted. Receives security fixes. |
 | `v0.1.0` through `v0.1.5` | Unsupported. These tags produced no admitted npm package plus GitHub Release pair; `docs/beta-release.md` records each outcome. |
 
 Only the latest published beta receives security fixes.
