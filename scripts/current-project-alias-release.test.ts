@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { constants, fstatSync, openSync } from "node:fs";
 import { chmod, link, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,13 +11,21 @@ import {
   assertCurrentAliasReleaseStateCapacity,
   buildVercelEnvironment,
   currentAliasReleaseApiArguments,
+  currentAliasReleaseProviderActivityEvidenceSchema,
+  currentAliasReleaseReviewedLegacyOperatorProvenance,
   currentAliasReleaseVercelApiRequest,
   currentAliasReleaseIntentSchema,
+  currentAliasReleaseIntentFor,
   currentAliasReleasePlanDigest,
   currentAliasReleaseMutationKey,
   currentAliasReleaseReceiptSchema,
+  currentAliasReleaseSourceRecoveryFor,
+  currentAliasReleaseSourceRecoverySchema,
   currentAliasReleaseStateEntryMaximum,
   currentAliasReleaseStatePaths,
+  currentAliasReleaseTargetPhaseSchema,
+  currentAliasReleaseTargetPhaseForMutationResponse,
+  currentAliasReleaseTargetPhaseForProviderActivity,
   CurrentAliasReleaseError,
   executeCurrentProjectAliasReleaseWithExplicitApiCapability,
   executeCurrentProjectAliasReleaseWithExplicitCapability,
@@ -24,6 +33,7 @@ import {
   parseArguments,
   parseCurrentDeploymentReadback,
   parseCurrentProjectAliasReleasePlan,
+  readProtectedProviderActivityEvidence,
   readProtectedVercelAccessToken,
   requiredAliasConfirmation,
   type CurrentAliasReadback,
@@ -32,6 +42,7 @@ import {
   type CurrentProjectAliasReleasePlan,
   type CurrentProjectAliasReleaseProvider,
   type CurrentProjectReadback,
+  type ProviderActivityTargetEvidence,
 } from "./current-project-alias-release";
 import {
   HRA_CONVEX_PROJECT_ID,
@@ -176,13 +187,92 @@ const markerFor = (endpoint: CurrentProjectAliasEndpoint): unknown => ({
   version: HRA_RELEASE_VERSION,
 });
 
+const markerWithVersion = (
+  endpoint: CurrentProjectAliasEndpoint,
+  version: string,
+): unknown => ({
+  ...markerFor(endpoint) as object,
+  version,
+});
+
+const providerActivityText = `Assigned an alias to ${target.deploymentUrl}`;
+
+const providerActivityEvidenceFor = (
+  intentPublishedAtMs: number,
+): ProviderActivityTargetEvidence => {
+  const updatedAtMs = Math.ceil(intentPublishedAtMs) + 1;
+  const createdAtMs = updatedAtMs + 500;
+  return currentAliasReleaseProviderActivityEvidenceSchema.parse(withSelfDigest({
+    activity: {
+      createdAtMs,
+      eventId: `uev_${"a".repeat(24)}`,
+      principalId: "operator_fixture",
+      textSha256: createHash("sha256").update(providerActivityText).digest("hex"),
+    },
+    alias: {
+      createdAtMs: Math.max(0, Math.floor(intentPublishedAtMs) - 1_000),
+      uid: "alias_CurrentHra12345678901234567890",
+      updatedAtMs,
+    },
+    custody: { soleWriterConfirmed: true },
+    intentPublishedAtMs,
+    kind: "provider-activity-and-operator-provenance",
+    observedTargetMarkerVersion: "0.1.99",
+    operator: currentAliasReleaseReviewedLegacyOperatorProvenance,
+  }));
+};
+
+const providerActivityEvidence = providerActivityEvidenceFor(1_787_961_600_000);
+
+const seedLegacyIntent = async (
+  inputPlan: CurrentProjectAliasReleasePlan,
+  stateDirectory: string,
+): Promise<ReturnType<typeof currentAliasReleaseStatePaths>> => {
+  const paths = currentAliasReleaseStatePaths(inputPlan, stateDirectory);
+  await writeFile(
+    paths.intent,
+    `${JSON.stringify(currentAliasReleaseIntentFor(inputPlan))}\n`,
+    { flag: "wx", mode: 0o600 },
+  );
+  return paths;
+};
+
+const seedTargetPhase = async (
+  inputPlan: CurrentProjectAliasReleasePlan,
+  stateDirectory: string,
+): Promise<Readonly<{
+  intent: ReturnType<typeof currentAliasReleaseIntentFor>;
+  paths: ReturnType<typeof currentAliasReleaseStatePaths>;
+  targetPhase: ReturnType<typeof currentAliasReleaseTargetPhaseForMutationResponse>;
+}>> => {
+  const paths = await seedLegacyIntent(inputPlan, stateDirectory);
+  const intent = currentAliasReleaseIntentFor(inputPlan);
+  const targetPhase = currentAliasReleaseTargetPhaseForMutationResponse(
+    inputPlan,
+    intent,
+    {
+      alias: "hra.sh",
+      created: 1_787_961_600_000,
+      oldDeploymentId: inputPlan.vercel.source.deploymentId,
+      uid: "alias_CurrentHra1234567890",
+    },
+  );
+  await writeFile(paths.targetPhase, `${JSON.stringify(targetPhase)}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  return { intent, paths, targetPhase };
+};
+
 type AliasState = "source" | "target" | "unknown";
 type TargetSetBehavior = "commit" | "commit-and-throw" | "noop" | "throw";
 
 class FakeProvider implements CurrentProjectAliasReleaseProvider {
   activePlan: CurrentProjectAliasReleasePlan = plan;
+  activityEvidenceFailure = false;
   aliasState: AliasState = "source";
   afterReadMarker?: () => Promise<void> | void;
+  beforeReadAlias?: () => Promise<void> | void;
   beforeSetAlias?: (endpoint: CurrentProjectAliasEndpoint) => Promise<void> | void;
   breakTargetDeployment = false;
   breakTargetMarker = false;
@@ -194,6 +284,8 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
   sourceDeploymentOverride: CurrentDeploymentReadback | undefined;
   sourceVisibilityLagReads = 0;
   sourceSetCommitAndThrow = false;
+  sourceMarkerOverride: unknown;
+  targetMarkerOverride: unknown;
   targetDeploymentOverride: CurrentDeploymentReadback | undefined;
   #staleAliasState: AliasState | undefined;
   #staleReadsRemaining = 0;
@@ -209,6 +301,17 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
       || this.failVerifyVercelWhileTarget && this.aliasState === "target"
     ) {
       throw new CurrentAliasReleaseError("provider_command_failed");
+    }
+  }
+
+  async verifyTargetActivityEvidence(
+    inputPlan: CurrentProjectAliasReleasePlan,
+    evidence: ProviderActivityTargetEvidence,
+  ): Promise<void> {
+    this.operations.push(`verify-target-activity:${evidence.activity.eventId}`);
+    expect(inputPlan).toEqual(this.activePlan);
+    if (this.activityEvidenceFailure) {
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
     }
   }
 
@@ -239,6 +342,7 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
   }
 
   async readAlias(): Promise<CurrentAliasReadback> {
+    await this.beforeReadAlias?.();
     const observedState = this.#staleReadsRemaining > 0
       ? this.#staleAliasState ?? this.aliasState
       : this.aliasState;
@@ -256,8 +360,9 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
   async readMarker(): Promise<unknown> {
     this.operations.push(`read-marker:${this.aliasState}`);
     const marker = this.aliasState === "target"
-      ? this.breakTargetMarker ? markerFor(source) : markerFor(target)
-      : markerFor(source);
+      ? this.targetMarkerOverride
+        ?? (this.breakTargetMarker ? markerFor(source) : markerFor(target))
+      : this.sourceMarkerOverride ?? markerFor(source);
     await this.afterReadMarker?.();
     return marker;
   }
@@ -314,9 +419,13 @@ type DirectTransportMode =
   | "ok"
   | "mutation-malformed"
   | "mutation-rejected"
+  | "recover-source"
   | "target-unprovable-restore-rejected";
 
 class FakeDirectVercelTransport {
+  activityCreatedOffset = 0;
+  activityEvidence: ProviderActivityTargetEvidence | undefined;
+  activityEventCount = 1;
   aliasState: "source" | "target" = "source";
   mode: DirectTransportMode = "ok";
   readonly requests: Readonly<{ init: RequestInit; url: string }>[] = [];
@@ -340,17 +449,25 @@ class FakeDirectVercelTransport {
       expect(headers.has("authorization")).toBeFalse();
       expect(init.method).toBe("GET");
       expect(init.redirect).toBe("error");
-      const endpoint = this.aliasState === "source"
-        || this.mode === "target-unprovable-restore-rejected"
-        ? source
-        : target;
-      return json(markerFor(endpoint));
+      if (this.aliasState === "source") return json(markerFor(source));
+      if (this.mode === "target-unprovable-restore-rejected") {
+        return json(markerFor(source));
+      }
+      if (this.mode === "recover-source") {
+        return json(markerWithVersion(
+          target,
+          this.activityEvidence?.observedTargetMarkerVersion ?? "0.1.99",
+        ));
+      }
+      return json(markerFor(target));
     }
 
     const parsedUrl = new URL(url);
     expect(parsedUrl.origin).toBe("https://api.vercel.com");
     expect(parsedUrl.searchParams.get("teamId")).toBe(HRA_VERCEL_TEAM_ID);
-    expect([...parsedUrl.searchParams.keys()]).toEqual(["teamId"]);
+    if (parsedUrl.pathname !== "/v3/events") {
+      expect([...parsedUrl.searchParams.keys()]).toEqual(["teamId"]);
+    }
     const headers = new Headers(init.headers);
     expect(headers.get("authorization")).toBe("Bearer fixture-vercel-token");
     expect(headers.get("accept")).toBe("application/json");
@@ -368,8 +485,17 @@ class FakeDirectVercelTransport {
         assigningTarget ? "assign-target" : "restore-source",
       ));
       if (!assigningTarget) {
-        expect(this.mode).toBe("target-unprovable-restore-rejected");
-        return json({ error: "restore refused" }, 500);
+        if (this.mode === "target-unprovable-restore-rejected") {
+          return json({ error: "restore refused" }, 500);
+        }
+        expect(this.mode).toBe("recover-source");
+        this.aliasState = "source";
+        return json({
+          alias: "hra.sh",
+          created: 1_787_961_603_000,
+          oldDeploymentId: target.deploymentId,
+          uid: "alias_CurrentHra1234567890",
+        });
       }
       if (this.mode === "mutation-rejected") return json({ error: "refused" }, 500);
       if (this.mode === "mutation-malformed") {
@@ -396,7 +522,60 @@ class FakeDirectVercelTransport {
       return json(deploymentFor(target));
     }
     if (parsedUrl.pathname === "/v4/aliases/hra.sh") {
-      return json(aliasFor(this.aliasState === "source" ? source : target));
+      const alias = aliasFor(this.aliasState === "source" ? source : target);
+      return json(this.activityEvidence === undefined
+        ? alias
+        : {
+            ...alias,
+            createdAt: this.activityEvidence.alias.createdAtMs,
+            uid: this.activityEvidence.alias.uid,
+            updatedAt: this.activityEvidence.alias.updatedAtMs,
+          });
+    }
+    if (parsedUrl.pathname === `/v2/deployments/${target.deploymentId}/aliases`) {
+      return json({
+        aliases: this.activityEvidence === undefined
+          ? []
+          : [{ alias: "hra.sh", uid: this.activityEvidence.alias.uid }],
+      });
+    }
+    if (parsedUrl.pathname === `/v2/deployments/${source.deploymentId}/aliases`) {
+      return json({ aliases: [] });
+    }
+    if (parsedUrl.pathname === "/v3/events") {
+      const evidence = this.activityEvidence;
+      if (evidence === undefined) throw new Error("unexpected_activity_read");
+      expect(parsedUrl.searchParams.get("limit")).toBe("100");
+      expect(parsedUrl.searchParams.get("types")).toBe("aliases-assigned");
+      expect(parsedUrl.searchParams.has("withPayload")).toBeFalse();
+      expect(parsedUrl.searchParams.has("projectIds")).toBeFalse();
+      expect(parsedUrl.searchParams.has("until")).toBeFalse();
+      const boldStart = providerActivityText.indexOf("an alias");
+      const deploymentStart = providerActivityText.indexOf(target.deploymentUrl);
+      const event = (index: number) => ({
+        categories: ["domain", "project"],
+        created: evidence.activity.createdAtMs + index * 10_000
+          + this.activityCreatedOffset,
+        createdAt: evidence.activity.createdAtMs + index * 10_000,
+        entities: [
+          { end: boldStart + "an alias".length, start: boldStart, type: "bold" },
+          {
+            end: deploymentStart + target.deploymentUrl.length,
+            start: deploymentStart,
+            type: "deployment_host",
+          },
+        ],
+        id: index === 0 ? evidence.activity.eventId : `uev_${String(index).padStart(24, "b")}`,
+        principal: { uid: evidence.activity.principalId },
+        principalId: evidence.activity.principalId,
+        text: providerActivityText,
+        type: "aliases-assigned" as const,
+        user: { uid: evidence.activity.principalId },
+        userId: evidence.activity.principalId,
+      });
+      return json({
+        events: Array.from({ length: this.activityEventCount }, (_, index) => event(index)),
+      });
     }
     throw new Error(`unexpected_request:${url}`);
   };
@@ -412,14 +591,15 @@ const immediateClock = () => {
   };
 };
 
-const runExecuteCli = async (
+const runConfirmedCli = async (
+  operation: "execute" | "recover-source",
   inputPlan: CurrentProjectAliasReleasePlan,
   provider: CurrentProjectAliasReleaseProvider,
   stateDirectory: string,
   options: Readonly<{
     afterIntentPublication?: () => void;
     clock?: ReturnType<typeof immediateClock>;
-    extraArguments?: readonly string[];
+    providerActivityEvidence?: ProviderActivityTargetEvidence;
     receiptWriter?: () => void;
     timeoutMs?: number;
   }> = {},
@@ -432,6 +612,9 @@ const runExecuteCli = async (
       ...(options.afterIntentPublication === undefined
         ? {}
         : { afterIntentPublication: options.afterIntentPublication }),
+      ...(options.providerActivityEvidence === undefined
+        ? {}
+        : { providerActivityEvidence: options.providerActivityEvidence }),
       ...(options.receiptWriter === undefined
         ? {}
         : { receiptWriter: options.receiptWriter }),
@@ -439,8 +622,7 @@ const runExecuteCli = async (
     },
     {
       arguments: [
-        "--execute",
-        ...(options.extraArguments ?? []),
+        operation === "execute" ? "--execute" : "recover-source",
         "--vercel-auth-fd",
         "3",
         "--confirm-exact",
@@ -461,6 +643,34 @@ const runExecuteCli = async (
   );
   return { exitCode, stderr, stdout };
 };
+
+const runExecuteCli = async (
+  inputPlan: CurrentProjectAliasReleasePlan,
+  provider: CurrentProjectAliasReleaseProvider,
+  stateDirectory: string,
+  options: Readonly<{
+    afterIntentPublication?: () => void;
+    clock?: ReturnType<typeof immediateClock>;
+    providerActivityEvidence?: ProviderActivityTargetEvidence;
+    receiptWriter?: () => void;
+    timeoutMs?: number;
+  }> = {},
+): Promise<Readonly<{ exitCode: number; stderr: string[]; stdout: string[] }>> =>
+  await runConfirmedCli("execute", inputPlan, provider, stateDirectory, options);
+
+const runRecoverSourceCli = async (
+  inputPlan: CurrentProjectAliasReleasePlan,
+  provider: CurrentProjectAliasReleaseProvider,
+  stateDirectory: string,
+  options: Readonly<{
+    afterIntentPublication?: () => void;
+    clock?: ReturnType<typeof immediateClock>;
+    providerActivityEvidence?: ProviderActivityTargetEvidence;
+    receiptWriter?: () => void;
+    timeoutMs?: number;
+  }> = {},
+): Promise<Readonly<{ exitCode: number; stderr: string[]; stdout: string[] }>> =>
+  await runConfirmedCli("recover-source", inputPlan, provider, stateDirectory, options);
 
 const runPreflightCli = async (
   inputPlan: CurrentProjectAliasReleasePlan,
@@ -491,8 +701,9 @@ const runDirectApiCli = async (
   inputPlan: CurrentProjectAliasReleasePlan,
   transport: FakeDirectVercelTransport,
   stateDirectory: string,
-  operation: "execute" | "preflight",
+  operation: "execute" | "preflight" | "recover-source",
   confirmation = requiredAliasConfirmation(inputPlan),
+  providerActivityEvidence?: ProviderActivityTargetEvidence,
 ): Promise<Readonly<{
   convexCalls: number;
   exitCode: number;
@@ -510,13 +721,14 @@ const runDirectApiCli = async (
         expect(targetValue).toEqual(convex);
       },
       fetcher: transport.fetch,
+      ...(providerActivityEvidence === undefined ? {} : { providerActivityEvidence }),
       stateDirectory,
     },
     {
       arguments: operation === "preflight"
         ? ["preflight", "--vercel-auth-fd", "3"]
         : [
-            "--execute",
+            operation === "execute" ? "--execute" : "recover-source",
             "--vercel-auth-fd",
             "3",
             "--confirm-exact",
@@ -608,6 +820,82 @@ describe("current-project alias plan", () => {
     };
     expect(currentAliasReleaseMutationKey(changedPlan, "assign-target")).not.toBe(targetKey);
     expect(currentAliasReleaseMutationKey(changedPlan, "restore-source")).not.toBe(sourceKey);
+  });
+
+  test("binds target acknowledgement and source recovery to the exact intent", () => {
+    const intent = currentAliasReleaseIntentFor(plan);
+    const targetPhase = currentAliasReleaseTargetPhaseForMutationResponse(
+      plan,
+      intent,
+      {
+        alias: "hra.sh",
+        created: 1_787_961_600_000,
+        oldDeploymentId: source.deploymentId,
+        uid: "alias_CurrentHra1234567890",
+      },
+    );
+    const sourceRecovery = currentAliasReleaseSourceRecoveryFor(
+      intent,
+      targetPhase,
+      { phase: "target_authority", reason: "marker_mismatch" },
+    );
+
+    expect(targetPhase).toMatchObject({
+      evidence: {
+        kind: "mutation-response",
+        response: { oldDeploymentId: source.deploymentId },
+      },
+      intentDigest: intent.selfDigest,
+      planDigest: intent.planDigest,
+      targetMutationKey: intent.targetMutationKey,
+    });
+    expect(sourceRecovery).toMatchObject({
+      intentDigest: intent.selfDigest,
+      planDigest: intent.planDigest,
+      sourceRecoveryKey: intent.sourceRecoveryKey,
+      targetPhaseDigest: targetPhase.selfDigest,
+    });
+    expect(() => currentAliasReleaseTargetPhaseForMutationResponse(
+      plan,
+      intent,
+      {
+        alias: "hra.sh",
+        created: 1_787_961_600_000,
+        oldDeploymentId: "dpl_UnknownCurrent12345678901",
+        uid: "alias_CurrentHra1234567890",
+      },
+    )).toThrow("provider_readback_invalid");
+
+    const activityPhase = currentAliasReleaseTargetPhaseForProviderActivity(
+      plan,
+      intent,
+      providerActivityEvidence,
+    );
+    expect(activityPhase).toMatchObject({
+      evidence: providerActivityEvidence,
+      intentDigest: intent.selfDigest,
+      targetMutationKey: intent.targetMutationKey,
+    });
+    expect(currentAliasReleaseProviderActivityEvidenceSchema.safeParse({
+      ...providerActivityEvidence,
+      selfDigest: "0".repeat(64),
+    }).success).toBeFalse();
+    for (const [field, value] of [
+      ["bunVersion", "1.3.13"],
+      ["entrypointSha256", "b".repeat(64)],
+      ["gitCommit", "3".repeat(40)],
+      ["sourceBlobOid", "4".repeat(40)],
+    ] as const) {
+      const { selfDigest: _selfDigest, ...unsigned } = providerActivityEvidence;
+      void _selfDigest;
+      expect(currentAliasReleaseProviderActivityEvidenceSchema.safeParse(withSelfDigest({
+        ...unsigned,
+        operator: {
+          ...unsigned.operator,
+          [field]: value,
+        },
+      })).success).toBeFalse();
+    }
   });
 
   test("binds the narrow current CLI source provenance into the plan digest", () => {
@@ -886,31 +1174,33 @@ describe("current-project alias authority", () => {
 
   test("requires the exact plan-bound machine token before any alias write", async () => {
     await withStateDirectory(async (stateDirectory) => {
-      for (const confirmation of [
-        undefined,
-        "approve both",
-        "confirmed do it",
-        "reassign hra.sh",
-      ] as const) {
-        const provider = new FakeProvider();
-        const stderr: string[] = [];
-        const arguments_ = ["--execute", "--vercel-auth-fd", "3"];
-        if (confirmation !== undefined) arguments_.push("--confirm-exact", confirmation);
-        const exitCode = await executeCurrentProjectAliasReleaseWithExplicitCapability(
-          { provider, stateDirectory },
-          {
-            arguments: arguments_,
-            inputDocument: JSON.stringify(plan),
-            stderr: { write: (value) => {
-              stderr.push(String(value));
-              return true;
-            } },
-            stdout: { write: () => true },
-          },
-        );
-        expect(exitCode).toBe(1);
-        expect(JSON.parse(stderr.join(""))).toMatchObject({ code: "confirmation_required" });
-        expect(provider.operations).toEqual([]);
+      for (const operation of ["--execute", "recover-source"] as const) {
+        for (const confirmation of [
+          undefined,
+          "approve both",
+          "confirmed do it",
+          "reassign hra.sh",
+        ] as const) {
+          const provider = new FakeProvider();
+          const stderr: string[] = [];
+          const arguments_ = [operation, "--vercel-auth-fd", "3"];
+          if (confirmation !== undefined) arguments_.push("--confirm-exact", confirmation);
+          const exitCode = await executeCurrentProjectAliasReleaseWithExplicitCapability(
+            { provider, stateDirectory },
+            {
+              arguments: arguments_,
+              inputDocument: JSON.stringify(plan),
+              stderr: { write: (value) => {
+                stderr.push(String(value));
+                return true;
+              } },
+              stdout: { write: () => true },
+            },
+          );
+          expect(exitCode).toBe(1);
+          expect(JSON.parse(stderr.join(""))).toMatchObject({ code: "confirmation_required" });
+          expect(provider.operations).toEqual([]);
+        }
       }
     });
   });
@@ -1035,6 +1325,8 @@ describe("current-project alias authority", () => {
       expect(provider.aliasState).toBe("target");
       expect(await Bun.file(paths.intent).exists()).toBeTrue();
       expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+      expect(await Bun.file(paths.targetPhase).exists()).toBeFalse();
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
       const writes = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
 
       const preflightProvider = new FakeProvider();
@@ -1059,88 +1351,6 @@ describe("current-project alias authority", () => {
     });
   });
 
-  test("reconciles a receipt-less intent by restoring the exact source when the alias sits at the target", async () => {
-    await withStateDirectory(async (stateDirectory) => {
-      const provider = new FakeProvider();
-      provider.targetSetBehavior = "commit-and-throw";
-      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
-      const ambiguous = await runExecuteCli(plan, provider, stateDirectory);
-      expect(ambiguous.exitCode).toBe(75);
-      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
-      expect(provider.aliasState).toBe("target");
-      const writesBefore = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
-
-      const reconcile = await runExecuteCli(plan, provider, stateDirectory, {
-        extraArguments: ["--reconcile-receiptless-intent"],
-      });
-      expect(reconcile.exitCode).toBe(1);
-      expect(JSON.parse(reconcile.stderr.join(""))).toMatchObject({ code: "alias_reverted" });
-      expect(provider.aliasState).toBe("source");
-      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema))
-        .toMatchObject({
-          finalState: "source",
-          rollbackDiagnostic: { phase: "target_authority", reason: "receiptless_intent" },
-        });
-      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
-        .toEqual([...writesBefore, `set-alias:${source.deploymentUrl}`]);
-
-      const replay = await runExecuteCli(plan, provider, stateDirectory);
-      expect(replay.exitCode).toBe(1);
-      expect(JSON.parse(replay.stderr.join(""))).toMatchObject({ code: "alias_reverted" });
-    });
-  });
-
-  test("reconciles a receipt-less intent without any write when the alias already sits at the source", async () => {
-    await withStateDirectory(async (stateDirectory) => {
-      const provider = new FakeProvider();
-      provider.targetSetBehavior = "throw";
-      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
-      const ambiguous = await runExecuteCli(plan, provider, stateDirectory);
-      expect(ambiguous.exitCode).toBe(75);
-      expect(provider.aliasState).toBe("source");
-      const writesBefore = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
-
-      const reconcile = await runExecuteCli(plan, provider, stateDirectory, {
-        extraArguments: ["--reconcile-receiptless-intent"],
-      });
-      expect(reconcile.exitCode).toBe(1);
-      expect(JSON.parse(reconcile.stderr.join(""))).toMatchObject({ code: "alias_reverted" });
-      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema))
-        .toMatchObject({
-          finalState: "source",
-          rollbackDiagnostic: { phase: "target_authority", reason: "receiptless_intent" },
-        });
-      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
-        .toEqual(writesBefore);
-    });
-  });
-
-  test("refuses to reconcile a receipt-less intent without the explicit flag, the exact token, or a planned alias", async () => {
-    await withStateDirectory(async (stateDirectory) => {
-      const provider = new FakeProvider();
-      provider.targetSetBehavior = "commit-and-throw";
-      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
-      await runExecuteCli(plan, provider, stateDirectory);
-      const writesBefore = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
-
-      const withoutFlag = await runExecuteCli(plan, provider, stateDirectory);
-      expect(JSON.parse(withoutFlag.stderr.join(""))).toMatchObject({ code: "unresolved_current_intent" });
-
-      provider.aliasState = "unknown";
-      const unplanned = await runExecuteCli(plan, provider, stateDirectory, {
-        extraArguments: ["--reconcile-receiptless-intent"],
-      });
-      expect(unplanned.exitCode).toBe(75);
-      expect(JSON.parse(unplanned.stderr.join(""))).toMatchObject({ code: "unresolved_current_intent" });
-      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
-        .toEqual(writesBefore);
-      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
-
-      expect(() => parseArguments(["preflight", "--reconcile-receiptless-intent", "--vercel-auth-fd", "3", "--plan-fd", "4"]))
-        .toThrow();
-    });
-  });
-
   test("rejects a target response that replaced an unplanned deployment", async () => {
     await withStateDirectory(async (stateDirectory) => {
       const provider = new FakeProvider();
@@ -1156,6 +1366,8 @@ describe("current-project alias authority", () => {
       expect(provider.aliasState).toBe("target");
       expect(await Bun.file(paths.intent).exists()).toBeTrue();
       expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+      expect(await Bun.file(paths.targetPhase).exists()).toBeFalse();
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
       expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
         .toHaveLength(1);
     });
@@ -1394,6 +1606,33 @@ describe("current-project Vercel provider", () => {
     });
   });
 
+  test("consumes only a self-digested private recovery-evidence descriptor and closes it", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const validPath = join(stateDirectory, "recovery-evidence.json");
+      await writeFile(validPath, JSON.stringify(providerActivityEvidence), { mode: 0o600 });
+      const validDescriptor = openSync(
+        validPath,
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
+      expect(readProtectedProviderActivityEvidence(validDescriptor))
+        .toEqual(providerActivityEvidence);
+      expect(() => fstatSync(validDescriptor)).toThrow();
+
+      const invalidPath = join(stateDirectory, "recovery-evidence-invalid.json");
+      await writeFile(invalidPath, JSON.stringify({
+        ...providerActivityEvidence,
+        observedTargetMarkerVersion: HRA_RELEASE_VERSION,
+      }), { mode: 0o600 });
+      const invalidDescriptor = openSync(
+        invalidPath,
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
+      expect(() => readProtectedProviderActivityEvidence(invalidDescriptor))
+        .toThrow("recovery_evidence_invalid");
+      expect(() => fstatSync(invalidDescriptor)).toThrow();
+    });
+  });
+
   test("drives the exact CLI-source preflight and one target POST through direct REST", async () => {
     await withStateDirectory(async (stateDirectory) => {
       const transport = new FakeDirectVercelTransport();
@@ -1446,6 +1685,133 @@ describe("current-project Vercel provider", () => {
         expect(document).not.toContain("fixture-vercel-token");
         expect(document).not.toContain("must-not-be-retained");
       }
+    });
+  });
+
+  test("recovers source through direct REST without ever dispatching a target write", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      await seedTargetPhase(cliSourcePlan, stateDirectory);
+      const transport = new FakeDirectVercelTransport();
+      transport.aliasState = "target";
+      transport.mode = "recover-source";
+
+      const recovered = await runDirectApiCli(
+        cliSourcePlan,
+        transport,
+        stateDirectory,
+        "recover-source",
+      );
+
+      expect(recovered.stderr).toEqual([]);
+      expect(recovered.exitCode).toBe(0);
+      expect(transport.aliasState as AliasState).toBe("source");
+      const posts = transport.requests.filter(({ init }) => init.method === "POST");
+      expect(posts.map(({ url }) => new URL(url).pathname)).toEqual([
+        `/v2/deployments/${source.deploymentId}/aliases`,
+      ]);
+      expect(JSON.parse(recovered.stdout.join(""))).toMatchObject({
+        changed: true,
+        status: "recovered_source",
+      });
+    });
+  });
+
+  test("revalidates legacy activity authority through direct REST before source recovery", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const paths = await seedLegacyIntent(cliSourcePlan, stateDirectory);
+      const evidence = providerActivityEvidenceFor((await stat(paths.intent)).mtimeMs);
+      const transport = new FakeDirectVercelTransport();
+      transport.activityEvidence = evidence;
+      transport.aliasState = "target";
+      transport.mode = "recover-source";
+
+      const recovered = await runDirectApiCli(
+        cliSourcePlan,
+        transport,
+        stateDirectory,
+        "recover-source",
+        requiredAliasConfirmation(cliSourcePlan),
+        evidence,
+      );
+
+      expect(recovered.stderr).toEqual([]);
+      expect(recovered.exitCode).toBe(0);
+      expect(transport.requests.filter(({ url }) =>
+        new URL(url).pathname === "/v3/events")).toHaveLength(2);
+      expect(transport.requests.filter(({ init }) => init.method === "POST")
+        .map(({ url }) => new URL(url).pathname)).toEqual([
+        `/v2/deployments/${source.deploymentId}/aliases`,
+      ]);
+      expect(readProtectedJson(paths.targetPhase, currentAliasReleaseTargetPhaseSchema))
+        .toMatchObject({
+          evidence: {
+            kind: "provider-activity-and-operator-provenance",
+            selfDigest: evidence.selfDigest,
+          },
+        });
+    });
+  });
+
+  test("refuses a full Activity page because event uniqueness is not complete", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const paths = await seedLegacyIntent(cliSourcePlan, stateDirectory);
+      const evidence = providerActivityEvidenceFor((await stat(paths.intent)).mtimeMs);
+      const transport = new FakeDirectVercelTransport();
+      transport.activityEvidence = evidence;
+      transport.activityEventCount = 100;
+      transport.aliasState = "target";
+      transport.mode = "recover-source";
+
+      const refused = await runDirectApiCli(
+        cliSourcePlan,
+        transport,
+        stateDirectory,
+        "recover-source",
+        requiredAliasConfirmation(cliSourcePlan),
+        evidence,
+      );
+
+      expect(refused.exitCode).toBe(75);
+      expect(refused.stdout).toEqual([]);
+      expect(JSON.parse(refused.stderr.join(""))).toMatchObject({
+        code: "recovery_evidence_invalid",
+        status: "recovery_required",
+      });
+      expect(transport.requests.filter(({ init }) => init.method === "POST"))
+        .toHaveLength(0);
+      expect(await Bun.file(paths.targetPhase).exists()).toBeFalse();
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+    });
+  });
+
+  test("refuses an Activity event whose two provider timestamps disagree", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const paths = await seedLegacyIntent(cliSourcePlan, stateDirectory);
+      const evidence = providerActivityEvidenceFor((await stat(paths.intent)).mtimeMs);
+      const transport = new FakeDirectVercelTransport();
+      transport.activityCreatedOffset = 1;
+      transport.activityEvidence = evidence;
+      transport.aliasState = "target";
+      transport.mode = "recover-source";
+
+      const refused = await runDirectApiCli(
+        cliSourcePlan,
+        transport,
+        stateDirectory,
+        "recover-source",
+        requiredAliasConfirmation(cliSourcePlan),
+        evidence,
+      );
+
+      expect(refused.exitCode).toBe(75);
+      expect(JSON.parse(refused.stderr.join(""))).toMatchObject({
+        code: "recovery_evidence_invalid",
+        status: "recovery_required",
+      });
+      expect(transport.requests.filter(({ init }) => init.method === "POST"))
+        .toHaveLength(0);
+      expect(await Bun.file(paths.targetPhase).exists()).toBeFalse();
     });
   });
 
@@ -1609,16 +1975,16 @@ describe("current-project Vercel provider", () => {
 });
 
 describe("durable current-project alias execution", () => {
-  test("reserves room for a complete terminal pair at the bounded ledger edge", () => {
-    expect(currentAliasReleaseStateEntryMaximum).toBe(4_097);
-    expect(() => assertCurrentAliasReleaseStateCapacity(4_095, 2)).not.toThrow();
-    expect(() => assertCurrentAliasReleaseStateCapacity(4_096, 2))
+  test("reserves room for the complete phase and receipt quartet at the ledger edge", () => {
+    expect(currentAliasReleaseStateEntryMaximum).toBe(8_193);
+    expect(() => assertCurrentAliasReleaseStateCapacity(8_189, 4)).not.toThrow();
+    expect(() => assertCurrentAliasReleaseStateCapacity(8_190, 4))
       .toThrow("durable_state_capacity_exhausted");
-    expect(() => assertCurrentAliasReleaseStateCapacity(4_097, 0)).not.toThrow();
-    expect(() => assertCurrentAliasReleaseStateCapacity(4_097, 1))
+    expect(() => assertCurrentAliasReleaseStateCapacity(8_193, 0)).not.toThrow();
+    expect(() => assertCurrentAliasReleaseStateCapacity(8_193, 1))
       .toThrow("durable_state_capacity_exhausted");
-    expect(() => assertCurrentAliasReleaseScanCapacity(4_098)).not.toThrow();
-    expect(() => assertCurrentAliasReleaseScanCapacity(4_099))
+    expect(() => assertCurrentAliasReleaseScanCapacity(8_194)).not.toThrow();
+    expect(() => assertCurrentAliasReleaseScanCapacity(8_195))
       .toThrow("durable_state_capacity_exhausted");
   });
 
@@ -1626,6 +1992,7 @@ describe("durable current-project alias execution", () => {
     await withStateDirectory(async (stateDirectory) => {
       const provider = new FakeProvider();
       const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      let targetPhaseObservedBeforePostflight = false;
       provider.beforeSetAlias = async (endpoint) => {
         if (endpoint.deploymentUrl !== target.deploymentUrl) return;
         const intent = readProtectedJson(paths.intent, currentAliasReleaseIntentSchema);
@@ -1633,6 +2000,31 @@ describe("durable current-project alias execution", () => {
         expect(intent.planDigest).toBe(currentAliasReleasePlanDigest(plan));
         expect(intent.sourceAuthority.marker.sourceCommit).toBe(source.sourceCommit);
         expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+      };
+      provider.beforeReadAlias = async () => {
+        if (
+          targetPhaseObservedBeforePostflight
+          || provider.aliasState !== "target"
+          || !provider.operations.includes(`set-alias:${target.deploymentUrl}`)
+        ) return;
+        const targetPhase = readProtectedJson(
+          paths.targetPhase,
+          currentAliasReleaseTargetPhaseSchema,
+        );
+        expect(targetPhase).toMatchObject({
+          evidence: {
+            kind: "mutation-response",
+            response: { oldDeploymentId: source.deploymentId },
+          },
+          intentDigest: readProtectedJson(
+            paths.intent,
+            currentAliasReleaseIntentSchema,
+          ).selfDigest,
+          targetMutationKey: currentAliasReleaseMutationKey(plan, "assign-target"),
+        });
+        expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
+        expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+        targetPhaseObservedBeforePostflight = true;
       };
 
       const first = await runExecuteCli(plan, provider, stateDirectory);
@@ -1645,14 +2037,22 @@ describe("durable current-project alias execution", () => {
         status: "committed",
       });
       const intent = readProtectedJson(paths.intent, currentAliasReleaseIntentSchema);
+      const targetPhase = readProtectedJson(
+        paths.targetPhase,
+        currentAliasReleaseTargetPhaseSchema,
+      );
       const receipt = readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema);
+      expect(targetPhaseObservedBeforePostflight).toBeTrue();
       expect(receipt).toMatchObject({
         finalState: "target",
         idempotencyKey: plan.idempotencyKey,
         intentDigest: intent.selfDigest,
+        targetPhaseDigest: targetPhase.selfDigest,
       });
       expect((await stat(paths.intent)).mode & 0o777).toBe(0o600);
+      expect((await stat(paths.targetPhase)).mode & 0o777).toBe(0o600);
       expect((await stat(paths.receipt)).mode & 0o777).toBe(0o600);
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
 
       const writes = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
       const replay = await runExecuteCli(plan, provider, stateDirectory);
@@ -1664,6 +2064,367 @@ describe("durable current-project alias execution", () => {
       });
       expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
         .toEqual(writes);
+    });
+  });
+
+  test("explicitly recovers source from two exact version-mismatch target samples", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const { intent, paths, targetPhase } = await seedTargetPhase(plan, stateDirectory);
+      const provider = new FakeProvider();
+      provider.aliasState = "target";
+      provider.targetMarkerOverride = markerWithVersion(target, "0.1.99");
+      let sourceRecoveryObservedBeforeMutation = false;
+      provider.beforeSetAlias = async (endpoint) => {
+        expect(endpoint).toEqual(source);
+        const sourceRecovery = readProtectedJson(
+          paths.sourceRecovery,
+          currentAliasReleaseSourceRecoverySchema,
+        );
+        expect(sourceRecovery).toMatchObject({
+          intentDigest: intent.selfDigest,
+          rollbackDiagnostic: {
+            phase: "target_authority",
+            reason: "marker_mismatch",
+          },
+          sourceRecoveryKey: currentAliasReleaseMutationKey(plan, "restore-source"),
+          targetPhaseDigest: targetPhase.selfDigest,
+        });
+        expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+        sourceRecoveryObservedBeforeMutation = true;
+      };
+
+      const recovered = await runRecoverSourceCli(plan, provider, stateDirectory);
+
+      expect(recovered.exitCode).toBe(0);
+      expect(recovered.stderr).toEqual([]);
+      expect(sourceRecoveryObservedBeforeMutation).toBeTrue();
+      expect(provider.aliasState as AliasState).toBe("source");
+      expect(provider.operations.filter((operation) => operation === "read-marker:target"))
+        .toHaveLength(2);
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([`set-alias:${source.deploymentUrl}`]);
+      const sourceRecovery = readProtectedJson(
+        paths.sourceRecovery,
+        currentAliasReleaseSourceRecoverySchema,
+      );
+      const receipt = readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema);
+      expect(receipt).toMatchObject({
+        changed: true,
+        finalState: "source",
+        intentDigest: intent.selfDigest,
+        sourceRecoveryDigest: sourceRecovery.selfDigest,
+        targetPhaseDigest: targetPhase.selfDigest,
+      });
+      expect(JSON.parse(recovered.stdout.join(""))).toMatchObject({
+        changed: true,
+        sourceRecoveryDigest: sourceRecovery.selfDigest,
+        status: "recovered_source",
+        targetPhaseDigest: targetPhase.selfDigest,
+      });
+      expect((await stat(paths.sourceRecovery)).mode & 0o777).toBe(0o600);
+
+      const writes = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
+      const replay = await runRecoverSourceCli(plan, provider, stateDirectory);
+      expect(replay.exitCode).toBe(0);
+      expect(JSON.parse(replay.stdout.join(""))).toMatchObject({
+        replayed: true,
+        status: "recovered_source",
+      });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual(writes);
+    });
+  });
+
+  test("requires durable target acknowledgment before explicit recovery", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const paths = await seedLegacyIntent(plan, stateDirectory);
+      const provider = new FakeProvider();
+      provider.aliasState = "target";
+      provider.targetMarkerOverride = markerWithVersion(target, "0.1.99");
+
+      const refused = await runRecoverSourceCli(plan, provider, stateDirectory);
+
+      expect(refused.exitCode).toBe(75);
+      expect(JSON.parse(refused.stderr.join(""))).toMatchObject({
+        code: "recovery_evidence_invalid",
+        status: "recovery_required",
+      });
+      expect(provider.operations).toEqual([]);
+      expect(await Bun.file(paths.targetPhase).exists()).toBeFalse();
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+    });
+  });
+
+  test("revalidates legacy activity evidence and refuses it without durable mutation", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const paths = await seedLegacyIntent(plan, stateDirectory);
+      const evidence = providerActivityEvidenceFor((await stat(paths.intent)).mtimeMs);
+      const provider = new FakeProvider();
+      provider.activityEvidenceFailure = true;
+      provider.aliasState = "target";
+      provider.targetMarkerOverride = markerWithVersion(target, "0.1.99");
+
+      const refused = await runRecoverSourceCli(plan, provider, stateDirectory, {
+        providerActivityEvidence: evidence,
+      });
+
+      expect(refused.exitCode).toBe(75);
+      expect(JSON.parse(refused.stderr.join(""))).toMatchObject({
+        code: "provider_readback_invalid",
+        status: "recovery_required",
+      });
+      expect(provider.operations).toEqual([
+        `verify-target-activity:${evidence.activity.eventId}`,
+      ]);
+      expect(await Bun.file(paths.targetPhase).exists()).toBeFalse();
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+    });
+  });
+
+  test("permits recovery only from the exact target with solely a marker-version mismatch", async () => {
+    for (const configure of [
+      (provider: FakeProvider) => {
+        provider.aliasState = "source";
+      },
+      (provider: FakeProvider) => {
+        provider.aliasState = "unknown";
+      },
+      (provider: FakeProvider) => {
+        provider.aliasState = "target";
+      },
+      (provider: FakeProvider) => {
+        provider.aliasState = "target";
+        provider.breakTargetMarker = true;
+      },
+    ]) {
+      await withStateDirectory(async (stateDirectory) => {
+        const { paths } = await seedTargetPhase(plan, stateDirectory);
+        const provider = new FakeProvider();
+        configure(provider);
+
+        const refused = await runRecoverSourceCli(plan, provider, stateDirectory);
+
+        expect(refused.exitCode).toBe(75);
+        expect(JSON.parse(refused.stderr.join(""))).toMatchObject({
+          code: "recovery_not_permitted",
+          status: "recovery_required",
+        });
+        expect(provider.operations.some((operation) => operation.startsWith("set-alias:")))
+          .toBeFalse();
+        expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
+        expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+      });
+    }
+  });
+
+  test("refuses target marker-version drift between recovery authority samples", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const { paths } = await seedTargetPhase(plan, stateDirectory);
+      const provider = new FakeProvider();
+      provider.aliasState = "target";
+      provider.targetMarkerOverride = markerWithVersion(target, "0.1.99");
+      let markerReads = 0;
+      provider.afterReadMarker = () => {
+        markerReads += 1;
+        if (markerReads === 1) {
+          provider.targetMarkerOverride = markerWithVersion(target, "0.1.98");
+        }
+      };
+
+      const refused = await runRecoverSourceCli(plan, provider, stateDirectory);
+
+      expect(refused.exitCode).toBe(75);
+      expect(JSON.parse(refused.stderr.join(""))).toMatchObject({
+        code: "recovery_not_permitted",
+        status: "recovery_required",
+      });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([]);
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+    });
+  });
+
+  test("never retries an ambiguous or refused source recovery", async () => {
+    for (const configure of [
+      (provider: FakeProvider) => {
+        provider.sourceSetCommitAndThrow = true;
+      },
+      (provider: FakeProvider) => {
+        provider.failSourceSet = true;
+      },
+      (provider: FakeProvider) => {
+        provider.mutationOldDeploymentIdOverride = source.deploymentId;
+      },
+    ]) {
+      await withStateDirectory(async (stateDirectory) => {
+        const { paths } = await seedTargetPhase(plan, stateDirectory);
+        const provider = new FakeProvider();
+        provider.aliasState = "target";
+        provider.targetMarkerOverride = markerWithVersion(target, "0.1.99");
+        configure(provider);
+
+        const failed = await runRecoverSourceCli(plan, provider, stateDirectory);
+
+        expect(failed.exitCode).toBe(75);
+        expect(JSON.parse(failed.stderr.join(""))).toMatchObject({
+          code: "compensation_failed",
+          status: "recovery_required",
+        });
+        expect(await Bun.file(paths.sourceRecovery).exists()).toBeTrue();
+        expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+        const writes = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
+        expect(writes).toEqual([`set-alias:${source.deploymentUrl}`]);
+
+        const retry = await runRecoverSourceCli(plan, provider, stateDirectory);
+        expect(retry.exitCode).toBe(75);
+        expect(JSON.parse(retry.stderr.join(""))).toMatchObject({
+          code: "unresolved_source_recovery",
+          status: "recovery_required",
+        });
+        expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+          .toEqual(writes);
+      });
+    }
+  });
+
+  test("does not receipt source authority that drifts during its proof", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const { paths } = await seedTargetPhase(plan, stateDirectory);
+      const provider = new FakeProvider();
+      provider.aliasState = "target";
+      provider.targetMarkerOverride = markerWithVersion(target, "0.1.99");
+      let markerReads = 0;
+      provider.afterReadMarker = () => {
+        markerReads += 1;
+        if (markerReads === 3) provider.aliasState = "target";
+      };
+
+      const drifted = await runRecoverSourceCli(plan, provider, stateDirectory);
+
+      expect(drifted.exitCode).toBe(75);
+      expect(JSON.parse(drifted.stderr.join(""))).toMatchObject({
+        code: "compensation_failed",
+        status: "recovery_required",
+      });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([`set-alias:${source.deploymentUrl}`]);
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeTrue();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+    });
+  });
+
+  test("fails closed when target-phase publication fails after target mutation", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      const provider = new FakeProvider();
+      provider.beforeSetAlias = async (endpoint) => {
+        if (endpoint.deploymentId === target.deploymentId) {
+          await writeFile(paths.targetPhase, "{}\n", { flag: "wx", mode: 0o600 });
+        }
+      };
+
+      const failed = await runExecuteCli(plan, provider, stateDirectory);
+
+      expect(failed.exitCode).toBe(75);
+      expect(JSON.parse(failed.stderr.join(""))).toMatchObject({
+        code: "target_phase_write_failed",
+        status: "recovery_required",
+      });
+      expect(provider.aliasState).toBe("target");
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual([`set-alias:${target.deploymentUrl}`]);
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+    });
+  });
+
+  test("fails closed before source mutation when source-recovery publication fails", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const { paths } = await seedTargetPhase(plan, stateDirectory);
+      const provider = new FakeProvider();
+      provider.aliasState = "target";
+      provider.targetMarkerOverride = markerWithVersion(target, "0.1.99");
+      let targetMarkerReads = 0;
+      provider.afterReadMarker = async () => {
+        if (provider.aliasState !== "target") return;
+        targetMarkerReads += 1;
+        if (targetMarkerReads === 2) {
+          await writeFile(paths.sourceRecovery, "{}\n", { flag: "wx", mode: 0o600 });
+        }
+      };
+
+      const failed = await runRecoverSourceCli(plan, provider, stateDirectory);
+
+      expect(failed.exitCode).toBe(75);
+      expect(JSON.parse(failed.stderr.join(""))).toMatchObject({
+        code: "source_recovery_write_failed",
+        status: "recovery_required",
+      });
+      expect(provider.aliasState).toBe("target");
+      expect(provider.operations.some((operation) => operation.startsWith("set-alias:")))
+        .toBeFalse();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+    });
+  });
+
+  test("never retries after source proof when its final receipt publication fails", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const { paths } = await seedTargetPhase(plan, stateDirectory);
+      const provider = new FakeProvider();
+      provider.aliasState = "target";
+      provider.targetMarkerOverride = markerWithVersion(target, "0.1.99");
+
+      const failed = await runRecoverSourceCli(plan, provider, stateDirectory, {
+        receiptWriter: () => {
+          throw new Error("receipt unavailable");
+        },
+      });
+
+      expect(failed.exitCode).toBe(75);
+      expect(JSON.parse(failed.stderr.join(""))).toMatchObject({
+        code: "receipt_write_failed",
+        status: "recovery_required",
+      });
+      expect(provider.aliasState as AliasState).toBe("source");
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeTrue();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+      const writes = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
+
+      const retry = await runRecoverSourceCli(plan, provider, stateDirectory);
+      expect(retry.exitCode).toBe(75);
+      expect(JSON.parse(retry.stderr.join(""))).toMatchObject({
+        code: "unresolved_source_recovery",
+        status: "recovery_required",
+      });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual(writes);
+    });
+  });
+
+  test("rejects tampered phase records before provider reads", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const { paths, targetPhase } = await seedTargetPhase(plan, stateDirectory);
+      await writeFile(paths.targetPhase, `${JSON.stringify({
+        ...targetPhase,
+        targetMutationKey: "f".repeat(64),
+      })}\n`, { mode: 0o600 });
+      const provider = new FakeProvider();
+      provider.aliasState = "target";
+      provider.targetMarkerOverride = markerWithVersion(target, "0.1.99");
+
+      const refused = await runRecoverSourceCli(plan, provider, stateDirectory);
+
+      expect(refused.exitCode).toBe(75);
+      expect(JSON.parse(refused.stderr.join(""))).toMatchObject({
+        code: "durable_state_invalid",
+        status: "recovery_required",
+      });
+      expect(provider.operations).toEqual([]);
+      expect(await Bun.file(paths.sourceRecovery).exists()).toBeFalse();
+      expect(await Bun.file(paths.receipt).exists()).toBeFalse();
     });
   });
 
@@ -1874,6 +2635,30 @@ describe("durable current-project alias execution", () => {
       const provider = new FakeProvider();
       provider.breakTargetMarker = true;
       const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      let sourceRecoveryObservedBeforeMutation = false;
+      provider.beforeSetAlias = async (endpoint) => {
+        if (endpoint.deploymentId !== source.deploymentId) return;
+        const intent = readProtectedJson(paths.intent, currentAliasReleaseIntentSchema);
+        const targetPhase = readProtectedJson(
+          paths.targetPhase,
+          currentAliasReleaseTargetPhaseSchema,
+        );
+        const sourceRecovery = readProtectedJson(
+          paths.sourceRecovery,
+          currentAliasReleaseSourceRecoverySchema,
+        );
+        expect(sourceRecovery).toMatchObject({
+          intentDigest: intent.selfDigest,
+          rollbackDiagnostic: {
+            phase: "target_probe",
+            reason: "marker_mismatch",
+          },
+          sourceRecoveryKey: currentAliasReleaseMutationKey(plan, "restore-source"),
+          targetPhaseDigest: targetPhase.selfDigest,
+        });
+        expect(await Bun.file(paths.receipt).exists()).toBeFalse();
+        sourceRecoveryObservedBeforeMutation = true;
+      };
       const reverted = await runExecuteCli(plan, provider, stateDirectory);
 
       expect(reverted.exitCode).toBe(1);
@@ -1881,8 +2666,21 @@ describe("durable current-project alias execution", () => {
         code: "alias_reverted",
         status: "reverted",
       });
-      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema).finalState)
-        .toBe("source");
+      const targetPhase = readProtectedJson(
+        paths.targetPhase,
+        currentAliasReleaseTargetPhaseSchema,
+      );
+      const sourceRecovery = readProtectedJson(
+        paths.sourceRecovery,
+        currentAliasReleaseSourceRecoverySchema,
+      );
+      expect(sourceRecoveryObservedBeforeMutation).toBeTrue();
+      expect(readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema))
+        .toMatchObject({
+          finalState: "source",
+          sourceRecoveryDigest: sourceRecovery.selfDigest,
+          targetPhaseDigest: targetPhase.selfDigest,
+        });
       const writes = provider.operations.filter((operation) => operation.startsWith("set-alias:"));
 
       const replay = await runExecuteCli(plan, provider, stateDirectory);
@@ -1906,12 +2704,18 @@ describe("durable current-project alias execution", () => {
       const {
         rollbackDiagnostic: omittedRollbackDiagnostic,
         selfDigest: omittedSelfDigest,
+        sourceRecoveryDigest: omittedSourceRecoveryDigest,
+        targetPhaseDigest: omittedTargetPhaseDigest,
         ...legacyFields
       } = current;
       void omittedRollbackDiagnostic;
       void omittedSelfDigest;
+      void omittedSourceRecoveryDigest;
+      void omittedTargetPhaseDigest;
 
       const legacy = currentAliasReleaseReceiptSchema.parse(withSelfDigest(legacyFields));
+      await rm(paths.sourceRecovery);
+      await rm(paths.targetPhase);
       await writeFile(paths.receipt, `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
       const writesBeforeReplay = provider.operations.filter((operation) =>
         operation.startsWith("set-alias:"));
@@ -1919,8 +2723,20 @@ describe("durable current-project alias execution", () => {
 
       expect(legacy.finalState).toBe("source");
       expect(legacy.rollbackDiagnostic).toBeUndefined();
+      expect(legacy.sourceRecoveryDigest).toBeUndefined();
+      expect(legacy.targetPhaseDigest).toBeUndefined();
       expect(replay.exitCode).toBe(1);
       expect(JSON.parse(replay.stderr.join(""))).toMatchObject({
+        code: "alias_reverted",
+        status: "reverted",
+      });
+      expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
+        .toEqual(writesBeforeReplay);
+
+      const recoveryReplay = await runRecoverSourceCli(plan, provider, stateDirectory);
+      expect(recoveryReplay.exitCode).toBe(1);
+      expect(recoveryReplay.stdout).toEqual([]);
+      expect(JSON.parse(recoveryReplay.stderr.join(""))).toMatchObject({
         code: "alias_reverted",
         status: "reverted",
       });
@@ -2136,7 +2952,7 @@ describe("current-project alias CLI", () => {
     });
   });
 
-  test("accepts only the closed preflight and execute argument surfaces", () => {
+  test("accepts only the closed preflight, execute, and source-recovery surfaces", () => {
     expect(parseArguments([
       "preflight",
       "--vercel-auth-fd",
@@ -2161,6 +2977,23 @@ describe("current-project alias CLI", () => {
       "--vercel-cli",
       "/safe/bin/vercel",
     ])).toEqual({ operation: "preflight", planFd: 0, vercelCli: "/safe/bin/vercel" });
+    expect(parseArguments([
+      "recover-source",
+      "--vercel-auth-fd",
+      "4",
+      "--confirm-exact",
+      requiredAliasConfirmation(plan),
+      "--plan-fd",
+      "3",
+      "--recovery-evidence-fd",
+      "5",
+    ])).toEqual({
+      confirmation: requiredAliasConfirmation(plan),
+      operation: "recover-source",
+      planFd: 3,
+      recoveryEvidenceFd: 5,
+      vercelAuthFd: 4,
+    });
     for (const arguments_ of [
       ["preflight", "--vercel-cli", "vercel"],
       ["preflight", "--vercel-auth-fd", "2"],
@@ -2170,6 +3003,21 @@ describe("current-project alias CLI", () => {
       ["--execute", "--vercel-auth-fd", "3", "--force"],
       ["--execute", "--vercel-auth-fd", "3", "--domain"],
       ["--execute", "--vercel-auth-fd", "3", "--dns"],
+      ["--execute", "--vercel-auth-fd", "3", "--recovery-evidence-fd", "4"],
+      ["preflight", "--vercel-auth-fd", "3", "--recovery-evidence-fd", "4"],
+      ["recover-source", "--vercel-auth-fd", "3", "--recovery-evidence-fd", "2"],
+      ["recover-source", "--vercel-auth-fd", "3", "--recovery-evidence-fd", "3"],
+      [
+        "recover-source",
+        "--vercel-auth-fd",
+        "4",
+        "--plan-fd",
+        "3",
+        "--recovery-evidence-fd",
+        "3",
+      ],
+      ["recover-source", "--vercel-auth-fd", "3", "--force"],
+      ["recover-source", "--execute", "--vercel-auth-fd", "3"],
     ]) expect(() => parseArguments(arguments_)).toThrow("usage_invalid");
   });
 });

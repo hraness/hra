@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -60,6 +60,12 @@ import {
 const canonicalAlias = "hra.sh";
 const supportedBunVersion = "1.3.14";
 const supportedVercelVersion = "58.4.0";
+export const currentAliasReleaseReviewedLegacyOperatorProvenance = Object.freeze({
+  bunVersion: supportedBunVersion,
+  entrypointSha256: "29651058110e887ddc500e298308c98b947d8a683941146593b29a57760b9777",
+  gitCommit: "fbf49ca9c0ee0b5f04a009c3ae4c85b94ac9e8df",
+  sourceBlobOid: "5c98c061fe06883de73d6f237031f5d6018d4a68",
+});
 const commandTimeoutMs = 30_000;
 const commandTerminationGraceMs = 1_000;
 const convergenceTimeoutMs = 60_000;
@@ -80,6 +86,14 @@ const deploymentUrlSchema = z.string()
   .max(253)
   .regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.vercel\.app$/u)
   .refine((value) => value.indexOf(".vercel.app") === value.length - ".vercel.app".length);
+const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+const gitBlobOidSchema = z.string().regex(/^[0-9a-f]{40}$/u);
+const providerIdentitySchema = z.string().min(1).max(256).regex(/^[A-Za-z0-9_-]+$/u);
+const aliasUidSchema = z.string().min(32).max(256).regex(/^[A-Za-z0-9_-]+$/u);
+const releaseVersionEvidenceSchema = z.string()
+  .min(1)
+  .max(64)
+  .regex(/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u);
 
 const endpointSchema = z.object({
   deploymentId: deploymentIdSchema,
@@ -159,6 +173,43 @@ const aliasMutationReadbackSchema = z.object({
   uid: z.string().min(1).max(256),
 });
 
+const recoveryAliasReadbackSchema = aliasReadbackSchema.extend({
+  createdAt: z.number().int().nonnegative().safe(),
+  uid: aliasUidSchema,
+  updatedAt: z.number().int().nonnegative().safe(),
+});
+
+const deploymentAliasListSchema = z.object({
+  aliases: z.array(z.object({
+    alias: z.string().min(1).max(253),
+    uid: aliasUidSchema,
+  })).max(1_000),
+});
+
+const activityEntitySchema = z.object({
+  end: z.number().int().nonnegative().safe(),
+  start: z.number().int().nonnegative().safe(),
+  type: z.string().min(1).max(64),
+});
+
+const aliasActivityEventSchema = z.object({
+  categories: z.array(z.string().min(1).max(64)).max(16),
+  created: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative().safe(),
+  entities: z.array(activityEntitySchema).max(64),
+  id: z.string().regex(/^uev_[A-Za-z0-9]{20,80}$/u),
+  principal: z.object({ uid: providerIdentitySchema }),
+  principalId: providerIdentitySchema,
+  text: z.string().min(1).max(4_096),
+  type: z.literal("aliases-assigned"),
+  user: z.object({ uid: providerIdentitySchema }),
+  userId: providerIdentitySchema,
+}).strict();
+
+const aliasActivityEventsSchema = z.object({
+  events: z.array(aliasActivityEventSchema).max(100),
+}).strict();
+
 const deploymentReadbackBaseSchema = z.object({
   id: deploymentIdSchema,
   projectId: z.literal(HRA_VERCEL_PROJECT_ID),
@@ -233,14 +284,24 @@ const markerSchema = z.object({
   version: z.literal(HRA_RELEASE_VERSION),
 }).strict();
 
-const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+const recoveryTargetMarkerSchema = z.object({
+  generation: z.literal(1),
+  product: z.literal("HRA"),
+  repository: z.object({
+    id: z.literal(HRA_REPOSITORY_ID),
+    path: z.literal(HRA_REPOSITORY),
+  }).strict(),
+  schemaVersion: z.literal(2),
+  source: z.object({ commit: commitSchema }).strict(),
+  version: releaseVersionEvidenceSchema,
+}).strict();
+
 const currentAliasReleaseRollbackDiagnosticSchema = z.object({
   phase: z.enum(["target_probe", "target_authority"]),
   reason: z.enum([
     "alias_not_planned",
     "marker_mismatch",
     "provider_command_failed",
-    "receiptless_intent",
     "provider_readback_invalid",
     "stability_not_proven",
     "vercel_version_unsupported",
@@ -349,6 +410,82 @@ export const currentAliasReleaseIntentSchema = z.object({
   }
 });
 
+const targetMutationResponseEvidenceSchema = z.object({
+  kind: z.literal("mutation-response"),
+  response: aliasMutationReadbackSchema,
+}).strict();
+
+export const currentAliasReleaseProviderActivityEvidenceSchema = z.object({
+  activity: z.object({
+    createdAtMs: z.number().int().nonnegative().safe(),
+    eventId: z.string().regex(/^uev_[A-Za-z0-9]{20,80}$/u),
+    principalId: providerIdentitySchema,
+    textSha256: digestSchema,
+  }).strict(),
+  alias: z.object({
+    createdAtMs: z.number().int().nonnegative().safe(),
+    uid: aliasUidSchema,
+    updatedAtMs: z.number().int().nonnegative().safe(),
+  }).strict(),
+  custody: z.object({
+    soleWriterConfirmed: z.literal(true),
+  }).strict(),
+  intentPublishedAtMs: z.number().nonnegative().finite(),
+  kind: z.literal("provider-activity-and-operator-provenance"),
+  observedTargetMarkerVersion: releaseVersionEvidenceSchema,
+  operator: z.object({
+    bunVersion: z.literal(supportedBunVersion),
+    entrypointSha256: digestSchema,
+    gitCommit: commitSchema,
+    sourceBlobOid: gitBlobOidSchema,
+  }).strict(),
+  selfDigest: digestSchema,
+}).strict().superRefine((value, context) => {
+  const { selfDigest, ...unsigned } = value;
+  const reviewedOperator = currentAliasReleaseReviewedLegacyOperatorProvenance;
+  if (
+    selfDigest !== canonicalDigest(unsigned)
+    ||
+    value.operator.entrypointSha256 !== reviewedOperator.entrypointSha256
+    || value.operator.gitCommit !== reviewedOperator.gitCommit
+    || value.operator.sourceBlobOid !== reviewedOperator.sourceBlobOid
+    ||
+    value.alias.updatedAtMs < value.intentPublishedAtMs
+    || value.activity.createdAtMs < value.alias.updatedAtMs
+    || value.activity.createdAtMs - value.alias.updatedAtMs > 1_000
+    || value.activity.createdAtMs - value.intentPublishedAtMs > 5_000
+    || value.observedTargetMarkerVersion === HRA_RELEASE_VERSION
+  ) context.addIssue({ code: "custom", message: "provider_activity_timeline_invalid" });
+});
+
+const targetPhaseEvidenceSchema = z.union([
+  targetMutationResponseEvidenceSchema,
+  currentAliasReleaseProviderActivityEvidenceSchema,
+]);
+
+export const currentAliasReleaseTargetPhaseSchema = z.object({
+  evidence: targetPhaseEvidenceSchema,
+  idempotencyKey: idempotencyKeySchema,
+  intentDigest: digestSchema,
+  kind: z.literal("current-project-canonical-alias-target-phase"),
+  planDigest: digestSchema,
+  schemaVersion: z.literal(1),
+  selfDigest: digestSchema,
+  targetMutationKey: digestSchema,
+}).strict();
+
+export const currentAliasReleaseSourceRecoverySchema = z.object({
+  idempotencyKey: idempotencyKeySchema,
+  intentDigest: digestSchema,
+  kind: z.literal("current-project-canonical-alias-source-recovery"),
+  planDigest: digestSchema,
+  rollbackDiagnostic: currentAliasReleaseRollbackDiagnosticSchema,
+  schemaVersion: z.literal(1),
+  selfDigest: digestSchema,
+  sourceRecoveryKey: digestSchema,
+  targetPhaseDigest: digestSchema,
+}).strict();
+
 export const currentAliasReleaseReceiptSchema = z.object({
   changed: z.boolean(),
   finalAuthority: normalizedAliasAuthoritySchema,
@@ -361,6 +498,8 @@ export const currentAliasReleaseReceiptSchema = z.object({
   rollbackDiagnostic: currentAliasReleaseRollbackDiagnosticSchema.optional(),
   schemaVersion: z.literal(1),
   selfDigest: digestSchema,
+  sourceRecoveryDigest: digestSchema.optional(),
+  targetPhaseDigest: digestSchema.optional(),
   targetDeploymentId: deploymentIdSchema,
   targetSourceCommit: commitSchema,
 }).strict().superRefine((value, context) => {
@@ -375,6 +514,10 @@ export const currentAliasReleaseReceiptSchema = z.object({
       value.rollbackDiagnostic !== undefined
       && (value.finalState !== "source" || !value.changed)
     )
+    || value.sourceRecoveryDigest !== undefined && (
+      value.finalState !== "source"
+      || value.targetPhaseDigest === undefined
+    )
   ) context.addIssue({ code: "custom", message: "final_authority_digest_invalid" });
 });
 
@@ -383,7 +526,16 @@ export type CurrentAliasMutationReadback = z.infer<typeof aliasMutationReadbackS
 export type CurrentDeploymentReadback = z.infer<typeof deploymentReadbackSchema>;
 export type CurrentProjectReadback = z.infer<typeof projectReadbackSchema>;
 export type CurrentAliasReleaseIntent = z.infer<typeof currentAliasReleaseIntentSchema>;
+export type CurrentAliasReleaseTargetPhase = z.infer<
+  typeof currentAliasReleaseTargetPhaseSchema
+>;
+export type CurrentAliasReleaseSourceRecovery = z.infer<
+  typeof currentAliasReleaseSourceRecoverySchema
+>;
 export type CurrentAliasReleaseReceipt = z.infer<typeof currentAliasReleaseReceiptSchema>;
+export type ProviderActivityTargetEvidence = z.infer<
+  typeof currentAliasReleaseProviderActivityEvidenceSchema
+>;
 type CurrentAliasReleaseRollbackDiagnostic = z.infer<
   typeof currentAliasReleaseRollbackDiagnosticSchema
 >;
@@ -414,10 +566,15 @@ type CurrentAliasReleaseFailureCode =
   | "provider_readback_invalid"
   | "receipt_authority_mismatch"
   | "receipt_write_failed"
+  | "recovery_evidence_invalid"
+  | "recovery_not_permitted"
+  | "source_recovery_write_failed"
   | "source_not_authoritative"
   | "target_result_ambiguous"
+  | "target_phase_write_failed"
   | "unresolved_current_intent"
   | "unresolved_prior_intent"
+  | "unresolved_source_recovery"
   | "usage_invalid"
   | "vercel_version_unsupported";
 
@@ -634,6 +791,10 @@ export interface CurrentProjectAliasReleaseProvider {
     endpoint: CurrentProjectAliasEndpoint,
     idempotencyKey: string,
   ): Promise<CurrentAliasMutationReadback>;
+  verifyTargetActivityEvidence(
+    plan: CurrentProjectAliasReleasePlan,
+    evidence: ProviderActivityTargetEvidence,
+  ): Promise<void>;
   verifyConvexTarget(target: ConvexTarget): Promise<void>;
   verifyVercelVersion(): Promise<void>;
 }
@@ -775,9 +936,70 @@ export const currentAliasReleaseIntentFor = (
   }));
 };
 
+export const currentAliasReleaseTargetPhaseForMutationResponse = (
+  plan: CurrentProjectAliasReleasePlan,
+  intent: CurrentAliasReleaseIntent,
+  response: CurrentAliasMutationReadback,
+): CurrentAliasReleaseTargetPhase => {
+  if (
+    intent.selfDigest !== currentAliasReleaseIntentFor(plan).selfDigest
+    || response.oldDeploymentId !== plan.vercel.source.deploymentId
+  ) throw new CurrentAliasReleaseError("provider_readback_invalid");
+  return currentAliasReleaseTargetPhaseSchema.parse(withSelfDigest({
+    evidence: {
+      kind: "mutation-response" as const,
+      response: aliasMutationReadbackSchema.parse(response),
+    },
+    idempotencyKey: intent.idempotencyKey,
+    intentDigest: intent.selfDigest,
+    kind: "current-project-canonical-alias-target-phase" as const,
+    planDigest: intent.planDigest,
+    schemaVersion: 1 as const,
+    targetMutationKey: intent.targetMutationKey,
+  }));
+};
+
+export const currentAliasReleaseTargetPhaseForProviderActivity = (
+  plan: CurrentProjectAliasReleasePlan,
+  intent: CurrentAliasReleaseIntent,
+  evidence: ProviderActivityTargetEvidence,
+): CurrentAliasReleaseTargetPhase => {
+  if (intent.selfDigest !== currentAliasReleaseIntentFor(plan).selfDigest) {
+    throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  return currentAliasReleaseTargetPhaseSchema.parse(withSelfDigest({
+    evidence: currentAliasReleaseProviderActivityEvidenceSchema.parse(evidence),
+    idempotencyKey: intent.idempotencyKey,
+    intentDigest: intent.selfDigest,
+    kind: "current-project-canonical-alias-target-phase" as const,
+    planDigest: intent.planDigest,
+    schemaVersion: 1 as const,
+    targetMutationKey: intent.targetMutationKey,
+  }));
+};
+
+export const currentAliasReleaseSourceRecoveryFor = (
+  intent: CurrentAliasReleaseIntent,
+  targetPhase: CurrentAliasReleaseTargetPhase,
+  rollbackDiagnostic: CurrentAliasReleaseRollbackDiagnostic,
+): CurrentAliasReleaseSourceRecovery => currentAliasReleaseSourceRecoverySchema.parse(
+  withSelfDigest({
+    idempotencyKey: intent.idempotencyKey,
+    intentDigest: intent.selfDigest,
+    kind: "current-project-canonical-alias-source-recovery" as const,
+    planDigest: intent.planDigest,
+    rollbackDiagnostic,
+    schemaVersion: 1 as const,
+    sourceRecoveryKey: intent.sourceRecoveryKey,
+    targetPhaseDigest: targetPhase.selfDigest,
+  }),
+);
+
 export type CurrentAliasReleaseStatePaths = Readonly<{
   intent: string;
   receipt: string;
+  sourceRecovery: string;
+  targetPhase: string;
 }>;
 
 export const currentAliasReleaseStatePaths = (
@@ -797,6 +1019,8 @@ export const currentAliasReleaseStatePaths = (
   return {
     intent: join(stateDirectory, `${idempotencyKey}.intent.json`),
     receipt: join(stateDirectory, `${idempotencyKey}.receipt.json`),
+    sourceRecovery: join(stateDirectory, `${idempotencyKey}.source-recovery.json`),
+    targetPhase: join(stateDirectory, `${idempotencyKey}.target-phase.json`),
   };
 };
 
@@ -822,12 +1046,54 @@ const reserveCurrentAliasReleaseIntent = (
   }
 };
 
+const reserveCurrentAliasReleaseTargetPhase = (
+  path: string,
+  targetPhase: CurrentAliasReleaseTargetPhase,
+): CurrentAliasReleaseTargetPhase => {
+  try {
+    writeProtectedJsonNoReplace(
+      path,
+      targetPhase,
+      currentAliasReleaseTargetPhaseSchema,
+      { allowExactReplay: true },
+    );
+    return readProtectedJson(path, currentAliasReleaseTargetPhaseSchema, {
+      recoverInterruptedPublication: true,
+    });
+  } catch {
+    throw new CurrentAliasReleaseError("target_phase_write_failed");
+  }
+};
+
+const reserveCurrentAliasReleaseSourceRecovery = (
+  path: string,
+  sourceRecovery: CurrentAliasReleaseSourceRecovery,
+): CurrentAliasReleaseSourceRecovery => {
+  try {
+    writeProtectedJsonNoReplace(
+      path,
+      sourceRecovery,
+      currentAliasReleaseSourceRecoverySchema,
+      { allowExactReplay: true },
+    );
+    return readProtectedJson(path, currentAliasReleaseSourceRecoverySchema, {
+      recoverInterruptedPublication: true,
+    });
+  } catch {
+    throw new CurrentAliasReleaseError("source_recovery_write_failed");
+  }
+};
+
 const currentAliasReleaseReceiptFor = (
   plan: CurrentProjectAliasReleasePlan,
   intent: CurrentAliasReleaseIntent,
   changed: boolean,
   finalState: "source" | "target",
-  rollbackDiagnostic?: CurrentAliasReleaseRollbackDiagnostic,
+  evidence: Readonly<{
+    rollbackDiagnostic?: CurrentAliasReleaseRollbackDiagnostic;
+    sourceRecovery?: CurrentAliasReleaseSourceRecovery;
+    targetPhase?: CurrentAliasReleaseTargetPhase;
+  }> = {},
 ): CurrentAliasReleaseReceipt => currentAliasReleaseReceiptSchema.parse(withSelfDigest({
   changed,
   finalAuthority: normalizedAliasAuthority(plan, finalState),
@@ -837,8 +1103,16 @@ const currentAliasReleaseReceiptFor = (
   intentDigest: intent.selfDigest,
   kind: "current-project-canonical-alias-receipt" as const,
   planDigest: intent.planDigest,
-  ...(rollbackDiagnostic === undefined ? {} : { rollbackDiagnostic }),
+  ...(evidence.rollbackDiagnostic === undefined
+    ? {}
+    : { rollbackDiagnostic: evidence.rollbackDiagnostic }),
   schemaVersion: 1 as const,
+  ...(evidence.sourceRecovery === undefined
+    ? {}
+    : { sourceRecoveryDigest: evidence.sourceRecovery.selfDigest }),
+  ...(evidence.targetPhase === undefined
+    ? {}
+    : { targetPhaseDigest: evidence.targetPhase.selfDigest }),
   targetDeploymentId: plan.vercel.target.deploymentId,
   targetSourceCommit: plan.vercel.target.sourceCommit,
 }));
@@ -846,10 +1120,12 @@ const currentAliasReleaseReceiptFor = (
 type CurrentAliasReleaseDurableState = Readonly<{
   intent: CurrentAliasReleaseIntent | null;
   receipt: CurrentAliasReleaseReceipt | null;
+  sourceRecovery: CurrentAliasReleaseSourceRecovery | null;
+  targetPhase: CurrentAliasReleaseTargetPhase | null;
 }>;
 
-const stateFilePattern = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(intent|receipt)\.json$/u;
-export const currentAliasReleaseStateEntryMaximum = 4_097;
+const stateFilePattern = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(intent|receipt|source-recovery|target-phase)\.json$/u;
+export const currentAliasReleaseStateEntryMaximum = 8_193;
 
 export const assertCurrentAliasReleaseStateCapacity = (
   existingEntries: number,
@@ -887,6 +1163,8 @@ const inspectCurrentAliasReleaseDurableState = (
   assertCurrentAliasReleaseScanCapacity(names.length);
   const intents = new Map<string, CurrentAliasReleaseIntent>();
   const receipts = new Map<string, CurrentAliasReleaseReceipt>();
+  const sourceRecoveries = new Map<string, CurrentAliasReleaseSourceRecovery>();
+  const targetPhases = new Map<string, CurrentAliasReleaseTargetPhase>();
   for (const name of names) {
     const match = stateFilePattern.exec(name);
     if (match === null) continue;
@@ -906,7 +1184,7 @@ const inspectCurrentAliasReleaseDurableState = (
           throw new CurrentAliasReleaseError("durable_state_invalid");
         }
         intents.set(idempotencyKey, intent);
-      } else {
+      } else if (kind === "receipt") {
         const receipt = readProtectedJson(
           join(stateDirectory, name),
           currentAliasReleaseReceiptSchema,
@@ -916,6 +1194,26 @@ const inspectCurrentAliasReleaseDurableState = (
           throw new CurrentAliasReleaseError("durable_state_invalid");
         }
         receipts.set(idempotencyKey, receipt);
+      } else if (kind === "source-recovery") {
+        const sourceRecovery = readProtectedJson(
+          join(stateDirectory, name),
+          currentAliasReleaseSourceRecoverySchema,
+          { recoverInterruptedPublication: true },
+        );
+        if (sourceRecovery.idempotencyKey !== idempotencyKey) {
+          throw new CurrentAliasReleaseError("durable_state_invalid");
+        }
+        sourceRecoveries.set(idempotencyKey, sourceRecovery);
+      } else {
+        const targetPhase = readProtectedJson(
+          join(stateDirectory, name),
+          currentAliasReleaseTargetPhaseSchema,
+          { recoverInterruptedPublication: true },
+        );
+        if (targetPhase.idempotencyKey !== idempotencyKey) {
+          throw new CurrentAliasReleaseError("durable_state_invalid");
+        }
+        targetPhases.set(idempotencyKey, targetPhase);
       }
     } catch (error: unknown) {
       if (error instanceof CurrentAliasReleaseError) throw error;
@@ -934,6 +1232,8 @@ const inspectCurrentAliasReleaseDurableState = (
     executionLockName,
     ...[...intents.keys()].map((key) => `${key}.intent.json`),
     ...[...receipts.keys()].map((key) => `${key}.receipt.json`),
+    ...[...sourceRecoveries.keys()].map((key) => `${key}.source-recovery.json`),
+    ...[...targetPhases.keys()].map((key) => `${key}.target-phase.json`),
   ];
   if (
     [...remaining].sort().join("\0") !== [...stable].sort().join("\0")
@@ -943,6 +1243,8 @@ const inspectCurrentAliasReleaseDurableState = (
   }
   for (const [idempotencyKey, receipt] of receipts) {
     const intent = intents.get(idempotencyKey);
+    const sourceRecovery = sourceRecoveries.get(idempotencyKey);
+    const targetPhase = targetPhases.get(idempotencyKey);
     if (
       intent === undefined
       || receipt.intentDigest !== intent.selfDigest
@@ -954,6 +1256,34 @@ const inspectCurrentAliasReleaseDurableState = (
       )
       || receipt.targetDeploymentId !== receipt.finalAuthority.target.deploymentId
       || receipt.targetSourceCommit !== receipt.finalAuthority.target.sourceCommit
+      || receipt.targetPhaseDigest !== targetPhase?.selfDigest
+      || receipt.sourceRecoveryDigest !== sourceRecovery?.selfDigest
+    ) throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  for (const [idempotencyKey, targetPhase] of targetPhases) {
+    const intent = intents.get(idempotencyKey);
+    if (
+      intent === undefined
+      || targetPhase.idempotencyKey !== intent.idempotencyKey
+      || targetPhase.intentDigest !== intent.selfDigest
+      || targetPhase.planDigest !== intent.planDigest
+      || targetPhase.targetMutationKey !== intent.targetMutationKey
+      || targetPhase.evidence.kind === "mutation-response" && (
+        targetPhase.evidence.response.oldDeploymentId
+          !== intent.sourceAuthority.source.deploymentId
+      )
+    ) throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  for (const [idempotencyKey, sourceRecovery] of sourceRecoveries) {
+    const intent = intents.get(idempotencyKey);
+    const targetPhase = targetPhases.get(idempotencyKey);
+    if (
+      intent === undefined
+      || targetPhase === undefined
+      || sourceRecovery.intentDigest !== intent.selfDigest
+      || sourceRecovery.planDigest !== intent.planDigest
+      || sourceRecovery.sourceRecoveryKey !== intent.sourceRecoveryKey
+      || sourceRecovery.targetPhaseDigest !== targetPhase.selfDigest
     ) throw new CurrentAliasReleaseError("durable_state_invalid");
   }
   for (const idempotencyKey of intents.keys()) {
@@ -968,9 +1298,19 @@ const inspectCurrentAliasReleaseDurableState = (
   }
   const intent = intents.get(plan.idempotencyKey) ?? null;
   const receipt = receipts.get(plan.idempotencyKey) ?? null;
+  const sourceRecovery = sourceRecoveries.get(plan.idempotencyKey) ?? null;
+  const targetPhase = targetPhases.get(plan.idempotencyKey) ?? null;
   assertCurrentAliasReleaseStateCapacity(
     stable.length,
-    intent === null ? 2 : receipt === null ? 1 : 0,
+    receipt !== null
+      ? 0
+      : intent === null
+      ? 4
+      : targetPhase === null
+        ? 3
+        : sourceRecovery === null
+          ? 2
+          : 1,
   );
   if (intent !== null) {
     const expected = currentAliasReleaseIntentFor(plan);
@@ -984,13 +1324,19 @@ const inspectCurrentAliasReleaseDurableState = (
       intent,
       receipt.changed,
       receipt.finalState,
-      receipt.rollbackDiagnostic,
+      {
+        ...(receipt.rollbackDiagnostic === undefined
+          ? {}
+          : { rollbackDiagnostic: receipt.rollbackDiagnostic }),
+        ...(sourceRecovery === null ? {} : { sourceRecovery }),
+        ...(targetPhase === null ? {} : { targetPhase }),
+      },
     );
     if (receipt.selfDigest !== expected.selfDigest) {
       throw new CurrentAliasReleaseError("durable_state_invalid");
     }
   }
-  return { intent, receipt };
+  return { intent, receipt, sourceRecovery, targetPhase };
 };
 
 const aliasMatches = (
@@ -1219,7 +1565,12 @@ const restoreCurrentAliasReleaseSource = async (
   timeoutMs: number,
   assertMutationAuthority: () => void,
   rollbackDiagnostic: CurrentAliasReleaseRollbackDiagnostic,
+  recordSourceRecovery: (
+    rollbackDiagnostic: CurrentAliasReleaseRollbackDiagnostic,
+  ) => CurrentAliasReleaseSourceRecovery,
 ): Promise<never> => {
+  assertMutationAuthority();
+  recordSourceRecovery(rollbackDiagnostic);
   assertMutationAuthority();
   try {
     const response = await provider.setAlias(
@@ -1253,6 +1604,12 @@ const executeCurrentAliasReleasePlan = async (
   clock: ReleaseClock = defaultClock,
   timeoutMs = convergenceTimeoutMs,
   assertMutationAuthority: () => void,
+  recordTargetPhase: (
+    response: CurrentAliasMutationReadback,
+  ) => CurrentAliasReleaseTargetPhase,
+  recordSourceRecovery: (
+    rollbackDiagnostic: CurrentAliasReleaseRollbackDiagnostic,
+  ) => CurrentAliasReleaseSourceRecovery,
 ): Promise<CurrentAliasReleaseOutcome> => {
   if (confirmation !== requiredAliasConfirmation(plan)) {
     throw new CurrentAliasReleaseError("confirmation_required");
@@ -1261,7 +1618,9 @@ const executeCurrentAliasReleasePlan = async (
   if (initial.state === "blocked") {
     throw new CurrentAliasReleaseError("source_not_authoritative");
   }
-  if (initial.state === "target") return { changed: false, replayed: true };
+  if (initial.state === "target") {
+    throw new CurrentAliasReleaseError("target_result_ambiguous");
+  }
 
   assertMutationAuthority();
   let response: CurrentAliasMutationReadback;
@@ -1277,6 +1636,7 @@ const executeCurrentAliasReleasePlan = async (
   if (response.oldDeploymentId !== plan.vercel.source.deploymentId) {
     throw new CurrentAliasReleaseError("provider_readback_invalid");
   }
+  recordTargetPhase(response);
 
   const targetAuthority = await proveStableAliasAuthority(
     plan,
@@ -1294,83 +1654,132 @@ const executeCurrentAliasReleasePlan = async (
     timeoutMs,
     assertMutationAuthority,
     currentAliasReleaseRollbackDiagnosticSchema.parse(targetAuthority.diagnostic),
+    recordSourceRecovery,
   );
 };
 
-/**
- * Phase-aware recovery for one receipt-less intent of the exact same plan.
- *
- * A receipt-less intent proves only that the plan was approved and its intent
- * published; it cannot say whether the target request was sent, acknowledged,
- * or proved. The reviewed recovery therefore never performs the forward
- * (target) write. It reads the current alias tuple and finishes the plan on
- * the only automatic recovery target the runbook allows, the plan's exact
- * source:
- *
- * - alias exactly at the target: dispatch the plan's own restore-source effect
- *   under its recorded mutation key, prove the source stable, and receipt the
- *   plan as reverted with the `receiptless_intent` diagnostic;
- * - alias exactly at the source: prove the source stable without any write and
- *   receipt the plan as reverted;
- * - anything else: leave the intent untouched and stop.
- *
- * It runs only when the operator explicitly requests
- * `--reconcile-receiptless-intent` together with the plan's exact machine
- * confirmation, so an ordinary replay of a receipt-less plan still stops.
- */
 const reconcileCurrentAliasReleaseIntent = async (
   plan: CurrentProjectAliasReleasePlan,
   provider: CurrentProjectAliasReleaseProvider,
   clock: ReleaseClock,
   timeoutMs: number,
   assertMutationAuthority: () => void,
-  confirmation: string | undefined,
-  reconcileRequested: boolean,
 ): Promise<CurrentAliasReleaseOutcome> => {
-  if (!reconcileRequested) {
-    throw new CurrentAliasReleaseError("unresolved_current_intent");
+  void plan;
+  void provider;
+  void clock;
+  void timeoutMs;
+  void assertMutationAuthority;
+  throw new CurrentAliasReleaseError("unresolved_current_intent");
+};
+
+const proveRecoveryTargetSample = async (
+  plan: CurrentProjectAliasReleasePlan,
+  provider: CurrentProjectAliasReleaseProvider,
+  expectedMarkerVersion?: string,
+): Promise<string> => {
+  try {
+    await provider.verifyVercelVersion();
+    await provider.verifyConvexTarget(parseConvexTarget(plan.convex));
+    await provider.readProject();
+    const source = parseCurrentDeploymentReadback(
+      await provider.readDeployment(plan.vercel.source.deploymentId),
+    );
+    const target = parseCurrentDeploymentReadback(
+      await provider.readDeployment(plan.vercel.target.deploymentId),
+    );
+    const alias = await provider.readAlias();
+    const marker = recoveryTargetMarkerSchema.safeParse(await provider.readMarker());
+    if (
+      !sourceDeploymentMatches(source, plan)
+      || !githubDeploymentMatches(target, plan.vercel.target)
+      || !aliasMatches(alias, plan.vercel.target)
+      || !marker.success
+      || marker.data.source.commit !== plan.vercel.target.sourceCommit
+      || expectedMarkerVersion !== undefined
+        && marker.data.version !== expectedMarkerVersion
+      || marker.data.version === HRA_RELEASE_VERSION
+    ) throw new CurrentAliasReleaseError("recovery_not_permitted");
+    return marker.data.version;
+  } catch (error: unknown) {
+    rethrowTerminalProviderError(error);
+    if (error instanceof CurrentAliasReleaseError) throw error;
+    throw new CurrentAliasReleaseError("recovery_not_permitted");
   }
-  if (confirmation !== requiredAliasConfirmation(plan)) {
-    throw new CurrentAliasReleaseError("confirmation_required");
+};
+
+const assertProviderActivityIntentPublication = (
+  intentPath: string,
+  evidence: ProviderActivityTargetEvidence,
+): void => {
+  try {
+    const metadata = lstatSync(intentPath);
+    if (
+      !metadata.isFile()
+      || metadata.isSymbolicLink()
+      || metadata.uid !== process.getuid?.()
+      || metadata.nlink !== 1
+      || (metadata.mode & 0o777) !== 0o600
+      || Math.abs(metadata.mtimeMs - evidence.intentPublishedAtMs) > 0.001
+    ) throw new Error("intent publication changed");
+  } catch {
+    throw new CurrentAliasReleaseError("recovery_evidence_invalid");
   }
-  await provider.verifyVercelVersion();
-  await provider.verifyConvexTarget(parseConvexTarget(plan.convex));
-  await provider.readProject();
-  const sourceDeployment = parseCurrentDeploymentReadback(
-    await provider.readDeployment(plan.vercel.source.deploymentId),
-  );
-  if (!sourceDeploymentMatches(sourceDeployment, plan)) {
-    throw new CurrentAliasReleaseError("provider_readback_invalid");
+};
+
+const recoverCurrentAliasReleaseSource = async (
+  plan: CurrentProjectAliasReleasePlan,
+  provider: CurrentProjectAliasReleaseProvider,
+  targetPhase: CurrentAliasReleaseTargetPhase,
+  clock: ReleaseClock,
+  timeoutMs: number,
+  assertMutationAuthority: () => void,
+  recordSourceRecovery: (
+    rollbackDiagnostic: CurrentAliasReleaseRollbackDiagnostic,
+  ) => CurrentAliasReleaseSourceRecovery,
+): Promise<CurrentAliasReleaseRollbackDiagnostic> => {
+  let observedMarkerVersion = targetPhase.evidence.kind === "mutation-response"
+    ? undefined
+    : targetPhase.evidence.observedTargetMarkerVersion;
+  for (let sample = 0; sample < 2; sample += 1) {
+    assertMutationAuthority();
+    observedMarkerVersion = await proveRecoveryTargetSample(
+      plan,
+      provider,
+      observedMarkerVersion,
+    );
   }
-  const alias = await provider.readAlias();
-  const diagnostic: CurrentAliasReleaseRollbackDiagnostic = {
+  const rollbackDiagnostic = currentAliasReleaseRollbackDiagnosticSchema.parse({
     phase: "target_authority",
-    reason: "receiptless_intent",
-  };
-  if (aliasMatches(alias, plan.vercel.target)) {
-    return await restoreCurrentAliasReleaseSource(
-      plan,
-      provider,
-      clock,
-      timeoutMs,
-      assertMutationAuthority,
-      diagnostic,
+    reason: "marker_mismatch",
+  });
+  assertMutationAuthority();
+  recordSourceRecovery(rollbackDiagnostic);
+  assertMutationAuthority();
+  let response: CurrentAliasMutationReadback;
+  try {
+    response = await provider.setAlias(
+      plan.vercel.source,
+      currentAliasReleaseMutationKey(plan, "restore-source"),
     );
-  }
-  if (aliasMatches(alias, plan.vercel.source)) {
-    const sourceProved = await proveStableAliasAuthority(
-      plan,
-      provider,
-      "source",
-      clock,
-      clock.now() + timeoutMs,
-    );
-    if (sourceProved.proved) {
-      throw new CurrentAliasReleaseRevertedError(diagnostic);
-    }
+  } catch (error: unknown) {
+    rethrowTerminalProviderError(error);
     throw new CurrentAliasReleaseError("compensation_failed");
   }
-  throw new CurrentAliasReleaseError("unresolved_current_intent");
+  if (response.oldDeploymentId !== plan.vercel.target.deploymentId) {
+    throw new CurrentAliasReleaseError("compensation_failed");
+  }
+  const sourceRestored = await proveStableAliasAuthority(
+    plan,
+    provider,
+    "source",
+    clock,
+    clock.now() + timeoutMs,
+  );
+  if (!sourceRestored.proved) {
+    throw new CurrentAliasReleaseError("compensation_failed");
+  }
+  return rollbackDiagnostic;
 };
 
 export type VercelCommandRequest = Readonly<{
@@ -1584,6 +1993,64 @@ export const readProtectedVercelAccessToken = (
   return accessToken;
 };
 
+export const readProtectedProviderActivityEvidence = (
+  descriptor: number,
+): ProviderActivityTargetEvidence => {
+  let first: Buffer | undefined;
+  let second: Buffer | undefined;
+  let evidence: ProviderActivityTargetEvidence | undefined;
+  let refused = false;
+  try {
+    const uid = process.getuid?.();
+    if (
+      uid === undefined
+      || !Number.isSafeInteger(descriptor)
+      || descriptor < 3
+      || descriptor > 255
+      || isatty(descriptor)
+    ) throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+    const initial = fstatSync(descriptor);
+    proveDescriptorAclAbsence(descriptor, {}, "recovery_evidence_invalid");
+    if (
+      !initial.isFile()
+      || initial.uid !== uid
+      || initial.nlink !== 1
+      || (initial.mode & 0o777) !== 0o600
+      || initial.size <= 0
+      || initial.size > inputMaximumBytes
+    ) throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+    first = readCredentialDescriptor(descriptor, initial.size);
+    const afterFirstRead = fstatSync(descriptor);
+    second = readCredentialDescriptor(descriptor, initial.size);
+    const final = fstatSync(descriptor);
+    proveDescriptorAclAbsence(descriptor, {}, "recovery_evidence_invalid");
+    if (
+      !sameCredentialIdentity(initial, afterFirstRead)
+      || !sameCredentialIdentity(initial, final)
+      || !first.subarray(0, initial.size).equals(second.subarray(0, initial.size))
+    ) throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+    const document = new TextDecoder("utf-8", { fatal: true })
+      .decode(first.subarray(0, initial.size));
+    evidence = currentAliasReleaseProviderActivityEvidenceSchema.parse(
+      JSON.parse(document) as unknown,
+    );
+  } catch {
+    refused = true;
+  } finally {
+    first?.fill(0);
+    second?.fill(0);
+    try {
+      closeSync(descriptor);
+    } catch {
+      refused = true;
+    }
+  }
+  if (refused || evidence === undefined) {
+    throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+  }
+  return evidence;
+};
+
 type VercelCurrentProjectAliasProviderOptions = Readonly<{
   convexVerifier?: ConvexTargetVerifier;
   environment?: Readonly<NodeJS.ProcessEnv>;
@@ -1707,6 +2174,10 @@ implements CurrentProjectAliasReleaseProvider {
       if (error instanceof CurrentAliasReleaseError) throw error;
       throw new CurrentAliasReleaseError("provider_readback_invalid");
     }
+  }
+
+  async verifyTargetActivityEvidence(): Promise<void> {
+    throw new CurrentAliasReleaseError("recovery_evidence_invalid");
   }
 
   async setAlias(
@@ -1834,6 +2305,100 @@ implements CurrentProjectAliasReleaseProvider {
     }
   }
 
+  async verifyTargetActivityEvidence(
+    plan: CurrentProjectAliasReleasePlan,
+    evidence: ProviderActivityTargetEvidence,
+  ): Promise<void> {
+    const parsedEvidence = currentAliasReleaseProviderActivityEvidenceSchema.safeParse(evidence);
+    if (!parsedEvidence.success) {
+      throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+    }
+    const expected = parsedEvidence.data;
+    try {
+      const alias = await this.#read(
+        `/v4/aliases/${canonicalAlias}`,
+        recoveryAliasReadbackSchema,
+      );
+      if (
+        !aliasMatches(alias, plan.vercel.target)
+        || alias.createdAt !== expected.alias.createdAtMs
+        || alias.updatedAt !== expected.alias.updatedAtMs
+        || alias.uid !== expected.alias.uid
+      ) throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+
+      const targetAliases = await this.#read(
+        `/v2/deployments/${plan.vercel.target.deploymentId}/aliases`,
+        deploymentAliasListSchema,
+      );
+      const sourceAliases = await this.#read(
+        `/v2/deployments/${plan.vercel.source.deploymentId}/aliases`,
+        deploymentAliasListSchema,
+      );
+      const matchingTargetAliases = targetAliases.aliases.filter((item) =>
+        item.alias === canonicalAlias || item.uid === expected.alias.uid
+      );
+      if (
+        matchingTargetAliases.length !== 1
+        || matchingTargetAliases[0]?.alias !== canonicalAlias
+        || matchingTargetAliases[0].uid !== expected.alias.uid
+        || sourceAliases.aliases.some((item) =>
+          item.alias === canonicalAlias || item.uid === expected.alias.uid
+        )
+      ) throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+
+      const activityQuery = new URLSearchParams({
+        limit: "100",
+        since: new Date(expected.intentPublishedAtMs - 250).toISOString(),
+        types: "aliases-assigned",
+      });
+      const activity = await this.#read(
+        `/v3/events?${activityQuery.toString()}`,
+        aliasActivityEventsSchema,
+      );
+      if (activity.events.length >= 100) {
+        throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+      }
+      const incidentWindow = activity.events.filter((item) =>
+        item.createdAt >= expected.intentPublishedAtMs - 250
+        && item.createdAt <= expected.activity.createdAtMs + 250
+      );
+      if (incidentWindow.length !== 1) {
+        throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+      }
+      const event = incidentWindow[0];
+      if (event === undefined) {
+        throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+      }
+      const entityValues = (type: string): string[] => event.entities.flatMap((entity) => {
+        if (
+          entity.type !== type
+          || entity.start > entity.end
+          || entity.end > event.text.length
+        ) return [];
+        return [event.text.slice(entity.start, entity.end)];
+      });
+      if (
+        event.id !== expected.activity.eventId
+        || event.created !== event.createdAt
+        || event.createdAt !== expected.activity.createdAtMs
+        || event.principalId !== expected.activity.principalId
+        || event.userId !== expected.activity.principalId
+        || event.principal.uid !== expected.activity.principalId
+        || event.user.uid !== expected.activity.principalId
+        || [...event.categories].sort().join("\0") !== "domain\0project"
+        || createHash("sha256").update(event.text).digest("hex")
+          !== expected.activity.textSha256
+        || entityValues("bold").length !== 1
+        || entityValues("bold")[0] !== "an alias"
+        || entityValues("deployment_host").length !== 1
+        || entityValues("deployment_host")[0] !== plan.vercel.target.deploymentUrl
+      ) throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+    } catch (error: unknown) {
+      if (error instanceof CurrentAliasReleaseError) throw error;
+      throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+    }
+  }
+
   async setAlias(
     endpoint: CurrentProjectAliasEndpoint,
     idempotencyKey: string,
@@ -1867,9 +2432,9 @@ implements CurrentProjectAliasReleaseProvider {
 
 type ParsedArguments = Readonly<{
   confirmation?: string;
-  operation: "execute" | "preflight";
+  operation: "execute" | "preflight" | "recover-source";
   planFd: number;
-  reconcileReceiptlessIntent?: true;
+  recoveryEvidenceFd?: number;
   vercelAuthFd?: number;
   vercelCli?: string;
 }>;
@@ -1878,21 +2443,21 @@ export const parseArguments = (arguments_: readonly string[]): ParsedArguments =
   let confirmation: string | undefined;
   let operation: ParsedArguments["operation"] | undefined;
   let planFd = 0;
-  let reconcileReceiptlessIntent = false;
+  let recoveryEvidenceFd: number | undefined;
   let vercelAuthFd: number | undefined;
   let vercelCli: string | undefined;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
-    if (argument === "--reconcile-receiptless-intent" && !reconcileReceiptlessIntent) {
-      reconcileReceiptlessIntent = true;
-      continue;
-    }
     if (argument === "preflight" && operation === undefined) {
       operation = "preflight";
       continue;
     }
     if (argument === "--execute" && operation === undefined) {
       operation = "execute";
+      continue;
+    }
+    if (argument === "recover-source" && operation === undefined) {
+      operation = "recover-source";
       continue;
     }
     if (argument === "--confirm-exact" && confirmation === undefined) {
@@ -1937,6 +2502,20 @@ export const parseArguments = (arguments_: readonly string[]): ParsedArguments =
       index += 1;
       continue;
     }
+    if (argument === "--recovery-evidence-fd" && recoveryEvidenceFd === undefined) {
+      const value = arguments_[index + 1];
+      if (value === undefined || !/^[0-9]+$/u.test(value)) {
+        throw new CurrentAliasReleaseError("usage_invalid");
+      }
+      recoveryEvidenceFd = Number(value);
+      if (
+        !Number.isSafeInteger(recoveryEvidenceFd)
+        || recoveryEvidenceFd < 3
+        || recoveryEvidenceFd > 255
+      ) throw new CurrentAliasReleaseError("usage_invalid");
+      index += 1;
+      continue;
+    }
     throw new CurrentAliasReleaseError("usage_invalid");
   }
   if (
@@ -1944,13 +2523,17 @@ export const parseArguments = (arguments_: readonly string[]): ParsedArguments =
     || (vercelCli === undefined) === (vercelAuthFd === undefined)
     || vercelAuthFd !== undefined && planFd === vercelAuthFd
     || operation === "preflight" && confirmation !== undefined
-    || operation === "preflight" && reconcileReceiptlessIntent
+    || operation !== "recover-source" && recoveryEvidenceFd !== undefined
+    || recoveryEvidenceFd !== undefined && (
+      recoveryEvidenceFd === planFd
+      || recoveryEvidenceFd === vercelAuthFd
+    )
   ) throw new CurrentAliasReleaseError("usage_invalid");
   return {
     ...(confirmation === undefined ? {} : { confirmation }),
     operation,
     planFd,
-    ...(reconcileReceiptlessIntent ? { reconcileReceiptlessIntent: true as const } : {}),
+    ...(recoveryEvidenceFd === undefined ? {} : { recoveryEvidenceFd }),
     ...(vercelAuthFd === undefined ? {} : { vercelAuthFd }),
     ...(vercelCli === undefined ? {} : { vercelCli }),
   };
@@ -1998,6 +2581,7 @@ type ExecuteOptions = Readonly<{
   fetcher?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
   inputDocument: string;
   provider?: CurrentProjectAliasReleaseProvider;
+  providerActivityEvidence?: ProviderActivityTargetEvidence;
   receiptWriter?: (
     path: string,
     receipt: CurrentAliasReleaseReceipt,
@@ -2068,7 +2652,10 @@ const renderFailure = (
     || code === "receipt_authority_mismatch"
     || code === "receipt_write_failed"
     || code === "intent_write_failed"
+    || code === "source_recovery_write_failed"
+    || code === "target_phase_write_failed"
     || code === "unresolved_prior_intent"
+    || code === "unresolved_source_recovery"
     || code === "durable_state_invalid" && effectiveDurableContext !== undefined;
   const status = recoveryRequired
     ? "recovery_required"
@@ -2139,7 +2726,13 @@ const executeCurrentProjectAliasRelease = async (
           throw new CurrentAliasReleaseError("unresolved_current_intent");
         }
         const guard = new BoundedProcessInvocationGuard();
-        for (const path of [lock.path, paths.intent, paths.receipt]) {
+        for (const path of [
+          lock.path,
+          paths.intent,
+          paths.receipt,
+          paths.sourceRecovery,
+          paths.targetPhase,
+        ]) {
           guard.retainRecoveryPath(path);
         }
         const provider = options.provider ?? (arguments_.vercelAuthFd === undefined
@@ -2214,7 +2807,13 @@ const executeCurrentProjectAliasRelease = async (
         receiptPath: paths.receipt,
       };
       const guard = new BoundedProcessInvocationGuard();
-      for (const path of [lock.path, paths.intent, paths.receipt]) {
+      for (const path of [
+        lock.path,
+        paths.intent,
+        paths.receipt,
+        paths.sourceRecovery,
+        paths.targetPhase,
+      ]) {
         guard.retainRecoveryPath(path);
       }
       const durableState = inspectCurrentAliasReleaseDurableState(
@@ -2239,8 +2838,151 @@ const executeCurrentProjectAliasRelease = async (
             ...(options.convexVerifier === undefined
               ? {}
               : { convexVerifier: options.convexVerifier }),
-            ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
-          }));
+              ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+            }));
+      if (arguments_.operation === "recover-source") {
+        const intent = durableState.intent;
+        if (intent === null) {
+          throw new CurrentAliasReleaseError("recovery_not_permitted");
+        }
+        if (durableState.receipt !== null) {
+          const observation = await observeCurrentAliasAuthority(plan, provider);
+          if (
+            durableState.receipt.finalState !== "source"
+            || observation.state !== "source"
+          ) throw new CurrentAliasReleaseError("receipt_authority_mismatch");
+          if (
+            durableState.targetPhase === null
+            || durableState.sourceRecovery === null
+            || durableState.receipt.targetPhaseDigest !== durableState.targetPhase.selfDigest
+            || durableState.receipt.sourceRecoveryDigest
+              !== durableState.sourceRecovery.selfDigest
+          ) throw new CurrentAliasReleaseError("alias_reverted");
+          output = `${JSON.stringify({
+            alias: plan.alias,
+            changed: durableState.receipt.changed,
+            idempotencyKey,
+            intentDigest: intent.selfDigest,
+            receiptDigest: durableState.receipt.selfDigest,
+            replayed: true,
+            schemaVersion: 1,
+            sourceDeploymentId: plan.vercel.source.deploymentId,
+            sourceDeploymentUrl: plan.vercel.source.deploymentUrl,
+            status: "recovered_source",
+          })}\n`;
+          lock.assertHeld();
+          lock.release();
+          options.stdout.write(output);
+          return 0;
+        }
+        if (durableState.sourceRecovery !== null) {
+          throw new CurrentAliasReleaseError("unresolved_source_recovery");
+        }
+        const suppliedActivityEvidence = options.providerActivityEvidence
+          ?? (arguments_.recoveryEvidenceFd === undefined
+            ? undefined
+            : readProtectedProviderActivityEvidence(arguments_.recoveryEvidenceFd));
+        let targetPhase = durableState.targetPhase;
+        if (targetPhase === null) {
+          if (suppliedActivityEvidence === undefined) {
+            throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+          }
+          assertProviderActivityIntentPublication(paths.intent, suppliedActivityEvidence);
+          await provider.verifyTargetActivityEvidence(plan, suppliedActivityEvidence);
+          lock.assertHeld();
+          const candidate = currentAliasReleaseTargetPhaseForProviderActivity(
+            plan,
+            intent,
+            suppliedActivityEvidence,
+          );
+          targetPhase = reserveCurrentAliasReleaseTargetPhase(
+            paths.targetPhase,
+            candidate,
+          );
+          if (targetPhase.selfDigest !== candidate.selfDigest) {
+            throw new CurrentAliasReleaseError("target_phase_write_failed");
+          }
+        } else if (suppliedActivityEvidence !== undefined) {
+          if (
+            targetPhase.evidence.kind !== "provider-activity-and-operator-provenance"
+            || targetPhase.evidence.selfDigest !== suppliedActivityEvidence.selfDigest
+          ) throw new CurrentAliasReleaseError("recovery_evidence_invalid");
+        }
+        if (targetPhase.evidence.kind === "provider-activity-and-operator-provenance") {
+          assertProviderActivityIntentPublication(paths.intent, targetPhase.evidence);
+          await provider.verifyTargetActivityEvidence(plan, targetPhase.evidence);
+        }
+        let sourceRecovery: CurrentAliasReleaseSourceRecovery | undefined;
+        const rollbackDiagnostic = await recoverCurrentAliasReleaseSource(
+          plan,
+          provider,
+          targetPhase,
+          options.clock ?? defaultClock,
+          options.timeoutMs ?? convergenceTimeoutMs,
+          lock.assertHeld,
+          (diagnostic) => {
+            const candidate = currentAliasReleaseSourceRecoveryFor(
+              intent,
+              targetPhase,
+              diagnostic,
+            );
+            sourceRecovery = reserveCurrentAliasReleaseSourceRecovery(
+              paths.sourceRecovery,
+              candidate,
+            );
+            if (sourceRecovery.selfDigest !== candidate.selfDigest) {
+              throw new CurrentAliasReleaseError("source_recovery_write_failed");
+            }
+            return sourceRecovery;
+          },
+        );
+        if (sourceRecovery === undefined) {
+          throw new CurrentAliasReleaseError("source_recovery_write_failed");
+        }
+        lock.assertHeld();
+        const candidate = currentAliasReleaseReceiptFor(
+          plan,
+          intent,
+          true,
+          "source",
+          { rollbackDiagnostic, sourceRecovery, targetPhase },
+        );
+        try {
+          (options.receiptWriter ?? writeCurrentAliasReleaseReceipt)(
+            paths.receipt,
+            candidate,
+          );
+          const receipt = readProtectedJson(
+            paths.receipt,
+            currentAliasReleaseReceiptSchema,
+            { recoverInterruptedPublication: true },
+          );
+          if (receipt.selfDigest !== candidate.selfDigest) {
+            throw new Error("receipt changed");
+          }
+          unresolvedIntent = false;
+          output = `${JSON.stringify({
+            alias: plan.alias,
+            changed: true,
+            idempotencyKey,
+            intentDigest: intent.selfDigest,
+            receiptDigest: receipt.selfDigest,
+            replayed: false,
+            schemaVersion: 1,
+            sourceDeploymentId: plan.vercel.source.deploymentId,
+            sourceDeploymentUrl: plan.vercel.source.deploymentUrl,
+            sourceRecoveryDigest: sourceRecovery.selfDigest,
+            status: "recovered_source",
+            targetPhaseDigest: targetPhase.selfDigest,
+          })}\n`;
+        } catch {
+          throw new CurrentAliasReleaseError("receipt_write_failed");
+        }
+        lock.assertHeld();
+        lock.release();
+        options.stdout.write(output);
+        return 0;
+      }
       let initial: AliasAuthorityObservation;
       try {
         initial = await observeCurrentAliasAuthority(plan, provider);
@@ -2296,6 +3038,8 @@ const executeCurrentProjectAliasRelease = async (
           );
         }
         let outcome: CurrentAliasReleaseOutcome;
+        let targetPhase = durableState.targetPhase;
+        let sourceRecovery = durableState.sourceRecovery;
         try {
           outcome = intentWasPreexisting
             ? await reconcileCurrentAliasReleaseIntent(
@@ -2304,8 +3048,6 @@ const executeCurrentProjectAliasRelease = async (
                 options.clock ?? defaultClock,
                 options.timeoutMs ?? convergenceTimeoutMs,
                 lock.assertHeld,
-                arguments_.confirmation,
-                arguments_.reconcileReceiptlessIntent === true,
               )
             : await executeCurrentAliasReleasePlan(
                 plan,
@@ -2314,6 +3056,42 @@ const executeCurrentProjectAliasRelease = async (
                 options.clock ?? defaultClock,
                 options.timeoutMs ?? convergenceTimeoutMs,
                 lock.assertHeld,
+                (response) => {
+                  if (intent === null) {
+                    throw new CurrentAliasReleaseError("durable_state_invalid");
+                  }
+                  const candidate = currentAliasReleaseTargetPhaseForMutationResponse(
+                    plan,
+                    intent,
+                    response,
+                  );
+                  targetPhase = reserveCurrentAliasReleaseTargetPhase(
+                    paths.targetPhase,
+                    candidate,
+                  );
+                  if (targetPhase.selfDigest !== candidate.selfDigest) {
+                    throw new CurrentAliasReleaseError("target_phase_write_failed");
+                  }
+                  return targetPhase;
+                },
+                (diagnostic) => {
+                  if (intent === null || targetPhase === null) {
+                    throw new CurrentAliasReleaseError("durable_state_invalid");
+                  }
+                  const candidate = currentAliasReleaseSourceRecoveryFor(
+                    intent,
+                    targetPhase,
+                    diagnostic,
+                  );
+                  sourceRecovery = reserveCurrentAliasReleaseSourceRecovery(
+                    paths.sourceRecovery,
+                    candidate,
+                  );
+                  if (sourceRecovery.selfDigest !== candidate.selfDigest) {
+                    throw new CurrentAliasReleaseError("source_recovery_write_failed");
+                  }
+                  return sourceRecovery;
+                },
               );
         } catch (error: unknown) {
           if (!(error instanceof CurrentAliasReleaseRevertedError)) {
@@ -2325,7 +3103,11 @@ const executeCurrentProjectAliasRelease = async (
             intent,
             true,
             "source",
-            error.rollbackDiagnostic,
+            {
+              rollbackDiagnostic: error.rollbackDiagnostic,
+              ...(sourceRecovery === null ? {} : { sourceRecovery }),
+              ...(targetPhase === null ? {} : { targetPhase }),
+            },
           );
           try {
             (options.receiptWriter ?? writeCurrentAliasReleaseReceipt)(
@@ -2345,11 +3127,15 @@ const executeCurrentProjectAliasRelease = async (
           throw error;
         }
         lock.assertHeld();
+        if (targetPhase === null) {
+          throw new CurrentAliasReleaseError("target_phase_write_failed");
+        }
         const candidate = currentAliasReleaseReceiptFor(
           plan,
           intent,
           outcome.changed,
           "target",
+          { targetPhase },
         );
         try {
           (options.receiptWriter ?? writeCurrentAliasReleaseReceipt)(
@@ -2399,6 +3185,7 @@ export type CurrentProjectAliasReleaseExplicitCapability = Readonly<{
     intent: CurrentAliasReleaseIntent,
   ) => void;
   provider: CurrentProjectAliasReleaseProvider;
+  providerActivityEvidence?: ProviderActivityTargetEvidence;
   receiptWriter?: (
     path: string,
     receipt: CurrentAliasReleaseReceipt,
@@ -2425,6 +3212,7 @@ const isExplicitAliasReleaseProvider = (
     "readMarker",
     "readProject",
     "setAlias",
+    "verifyTargetActivityEvidence",
     "verifyConvexTarget",
     "verifyVercelVersion",
   ] as const) {
@@ -2470,6 +3258,9 @@ export const executeCurrentProjectAliasReleaseWithExplicitCapability = async (
     ...(request.clock === undefined ? {} : { clock: request.clock }),
     inputDocument: request.inputDocument,
     provider,
+    ...(capability.providerActivityEvidence === undefined
+      ? {}
+      : { providerActivityEvidence: capability.providerActivityEvidence }),
     ...(capability.receiptWriter === undefined
       ? {}
       : { receiptWriter: capability.receiptWriter }),
@@ -2484,6 +3275,7 @@ export type CurrentProjectAliasReleaseExplicitApiCapability = Readonly<{
   accessToken: string;
   convexVerifier: ConvexTargetVerifier;
   fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  providerActivityEvidence?: ProviderActivityTargetEvidence;
   stateDirectory: string;
 }>;
 
@@ -2526,6 +3318,9 @@ export const executeCurrentProjectAliasReleaseWithExplicitApiCapability = async 
     convexVerifier: convexVerifier as ConvexTargetVerifier,
     fetcher: fetcher as NonNullable<VercelCurrentProjectAliasApiProviderOptions["fetcher"]>,
     inputDocument: request.inputDocument,
+    ...(capability.providerActivityEvidence === undefined
+      ? {}
+      : { providerActivityEvidence: capability.providerActivityEvidence }),
     stateDirectory,
     stderr: request.stderr,
     stdout: request.stdout,
@@ -2542,6 +3337,9 @@ if (import.meta.main) {
     const vercelAccessToken = arguments_.vercelAuthFd === undefined
       ? undefined
       : readProtectedVercelAccessToken(arguments_.vercelAuthFd);
+    const providerActivityEvidence = arguments_.recoveryEvidenceFd === undefined
+      ? undefined
+      : readProtectedProviderActivityEvidence(arguments_.recoveryEvidenceFd);
     await recoverBoundedProcessJournal();
     const inputDocument = await readPlanInput(arguments_.planFd);
     exitCode = await executeCurrentProjectAliasRelease({
@@ -2550,6 +3348,9 @@ if (import.meta.main) {
       stderr: process.stderr,
       stdout: process.stdout,
       ...(vercelAccessToken === undefined ? {} : { vercelAccessToken }),
+      ...(providerActivityEvidence === undefined
+        ? {}
+        : { providerActivityEvidence }),
     });
   } catch (error: unknown) {
     exitCode = renderFailure(error, process.stderr);
