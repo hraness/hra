@@ -4,7 +4,7 @@ Every entry names the release or the plan wave it belongs to. Unreleased work si
 
 ## v0.2.0
 
-HRA v2 wave 0. Release candidate until the release workflow admits the tag.
+HRA v2 wave 0. Admitted 2026-09-03 as immutable GitHub Release `v0.2.0` and npm `latest`.
 
 Robustness and security:
 
