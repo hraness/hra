@@ -2,6 +2,10 @@ import type { CanonicalAuthEmail } from "../src/cloud/authCredentials";
 import { isCanonicalAuthEmail } from "../src/cloud/authCredentials";
 import { sha256Hex } from "../src/cloud/crypto";
 import { authOtpLifetimeMs } from "./authPolicy";
+import {
+  hraOtpEmailFrom,
+  resolveHraOtpReplyTo,
+} from "./otpEmailConfig";
 
 const resendEndpoint = "https://api.resend.com/emails";
 const deliveryTimeoutMs = 8_000;
@@ -18,24 +22,26 @@ function requireResendApiKey(): string {
   return value;
 }
 
-function requireSender(): string {
-  const value = process.env.HRA_AUTH_EMAIL_FROM;
-  if (
-    value === undefined
-    || value.length < 3
-    || value.length > 320
-    || value.includes("\r")
-    || value.includes("\n")
-  ) throw new Error("Email delivery is unavailable.");
-  return value;
-}
+export type HraOtpEmailPayload = Readonly<{
+  from: typeof hraOtpEmailFrom;
+  reply_to: CanonicalAuthEmail;
+  subject: "Your HRA sign-in code";
+  text: string;
+  to: readonly [CanonicalAuthEmail];
+}>;
 
-export async function sendOtpEmail(input: Readonly<{
-  email: CanonicalAuthEmail;
-  expiresAt: number;
-  token: string;
-}>): Promise<void> {
-  const now = Date.now();
+export function buildHraOtpEmailPayload(
+  input: Readonly<{
+    email: CanonicalAuthEmail;
+    expiresAt: number;
+    token: string;
+  }>,
+  options: Readonly<{
+    environment?: Readonly<Record<string, string | undefined>>;
+    now?: number;
+  }> = {},
+): HraOtpEmailPayload {
+  const now = options.now ?? Date.now();
   if (
     !isCanonicalAuthEmail(input.email)
     || !/^[0-9]{8}$/u.test(input.token)
@@ -44,20 +50,31 @@ export async function sendOtpEmail(input: Readonly<{
     || input.expiresAt > now + authOtpLifetimeMs
   ) throw new Error("Email delivery is unavailable.");
 
+  return {
+    from: hraOtpEmailFrom,
+    reply_to: resolveHraOtpReplyTo(options.environment),
+    subject: "Your HRA sign-in code",
+    text: [
+      `Your HRA sign-in code is ${input.token}.`,
+      "",
+      "It expires in 10 minutes. If you did not request it, you can ignore this email.",
+    ].join("\n"),
+    to: [input.email],
+  };
+}
+
+export async function sendOtpEmail(input: Readonly<{
+  email: CanonicalAuthEmail;
+  expiresAt: number;
+  token: string;
+}>): Promise<void> {
+  const body = buildHraOtpEmailPayload(input);
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), deliveryTimeoutMs);
   try {
     const response = await fetch(resendEndpoint, {
-      body: JSON.stringify({
-        from: requireSender(),
-        subject: "Your HRA sign-in code",
-        text: [
-          `Your HRA sign-in code is ${input.token}.`,
-          "",
-          "It expires in 10 minutes. If you did not request it, you can ignore this email.",
-        ].join("\n"),
-        to: [input.email],
-      }),
+      body: JSON.stringify(body),
       headers: {
         Authorization: `Bearer ${requireResendApiKey()}`,
         "Content-Type": "application/json",

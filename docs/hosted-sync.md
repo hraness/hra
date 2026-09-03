@@ -151,10 +151,10 @@ Deployment intents and final documents use canonical SHA-256 JSON, bounded no-fo
 `bun run hosted:configure` accepts one strict JSON object with exactly these fields:
 
 ```json
-{"authEmailFrom":"HRA Auth <auth@example.com>","resendApiKey":"<secret>","siteUrl":"https://hra.sh"}
+{"authEmailReplyTo":"ben@substrate.run","resendApiKey":"<secret>","siteUrl":"https://hra.sh"}
 ```
 
-`siteUrl` must be one HTTPS origin. For the HRA `v0.1.0` authority it is exactly `https://hra.sh`, the final canonical origin. Do not substitute `https://try-hra.vercel.app` or an automatic deployment hostname: configuration is one-shot, while staging aliases move and rehearsal may replace candidate deployments. `resendApiKey` must be a Resend key. `authEmailFrom` must be the verified sender accepted by Resend. The helper generates a fresh 2048-bit RS256 private key, its matching public JWKS, and a 256-bit HMAC secret locally with WebCrypto.
+`siteUrl` must be one HTTPS origin. For the HRA `v0.1.0` authority it is exactly `https://hra.sh`, the final canonical origin. Do not substitute `https://try-hra.vercel.app` or an automatic deployment hostname: configuration is one-shot, while staging aliases move and rehearsal may replace candidate deployments. `resendApiKey` must be a Resend sending key. HRA pins every OTP sender to `HRA sign-in <hra@auth.hraness.com>` in source; the operator cannot replace it with an environment value. `authEmailReplyTo` must be one lowercase canonical mailbox without an apostrophe that is monitored and verified to receive mail. The sending-only `auth.hraness.com` and `news.hraness.com` domains are rejected. If the runtime variable is absent, HRA falls back to the receive-capable `ben@substrate.run` mailbox. The helper generates a fresh 2048-bit RS256 private key, its matching public JWKS, and a 256-bit HMAC secret locally with WebCrypto.
 
 Pass the JSON from a protected secret source through standard input:
 
@@ -188,7 +188,7 @@ The helper reads at most 8 KiB, rejects a terminal descriptor, and ignores inher
 - `JWKS`
 - `HRA_AUTH_HMAC_SECRET`
 - `HRA_RESEND_API_KEY`
-- `HRA_AUTH_EMAIL_FROM`
+- `HRA_AUTH_EMAIL_REPLY_TO`
 
 If any target name already exists, the names response is ambiguous, Convex refuses the batch, or the final names readback is incomplete, the helper closes with a generic error. A failure after the batch may have left a complete or partial provider write. Do not retry or overwrite. Inspect names only, then replace the still-unused deployment if the result is uncertain.
 
