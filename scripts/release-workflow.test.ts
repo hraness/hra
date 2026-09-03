@@ -362,7 +362,7 @@ describe("release workflow", () => {
     expect(releaseNotes).not.toContain(
       'bun "$BUN_INSTALL_GLOBAL_DIR/node_modules/hra/src/install-normalizer.ts"',
     );
-    expect(releaseNotes).toContain("Optional hosted encrypted sync is not yet live.");
+    expect(releaseNotes).toContain("Optional hosted encrypted sync is live as an invite-only beta since 2026-09-03.");
     expect(releaseNotes).not.toContain("Cloud enrollment is invitation-only");
     expect(releaseNotes).not.toContain("artifact-identity SPDX");
     expect(releaseNotes).not.toContain("runtime SPDX inventory");
@@ -517,7 +517,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("Immutable local CLI release; hosted sync not yet live.");
     expect(releaseRecord).toContain("The website and the `v0.2.0` local CLI are live");
     expect(releaseRecord).toContain("without changing the published `v0.2.0` bytes");
-    expect(releaseRecord).toContain("Neither phase claims that hosted sync is available.");
+    expect(releaseRecord).toContain("Neither phase claimed that hosted sync was available; the hosted invite-only beta went live separately on 2026-09-03");
     expect(releaseRecord).toContain("may create\none annotated stable-semver tag before or after");
     expect(releaseRecord).toContain("outer digest is a transport assertion, not independent release authority");
     expect(releaseRecord).toContain("`@hraness/hra@0.1.0-bootstrap.0`");
