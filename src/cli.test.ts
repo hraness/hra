@@ -1466,7 +1466,7 @@ describe("CLI entry point", () => {
         ok: true,
         version: 1,
         command: "version",
-        data: { version: "0.4.1" },
+        data: { version: "0.5.0" },
       });
       expect(version.read().stderr).toBe("");
     }
@@ -2165,7 +2165,7 @@ describe("CLI entry point", () => {
   test("version is sourced from package metadata", async () => {
     const captured = capture();
     expect(await main(["--version"], captured.output)).toBe(0);
-    expect(captured.read()).toEqual({ stdout: "hra 0.4.1\n", stderr: "" });
+    expect(captured.read()).toEqual({ stdout: "hra 0.5.0\n", stderr: "" });
   });
 
   test("completes protected interaction input outside argv and never renders its value", async () => {
