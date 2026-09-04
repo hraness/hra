@@ -425,6 +425,12 @@ const renderSingleEvent = (event: SessionEvent): string => {
     case "warning": return `Warning ${line(body.code)}: ${line(body.message)}`;
     case "error": return `Error ${line(body.code)}${body.terminal ? " (terminal)" : ""}: ${line(body.message)}`;
     case "protocol_incompatible": return `Protocol notice: unsupported ${line(body.method)} (${line(body.payloadDigest)})`;
+    case "subagent_activity": return [
+      `Subagent ${line(body.kind)}: ${line(body.agentId)}`,
+      ...(body.nickname === undefined ? [] : [`  nickname ${line(body.nickname)}`]),
+      ...(body.role === undefined ? [] : [`  role ${line(body.role)}`]),
+      ...(body.depth === undefined ? [] : [`  depth ${String(body.depth)}`]),
+    ].join("\n");
   }
 };
 

@@ -200,15 +200,19 @@ function foldDetail(model: SessionModel, event: DetailSessionEvent): SessionMode
       if (event.kind === "interrupted" || event.kind === "completed") {
         return { ...model, subagents: without };
       }
+      // Only the thread-start announcement carries the nickname, role, and
+      // depth; a later activity for the same agent omits them, so what is
+      // already known is kept rather than blanked.
+      const known = model.subagents.find((entry) => entry.agentId === event.agentId);
       return {
         ...model,
         subagents: [
           ...without,
           {
             agentId: event.agentId,
-            depth: event.depth ?? null,
-            nickname: event.nickname ?? null,
-            role: event.role ?? null,
+            depth: event.depth ?? known?.depth ?? null,
+            nickname: event.nickname ?? known?.nickname ?? null,
+            role: event.role ?? known?.role ?? null,
           },
         ],
       };

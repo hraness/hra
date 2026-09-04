@@ -2,6 +2,11 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## HRA Web v1 wave 3
+
+- The pinned Codex runtime moves from 0.149.0 to 0.153.2, the newest exact release. Six added `ServerNotification` methods are reviewed and discarded (`mcpServer/event/stream/notification`, both `modelProvider/authRecovery*`, and three `thread/realtime/item/*`), three generated schema digests and both reviewed matrix digests are re-pinned, and no method was removed.
+- Subagent activity is visible. Codex reports a spawned subagent through a `subAgentActivity` thread item on the parent thread rather than through any notification, so HRA projects `subagent_activity` session events (`started`, `interacted`, `interrupted`, `completed`) from that item, and reduces the start of a spawned subagent thread to the same event when it carries a nickname, role, or depth. The agent identity is the same opaque provider identifier every other id uses, labels are bounded to 120 bytes and stripped of paths, control scalars, and secret shapes, and the agent definition path Codex supplies is never retained. Open subagents keep a finished turn classified as working, and the live uploader carries the events onto the hosted `detail` stream for the session grid.
+
 ## v0.4.1
 
 Patch release for the local state schema migration. Release candidate until the release workflow admits the tag.

@@ -115,6 +115,27 @@ describe("live batcher", () => {
     }]);
   });
 
+  test("queues subagent activity so the grid can show a running subagent", () => {
+    const agentId = `opaque_v2_${"b".repeat(64)}`;
+    const batcher = new LiveBatcher({ includeThinking: false });
+    batcher.observe(event({
+      type: "subagent_activity",
+      turnId: turn,
+      agentId,
+      kind: "started",
+      depth: 1,
+      nickname: "quiet-otter",
+      role: "reviewer",
+    }));
+    batcher.observe(event({ type: "subagent_activity", turnId: turn, agentId, kind: "completed" }));
+    const batch = batcher.drain();
+    expect(batch.bodies).toEqual([
+      { agentId, depth: 1, kind: "started", nickname: "quiet-otter", role: "reviewer", turnId: turn, type: "subagent_activity" },
+      { agentId, kind: "completed", turnId: turn, type: "subagent_activity" },
+    ]);
+    expect(parseDetailSessionEvents(assignDetailSequences(batch.bodies, 0))).toHaveLength(2);
+  });
+
   test("bounds a batch by bytes and keeps the remainder queued", () => {
     const batcher = new LiveBatcher({ includeThinking: false });
     const big = "x".repeat(LIVE_BATCH_MAX_BYTES);

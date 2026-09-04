@@ -39,6 +39,9 @@
   "src/codex/process.ts": {
     "safeEnvironmentKeys": 2
   },
+  "src/codex/protocol.ts": {
+    "redactCompleteSensitiveText": 1
+  },
   "src/daemon/codex-runtime-adapter.ts": {
     "redactCompleteSensitiveText": 1
   },

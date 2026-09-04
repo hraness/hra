@@ -85,7 +85,7 @@ export const projectPublicSessionEventBody = (
 ): unknown => {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
   const body = value as Readonly<Record<string, unknown>>;
-  const project = (key: "activeTurnId" | "itemId" | "turnId") => {
+  const project = (key: "activeTurnId" | "agentId" | "itemId" | "turnId") => {
     const candidate = body[key];
     return candidate === null
       ? null
@@ -106,6 +106,11 @@ export const projectPublicSessionEventBody = (
       ...body,
       turnId: project("turnId"),
       itemId: project("itemId"),
+    };
+    case "subagent_activity": return {
+      ...body,
+      turnId: project("turnId"),
+      agentId: project("agentId"),
     };
     case "token_usage": return { ...body, turnId: project("turnId") };
     case "interaction_requested": return body.interactionKind === "mcp_elicitation"

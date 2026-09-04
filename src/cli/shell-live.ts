@@ -401,6 +401,7 @@ const renderNonDeltaEvent = (event: SessionEvent): string | null => {
     case "warning": return `Warning ${safeLiveText(body.code)}: ${safeLiveText(body.message)}`;
     case "error": return `Error ${safeLiveText(body.code)}${body.terminal ? " (terminal)" : ""}: ${safeLiveText(body.message)}`;
     case "protocol_incompatible": return `Protocol notice: unsupported ${safeLiveText(body.method)}.`;
+    case "subagent_activity": return `Subagent ${safeLiveText(body.nickname ?? body.role ?? body.agentId)}: ${safeLiveText(body.kind)}.`;
     case "session_state": return `Session state: ${safeLiveText(body.state)}${body.attention ? " (needs attention)" : ""}.`;
   }
 };

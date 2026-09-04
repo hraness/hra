@@ -209,6 +209,15 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     revision: z.number().int().positive(),
   }).strict(),
   z.object({
+    type: z.literal("subagent_activity"),
+    turnId: publicProviderIdentifierSchema,
+    agentId: publicProviderIdentifierSchema,
+    kind: z.enum(["started", "interacted", "interrupted", "completed"]),
+    depth: z.number().int().nonnegative().max(32).optional(),
+    nickname: boundedText(120).optional(),
+    role: boundedText(120).optional(),
+  }).strict(),
+  z.object({
     type: z.literal("session_state"),
     state: z.enum([
       "working",

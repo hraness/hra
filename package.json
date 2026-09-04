@@ -79,7 +79,7 @@
   ],
   "dependencies": {
     "@hraness/oh": "0.2.7",
-    "@openai/codex": "0.149.0",
+    "@openai/codex": "0.153.2",
     "convex": "1.45.0",
     "zod": "4.4.3"
   },

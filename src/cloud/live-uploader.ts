@@ -137,6 +137,18 @@ export class LiveBatcher {
         this.#flush = true;
         return;
       }
+      case "subagent_activity": {
+        this.#queued.push({
+          agentId: body.agentId,
+          ...(body.depth === undefined ? {} : { depth: body.depth }),
+          kind: body.kind,
+          ...(body.nickname === undefined ? {} : { nickname: body.nickname }),
+          ...(body.role === undefined ? {} : { role: body.role }),
+          turnId: body.turnId,
+          type: "subagent_activity",
+        });
+        return;
+      }
       case "session_state": {
         this.#queued.push({
           attention: body.attention,

@@ -372,6 +372,9 @@ const projectItem = (item: CodexThreadItem, root: string): unknown => {
     return { type: item.type, id: item.id, status: item.status, exitCode: item.exitCode, durationMs: item.durationMs, ...(cwd === null ? {} : { cwd: sanitizeProviderText(cwd, false) }), commandClass: classifyCommand(item.command) };
   }
   if (item.type === "mcpToolCall") return { type: item.type, id: item.id, server: sanitizeProviderText(item.server, false), tool: sanitizeProviderText(item.tool, false), status: item.status, durationMs: item.durationMs };
+  // The agent definition path the provider carries on this item is never
+  // projected; only the activity kind is inspectable.
+  if (item.type === "subAgentActivity") return { type: item.type, id: item.id, kind: item.kind };
   return { type: "unsupported", id: item.id, providerType: sanitizeProviderText(item.providerType, false) };
 };
 

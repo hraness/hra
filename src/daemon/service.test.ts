@@ -7230,6 +7230,85 @@ describe("HraService", () => {
     ]);
   });
 
+  test("projects subagent activity into the session event stream with opaque agent identity", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Subagent stream");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const providerThreadId = session.providerThreadId;
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const connectionId = "3a000000-0000-4000-8000-000000000001";
+    value.codex.observationConnectionId = connectionId;
+    await value.service.observeCodexFact(authority, {
+      type: "turnStarted",
+      connectionId,
+      threadId: providerThreadId,
+      turn: { id: "turn-fanout", items: [], status: "inProgress", startedAt: 1, completedAt: null, durationMs: null },
+    });
+    await value.service.observeCodexFact(authority, {
+      type: "subagentThreadStarted",
+      connectionId,
+      threadId: providerThreadId,
+      agentThreadId: "thread-agent-1",
+      depth: 1,
+      nickname: "quiet-otter",
+      role: "reviewer",
+    });
+    for (const kind of ["started", "interacted", "completed"] as const) {
+      await value.service.observeCodexFact(authority, {
+        type: "itemStarted",
+        connectionId,
+        threadId: providerThreadId,
+        turnId: "turn-fanout",
+        itemId: `activity-${kind}`,
+        itemKind: "subAgentActivity",
+        subagent: { agentThreadId: "thread-agent-1", kind },
+      });
+      await value.service.observeCodexFact(authority, {
+        type: "itemCompleted",
+        connectionId,
+        threadId: providerThreadId,
+        turnId: "turn-fanout",
+        itemId: `activity-${kind}`,
+        itemKind: "subAgentActivity",
+        subagent: { agentThreadId: "thread-agent-1", kind },
+      });
+    }
+    const page = await value.service.execute({
+      kind: "session.events",
+      session: sessionId,
+      limit: 200,
+      waitMs: 0,
+    }, { signal }) as {
+      events: Array<{ body: Record<string, unknown> }>;
+    };
+    const subagentEvents = page.events
+      .map((event) => event.body)
+      .filter((body) => body.type === "subagent_activity");
+    expect(subagentEvents.map((body) => body.kind)).toEqual([
+      "started",
+      "started",
+      "started",
+      "interacted",
+      "interacted",
+      "completed",
+      "completed",
+    ]);
+    const agentIds = new Set(subagentEvents.map((body) => body.agentId));
+    expect(agentIds.size).toBe(1);
+    for (const agentId of agentIds) expect(agentId).toMatch(/^opaque_v2_[a-f0-9]{64}$/u);
+    expect(subagentEvents[0]).toMatchObject({ nickname: "quiet-otter", role: "reviewer", depth: 1 });
+    expect(JSON.stringify(page.events)).not.toContain("thread-agent-1");
+    // The marker items never leak as ordinary item rows.
+    expect(page.events.some((event) => event.body.itemKind === "subAgentActivity")).toBe(false);
+  });
+
   test("exposes an atomic status cursor and wakes a bounded event tail without losing safe deltas", async () => {
     const value = await fixture();
     const { sessionId } = await createIdleSession(value, "Event stream");

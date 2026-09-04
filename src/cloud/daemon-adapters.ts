@@ -2883,6 +2883,7 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
         || event.body.type === "turn_completed"
         || event.body.type === "assistant_delta"
         || event.body.type === "reasoning_summary_delta"
+        || event.body.type === "subagent_activity"
         || event.body.type === "session_state");
       // The stored per-session setting (falling back to the daemon default)
       // decides; the constructor flag is a startup override that can only

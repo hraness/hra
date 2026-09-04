@@ -230,6 +230,25 @@ describe("sessionModelReducer", () => {
     expect(finished.subagents).toEqual([]);
   });
 
+  test("a later activity keeps the labels only the thread start carried", () => {
+    const model = foldDetail([
+      {
+        agentId: "agent_00000001",
+        depth: 2,
+        kind: "started",
+        nickname: "scout",
+        role: "reviewer",
+        sequence: 1,
+        turnId: turn,
+        type: "subagent_activity",
+      },
+      { agentId: "agent_00000001", kind: "interacted", sequence: 2, turnId: turn, type: "subagent_activity" },
+    ]);
+    expect(model.subagents).toEqual([
+      { agentId: "agent_00000001", depth: 2, nickname: "scout", role: "reviewer" },
+    ]);
+  });
+
   test("folding is pure: the input model is never mutated", () => {
     const before = initialSessionModel();
     const snapshot: SessionModel = { ...before };

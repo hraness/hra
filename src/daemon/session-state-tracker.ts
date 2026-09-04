@@ -46,11 +46,13 @@ type SessionTracking = {
   lastFinalText: string;
   lastTurnStatus: "completed" | "interrupted" | "failed";
   openSubagents: number;
+  openSubagentIds: Set<string>;
   revision: number;
   snapshot: SessionStateSnapshot | null;
 };
 
 const REASON_MAX_CHARACTERS = 256;
+const OPEN_SUBAGENT_LIMIT = 256;
 
 export class SessionStateTracker {
   readonly #sessions = new Map<string, SessionTracking>();
@@ -142,6 +144,19 @@ export class SessionStateTracker {
         }
         return null;
       }
+      // Presence, not a count of announcements: the same agent may be
+      // announced more than once, so membership is what rises and falls.
+      case "subagent_activity": {
+        if (body.kind === "started" || body.kind === "interacted") {
+          if (tracking.openSubagentIds.size < OPEN_SUBAGENT_LIMIT) {
+            tracking.openSubagentIds.add(body.agentId);
+          }
+        } else {
+          tracking.openSubagentIds.delete(body.agentId);
+        }
+        tracking.openSubagents = tracking.openSubagentIds.size;
+        return null;
+      }
       case "connection":
       case "gap":
       case "item_started":
@@ -204,6 +219,11 @@ export class SessionStateTracker {
     };
   }
 
+  /*
+   * Direct override for a provider that reports a count rather than per-agent
+   * activity. The next observed `subagent_activity` event recomputes the count
+   * from the membership this tracker maintains.
+   */
   setOpenSubagents(sessionId: string, count: number): void {
     this.#tracking(sessionId).openSubagents = Math.max(0, Math.floor(count));
   }
@@ -217,6 +237,7 @@ export class SessionStateTracker {
         lastFinalText: "",
         lastTurnStatus: "completed",
         openSubagents: 0,
+        openSubagentIds: new Set<string>(),
         revision: 0,
         snapshot: null,
       };

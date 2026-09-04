@@ -352,6 +352,7 @@ describe("pinned server requests and safe notifications", () => {
       "item/mcpToolCall/progress",
       "mcpServer/oauthLogin/completed",
       "mcpServer/startupStatus/updated",
+      "mcpServer/event/stream/notification",
       "account/updated",
       "account/rateLimits/updated",
       "app/list/updated",
@@ -365,6 +366,8 @@ describe("pinned server requests and safe notifications", () => {
       "thread/compacted",
       "model/rerouted",
       "model/verification",
+      "modelProvider/authRecoveryStarted",
+      "modelProvider/authRecoveryCompleted",
       "turn/moderationMetadata",
       "model/safetyBuffering/updated",
       "warning",
@@ -375,6 +378,9 @@ describe("pinned server requests and safe notifications", () => {
       "fuzzyFileSearch/sessionCompleted",
       "thread/realtime/started",
       "thread/realtime/itemAdded",
+      "thread/realtime/item/started",
+      "thread/realtime/item/transcript/delta",
+      "thread/realtime/item/completed",
       "thread/realtime/transcript/delta",
       "thread/realtime/transcript/done",
       "thread/realtime/outputAudio/delta",
@@ -1401,6 +1407,116 @@ describe("pinned server requests and safe notifications", () => {
       command.replace(".hra-live-command-proof-", ".other-"),
       command.replace("00000000-0000-4000-8000-000000000001", "NOT-A-UUID"),
     ]) expect(safeLiveAcceptanceCommandDigest(lookalike)).toBeUndefined();
+  });
+
+  test("reduces every subagent activity kind and never retains the agent definition path", () => {
+    const agentPath = ["", "Users", "someone", ".codex", "agents", "reviewer.md"].join("/");
+    for (const kind of ["started", "interacted", "interrupted", "completed"] as const) {
+      const item = {
+        type: "subAgentActivity",
+        id: `activity-${kind}`,
+        kind,
+        agentThreadId: "thread-agent-1",
+        agentPath,
+      };
+      for (const method of ["item/started", "item/completed"] as const) {
+        const fact = parseFact(method, { threadId: "thread-1", turnId: "turn-1", item });
+        expect(fact).toMatchObject({
+          type: method === "item/started" ? "itemStarted" : "itemCompleted",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          itemId: `activity-${kind}`,
+          itemKind: "subAgentActivity",
+          subagent: { agentThreadId: "thread-agent-1", kind },
+        });
+        expect(JSON.stringify(fact)).not.toContain("agents");
+        expect(JSON.stringify(fact)).not.toContain("someone");
+      }
+    }
+    expect(() => parseFact("item/started", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: { type: "subAgentActivity", id: "activity-x", kind: "futureKind", agentThreadId: "thread-agent-1" },
+    })).toThrow(CodexError);
+  });
+
+  test("carries the same subagent activity through a thread item page", () => {
+    expect(parseThreadItemsPage({
+      data: [{
+        turnId: "turn-1",
+        item: {
+          type: "subAgentActivity",
+          id: "activity-1",
+          kind: "interacted",
+          agentThreadId: "thread-agent-1",
+          agentPath: ["", "tmp", "agents", "reviewer.md"].join("/"),
+        },
+      }],
+      nextCursor: null,
+      backwardsCursor: null,
+    })).toEqual({
+      data: [{
+        turnId: "turn-1",
+        item: {
+          type: "subAgentActivity",
+          id: "activity-1",
+          kind: "interacted",
+          agentThreadId: "thread-agent-1",
+        },
+      }],
+      nextCursor: null,
+      backwardsCursor: null,
+    });
+  });
+
+  test("reduces a spawned subagent thread start to bounded labels keyed by its parent", () => {
+    expect(parseFact("thread/started", {
+      thread: {
+        id: "thread-agent-1",
+        parentThreadId: "thread-1",
+        agentNickname: "quiet-otter",
+        agentRole: "reviewer",
+        source: { subAgent: { thread_spawn: { parent_thread_id: "thread-1", depth: 2 } } },
+      },
+    })).toEqual({
+      type: "subagentThreadStarted",
+      threadId: "thread-1",
+      agentThreadId: "thread-agent-1",
+      depth: 2,
+      nickname: "quiet-otter",
+      role: "reviewer",
+    });
+  });
+
+  test("discards an ordinary thread start and every unsafe subagent label", () => {
+    expect(parseFact("thread/started", {
+      thread: { id: "thread-1", parentThreadId: null, agentNickname: null, agentRole: null },
+    })).toEqual({ type: "notificationIgnored", method: "thread/started" });
+
+    const reduced = parseFact("thread/started", {
+      thread: {
+        id: "thread-agent-2",
+        parentThreadId: "thread-1",
+        agentNickname: ["", "Users", "someone", "work"].join("/"),
+        agentRole: `token=${"a".repeat(40)}`,
+        source: { subAgent: { thread_spawn: { parent_thread_id: "thread-1", depth: 4_000 } } },
+      },
+    });
+    expect(reduced).toMatchObject({ type: "subagentThreadStarted", agentThreadId: "thread-agent-2" });
+    expect(reduced).not.toHaveProperty("depth");
+    expect(JSON.stringify(reduced)).not.toContain("someone");
+    expect(JSON.stringify(reduced)).not.toContain("a".repeat(40));
+
+    const long = parseFact("thread/started", {
+      thread: {
+        id: "thread-agent-3",
+        parentThreadId: "thread-1",
+        agentNickname: "n".repeat(400),
+        agentRole: "ops\u0007team\u200b",
+      },
+    }) as { nickname?: string; role?: string };
+    expect(long.nickname?.length).toBe(120);
+    expect(long.role).toBe("ops\uFFFDteam\uFFFD");
   });
 });
 

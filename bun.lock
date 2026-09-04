@@ -6,7 +6,7 @@
       "name": "hra",
       "dependencies": {
         "@hraness/oh": "0.2.7",
-        "@openai/codex": "0.149.0",
+        "@openai/codex": "0.153.2",
         "convex": "1.45.0",
         "zod": "4.4.3",
       },
@@ -277,19 +277,19 @@
 
     "@npmcli/redact": ["@npmcli/redact@4.0.0", "", {}, "sha512-gOBg5YHMfZy+TfHArfVogwgfBeQnKbbGo3pSUyK/gSI0AVu+pEiDVcKlQb0D8Mg1LNRZILZ6XG8I5dJ4KuAd9Q=="],
 
-    "@openai/codex": ["@openai/codex@0.149.0", "", { "optionalDependencies": { "@openai/codex-darwin-arm64": "npm:@openai/codex@0.149.0-darwin-arm64", "@openai/codex-darwin-x64": "npm:@openai/codex@0.149.0-darwin-x64", "@openai/codex-linux-arm64": "npm:@openai/codex@0.149.0-linux-arm64", "@openai/codex-linux-x64": "npm:@openai/codex@0.149.0-linux-x64", "@openai/codex-win32-arm64": "npm:@openai/codex@0.149.0-win32-arm64", "@openai/codex-win32-x64": "npm:@openai/codex@0.149.0-win32-x64" }, "bin": { "codex": "bin/codex.js" } }, "sha512-i4dryj2Y1j+00Mb5n+0n71EYnTK9/KDc2cdFo/dXD0d1oTog2bhUssKDEIOnKmnEf51P0Z/HJTWvTKw/UHyOvQ=="],
+    "@openai/codex": ["@openai/codex@0.153.2", "", { "optionalDependencies": { "@openai/codex-darwin-arm64": "npm:@openai/codex@0.153.2-darwin-arm64", "@openai/codex-darwin-x64": "npm:@openai/codex@0.153.2-darwin-x64", "@openai/codex-linux-arm64": "npm:@openai/codex@0.153.2-linux-arm64", "@openai/codex-linux-x64": "npm:@openai/codex@0.153.2-linux-x64", "@openai/codex-win32-arm64": "npm:@openai/codex@0.153.2-win32-arm64", "@openai/codex-win32-x64": "npm:@openai/codex@0.153.2-win32-x64" }, "bin": { "codex": "bin/codex.js" } }, "sha512-IRocJlE+jCZGYHwIJWBja2nDswTSZY4sNddQgU5xiR/mVWxo5WcO8pqcajXJea1XDoNK9CaVzizVhUxDhFkU6g=="],
 
-    "@openai/codex-darwin-arm64": ["@openai/codex@0.149.0-darwin-arm64", "", { "os": "darwin", "cpu": "arm64" }, "sha512-GsZJbzBWiD48RETrO8VHGAQNgfSrUVxItXZFeD87wswatPi0+lKuQo8Dx4nMYmOZhZrVtwr3al/feRrZxnDV8Q=="],
+    "@openai/codex-darwin-arm64": ["@openai/codex@0.153.2-darwin-arm64", "", { "os": "darwin", "cpu": "arm64" }, "sha512-8cEJWOIW5WnSn2+W1RUjc1sm2sN1H6NP+cCrOe73ImamUy2yOk3QKjZM2SfkA9jf3fqgwlBNUslhGMen2omc5g=="],
 
-    "@openai/codex-darwin-x64": ["@openai/codex@0.149.0-darwin-x64", "", { "os": "darwin", "cpu": "x64" }, "sha512-H+mMgW3Nhc5QzGWEklCoFqACuOc0cVpgPkPQRw0LShoK7P5664T6BRnyl1yzT6orKPKv49cXry7DIWWZ19SanQ=="],
+    "@openai/codex-darwin-x64": ["@openai/codex@0.153.2-darwin-x64", "", { "os": "darwin", "cpu": "x64" }, "sha512-hY68UBhIUE3xIn40SdoujokNiCBeHn9Jp9bEtcIrYeYd2IUtu1oCFwxFnkGhw6+UjHn7piiMxohAomddRA4MCg=="],
 
-    "@openai/codex-linux-arm64": ["@openai/codex@0.149.0-linux-arm64", "", { "os": "linux", "cpu": "arm64" }, "sha512-fAXPpvIob+11RNZJS9CVVTsKb+V4Hw3woGFPj42D7fU2wBJUKI2jfAc4fLJNtrpwRecLeW601mtkMHOSIbWuuA=="],
+    "@openai/codex-linux-arm64": ["@openai/codex@0.153.2-linux-arm64", "", { "os": "linux", "cpu": "arm64" }, "sha512-QDkOdJzIdMGaOCViY2dqGqr8WhQv81WfmJkAghC3doFedsOfHt87RuAO4yFN7m0FSR3y5UsScSDUT4zOCcmEVA=="],
 
-    "@openai/codex-linux-x64": ["@openai/codex@0.149.0-linux-x64", "", { "os": "linux", "cpu": "x64" }, "sha512-uZXaN9JPxu0/jjnqqJeTd4kRYPnjVZK3MiVndfG1mHhEaoDKL7ScWHfPqvAEOjwsSDEmQSlMfUkmvYp/CHciYw=="],
+    "@openai/codex-linux-x64": ["@openai/codex@0.153.2-linux-x64", "", { "os": "linux", "cpu": "x64" }, "sha512-CPUPhFmykKRdIcgwiOfKvFKHBP62dPfaiP+pzQ2bVNAfLTW+i0Kasd7hQryoxZUmTPvw0h9HyM2NgsnQ9AJlTw=="],
 
-    "@openai/codex-win32-arm64": ["@openai/codex@0.149.0-win32-arm64", "", { "os": "win32", "cpu": "arm64" }, "sha512-pUd8MzuwtqT5DhM1NUE1gETWIZ9fkDA1XB7tt9YNIi/peUgLuziQgZd7o0bNON4cNzgbil1YUN1qDTgQm0g3pg=="],
+    "@openai/codex-win32-arm64": ["@openai/codex@0.153.2-win32-arm64", "", { "os": "win32", "cpu": "arm64" }, "sha512-+49dim0F4FoxKLBDBLzMQL4C1m9FG2kx6twg98jo2USesKfmj8XG3HSCe2tW2zOfRArSgHCDyNDHFdts3AfaBg=="],
 
-    "@openai/codex-win32-x64": ["@openai/codex@0.149.0-win32-x64", "", { "os": "win32", "cpu": "x64" }, "sha512-qKbwSOOO/fdhQ5MlXE2fts6taPxRPZ/zqeC+eqHD72hLRymV9rFCUbUxOCquognUPRPvS/2/kRCV0UVhoDd3yQ=="],
+    "@openai/codex-win32-x64": ["@openai/codex@0.153.2-win32-x64", "", { "os": "win32", "cpu": "x64" }, "sha512-x1PnFo9Uy81NEIlPx3qxkP3PQgkfmJOY/2LqKCKlvxArWIL+PrEV9xKcmKeo9Yw23PPU2TDH3AyqcdeblqtNNg=="],
 
     "@oslojs/asn1": ["@oslojs/asn1@1.0.0", "", { "dependencies": { "@oslojs/binary": "1.0.0" } }, "sha512-zw/wn0sj0j0QKbIXfIlnEcTviaCzYOY3V5rAyjR6YtOByFtJiT574+8p9Wlach0lZH9fddD4yb9laEAIl4vXQA=="],
 

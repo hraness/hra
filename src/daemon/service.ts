@@ -2906,29 +2906,61 @@ export class HraService {
         activeTurnId: fact.status.type === "active" ? session.activeTurnId ?? null : null,
       };
       case "threadDeleted": return null;
-      case "itemStarted": return {
-        type: "item_started",
-        turnId: fact.turnId,
-        itemId: fact.itemId,
-        itemKind: fact.itemKind,
-        ...(fact.server === undefined ? {} : { server: fact.server }),
-        ...(fact.tool === undefined ? {} : { tool: fact.tool }),
-        ...(fact.liveAcceptanceCommandDigest === undefined
-          ? {}
-          : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
-      };
-      case "itemCompleted": return {
-        type: "item_completed",
-        turnId: fact.turnId,
-        itemId: fact.itemId,
-        itemKind: fact.itemKind,
-        ...(fact.server === undefined ? {} : { server: fact.server }),
-        ...(fact.tool === undefined ? {} : { tool: fact.tool }),
-        ...(fact.liveAcceptanceCommandDigest === undefined
-          ? {}
-          : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
-        ...(fact.status === undefined ? {} : { status: fact.status }),
-      };
+      // A `subAgentActivity` marker item announces the same activity on both
+      // its started and its completed notification, so the projection is the
+      // same body twice at most. Every consumer folds by agent id, so the
+      // repeat is a no-op rather than a second subagent.
+      case "itemStarted":
+      case "itemCompleted": {
+        if (fact.subagent !== undefined) {
+          return {
+            type: "subagent_activity",
+            turnId: fact.turnId,
+            agentId: fact.subagent.agentThreadId,
+            kind: fact.subagent.kind,
+          };
+        }
+        return fact.type === "itemStarted"
+          ? {
+              type: "item_started",
+              turnId: fact.turnId,
+              itemId: fact.itemId,
+              itemKind: fact.itemKind,
+              ...(fact.server === undefined ? {} : { server: fact.server }),
+              ...(fact.tool === undefined ? {} : { tool: fact.tool }),
+              ...(fact.liveAcceptanceCommandDigest === undefined
+                ? {}
+                : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
+            }
+          : {
+              type: "item_completed",
+              turnId: fact.turnId,
+              itemId: fact.itemId,
+              itemKind: fact.itemKind,
+              ...(fact.server === undefined ? {} : { server: fact.server }),
+              ...(fact.tool === undefined ? {} : { tool: fact.tool }),
+              ...(fact.liveAcceptanceCommandDigest === undefined
+                ? {}
+                : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
+              ...(fact.status === undefined ? {} : { status: fact.status }),
+            };
+      }
+      // Only a spawned subagent thread reaches here, and only its bounded
+      // nickname, role, and depth. Without an active turn there is nothing to
+      // attach the activity to, so the metadata is dropped.
+      case "subagentThreadStarted": {
+        const turnId = session.activeTurnId ?? null;
+        if (turnId === null) return null;
+        return {
+          type: "subagent_activity",
+          turnId,
+          agentId: fact.agentThreadId,
+          kind: "started",
+          ...(fact.depth === undefined ? {} : { depth: fact.depth }),
+          ...(fact.nickname === undefined ? {} : { nickname: fact.nickname }),
+          ...(fact.role === undefined ? {} : { role: fact.role }),
+        };
+      }
       case "assistantDelta": return {
         type: "assistant_delta",
         turnId: fact.turnId,
