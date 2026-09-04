@@ -15,7 +15,7 @@
     "redactCompleteSensitiveText": 1
   },
   "src/cli.ts": {
-    "mode0600": 2,
+    "mode0600": 3,
     "mode0700": 4,
     "assertCurrent": 5,
     "redactCompleteSensitiveText": 1
@@ -131,7 +131,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 75,
+    "immediateTransaction": 76,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 2

@@ -81,6 +81,12 @@ const subagentLabelMaximumCharacters = 120;
 const sanitizeSubagentLabel = (value: string): string =>
   sanitizeProviderProse(value, false).slice(0, subagentLabelMaximumCharacters);
 
+/** The bounded one-line tool summary declared in `session-events.ts`. */
+const toolSummaryMaximumCharacters = 256;
+
+const sanitizeToolSummary = (value: string): string =>
+  sanitizeProviderProse(value, false).slice(0, toolSummaryMaximumCharacters);
+
 const sanitizeProviderToolLabel = (value: string): string => {
   const sanitized = sanitizeProviderProse(value, false);
   let output = "";
@@ -227,6 +233,8 @@ const sanitizeCompleteBody = (
       itemKind: safeInline(body.itemKind),
       ...(body.server === undefined ? {} : { server: sanitizeProviderToolLabel(body.server) }),
       ...(body.tool === undefined ? {} : { tool: sanitizeProviderToolLabel(body.tool) }),
+      ...(body.callId === undefined ? {} : { callId: publicId(body.callId) }),
+      ...(body.summary === undefined ? {} : { summary: sanitizeToolSummary(body.summary) }),
     };
     case "item_completed": return {
       ...body,
@@ -236,7 +244,15 @@ const sanitizeCompleteBody = (
       ...(body.status === undefined ? {} : { status: safeInline(body.status) }),
       ...(body.server === undefined ? {} : { server: sanitizeProviderToolLabel(body.server) }),
       ...(body.tool === undefined ? {} : { tool: sanitizeProviderToolLabel(body.tool) }),
+      ...(body.callId === undefined ? {} : { callId: publicId(body.callId) }),
+      ...(body.summary === undefined ? {} : { summary: sanitizeToolSummary(body.summary) }),
     };
+    case "user_message": return {
+      ...body,
+      turnId: body.turnId === null ? null : publicId(body.turnId),
+      text: safe(body.text),
+    };
+    case "provider_switched": return body;
     case "tool_progress": return {
       ...body,
       turnId: publicId(body.turnId),

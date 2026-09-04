@@ -203,6 +203,7 @@ function publicCommand(command: Readonly<{
     | "steer"
     | "stop"
     | "set_model"
+    | "set_provider"
     | "set_fast"
     | "resolve_interaction"
     | "send_or_steer"

@@ -754,14 +754,9 @@ describe("persistent shell live observation", () => {
     expect(eventReads).toBeGreaterThanOrEqual(3);
   });
 
-  test("rejects cross-page sequence and account discontinuities", async () => {
-    const otherAccount = `acct_${"b".repeat(32)}`;
+  test("rejects a cross-page sequence discontinuity", async () => {
     for (const secondEvent of [
       event(sessionOne, 3, { type: "warning", code: "SKIP", message: "skipped sequence" }),
-      {
-        ...event(sessionOne, 2, { type: "warning", code: "ACCOUNT", message: "foreign account" }),
-        accountId: otherAccount,
-      },
     ]) {
       let rendered = "";
       let eventReads = 0;

@@ -129,7 +129,7 @@ const maximumProjectionRecoveryStatusSessions = 20;
 const scheduledTaskPromptProjectionMarker = "[scheduled task prompt omitted]";
 
 type ProviderRemoteLocalCommand = Extract<LocalCommand, Readonly<{
-  kind: "session.send" | "session.queue" | "session.steer" | "session.stop" | "session.rename" | "session.preset" | "session.fast" | "interaction.resolve";
+  kind: "session.send" | "session.queue" | "session.steer" | "session.stop" | "session.rename" | "session.preset" | "session.switch" | "session.fast" | "interaction.resolve";
 }>>;
 
 /** Remote command kinds that only change local daemon settings. */
@@ -3410,6 +3410,18 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
             break;
           case "set_model":
             command = { kind: "session.preset", session: session.id, preset: input.payload.preset, idempotencyKey: input.idempotencyKey };
+            break;
+          // A provider switch is a provider effect, not a setting: it ends one
+          // provider thread and starts another. It therefore runs on the
+          // ordinary execution path under the same lease as a turn.
+          case "set_provider":
+            command = {
+              kind: "session.switch",
+              session: session.id,
+              provider: input.payload.provider,
+              ...(input.payload.preset === undefined ? {} : { preset: input.payload.preset }),
+              idempotencyKey: input.idempotencyKey,
+            };
             break;
           case "set_fast":
             command = { kind: "session.fast", session: session.id, enabled: input.payload.enabled, idempotencyKey: input.idempotencyKey };

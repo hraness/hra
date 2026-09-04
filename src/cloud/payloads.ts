@@ -66,6 +66,13 @@ export type RemoteCommandPayload =
   | Readonly<{ kind: "send" | "queue" | "steer" | "send_or_steer"; message: string }>
   | Readonly<{ kind: "stop" }>
   | Readonly<{ kind: "set_model"; preset: ModelPreset }>
+  /**
+   * Move one session to another provider. The preset is optional: omitted, the
+   * custodian keeps the session's tier when the target provider has one. The
+   * account is deliberately absent — choosing an account is user-directed and
+   * stays on the machine that holds the credentials.
+   */
+  | Readonly<{ kind: "set_provider"; preset?: ModelPreset; provider: "codex" | "claude" }>
   | Readonly<{ enabled: boolean; kind: "set_fast" }>
   | ResolveInteractionDecisionPayload
   | ResolveInteractionAnswersPayload
@@ -342,6 +349,18 @@ export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload 
     && hasExactKeys(value, ["kind", "preset"])
     && isModelPreset(value.preset)
   ) return { kind: value.kind, preset: value.preset };
+  if (
+    value.kind === "set_provider"
+    && (value.provider === "codex" || value.provider === "claude")
+    && (
+      (hasExactKeys(value, ["kind", "provider"]) && value.preset === undefined)
+      || (hasExactKeys(value, ["kind", "preset", "provider"]) && isModelPreset(value.preset))
+    )
+  ) {
+    return isModelPreset(value.preset)
+      ? { kind: value.kind, preset: value.preset, provider: value.provider }
+      : { kind: value.kind, provider: value.provider };
+  }
   if (
     value.kind === "set_fast"
     && hasExactKeys(value, ["enabled", "kind"])

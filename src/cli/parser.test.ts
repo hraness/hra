@@ -160,6 +160,34 @@ describe("CLI parser", () => {
       .toThrow("Preset must be `low`, `high`, `ultra`, or `fable-max`.");
   });
 
+  test("parses a provider switch, an export, and the remote provider command", () => {
+    expect(parseCli(["session", "switch", "s", "--provider", "claude"]))
+      .toMatchObject({ command: { kind: "session.switch", provider: "claude", session: "s" } });
+    expect(parseCli([
+      "session", "switch", "s", "--provider", "codex", "--preset", "ultra", "--account", "work",
+    ])).toMatchObject({
+      command: { account: "work", kind: "session.switch", preset: "ultra", provider: "codex" },
+    });
+    expect(() => parseCli(["session", "switch", "s"]))
+      .toThrow("Provider must be `codex` or `claude`.");
+    expect(() => parseCli(["session", "switch", "s", "--provider", "gemini"]))
+      .toThrow("Provider must be `codex` or `claude`.");
+
+    expect(parseCli(["session", "export", "s"]))
+      .toMatchObject({ format: "trajectory", kind: "session.export", session: "s" });
+    expect(parseCli(["session", "export", "s", "--format", "json", "--out", "out.json"]))
+      .toMatchObject({ format: "json", kind: "session.export", out: "out.json", session: "s" });
+    expect(() => parseCli(["session", "export", "s", "--format", "csv"]))
+      .toThrow("Export format must be `trajectory` or `json`.");
+
+    expect(parseCli(["remote", "provider", "s", "claude"]))
+      .toMatchObject({ command: { kind: "remote.provider", provider: "claude", session: "s" } });
+    expect(parseCli(["remote", "provider", "s", "claude", "--preset", "fable-max"]))
+      .toMatchObject({ command: { kind: "remote.provider", preset: "fable-max" } });
+    expect(() => parseCli(["remote", "provider", "s", "gemini"]))
+      .toThrow("Provider must be `codex` or `claude`.");
+  });
+
   test("parses conversation-bound session task reads with exact task IDs", () => {
     const task = `stask_${"a".repeat(32)}`;
     expect(parseCli(["session", "task", "list", "Release work", "--json"]))

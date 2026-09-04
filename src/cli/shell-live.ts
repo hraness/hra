@@ -377,6 +377,9 @@ const liveToolTarget = (
   ? ""
   : ` ${safeLiveText(server ?? "local")}/${safeLiveText(tool ?? fallback)}`;
 
+const liveMessageActor = (actor: "human" | "autorespond" | "provider_switch"): string =>
+  actor === "human" ? "You" : actor === "autorespond" ? "Autorespond" : "Handoff";
+
 const renderNonDeltaEvent = (event: SessionEvent): string | null => {
   const body = event.body;
   switch (body.type) {
@@ -403,6 +406,10 @@ const renderNonDeltaEvent = (event: SessionEvent): string | null => {
     case "protocol_incompatible": return `Protocol notice: unsupported ${safeLiveText(body.method)}.`;
     case "subagent_activity": return `Subagent ${safeLiveText(body.nickname ?? body.role ?? body.agentId)}: ${safeLiveText(body.kind)}.`;
     case "session_state": return `Session state: ${safeLiveText(body.state)}${body.attention ? " (needs attention)" : ""}.`;
+    case "user_message": return `${liveMessageActor(body.actor)}: ${safeLiveText(body.text.slice(0, 200))}${
+      body.text.length > 200 || body.omittedCharacters > 0 ? " ..." : ""}`;
+    case "provider_switched": return `Provider switched: ${safeLiveText(body.fromProvider)} to ${
+      safeLiveText(body.toProvider)} (${safeLiveText(body.toPreset)}).`;
   }
 };
 

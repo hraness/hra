@@ -159,6 +159,8 @@ export class SessionStateTracker {
       }
       case "connection":
       case "gap":
+      case "user_message":
+      case "provider_switched":
       case "item_started":
       case "item_completed":
       case "reasoning_summary_delta":

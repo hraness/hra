@@ -345,14 +345,16 @@ describe("session event watch", () => {
       page({ requestedCursor: "c1", nextCursor: "c3", events: [event(3)] }),
     ])).rejects.toThrow("SESSION_EVENT_CONTINUITY_SEQUENCE_MISMATCH");
 
+    // A provider switch may move a session to another account, so a page under
+    // a new account continues the follow rather than failing it.
     await expect(follow([
       page({ requestedCursor: null, nextCursor: "c1", events: [event(1)] }),
       page({
         requestedCursor: "c1",
         nextCursor: "c2",
-        events: [event(2, "foreign account", streamEpoch, otherAccountId)],
+        events: [event(2, "switched account", streamEpoch, otherAccountId)],
       }),
-    ])).rejects.toThrow("SESSION_EVENT_CONTINUITY_ACCOUNT_CHANGED");
+    ])).resolves.toBeDefined();
 
     await expect(follow([
       page({ requestedCursor: null, nextCursor: "old-1", events: [event(1)] }),

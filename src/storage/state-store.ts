@@ -5703,6 +5703,88 @@ export class StateStore {
     return this.requireSession(current.id);
   }
 
+  /**
+   * Rebind one session to another provider, in one transaction.
+   *
+   * A session's provider, account, preset, and provider thread all move
+   * together: they are one binding, and half of it is never durable on its
+   * own. The order inside the transaction matters. `sessions` is updated
+   * first so that `session_runtime_profile_authority_guard` — which requires
+   * a runtime profile's account to equal the session's account — sees the new
+   * binding when the target provider's reviewed profile is inserted. The
+   * conversation-automation row follows the new provider thread, otherwise a
+   * scheduled session task would keep addressing the abandoned one.
+   *
+   * The caller has already proved the target provider accepted a thread; this
+   * method never talks to a provider and never invents a preset the target
+   * cannot run.
+   */
+  completeSessionProviderSwitch(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    expectedSessionRevision: number;
+    provider: Provider;
+    profileId: ProfileId;
+    preset: Preset;
+    providerThreadId: string;
+    state: "active" | "idle" | "terminal";
+    activeTurnId?: string;
+    providerUpdatedAt?: number;
+    runtimeProfile: ReviewedRuntimeProfile;
+    receipt: unknown;
+  }): SessionRecord {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const provider = providerSchema.parse(input.provider);
+    const profileId = profileIdSchema.parse(input.profileId);
+    const preset = presetSchema.parse(input.preset);
+    assertPresetSupportedByProvider(provider, preset);
+    const runtimeProfile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
+    if (reviewedRuntimeProfileProvider(runtimeProfile) !== provider) {
+      throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_PROVIDER_MISMATCH");
+    }
+    if (runtimeProfile.profileId !== profileId) {
+      throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_ACCOUNT_MISMATCH");
+    }
+    const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
+    const receiptJson = JSON.stringify(input.receipt);
+    const now = this.#now();
+    const transaction = this.#database.transaction(() => {
+      const bound = this.#database.query(
+        `UPDATE sessions
+         SET provider=?,profile_id=?,preset=?,provider_thread_id=?,state=?,active_turn_id=?,
+             provider_updated_at=?,revision=revision+1,updated_at=?
+         WHERE id=? AND revision=? AND state NOT IN ('recovery_required','terminal')`,
+      ).run(
+        provider,
+        profileId,
+        presetTiers[preset],
+        providerThreadId,
+        input.state,
+        input.activeTurnId ?? null,
+        input.providerUpdatedAt ?? null,
+        now,
+        sessionId,
+        z.number().int().positive().parse(input.expectedSessionRevision),
+      );
+      if (bound.changes !== 1) throw new Error("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
+      this.#database.query(
+        `UPDATE session_conversation_automation
+         SET provider_thread_id=? WHERE session_id=?`,
+      ).run(providerThreadId, sessionId);
+      this.#insertSessionRuntimeProfile(
+        { sessionId, sourceKind: "session_start", sourceId: attemptId, profile: runtimeProfile },
+        now,
+      );
+      const applied = this.#database.query(
+        "UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=? WHERE id=? AND state='effect_started'",
+      ).run(receiptJson, now, attemptId);
+      if (applied.changes !== 1) throw new Error("SESSION_PROVIDER_SWITCH_RECEIPT_CAS_CONFLICT");
+    });
+    transaction.immediate();
+    return this.requireSession(sessionId);
+  }
+
   setSessionTurnState(input: { sessionId: SessionId; expectedRevision: number; state: "active" | "idle" | "terminal" | "recovery_required"; activeTurnId?: string }): SessionRecord {
     const now = this.#now();
     const result = this.#database.query("UPDATE sessions SET state=?,active_turn_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(input.state, input.activeTurnId ?? null, now, input.sessionId, input.expectedRevision);
@@ -8875,6 +8957,7 @@ export class StateStore {
       ).all(sessionId, startSequence, limit);
       const events: SessionEvent[] = [];
       let pageBytes = 0;
+      let pageAccountId: string | null = null;
       for (const row of rows) {
         const parsed = z.object({
           event_json: z.string(),
@@ -8888,6 +8971,12 @@ export class StateStore {
         );
         const nextBytes = utf8Bytes(JSON.stringify(next));
         if (events.length > 0 && pageBytes + nextBytes > SESSION_EVENT_PAGE_BYTES) break;
+        // A session that switched provider to another account has events from
+        // both accounts in one stream. One page still never mixes account
+        // identities, so the page ends at the boundary and the next page
+        // opens under the new account.
+        if (pageAccountId !== null && next.accountId !== pageAccountId) break;
+        pageAccountId = next.accountId;
         if (next.sessionId !== sessionId || next.streamEpoch !== stream.stream_epoch) {
           throw new Error("SESSION_EVENT_STORED_AUTHORITY_MISMATCH");
         }

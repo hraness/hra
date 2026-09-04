@@ -947,6 +947,15 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
+  /**
+   * A no-op for Codex. The app-server owns thread lifetime and one process
+   * serves every thread of an account, so there is nothing per-thread to
+   * release; the thread itself is deliberately left intact.
+   */
+  async endSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<void> {
+    void input;
+  }
+
   async readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;

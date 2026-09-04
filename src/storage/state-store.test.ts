@@ -1282,6 +1282,142 @@ describe("StateStore", () => {
       .toMatchObject({ profile: claudeProfile });
   });
 
+  test("rebinds a session to another provider and account in one transaction", async () => {
+    const { store, home } = await fixture();
+    const codexAccount = signInProfile(store, "Codex account", "codex@example.com");
+    const claudeAccount = signInProfile(store, "Claude account", "claude@example.com");
+    const projectRoot = join(home, "switch-project");
+    await mkdir(projectRoot);
+    const project = await store.createProject("Switch project", projectRoot, true);
+    const codexProfile = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-5.6-sol",
+      observedAt: 2_000,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: codexAccount.processGeneration,
+      profileId: codexAccount.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+    const claudeProfile = {
+      claudeVersion: "2.1.260",
+      inputFormat: "stream-json" as const,
+      isolatedConfigDir: true as const,
+      model: "claude-fable-5-1",
+      observedAt: 2_100,
+      outputFormat: "stream-json" as const,
+      permissionMode: "default" as const,
+      preset: "fable-max" as const,
+      processGeneration: claudeAccount.processGeneration,
+      profileId: claudeAccount.id,
+      reasoningEffort: "max" as const,
+    };
+    const startAttempt = store.prepareMutation({
+      authorityGeneration: codexAccount.processGeneration,
+      authorityId: codexAccount.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b0",
+      kind: "session.start",
+      request: { fast: false, preset: "high", projectId: project.id },
+    });
+    const started = store.beginSessionStartEffect({
+      attemptId: startAttempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        projectId: project.id,
+        runtimeProfile: codexProfile,
+      },
+      fastEnabled: false,
+      preset: "high",
+      profileGeneration: codexAccount.processGeneration,
+      profileId: codexAccount.id,
+      projectId: project.id,
+      provider: "codex",
+    });
+    store.completeSessionStartEffect({
+      attemptId: startAttempt.id,
+      expectedSessionRevision: started.revision,
+      providerThreadId: "codex-thread",
+      receipt: { effectiveRuntimeProfile: codexProfile, sessionId: started.id },
+      runtimeProfile: codexProfile,
+      sessionId: started.id,
+      state: "idle",
+    });
+
+    const switchAttempt = store.prepareMutation({
+      authorityGeneration: claudeAccount.processGeneration,
+      authorityId: started.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b1",
+      kind: "session.switch",
+      request: { preset: "fable-max", provider: "claude" },
+    });
+    expect(store.transitionMutation(switchAttempt.id, "prepared", "effect_started")).toBe(true);
+    const before = store.requireSession(started.id);
+    const switched = store.completeSessionProviderSwitch({
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: before.revision,
+      preset: "fable-max",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread",
+      receipt: { providerThreadId: "claude-thread", sessionId: started.id, toProvider: "claude" },
+      runtimeProfile: claudeProfile,
+      sessionId: started.id,
+      state: "idle",
+    });
+    // The provider, the account, the preset, and the thread are one binding.
+    expect(switched).toMatchObject({
+      preset: "fable-max",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread",
+    });
+    // The runtime-profile authority guard requires the row's account to equal
+    // the session's, so the rebind must land before the profile is inserted.
+    expect(store.latestSessionRuntimeProfile(started.id)).toMatchObject({
+      profile: { ...claudeProfile, profileId: claudeAccount.id },
+      sourceKind: "session_start",
+    });
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006b1")).toMatchObject({
+      state: "applied",
+    });
+
+    // A stale revision never rebinds, and a preset the target cannot run is
+    // refused before anything is written.
+    expect(() => store.completeSessionProviderSwitch({
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: before.revision,
+      preset: "fable-max",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread-2",
+      receipt: {},
+      runtimeProfile: claudeProfile,
+      sessionId: started.id,
+      state: "idle",
+    })).toThrow("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
+    expect(() => store.completeSessionProviderSwitch({
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: switched.revision,
+      preset: "high",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread-2",
+      receipt: {},
+      runtimeProfile: claudeProfile,
+      sessionId: started.id,
+      state: "idle",
+    })).toThrow("does not support the `high` model preset");
+    expect(store.requireSession(started.id).providerThreadId).toBe("claude-thread");
+  });
+
   test("refuses a session-start evidence row whose profile names another provider", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Mismatch", "mismatch@example.com");

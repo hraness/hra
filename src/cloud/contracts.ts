@@ -55,6 +55,7 @@ export type CommandKind =
   | "steer"
   | "stop"
   | "set_model"
+  | "set_provider"
   | "set_fast"
   | "resolve_interaction"
   | "send_or_steer"
@@ -76,6 +77,7 @@ export const COMMAND_KINDS: readonly CommandKind[] = Object.freeze([
   "steer",
   "stop",
   "set_model",
+  "set_provider",
   "set_fast",
   "resolve_interaction",
   "send_or_steer",
