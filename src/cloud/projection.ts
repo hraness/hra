@@ -111,9 +111,76 @@ export type CompactInteractionEvent = Readonly<{
 
 export type CompactMessageActor = "human" | "autorespond";
 
+/**
+ * One attachment as the compact stream carries it: what it was called, what
+ * it is, how big it is, and the digest that identifies its bytes in the
+ * custodian machine`s local store. Never the bytes, and never a path.
+ */
+export type CompactAttachment = Readonly<{
+  byteLength: number;
+  digest: string;
+  mediaType: string;
+  name: string;
+}>;
+
+const compactAttachmentDigestPattern = /^[0-9a-f]{64}$/u;
+const compactAttachmentMediaTypes = new Set<string>([
+  "application/json",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "text/csv",
+  "text/markdown",
+  "text/plain",
+]);
+const compactAttachmentMaximumBytes = 5 * 1024 * 1024;
+const compactAttachmentMaximumCount = 8;
+
+/*
+ * An attachment manifest is parsed exactly as strictly as an interaction
+ * detail is. A name is a bounded, terminal-safe file name that cannot be an
+ * absolute path and cannot look like a credential, the media type comes from
+ * the closed reviewed list, and the size is a bounded positive integer. A
+ * manifest that fails any of that makes the whole event unparseable rather
+ * than silently losing an attachment.
+ */
+export function parseCompactAttachments(value: unknown): readonly CompactAttachment[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > compactAttachmentMaximumCount) {
+    return null;
+  }
+  const parsed: CompactAttachment[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) return null;
+    if (!hasRequiredKeys(entry, ["byteLength", "digest", "mediaType", "name"])) return null;
+    if (
+      typeof entry.digest !== "string"
+      || !compactAttachmentDigestPattern.test(entry.digest)
+      || typeof entry.mediaType !== "string"
+      || !compactAttachmentMediaTypes.has(entry.mediaType)
+      || !isSafePositiveInteger(entry.byteLength)
+      || entry.byteLength > compactAttachmentMaximumBytes
+      || !isBoundedSafeText(entry.name, 255, false)
+      || entry.name.length < 1
+      || entry.name.includes("/")
+      || entry.name.includes("\\")
+      || forbiddenDetailKeyPattern.test(entry.name)
+      || forbiddenSecretValuePattern.test(entry.name)
+    ) return null;
+    parsed.push({
+      byteLength: entry.byteLength,
+      digest: entry.digest,
+      mediaType: entry.mediaType,
+      name: entry.name,
+    });
+  }
+  return parsed;
+}
+
 export type CompactSessionEvent =
   | Readonly<{
       actor?: CompactMessageActor;
+      attachments?: readonly CompactAttachment[];
       kind: "user_message";
       sequence: number;
       text: string;
@@ -439,7 +506,7 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
   if (!isRecord(value)) return null;
   if (
     (value.kind === "user_message" || value.kind === "assistant_message")
-    && hasRequiredKeys(value, ["kind", "sequence", "text", "turnId"])
+    && hasRequiredKeys(value, ["kind", "sequence", "text", "turnId"], 2)
     && isSafePositiveInteger(value.sequence)
     && typeof value.text === "string"
     && value.text.length <= 64_000
@@ -462,8 +529,15 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
     }
     const actor: CompactMessageActor | undefined =
       value.actor === "human" || value.actor === "autorespond" ? value.actor : undefined;
+    // Absent stays absent: an event with no attachment is byte-identical to
+    // what an older writer produced, and an older reader ignores the key.
+    const attachments = value.attachments === undefined
+      ? undefined
+      : parseCompactAttachments(value.attachments);
+    if (attachments === null) return null;
     return {
       ...(actor === undefined ? {} : { actor }),
+      ...(attachments === undefined ? {} : { attachments }),
       kind: value.kind,
       sequence: value.sequence,
       text: value.text,

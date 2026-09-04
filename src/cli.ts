@@ -11,6 +11,12 @@ import { isatty } from "node:tty";
 import { z } from "zod";
 
 import {
+  AttachmentIngestError,
+  ingestAttachments,
+} from "./daemon/attachment-ingest";
+import { AttachmentBlobStore } from "./storage/attachment-store";
+import type { AttachmentReference } from "./domain/attachments";
+import {
   CliUsageError,
   accountLoginCancelCommand,
   accountLoginReplayCommand,
@@ -1218,6 +1224,9 @@ export type CliMainInput = Readonly<{
   readRootStatus?: (paths: StatePaths) => unknown;
   offlineDoctorOwnerUid?: number;
   sessionObserverSignalMode?: "process" | "foreground_interrupt";
+  /** Where a relative `--attach` path is resolved from. Defaults to the process cwd. */
+  attachmentCwd?: string;
+  attachmentBlobStore?: AttachmentBlobStore;
   onHumanSessionObserverBootstrap?: (bootstrap: Readonly<{
     interactions: readonly Readonly<{
       id: string;
@@ -5188,6 +5197,39 @@ async function executeInvocation(
     });
   }
   if (invocation.kind === "daemon.run") return await runDaemon(installation);
+  if (invocation.kind === "session.attach") {
+    // The CLI, and only the CLI, turns a path into bytes. It admits each file
+    // and writes it into local content-addressed custody, then reissues the
+    // same command carrying digests. Nothing downstream ever sees a path.
+    const blobs = input.attachmentBlobStore
+      ?? AttachmentBlobStore.forStatePaths(installation.paths);
+    let attachments: readonly AttachmentReference[];
+    try {
+      attachments = await ingestAttachments(
+        blobs,
+        invocation.attach,
+        input.attachmentCwd ?? process.cwd(),
+      );
+    } catch (error: unknown) {
+      if (error instanceof AttachmentIngestError) {
+        return renderFailure(
+          { code: "INVALID_INPUT", message: error.message },
+          invocation.json,
+          output,
+        );
+      }
+      throw error;
+    }
+    return await executeInvocation(
+      {
+        command: { ...invocation.command, attachments: [...attachments] },
+        json: invocation.json,
+        kind: "command",
+      },
+      output,
+      { ...input, installation },
+    );
+  }
   if (invocation.kind === "remote") {
     return await executeRemoteInvocation(invocation, output, { ...input, installation });
   }

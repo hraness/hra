@@ -9,6 +9,12 @@ import {
   type DeviceCommandKind,
   type EncryptedEnvelope,
 } from "./contracts";
+import {
+  ATTACHMENT_MAX_BYTES,
+  isAttachmentMediaType,
+  isAttachmentName,
+  type AttachmentMediaType,
+} from "../domain/attachments";
 import { decryptBytes, encryptBytes } from "./crypto";
 import { isModelPreset, type ModelPreset } from "./projection";
 import {
@@ -62,8 +68,119 @@ export type ResolveInteractionAnswersPayload = Readonly<{
   revision: number;
 }>;
 
+/*
+ * Hosted attachments.
+ *
+ * A remote message payload is versioned. Version 1 is the exact
+ * `{kind, message}` shape that shipped before attachments existed and is
+ * still what a message with no attachment serializes to, byte for byte.
+ * Version 2 adds `attachments`: a bounded manifest, each entry optionally
+ * carrying its own bytes as base64.
+ *
+ * The bounds exist because the whole command is one encrypted Convex
+ * document. Convex caps a document at 1 MiB and `parseEncryptedEnvelope`
+ * caps the ciphertext at `cloudLimits.ciphertextCharacters` (350,000
+ * base64url characters, so about 262,000 plaintext bytes). A full 64,000
+ * character message plus 96 KiB of inlined attachment bytes base64-encodes to
+ * roughly 195,000 plaintext bytes and about 260,000 ciphertext characters,
+ * which leaves real room under both caps.
+ *
+ * An attachment larger than `remoteAttachmentLimits.inlineBytes` is refused,
+ * not truncated and not silently dropped. A caller that holds larger bytes
+ * must attach the file from the custodian machine with
+ * `hra session send --attach`; a browser cannot push it through this lane.
+ */
+export const remoteAttachmentLimits = Object.freeze({
+  count: 8,
+  inlineBytes: 64 * 1024,
+  nameCharacters: 255,
+  totalInlineBytes: 96 * 1024,
+} as const);
+
+export type RemoteAttachment = Readonly<{
+  byteLength: number;
+  /** Base64 of the exact bytes. Absent means "the custodian already holds this digest". */
+  data?: string;
+  digest: string;
+  mediaType: AttachmentMediaType;
+  name: string;
+}>;
+
+export type RemoteMessagePayload = Readonly<{
+  attachments: readonly RemoteAttachment[];
+  kind: "send" | "queue" | "steer" | "send_or_steer";
+  message: string;
+  version: 2;
+}>;
+
+const base64Pattern = /^[A-Za-z0-9+/]+={0,2}$/u;
+
+function base64ByteLength(value: string): number {
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return (value.length / 4) * 3 - padding;
+}
+
+function parseRemoteAttachments(value: unknown): readonly RemoteAttachment[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > remoteAttachmentLimits.count) {
+    return null;
+  }
+  const parsed: RemoteAttachment[] = [];
+  let inlineTotal = 0;
+  for (const entry of value) {
+    if (!isRecord(entry)) return null;
+    const inline = Object.hasOwn(entry, "data");
+    if (!hasExactKeys(
+      entry,
+      inline
+        ? ["byteLength", "data", "digest", "mediaType", "name"]
+        : ["byteLength", "digest", "mediaType", "name"],
+    )) return null;
+    if (
+      typeof entry.digest !== "string"
+      || !/^[0-9a-f]{64}$/u.test(entry.digest)
+      || !isAttachmentMediaType(entry.mediaType)
+      || typeof entry.name !== "string"
+      || entry.name.length > remoteAttachmentLimits.nameCharacters
+      || !isAttachmentName(entry.name)
+      || containsAbsolutePath(entry.name)
+      || containsUnsafeTerminalScalar(entry.name)
+      || !Number.isSafeInteger(entry.byteLength)
+      || (entry.byteLength as number) < 1
+      || (entry.byteLength as number) > ATTACHMENT_MAX_BYTES
+    ) return null;
+    if (!inline) {
+      parsed.push({
+        byteLength: entry.byteLength as number,
+        digest: entry.digest,
+        mediaType: entry.mediaType,
+        name: entry.name,
+      });
+      continue;
+    }
+    if (
+      typeof entry.data !== "string"
+      || entry.data.length < 4
+      || entry.data.length % 4 !== 0
+      || !base64Pattern.test(entry.data)
+    ) return null;
+    const bytes = base64ByteLength(entry.data);
+    if (bytes !== entry.byteLength || bytes > remoteAttachmentLimits.inlineBytes) return null;
+    inlineTotal += bytes;
+    if (inlineTotal > remoteAttachmentLimits.totalInlineBytes) return null;
+    parsed.push({
+      byteLength: entry.byteLength,
+      data: entry.data,
+      digest: entry.digest,
+      mediaType: entry.mediaType,
+      name: entry.name,
+    });
+  }
+  return parsed;
+}
+
 export type RemoteCommandPayload =
   | Readonly<{ kind: "send" | "queue" | "steer" | "send_or_steer"; message: string }>
+  | RemoteMessagePayload
   | Readonly<{ kind: "stop" }>
   | Readonly<{ kind: "set_model"; preset: ModelPreset }>
   /**
@@ -336,13 +453,24 @@ export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload 
   if (
     (value.kind === "send" || value.kind === "queue" || value.kind === "steer"
       || value.kind === "send_or_steer")
-    && hasExactKeys(value, ["kind", "message"])
     && typeof value.message === "string"
     && value.message.length >= 1
     && value.message.length <= 64_000
     && !containsAbsolutePath(value.message)
     && !containsUnsafeTerminalScalar(value.message, true)
-  ) return { kind: value.kind, message: value.message };
+  ) {
+    // Version 1 stays exactly what it was: no version key, no attachments.
+    if (hasExactKeys(value, ["kind", "message"])) {
+      return { kind: value.kind, message: value.message };
+    }
+    if (hasExactKeys(value, ["attachments", "kind", "message", "version"]) && value.version === 2) {
+      const attachments = parseRemoteAttachments(value.attachments);
+      if (attachments !== null) {
+        return { attachments, kind: value.kind, message: value.message, version: 2 };
+      }
+    }
+    return null;
+  }
   if (value.kind === "stop" && hasExactKeys(value, ["kind"])) return { kind: value.kind };
   if (
     value.kind === "set_model"

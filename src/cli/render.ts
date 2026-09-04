@@ -1,3 +1,4 @@
+import { formatAttachmentSize } from "../domain/attachments";
 import {
   publicSessionListPageSchema,
   signedOutSessionListMetadataSchema,
@@ -222,6 +223,26 @@ const duration = (value: unknown): string => {
 const indented = (value: string): string =>
   terminalSafe(value, true).split("\n").map((part) => `  ${part}`).join("\n");
 
+/*
+ * The attachment manifest for one message: name, declared media type, and
+ * size. Never the bytes, never a digest the human did not ask for, and never a
+ * path — a renderer that could print bytes is a renderer that can leak them.
+ */
+const renderAttachments = (value: unknown): string => {
+  if (!Array.isArray(value)) return "";
+  const rows = value.flatMap((entry) => {
+    const attachment = object(entry);
+    if (
+      attachment === null
+      || typeof attachment.name !== "string"
+      || typeof attachment.mediaType !== "string"
+      || typeof attachment.byteLength !== "number"
+    ) return [];
+    return [`  attached: ${line(attachment.name)}  ${line(attachment.mediaType)}  ${formatAttachmentSize(attachment.byteLength)}`];
+  });
+  return rows.length === 0 ? "" : `\n${rows.join("\n")}`;
+};
+
 const renderMessage = (value: unknown): string | null => {
   const message = object(value);
   if (message === null) return null;
@@ -232,7 +253,7 @@ const renderMessage = (value: unknown): string | null => {
     ? ""
     : `\n  … [${String(omission.omittedUtf8Bytes)} UTF-8 bytes omitted]`;
   const turn = typeof message.turnId === "string" ? `  ${line(message.turnId)}` : "";
-  return `${message.role === "user" ? "You" : "Codex"}${turn}\n${indented(message.text)}${omitted}`;
+  return `${message.role === "user" ? "You" : "Codex"}${turn}\n${indented(message.text)}${omitted}${renderAttachments(message.attachments)}`;
 };
 
 const stringArray = (value: unknown): readonly string[] =>

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, realpath, rename, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,6 +36,9 @@ import {
   type PublicInteraction,
 } from "../domain/interactions";
 import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
+import type { PreparedAttachment } from "../domain/attachments";
+import { AttachmentBlobStore } from "../storage/attachment-store";
+import { ingestAttachments } from "./attachment-ingest";
 import type { Preset } from "../domain/presets";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import {
@@ -92,6 +95,10 @@ class FakeCodex implements CodexRuntimePort {
   readonly observedThreads: string[] = [];
   readonly freshThreads = new Set<string>();
   readonly turnEffectTrace: string[] = [];
+  readonly startTurnAttachments: {
+    attachments?: readonly PreparedAttachment[];
+    clientMessageId: string;
+  }[] = [];
   beforeObserveReturn?: () => Promise<void>;
   observeError?: Error;
   observeErrorOnce?: Error;
@@ -308,8 +315,12 @@ class FakeCodex implements CodexRuntimePort {
     };
     return { reviewId: crypto.randomUUID(), kind: "turn_start", effectiveRuntimeProfile };
   }
-  async startTurn(input: { review: RuntimeStartReview; message: string; clientMessageId: string }): Promise<{ turnId: string; status: "completed" | "interrupted" | "failed" | "inProgress"; effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
+  async startTurn(input: { review: RuntimeStartReview; message: string; attachments?: readonly PreparedAttachment[]; clientMessageId: string }): Promise<{ turnId: string; status: "completed" | "interrupted" | "failed" | "inProgress"; effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
     this.calls.push("send");
+    this.startTurnAttachments.push({
+      ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
+      clientMessageId: input.clientMessageId,
+    });
     this.turnEffectTrace.push("start");
     this.activeStartTurns += 1;
     this.maximumConcurrentStartTurns = Math.max(this.maximumConcurrentStartTurns, this.activeStartTurns);
@@ -1964,6 +1975,76 @@ describe("HraService", () => {
     expect(await service.execute({ kind: "session.rename", session: started.session.id, name: "Release" }, { signal })).toMatchObject({ session: { title: "Release" } });
   });
 
+  test("carries attachments from a command to the provider, custody, and the projection", async () => {
+    const value = await fixture();
+    const { service, codex, documents, paths, store } = value;
+    const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+
+    // The image bytes are assembled here; the repository commits no binary.
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+    await writeFile(join(documents, "diagram.png"), png);
+    await writeFile(join(documents, "notes.md"), "# hello");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const attachments = await ingestAttachments(blobs, ["diagram.png", "notes.md"], documents);
+
+    const sent = await service.execute({
+      attachments: [...attachments],
+      kind: "session.send",
+      message: "what changed?",
+      session: started.session.id,
+    }, { signal }) as { attachments: readonly { name: string }[] };
+    expect(sent.attachments.map((entry) => entry.name)).toEqual(["diagram.png", "notes.md"]);
+
+    const dispatched = codex.startTurnAttachments.at(-1);
+    expect(dispatched?.attachments?.map((entry) => entry.kind)).toEqual(["image", "text"]);
+    const image = dispatched?.attachments?.[0];
+    expect(image?.kind === "image" ? image.base64 : null)
+      .toBe(Buffer.from(png).toString("base64"));
+    const text = dispatched?.attachments?.[1];
+    expect(text?.kind === "text" ? text.text : null).toBe("# hello");
+
+    // Custody records the manifest against the exact dispatched client id.
+    const manifest = store.messageAttachmentManifest(
+      started.session.id,
+      dispatched?.clientMessageId ?? "",
+    );
+    expect(manifest.map((entry) => [entry.name, entry.mediaType, entry.byteLength])).toEqual([
+      ["diagram.png", "image/png", png.byteLength],
+      ["notes.md", "text/markdown", 7],
+    ]);
+
+    const shown = await service.execute({
+      detail: false,
+      kind: "session.show",
+      session: started.session.id,
+    }, { signal }) as { projection: { messages: readonly { attachments?: readonly unknown[] }[] } };
+    expect(shown.projection.messages.at(-1)?.attachments).toEqual(manifest);
+    expect(JSON.stringify(shown)).not.toContain(Buffer.from(png).toString("base64"));
+  });
+
+  test("refuses a message whose attachment is not in local custody", async () => {
+    const value = await fixture();
+    const { service, documents } = value;
+    const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    await expect(service.execute({
+      attachments: [{
+        byteLength: 7,
+        digest: "c".repeat(64),
+        mediaType: "text/markdown",
+        name: "absent.md",
+      }],
+      kind: "session.send",
+      message: "look",
+      session: started.session.id,
+    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
   test("hooks host-owned facts memory into start, resume, terminal archive, and expiry without a model command", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const now = () => 10_000;
@@ -2884,10 +2965,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }]);
     } finally {
       inspector.close(false);
     }

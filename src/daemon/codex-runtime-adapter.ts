@@ -19,6 +19,7 @@ import {
   type ResolvedPreset,
   type ThreadStartResult,
 } from "../codex/index";
+import type { PreparedAttachment } from "../domain/attachments";
 import { assertPresetSupportedByProvider, type Preset } from "../domain/presets";
 import { redactAbsolutePaths } from "../domain/text-safety";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
@@ -1048,7 +1049,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
-  async startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReview; message: string; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurn["status"]; effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
+  async startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReview; message: string; attachments?: readonly PreparedAttachment[]; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurn["status"]; effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
     return await this.#admit(async () => {
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a turn.");
       if (input.signal.aborted) throw input.signal.reason;
@@ -1065,17 +1066,19 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         running,
         input.providerThreadId,
       );
-      const value = await running.client.startTurn({ threadId: input.providerThreadId, clientMessageId: input.clientMessageId, text: input.message, preset, cwd: input.projectRoot, policy: this.#policy(input.projectRoot) });
+      const attachments = input.attachments ?? [];
+      const value = await running.client.startTurn({ threadId: input.providerThreadId, clientMessageId: input.clientMessageId, text: input.message, ...(attachments.length === 0 ? {} : { attachments }), preset, cwd: input.projectRoot, policy: this.#policy(input.projectRoot) });
       return { turnId: value.value.turn.id, status: value.value.turn.status, effectiveRuntimeProfile: reviewed.review.effectiveRuntimeProfile };
     });
   }
 
-  async steer(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; message: string; clientMessageId: string; signal: AbortSignal }): Promise<void> {
+  async steer(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; message: string; attachments?: readonly PreparedAttachment[]; clientMessageId: string; signal: AbortSignal }): Promise<void> {
     await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
       const running = await this.#running(input.authority);
       await this.#ensureSessionObserved(running, input.providerThreadId);
-      await running.client.steerTurn({ threadId: input.providerThreadId, expectedTurnId: input.activeTurnId, clientMessageId: input.clientMessageId, text: input.message });
+      const attachments = input.attachments ?? [];
+      await running.client.steerTurn({ threadId: input.providerThreadId, expectedTurnId: input.activeTurnId, clientMessageId: input.clientMessageId, text: input.message, ...(attachments.length === 0 ? {} : { attachments }) });
     });
   }
 

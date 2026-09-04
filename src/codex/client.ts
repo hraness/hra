@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 
+import {
+  attachmentMessageText,
+  type PreparedAttachment,
+} from "../domain/attachments.ts";
 import { HRA_VERSION } from "../version.ts";
 import type {
   InteractionKind,
@@ -220,10 +224,34 @@ export interface StartTurnInput {
   readonly threadId: string;
   readonly clientMessageId: string;
   readonly text: string;
+  readonly attachments?: readonly PreparedAttachment[];
   readonly preset: ResolvedPreset;
   readonly cwd?: string;
   readonly policy?: ThreadPolicy;
 }
+
+/*
+ * The `turn/start` and `turn/steer` input array.
+ *
+ * The pinned app-server accepts `UserInput` variants `text`, `image`,
+ * `localImage`, `audio`, `localAudio`, `skill`, and `mention`. HRA emits
+ * exactly two of them: one `text` item, and one `localImage` item per image
+ * attachment naming its mode-0600 blob in the local content-addressed store.
+ * There is no file content item, so a text-ish attachment is folded into the
+ * text item as a fenced block with a header naming the file.
+ *
+ * With no attachment this returns the exact single-element array HRA sent
+ * before attachments existed, so every existing turn is byte-identical.
+ */
+export const codexTurnInput = (
+  text: string,
+  attachments: readonly PreparedAttachment[] = [],
+): readonly Readonly<Record<string, unknown>>[] => [
+  { type: "text", text: boundedText(attachmentMessageText(text, attachments), "message") },
+  ...attachments.flatMap((attachment) => attachment.kind === "image"
+    ? [{ type: "localImage", path: canonicalAbsolute(attachment.path, "attachment path") }]
+    : []),
+];
 
 export class CodexAppServerClient {
   readonly #process: CodexProcess;
@@ -723,7 +751,7 @@ export class CodexAppServerClient {
     const params: Record<string, unknown> = {
       threadId: boundedIdentifier(input.threadId, "thread id"),
       clientUserMessageId: boundedIdentifier(input.clientMessageId, "client message id"),
-      input: [{ type: "text", text: boundedText(input.text, "message") }],
+      input: codexTurnInput(input.text, input.attachments ?? []),
       model: input.preset.model,
       effort: input.preset.effort,
       serviceTier: input.preset.serviceTier,
@@ -744,6 +772,7 @@ export class CodexAppServerClient {
     readonly expectedTurnId: string;
     readonly clientMessageId: string;
     readonly text: string;
+    readonly attachments?: readonly PreparedAttachment[];
   }): Promise<FencedCodexValue<{ readonly turnId: string }>> {
     return this.#closedRequest(
       "turn/steer",
@@ -751,7 +780,7 @@ export class CodexAppServerClient {
         threadId: boundedIdentifier(input.threadId, "thread id"),
         expectedTurnId: boundedIdentifier(input.expectedTurnId, "expected turn id"),
         clientUserMessageId: boundedIdentifier(input.clientMessageId, "client message id"),
-        input: [{ type: "text", text: boundedText(input.text, "message") }],
+        input: codexTurnInput(input.text, input.attachments ?? []),
       },
       (value) => ({
         turnId: boundedIdentifier(record(value, "turn/steer result").turnId as string, "turn id"),
