@@ -1,12 +1,40 @@
 export const CLOUD_USAGE_SNAPSHOT_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 
+// live_tail retention for detail-stream chunks: keep the current and
+// previous turn. The corpus this plan is based on (23,699 measured turns)
+// has a p90 turn duration of 4,919s (~82 minutes), so a 6-hour TTL keeps the
+// current and previous turn in the overwhelming majority of sessions while
+// still reclaiming abandoned-session storage promptly. This is the sweeper's
+// time-based backstop; the row cap below is the size-based backstop.
+export const LIVE_TAIL_CHUNK_TTL_MS = 6 * 60 * 60 * 1_000;
+
+// Soft per-session cap on detail (live_tail) chunk rows. Enforcement in
+// appendChunk is amortized: it only prunes once a session is
+// LIVE_TAIL_ROW_CAP_TRIGGER rows over the cap, deleting back down to the cap
+// in one batch, so the true row count is allowed to drift up to the trigger
+// between prunes rather than doing a delete (and a fresh retention epoch)
+// on every single append past 200.
+export const LIVE_TAIL_ROW_CAP = 200;
+export const LIVE_TAIL_ROW_CAP_TRIGGER = 20;
+
 export type HostedTableLifecycle = Readonly<{
   owner: "user" | "parent" | "email_digest" | "capability" | "service";
   quota: "identity" | "device" | "account" | "session" | "chunk" | "usage" | "command" | "custody" | "receipt" | "security" | "job" | null;
-  retention: "auth_library" | "challenge_expiry" | "invite_expiry" | "active" | "encrypted_history" | "lease_expiry" | "command_recovery" | "usage_90d_daily" | "receipt_expiry" | "security_90d" | "job_until_complete" | "service_permanent";
+  retention: "auth_library" | "challenge_expiry" | "invite_expiry" | "active" | "encrypted_history" | "live_tail" | "lease_expiry" | "command_recovery" | "usage_90d_daily" | "receipt_expiry" | "security_90d" | "job_until_complete" | "service_permanent";
   deletionOrder: number | null;
   disposition: "erase" | "expire" | "complete_receipt" | "service_reset";
 }>;
+
+// sessionChunks and sessionStreamEpochs are declared "encrypted_history"
+// below: this is the table-wide (bulk) retention class shared by every
+// compact-stream row, which is never swept on its own schedule. Detail-
+// stream ("live_tail") rows in the same two tables are additionally, and
+// more aggressively, governed row-by-row by the live_tail retention class:
+// current and previous turn, at most 200 rows per session, enforced by the
+// live_tail_chunks maintenance sweeper (see convex/maintenance.ts) rather
+// than by table-uniform retention. This constant records that per-row
+// exception; it does not change the table-level entries themselves.
+export const DETAIL_CHUNK_RETENTION: HostedTableLifecycle["retention"] = "live_tail";
 
 export const HOSTED_TABLE_LIFECYCLE = {
   users: { owner: "user", quota: "identity", retention: "auth_library", deletionOrder: 130, disposition: "erase" },

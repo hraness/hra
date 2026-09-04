@@ -2664,10 +2664,32 @@ export function parseBrokeredCodexServerRequest(input: {
   }
   if (input.method === "item/fileChange/requestApproval") {
     if (turnId === null || itemId === null) throw protocol("file approval omitted turn or item context");
-    throw new CodexError(
-      "UNSUPPORTED_CAPABILITY",
-      "The pinned file-change callback omits affected paths and change detail, so HRA cannot offer informed approval.",
-    );
+    // The pinned Codex file-change callback omits affected paths and change
+    // detail, so HRA has never had enough to support an informed human
+    // decision. The request is still admitted as a durable interaction (never
+    // exposing a private approval authority, since none exists) so a session
+    // in an autorespond mode can accept it blind, exactly as the owner
+    // accepted in the plan; a session in manual mode auto-declines it at the
+    // daemon layer instead of leaving a human staring at an unreviewable
+    // prompt (`src/daemon/autorespond.ts`).
+    const availableDecisions = commandApprovalDecisions(privateParams.availableDecisions);
+    const reason = nullableSafeDisplayText(privateParams.reason, "file change approval reason", 4_096);
+    const grantRoot = nullableSafeDisplayText(privateParams.grantRoot, "file change grant root", 1_024);
+    return {
+      provider,
+      kind: "file_change_approval",
+      blocking: true,
+      timeoutMs,
+      display: {
+        kind: "file_change_approval",
+        summary: "Allow the proposed file changes",
+        reason,
+        grantRoot,
+        availableDecisions: [...availableDecisions],
+      },
+      privateParams,
+      privateApprovalAuthority: null,
+    };
   }
   if (input.method === "item/permissions/requestApproval") {
     if (turnId === null || itemId === null) throw protocol("permission approval omitted turn or item context");

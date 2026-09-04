@@ -31,6 +31,7 @@ import {
   accountUsageHistoryPageSchema,
   automaticRateLimitResetStatusSchema,
 } from "../domain/usage-metrics";
+import { sessionStateReportSchema } from "../domain/session-state";
 import { profileIdSchema, sessionIdSchema } from "../domain/values";
 import {
   sessionTaskDeleteResultSchema,
@@ -394,6 +395,7 @@ const renderSingleEvent = (event: SessionEvent): string => {
     case "session_status": return `Session: ${line(body.status)}${body.activeTurnId === null ? "" : `, active turn ${line(body.activeTurnId)}`}`;
     case "turn_started": return `Turn started: ${line(body.turnId)}`;
     case "turn_completed": return `Turn ${line(body.turnId)}: ${line(body.status)}${body.errorCode === undefined ? "" : ` (${line(body.errorCode)})`}`;
+    case "session_state": return `State: ${line(body.state)}${body.attention ? ", needs you" : ""} (${line(body.reason)}), revision ${String(body.revision)}`;
     case "item_started": return `Item started: ${line(body.itemKind)}${eventToolTarget(body.server, body.tool, body.itemKind)} ${line(body.itemId)}`;
     case "item_completed": return `Item completed: ${line(body.itemKind)}${eventToolTarget(body.server, body.tool, body.itemKind)} ${line(body.itemId)}${body.status === undefined ? "" : ` (${line(body.status)})`}`;
     case "assistant_delta": return `Codex\n${indented(body.text)}`;
@@ -897,6 +899,15 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
     if (
       !parsed.success
       || (exactSession.success && parsed.data.session.id !== exactSession.data)
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "session.state") {
+    const parsed = sessionStateReportSchema.safeParse(data);
+    const exactSession = sessionIdSchema.safeParse(command.session);
+    if (
+      !parsed.success
+      || (exactSession.success && parsed.data.session !== exactSession.data)
     ) invalidCommandResponse(command);
     return;
   }
@@ -2236,6 +2247,30 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(`${renderSession(data)}\n`);
   } else if (command.kind === "session.status") {
     output.writeStdout(`${renderSessionStatus(data)}\n`);
+  } else if (command.kind === "session.state") {
+    const report = sessionStateReportSchema.parse(data);
+    output.writeStdout(report.state === null
+      ? "State: not classified yet.\n"
+      : `State: ${line(report.state)}${report.attention ? " (needs you)" : ""}\nReason: ${line(report.reason)}\nRevision: ${String(report.revision)}\n`);
+  } else if (command.kind === "autorespond.status" || command.kind === "autorespond.set") {
+    const report = value as {
+      budgets?: { consecutive: number; lastDay: number; lastHour: number };
+      counts?: { accepted: number; refused: number };
+      mode?: unknown;
+      recent?: unknown[];
+      source?: unknown;
+    };
+    const rows = [`Approval mode: ${line(report.mode)} (${line(report.source)})`];
+    if (report.counts !== undefined) {
+      rows.push(`Autoresponses: ${String(report.counts.accepted)} accepted, ${String(report.counts.refused)} escalated`);
+    }
+    if (report.budgets !== undefined) {
+      rows.push(`Budgets: ${String(report.budgets.consecutive)} consecutive, ${String(report.budgets.lastHour)} this hour, ${String(report.budgets.lastDay)} today`);
+    }
+    if (Array.isArray(report.recent) && report.recent.length > 0) {
+      rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "kind", "approvalClass", "decision", "outcome", "sessionId"]));
+    }
+    output.writeStdout(`${rows.join("\n")}\n`);
   } else if (command.kind === "session.events") {
     const page = sessionEventPage(data);
     output.writeStdout(`${page === null ? "Event page data is unavailable." : renderSessionEventPageHuman(page)}\n`);

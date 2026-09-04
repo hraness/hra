@@ -90,3 +90,36 @@ describe("closed encrypted payloads", () => {
     }));
   });
 });
+
+describe("remote decision payloads", () => {
+  const interactionId = "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b";
+
+  test("accepts once, decline, and cancel decisions and bounded answer maps", () => {
+    expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 3, decision: "once" }))
+      .toEqual({ decision: "once", interactionId, kind: "resolve_interaction", revision: 3 });
+    expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 1, decision: "cancel" }))
+      .toMatchObject({ decision: "cancel" });
+    expect(parseRemoteCommandPayload({
+      kind: "resolve_interaction",
+      interactionId,
+      revision: 2,
+      answers: { q1: { answers: ["spaces"] } },
+    })).toEqual({ answers: { q1: { answers: ["spaces"] } }, interactionId, kind: "resolve_interaction", revision: 2 });
+    expect(parseRemoteCommandPayload({ kind: "send_or_steer", message: "keep going" }))
+      .toEqual({ kind: "send_or_steer", message: "keep going" });
+  });
+
+  test("refuses session scope, malformed ids, extra keys, and unsafe answers", () => {
+    expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 1, decision: "session" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId: "int_1", revision: 1, decision: "once" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 0, decision: "once" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 1, decision: "once", answers: {} })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 1, answers: {} })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "resolve_interaction",
+      interactionId,
+      revision: 1,
+      answers: { q1: { answers: ["/opt/someone/secret"] } },
+    })).toBeNull();
+  });
+});

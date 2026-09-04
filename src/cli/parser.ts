@@ -127,7 +127,14 @@ export type RemoteCliCommand =
   | Readonly<{ kind: "remote.list"; limit: number }>
   | Readonly<{ kind: "remote.show"; session: string }>
   | Readonly<{ commandPublicId: string; kind: "remote.command" }>
-  | Readonly<{ kind: "remote.send" | "remote.queue" | "remote.steer"; message: string; session: string }>
+  | Readonly<{ kind: "remote.send" | "remote.queue" | "remote.steer"; message: string; orSteer?: boolean; session: string }>
+  | Readonly<{
+      decision: "once" | "decline" | "cancel";
+      interaction: string;
+      kind: "remote.resolve";
+      revision: number;
+      session: string;
+    }>
   | Readonly<{ kind: "remote.stop"; session: string }>
   | Readonly<{ kind: "remote.preset"; preset: "low" | "high" | "ultra"; session: string }>
   | Readonly<{ enabled: boolean; kind: "remote.fast"; session: string }>;
@@ -270,6 +277,8 @@ Usage:
   hra session list [--account <profile>] [--limit <1..100>] [--cursor <cursor>]
   hra session show <session> [--detail]
   hra session status <session> [--json]
+  hra session state <session> [--json]
+  hra autorespond on|workspace|off|default|status [--session <session>] [--json]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
@@ -1002,6 +1011,7 @@ const parseSession = (
     }
     case "show": { const detail = flag(cursor, "--detail"); const session = take(cursor, "session"); finish(cursor); return { kind: "session.show", session, detail }; }
     case "status": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.status", session }; }
+    case "state": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.state", session }; }
     case "events": {
       const followFlag = flag(cursor, "--follow");
       const follow = followFlag || jsonl;
@@ -1374,10 +1384,31 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
     case "send":
     case "queue":
     case "steer": {
+      const orSteer = action === "send" && flag(cursor, "--or-steer");
       const session = take(cursor, "session");
       const message = remainder(cursor, "message");
       if (message.length > 64_000) throw new CliUsageError("Remote message is too long.");
-      return { kind: `remote.${action}`, session, message };
+      return orSteer
+        ? { kind: "remote.send", session, message, orSteer: true }
+        : { kind: `remote.${action}`, session, message };
+    }
+    case "resolve": {
+      const interaction = option(cursor, "--interaction");
+      const revisionValue = option(cursor, "--revision");
+      const decision = option(cursor, "--decision");
+      const session = take(cursor, "session");
+      finish(cursor);
+      if (interaction === undefined || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(interaction)) {
+        throw new CliUsageError("Remote resolve requires --interaction <uuid>.");
+      }
+      const revision = Number(revisionValue);
+      if (revisionValue === undefined || !/^[1-9]\d{0,15}$/u.test(revisionValue) || !Number.isSafeInteger(revision)) {
+        throw new CliUsageError("Remote resolve requires --revision <positive integer>.");
+      }
+      if (decision !== "once" && decision !== "decline" && decision !== "cancel") {
+        throw new CliUsageError("Remote resolve requires --decision once|decline|cancel.");
+      }
+      return { decision, interaction, kind: "remote.resolve", revision, session };
     }
     case "stop": {
       const session = take(cursor, "session");
@@ -1471,6 +1502,31 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       ...(mutates && idempotencyKey !== undefined ? { idempotencyKey } : {}),
       json,
     };
+  }
+  if (group === "autorespond") {
+    const action = take(cursor, "autorespond action");
+    const session = option(cursor, "--session");
+    finish(cursor);
+    if (idempotencyKey !== undefined) throw new CliUsageError("--idempotency-key is not supported by autorespond.");
+    if (action === "status") {
+      return { kind: "command", command: { kind: "autorespond.status", ...(session === undefined ? {} : { session }) }, json };
+    }
+    const mode = action === "on"
+      ? "auto:all"
+      : action === "workspace"
+        ? "auto:workspace"
+        : action === "off"
+          ? "manual"
+          : action === "default"
+            ? null
+            : undefined;
+    if (mode === undefined) {
+      throw new CliUsageError("Unknown autorespond action. Use `on`, `workspace`, `off`, `default`, or `status`.");
+    }
+    if (mode === null && session === undefined) {
+      throw new CliUsageError("`autorespond default` clears a session override; pass --session <session>.");
+    }
+    return { kind: "command", command: { kind: "autorespond.set", mode, ...(session === undefined ? {} : { session }) }, json };
   }
   let parsed: LocalCommand;
   if (group === "account") {
