@@ -223,6 +223,18 @@ export async function launchPinnedCodexAppServer(
       ...(options.experimentalApi === undefined
         ? {}
         : { experimentalApi: options.experimentalApi }),
+      ...(options.onConversationAutomationToolCall === undefined
+        ? {}
+        : {
+            onConversationAutomationToolCall:
+              options.onConversationAutomationToolCall,
+          }),
+      ...(options.onConversationAutomationToolResponseWritten === undefined
+        ? {}
+        : {
+            onConversationAutomationToolResponseWritten:
+              options.onConversationAutomationToolResponseWritten,
+          }),
       ...(options.onFact === undefined ? {} : { onFact: options.onFact }),
       ...(options.onSafeDiagnostic === undefined
         ? {}

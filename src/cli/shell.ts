@@ -53,9 +53,11 @@ const sessionActions = new Set([
   "preset",
   "fast",
   "project",
+  "task",
 ]);
 
 const pluginActions = new Set(["list", "show"]);
+const sessionTaskActions = new Set(["list", "show", "create", "edit", "delete"]);
 
 const encodedBytes = (value: string): number => new TextEncoder().encode(value).byteLength;
 
@@ -238,6 +240,19 @@ export const compileShellLine = (line: string, selection: ShellSelection = {}): 
       kind: "dispatch",
     };
   }
+  if (name === "task") {
+    const action = rest[0];
+    if (
+      action === undefined
+      || !sessionTaskActions.has(action)
+    ) {
+      throw new ShellUsageError("Use /task list|show|create|edit|delete for the selected session.");
+    }
+    return {
+      argv: ["session", "task", action, selectedSession(selection), ...rest.slice(1)],
+      kind: "dispatch",
+    };
+  }
   if (name === "interrupt") {
     if (rest.length !== 0) throw new ShellUsageError("/interrupt does not accept arguments.");
     return { argv: ["session", "stop", selectedSession(selection)], kind: "dispatch" };
@@ -305,6 +320,9 @@ export const shellHelp = `Shell commands
   /events                   Read the selected session's next event page
   /watch [--jsonl]          Watch the selected session; JSONL is opt-in
   /interactions             List pending interactions for the selected session
+  /task list                List conversation-bound tasks for the selected session
+  /task show ID             Show one exact conversation-bound task
+  /task create|edit|delete  Manage tasks without creating another conversation
   /interaction show ID      Show one interaction's questions, choices, or form fields
   /inspect ID --revision N  Show exact live approval authority in the protected terminal
   /approve ID --revision N  Approve once unless --decision is supplied

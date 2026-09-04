@@ -14,7 +14,7 @@ import {
 
 /**
  * Rewrites `src/codex/pin.ts` for one exact Codex release: the pin constant,
- * the six generated-schema digests, and the two reviewed matrix digests.
+ * the fifteen generated-schema digests, and the two reviewed matrix digests.
  * `--check` recomputes everything and reports whether the file is current.
  * The script refuses to run when the installed `@openai/codex` package or the
  * `package.json` dependency differs from the requested version.
@@ -30,6 +30,15 @@ export const TRACKED_CODEX_SCHEMA_FILES = [
   "v2/ConsumeAccountRateLimitResetCreditParams.ts",
   "v2/ConsumeAccountRateLimitResetCreditResponse.ts",
   "v2/ConsumeAccountRateLimitResetCreditOutcome.ts",
+  "v2/ThreadStartParams.ts",
+  "v2/ThreadResumeParams.ts",
+  "v2/DynamicToolCallParams.ts",
+  "v2/DynamicToolCallResponse.ts",
+  "v2/DynamicToolSpec.ts",
+  "v2/DynamicToolNamespaceSpec.ts",
+  "v2/DynamicToolNamespaceTool.ts",
+  "v2/DynamicToolFunctionSpec.ts",
+  "v2/DynamicToolCallOutputContentItem.ts",
 ] as const;
 
 export type TrackedCodexSchemaFile = (typeof TRACKED_CODEX_SCHEMA_FILES)[number];

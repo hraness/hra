@@ -12,6 +12,7 @@ import { CodexError } from "./errors.ts";
 import { CODEX_PIN, PINNED_CODEX_MATRIX_DIGESTS, PINNED_CODEX_SCHEMA_DIGESTS } from "./pin.ts";
 import { resolvePinnedCodexRuntime } from "./runtime.ts";
 import {
+  HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
   OPERATIONS,
   PINNED_CODEX_NOTIFICATION_MATRIX,
   PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST,
@@ -25,6 +26,7 @@ import {
   compileCodexInteractionResponse,
   parseAccountUsage,
   parseBrokeredCodexServerRequest,
+  parseConversationAutomationToolCall,
   parseFact,
   parseModelPage,
   parseManagedLoginCancel,
@@ -37,6 +39,7 @@ import {
   parseThreadTurnsPage,
   resolvePreset,
   safeLiveAcceptanceCommandDigest,
+  serializeDynamicToolPublicResult,
   type BrokeredCodexServerRequestMethod,
   type CodexCapabilitySnapshot,
 } from "./protocol.ts";
@@ -158,7 +161,7 @@ describe("pinned server requests and safe notifications", () => {
       expect(clientRequestSource).toContain(
         '{ "method": "account/rateLimitResetCredit/consume", id: RequestId, params: ConsumeAccountRateLimitResetCreditParams, }',
       );
-      expect(Object.keys(PINNED_CODEX_SCHEMA_DIGESTS)).toHaveLength(6);
+      expect(Object.keys(PINNED_CODEX_SCHEMA_DIGESTS)).toHaveLength(15);
       for (const [relativePath, expected] of Object.entries(PINNED_CODEX_SCHEMA_DIGESTS)) {
         const source = await readFile(join(outputDirectory, relativePath), "utf8");
         expect({ relativePath, digest: digest(source) }).toEqual({ relativePath, digest: expected });
@@ -507,6 +510,187 @@ describe("pinned server requests and safe notifications", () => {
     expect(PINNED_CODEX_SERVER_REQUEST_SCHEMA_DIGEST).toMatch(/^[a-f0-9]{64}$/u);
     expect(() => assertPinnedCodexServerRequestMatrix()).not.toThrow();
     expect(codexServerRequestDisposition("future/request")).toBeNull();
+  });
+
+  test("defines one closed conversation-only dynamic tool schema", () => {
+    expect(HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS).toHaveLength(1);
+    expect(HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS[0]).toMatchObject({
+      type: "namespace",
+      name: "hra",
+      tools: [{ type: "function", name: "automation_update" }],
+    });
+    const serialized = JSON.stringify(HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS);
+    for (const forbidden of [
+      "targetThreadId",
+      "threadId",
+      "sessionId",
+      "destination",
+      "executionEnvironment",
+      "model",
+      "cron",
+      "rrule",
+    ]) expect(serialized).not.toContain(forbidden);
+    const inputSchema = JSON.parse(JSON.stringify(
+      HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS[0].tools[0].inputSchema,
+    )) as {
+      oneOf: {
+        additionalProperties?: boolean;
+        properties: Record<string, { additionalProperties?: boolean }>;
+      }[];
+    };
+    expect(inputSchema.oneOf).toHaveLength(5);
+    expect(inputSchema.oneOf.every((branch) => branch.additionalProperties === false)).toBe(true);
+    const schedules = inputSchema.oneOf.flatMap((branch) =>
+      "schedule" in branch.properties ? [branch.properties.schedule] : []);
+    expect(schedules).toHaveLength(2);
+    expect(schedules.every((schedule) => schedule.additionalProperties === false)).toBe(true);
+  });
+
+  test("parses exact dynamic-tool authority and rejects standalone-field smuggling", () => {
+    const common = {
+      authority: { profileId: "profile-a", processGeneration: 9 },
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "number", value: 71 } as const,
+    };
+    const params = {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      callId: "call-1",
+      namespace: "hra",
+      tool: "automation_update",
+      arguments: {
+        mode: "create",
+        name: "Review",
+        prompt: "Continue this conversation",
+        schedule: { kind: "interval_minutes", minutes: 60 },
+      },
+    };
+    const parsed = parseConversationAutomationToolCall({ ...common, params });
+    expect(parsed).toMatchObject({
+      authority: common.authority,
+      connectionId: common.connectionId,
+      requestId: common.requestId,
+      threadId: "thread-1",
+      turnId: "turn-1",
+      callId: "call-1",
+      operation: params.arguments,
+    });
+    expect(parsed.requestDigest).toMatch(/^[a-f0-9]{64}$/u);
+    const reordered = parseConversationAutomationToolCall({
+      ...common,
+      params: {
+        arguments: {
+          schedule: { minutes: 60, kind: "interval_minutes" },
+          prompt: "Continue this conversation",
+          name: "Review",
+          mode: "create",
+        },
+        tool: "automation_update",
+        namespace: "hra",
+        callId: "call-1",
+        turnId: "turn-1",
+        threadId: "thread-1",
+      },
+    });
+    expect(reordered.requestDigest).toBe(parsed.requestDigest);
+
+    const taskId = `stask_${"a".repeat(32)}`;
+    const supportedOperations = [
+      { mode: "update", id: taskId, revision: 2, status: "paused" },
+      { mode: "view", id: taskId },
+      { mode: "list" },
+      { mode: "delete", id: taskId, revision: 3 },
+    ] as const;
+    for (const operation of supportedOperations) {
+      expect(parseConversationAutomationToolCall({
+        ...common,
+        params: { ...params, arguments: operation },
+      }).operation).toEqual(operation);
+    }
+
+    const invalid = [
+      { ...params, namespace: null },
+      { ...params, namespace: "other" },
+      { ...params, tool: "automation_create" },
+      { ...params, destination: "standalone" },
+      { ...params, arguments: { ...params.arguments, destination: "standalone" } },
+      {
+        ...params,
+        arguments: {
+          ...params.arguments,
+          schedule: { ...params.arguments.schedule, cron: "0 9 * * *" },
+        },
+      },
+      {
+        ...params,
+        arguments: {
+          mode: "update",
+          id: "task-1",
+          revision: 1,
+        },
+      },
+      {
+        ...params,
+        arguments: {
+          mode: "delete",
+          id: "task-1",
+          revision: 0,
+        },
+      },
+      {
+        ...params,
+        arguments: {
+          ...params.arguments,
+          schedule: { kind: "interval_minutes", minutes: 10 },
+        },
+      },
+    ];
+    for (const candidate of invalid) {
+      expect(() => parseConversationAutomationToolCall({
+        ...common,
+        params: candidate,
+      })).toThrow(CodexError);
+    }
+  });
+
+  test("enforces UTF-8 task bounds and one bounded canonical text result", () => {
+    const parseArguments = (argumentsValue: unknown) => parseConversationAutomationToolCall({
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "string", value: "tool-1" },
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-1",
+        namespace: "hra",
+        tool: "automation_update",
+        arguments: argumentsValue,
+      },
+    });
+    expect(parseArguments({
+      mode: "create",
+      name: "é".repeat(80),
+      prompt: "x".repeat(262_144),
+      schedule: { kind: "interval_minutes", minutes: 10_080 },
+    }).operation).toMatchObject({ mode: "create" });
+    expect(() => parseArguments({
+      mode: "create",
+      name: "é".repeat(81),
+      prompt: "continue",
+      schedule: { kind: "interval_minutes", minutes: 15 },
+    })).toThrow(CodexError);
+    expect(() => parseArguments({
+      mode: "create",
+      name: "Review",
+      prompt: "é".repeat(131_073),
+      schedule: { kind: "interval_minutes", minutes: 15 },
+    })).toThrow(CodexError);
+    expect(serializeDynamicToolPublicResult({ z: 1, a: { d: 2, b: true } })).toBe(
+      "{\"a\":{\"b\":true,\"d\":2},\"z\":1}",
+    );
+    expect(() => serializeDynamicToolPublicResult("")).toThrow(CodexError);
+    expect(() => serializeDynamicToolPublicResult("é".repeat(32_769))).toThrow(CodexError);
+    expect(() => serializeDynamicToolPublicResult([] as never)).toThrow(CodexError);
   });
 
   test("parses every brokered method into a bounded display and exact private authority", () => {

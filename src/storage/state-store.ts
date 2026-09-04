@@ -65,6 +65,7 @@ import {
   type SessionEventBody,
   type SessionEventGapReason,
 } from "../domain/session-events";
+import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../domain/session-tasks";
 import {
   canTransitionQueue,
   mutationStateSchema,
@@ -114,6 +115,11 @@ import {
   type WorkCapabilityVerifier,
   type WorkCursorEncoder,
 } from "./work-store";
+import {
+  SESSION_TASK_SCHEMA_SQL,
+  SessionTaskStore,
+  assertSessionTaskSchema,
+} from "./session-task-store";
 import type { StatePaths } from "./paths";
 import type {
   DesktopRecoveryBinding,
@@ -529,7 +535,7 @@ export type MutationEffectEvidence =
   | { kind: "session.steer"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null; clientMessageId: string; messageDigest: string }
   | { kind: "session.stop"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null }
   | { kind: "session.rename"; providerThreadId: string; baseline: SessionProviderBaseline; requestedName: string }
-  | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: EffectiveRuntimeProfile }
+  | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: EffectiveRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
   | { kind: "account.login"; method: "browser" | "device_code" }
   | { kind: "account.logout"; baselineSignedIn: boolean }
   | { kind: "account.login-cancel"; loginId: string };
@@ -620,7 +626,7 @@ const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.steer"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable(), clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema }).strict(),
   z.object({ kind: z.literal("session.stop"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable() }).strict(),
   z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
-  z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: effectiveRuntimeProfileSchema.optional() }).strict(),
+  z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: effectiveRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
   z.object({ kind: z.literal("account.login"), method: z.enum(["browser", "device_code"]) }).strict(),
   z.object({ kind: z.literal("account.logout"), baselineSignedIn: z.boolean() }).strict(),
   z.object({ kind: z.literal("account.login-cancel"), loginId: providerLoginIdSchema }).strict(),
@@ -691,7 +697,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 28;
+const currentSchemaVersion = 29;
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -3409,6 +3415,14 @@ const migrateWritableDatabase = (
       version = 28;
     }
 
+    if (version < 29) {
+      database.exec(SESSION_TASK_SCHEMA_SQL);
+      assertSessionTaskSchema(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(29, now());
+      database.exec("PRAGMA user_version = 29");
+      version = 29;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -3441,6 +3455,8 @@ const migrateWritableDatabase = (
     ensureUsagePollFailureAccountFingerprint(database);
     database.exec(schemaVersion28);
     assertAccountRateLimitResetPolicies(database);
+    database.exec(SESSION_TASK_SCHEMA_SQL);
+    assertSessionTaskSchema(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -3811,6 +3827,7 @@ export class StateStore {
       else assertWorkSchema(this.#database);
       assertCanonicalLabelKeys(this.#database);
       assertAccountRateLimitResetPolicies(this.#database);
+      assertSessionTaskSchema(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
@@ -3838,6 +3855,50 @@ export class StateStore {
       projectProviderIdentifier: (value) => this.#publicProviderIdentifierProjector(value),
       now: this.#now,
     });
+  }
+
+  createSessionTaskStore(): SessionTaskStore {
+    return new SessionTaskStore(this.#database, { now: this.#now });
+  }
+
+  isConversationAutomationEnabled(
+    sessionId: SessionId,
+    providerThreadId: string,
+  ): boolean {
+    const row = this.#database.query(
+      `SELECT 1
+       FROM session_conversation_automation
+       WHERE session_id=? AND provider_thread_id=?`,
+    ).get(
+      sessionIdSchema.parse(sessionId),
+      providerThreadIdSchema.parse(providerThreadId),
+    );
+    return row !== null;
+  }
+
+  isSessionTaskQueueSource(sessionId: SessionId, queueId: QueueId): boolean {
+    const row = this.#database.query(
+      `SELECT 1
+       FROM session_task_occurrences
+       WHERE session_id=? AND queue_id=?`,
+    ).get(sessionIdSchema.parse(sessionId), queueIdSchema.parse(queueId));
+    return row !== null;
+  }
+
+  isSessionTaskTurnSource(sessionId: SessionId, turnId: string): boolean {
+    const row = this.#database.query(
+      `SELECT 1
+       FROM session_task_occurrences o
+       JOIN session_turn_runtime_profiles p
+         ON p.session_id=o.session_id
+        AND p.source_kind='queue_start'
+        AND p.source_id=o.queue_id
+       WHERE o.session_id=? AND p.turn_id=?`,
+    ).get(
+      sessionIdSchema.parse(sessionId),
+      z.string().min(1).max(200).parse(turnId),
+    );
+    return row !== null;
   }
 
   configurePublicProviderIdentifierProjector(
@@ -4540,6 +4601,16 @@ export class StateStore {
         z.number().int().positive().parse(input.expectedSessionRevision),
       );
       if (bound.changes !== 1) throw new Error("SESSION_START_BINDING_CAS_CONFLICT");
+      if (
+        evidence.conversationAutomationCapability
+        === SESSION_CONVERSATION_AUTOMATION_CAPABILITY
+      ) {
+        this.#database.query(
+          `INSERT INTO session_conversation_automation(
+             session_id,provider_thread_id,enabled_at
+           ) VALUES (?,?,?)`,
+        ).run(sessionId, providerThreadIdSchema.parse(input.providerThreadId), now);
+      }
       this.#insertSessionRuntimeProfile({ sessionId, sourceKind: "session_start", sourceId: attemptId, profile }, now);
       const applied = this.#database.query("UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=? WHERE id=? AND state='effect_started'").run(receiptJson, now, attemptId);
       if (applied.changes !== 1) throw new Error("SESSION_START_RECEIPT_CAS_CONFLICT");
@@ -6024,6 +6095,28 @@ export class StateStore {
             turnId: recoveredTurn.turnId,
             profile: effectEvidence.runtimeProfile,
           }, now);
+        }
+      }
+      if (
+        resolution === "proven_applied"
+        && effectEvidence.kind === "session.start"
+        && effectEvidence.conversationAutomationCapability
+          === SESSION_CONVERSATION_AUTOMATION_CAPABILITY
+        && input.provider !== undefined
+        && input.provider.status !== "terminal"
+      ) {
+        this.#database.query(
+          `INSERT INTO session_conversation_automation(
+             session_id,provider_thread_id,enabled_at
+           ) VALUES (?,?,?)
+           ON CONFLICT(session_id) DO NOTHING`,
+        ).run(sessionId, providerThreadIdSchema.parse(input.provider.providerThreadId), now);
+        const capability = this.#database.query(
+          `SELECT 1 FROM session_conversation_automation
+           WHERE session_id=? AND provider_thread_id=?`,
+        ).get(sessionId, input.provider.providerThreadId);
+        if (capability === null) {
+          throw new Error("CONVERSATION_AUTOMATION_SESSION_BINDING_CONFLICT");
         }
       }
       const inserted = this.#database.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, resolution, resolutionJson, receiptJson, now);

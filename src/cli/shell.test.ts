@@ -88,10 +88,37 @@ describe("HRA line shell", () => {
       argv: ["session", "interactions", "release", "--pending", "--limit", "8"],
       kind: "dispatch",
     });
+    expect(compileShellLine("/task list", { session: "release" })).toEqual({
+      argv: ["session", "task", "list", "release"],
+      kind: "dispatch",
+    });
+    expect(compileShellLine(
+      "/task create --name nightly --every-minutes 60 -- inspect the queue",
+      { session: "release" },
+    )).toEqual({
+      argv: [
+        "session",
+        "task",
+        "create",
+        "release",
+        "--name",
+        "nightly",
+        "--every-minutes",
+        "60",
+        "--",
+        "inspect",
+        "the",
+        "queue",
+      ],
+      kind: "dispatch",
+    });
     expect(compileShellLine("/interrupt", { session: "release" })).toEqual({
       argv: ["session", "stop", "release"],
       kind: "dispatch",
     });
+    expect(() => compileShellLine("/task list")).toThrow("Select a session");
+    expect(() => compileShellLine("/task retarget release", { session: "release" }))
+      .toThrow("Use /task list|show|create|edit|delete");
   });
 
   test("binds plugin discovery to the selected account and keeps lifecycle effects closed", () => {
@@ -235,6 +262,11 @@ describe("HRA line shell", () => {
       argv: ["session", "watch", "release", "--jsonl"],
       kind: "dispatch",
     });
+  });
+
+  test("makes conversation-bound task management discoverable in shell help", () => {
+    expect(shellHelp).toContain("/task list");
+    expect(shellHelp).toContain("without creating another conversation");
   });
 
   test("bounds lines and remains total for arbitrary short input", () => {

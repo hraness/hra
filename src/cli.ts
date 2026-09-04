@@ -2931,6 +2931,19 @@ export async function runDaemon(
         account: async (authority, account) => {
           await serviceReference.current?.observeCodexAccount(authority, account);
         },
+        conversationAutomation: async (authority, call) => {
+          const current = serviceReference.current;
+          if (current === undefined) {
+            throw new Error("The HRA service is unavailable during conversation automation.");
+          }
+          return await current.handleConversationAutomationToolCall(authority, call);
+        },
+        conversationAutomationResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyConversationAutomationToolResponseWritten(
+            authority,
+            call,
+          );
+        },
         fact: async (authority, fact) => { await serviceReference.current?.observeCodexFact(authority, fact); },
       },
     });
@@ -4970,6 +4983,9 @@ export async function main(
         || invocation.command.kind === "session.steer"
         || invocation.command.kind === "session.stop"
         || invocation.command.kind === "session.rename"
+        || invocation.command.kind === "session.task.create"
+        || invocation.command.kind === "session.task.edit"
+        || invocation.command.kind === "session.task.delete"
       )
       && typeof invocation.command.idempotencyKey === "string"
       ? invocation.command

@@ -17,6 +17,7 @@ import { JsonLineDecoder } from "./jsonl.ts";
 import { record, safeInteger, string } from "./parse.ts";
 import type { CodexProcess } from "./process.ts";
 import {
+  HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
   OPERATIONS,
   PINNED_CODEX_VERSION,
   assertPinnedCodexNotificationMatrix,
@@ -31,6 +32,7 @@ import {
   parseAccountUsage,
   parseAppPage,
   parseBrokeredCodexServerRequest,
+  parseConversationAutomationToolCall,
   parseCredentialStores,
   parseFact,
   parseFeaturePage,
@@ -54,6 +56,7 @@ import {
   providerRequestIdKey,
   rawProviderRequestId,
   resolvePreset,
+  serializeDynamicToolPublicResult,
   validateAuthority,
   type AccountRateLimits,
   type AccountReadResult,
@@ -62,12 +65,14 @@ import {
   type CodexApp,
   type CodexAuthority,
   type CodexCapabilitySnapshot,
+  type ConversationAutomationToolCall,
   type CodexFact,
   type CodexFeature,
   type CodexMethod,
   type CodexModel,
   type CodexOperationDescriptor,
   type CodexThread,
+  type DynamicToolPublicResult,
   type FencedCodexValue,
   type ManagedLoginResult,
   type Page,
@@ -100,6 +105,8 @@ const INTERACTION_DEADLINE_ERROR = Object.freeze({
 });
 const PRE_READY_FACT_LIMIT = 128;
 const PRE_READY_FACT_BYTES = 1 * 1024 * 1024;
+const INBOUND_DYNAMIC_REQUEST_LIMIT = 128;
+const DYNAMIC_REQUEST_LEDGER_LIMIT = 4_096;
 const CAPABILITY_DISCOVERY_MAX_DEADLINE_MS = 40_000;
 
 interface PendingRequest {
@@ -147,6 +154,14 @@ export interface CodexAppServerClientOptions {
   readonly experimentalApi?: boolean;
   readonly isAuthorityCurrent: (authority: CodexAuthority) => boolean | Promise<boolean>;
   readonly onFact?: (fact: FencedCodexValue<CodexFact>) => void | Promise<void>;
+  /** Local-only host service for the one conversation-bound dynamic tool. */
+  readonly onConversationAutomationToolCall?: (
+    call: ConversationAutomationToolCall,
+  ) => DynamicToolPublicResult | Promise<DynamicToolPublicResult>;
+  /** Invoked only after the corresponding success response is fully written. */
+  readonly onConversationAutomationToolResponseWritten?: (
+    call: ConversationAutomationToolCall,
+  ) => void | Promise<void>;
   readonly onSafeDiagnostic?: (message: string) => void;
   readonly maxJsonLineBytes?: number;
   readonly shutdownTermGraceMs?: number;
@@ -218,6 +233,12 @@ export class CodexAppServerClient {
   readonly #experimentalApi: boolean;
   readonly #isAuthorityCurrent: CodexAppServerClientOptions["isAuthorityCurrent"];
   readonly #onFact: NonNullable<CodexAppServerClientOptions["onFact"]>;
+  readonly #onConversationAutomationToolCall:
+    | CodexAppServerClientOptions["onConversationAutomationToolCall"]
+    | undefined;
+  readonly #onConversationAutomationToolResponseWritten:
+    | CodexAppServerClientOptions["onConversationAutomationToolResponseWritten"]
+    | undefined;
   readonly #onSafeDiagnostic: NonNullable<CodexAppServerClientOptions["onSafeDiagnostic"]>;
   readonly #decoder: JsonLineDecoder;
   readonly #connectionId: string;
@@ -228,6 +249,8 @@ export class CodexAppServerClient {
   readonly #encoder = new TextEncoder();
   readonly #pending = new Map<number, PendingRequest>();
   readonly #serverRequests = new Map<string, PendingServerRequest>();
+  readonly #dynamicRequestDigests = new Map<string, string>();
+  readonly #inboundDynamicRequests = new Set<Promise<void>>();
   #factTail: Promise<void> = Promise.resolve();
   #writeTail: Promise<void> = Promise.resolve();
   #disconnectEmitted = false;
@@ -260,6 +283,18 @@ export class CodexAppServerClient {
     this.#experimentalApi = options.experimentalApi ?? false;
     this.#isAuthorityCurrent = options.isAuthorityCurrent;
     this.#onFact = options.onFact ?? (() => undefined);
+    if (
+      (options.onConversationAutomationToolCall === undefined)
+      !== (options.onConversationAutomationToolResponseWritten === undefined)
+    ) {
+      throw new CodexError(
+        "INVALID_INPUT",
+        "conversation automation requires paired call and response-written callbacks",
+      );
+    }
+    this.#onConversationAutomationToolCall = options.onConversationAutomationToolCall;
+    this.#onConversationAutomationToolResponseWritten =
+      options.onConversationAutomationToolResponseWritten;
     this.#onSafeDiagnostic = options.onSafeDiagnostic ?? (() => undefined);
     this.#decoder = new JsonLineDecoder(
       options.maxJsonLineBytes === undefined
@@ -634,6 +669,16 @@ export class CodexAppServerClient {
   }
 
   async startThread(input: StartThreadInput): Promise<FencedCodexValue<ThreadStartResult>> {
+    if (
+      !this.#experimentalApi
+      || this.#onConversationAutomationToolCall === undefined
+      || this.#onConversationAutomationToolResponseWritten === undefined
+    ) {
+      throw new CodexError(
+        "UNSUPPORTED_CAPABILITY",
+        "Conversation-bound scheduled tasks require the reviewed dynamic-tool host service",
+      );
+    }
     const cwd = canonicalAbsolute(input.cwd, "cwd");
     const policy = compileThreadPolicy(input.policy);
     return this.#closedRequest(
@@ -649,6 +694,7 @@ export class CodexAppServerClient {
         config: { model_reasoning_effort: input.preset.effort },
         ephemeral: false,
         historyMode: "paginated",
+        dynamicTools: HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
       },
       (value) => validateThreadStartResult(parseThreadStart(value), input, policy.runtimeWorkspaceRoots, cwd),
     );
@@ -1011,18 +1057,23 @@ export class CodexAppServerClient {
       }
     }
 
-    const [exitSettled, readSettled, factsSettled, writesSettled] = await Promise.all([
+    const inboundDynamicRequests = Promise.all([...this.#inboundDynamicRequests]);
+    const [exitSettled, readSettled, factsSettled, writesSettled, inboundSettled] = await Promise.all([
       resolvesWithin(this.#process.exited, this.#shutdownSettlementMs),
       this.#readTask === null
         ? Promise.resolve(true)
         : settlesWithin(this.#readTask, this.#shutdownSettlementMs),
       settlesWithin(this.#factTail, this.#shutdownSettlementMs),
       settlesWithin(this.#writeTail, this.#shutdownSettlementMs),
+      settlesWithin(inboundDynamicRequests, this.#shutdownSettlementMs),
     ]);
     if (!exitSettled) this.#onSafeDiagnostic("Codex process exit did not settle after termination");
     if (!readSettled) this.#onSafeDiagnostic("Codex stdout did not settle after termination");
     if (!factsSettled) this.#onSafeDiagnostic("HRA fact delivery did not settle after Codex termination");
     if (!writesSettled) this.#onSafeDiagnostic("Codex writes did not settle after termination");
+    if (!inboundSettled) {
+      this.#onSafeDiagnostic("HRA dynamic-tool handling did not settle after Codex termination");
+    }
     this.#state = "closed";
   }
 
@@ -1296,6 +1347,19 @@ export class CodexAppServerClient {
     }
     if (this.#state !== "ready") return;
     if (message.id !== undefined) {
+      if (method === "item/tool/call") {
+        if (this.#inboundDynamicRequests.size >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
+          this.#quarantineConnection("Codex exceeded the bounded dynamic-tool request limit");
+          return;
+        }
+        this.#trackInboundDynamicRequest(
+          this.#handleConversationAutomationToolCall(
+            message.id,
+            message.params ?? {},
+          ),
+        );
+        return;
+      }
       await this.#handleServerRequest(message.id, method, message.params ?? {});
       return;
     }
@@ -1361,9 +1425,174 @@ export class CodexAppServerClient {
     }
   }
 
+  async #handleConversationAutomationToolCall(
+    idValue: unknown,
+    params: unknown,
+  ): Promise<void> {
+    const requestId = parseProviderRequestId(idValue);
+    const requestKey = providerRequestIdKey(requestId);
+    if (this.#serverRequests.has(requestKey)) {
+      this.#quarantineConnection("Codex reused a brokered request id for a dynamic tool");
+      return;
+    }
+    const handler = this.#onConversationAutomationToolCall;
+    const afterWrite = this.#onConversationAutomationToolResponseWritten;
+    if (
+      !this.#experimentalApi
+      || handler === undefined
+      || afterWrite === undefined
+    ) {
+      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
+      await this.#writeConversationAutomationFrame({
+        id: rawProviderRequestId(requestId),
+        error: { code: -32_601, message: "HRA did not advertise this host service" },
+      });
+      void this.#enqueueFact({
+        type: "protocolNotice",
+        method: "item/tool/call",
+        connectionId: this.#connectionId,
+      });
+      return;
+    }
+
+    let call: ConversationAutomationToolCall;
+    try {
+      call = parseConversationAutomationToolCall({
+        authority: this.#authority,
+        connectionId: this.#connectionId,
+        requestId,
+        params,
+      });
+    } catch (error: unknown) {
+      const unsupported = error instanceof CodexError
+        && error.code === "UNSUPPORTED_CAPABILITY";
+      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
+      await this.#writeConversationAutomationFrame({
+        id: rawProviderRequestId(requestId),
+        error: unsupported
+          ? { code: -32_601, message: "HRA did not advertise this dynamic tool" }
+          : { code: -32_602, message: "Invalid dynamic tool call params" },
+      });
+      this.#onSafeDiagnostic(unsupported
+        ? "Codex requested an unadvertised dynamic tool"
+        : "Codex sent invalid params for item/tool/call");
+      void this.#enqueueFact({
+        type: "protocolNotice",
+        method: "item/tool/call",
+        connectionId: this.#connectionId,
+      });
+      return;
+    }
+
+    const existingDigest = this.#dynamicRequestDigests.get(requestKey);
+    if (existingDigest !== undefined && existingDigest !== call.requestDigest) {
+      this.#quarantineConnection("Codex changed a dynamic-tool request under an existing id");
+      return;
+    }
+    if (existingDigest === undefined) {
+      if (this.#dynamicRequestDigests.size >= DYNAMIC_REQUEST_LEDGER_LIMIT) {
+        this.#quarantineConnection("Codex exceeded the bounded dynamic-tool request ledger");
+        return;
+      }
+      this.#dynamicRequestDigests.set(requestKey, call.requestDigest);
+    }
+
+    let text: string;
+    try {
+      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
+      const publicResult = await handler(call);
+      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
+      text = serializeDynamicToolPublicResult(publicResult);
+    } catch {
+      if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
+      this.#onSafeDiagnostic("HRA conversation automation host handler failed");
+      await this.#writeConversationAutomationFrame({
+        id: rawProviderRequestId(requestId),
+        result: {
+          contentItems: [{
+            type: "inputText",
+            text: "HRA could not complete this conversation-bound scheduled task request.",
+          }],
+          success: false,
+        },
+      });
+      return;
+    }
+
+    await this.#writeConversationAutomationFrame({
+      id: rawProviderRequestId(requestId),
+      result: {
+        contentItems: [{ type: "inputText", text }],
+        success: true,
+      },
+    });
+    if (!(await this.#conversationAutomationAuthorityIsCurrent())) return;
+    try {
+      await afterWrite(call);
+    } catch {
+      this.#onSafeDiagnostic("HRA conversation automation post-response hook failed");
+    }
+  }
+
+  #trackInboundDynamicRequest(task: Promise<void>): void {
+    const tracked = task.then(
+      () => undefined,
+      () => {
+        if (this.#state !== "ready") return;
+        try {
+          this.#quarantineConnection("HRA dynamic-tool request handling failed");
+        } catch {
+          this.#onSafeDiagnostic("HRA could not terminate a failed dynamic-tool connection");
+        }
+      },
+    );
+    this.#inboundDynamicRequests.add(tracked);
+    void tracked.then(() => {
+      this.#inboundDynamicRequests.delete(tracked);
+    });
+  }
+
+  async #conversationAutomationAuthorityIsCurrent(): Promise<boolean> {
+    let current = false;
+    try {
+      current = await this.#authorityIsCurrent();
+    } catch {
+      current = false;
+    }
+    if (this.#state === "ready" && current) return true;
+    if (this.#state === "ready") {
+      this.#quarantineConnection("HRA dynamic-tool request belongs to stale authority");
+    }
+    return false;
+  }
+
+  async #writeConversationAutomationFrame(value: unknown): Promise<void> {
+    await this.#writeFrame(value, {
+      beforeWriteAsync: async () => {
+        if (!(await this.#conversationAutomationAuthorityIsCurrent())) {
+          throw new CodexError("AUTHORITY_STALE", "Codex process generation is stale");
+        }
+      },
+      beforeWrite: () => {
+        if (this.#state !== "ready") {
+          throw new CodexError("AUTHORITY_STALE", "Codex provider connection is no longer live");
+        }
+      },
+    });
+  }
+
   async #handleServerRequest(idValue: unknown, method: string, params: unknown): Promise<void> {
     const requestedAt = this.#now();
     const requestId = parseProviderRequestId(idValue);
+    const key = providerRequestIdKey(requestId);
+    if (this.#dynamicRequestDigests.has(key)) {
+      await this.#writeFrame({
+        id: rawProviderRequestId(requestId),
+        error: { code: -32_609, message: "Conflicting server request replay" },
+      });
+      this.#quarantineConnection("Codex reused a dynamic-tool request id for another service");
+      return;
+    }
     const disposition = codexServerRequestDisposition(method);
     if (disposition !== "brokered_interaction") {
       await this.#writeFrame({
@@ -1407,7 +1636,6 @@ export class CodexAppServerClient {
       void this.#enqueueFact({ type: "protocolNotice", method, connectionId: this.#connectionId });
       return;
     }
-    const key = providerRequestIdKey(requestId);
     const existing = this.#serverRequests.get(key);
     if (existing !== undefined) {
       if (!sameProviderInteractionAuthority(existing.admission.provider, admission.provider)) {
@@ -1537,7 +1765,10 @@ export class CodexAppServerClient {
 
   async #writeFrame(
     value: unknown,
-    options: { readonly beforeWrite?: () => void } = {},
+    options: Readonly<{
+      beforeWrite?: () => void;
+      beforeWriteAsync?: () => Promise<void>;
+    }> = {},
   ): Promise<void> {
     const serialized = JSON.stringify(value);
     if (serialized.length > 4 * 1024 * 1024) {
@@ -1545,9 +1776,12 @@ export class CodexAppServerClient {
     }
     const bytes = this.#encoder.encode(`${serialized}\n`);
     const write = this.#writeTail.then(async () => {
-      if (options.beforeWrite !== undefined) {
+      if (options.beforeWriteAsync !== undefined || options.beforeWrite !== undefined) {
         try {
-          options.beforeWrite();
+          if (options.beforeWriteAsync !== undefined) {
+            await options.beforeWriteAsync();
+          }
+          options.beforeWrite?.();
         } catch (error: unknown) {
           if (error instanceof CodexError) {
             throw new CodexFrameRejectedBeforeWriteError(error);

@@ -147,13 +147,15 @@ async function fixture(): Promise<Readonly<{
   codex: FakeCodex;
   paths: StatePaths;
   sessionId: string;
+  setNow: (now: number) => void;
   store: StateStore;
 }>> {
   const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-cloud-adapter-")));
   temporaryDirectories.push(temporary);
   const paths = resolveStatePaths({ homeDirectory: temporary, platform: "linux" });
   await initializeStatePaths(paths);
-  const store = new StateStore(paths, { now: () => 1_000 });
+  let now = 1_000;
+  const store = new StateStore(paths, { now: () => now });
   const profile = store.createProfile(`Personal \`${privateRootFixture}/profile\``);
   const current = store.nextProfileGeneration(profile.id);
   expect(store.setProfileState(current.id, current.processGeneration, "signed_in", {
@@ -191,7 +193,15 @@ async function fixture(): Promise<Readonly<{
     daemonGeneration: 1,
     previousPayload: null,
   }));
-  return { codex, paths, sessionId: bound.id, store };
+  return {
+    codex,
+    paths,
+    sessionId: bound.id,
+    setNow: (nextNow) => {
+      now = nextNow;
+    },
+    store,
+  };
 }
 
 function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, input: Readonly<{
@@ -236,6 +246,88 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
     sessionId: session.id,
   });
   return { attemptId: attempt.id as `attempt_${string}`, profile: runtime };
+}
+
+async function materializeScheduledTaskQueue(
+  value: Awaited<ReturnType<typeof fixture>>,
+  input: Readonly<{ idempotencyKey: string; prompt: string; turnId: string }>,
+): Promise<string> {
+  const project = value.store.listProjects()[0]
+    ?? await value.store.createProject("Cloud projection fixture", value.paths.root, true);
+  const session = value.store.requireSession(value.sessionId);
+  if (session.projectId === undefined) {
+    value.store.updateSessionMetadata({
+      sessionId: session.id,
+      expectedRevision: session.revision,
+      projectId: project.id,
+    });
+  }
+  const taskStore = value.store.createSessionTaskStore();
+  const task = taskStore.create({
+    idempotencyKey: input.idempotencyKey,
+    minutes: 15,
+    name: "Cloud projection privacy fixture",
+    prompt: input.prompt,
+    sessionId: value.sessionId,
+    status: "active",
+  });
+  if (task.nextDueAt === null) throw new Error("Expected an active scheduled task.");
+  value.setNow(task.nextDueAt);
+  const materialized = await taskStore.materializeDue({
+    now: task.nextDueAt,
+  });
+  const occurrence = materialized[0];
+  if (occurrence === undefined) throw new Error("Expected a scheduled task queue occurrence.");
+  const current = value.store.requireSession(value.sessionId);
+  const profile = value.store.requireProfileById(current.profileId);
+  if (current.providerThreadId === undefined) throw new Error("Expected a bound session.");
+  const runtime = {
+    profileId: profile.id,
+    processGeneration: profile.processGeneration,
+    observedAt: 2_000,
+    preset: "high" as const,
+    model: "gpt-5.6-sol",
+    reasoningEffort: "max" as const,
+    serviceTier: "priority" as const,
+    fast: true,
+    approvalPolicy: "on-request" as const,
+    reviewMode: "auto_review" as const,
+    permissionProfile: ":workspace" as const,
+    computerUse: true as const,
+    pluginCapability: true as const,
+    enabledApps: [],
+  };
+  const evidence = value.store.beginQueueEffect({
+    queueId: occurrence.queue.id,
+    sessionId: current.id,
+    profileGeneration: profile.processGeneration,
+    evidence: {
+      kind: "queue.dispatch",
+      queueId: occurrence.queue.id,
+      sessionId: current.id,
+      providerThreadId: current.providerThreadId,
+      profileGeneration: profile.processGeneration,
+      baseline: {
+        activeTurnId: null,
+        providerUpdatedAt: current.providerUpdatedAt ?? null,
+        status: "idle",
+      },
+      clientMessageId: occurrence.queue.id,
+      messageDigest: sha256(input.prompt),
+      runtimeProfile: runtime,
+    },
+  });
+  value.store.completeQueueEffect({
+    queueId: occurrence.queue.id,
+    expectedEvidenceDigest: evidence.digest,
+    expectedSessionRevision: current.revision,
+    applyResponseState: false,
+    turnId: input.turnId,
+    turnStatus: "completed",
+    runtimeProfile: runtime,
+    receipt: { turnId: input.turnId, sourceId: occurrence.queue.id },
+  });
+  return occurrence.queue.id;
 }
 
 function admitCloudInteraction(
@@ -427,6 +519,104 @@ describe("state-backed cloud daemon adapter", () => {
         matchReference: snapshot.matchReference,
         sourceRevision: snapshot.sourceRevision,
       }))).toEqual([{ matchReference: secondEmail, sourceRevision: 2 }]);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("omits only confirmed scheduled-task prompts from normal cloud projection", async () => {
+    const value = await fixture();
+    const privatePrompt = "SCHEDULED_TASK_PRIVATE_PROMPT_SENTINEL";
+    const scheduledQueueId = await materializeScheduledTaskQueue(value, {
+      idempotencyKey: "60000000-0000-4000-8000-000000000001",
+      prompt: privatePrompt,
+      turnId: "turn_scheduled_0001",
+    });
+    const ordinaryPrompt = "Ordinary queue prompt remains visible.";
+    const ordinaryQueue = value.store.enqueue(value.sessionId, ordinaryPrompt);
+    value.codex.projection = {
+      ...value.codex.projection,
+      messages: [
+        {
+          clientId: scheduledQueueId,
+          role: "user",
+          text: privatePrompt,
+          turnId: "turn_scheduled_0001",
+        },
+        {
+          role: "assistant",
+          text: "Scheduled task output retained.",
+          turnId: "turn_scheduled_0001",
+        },
+        {
+          clientId: ordinaryQueue.id,
+          role: "user",
+          text: ordinaryPrompt,
+          turnId: "turn_ordinary_queue_0001",
+        },
+        {
+          role: "assistant",
+          text: "Ordinary queue output retained.",
+          turnId: "turn_ordinary_queue_0001",
+        },
+      ],
+      turnSummaries: [
+        {
+          actions: [],
+          files: ["src/scheduled.ts"],
+          id: "turn_scheduled_0001",
+          omittedActions: 0,
+          omittedFiles: 0,
+          runtimeMs: 50,
+          status: "completed",
+        },
+        {
+          actions: [],
+          files: [],
+          id: "turn_ordinary_queue_0001",
+          omittedActions: 0,
+          omittedFiles: 0,
+          runtimeMs: 25,
+          status: "completed",
+        },
+      ],
+    };
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      const projected = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      const scheduled = projected.events.filter((event) =>
+        "turnId" in event && event.turnId === "turn_scheduled_0001");
+      expect(scheduled).toHaveLength(3);
+      expect(scheduled[0]).toMatchObject({
+        kind: "user_message",
+        text: "[scheduled task prompt omitted]",
+      });
+      expect(scheduled[1]).toMatchObject({
+        kind: "assistant_message",
+        text: "Scheduled task output retained.",
+      });
+      expect(scheduled[2]).toMatchObject({
+        filesTouched: ["src/scheduled.ts"],
+        kind: "turn_summary",
+        runtimeMs: 50,
+      });
+      expect(projected.events.find((event) =>
+        event.kind === "user_message" && event.turnId === "turn_ordinary_queue_0001"))
+        .toMatchObject({ text: ordinaryPrompt });
+      expect(JSON.stringify(projected.events)).not.toContain(privatePrompt);
     } finally {
       adapter.close();
       value.store.close();
@@ -1744,7 +1934,7 @@ describe("state-backed cloud daemon adapter", () => {
     }
   });
 
-  test("recovers at the global remote head, baselines visible turns, and uploads only later turns", async () => {
+  test("recovers at the global remote head and omits later scheduled-task prompts", async () => {
     const value = await fixture();
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
@@ -1784,12 +1974,22 @@ describe("state-backed cloud daemon adapter", () => {
       expect(baseline).toMatchObject({ complete: true, events: [] });
       expect(baseline.cacheId).toBe(plan.replacementCacheId);
 
+      const privatePrompt = "RECOVERY_SCHEDULED_TASK_PRIVATE_PROMPT_SENTINEL";
+      await materializeScheduledTaskQueue(value, {
+        idempotencyKey: "60000000-0000-4000-8000-000000000002",
+        prompt: privatePrompt,
+        turnId: "turn_0002",
+      });
       value.codex.projection = {
         ...value.codex.projection,
         messages: [
           ...(value.codex.projection.messages ?? []),
-          { role: "user", text: "Future question", turnId: "turn_0002" },
-          { role: "assistant", text: "Future answer", turnId: "turn_0002" },
+          {
+            role: "user",
+            text: privatePrompt,
+            turnId: "turn_0002",
+          },
+          { role: "assistant", text: "Future scheduled output", turnId: "turn_0002" },
         ],
         turnSummaries: [
           ...(value.codex.projection.turnSummaries ?? []),
@@ -1819,6 +2019,16 @@ describe("state-backed cloud daemon adapter", () => {
         "turn_0002",
         "turn_0002",
       ]);
+      expect(future.events[0]).toMatchObject({
+        kind: "user_message",
+        text: "[scheduled task prompt omitted]",
+      });
+      expect(future.events[1]).toMatchObject({
+        kind: "assistant_message",
+        text: "Future scheduled output",
+      });
+      expect(future.events[2]).toMatchObject({ kind: "turn_summary", runtimeMs: 25 });
+      expect(JSON.stringify(future.events)).not.toContain(privatePrompt);
     } finally {
       adapter.close();
       value.store.close();

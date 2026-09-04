@@ -4,7 +4,11 @@ import { HRA_VERSION } from "../version.ts";
 import { CodexAppServerClient, type CodexAppServerClientOptions } from "./client.ts";
 import { CodexError } from "./errors.ts";
 import type { CodexProcess } from "./process.ts";
-import type { CodexFact, FencedCodexValue } from "./protocol.ts";
+import {
+  HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+  type CodexFact,
+  type FencedCodexValue,
+} from "./protocol.ts";
 
 const CONNECTION_ID = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
 const CREDENTIAL_STORE_PREFLIGHT = Object.freeze({
@@ -39,6 +43,20 @@ const commandApprovalParams = (reason = "Need network access") => ({
   proposedExecpolicyAmendment: null,
   proposedNetworkPolicyAmendments: null,
   availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
+});
+
+const conversationAutomationParams = (argumentsValue: unknown = {
+  mode: "create",
+  name: "Daily review",
+  prompt: "Review the current conversation and continue the work.",
+  schedule: { kind: "interval_minutes", minutes: 60 },
+}) => ({
+  threadId: "thread-1",
+  turnId: "turn-1",
+  callId: "call-1",
+  namespace: "hra",
+  tool: "automation_update",
+  arguments: argumentsValue,
 });
 
 const appFixture = (id: string) => ({
@@ -1046,6 +1064,479 @@ describe("CodexAppServerClient", () => {
         message: "HRA does not support this server request",
       },
     });
+    await client.close();
+  });
+
+  test("requires paired conversation automation callbacks", () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const base = {
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    } as const;
+    expect(() => createClient({
+      ...base,
+      process: successfulFake(codexHome),
+      onConversationAutomationToolCall: async () => ({ scope: "conversation" }),
+    })).toThrow("conversation automation requires paired call and response-written callbacks");
+    expect(() => createClient({
+      ...base,
+      process: successfulFake(codexHome),
+      onConversationAutomationToolResponseWritten: () => undefined,
+    })).toThrow("conversation automation requires paired call and response-written callbacks");
+  });
+
+  test("routes the exact conversation automation tool and wakes only after the response write", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const calls: Parameters<NonNullable<
+      CodexAppServerClientOptions["onConversationAutomationToolCall"]
+    >>[0][] = [];
+    const postWriteFrames: unknown[] = [];
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onConversationAutomationToolCall: async (call) => {
+        calls.push(call);
+        return { task: { id: "task-1" }, scope: "conversation" };
+      },
+      onConversationAutomationToolResponseWritten: () => {
+        postWriteFrames.push(process.writes.at(-1));
+      },
+    });
+    await client.initialize();
+    const responseWrite = deferred<undefined>();
+    process.writeSettlementGate = responseWrite.promise;
+    const params = conversationAutomationParams();
+    process.respond({ id: "tool-request", method: "item/tool/call", params });
+    await waitFor(() => calls.length === 1);
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "tool-request"));
+    expect(postWriteFrames).toEqual([]);
+    responseWrite.resolve(undefined);
+    await waitFor(() => postWriteFrames.length === 1);
+    expect(calls[0]).toMatchObject({
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      connectionId: CONNECTION_ID,
+      requestId: { type: "string", value: "tool-request" },
+      threadId: "thread-1",
+      turnId: "turn-1",
+      callId: "call-1",
+      operation: {
+        mode: "create",
+        name: "Daily review",
+        schedule: { kind: "interval_minutes", minutes: 60 },
+      },
+    });
+    expect(calls[0]?.requestDigest).toMatch(/^[a-f0-9]{64}$/u);
+    expect(process.writes.at(-1)).toEqual({
+      id: "tool-request",
+      result: {
+        contentItems: [{
+          type: "inputText",
+          text: "{\"scope\":\"conversation\",\"task\":{\"id\":\"task-1\"}}",
+        }],
+        success: true,
+      },
+    });
+
+    process.respond({ id: "tool-request", method: "item/tool/call", params });
+    await waitFor(() => calls.length === 2);
+    await waitFor(() => postWriteFrames.length === 2);
+    expect(calls[1]?.requestDigest).toBe(calls[0]?.requestDigest);
+    expect(process.writes.filter((frame) =>
+      (frame as { id?: unknown }).id === "tool-request")).toHaveLength(2);
+    await client.close();
+  });
+
+  test("quarantines changed and cross-service reuse of a dynamic-tool request id", async () => {
+    for (const collision of ["changed_tool", "brokered_request"] as const) {
+      const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+      let calls = 0;
+      const client = createClient({
+        process,
+        authority: { profileId: "profile-a", processGeneration: 1 },
+        expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+        experimentalApi: true,
+        isAuthorityCurrent: () => true,
+        onConversationAutomationToolCall: async () => {
+          calls += 1;
+          return { scope: "conversation" };
+        },
+        onConversationAutomationToolResponseWritten: () => undefined,
+      });
+      await client.initialize();
+      process.respond({
+        id: "collision",
+        method: "item/tool/call",
+        params: conversationAutomationParams(),
+      });
+      await waitFor(() => process.writes.some((frame) =>
+        (frame as { id?: unknown }).id === "collision"));
+      if (collision === "changed_tool") {
+        process.respond({
+          id: "collision",
+          method: "item/tool/call",
+          params: { ...conversationAutomationParams(), callId: "call-2" },
+        });
+      } else {
+        process.respond({
+          id: "collision",
+          method: "item/commandExecution/requestApproval",
+          params: commandApprovalParams(),
+        });
+      }
+      await waitFor(() => client.state === "failed");
+      expect(calls).toBe(1);
+      expect(process.signals).toContain("SIGTERM");
+      await client.close();
+    }
+  });
+
+  test("keeps reading ordinary responses while a dynamic-tool handler is pending", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let accountRequestId: number | undefined;
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "account/read") {
+        accountRequestId = message.id as number;
+      }
+    });
+    const handlerGate = deferred<undefined>();
+    let handlerStarted = false;
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      onConversationAutomationToolCall: async () => {
+        handlerStarted = true;
+        await handlerGate.promise;
+        return { scope: "conversation" };
+      },
+      onConversationAutomationToolResponseWritten: () => undefined,
+    });
+    await client.initialize();
+
+    const accountRead = client.accountRead();
+    await waitFor(() => accountRequestId !== undefined);
+    process.respond({
+      id: "tool-pending",
+      method: "item/tool/call",
+      params: conversationAutomationParams(),
+    });
+    await waitFor(() => handlerStarted);
+    process.respond({
+      id: accountRequestId,
+      result: {
+        account: { type: "chatgpt", email: "person@example.com", planType: "pro" },
+        requiresOpenaiAuth: true,
+      },
+    });
+    const account = await accountRead;
+    handlerGate.resolve(undefined);
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "tool-pending"));
+    expect(account).toMatchObject({
+      value: { account: { type: "chatgpt", planType: "pro" } },
+    });
+    await client.close();
+  });
+
+  test("quarantines a dynamic-tool call without responding or waking after authority changes", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const handlerGate = deferred<undefined>();
+    let current = true;
+    let handlerStarted = false;
+    let postWriteCalls = 0;
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => current,
+      onConversationAutomationToolCall: async () => {
+        handlerStarted = true;
+        await handlerGate.promise;
+        return { scope: "conversation" };
+      },
+      onConversationAutomationToolResponseWritten: () => {
+        postWriteCalls += 1;
+      },
+    });
+    await client.initialize();
+    process.respond({
+      id: "tool-stale",
+      method: "item/tool/call",
+      params: conversationAutomationParams(),
+    });
+    await waitFor(() => handlerStarted);
+    current = false;
+    handlerGate.resolve(undefined);
+    await waitFor(() => client.state === "failed");
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "tool-stale")).toBe(false);
+    expect(postWriteCalls).toBe(0);
+    expect(process.signals).toContain("SIGTERM");
+    await client.close();
+  });
+
+  test("rechecks authority inside a queued dynamic-tool response write", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    let current = true;
+    let handlerCalls = 0;
+    let postWriteCalls = 0;
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => current,
+      onConversationAutomationToolCall: async () => {
+        handlerCalls += 1;
+        return { scope: "conversation" };
+      },
+      onConversationAutomationToolResponseWritten: () => {
+        postWriteCalls += 1;
+      },
+    });
+    await client.initialize();
+    const queuedWrite = deferred<undefined>();
+    process.writeSettlementGate = queuedWrite.promise;
+    const blockingRead = client.accountRead();
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { method?: unknown }).method === "account/read"));
+    process.respond({
+      id: "tool-queued",
+      method: "item/tool/call",
+      params: conversationAutomationParams(),
+    });
+    await waitFor(() => handlerCalls === 1);
+    current = false;
+    queuedWrite.resolve(undefined);
+    await blockingRead;
+    await waitFor(() => client.state === "failed");
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "tool-queued")).toBe(false);
+    expect(postWriteCalls).toBe(0);
+    await client.close();
+  });
+
+  test("rejects dynamic-tool calls when the experimental API was not negotiated", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    let calls = 0;
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: false,
+      isAuthorityCurrent: () => true,
+      onConversationAutomationToolCall: async () => {
+        calls += 1;
+        return { scope: "conversation" };
+      },
+      onConversationAutomationToolResponseWritten: () => undefined,
+    });
+    await client.initialize();
+    process.respond({
+      id: "tool-disabled",
+      method: "item/tool/call",
+      params: conversationAutomationParams(),
+    });
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "tool-disabled"));
+    expect(process.writes.at(-1)).toEqual({
+      id: "tool-disabled",
+      error: { code: -32_601, message: "HRA did not advertise this host service" },
+    });
+    expect(calls).toBe(0);
+    await client.close();
+  });
+
+  test("bounds close while a dynamic-tool handler remains pending", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const handlerGate = deferred<undefined>();
+    const diagnostics: string[] = [];
+    let handlerStarted = false;
+    let postWriteCalls = 0;
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      onConversationAutomationToolCall: async () => {
+        handlerStarted = true;
+        await handlerGate.promise;
+        return { scope: "conversation" };
+      },
+      onConversationAutomationToolResponseWritten: () => {
+        postWriteCalls += 1;
+      },
+      onSafeDiagnostic: (message) => { diagnostics.push(message); },
+      shutdownSettlementMs: 5,
+    });
+    await client.initialize();
+    process.respond({
+      id: "tool-close",
+      method: "item/tool/call",
+      params: conversationAutomationParams(),
+    });
+    await waitFor(() => handlerStarted);
+    await client.close();
+    expect(client.state).toBe("closed");
+    expect(diagnostics).toContain(
+      "HRA dynamic-tool handling did not settle after Codex termination",
+    );
+    handlerGate.resolve(undefined);
+    await Bun.sleep(1);
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === "tool-close")).toBe(false);
+    expect(postWriteCalls).toBe(0);
+  });
+
+  test("rejects unadvertised tools and standalone-field smuggling before the host callback", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const diagnostics: string[] = [];
+    let calls = 0;
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      onSafeDiagnostic: (message) => { diagnostics.push(message); },
+      onConversationAutomationToolCall: async () => {
+        calls += 1;
+        return "unexpected";
+      },
+      onConversationAutomationToolResponseWritten: () => undefined,
+    });
+    await client.initialize();
+    const cases = [
+      { ...conversationAutomationParams(), namespace: "other" },
+      { ...conversationAutomationParams(), tool: "automation_create" },
+      { ...conversationAutomationParams(), targetThreadId: "PRIVATE_TARGET_SENTINEL" },
+      conversationAutomationParams({
+        mode: "create",
+        name: "Review",
+        prompt: "Continue",
+        schedule: { kind: "interval_minutes", minutes: 60 },
+        destination: "standalone",
+      }),
+      conversationAutomationParams({
+        mode: "create",
+        name: "Review",
+        prompt: "Continue",
+        schedule: { kind: "interval_minutes", minutes: 60, cron: "PRIVATE_CRON_SENTINEL" },
+      }),
+    ];
+    for (const [index, params] of cases.entries()) {
+      process.respond({ id: 940 + index, method: "item/tool/call", params });
+      await waitFor(() => process.writes.some((frame) =>
+        (frame as { id?: unknown }).id === 940 + index));
+      expect(process.writes.at(-1)).toMatchObject({
+        id: 940 + index,
+        error: { code: index < 2 ? -32_601 : -32_602 },
+      });
+    }
+    process.respond({ id: 949, method: "currentTime/read", params: {} });
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === 949));
+    expect(process.writes.at(-1)).toEqual({
+      id: 949,
+      error: { code: -32_601, message: "HRA did not advertise this host service" },
+    });
+    expect(calls).toBe(0);
+    expect(JSON.stringify({ writes: process.writes, diagnostics })).not.toContain("PRIVATE_");
+    await client.close();
+  });
+
+  test("bounds dynamic-tool output and does not expose host failures", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const diagnostics: string[] = [];
+    let calls = 0;
+    let postWriteCalls = 0;
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      onSafeDiagnostic: (message) => { diagnostics.push(message); },
+      onConversationAutomationToolCall: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("PRIVATE_HOST_FAILURE_SENTINEL");
+        return "é".repeat(32_769);
+      },
+      onConversationAutomationToolResponseWritten: () => {
+        postWriteCalls += 1;
+      },
+    });
+    await client.initialize();
+    for (const id of [950, 951]) {
+      process.respond({ id, method: "item/tool/call", params: conversationAutomationParams() });
+      await waitFor(() => process.writes.some((frame) =>
+        (frame as { id?: unknown }).id === id));
+      expect(process.writes.at(-1)).toEqual({
+        id,
+        result: {
+          contentItems: [{
+            type: "inputText",
+            text: "HRA could not complete this conversation-bound scheduled task request.",
+          }],
+          success: false,
+        },
+      });
+    }
+    expect(JSON.stringify({ writes: process.writes, diagnostics })).not.toContain(
+      "PRIVATE_HOST_FAILURE_SENTINEL",
+    );
+    expect(postWriteCalls).toBe(0);
+    await client.close();
+  });
+
+  test("does not wake after an indeterminate dynamic-tool response write", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    let handlerCalls = 0;
+    let postWriteCalls = 0;
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      onConversationAutomationToolCall: async () => {
+        handlerCalls += 1;
+        return { scope: "conversation" };
+      },
+      onConversationAutomationToolResponseWritten: () => {
+        postWriteCalls += 1;
+      },
+    });
+    await client.initialize();
+    process.writeError = new Error("deterministic tool response write failure");
+    process.respond({
+      id: 952,
+      method: "item/tool/call",
+      params: conversationAutomationParams(),
+    });
+    await waitFor(() => handlerCalls === 1);
+    await waitFor(() => client.state === "failed");
+    expect(postWriteCalls).toBe(0);
     await client.close();
   });
 
@@ -2717,6 +3208,8 @@ describe("CodexAppServerClient", () => {
       expectedCodexHome: codexHome,
       experimentalApi: true,
       isAuthorityCurrent: () => true,
+      onConversationAutomationToolCall: async () => ({ scope: "conversation" }),
+      onConversationAutomationToolResponseWritten: () => undefined,
     });
     await client.initialize();
     const result = await client.startThread({
@@ -2739,6 +3232,7 @@ describe("CodexAppServerClient", () => {
         config: { model_reasoning_effort: "max" },
         ephemeral: false,
         historyMode: "paginated",
+        dynamicTools: HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
       },
     });
     await client.close();
@@ -2765,13 +3259,75 @@ describe("CodexAppServerClient", () => {
         } });
       }
     });
-    const client = createClient({ process, authority: { profileId: "profile-a", processGeneration: 1 }, expectedCodexHome: codexHome, experimentalApi: true, isAuthorityCurrent: () => true });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      onConversationAutomationToolCall: async () => ({ scope: "conversation" }),
+      onConversationAutomationToolResponseWritten: () => undefined,
+    });
     await client.initialize();
     await expect(client.startThread({
       cwd: "/workspace/project",
       preset: { alias: "high", model: "gpt-5.6-sol", effort: "max", serviceTier: null, fast: false },
       policy: { review: "auto_review", permissionProfile: ":workspace", writableRoots: ["/workspace/project"] },
     })).rejects.toMatchObject({ code: "INDETERMINATE_EFFECT", operation: "thread/start" });
+    await client.close();
+  });
+
+  test("does not retrofit dynamic tools onto legacy resumed threads", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "thread/resume") {
+        target.respond({
+          id: message.id,
+          result: {
+            thread: {
+              id: "thread-legacy",
+              sessionId: "thread-legacy",
+              preview: "",
+              ephemeral: false,
+              historyMode: "paginated",
+              modelProvider: "openai",
+              createdAt: 1,
+              updatedAt: 1,
+              status: { type: "idle" },
+              cwd: "/workspace/project",
+              name: null,
+              turns: [],
+            },
+          },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+      onConversationAutomationToolCall: async () => ({ scope: "conversation" }),
+      onConversationAutomationToolResponseWritten: () => undefined,
+    });
+    await client.initialize();
+    await client.resumeThread("thread-legacy");
+    expect(process.writes.at(-1)).toEqual({
+      id: 3,
+      method: "thread/resume",
+      params: { threadId: "thread-legacy" },
+    });
     await client.close();
   });
 

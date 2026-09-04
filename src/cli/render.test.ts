@@ -1082,6 +1082,165 @@ describe("CLI rendering", () => {
     expect(target.stderr).toEqual([]);
   });
 
+  test("renders strict conversation-bound session task records without list prompt leakage", () => {
+    const sessionId = `sess_${"1".repeat(32)}`;
+    const taskId = `stask_${"2".repeat(32)}`;
+    const summary = {
+      scope: "conversation" as const,
+      id: taskId,
+      sessionId,
+      name: "Release review",
+      status: "active" as const,
+      schedule: { kind: "interval_minutes" as const, minutes: 60 },
+      revision: 3,
+      nextDueAt: 3_600_000,
+      createdAt: 1_000,
+      updatedAt: 2_000,
+    };
+    const listing = capture();
+    renderSuccess(
+      { kind: "session.task.list", session: sessionId },
+      { scope: "conversation", sessionId, tasks: [summary] },
+      false,
+      listing.output,
+    );
+    const listOutput = listing.stdout.join("");
+    expect(listOutput).toContain(`Conversation tasks for ${sessionId}`);
+    expect(listOutput).toContain("Release review");
+    expect(listOutput).toContain("60m");
+    expect(listOutput).toContain(taskId);
+    expect(listOutput).not.toContain("inspect the private release queue");
+
+    const record = { ...summary, prompt: "inspect the private release queue" };
+    const shown = capture();
+    renderSuccess(
+      { kind: "session.task.show", session: sessionId, task: taskId },
+      record,
+      false,
+      shown.output,
+    );
+    expect(shown.stdout.join("")).toBe([
+      "Release review",
+      "Scope: conversation",
+      `Session: ${sessionId}`,
+      `ID: ${taskId}`,
+      "Status: active",
+      "Every: 60 minutes",
+      "Revision: 3",
+      "Next due: 1970-01-01T01:00:00.000Z",
+      "Created: 1970-01-01T00:00:01.000Z",
+      "Updated: 1970-01-01T00:00:02.000Z",
+      "",
+      "Prompt",
+      "  inspect the private release queue",
+      "",
+    ].join("\n"));
+
+    const json = capture();
+    renderSuccess(
+      { kind: "session.task.show", session: sessionId, task: taskId },
+      record,
+      true,
+      json.output,
+    );
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      command: "session.task.show",
+      data: record,
+      ok: true,
+      version: 1,
+    });
+  });
+
+  test("binds session task mutation responses to their exact command authority", () => {
+    const sessionId = `sess_${"3".repeat(32)}`;
+    const taskId = `stask_${"4".repeat(32)}`;
+    const key = "00000000-0000-4000-8000-000000000203";
+    const record = {
+      scope: "conversation" as const,
+      id: taskId,
+      sessionId,
+      name: "Queue review",
+      status: "paused" as const,
+      schedule: { kind: "interval_minutes" as const, minutes: 30 },
+      revision: 1,
+      nextDueAt: null,
+      createdAt: 1_000,
+      updatedAt: 1_000,
+      prompt: "review the queue",
+    };
+    const created = capture();
+    renderSuccess({
+      everyMinutes: 30,
+      idempotencyKey: key,
+      kind: "session.task.create",
+      name: "Queue review",
+      paused: true,
+      prompt: "review the queue",
+      session: sessionId,
+    }, record, false, created.output);
+    expect(created.stdout.join("")).toContain("Scope: conversation");
+    expect(created.stdout.join("")).toContain("Next due: paused");
+
+    const deleted = capture();
+    renderSuccess({
+      expectedRevision: 1,
+      idempotencyKey: key,
+      kind: "session.task.delete",
+      session: sessionId,
+      task: taskId,
+    }, {
+      scope: "conversation",
+      sessionId,
+      taskId,
+      deleted: true,
+      revision: 2,
+      deletedAt: 2_000,
+    }, false, deleted.output);
+    expect(deleted.stdout.join("")).toBe(
+      `Deleted conversation task ${taskId} from ${sessionId} at 1970-01-01T00:00:02.000Z (revision 2).\n`,
+    );
+
+    expect(() => renderSuccess({
+      everyMinutes: 30,
+      idempotencyKey: key,
+      kind: "session.task.create",
+      name: "Queue review",
+      paused: true,
+      prompt: "review the queue",
+      session: sessionId,
+    }, { ...record, revision: 2 }, true, capture().output))
+      .toThrow(InvalidCommandResponseError);
+    expect(() => renderSuccess({
+      expectedRevision: 1,
+      idempotencyKey: key,
+      kind: "session.task.delete",
+      session: sessionId,
+      task: taskId,
+    }, {
+      scope: "conversation",
+      sessionId,
+      taskId,
+      deleted: true,
+      revision: 1,
+      deletedAt: 2_000,
+    }, true, capture().output)).toThrow(InvalidCommandResponseError);
+
+    for (const attacked of [
+      { ...record, sessionId: `sess_${"5".repeat(32)}` },
+      { ...record, id: `stask_${"6".repeat(32)}` },
+      { ...record, providerThreadId: "private-thread" },
+    ]) {
+      const target = capture();
+      expect(() => renderSuccess(
+        { kind: "session.task.show", session: sessionId, task: taskId },
+        attacked,
+        true,
+        target.output,
+      )).toThrow(InvalidCommandResponseError);
+      expect(target.stdout).toEqual([]);
+    }
+  });
+
   test("escapes OSC, BEL, and bidi controls in both human and JSON output", () => {
     const attack = "\u001b]0;owned\u0007\u202etxt";
     const attacked = {

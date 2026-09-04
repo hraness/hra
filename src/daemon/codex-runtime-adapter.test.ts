@@ -11,6 +11,7 @@ import type {
   CodexPluginCatalog,
   CodexThread,
   CodexTurn,
+  ConversationAutomationToolCall,
   LaunchPinnedCodexOptions,
 } from "../codex/index";
 import {
@@ -476,6 +477,86 @@ describe("PinnedCodexRuntimeManager", () => {
       expectedCodexHome: authority.codexHome,
       now,
     });
+    await manager.close();
+  });
+
+  test("binds conversation automation and its post-response wake to the exact live connection", async () => {
+    const exactConnectionId = "70000000-0000-4000-8000-000000000777";
+    let launched: LaunchPinnedCodexOptions | undefined;
+    const handled: ConversationAutomationToolCall[] = [];
+    const responseWritten: ConversationAutomationToolCall[] = [];
+    const fake = {
+      state: "ready",
+      connectionId: exactConnectionId,
+      accountRead: async () => ({
+        authority: { profileId: authority.id, processGeneration: authority.generation },
+        value: { account: null, requiresOpenaiAuth: true },
+      }),
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      launchClient: async (options) => {
+        launched = options;
+        return fake;
+      },
+      observer: {
+        account: () => undefined,
+        conversationAutomation: (_authority, call) => {
+          handled.push(call);
+          return { scope: "conversation", task: { id: "stask_exact" } };
+        },
+        conversationAutomationResponseWritten: (_authority, call) => {
+          responseWritten.push(call);
+        },
+        fact: () => undefined,
+      },
+    });
+
+    await manager.readAccount({ authority, signal: new AbortController().signal });
+    if (launched === undefined) throw new Error("Missing launch fixture.");
+    if (launched.onConversationAutomationToolCall === undefined) {
+      throw new Error("Missing conversation automation fixture.");
+    }
+    if (launched.onConversationAutomationToolResponseWritten === undefined) {
+      throw new Error("Missing conversation automation post-response fixture.");
+    }
+    const connectionId = fake.connectionId;
+    expect(connectionId).toBe(exactConnectionId);
+    const call = {
+      authority: { profileId: authority.id, processGeneration: authority.generation },
+      connectionId,
+      requestId: { type: "string", value: "tool-request" },
+      requestDigest: "a".repeat(64),
+      threadId: "thread-exact",
+      turnId: "turn-exact",
+      callId: "call-exact",
+      operation: {
+        mode: "create",
+        name: "Continue review",
+        prompt: "Continue in this conversation.",
+        schedule: { kind: "interval_minutes", minutes: 60 },
+      },
+    } as const satisfies ConversationAutomationToolCall;
+
+    await expect(launched.onConversationAutomationToolCall(call)).resolves.toEqual({
+      scope: "conversation",
+      task: { id: "stask_exact" },
+    });
+    expect(handled).toEqual([call]);
+    expect(responseWritten).toEqual([]);
+    await launched.onConversationAutomationToolResponseWritten(call);
+    expect(responseWritten).toEqual([call]);
+
+    const staleConnectionCall = {
+      ...call,
+      connectionId: "70000000-0000-4000-8000-999999999999",
+    };
+    await expect(launched.onConversationAutomationToolCall(staleConnectionCall))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    await launched.onConversationAutomationToolResponseWritten(staleConnectionCall);
+    expect(handled).toEqual([call]);
+    expect(responseWritten).toEqual([call]);
     await manager.close();
   });
 

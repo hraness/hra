@@ -22,7 +22,7 @@ import { parseAccountUsage, parseRateLimits, type RateLimitSnapshot } from "../c
 import type { LocalCommand } from "../domain/contracts";
 import type { InteractionRecord } from "../domain/interactions";
 import { providerUsagePayload } from "../domain/usage-metrics";
-import { sessionIdSchema } from "../domain/values";
+import { queueIdSchema, sessionIdSchema } from "../domain/values";
 import type {
   CodexRuntimePort,
   CodexSessionProjection,
@@ -88,6 +88,7 @@ const projectionCacheFileName = "cloud-projection.sqlite";
 const projectionSidecarSuffixes = ["", "-journal", "-shm", "-wal"] as const;
 const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumProjectionRecoveryStatusSessions = 20;
+const scheduledTaskPromptProjectionMarker = "[scheduled task prompt omitted]";
 
 type ProviderRemoteLocalCommand = Extract<LocalCommand, Readonly<{
   kind: "session.send" | "session.queue" | "session.steer" | "session.stop" | "session.rename" | "session.preset" | "session.fast";
@@ -1948,9 +1949,20 @@ function completedProjectionTurns(
       && store.runtimeProfileSourceRequiresSettlement(session.id, message.clientId)
     ) unsettledProfileTurnIds.add(message.turnId);
     const messages = messagesByTurn.get(message.turnId) ?? [];
+    const queueSource = message.clientId === undefined
+      ? null
+      : queueIdSchema.safeParse(message.clientId);
+    const scheduledTaskSource = message.role === "user" && (
+      (queueSource?.success === true
+        && store.isSessionTaskQueueSource(session.id, queueSource.data))
+      || store.isSessionTaskTurnSource(session.id, message.turnId)
+    );
+    const text = scheduledTaskSource
+      ? scheduledTaskPromptProjectionMarker
+      : boundedText(message.text, 64_000);
     messages.push({
       kind: message.role === "user" ? "user_message" : "assistant_message",
-      text: boundedText(message.text, 64_000),
+      text,
       turnId: message.turnId,
     });
     messagesByTurn.set(message.turnId, messages);

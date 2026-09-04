@@ -11,6 +11,12 @@ import {
 } from "./session-events";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "./usage-metrics";
 import {
+  sessionTaskIntervalMinutesSchema,
+  sessionTaskNameSchema,
+  sessionTaskPromptSchema,
+  sessionTaskStatusSchema,
+} from "./session-tasks";
+import {
   WORK_EVENT_PAGE_LIMIT,
   WORK_TASK_HISTORY_ITEM_LIMIT,
   WORK_WAIT_MAX_MS,
@@ -27,9 +33,11 @@ import {
   profileIdSchema,
   projectIdSchema,
   sessionIdSchema,
+  sessionTaskIdSchema,
   titleSchema,
   unixMillisecondsSchema,
   utf8Bytes,
+  positiveRevisionSchema,
 } from "./values";
 
 const selectorSchema = z.string().trim().min(1).max(200);
@@ -217,6 +225,54 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.preset"), session: selectorSchema, preset: presetSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.fast"), session: selectorSchema, enabled: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.project"), session: selectorSchema, project: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({
+    kind: z.literal("session.task.list"),
+    session: selectorSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("session.task.show"),
+    session: selectorSchema,
+    task: sessionTaskIdSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("session.task.create"),
+    session: selectorSchema,
+    name: sessionTaskNameSchema,
+    everyMinutes: sessionTaskIntervalMinutesSchema,
+    paused: z.boolean(),
+    prompt: sessionTaskPromptSchema,
+    idempotencyKey: requiredIdempotencyKeySchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("session.task.edit"),
+    session: selectorSchema,
+    task: sessionTaskIdSchema,
+    expectedRevision: positiveRevisionSchema,
+    name: sessionTaskNameSchema.optional(),
+    everyMinutes: sessionTaskIntervalMinutesSchema.optional(),
+    prompt: sessionTaskPromptSchema.optional(),
+    status: sessionTaskStatusSchema.optional(),
+    idempotencyKey: requiredIdempotencyKeySchema,
+  }).strict().superRefine((value, context) => {
+    if (
+      value.name === undefined
+      && value.everyMinutes === undefined
+      && value.prompt === undefined
+      && value.status === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Session task edit requires at least one changed field.",
+      });
+    }
+  }),
+  z.object({
+    kind: z.literal("session.task.delete"),
+    session: selectorSchema,
+    task: sessionTaskIdSchema,
+    expectedRevision: positiveRevisionSchema,
+    idempotencyKey: requiredIdempotencyKeySchema,
+  }).strict(),
   z.object({ kind: z.literal("turn.inspect"), session: selectorSchema, turn: selectorSchema }).strict(),
   z.object({
     kind: z.literal("interaction.list"),

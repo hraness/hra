@@ -17,6 +17,8 @@ import {
   type CodexFact,
   type CodexPluginCatalog,
   type CodexPluginSummary,
+  type ConversationAutomationToolCall,
+  type DynamicToolPublicResult,
 } from "../codex/index";
 import {
   signedOutSessionListMetadataSchema,
@@ -40,6 +42,11 @@ import {
   type SessionStatus,
 } from "../domain/observation";
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
+import {
+  SESSION_CONVERSATION_AUTOMATION_CAPABILITY,
+  summarizeSessionTask,
+  type SessionTaskPatch,
+} from "../domain/session-tasks";
 import { sessionEventPageSchema, type SessionEventBody, type SessionEventPage } from "../domain/session-events";
 import {
   AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT,
@@ -78,7 +85,12 @@ import {
 } from "../domain/work";
 import { describeWorkProtocol } from "../domain/work-protocol";
 import { workPreparedEffectMessage } from "../domain/work-message";
-import { canonicalLabelKey, profileIdSchema, sessionIdSchema } from "../domain/values";
+import {
+  canonicalLabelKey,
+  profileIdSchema,
+  sessionIdSchema,
+  sessionTaskIdSchema,
+} from "../domain/values";
 import { initializeProfilePaths, profilePaths, type StatePaths } from "../storage/paths";
 import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
 import { WorkCapabilityCodec } from "../storage/work-capability";
@@ -101,6 +113,10 @@ import {
   type WorkPreparedEffectAuthorization,
   type WorkStore,
 } from "../storage/work-store";
+import {
+  SessionTaskStoreError,
+  type SessionTaskStore,
+} from "../storage/session-task-store";
 import { DaemonAuthoritySafetyError, type DaemonAuthorityFence } from "./daemon-lock";
 import type { HraFactsMemoryLifecyclePort } from "./facts-memory-lifecycle";
 import { commandFailureBrand } from "./local-transport";
@@ -460,6 +476,25 @@ const stoppedReceiptSchema = z.discriminatedUnion("stopped", [
 const renamedReceiptSchema = z.object({ renamed: z.literal(true) }).strict();
 
 const digestText = (value: string): string => createHash("sha256").update(value).digest("hex");
+const conversationAutomationIdempotencyKey = (
+  authority: ProfileAuthority,
+  call: ConversationAutomationToolCall,
+): string => {
+  const digest = createHash("sha256")
+    .update("hra:conversation-automation-call:v1\0", "utf8")
+    .update(authority.id, "utf8")
+    .update("\0", "utf8")
+    .update(call.threadId, "utf8")
+    .update("\0", "utf8")
+    .update(call.turnId, "utf8")
+    .update("\0", "utf8")
+    .update(call.callId, "utf8")
+    .digest();
+  digest[6] = (digest[6] ?? 0) & 0x0f | 0x50;
+  digest[8] = (digest[8] ?? 0) & 0x3f | 0x80;
+  const hex = digest.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+};
 const accountFingerprintForProfile = (
   profile: Pick<ProfileRecord, "providerEmail">,
 ): string | null => profile.providerEmail === undefined
@@ -601,6 +636,7 @@ export class HraService {
   readonly #work: WorkStore;
   readonly #workWaiters: WorkEventWaiters;
   readonly #eventRedactor: SessionEventStreamRedactor;
+  readonly #sessionTasks: SessionTaskStore;
   readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
   readonly #daemonGeneration: number;
   readonly #now: () => number;
@@ -623,6 +659,9 @@ export class HraService {
   readonly #interactionDeadlineAbort = new AbortController();
   #interactionDeadlineTask: Promise<void> | undefined;
   #interactionDeadlineWake: (() => void) | undefined;
+  #sessionTaskPumpTask: Promise<void> | undefined;
+  #sessionTaskPumpWake: (() => void) | undefined;
+  #sessionTaskPumpWakeRevision = 0;
   #stopScheduled = false;
   #state: "open" | "closing" | "closed" = "open";
   #terminalFactsMemoryRevision = 1;
@@ -663,6 +702,7 @@ export class HraService {
     this.#usageHistoryCursors = input.usageHistoryCursors
       ?? new UsageHistoryCursorCodec(UsageHistoryCursorCodec.generateKey());
     this.#eventWaiters = input.eventWaiters ?? new SessionEventWaiters();
+    this.#sessionTasks = this.#store.createSessionTaskStore();
     this.#factsMemory = input.factsMemory;
     this.#daemonGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.daemonGeneration ?? 0);
@@ -854,7 +894,72 @@ export class HraService {
           const session = await this.#updateSession(command.session, (current) => ({ projectId: project.id, expectedRevision: current.revision }));
           this.#resetQueuePreEffectRetries(session.id);
           this.#scheduleIdleQueue(session);
+          this.#wakeSessionTaskPump();
           return { session };
+        }
+        case "session.task.list": {
+          const session = this.#store.requireSession(command.session);
+          return {
+            scope: "conversation",
+            sessionId: session.id,
+            tasks: this.#sessionTasks.list(session.id),
+          };
+        }
+        case "session.task.show": {
+          const session = this.#store.requireSession(command.session);
+          return this.#sessionTasks.require(session.id, command.task);
+        }
+        case "session.task.create": {
+          const session = this.#requireBoundSession(command.session);
+          const task = await this.#serializeSessionAuthority(session, () => {
+            const current = this.#requireBoundSession(session.id);
+            return this.#sessionTasks.create({
+              sessionId: current.id,
+              name: command.name,
+              prompt: command.prompt,
+              minutes: command.everyMinutes,
+              status: command.paused ? "paused" : "active",
+              idempotencyKey: command.idempotencyKey,
+            });
+          });
+          this.#wakeSessionTaskPump();
+          return task;
+        }
+        case "session.task.edit": {
+          const session = this.#store.requireSession(command.session);
+          const task = await this.#serializeSessionAuthority(
+            session,
+            () => this.#sessionTasks.edit({
+              sessionId: session.id,
+              taskId: command.task,
+              expectedRevision: command.expectedRevision,
+              patch: {
+                ...(command.name === undefined ? {} : { name: command.name }),
+                ...(command.prompt === undefined ? {} : { prompt: command.prompt }),
+                ...(command.everyMinutes === undefined ? {} : { minutes: command.everyMinutes }),
+                ...(command.status === undefined ? {} : { status: command.status }),
+              },
+              idempotencyKey: command.idempotencyKey,
+            }),
+            { allowDuringProjectionRecovery: true },
+          );
+          this.#wakeSessionTaskPump();
+          return task;
+        }
+        case "session.task.delete": {
+          const session = this.#store.requireSession(command.session);
+          const result = await this.#serializeSessionAuthority(
+            session,
+            () => this.#sessionTasks.delete({
+              sessionId: session.id,
+              taskId: command.task,
+              expectedRevision: command.expectedRevision,
+              idempotencyKey: command.idempotencyKey,
+            }),
+            { allowDuringProjectionRecovery: true },
+          );
+          this.#wakeSessionTaskPump();
+          return result;
         }
         case "turn.inspect": {
           const session = this.#store.requireSession(command.session);
@@ -984,6 +1089,26 @@ export class HraService {
       }
       if (error instanceof WorkEventWaiterLimitError) {
         throw new CommandFailure("UNAVAILABLE", error.message);
+      }
+      if (error instanceof SessionTaskStoreError) {
+        const details = { reason: error.code };
+        switch (error.code) {
+          case "NOT_FOUND":
+          case "SESSION_NOT_FOUND":
+            throw new CommandFailure("NOT_FOUND", error.message, details);
+          case "TASK_LIMIT":
+          case "SCHEDULE_OVERFLOW":
+            throw new CommandFailure("INVALID_INPUT", error.message, details);
+          case "DAEMON_AUTHORITY_CHANGED":
+          case "TIMESTAMP_OVERFLOW":
+            throw new CommandFailure("UNAVAILABLE", error.message, details);
+          case "IDEMPOTENCY_CONFLICT":
+          case "IDEMPOTENCY_REPLAY_SUPERSEDED":
+          case "NO_CHANGES":
+          case "RECEIPT_CAPACITY_EXHAUSTED":
+          case "REVISION_CONFLICT":
+            throw new CommandFailure("CONFLICT", error.message, details);
+        }
       }
       if (error instanceof WorkStoreError) {
         const details = { reason: error.code };
@@ -1218,6 +1343,8 @@ export class HraService {
     this.#interactionDeadlineAbort.abort(new Error("HRA service is closing."));
     this.#interactionDeadlineWake?.();
     this.#interactionDeadlineWake = undefined;
+    this.#sessionTaskPumpWake?.();
+    this.#sessionTaskPumpWake = undefined;
     this.#daemonAuthority.close();
     this.#closeTask = this.#closeAdmittedService();
     return this.#closeTask;
@@ -1280,6 +1407,7 @@ export class HraService {
     }
     this.#scheduleRecoverySessionObservations(activeSessions);
     this.#wakeInteractionDeadlinePump();
+    this.#wakeSessionTaskPump();
   }
 
   async #recoverPreparedWorkEffects(signal: AbortSignal): Promise<void> {
@@ -1422,6 +1550,97 @@ export class HraService {
       });
     }
     return { examined: due.length, failed };
+  }
+
+  /** Runs one bounded scheduled-task materialization batch for deterministic tests. */
+  async maintainSessionTasks(): Promise<{ materialized: number }> {
+    if (this.#interactionDeadlineMaintenanceStopped()) return { materialized: 0 };
+    await this.#daemonAuthority.assertCurrent();
+    let materialized = 0;
+    while (materialized < 32) {
+      const [result] = await this.#sessionTasks.materializeDue({
+        now: this.#now(),
+        daemonGeneration: this.#daemonGeneration,
+      });
+      await this.#daemonAuthority.assertCurrent();
+      if (result === undefined) break;
+      const session = this.#store.requireSession(result.queue.sessionId);
+      if (session.state === "idle") {
+        this.#scheduleQueueDispatch(session);
+      }
+      materialized += 1;
+    }
+    return { materialized };
+  }
+
+  #wakeSessionTaskPump(): void {
+    if (this.#state !== "open" || this.#interactionDeadlineAbort.signal.aborted) return;
+    this.#sessionTaskPumpWakeRevision += 1;
+    if (this.#sessionTaskPumpTask === undefined) {
+      const task = this.#runSessionTaskPump();
+      this.#sessionTaskPumpTask = task;
+      void task.finally(() => {
+        if (this.#sessionTaskPumpTask === task) this.#sessionTaskPumpTask = undefined;
+      }).catch(() => undefined);
+      return;
+    }
+    this.#sessionTaskPumpWake?.();
+  }
+
+  async #runSessionTaskPump(): Promise<void> {
+    const signal = this.#interactionDeadlineAbort.signal;
+    while (this.#state === "open" && !signal.aborted) {
+      const observedWakeRevision = this.#sessionTaskPumpWakeRevision;
+      let processed: { materialized: number };
+      try {
+        processed = await this.maintainSessionTasks();
+      } catch (error: unknown) {
+        if (
+          this.#interactionDeadlineMaintenanceStopped()
+          || (error instanceof SessionTaskStoreError
+            && error.code === "DAEMON_AUTHORITY_CHANGED")
+        ) return;
+        await this.#waitForSessionTaskPump(60_000, signal, observedWakeRevision);
+        continue;
+      }
+      if (processed.materialized >= 32) continue;
+      const next = this.#sessionTasks.nextDueAt();
+      const delay = next === null
+        ? null
+        : next <= this.#now() && processed.materialized === 0
+          ? 60_000
+          : Math.max(0, next - this.#now());
+      await this.#waitForSessionTaskPump(delay, signal, observedWakeRevision);
+    }
+  }
+
+  async #waitForSessionTaskPump(
+    delayMs: number | null,
+    signal: AbortSignal,
+    observedWakeRevision: number,
+  ): Promise<void> {
+    if (
+      signal.aborted
+      || observedWakeRevision !== this.#sessionTaskPumpWakeRevision
+    ) return;
+    await new Promise<void>((resolveWait) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        if (this.#sessionTaskPumpWake === finish) this.#sessionTaskPumpWake = undefined;
+        resolveWait();
+      };
+      this.#sessionTaskPumpWake = finish;
+      signal.addEventListener("abort", finish, { once: true });
+      if (delayMs !== null) {
+        timer = setTimeout(finish, Math.min(delayMs, 2_147_483_647));
+        timer.unref();
+      }
+    });
   }
 
   #interactionDeadlineMaintenanceStopped(): boolean {
@@ -1593,6 +1812,135 @@ export class HraService {
     }
   }
 
+  async handleConversationAutomationToolCall(
+    authority: ProfileAuthority,
+    call: ConversationAutomationToolCall,
+  ): Promise<DynamicToolPublicResult> {
+    const finish = this.#beginOperation();
+    try {
+      await this.#daemonAuthority.assertCurrent();
+      if (
+        call.authority.profileId !== authority.id
+        || call.authority.processGeneration !== authority.generation
+      ) throw new Error("CONVERSATION_AUTOMATION_AUTHORITY_MISMATCH");
+      const profile = this.#store.requireProfileById(authority.id);
+      if (
+        profile.processGeneration !== authority.generation
+        || profile.state !== "signed_in"
+      ) throw new Error("CONVERSATION_AUTOMATION_AUTHORITY_STALE");
+      const session = this.#store.findSessionByProviderThread(authority.id, call.threadId);
+      if (
+        session === null
+        || session.state === "terminal"
+        || session.state === "recovery_required"
+        || !this.#store.isConversationAutomationEnabled(session.id, call.threadId)
+      ) {
+        throw new Error("CONVERSATION_AUTOMATION_SESSION_UNAVAILABLE");
+      }
+      const idempotencyKey = conversationAutomationIdempotencyKey(authority, call);
+      const result = await this.#serializeSessionAuthority(
+        session,
+        () => {
+          const currentProfile = this.#store.requireProfileById(authority.id);
+          const currentSession = this.#store.findSessionByProviderThread(
+            authority.id,
+            call.threadId,
+          );
+          if (
+            currentProfile.processGeneration !== authority.generation
+            || currentProfile.state !== "signed_in"
+            || currentSession === null
+            || currentSession.id !== session.id
+            || currentSession.state === "terminal"
+            || currentSession.state === "recovery_required"
+            || !this.#store.isConversationAutomationEnabled(currentSession.id, call.threadId)
+          ) throw new Error("CONVERSATION_AUTOMATION_AUTHORITY_STALE");
+          switch (call.operation.mode) {
+            case "list":
+              return this.#sessionTasks.listIdempotent(
+                currentSession.id,
+                idempotencyKey,
+                call.requestDigest,
+              );
+            case "view":
+              return summarizeSessionTask(this.#sessionTasks.requireIdempotent(
+                currentSession.id,
+                sessionTaskIdSchema.parse(call.operation.id),
+                idempotencyKey,
+                call.requestDigest,
+              ));
+            case "create":
+              return summarizeSessionTask(this.#sessionTasks.create({
+                sessionId: currentSession.id,
+                name: call.operation.name,
+                prompt: call.operation.prompt,
+                minutes: call.operation.schedule.minutes,
+                status: call.operation.paused === true ? "paused" : "active",
+                idempotencyKey,
+                receiptDigest: call.requestDigest,
+              }));
+            case "update": {
+              const patch: SessionTaskPatch = {
+                ...(call.operation.name === undefined ? {} : { name: call.operation.name }),
+                ...(call.operation.prompt === undefined ? {} : { prompt: call.operation.prompt }),
+                ...(call.operation.schedule === undefined
+                  ? {}
+                  : { minutes: call.operation.schedule.minutes }),
+                ...(call.operation.status === undefined ? {} : { status: call.operation.status }),
+              };
+              return summarizeSessionTask(this.#sessionTasks.edit({
+                sessionId: currentSession.id,
+                taskId: sessionTaskIdSchema.parse(call.operation.id),
+                expectedRevision: call.operation.revision,
+                patch,
+                idempotencyKey,
+                receiptDigest: call.requestDigest,
+              }));
+            }
+            case "delete":
+              return this.#sessionTasks.delete({
+                sessionId: currentSession.id,
+                taskId: sessionTaskIdSchema.parse(call.operation.id),
+                expectedRevision: call.operation.revision,
+                idempotencyKey,
+                receiptDigest: call.requestDigest,
+              });
+          }
+        },
+        { allowDuringProjectionRecovery: false },
+      );
+      await this.#daemonAuthority.assertCurrent();
+      return result;
+    } finally {
+      finish();
+    }
+  }
+
+  /** Called only after Codex has received a successful dynamic-tool response frame. */
+  notifyConversationAutomationToolResponseWritten(
+    authority: ProfileAuthority,
+    call: ConversationAutomationToolCall,
+  ): void {
+    if (
+      this.#state !== "open"
+      || call.authority.profileId !== authority.id
+      || call.authority.processGeneration !== authority.generation
+    ) return;
+    try {
+      const profile = this.#store.requireProfileById(authority.id);
+      const session = this.#store.findSessionByProviderThread(authority.id, call.threadId);
+      if (
+        profile.processGeneration === authority.generation
+        && profile.state === "signed_in"
+        && session !== null
+        && session.state !== "terminal"
+      ) this.#wakeSessionTaskPump();
+    } catch {
+      // The mutation was already committed and acknowledged; a later state change simply
+      // leaves the durable daemon pump or recovery path to observe it.
+    }
+  }
+
   async observeCodexAccount(
     authority: ProfileAuthority,
     account: CodexAccountProjection,
@@ -1643,6 +1991,7 @@ export class HraService {
           },
         );
         this.#notifyAffectedWork(stateChange.affectedWorkIds);
+        if (account.signedIn) this.#wakeSessionTaskPump();
       };
       const accountKey = `account:${profile.id}`;
       if (!this.#mutationTails.has(accountKey)) {
@@ -1699,6 +2048,7 @@ export class HraService {
           this.#work,
         );
         this.#notifyAffectedWork(retirement.affectedWorkIds);
+        this.#wakeSessionTaskPump();
       });
       return;
     }
@@ -2235,6 +2585,9 @@ export class HraService {
     try {
       if (this.#interactionDeadlineTask !== undefined) {
         await this.#interactionDeadlineTask.catch(() => undefined);
+      }
+      if (this.#sessionTaskPumpTask !== undefined) {
+        await this.#sessionTaskPumpTask.catch(() => undefined);
       }
       await this.#codex.close();
     } catch (error: unknown) {
@@ -5465,6 +5818,7 @@ export class HraService {
             clientMessageId: null,
             messageDigest: null,
             runtimeProfile: review.effectiveRuntimeProfile,
+            conversationAutomationCapability: SESSION_CONVERSATION_AUTOMATION_CAPABILITY,
           },
         });
         localSessionId = local.id;
@@ -5735,6 +6089,11 @@ export class HraService {
     if (session.state === "idle") this.#scheduleQueueDispatch(session);
   }
 
+  #resumeSessionWorkAfterRecovery(session: SessionRecord): void {
+    this.#scheduleIdleQueue(session);
+    this.#wakeSessionTaskPump();
+  }
+
   #resetQueuePreEffectRetries(sessionId: SessionRecord["id"]): void {
     for (const queued of this.#store.listQueue(sessionId)) {
       this.#queuePreEffectRetryCounts.delete(queued.id);
@@ -5864,7 +6223,7 @@ export class HraService {
           resolution: "abandoned",
         });
         await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
-        this.#scheduleIdleQueue(resolved);
+      this.#resumeSessionWorkAfterRecovery(resolved);
         return {
           session: resolved,
           recovery: {
@@ -5894,7 +6253,7 @@ export class HraService {
         },
       });
       await this.#reconcileCommittedSessionFactsMemory(resolved);
-      this.#scheduleIdleQueue(resolved);
+      this.#resumeSessionWorkAfterRecovery(resolved);
       return {
         session: resolved,
         projection,
@@ -5937,7 +6296,7 @@ export class HraService {
         resolutionEvidence: { action: "user_abandon", providerEffectRetried: false, providerStateDeleted: false },
       });
       await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
-      this.#scheduleIdleQueue(resolved);
+      this.#resumeSessionWorkAfterRecovery(resolved);
       return { session: resolved, idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
     }
 
@@ -5964,7 +6323,7 @@ export class HraService {
         provider,
       });
       await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
-      this.#scheduleIdleQueue(resolved);
+      this.#resumeSessionWorkAfterRecovery(resolved);
       return { session: resolved, projection, idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
     }
 
@@ -5982,7 +6341,7 @@ export class HraService {
       provider,
     });
     await this.#reconcileCommittedSessionFactsMemory(resolved);
-    this.#scheduleIdleQueue(resolved);
+      this.#resumeSessionWorkAfterRecovery(resolved);
     return { session: resolved, projection, idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false } };
   }
 
@@ -6053,7 +6412,7 @@ export class HraService {
         provider,
       });
       await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
-      this.#scheduleIdleQueue(resolved);
+      this.#resumeSessionWorkAfterRecovery(resolved);
       return { session: resolved, projection, queueId: record.queueId, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
     }
     const matches = new Set((projection.messages ?? [])
@@ -6073,7 +6432,7 @@ export class HraService {
       provider,
     });
     await this.#reconcileCommittedSessionFactsMemory(resolved);
-    this.#scheduleIdleQueue(resolved);
+      this.#resumeSessionWorkAfterRecovery(resolved);
     return { session: resolved, projection, queueId: record.queueId, recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false } };
   }
 
@@ -6296,6 +6655,7 @@ export class HraService {
         runtimeProfile: result.effectiveRuntimeProfile,
         receipt: { turnId: result.turnId, sourceId: queued.id, status: result.status },
       });
+      this.#wakeSessionTaskPump();
       const observed = this.#store.requireSession(session.id);
       if (observed.state === "idle") this.#scheduleQueueDispatch(observed);
     } catch (error: unknown) {
@@ -6315,6 +6675,7 @@ export class HraService {
       }
       try {
         if (!this.#store.failQueueEffect(queued.id)) return;
+        this.#wakeSessionTaskPump();
       } catch (settlementError: unknown) {
         if (settlementError instanceof StateSecurityScrubRequiredError) {
           this.#requestStop();

@@ -1334,6 +1334,8 @@ describe("CLI entry point", () => {
     expect(group.read().stdout).toContain("HRA session");
     expect(group.read().stdout).toContain("hra session events");
     expect(group.read().stdout).toContain("hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]");
+    expect(group.read().stdout).toContain("hra session task create <session>");
+    expect(group.read().stdout).toContain("They never create a standalone task or a new conversation.");
     expect(group.read().stdout).not.toContain("hra device pair");
     expect(group.read().stderr).toBe("");
 
@@ -2805,6 +2807,9 @@ describe("CLI entry point", () => {
       ["session", "steer", "session-1", privatePayload, "--json"],
       ["session", "stop", "session-1", "--json"],
       ["session", "rename", "session-1", privatePayload, "--json"],
+      ["session", "task", "create", "session-1", "--name", "review", "--every-minutes", "15", "--json", "--", privatePayload],
+      ["session", "task", "edit", "session-1", `stask_${"1".repeat(32)}`, "--revision", "1", "--json", "--", privatePayload],
+      ["session", "task", "delete", "session-1", `stask_${"1".repeat(32)}`, "--revision", "1", "--json"],
     ] as const;
 
     for (const argv of commands) {
