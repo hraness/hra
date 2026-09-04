@@ -235,13 +235,18 @@ export type DeviceCommandLoginStatus =
 
 /**
  * What the daemon settles back to the requesting browser. `account_login_start`
- * returns a relayed provider login URL: it is encrypted under the account key
- * like every other payload, carries its own short expiry, and the hosted row
- * releases it exactly once (`deviceCommands:consumeResult`).
+ * returns the complete provider device-code handoff: it is encrypted under the
+ * account key like every other payload, carries its own short expiry, and the
+ * hosted row releases it exactly once (`deviceCommands:consumeResult`).
  */
 export type DeviceCommandResultPayload =
   | Readonly<{ kind: "session_start"; sessionPublicId: string }>
-  | Readonly<{ expiresAt: number; kind: "account_login_start"; loginUrl: string }>
+  | Readonly<{
+      expiresAt: number;
+      kind: "account_login_start";
+      loginUrl: string;
+      userCode: string;
+    }>
   | Readonly<{
       instruction: string;
       kind: "account_login_status";
@@ -251,6 +256,7 @@ export type DeviceCommandResultPayload =
 
 export const deviceCommandLimits = Object.freeze({
   instructionCharacters: 512,
+  loginUserCodeCharacters: 38,
   loginUrlCharacters: 2_048,
   promptCharacters: 16_000,
 } as const);
@@ -275,6 +281,13 @@ export function isRelayedLoginUrl(value: unknown): value is string {
     && parsed.password === ""
     && parsed.hostname.length > 0
     && parsed.href === value;
+}
+
+/** The same closed device-code grammar accepted by the protected CLI handoff. */
+export function isRelayedLoginUserCode(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= deviceCommandLimits.loginUserCodeCharacters
+    && /^[A-Z0-9]{4,12}(?:-[A-Z0-9]{4,12}){0,2}$/u.test(value);
 }
 
 export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload | null {
@@ -335,15 +348,17 @@ export function parseDeviceCommandResultPayload(
   ) return { kind: value.kind, sessionPublicId: value.sessionPublicId };
   if (
     value.kind === "account_login_start"
-    && hasExactKeys(value, ["expiresAt", "kind", "loginUrl"])
+    && hasExactKeys(value, ["expiresAt", "kind", "loginUrl", "userCode"])
     && Number.isSafeInteger(value.expiresAt)
     && (value.expiresAt as number) > 0
     && isRelayedLoginUrl(value.loginUrl)
+    && isRelayedLoginUserCode(value.userCode)
   ) {
     return {
       expiresAt: value.expiresAt as number,
       kind: value.kind,
       loginUrl: value.loginUrl,
+      userCode: value.userCode,
     };
   }
   if (

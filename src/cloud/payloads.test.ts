@@ -13,6 +13,7 @@ import {
   encryptDeviceRegistry,
   encryptUsageProjection,
   encryptRemoteCommand,
+  isRelayedLoginUserCode,
   isRelayedLoginUrl,
   parseDeviceCommandPayload,
   parseDeviceCommandResultPayload,
@@ -383,17 +384,21 @@ describe("device command payloads", () => {
     })).toBeNull();
   });
 
-  test("a relayed login URL is https, credential free, and bounded", () => {
-    expect(isRelayedLoginUrl("https://auth.example.test/device?code=abc")).toBe(true);
+  test("a relayed device-code handoff has a safe URL and a closed user code", () => {
+    expect(isRelayedLoginUrl("https://auth.example.test/device")).toBe(true);
     expect(isRelayedLoginUrl("http://localhost:1455/callback")).toBe(false);
     expect(isRelayedLoginUrl("https://user:pass@auth.example.test/")).toBe(false);
     expect(isRelayedLoginUrl("javascript:alert(1)")).toBe(false);
     expect(isRelayedLoginUrl(
       `https://auth.example.test/${"a".repeat(deviceCommandLimits.loginUrlCharacters)}`,
     )).toBe(false);
+    expect(isRelayedLoginUserCode("ABCD-EFGH")).toBe(true);
+    expect(isRelayedLoginUserCode("ABCD EFGH")).toBe(false);
+    expect(isRelayedLoginUserCode("abcd-efgh")).toBe(false);
+    expect(isRelayedLoginUserCode(`ABCD-${"E".repeat(13)}`)).toBe(false);
   });
 
-  test("result payloads carry only what their kind promises", () => {
+  test("result payloads require the complete current handoff and each exact kind shape", () => {
     expect(parseDeviceCommandResultPayload({
       kind: "session_start",
       sessionPublicId: "sess_0000000000000001",
@@ -402,11 +407,26 @@ describe("device command payloads", () => {
       expiresAt: 1,
       kind: "account_login_start",
       loginUrl: "https://auth.example.test/device",
+      userCode: "ABCD-EFGH",
     })).not.toBeNull();
     expect(parseDeviceCommandResultPayload({
       expiresAt: 1,
       kind: "account_login_start",
       loginUrl: "http://auth.example.test/device",
+      userCode: "ABCD-EFGH",
+    })).toBeNull();
+    // A URL-only result from an older daemon must not masquerade as a usable
+    // phone handoff. Settings reports it as incompatible and asks for an update.
+    expect(parseDeviceCommandResultPayload({
+      expiresAt: 1,
+      kind: "account_login_start",
+      loginUrl: "https://auth.example.test/device",
+    })).toBeNull();
+    expect(parseDeviceCommandResultPayload({
+      expiresAt: 1,
+      kind: "account_login_start",
+      loginUrl: "https://auth.example.test/device",
+      userCode: "not a device code",
     })).toBeNull();
     expect(parseDeviceCommandResultPayload({
       instruction: "No login is in progress.",
@@ -436,10 +456,16 @@ describe("device command payloads", () => {
     const envelope = await encryptDeviceCommand(sessionStart, key, commandAuthority);
     expect(await decryptDeviceCommand(envelope, key, commandAuthority)).toEqual(sessionStart);
     // The two authorities are separate: a command envelope never decrypts as a
-    // result, so a relayed login URL cannot be produced by replaying a request.
+    // result, so a relayed login handoff cannot be produced by replaying a request.
     await expectPromiseToReject(decryptDeviceCommandResult(envelope, key, resultAuthority));
-    const result = { accountsRefreshed: 2, kind: "usage_refresh" } as const;
+    const result = {
+      expiresAt: 1_760_000_000_000,
+      kind: "account_login_start",
+      loginUrl: "https://auth.example.test/device",
+      userCode: "ABCD-EFGH",
+    } as const;
     const resultEnvelope = await encryptDeviceCommandResult(result, key, resultAuthority);
+    expect(JSON.stringify(resultEnvelope)).not.toContain(result.userCode);
     expect(await decryptDeviceCommandResult(resultEnvelope, key, resultAuthority)).toEqual(result);
   });
 

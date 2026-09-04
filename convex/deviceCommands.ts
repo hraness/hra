@@ -66,7 +66,7 @@ const terminalStates: readonly CommandState[] = [
   "expired",
 ];
 
-// Only `account_login_start` returns something a second reader must never see.
+// Only `account_login_start` returns a handoff a second reader must never see.
 const singleUseResultKinds: readonly DeviceCommandKind[] = ["account_login_start"];
 
 function terminalCleanupFields(
@@ -374,7 +374,7 @@ export const acknowledgeReceipt = mutation({
 /**
  * Exchanges a single-use result exactly once. Only the device that asked for it
  * may read it, the ciphertext is cleared in the same transaction, and a second
- * call reports `spent` rather than replaying the relay URL.
+ * call reports `spent` rather than replaying the URL and one-time user code.
  */
 export const consumeResult = mutation({
   args: { commandPublicId: v.string() },

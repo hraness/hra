@@ -35,6 +35,7 @@ import {
 } from "../domain/interactions";
 import {
   deviceRegistryLimits,
+  isRelayedLoginUserCode,
   isRelayedLoginUrl,
   type DeviceCommandPayload,
   type DeviceRegistryPayload,
@@ -3738,21 +3739,24 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   ): Promise<CloudDeviceCommandExecutionResult> {
     const response = await this.#executeLocal({
       account: accountPublicId,
-      deviceCode: false,
+      // A browser on another device cannot complete Codex's loopback browser
+      // login. The web lane is therefore always the managed device-code flow.
+      deviceCode: true,
       idempotencyKey: deriveDeviceEffectKey(idempotencyKey, "account-login"),
       kind: "account.login",
     }, { signal });
-    const loginUrl = relayedLoginUrlFrom(response);
-    // A login whose provider URL is a loopback callback cannot be completed on
-    // another device. Rather than relay something that cannot work, the command
-    // fails closed and the browser falls back to status polling and the CLI.
-    if (loginUrl === null) return { code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" };
+    const handoff = relayedLoginHandoffFrom(response);
+    // Both values are required to complete Codex device authorization. Refuse
+    // an incomplete or unsafe handoff rather than spending the single-use read
+    // on a login the requesting browser cannot finish.
+    if (handoff === null) return { code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" };
     return {
       code: "APPLIED",
       result: {
         expiresAt: this.#registryNow() + relayedLoginLifetimeMs,
         kind: "account_login_start",
-        loginUrl,
+        loginUrl: handoff.loginUrl,
+        userCode: handoff.userCode,
       },
       singleUseResult: true,
       state: "applied",
@@ -3794,7 +3798,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   }
 }
 
-/** How long a relayed provider login URL stays usable. */
+/** How long a relayed provider device-code handoff stays usable. */
 const relayedLoginLifetimeMs = 5 * 60 * 1_000;
 
 /**
@@ -3826,13 +3830,20 @@ function requireStartedSessionId(value: unknown): string {
 }
 
 /**
- * The relayable provider login URL, or null when the daemon's login response
- * has none or offers one that cannot be completed on another device.
+ * The complete relayable provider device-code handoff, or null when the
+ * daemon's login response is incomplete or unsafe for another device.
  */
-function relayedLoginUrlFrom(value: unknown): string | null {
+function relayedLoginHandoffFrom(
+  value: unknown,
+): Readonly<{ loginUrl: string; userCode: string }> | null {
   if (!isRecord(value) || !isRecord(value.login)) return null;
-  const url: unknown = value.login.verificationUrl;
-  return isRelayedLoginUrl(url) ? url : null;
+  const loginUrl: unknown = value.login.verificationUrl;
+  const userCode: unknown = value.login.userCode;
+  return value.login.status === "pending"
+    && isRelayedLoginUrl(loginUrl)
+    && isRelayedLoginUserCode(userCode)
+    ? { loginUrl, userCode }
+    : null;
 }
 
 type RemoteInteractionVerification =

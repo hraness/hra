@@ -4188,9 +4188,19 @@ async function deviceCommandFixture() {
     codex: value.codex,
     executeLocal: (command) => {
       executed.push(command);
-      return Promise.resolve(command.kind === "session.start"
-        ? { session: { id: value.sessionId } }
-        : {});
+      if (command.kind === "session.start") {
+        return Promise.resolve({ session: { id: value.sessionId } });
+      }
+      if (command.kind === "account.login") {
+        return Promise.resolve({
+          login: {
+            loginId: "login_incomplete",
+            status: "pending",
+            verificationUrl: "https://auth.example.test/device",
+          },
+        });
+      }
+      return Promise.resolve({});
     },
     executeRemote: () => Promise.resolve({}),
     notifyOperator: (input) => { notices.push(input.title); return Promise.resolve(); },
@@ -4308,7 +4318,7 @@ describe("device command execution", () => {
     }
   });
 
-  test("account linking needs the local opt-in and refuses a non-relayable URL", async () => {
+  test("account linking needs the local opt-in and a complete device-code handoff", async () => {
     const world = await deviceCommandFixture();
     try {
       const signal = new AbortController().signal;
@@ -4321,30 +4331,45 @@ describe("device command execution", () => {
       })).toEqual({ code: "ACCOUNT_LINKING_DENIED", state: "failed" });
 
       world.value.store.setAccountLinkingAllowed(true);
-      // The daemon's login returned a loopback callback, which no other device
-      // can complete: the command fails closed rather than relaying it.
+      // A verification URL without the separate one-time user code is not a
+      // usable Codex device-code handoff, so the command fails closed.
       expect(await world.adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000005",
         payload,
         requestingDevicePublicId: "device_browser1",
         signal,
       })).toEqual({ code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" });
+      expect(world.executed).toHaveLength(1);
+      expect(world.executed[0]).toMatchObject({
+        account: world.account.id,
+        deviceCode: true,
+        kind: "account.login",
+      });
     } finally {
       world.adapter.close();
       world.value.store.close();
     }
   });
 
-  test("relays a single-use https login URL when the machine has opted in", async () => {
+  test("relays the complete single-use device-code handoff when the machine has opted in", async () => {
     const value = await fixture();
     const account = value.store.listProfiles()[0];
     if (account === undefined) throw new Error("missing account fixture");
     value.store.setAccountLinkingAllowed(true);
+    const executed: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
-      executeLocal: () => Promise.resolve({
-        login: { loginId: "login_1", status: "pending", verificationUrl: "https://auth.example.test/device?code=abc" },
-      }),
+      executeLocal: (command) => {
+        executed.push(command);
+        return Promise.resolve({
+          login: {
+            loginId: "login_1",
+            status: "pending",
+            userCode: "ABCD-EFGH",
+            verificationUrl: "https://auth.example.test/device",
+          },
+        });
+      },
       executeRemote: () => Promise.resolve({}),
       now: () => 1_760_000_000_000,
       paths: value.paths,
@@ -4361,7 +4386,13 @@ describe("device command execution", () => {
       expect(outcome.result).toEqual({
         expiresAt: 1_760_000_000_000 + 5 * 60 * 1_000,
         kind: "account_login_start",
-        loginUrl: "https://auth.example.test/device?code=abc",
+        loginUrl: "https://auth.example.test/device",
+        userCode: "ABCD-EFGH",
+      });
+      expect(executed[0]).toMatchObject({
+        account: account.id,
+        deviceCode: true,
+        kind: "account.login",
       });
     } finally {
       adapter.close();
