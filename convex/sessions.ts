@@ -1,4 +1,4 @@
-import { v } from "convex/values";
+import { v, type GenericId as Id } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 
 import {
@@ -20,12 +20,20 @@ import {
 } from "./idempotency";
 import { requireLiveExecutionLease } from "./leases";
 import {
+  LIVE_TAIL_CHUNK_TTL_MS,
+  LIVE_TAIL_ROW_CAP,
+  LIVE_TAIL_ROW_CAP_TRIGGER,
+} from "./lifecyclePolicy";
+import {
   adjustQuotaForPatch,
+  releaseLiveChunkResourceForDelete,
+  releaseSessionChunkQuotaForDelete,
+  reserveLiveChunkResourceForInsert,
   reserveQuotaForInsert,
   reserveSessionChunkQuotaForInsert,
   reserveSessionHeadQuotaForInsert,
 } from "./quota";
-import { mutation, query } from "./server";
+import { mutation, query, type MutationCtx } from "./server";
 import {
   authorityTuple,
   encryptedEnvelope,
@@ -102,6 +110,105 @@ function currentCompactRecoveryGap(session: Readonly<{ compactHasRecoveryGap?: b
   const gap = session.compactHasRecoveryGap ?? false;
   if (typeof gap !== "boolean") rejectAuthority();
   return gap;
+}
+
+function currentDetailStreamEpoch(session: Readonly<{ detailStreamEpoch?: number }>): number {
+  const epoch = session.detailStreamEpoch ?? 0;
+  if (!isSafeNonNegativeInteger(epoch)) rejectAuthority();
+  return epoch;
+}
+
+/**
+ * Records a live_tail retention cut for the detail stream, mirroring the
+ * compact sessionStreamEpochs mechanism but system-driven: no device
+ * authority, idempotency key, or client replay protocol, since it is never
+ * initiated by a client request. Called once per prune batch (never once
+ * per deleted row) so an active session does not accumulate one epoch row
+ * per pruned chunk. The caller is responsible for deleting the pruned rows
+ * and releasing their quota; this only records the boundary and bumps the
+ * session's detailStreamEpoch.
+ */
+export async function beginDetailRetentionEpoch(
+  ctx: MutationCtx,
+  session: Readonly<{
+    _id: Id<"sessionHeads">;
+    detailStreamEpoch?: number;
+    executionDeviceId: Id<"devices">;
+    projectionRevision: number;
+    userId: Id<"users">;
+  }>,
+  boundaryHeadSequence: number,
+  boundaryTailDigest: string,
+): Promise<number> {
+  const predecessorEpoch = currentDetailStreamEpoch(session);
+  const nextEpoch = predecessorEpoch + 1;
+  if (!isSafePositiveInteger(nextEpoch)) rejectAuthority();
+  const now = Date.now();
+  const epochDocument = {
+    authority: { bootGeneration: 0, bootId: "system-live-tail-sweep", fence: 0 },
+    boundaryHeadSequence,
+    boundaryTailDigest,
+    createdAt: now,
+    epoch: nextEpoch,
+    idempotencyKey: `live-tail-retention:${session._id}:${String(nextEpoch)}`,
+    lineageCommitment: boundaryTailDigest,
+    predecessorEpoch,
+    projectionRevision: session.projectionRevision,
+    publicId: crypto.randomUUID(),
+    reason: "live_tail_retention",
+    requestDigest: boundaryTailDigest,
+    sessionId: session._id,
+    sourceDeviceId: session.executionDeviceId,
+    stream: "detail",
+    userId: session.userId,
+  } as const;
+  await reserveQuotaForInsert(ctx, session.userId, "chunk", epochDocument);
+  await ctx.db.insert("sessionStreamEpochs", epochDocument);
+  await adjustQuotaForPatch(ctx, session.userId, "session", session, {
+    detailStreamEpoch: nextEpoch,
+  });
+  await ctx.db.patch(session._id, { detailStreamEpoch: nextEpoch });
+  return nextEpoch;
+}
+
+/**
+ * Amortized live_tail row-cap enforcement: only prunes once a session holds
+ * more than LIVE_TAIL_ROW_CAP + LIVE_TAIL_ROW_CAP_TRIGGER detail chunk rows,
+ * and then deletes back down to LIVE_TAIL_ROW_CAP in one batch with exactly
+ * one retention epoch for the whole batch. This keeps the common append
+ * path (a session under the cap) to its existing single indexed read.
+ */
+export async function enforceLiveTailRowCap(
+  ctx: MutationCtx,
+  session: Readonly<{
+    _id: Id<"sessionHeads">;
+    detailStreamEpoch?: number;
+    executionDeviceId: Id<"devices">;
+    projectionRevision: number;
+    userId: Id<"users">;
+  }>,
+): Promise<number> {
+  const window = LIVE_TAIL_ROW_CAP + LIVE_TAIL_ROW_CAP_TRIGGER + 1;
+  const oldest = await ctx.db
+    .query("sessionChunks")
+    .withIndex("by_session_stream_and_first", (builder) => builder
+      .eq("sessionId", session._id)
+      .eq("stream", "detail"))
+    .order("asc")
+    .take(window);
+  if (oldest.length < window) return 0;
+  const toDelete = oldest.slice(0, LIVE_TAIL_ROW_CAP_TRIGGER + 1);
+  const survivor = oldest[LIVE_TAIL_ROW_CAP_TRIGGER];
+  const cutDigest = toDelete.at(-1)?.digest;
+  if (survivor === undefined || cutDigest === undefined) rejectAuthority();
+  await beginDetailRetentionEpoch(ctx, session, survivor.firstSequence - 1, cutDigest);
+  for (const chunk of toDelete) {
+    if (chunk.userId !== session.userId) rejectAuthority();
+    await releaseSessionChunkQuotaForDelete(ctx, session.userId, chunk);
+    await releaseLiveChunkResourceForDelete(ctx, session.userId);
+    await ctx.db.delete(chunk._id);
+  }
+  return toDelete.length;
 }
 
 export const create = mutation({
@@ -292,6 +399,7 @@ export const getHead = query({
         : { compactTailDigest: session.compactTailDigest }),
       createdAt: session.createdAt,
       detailHeadSequence: session.detailHeadSequence,
+      detailStreamEpoch: currentDetailStreamEpoch(session),
       ...(session.detailTailDigest === undefined
         ? {}
         : { detailTailDigest: session.detailTailDigest }),
@@ -691,7 +799,7 @@ export const appendChunk = mutation({
       : session.detailTailDigest;
     const streamEpoch = args.stream === "compact"
       ? currentCompactStreamEpoch(session)
-      : 0;
+      : currentDetailStreamEpoch(session);
     if (
       headSequence !== args.expectedHeadSequence
       || streamEpoch !== args.expectedStreamEpoch
@@ -705,6 +813,7 @@ export const appendChunk = mutation({
       createdAt: now,
       digest: args.digest,
       envelope: args.envelope,
+      ...(args.stream === "detail" ? { expiresAt: now + LIVE_TAIL_CHUNK_TTL_MS } : {}),
       firstSequence: args.firstSequence,
       lastSequence: args.lastSequence,
       ...(args.previousDigest === undefined ? {} : { previousDigest: args.previousDigest }),
@@ -715,6 +824,9 @@ export const appendChunk = mutation({
       userId: current.userId,
     } as const;
     await reserveSessionChunkQuotaForInsert(ctx, current.userId, chunkDocument);
+    if (args.stream === "detail") {
+      await reserveLiveChunkResourceForInsert(ctx, current.userId);
+    }
     await ctx.db.insert("sessionChunks", chunkDocument);
     const sessionPatch = {
       ...(args.stream === "compact"
@@ -725,6 +837,9 @@ export const appendChunk = mutation({
     };
     await adjustQuotaForPatch(ctx, current.userId, "session", session, sessionPatch);
     await ctx.db.patch(session._id, sessionPatch);
+    if (args.stream === "detail") {
+      await enforceLiveTailRowCap(ctx, { ...session, ...sessionPatch });
+    }
     return {
       digest: args.digest,
       headSequence: args.lastSequence,

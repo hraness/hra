@@ -10,13 +10,16 @@ import {
   finalizeUserQuotaAuthorityForDelete,
   releaseAccountUsageSnapshotQuotaForDelete,
   releaseCommandQuotaForDelete,
+  releaseLiveChunkResourceForDelete,
   releaseParentAttributedQuotaForDelete,
   releaseQuotaForDelete,
   releaseQuotaForStoredIdentity,
   releaseServiceQuotaForDelete,
+  releaseSessionChunkQuotaForDelete,
   requireHardQuotaAuthority,
 } from "./quota";
 import { internalMutation, type MutationCtx } from "./server";
+import { beginDetailRetentionEpoch } from "./sessions";
 
 const maximumCleanupBatch = 200;
 const categoryQuantum = 20;
@@ -34,6 +37,7 @@ const maintenanceCategories = [
   "usage_snapshots",
   "account_deletion_receipts",
   "device_revocation_jobs",
+  "live_tail_chunks",
 ] as const;
 type MaintenanceCategory = typeof maintenanceCategories[number];
 
@@ -60,6 +64,7 @@ type CleanupCounts = {
   deviceRevocationJobs: number;
   expiredPendingCommands: number;
   idempotencyReceipts: number;
+  liveTailChunks: number;
   otpChallenges: number;
   securityEvents: number;
   terminalCommands: number;
@@ -67,6 +72,7 @@ type CleanupCounts = {
 };
 
 const countField = {
+  live_tail_chunks: "liveTailChunks",
   auth_attempts: "authAttempts",
   otp_challenges: "otpChallenges",
   auth_invites: "authInvites",
@@ -400,7 +406,57 @@ async function deleteCompletedRevocationJobs(ctx: MutationCtx, now: number, limi
   return records.length;
 }
 
+/*
+ * live_tail retention: detail-stream chunks carry an expiresAt deadline set at
+ * append time. Expired rows are removed per session behind one detail
+ * retention epoch per session per sweep, so digest-chain verification of the
+ * surviving tail stays valid, and both the session_chunk charge and the
+ * live_chunk resource counter are released.
+ */
+async function deleteExpiredLiveTailChunks(ctx: MutationCtx, now: number, limit: number): Promise<number> {
+  const expired = await ctx.db.query("sessionChunks")
+    .withIndex("by_stream_and_expires_at", (builder) => builder
+      .eq("stream", "detail")
+      .lt("expiresAt", now))
+    .take(limit);
+  if (expired.length === 0) return 0;
+  const bySession = new Map<string, typeof expired>();
+  for (const chunk of expired) {
+    const list = bySession.get(chunk.sessionId) ?? [];
+    list.push(chunk);
+    bySession.set(chunk.sessionId, list);
+  }
+  let deleted = 0;
+  for (const chunks of bySession.values()) {
+    const first = chunks[0];
+    if (first === undefined) continue;
+    const session = await ctx.db.get(first.sessionId);
+    if (session === null) {
+      for (const chunk of chunks) {
+        await releaseSessionChunkQuotaForDelete(ctx, chunk.userId, chunk);
+        await releaseLiveChunkResourceForDelete(ctx, chunk.userId);
+        await ctx.db.delete(chunk._id);
+        deleted += 1;
+      }
+      continue;
+    }
+    chunks.sort((left, right) => left.firstSequence - right.firstSequence);
+    const last = chunks.at(-1);
+    if (last === undefined) continue;
+    await beginDetailRetentionEpoch(ctx, session, last.lastSequence, last.digest);
+    for (const chunk of chunks) {
+      if (chunk.userId !== session.userId) throw new Error("Maintenance authority is corrupt.");
+      await releaseSessionChunkQuotaForDelete(ctx, session.userId, chunk);
+      await releaseLiveChunkResourceForDelete(ctx, session.userId);
+      await ctx.db.delete(chunk._id);
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
 const handlers = {
+  live_tail_chunks: deleteExpiredLiveTailChunks,
   auth_attempts: deleteExpiredAuthAttempts,
   otp_challenges: deleteExpiredOtpChallenges,
   auth_invites: deleteExpiredInvites,
@@ -429,6 +485,7 @@ const emptyCounts = (): CleanupCounts => ({
   deviceRevocationJobs: 0,
   expiredPendingCommands: 0,
   idempotencyReceipts: 0,
+  liveTailChunks: 0,
   otpChallenges: 0,
   securityEvents: 0,
   terminalCommands: 0,

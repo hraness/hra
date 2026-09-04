@@ -166,7 +166,7 @@ Every hosted change is a separate attested deploy through the candidate chain (`
 
 | Wave | State | Evidence |
 | --- | --- | --- |
-| W1 | Not started | - |
+| W1 | Implemented 2026-09-04 on `claude/w1` (rebased over v0.3.0 and the conversation scheduled tasks of PR 91; store schema version 30) | Live projection on the `detail` stream (batcher with redaction carry-over, one-second live loop, `live_tail` retention, sweeper, epoch pruning, `live_chunk` quota); session-state classifier with the content-free corpus fixture (81% agreement, full attention recall, zero human-action rows as approvals) and `hra session state`; approval modes with protocol autorespond, evidence, budgets, and `hra autorespond`; `resolve_interaction` and `send_or_steer` with the decision lane, custodian verification, requesting-device gate, and `hra remote resolve`; interaction `presentation`; spikes recorded in `kb/notes/codex-schedules.md` and `docs/providers/claude.md`. Deferred from W1 to the start of W2: the websocket push-wake and adaptive interval (steering latency stays at the poll interval until then). |
 | W2 | Not started | - |
 | W3 | Not started | - |
 

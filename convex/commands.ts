@@ -196,7 +196,15 @@ function publicCommand(command: Readonly<{
   boundAuthority?: AuthorityTuple;
   createdAt: number;
   deadline: number;
-  kind: "send" | "queue" | "steer" | "stop" | "set_model" | "set_fast";
+  kind:
+    | "send"
+    | "queue"
+    | "steer"
+    | "stop"
+    | "set_model"
+    | "set_fast"
+    | "resolve_interaction"
+    | "send_or_steer";
   payload: Parameters<typeof parseEncryptedEnvelope>[0];
   publicId: string;
   result?: Parameters<typeof parseEncryptedEnvelope>[0];
@@ -280,17 +288,20 @@ export const get = query({
       || (command.requestingDeviceId !== authority.deviceId
         && command.targetDeviceId !== authority.deviceId)
     ) rejectAuthority();
-    const [session, targetDevice] = await Promise.all([
+    const [session, targetDevice, requestingDevice] = await Promise.all([
       ctx.db.get(command.sessionId),
       ctx.db.get(command.targetDeviceId),
+      ctx.db.get(command.requestingDeviceId),
     ]);
     if (
       session?.userId !== authority.userId
       || targetDevice?.userId !== authority.userId
+      || requestingDevice?.userId !== authority.userId
     ) rejectAuthority();
     return {
       ...publicCommand(command, session.publicId),
       requestDigest: command.requestDigest,
+      requestingDevicePublicId: requestingDevice.publicId,
       targetDevicePublicId: targetDevice.publicId,
     };
   },
