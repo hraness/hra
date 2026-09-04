@@ -30,7 +30,14 @@ const layerRules = (patterns) => ({
 
 export default tseslint.config(
   {
-    ignores: ["dist/**", "node_modules/**", "convex/_generated/**", "site/dist/**", "eslint.config.mjs"],
+    ignores: [
+      "app/dist/**",
+      "convex/_generated/**",
+      "dist/**",
+      "eslint.config.mjs",
+      "node_modules/**",
+      "site/dist/**",
+    ],
   },
   eslint.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
@@ -165,7 +172,22 @@ export default tseslint.config(
     ]),
   },
   {
-    files: ["**/*.test.ts"],
+    // The browser app is a separate consumer of the repository, not another
+    // `src/` layer. It may reach only the browser-safe cloud modules and the
+    // domain leaf, and it reaches those through `app/src/hra/`. Every other
+    // `src/cloud` module is node-only (daemon adapters, journals, on-disk
+    // secret custody) and must never enter the bundle.
+    files: ["app/**/*.ts", "app/**/*.tsx"],
+    rules: layerRules([
+      {
+        regex: "(^|/)src/(?!cloud/(client|contracts|crypto|payloads|projection)(\\.ts)?$)(?!domain/)",
+        message:
+          "app/ imports repository source only from src/cloud/{crypto,projection,payloads,contracts,client} and src/domain/*, through app/src/hra/.",
+      },
+    ]),
+  },
+  {
+    files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
       "@typescript-eslint/await-thenable": "off",
       "@typescript-eslint/no-non-null-assertion": "off",

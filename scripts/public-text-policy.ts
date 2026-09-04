@@ -11,8 +11,10 @@ const allowedPublicScopes = new Set([
   "convex-dev",
   "eslint",
   "openai",
+  "tailwindcss",
   "types",
   "typescript-eslint",
+  "vitejs",
 ]);
 const allowedPublicScopedPackages = new Set([
   "@hraness/atet",

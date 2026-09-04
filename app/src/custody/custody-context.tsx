@@ -1,0 +1,470 @@
+import { useConvex } from "convex/react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+
+import {
+  accountCurrent,
+  currentRegistration,
+  finishBind,
+  listKeyEnvelopes,
+  beginBind as beginBindReference,
+  presenceConnect,
+  presenceDisconnect,
+  presenceHeartbeat,
+  registerDevice,
+} from "../data/functions";
+import {
+  parseAccountContext,
+  parseBindChallenge,
+  parseDeviceSummary,
+  parseKeyEnvelopes,
+  type AccountContext,
+} from "../data/wire";
+import {
+  accountKeyVersion,
+  enrollmentPollMs,
+  idleLockMs,
+  presenceHeartbeatMs,
+} from "../env";
+import {
+  createCloudUuidV7,
+  randomKeyBytes,
+  signDeviceBind,
+  unwrapAccountDataKey,
+} from "../hra/cloud";
+import { createCancellation } from "../lib/cancellation";
+import { isAuthorityError, wipeBytes } from "./authority";
+import { deviceKeyFingerprint } from "./fingerprint";
+import { createIdleTimer, idleActivityEvents, isLockShortcut } from "./idle";
+import { readDeviceKeys, readOrCreateDeviceKeys, type BrowserDeviceKeys } from "./keystore";
+import { newConnectionId, presenceArgs, type PresenceIdentity } from "./presence";
+import {
+  browserDeviceLabel,
+  encryptDeviceLabel,
+  isDeviceClassValidatorRejection,
+  randomBindNonce,
+  randomOpaqueId,
+  registrationIntent,
+  registrationRequestDigest,
+  selectKeyEnvelope,
+} from "./registration";
+
+export type EnrollmentStage =
+  /** The account has no active device, so a browser cannot be the first one. */
+  | "needs_first_device"
+  /** Keys are not generated yet: this tab has never enrolled. */
+  | "needs_registration"
+  /** Keys exist and a device row exists, but this auth session is not bound. */
+  | "needs_bind"
+  /** Registered and waiting for `hra device approve` against the fingerprint. */
+  | "awaiting_approval"
+  /** The device row was revoked from another device. */
+  | "revoked"
+  /** Registered, approved, and bindable. */
+  | "active"
+  | "unknown";
+
+export type UnlockedIdentity = Readonly<{
+  authEpoch: number;
+  credentialGeneration: number;
+  devicePublicId: string;
+  keyVersion: number;
+  userPublicId: string;
+}>;
+
+type CustodyCommon = Readonly<{
+  busy: boolean;
+  devicePublicId: string | null;
+  enroll: () => Promise<void>;
+  enrollment: EnrollmentStage;
+  error: string | null;
+  fingerprint: string | null;
+  lock: () => void;
+  refresh: () => Promise<void>;
+  reportAuthorityFailure: (error: unknown) => void;
+  unlock: () => Promise<void>;
+}>;
+
+export type Custody =
+  | (CustodyCommon & Readonly<{
+      identity: UnlockedIdentity;
+      key: Uint8Array;
+      state: "unlocked";
+    }>)
+  | (CustodyCommon & Readonly<{ state: "locked" | "unenrolled" }>);
+
+const CustodyContext = createContext<Custody | null>(null);
+
+/**
+ * The unwrapped account key never leaves this module's state. It is held as raw
+ * bytes because `encryptRemoteCommand`, `decryptCompactEvents`, and
+ * `decryptDetailEvents` take the key material rather than a `CryptoKey`; the
+ * bytes are overwritten in place on lock, on any authority failure, and on
+ * unload, and they are never written to storage of any kind.
+ */
+type Unlocked = Readonly<{ identity: UnlockedIdentity; key: Uint8Array }>;
+
+function stageFor(
+  account: AccountContext | null,
+  keys: BrowserDeviceKeys | null,
+): EnrollmentStage {
+  if (account === null) return "unknown";
+  if (account.device === null) {
+    if (keys === null) {
+      return account.hasActiveDevices ? "needs_registration" : "needs_first_device";
+    }
+    return "needs_bind";
+  }
+  if (account.device.status === "revoked") return "revoked";
+  if (account.device.status === "pending") return "awaiting_approval";
+  return keys === null || keys.publicId !== account.device.publicId
+    ? "needs_first_device"
+    : "active";
+}
+
+export function CustodyProvider({ children }: Readonly<{ children: ReactNode }>) {
+  const convex = useConvex();
+  const [account, setAccount] = useState<AccountContext | null>(null);
+  const [keys, setKeys] = useState<BrowserDeviceKeys | null>(null);
+  const [fingerprint, setFingerprint] = useState<string | null>(null);
+  const [unlocked, setUnlocked] = useState<Unlocked | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const presence = useRef<{ connectionId: string; sequence: number } | null>(null);
+  const unlockedRef = useRef<Unlocked | null>(null);
+
+  unlockedRef.current = unlocked;
+
+  const disconnectPresence = useCallback(
+    (identity: UnlockedIdentity) => {
+      const current = presence.current;
+      presence.current = null;
+      if (current === null) return;
+      const presenceIdentity: PresenceIdentity = {
+        authEpoch: identity.authEpoch,
+        credentialGeneration: identity.credentialGeneration,
+        devicePublicId: identity.devicePublicId,
+        userPublicId: identity.userPublicId,
+      };
+      void presenceArgs({
+        connectionId: current.connectionId,
+        identity: presenceIdentity,
+        kind: current.sequence === 0 ? "connect" : "heartbeat",
+        sequence: current.sequence,
+      })
+        .then(async (args) => await convex.mutation(presenceDisconnect, args))
+        .catch(() => undefined);
+    },
+    [convex],
+  );
+
+  const lock = useCallback(() => {
+    const current = unlockedRef.current;
+    if (current !== null) disconnectPresence(current.identity);
+    wipeBytes(current?.key);
+    unlockedRef.current = null;
+    setUnlocked(null);
+  }, [disconnectPresence]);
+
+  const reportAuthorityFailure = useCallback((failure: unknown) => {
+    if (!isAuthorityError(failure)) return;
+    lock();
+    setError("This device lost its authority on the account. Sign in again.");
+  }, [lock]);
+
+  const guard = useCallback(<T,>(run: () => Promise<T>) => async (): Promise<T | null> => {
+    setBusy(true);
+    setError(null);
+    try {
+      return await run();
+    } catch (failure: unknown) {
+      reportAuthorityFailure(failure);
+      setError(failure instanceof Error ? failure.message : "The operation failed.");
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }, [reportAuthorityFailure]);
+
+  const readAccount = useCallback(async (): Promise<AccountContext> => {
+    const value = parseAccountContext(await convex.query(accountCurrent, {}));
+    if (value === null) throw new Error("Cloud account response is invalid.");
+    return value;
+  }, [convex]);
+
+  const refresh = useCallback(async () => {
+    const [nextAccount, nextKeys] = await Promise.all([readAccount(), readDeviceKeys()]);
+    setAccount(nextAccount);
+    setKeys(nextKeys);
+    if (nextAccount.device === null || nextAccount.device.status !== "active") {
+      // A pending registration is only visible through the auth-session bind.
+      const registration = parseDeviceSummary(await convex.query(currentRegistration, {}));
+      if (registration !== null && nextAccount.device === null) {
+        setAccount({
+          ...nextAccount,
+          device: {
+            credentialGeneration: 1,
+            keyVersion: accountKeyVersion,
+            publicId: registration.publicId,
+            revision: registration.revision,
+            status: registration.status,
+          },
+        });
+      }
+    }
+  }, [convex, readAccount]);
+
+  const enroll = useCallback(async () => {
+    const context = await readAccount();
+    if (!context.hasActiveDevices) {
+      throw new Error(
+        "A browser is never the first device on an account. Enroll a machine with hra installed first.",
+      );
+    }
+    const deviceKeys = await readOrCreateDeviceKeys();
+    setKeys(deviceKeys);
+    const provisionalKey = randomKeyBytes();
+    try {
+      const encryptedLabel = await encryptDeviceLabel({
+        devicePublicId: deviceKeys.publicId,
+        keyVersion: accountKeyVersion,
+        label: browserDeviceLabel(navigator.platform),
+        provisionalKey,
+        userPublicId: context.userPublicId,
+      });
+      const intent = registrationIntent({
+        encryptedLabel,
+        idempotencyKey: createCloudUuidV7(Date.now()),
+        keyVersion: accountKeyVersion,
+        publicId: deviceKeys.publicId,
+        signingPublicKey: deviceKeys.signingPublicKey,
+        wrappingPublicKey: deviceKeys.wrappingPublicKey,
+      });
+      const requestDigest = await registrationRequestDigest(provisionalKey, intent);
+      try {
+        await convex.mutation(registerDevice, {
+          ...intent,
+          deviceClass: "browser",
+          requestDigest,
+        });
+      } catch (failure: unknown) {
+        // The additive `deviceClass` field may not be deployed yet. A validator
+        // rejection runs before the handler, so nothing was written and the
+        // identical idempotency key and digest replay cleanly without it.
+        if (!isDeviceClassValidatorRejection(failure)) throw failure;
+        await convex.mutation(registerDevice, { ...intent, requestDigest });
+      }
+    } finally {
+      wipeBytes(provisionalKey);
+    }
+    await refresh();
+  }, [convex, readAccount, refresh]);
+
+  const unlock = useCallback(async () => {
+    const deviceKeys = await readDeviceKeys();
+    if (deviceKeys === null) {
+      throw new Error("This browser has no enrolled device keys.");
+    }
+    let context = await readAccount();
+    if (context.device === null) {
+      const challengeId = randomOpaqueId("bind");
+      const nonce = randomBindNonce();
+      const challenge = parseBindChallenge(await convex.mutation(beginBindReference, {
+        challengeId,
+        devicePublicId: deviceKeys.publicId,
+        nonce,
+      }));
+      if (
+        challenge === null
+        || challenge.challengeId !== challengeId
+        || challenge.devicePublicId !== deviceKeys.publicId
+        || challenge.nonce !== nonce
+      ) throw new Error("Cloud device bind response is invalid.");
+      await convex.action(finishBind, {
+        challengeId,
+        signature: await signDeviceBind(deviceKeys.signing.privateKey, {
+          challengeId,
+          devicePublicId: deviceKeys.publicId,
+          nonce,
+        }),
+      });
+      context = await readAccount();
+    }
+    const device = context.device;
+    if (device === null || device.status !== "active" || device.publicId !== deviceKeys.publicId) {
+      throw new Error("This device is not approved on the account yet.");
+    }
+    const envelopes = parseKeyEnvelopes(await convex.query(listKeyEnvelopes, {}));
+    const envelope = selectKeyEnvelope(envelopes, device.keyVersion);
+    if (envelope === null) {
+      throw new Error("No account key envelope exists for this device yet.");
+    }
+    const key = await unwrapAccountDataKey(envelope, deviceKeys.wrapping.privateKey, {
+      accountKeyVersion: device.keyVersion,
+      devicePublicId: device.publicId,
+      userPublicId: context.userPublicId,
+    });
+    const identity: UnlockedIdentity = {
+      authEpoch: context.authEpoch,
+      credentialGeneration: device.credentialGeneration,
+      devicePublicId: device.publicId,
+      keyVersion: device.keyVersion,
+      userPublicId: context.userPublicId,
+    };
+    setAccount(context);
+    setKeys(deviceKeys);
+    unlockedRef.current = { identity, key };
+    setUnlocked({ identity, key });
+
+    const connectionId = newConnectionId();
+    const args = await presenceArgs({
+      connectionId,
+      identity,
+      kind: "connect",
+      sequence: 0,
+    });
+    await convex.mutation(presenceConnect, args);
+    presence.current = { connectionId, sequence: 0 };
+  }, [convex, readAccount]);
+
+  // Device key fingerprint, shown so the operator can compare it before running
+  // `hra device approve`.
+  useEffect(() => {
+    if (keys === null) {
+      setFingerprint(null);
+      return;
+    }
+    const run = createCancellation();
+    void deviceKeyFingerprint(keys.signingPublicKey, keys.wrappingPublicKey)
+      .then((value) => { if (run.live()) setFingerprint(value); })
+      .catch(() => { if (run.live()) setFingerprint(null); });
+    return () => { run.cancel(); };
+  }, [keys]);
+
+  // First read, then a bounded poll while a registration is waiting for
+  // approval from a machine with hra installed.
+  const stage = stageFor(account, keys);
+  const guardedRefresh = useMemo(() => guard(refresh), [guard, refresh]);
+  useEffect(() => {
+    void guardedRefresh();
+  }, [guardedRefresh]);
+  useEffect(() => {
+    if (stage !== "awaiting_approval") return;
+    const timer = setInterval(() => { void guardedRefresh(); }, enrollmentPollMs);
+    return () => { clearInterval(timer); };
+  }, [guardedRefresh, stage]);
+
+  // Presence heartbeat, only while the document is visible.
+  useEffect(() => {
+    if (unlocked === null) return;
+    const identity = unlocked.identity;
+    const timer = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      const current = presence.current;
+      if (current === null) return;
+      const sequence = current.sequence + 1;
+      void presenceArgs({
+        connectionId: current.connectionId,
+        identity,
+        kind: "heartbeat",
+        sequence,
+      })
+        .then(async (args) => {
+          await convex.mutation(presenceHeartbeat, args);
+          presence.current = { connectionId: current.connectionId, sequence };
+        })
+        .catch((failure: unknown) => { reportAuthorityFailure(failure); });
+    }, presenceHeartbeatMs);
+    return () => { clearInterval(timer); };
+  }, [convex, reportAuthorityFailure, unlocked]);
+
+  // Idle lock and the explicit Ctrl+L lock.
+  useEffect(() => {
+    if (unlocked === null) return;
+    const timer = createIdleTimer({ idleMs: idleLockMs, now: Date.now(), onIdle: lock });
+    const onActivity = () => { timer.activity(Date.now()); };
+    const onKeyDown = (event: KeyboardEvent) => {
+      timer.activity(Date.now());
+      if (isLockShortcut(event)) {
+        event.preventDefault();
+        lock();
+      }
+    };
+    for (const name of idleActivityEvents) {
+      window.addEventListener(name, onActivity, { passive: true });
+    }
+    window.addEventListener("keydown", onKeyDown);
+    const interval = setInterval(() => { timer.tick(Date.now()); }, 15_000);
+    return () => {
+      for (const name of idleActivityEvents) window.removeEventListener(name, onActivity);
+      window.removeEventListener("keydown", onKeyDown);
+      clearInterval(interval);
+    };
+  }, [lock, unlocked]);
+
+  // The key never survives the page.
+  useEffect(() => {
+    const onUnload = () => { lock(); };
+    window.addEventListener("pagehide", onUnload);
+    return () => { window.removeEventListener("pagehide", onUnload); };
+  }, [lock]);
+
+  const value = useMemo<Custody>(() => {
+    const common: CustodyCommon = {
+      busy,
+      devicePublicId: keys?.publicId ?? null,
+      enroll: async () => { await guard(enroll)(); },
+      enrollment: stage,
+      error,
+      fingerprint,
+      lock,
+      refresh: async () => { await guardedRefresh(); },
+      reportAuthorityFailure,
+      unlock: async () => { await guard(unlock)(); },
+    };
+    if (unlocked !== null) {
+      return { ...common, identity: unlocked.identity, key: unlocked.key, state: "unlocked" };
+    }
+    return {
+      ...common,
+      state: stage === "active" || stage === "needs_bind" ? "locked" : "unenrolled",
+    };
+  }, [
+    busy,
+    enroll,
+    error,
+    fingerprint,
+    guard,
+    guardedRefresh,
+    keys,
+    lock,
+    reportAuthorityFailure,
+    stage,
+    unlock,
+    unlocked,
+  ]);
+
+  return <CustodyContext.Provider value={value}>{children}</CustodyContext.Provider>;
+}
+
+export function useCustody(): Custody {
+  const value = useContext(CustodyContext);
+  if (value === null) throw new Error("useCustody used outside the custody provider.");
+  return value;
+}
+
+export type UnlockedCustody = Extract<Custody, { state: "unlocked" }>;
+
+export function useUnlockedCustody(): UnlockedCustody {
+  const custody = useCustody();
+  if (custody.state !== "unlocked") throw new Error("The account key is locked.");
+  return custody;
+}
