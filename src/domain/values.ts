@@ -26,12 +26,14 @@ export const messageSchema = boundedText("Message", MESSAGE_MAX_BYTES);
 export const profileIdSchema = z.string().regex(/^acct_[0-9a-f]{32}$/u);
 export const projectIdSchema = z.string().regex(/^proj_[0-9a-f]{32}$/u);
 export const sessionIdSchema = z.string().regex(/^sess_[0-9a-f]{32}$/u);
+export const sessionTaskIdSchema = z.string().regex(/^stask_[0-9a-f]{32}$/u);
 export const queueIdSchema = z.string().regex(/^queue_[0-9a-f]{32}$/u);
 export const attemptIdSchema = z.string().regex(/^attempt_[0-9a-f]{32}$/u);
 
 export type ProfileId = z.infer<typeof profileIdSchema>;
 export type ProjectId = z.infer<typeof projectIdSchema>;
 export type SessionId = z.infer<typeof sessionIdSchema>;
+export type SessionTaskId = z.infer<typeof sessionTaskIdSchema>;
 export type QueueId = z.infer<typeof queueIdSchema>;
 export type AttemptId = z.infer<typeof attemptIdSchema>;
 
@@ -41,6 +43,7 @@ const createId = <Prefix extends string>(prefix: Prefix): `${Prefix}_${string}` 
 export const createProfileId = (): ProfileId => profileIdSchema.parse(createId("acct"));
 export const createProjectId = (): ProjectId => projectIdSchema.parse(createId("proj"));
 export const createSessionId = (): SessionId => sessionIdSchema.parse(createId("sess"));
+export const createSessionTaskId = (): SessionTaskId => sessionTaskIdSchema.parse(createId("stask"));
 export const createQueueId = (): QueueId => queueIdSchema.parse(createId("queue"));
 export const createAttemptId = (): AttemptId => attemptIdSchema.parse(createId("attempt"));
 

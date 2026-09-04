@@ -9,11 +9,13 @@ import {
   launchPinnedCodexAppServer,
   type CodexAppServerClient,
   type CodexFact,
+  type ConversationAutomationToolCall,
   type CodexThread,
   type CodexThreadItem,
   type CodexTurn,
   type CodexPluginCatalog,
   type FencedCodexValue,
+  type DynamicToolPublicResult,
   type ResolvedPreset,
   type ThreadStartResult,
 } from "../codex/index";
@@ -114,6 +116,14 @@ const assertReviewedThreadStart = (
 
 export type CodexRuntimeObserver = {
   account(authority: ProfileAuthority, account: CodexAccountProjection): void | Promise<void>;
+  conversationAutomation?(
+    authority: ProfileAuthority,
+    call: ConversationAutomationToolCall,
+  ): DynamicToolPublicResult | Promise<DynamicToolPublicResult>;
+  conversationAutomationResponseWritten?(
+    authority: ProfileAuthority,
+    call: ConversationAutomationToolCall,
+  ): void | Promise<void>;
   fact(authority: ProfileAuthority, fact: CodexFact): void | Promise<void>;
 };
 
@@ -2122,6 +2132,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     const environment = this.#codexEnvironment === undefined
       ? undefined
       : await this.#codexEnvironment(authority.codexHome);
+    const launchedClient: { current: CodexAppServerClient | undefined } = {
+      current: undefined,
+    };
     const client = await this.#launchClient({
         authority: { profileId: authority.id, processGeneration: authority.generation },
         expectedCodexHome: authority.codexHome,
@@ -2130,6 +2143,43 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         experimentalApi: true,
         isAuthorityCurrent: () => this.#isCurrent(authority),
         now: this.#now,
+        onConversationAutomationToolCall: async (call) => await this.#admit(async () => {
+          const current = this.#clients.get(authority.id);
+          if (
+            call.authority.profileId !== authority.id
+            || call.authority.processGeneration !== authority.generation
+            || !this.#isCurrent(authority)
+            || launchedClient.current === undefined
+            || current?.client !== launchedClient.current
+            || launchedClient.current.state !== "ready"
+            || launchedClient.current.connectionId !== call.connectionId
+          ) {
+            throw new CodexError(
+              "AUTHORITY_STALE",
+              "Conversation automation belongs to a stale Codex account generation",
+            );
+          }
+          if (this.#observer.conversationAutomation === undefined) {
+            throw new CodexError(
+              "UNSUPPORTED_CAPABILITY",
+              "The HRA conversation automation host service is unavailable",
+            );
+          }
+          return await this.#observer.conversationAutomation(authority, call);
+        }),
+        onConversationAutomationToolResponseWritten: (call) => {
+          const current = this.#clients.get(authority.id);
+          if (
+            call.authority.profileId !== authority.id
+            || call.authority.processGeneration !== authority.generation
+            || !this.#isCurrent(authority)
+            || launchedClient.current === undefined
+            || current?.client !== launchedClient.current
+            || launchedClient.current.state !== "ready"
+            || launchedClient.current.connectionId !== call.connectionId
+          ) return;
+          return this.#observer.conversationAutomationResponseWritten?.(authority, call);
+        },
         onFact: async (value: FencedCodexValue<CodexFact>) => {
           const factUnloadsThread = value.value.type === "threadDeleted"
             || (
@@ -2197,6 +2247,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           }
         },
       });
+    launchedClient.current = client;
     if (!this.#isCurrent(authority)) {
       await client.close();
       throw new Error("Codex account generation changed during launch.");

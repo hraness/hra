@@ -22,11 +22,11 @@ describe("CODEX_PIN", () => {
     expect(manifest).toMatchObject({ dependencies: { "@openai/codex": CODEX_PIN } });
   });
 
-  test("records six schema digests and two matrix digests", () => {
+  test("records fifteen schema digests and two matrix digests", () => {
     const digests = [...Object.values(PINNED_CODEX_SCHEMA_DIGESTS), ...Object.values(PINNED_CODEX_MATRIX_DIGESTS)];
-    expect(digests).toHaveLength(8);
+    expect(digests).toHaveLength(17);
     for (const digest of digests) expect(digest).toMatch(/^[a-f0-9]{64}$/u);
-    expect(new Set(digests).size).toBe(8);
+    expect(new Set(digests).size).toBe(17);
   });
 
   test("is the only non-test src file that spells the pinned version", async () => {

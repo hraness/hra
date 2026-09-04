@@ -51,7 +51,7 @@
     "validateOwnedFile": 6
   },
   "src/daemon/service.ts": {
-    "assertCurrent": 52
+    "assertCurrent": 56
   },
   "src/daemon/session-event-cursor.ts": {
     "timingSafeEqual": 1
@@ -109,6 +109,9 @@
     "fsync": 4,
     "mode0600": 13,
     "mode0700": 1
+  },
+  "src/storage/session-task-store.ts": {
+    "immediateTransaction": 6
   },
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,

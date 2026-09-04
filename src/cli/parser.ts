@@ -12,6 +12,10 @@ import {
   WORK_TASK_HISTORY_ITEM_LIMIT,
 } from "../domain/work";
 import { workProtocolQuerySchema } from "../domain/work-protocol";
+import {
+  SESSION_TASK_MAX_INTERVAL_MINUTES,
+  SESSION_TASK_MIN_INTERVAL_MINUTES,
+} from "../domain/session-tasks";
 
 type InteractionRequiredInvocation = Readonly<{
   error: Readonly<{
@@ -149,6 +153,7 @@ Usage:
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
   hra session list|show|status|watch|start|send|queue|steer|stop
+  hra session task list|show|create|edit|delete
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
@@ -259,6 +264,7 @@ Examples:
   hra project add --path . --name jungle
   hra project use jungle`,
   session: `HRA session
+Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
 Usage:
   hra session list [--account <profile>] [--limit <1..100>] [--cursor <cursor>]
@@ -276,13 +282,19 @@ Usage:
   hra session preset <session> <low|high|ultra>
   hra session fast <session> <on|off>
   hra session project <session> <project>
+  hra session task list <session>
+  hra session task show <session> <task-id>
+  hra session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>
+  hra session task edit <session> <task-id> --revision <n> [--name <name>] [--every-minutes <15..10080>] [--pause|--resume] [--idempotency-key <uuid>] [-- <replacement-prompt>]
+  hra session task delete <session> <task-id> --revision <n> [--idempotency-key <uuid>]
 
 Examples:
   hra session start personal --project jungle --preset high
   hra session watch my-session
   hra session watch my-session --jsonl
   hra session events my-session --wait-ms 30000 --jsonl
-  hra session send my-session -- "run --help exactly"`,
+  hra session send my-session -- "run --help exactly"
+  hra session task create my-session --name daily-review --every-minutes 1440 -- "review the release queue"`,
   work: `HRA work
 
 Usage:
@@ -476,7 +488,7 @@ export function requestsWorkApplyProtocol(argv: readonly string[]): boolean {
   return commandArguments[0] === "work" && commandArguments[1] === "apply";
 }
 
-type Cursor = { values: string[] };
+type Cursor = { values: string[]; literalDelimiter: boolean };
 const literalPrefix = "\u0000";
 const uuidV7KeyLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
 const uuidV7KeyFutureSkewMs = 5 * 60 * 1_000;
@@ -490,6 +502,9 @@ const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "session.steer",
   "session.stop",
   "session.rename",
+  "session.task.create",
+  "session.task.edit",
+  "session.task.delete",
   "device.approve",
   "device.revoke",
 ]);
@@ -509,6 +524,14 @@ const take = (cursor: Cursor, label: string): string => {
   const value = cursor.values.shift();
   if (value === undefined || isOption(value)) throw new CliUsageError(`Missing ${label}.`);
   return decode(value);
+};
+
+const takeBeforeLiteralDelimiter = (cursor: Cursor, label: string): string => {
+  const value = cursor.values.shift();
+  if (value === undefined || isOption(value) || value.startsWith(literalPrefix)) {
+    throw new CliUsageError(`Missing ${label}.`);
+  }
+  return value;
 };
 
 const takeOptional = (cursor: Cursor): string | undefined => {
@@ -599,9 +622,36 @@ const remainder = (cursor: Cursor, label: string): string => {
   return cursor.values.splice(0).map(decode).join(" ");
 };
 
+const taskPrompt = (
+  cursor: Cursor,
+  label: "prompt" | "replacement prompt",
+  required: boolean,
+): string | undefined => {
+  if (!cursor.literalDelimiter) {
+    if (required || cursor.values.length > 0) {
+      throw new CliUsageError(`Session task ${label} must follow the literal \`--\` delimiter.`);
+    }
+    return undefined;
+  }
+  if (cursor.values.length === 0) {
+    throw new CliUsageError(`Missing session task ${label} after \`--\`.`);
+  }
+  if (cursor.values.some((value) => !value.startsWith(literalPrefix))) {
+    throw new CliUsageError(`Session task ${label} must follow the literal \`--\` delimiter.`);
+  }
+  return cursor.values.splice(0).map(decode).join(" ");
+};
+
 const finish = (cursor: Cursor): void => {
   const unexpected = cursor.values[0];
   if (unexpected !== undefined) throw new CliUsageError("Unexpected argument. Run `hra --help` for the supported command shape.");
+};
+
+const finishWithoutTaskPrompt = (cursor: Cursor): void => {
+  finish(cursor);
+  if (cursor.literalDelimiter) {
+    throw new CliUsageError("This session task command does not accept a prompt delimiter.");
+  }
 };
 
 const shellArgument = (value: string): string => {
@@ -845,9 +895,101 @@ const parseSessionNote = (cursor: Cursor): LocalCommand => {
   }
 };
 
+const parseSessionTask = (
+  cursor: Cursor,
+  idempotencyKey: string | undefined,
+): LocalCommand => {
+  const action = takeBeforeLiteralDelimiter(cursor, "task action");
+  const session = takeBeforeLiteralDelimiter(cursor, "session");
+  if (action === "list") {
+    finishWithoutTaskPrompt(cursor);
+    return { kind: "session.task.list", session };
+  }
+  if (action === "show") {
+    const task = takeBeforeLiteralDelimiter(cursor, "task ID");
+    finishWithoutTaskPrompt(cursor);
+    return command({ kind: "session.task.show", session, task });
+  }
+  if (action === "create") {
+    const name = option(cursor, "--name");
+    const everyMinutes = boundedDecimal(
+      option(cursor, "--every-minutes"),
+      "Session task --every-minutes",
+      SESSION_TASK_MIN_INTERVAL_MINUTES,
+      SESSION_TASK_MAX_INTERVAL_MINUTES,
+    );
+    const paused = flag(cursor, "--paused");
+    const prompt = taskPrompt(cursor, "prompt", true);
+    return command({
+      everyMinutes,
+      idempotencyKey: idempotencyKey ?? randomUUID(),
+      kind: "session.task.create",
+      name,
+      paused,
+      prompt,
+      session,
+    });
+  }
+  if (action === "edit") {
+    const task = takeBeforeLiteralDelimiter(cursor, "task ID");
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Session task --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const name = option(cursor, "--name");
+    const rawEveryMinutes = option(cursor, "--every-minutes");
+    const everyMinutes = rawEveryMinutes === undefined
+      ? undefined
+      : boundedDecimal(
+        rawEveryMinutes,
+        "Session task --every-minutes",
+        SESSION_TASK_MIN_INTERVAL_MINUTES,
+        SESSION_TASK_MAX_INTERVAL_MINUTES,
+      );
+    const pause = flag(cursor, "--pause");
+    const resume = flag(cursor, "--resume");
+    if (pause && resume) {
+      throw new CliUsageError("Session task --pause and --resume are mutually exclusive.");
+    }
+    const prompt = taskPrompt(cursor, "replacement prompt", false);
+    return command({
+      expectedRevision,
+      idempotencyKey: idempotencyKey ?? randomUUID(),
+      kind: "session.task.edit",
+      ...(name === undefined ? {} : { name }),
+      ...(everyMinutes === undefined ? {} : { everyMinutes }),
+      ...(prompt === undefined ? {} : { prompt }),
+      ...(pause ? { status: "paused" } : resume ? { status: "active" } : {}),
+      session,
+      task,
+    });
+  }
+  if (action === "delete") {
+    const task = takeBeforeLiteralDelimiter(cursor, "task ID");
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Session task --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    finishWithoutTaskPrompt(cursor);
+    return command({
+      expectedRevision,
+      idempotencyKey: idempotencyKey ?? randomUUID(),
+      kind: "session.task.delete",
+      session,
+      task,
+    });
+  }
+  throw new CliUsageError("Unknown session task action. Run `hra session --help` for supported actions.");
+};
+
 const parseSession = (
   cursor: Cursor,
   jsonl: boolean,
+  idempotencyKey: string | undefined,
 ): LocalCommand | SessionEventFollowCliInvocation | SessionEventWatchCliInvocation => {
   const action = take(cursor, "session action");
   switch (action) {
@@ -923,6 +1065,7 @@ const parseSession = (
     case "preset": { const session = take(cursor, "session"); const preset = take(cursor, "preset"); finish(cursor); return command({ kind: "session.preset", session, preset }); }
     case "fast": { const session = take(cursor, "session"); const value = take(cursor, "on or off"); finish(cursor); if (value !== "on" && value !== "off") throw new CliUsageError("Fast must be `on` or `off`."); return { kind: "session.fast", session, enabled: value === "on" }; }
     case "project": { const session = take(cursor, "session"); const project = take(cursor, "project"); finish(cursor); return { kind: "session.project", session, project }; }
+    case "task": return parseSessionTask(cursor, idempotencyKey);
     default: throw new CliUsageError("Unknown session action. Run `hra session --help` for supported actions.");
   }
 };
@@ -1265,7 +1408,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   const delimiter = argv.indexOf("--");
   const regular = delimiter < 0 ? [...argv] : argv.slice(0, delimiter);
   const literalTail = delimiter < 0 ? [] : argv.slice(delimiter + 1).map(literal);
-  const cursor: Cursor = { values: regular };
+  const cursor: Cursor = { literalDelimiter: delimiter >= 0, values: regular };
   const json = flag(cursor, "--json");
   const jsonl = flag(cursor, "--jsonl");
   if (json && jsonl) {
@@ -1338,7 +1481,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   else if (group === "plugin") parsed = parsePlugin(cursor);
   else if (group === "project") parsed = parseProject(cursor, cwd);
   else if (group === "session") {
-    const sessionCommand = parseSession(cursor, jsonl);
+    const sessionCommand = parseSession(cursor, jsonl, idempotencyKey);
     if (sessionCommand.kind === "session.events.follow") {
       if (json) {
         throw new CliUsageError("Event following is already JSON Lines and cannot be combined with --json.");

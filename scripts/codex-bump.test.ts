@@ -127,7 +127,7 @@ describe("codex-bump end to end", () => {
     );
     const output = lines.join("\n");
     expect({ exitCode, output }).toEqual({ exitCode: CODEX_BUMP_EXIT.ok, output });
-    expect(output).toContain("schema digests: 0 of 6 changed");
+    expect(output).toContain("schema digests: 0 of 15 changed");
     expect(output).toContain("matrix digests: 0 of 2 changed");
     expect(output).toContain("ServerNotification methods: unchanged");
     expect(output).toContain("ServerRequest methods: unchanged");

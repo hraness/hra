@@ -137,6 +137,177 @@ describe("CLI parser", () => {
     expect(parseCli(["session", "send", "session", "hello", "from", "the", "CLI"])).toMatchObject({ command: { message: "hello from the CLI" } });
   });
 
+  test("parses conversation-bound session task reads with exact task IDs", () => {
+    const task = `stask_${"a".repeat(32)}`;
+    expect(parseCli(["session", "task", "list", "Release work", "--json"]))
+      .toEqual({
+        command: { kind: "session.task.list", session: "Release work" },
+        json: true,
+        kind: "command",
+      });
+    expect(parseCli(["session", "task", "show", "Release work", task]))
+      .toEqual({
+        command: { kind: "session.task.show", session: "Release work", task },
+        json: false,
+        kind: "command",
+      });
+    for (const argv of [
+      ["session", "task", "show", "Release work", "daily-review"],
+      ["session", "task", "list", "Release work", "--"],
+      ["session", "task", "show", "Release work", task, "--", "prompt"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
+  test("creates interval tasks with a required literal prompt and durable key", () => {
+    const idempotencyKey = "00000000-0000-4000-8000-000000000201";
+    expect(parseCli([
+      "session",
+      "task",
+      "create",
+      "Release work",
+      "--name",
+      "Daily review",
+      "--every-minutes",
+      "1440",
+      "--paused",
+      "--idempotency-key",
+      idempotencyKey,
+      "--",
+      "review",
+      "--help",
+      "literally",
+    ])).toEqual({
+      command: {
+        everyMinutes: 1440,
+        idempotencyKey,
+        kind: "session.task.create",
+        name: "Daily review",
+        paused: true,
+        prompt: "review --help literally",
+        session: "Release work",
+      },
+      json: false,
+      kind: "command",
+    });
+
+    const generated = parseCli([
+      "session",
+      "task",
+      "create",
+      "release",
+      "--name",
+      "Quarter hour",
+      "--every-minutes",
+      "15",
+      "--",
+      "check",
+    ]);
+    expect(generated).toMatchObject({
+      command: {
+        everyMinutes: 15,
+        kind: "session.task.create",
+        paused: false,
+        prompt: "check",
+      },
+    });
+    if (generated.kind !== "command" || generated.command.kind !== "session.task.create") {
+      throw new Error("Expected a session task create command.");
+    }
+    expect(generated.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+
+    for (const argv of [
+      ["session", "task", "create", "release", "--name", "No delimiter", "--every-minutes", "15", "plain", "prompt"],
+      ["session", "task", "create", "release", "--name", "Empty prompt", "--every-minutes", "15", "--"],
+      ["session", "task", "create", "release", "--name", "Too fast", "--every-minutes", "14", "--", "prompt"],
+      ["session", "task", "create", "release", "--name", "Too slow", "--every-minutes", "10081", "--", "prompt"],
+      ["session", "task", "create", "release", "--name", "Standalone", "--every-minutes", "15", "--destination", "local", "--", "prompt"],
+      ["session", "task", "create", "--", "release", "prompt"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
+  test("parses compare-and-swap task edits and exact deletion", () => {
+    const task = `stask_${"b".repeat(32)}`;
+    const idempotencyKey = "00000000-0000-4000-8000-000000000202";
+    expect(parseCli([
+      "session",
+      "task",
+      "edit",
+      "release",
+      task,
+      "--revision",
+      "3",
+      "--name",
+      "Release review",
+      "--every-minutes",
+      "60",
+      "--resume",
+      "--idempotency-key",
+      idempotencyKey,
+      "--",
+      "inspect",
+      "the queue",
+    ])).toEqual({
+      command: {
+        everyMinutes: 60,
+        expectedRevision: 3,
+        idempotencyKey,
+        kind: "session.task.edit",
+        name: "Release review",
+        prompt: "inspect the queue",
+        session: "release",
+        status: "active",
+        task,
+      },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli([
+      "session",
+      "task",
+      "edit",
+      "release",
+      task,
+      "--revision",
+      "4",
+      "--pause",
+    ])).toMatchObject({
+      command: { expectedRevision: 4, kind: "session.task.edit", status: "paused", task },
+    });
+    expect(parseCli([
+      "session",
+      "task",
+      "delete",
+      "release",
+      task,
+      "--revision",
+      "5",
+      "--idempotency-key",
+      idempotencyKey,
+    ])).toEqual({
+      command: {
+        expectedRevision: 5,
+        idempotencyKey,
+        kind: "session.task.delete",
+        session: "release",
+        task,
+      },
+      json: false,
+      kind: "command",
+    });
+
+    for (const argv of [
+      ["session", "task", "edit", "release", task, "--revision", "3"],
+      ["session", "task", "edit", "release", task, "--revision", "3", "--pause", "--resume"],
+      ["session", "task", "edit", "release", task, "--revision", "0", "--pause"],
+      ["session", "task", "edit", "release", task, "--revision", "3", "--"],
+      ["session", "task", "delete", "release", task],
+      ["session", "task", "delete", "release", task, "--revision", "3", "--"],
+      ["session", "task", "delete", "release", "mutable-title", "--revision", "3"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
   test("parses bounded opaque session-list continuations", () => {
     const cursor = `hra1.${"a".repeat(128)}.${"b".repeat(43)}`;
     expect(parseCli([

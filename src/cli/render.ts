@@ -33,6 +33,12 @@ import {
 } from "../domain/usage-metrics";
 import { profileIdSchema, sessionIdSchema } from "../domain/values";
 import {
+  sessionTaskDeleteResultSchema,
+  sessionTaskListSchema,
+  sessionTaskRecordSchema,
+  type SessionTaskRecord,
+} from "../domain/session-tasks";
+import {
   WORK_PROTOCOL,
   WORK_PROTOCOL_VERSION,
   WORK_EVENT_PAGE_MAX_BYTES,
@@ -824,6 +830,67 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
     ) invalidCommandResponse(command);
     return;
   }
+  if (command.kind === "session.task.list") {
+    const parsed = sessionTaskListSchema.safeParse(data);
+    const exactSession = sessionIdSchema.safeParse(command.session);
+    if (
+      !parsed.success
+      || (exactSession.success && parsed.data.sessionId !== exactSession.data)
+      || parsed.data.tasks.some((task) => task.sessionId !== parsed.data.sessionId)
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (
+    command.kind === "session.task.show"
+    || command.kind === "session.task.create"
+    || command.kind === "session.task.edit"
+  ) {
+    const parsed = sessionTaskRecordSchema.safeParse(data);
+    const exactSession = sessionIdSchema.safeParse(command.session);
+    if (
+      !parsed.success
+      || (exactSession.success && parsed.data.sessionId !== exactSession.data)
+      || (
+        (command.kind === "session.task.show" || command.kind === "session.task.edit")
+        && parsed.data.id !== command.task
+      )
+      || (
+        command.kind === "session.task.create"
+        && (
+          parsed.data.revision !== 1
+          || parsed.data.name !== command.name
+          || parsed.data.prompt !== command.prompt
+          || parsed.data.schedule.minutes !== command.everyMinutes
+          || parsed.data.status !== (command.paused ? "paused" : "active")
+        )
+      )
+      || (
+        command.kind === "session.task.edit"
+        && (
+          parsed.data.revision !== command.expectedRevision + 1
+          || (command.name !== undefined && parsed.data.name !== command.name)
+          || (command.prompt !== undefined && parsed.data.prompt !== command.prompt)
+          || (
+            command.everyMinutes !== undefined
+            && parsed.data.schedule.minutes !== command.everyMinutes
+          )
+          || (command.status !== undefined && parsed.data.status !== command.status)
+        )
+      )
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "session.task.delete") {
+    const parsed = sessionTaskDeleteResultSchema.safeParse(data);
+    const exactSession = sessionIdSchema.safeParse(command.session);
+    if (
+      !parsed.success
+      || parsed.data.taskId !== command.task
+      || parsed.data.revision !== command.expectedRevision + 1
+      || (exactSession.success && parsed.data.sessionId !== exactSession.data)
+    ) invalidCommandResponse(command);
+    return;
+  }
   if (command.kind === "session.status") {
     const parsed = sessionStatusSchema.safeParse(data);
     const exactSession = sessionIdSchema.safeParse(command.session);
@@ -903,6 +970,13 @@ const publicInteractionData = (command: LocalCommand, data: unknown): unknown =>
   if (command.kind === "work.poll") return workPollSchema.parse(data);
   if (command.kind === "work.events") return workEventPageSchema.parse(data);
   if (command.kind === "account.login") return publicAccountLoginData(data);
+  if (command.kind === "session.task.list") return sessionTaskListSchema.parse(data);
+  if (
+    command.kind === "session.task.show"
+    || command.kind === "session.task.create"
+    || command.kind === "session.task.edit"
+  ) return sessionTaskRecordSchema.parse(data);
+  if (command.kind === "session.task.delete") return sessionTaskDeleteResultSchema.parse(data);
   if (command.kind === "device.list") {
     const parsed = parseCloudDeviceList(data);
     return parsed ?? { currentDevicePublicId: null, devices: [] };
@@ -1016,6 +1090,38 @@ const renderSessionList = (
   if (nextCursor === undefined || !accountId.success) return listing;
   return `${listing}\n\nContinue: hra session list --account ${accountId.data} --limit ${String(command.limit)} --cursor ${nextCursor}`;
 };
+
+const renderSessionTaskList = (data: unknown): string => {
+  const listing = sessionTaskListSchema.parse(data);
+  const rows = listing.tasks.map((task) => ({
+    name: task.name,
+    status: task.status,
+    every: `${String(task.schedule.minutes)}m`,
+    nextDue: task.nextDueAt === null ? "paused" : instant(task.nextDueAt),
+    revision: task.revision,
+    id: task.id,
+  }));
+  return [
+    `Conversation tasks for ${line(listing.sessionId)}`,
+    table(rows, ["name", "status", "every", "nextDue", "revision", "id"]),
+  ].join("\n\n");
+};
+
+const renderSessionTask = (task: SessionTaskRecord): string => [
+  line(task.name),
+  "Scope: conversation",
+  `Session: ${line(task.sessionId)}`,
+  `ID: ${line(task.id)}`,
+  `Status: ${task.status}`,
+  `Every: ${String(task.schedule.minutes)} minutes`,
+  `Revision: ${String(task.revision)}`,
+  `Next due: ${task.nextDueAt === null ? "paused" : instant(task.nextDueAt)}`,
+  `Created: ${instant(task.createdAt)}`,
+  `Updated: ${instant(task.updatedAt)}`,
+  "",
+  "Prompt",
+  indented(task.prompt),
+].join("\n");
 
 const renderInteractionList = (
   command: Extract<LocalCommand, { kind: "interaction.list" | "session.interactions" }>,
@@ -2113,6 +2219,19 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(`${table(value.projects as Record<string, unknown>[], ["label", "rootPath", "default", "id"])}\n`);
   } else if (command.kind === "session.list" && Array.isArray(value.sessions)) {
     output.writeStdout(`${renderSessionList(command, publicData)}\n`);
+  } else if (command.kind === "session.task.list") {
+    output.writeStdout(`${renderSessionTaskList(publicData)}\n`);
+  } else if (
+    command.kind === "session.task.show"
+    || command.kind === "session.task.create"
+    || command.kind === "session.task.edit"
+  ) {
+    output.writeStdout(`${renderSessionTask(sessionTaskRecordSchema.parse(publicData))}\n`);
+  } else if (command.kind === "session.task.delete") {
+    const deleted = sessionTaskDeleteResultSchema.parse(publicData);
+    output.writeStdout(
+      `Deleted conversation task ${line(deleted.taskId)} from ${line(deleted.sessionId)} at ${instant(deleted.deletedAt)} (revision ${String(deleted.revision)}).\n`,
+    );
   } else if (command.kind === "session.show") {
     output.writeStdout(`${renderSession(data)}\n`);
   } else if (command.kind === "session.status") {
