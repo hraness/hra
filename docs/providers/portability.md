@@ -6,7 +6,7 @@ in the letta-ai trajectory v1 shape for memory and search tooling.
 
 Before this, HRA stored no conversation of its own. Assistant text existed only
 as `assistant_delta` events, there was no record of what HRA had sent, and
-`readSession` asked the provider for its transcript — `thread/items/list` for
+`readSession` asked the provider for its transcript: `thread/items/list` for
 Codex, and an in-memory, process-lifetime message list for Claude. A session
 therefore could not outlive its provider, and could not be handed to another
 one.
@@ -18,13 +18,13 @@ obeys the bounds and redaction rules that already governed the event stream
 (`SESSION_EVENT_MAX_BYTES`, `containsAbsolutePath`, the secret patterns, and
 the projection's `forbiddenDetailKeyPattern`).
 
-- `user_message` — exactly what HRA sent to the provider, with the actor that
+- `user_message`, exactly what HRA sent to the provider, with the actor that
   authored it: `human`, `autorespond`, or `provider_switch` for a handoff seed.
   It is written after the provider accepted the message, so the transcript
   never claims HRA sent something the provider rejected. Text is capped at
   16,384 characters and the remainder is stated as an exact
   `omittedCharacters` count.
-- `item_started` / `item_completed` — already carried the item kind, MCP server,
+- `item_started` / `item_completed`, already carried the item kind, MCP server,
   tool name, and status. They now also carry `callId`, the stable opaque
   identity a result binds back to its call, and `summary`, a bounded one-line
   label. The summary is assembled only from values the protocol layer already
@@ -32,7 +32,7 @@ the projection's `forbiddenDetailKeyPattern`).
   closed-vocabulary command class (`git commit`, `bun test`, `command`) that
   the command-approval display has always used. **A raw tool argument or a raw
   tool output is never stored**, so neither is ever in the transcript.
-- `provider_switched` — the boundary record: the providers and presets moved
+- `provider_switched`, the boundary record: the providers and presets moved
   between, whether the account changed, the digest of the neutral transcript,
   the digest of the seed the target provider was given, and how many records
   that seed omitted.
@@ -61,12 +61,12 @@ In order, a switch:
 
 1. refuses a switch it cannot make safely (below);
 2. builds the neutral transcript and renders the bounded handoff seed from it;
-3. releases the outgoing provider's hold on the thread — `endSession` on the
+3. releases the outgoing provider's hold on the thread, `endSession` on the
    neutral runtime port, which stops the pinned Claude Code process that served
    the session and is a documented no-op for Codex, whose app-server owns
    thread lifetime. The outgoing thread is **never deleted**;
 4. reviews and starts a thread on the target provider and account;
-5. commits the whole rebinding in one transaction — provider, account, preset,
+5. commits the whole rebinding in one transaction, provider, account, preset,
    provider thread, the target's reviewed runtime profile, and the session's
    conversation-automation row, which follows the new thread so a scheduled
    session task keeps addressing a live one;
@@ -76,7 +76,7 @@ In order, a switch:
 
 A switch is refused, with no effect, when:
 
-- a turn is active — the turn would be stranded on the outgoing provider with
+- a turn is active, the turn would be stranded on the outgoing provider with
   no way to attribute its result. Stop it with `hra session stop` first;
 - the session is quarantined or terminal;
 - the requested preset is not one the target provider can run (`low` on
@@ -87,7 +87,7 @@ A switch is refused, with no effect, when:
 
 ### What a switch preserves, and what it cannot
 
-**Preserved:** the conversation as HRA saw it — what was asked, what the
+**Preserved:** the conversation as HRA saw it, what was asked, what the
 assistant said, what its reasoning summaries said, which tools were called and
 whether they succeeded, and the switch boundary itself. Also the session's
 identity, its project, its note, its title, its queue, its session tasks, and
@@ -95,7 +95,7 @@ its event stream; the session id never changes.
 
 **Not preserved, and not recoverable:**
 
-- the provider's own hidden state — Codex's server-side thread and Claude's
+- the provider's own hidden state, Codex's server-side thread and Claude's
   full reasoning traces, neither of which HRA ever stored;
 - the provider's native thread. Codex `thread/resume` takes only a thread id,
   and the pinned Claude CLI's `--resume` takes only its own session id and
@@ -162,7 +162,7 @@ below is HRA's, and `src/domain/trajectory.ts` is its only implementation.
 
 | Neutral record | Trajectory record | Notes |
 | --- | --- | --- |
-| — | `meta` | Always first: `version`, `source: "hra"`, `session_id`, `provider`, `created_at`, `transcript_digest`, `omitted_records`. |
+|, | `meta` | Always first: `version`, `source: "hra"`, `session_id`, `provider`, `created_at`, `transcript_digest`, `omitted_records`. |
 | `user` | `user` | `content`, `timestamp`. An autorespond message is prefixed `[hra autorespond]`; a handoff seed keeps its own `[HRA provider handoff]` header and is not labelled twice. |
 | `assistant` | `assistant` | `content`, `timestamp`. |
 | `reasoning` | `reasoning` | The provider's reasoning *summary*, which is all HRA ever stored. |
@@ -172,8 +172,7 @@ below is HRA's, and `src/domain/trajectory.ts` is its only implementation.
 
 `arguments` deserves a note. The format expects stringified JSON arguments, and
 HRA holds none: it never stored them. Rather than invent input or drop the
-field, HRA emits a stringified object that states exactly what it does hold —
-`{"hra_arguments_retained": false, "item_kind": …, "server": …, "tool": …,
+field, HRA emits a stringified object that states exactly what it does hold, `{"hra_arguments_retained": false, "item_kind": …, "server": …, "tool": …,
 "summary": …}`. A consumer can always tell an HRA trajectory's tool call from
 one captured with real arguments.
 
