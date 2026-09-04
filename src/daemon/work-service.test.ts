@@ -145,6 +145,8 @@ class WorkRuntime implements CodexRuntimePort {
     return this.#requireProjection(input.providerThreadId);
   }
 
+  async endSession(): Promise<void> {}
+
   async reviewTurnStart(
     input: Parameters<CodexRuntimePort["reviewTurnStart"]>[0],
   ): Promise<RuntimeStartReview> {

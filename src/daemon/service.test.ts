@@ -278,6 +278,10 @@ class FakeCodex implements CodexRuntimePort {
       this.activeObservations -= 1;
     }
   }
+  endSession(): Promise<void> {
+    this.calls.push("end");
+    return Promise.resolve();
+  }
   async readSession(): Promise<CodexSessionProjection> {
     this.calls.push("read");
     this.turnEffectTrace.push("read");

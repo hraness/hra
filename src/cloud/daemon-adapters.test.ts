@@ -104,6 +104,8 @@ class FakeCodex implements CodexRuntimePort {
   timeoutInteraction(): Promise<{ responseWritten: true }> { return Promise.reject(new Error("unused")); }
   close(): Promise<void> { return Promise.resolve(); }
 
+  endSession(): Promise<void> { return Promise.resolve(); }
+
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection> {
     this.readSessionCalls += 1;
     expect(input.providerThreadId).toBe("thread_0001");
@@ -426,6 +428,7 @@ class FakeClaude implements ClaudeRuntimePort {
     this.readSessionCalls += 1;
     return this.projection;
   }
+  endSession(): Promise<void> { return Promise.resolve(); }
   #unused(): never { throw new Error("unused"); }
   pinnedVersion(): string { return this.#unused(); }
   interactionAuthority(): never { return this.#unused(); }
@@ -3185,6 +3188,59 @@ describe("state-backed cloud daemon adapter", () => {
         adapter.close();
         value.store.close();
       }
+    }
+  });
+
+  test("routes a remote provider switch onto the ordinary execution path", async () => {
+    const value = await fixture();
+    const commands: LocalCommand[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const authority = await adapter.resolveCommandAuthority({
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(authority).not.toBeNull();
+      expect(await adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000a1",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "set_provider", preset: "fable-max", provider: "claude" },
+        sessionPublicId: value.sessionId,
+        signal,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      // A provider switch is a provider effect, not a local setting: it reaches
+      // the daemon as a command rather than settling inside the adapter.
+      expect(commands).toEqual([{
+        idempotencyKey: "00000000-0000-7000-8000-0000000000a1",
+        kind: "session.switch",
+        preset: "fable-max",
+        provider: "claude",
+        session: value.sessionId,
+      }]);
+      expect(await adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000a2",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "set_provider", provider: "codex" },
+        sessionPublicId: value.sessionId,
+        signal,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      expect(commands[1]).toEqual({
+        idempotencyKey: "00000000-0000-7000-8000-0000000000a2",
+        kind: "session.switch",
+        provider: "codex",
+        session: value.sessionId,
+      });
+    } finally {
+      adapter.close();
+      value.store.close();
     }
   });
 

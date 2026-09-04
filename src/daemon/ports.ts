@@ -149,6 +149,14 @@ export interface SessionRuntimePort<Profile> {
   startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: Profile }>;
   observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation>;
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
+  /**
+   * Release this runtime's hold on one provider thread without deleting it.
+   * `hra session switch` calls it on the provider a session is leaving, so a
+   * runtime that owns a per-session process stops that process instead of
+   * leaking it. It never destroys the user's thread: a switched-away Codex
+   * thread stays exactly where it is on the provider.
+   */
+  endSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<void>;
   reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
   startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; message: string; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurnStatus; effectiveRuntimeProfile: Profile }>;
   steer(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; message: string; clientMessageId: string; signal: AbortSignal }): Promise<void>;
@@ -313,6 +321,7 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  endSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewTurnStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   startTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
   steer(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -367,6 +376,7 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  endSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewTurnStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   startTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
   steer(): Promise<never> { return Promise.reject(this.#unavailable()); }

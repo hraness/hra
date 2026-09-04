@@ -50,6 +50,10 @@ import {
 import {
   isPresetSupportedByProvider,
   PresetProviderMismatchError,
+  presetsForProvider,
+  presetTiers,
+  providerSchema,
+  type Preset,
   type Provider,
 } from "../domain/presets";
 import {
@@ -61,7 +65,22 @@ import {
   summarizeSessionTask,
   type SessionTaskPatch,
 } from "../domain/session-tasks";
-import { sessionEventPageSchema, type SessionEventBody, type SessionEventPage } from "../domain/session-events";
+import {
+  SESSION_EVENT_PAGE_LIMIT,
+  SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+  sessionEventPageSchema,
+  type SessionEvent,
+  type SessionEventBody,
+  type SessionEventPage,
+  type SessionMessageActor,
+} from "../domain/session-events";
+import {
+  buildSessionTranscript,
+  renderTranscriptSeed,
+  sessionTranscriptSchema,
+  TRANSCRIPT_PAGE_LIMIT,
+  type SessionTranscript,
+} from "../domain/transcript";
 import {
   AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT,
   AUTO_RATE_LIMIT_RESET_USED_PERCENT,
@@ -532,6 +551,78 @@ const authorityFor = (paths: StatePaths, profile: ProfileRecord): ProfileAuthori
   return { id: profile.id, generation: profile.processGeneration, codexHome: owned.codexHome, desktopUserData: owned.desktopUserData };
 };
 
+/**
+ * Item kinds that are conversation rather than a tool call. Everything else a
+ * provider announces as an item is treated as a tool call, so an unknown kind
+ * still gets its neutral call identity instead of being silently dropped.
+ * `src/domain/transcript.ts` applies the same rule when it reads the events
+ * back, and `session-events.test.ts` pins the two lists equal.
+ */
+export const NEUTRAL_NON_TOOL_ITEM_KINDS = Object.freeze([
+  "agentMessage",
+  "assistantMessage",
+  "reasoning",
+  "subAgentActivity",
+  "userMessage",
+] as const);
+
+const nonToolItemKinds: ReadonlySet<string> = new Set(NEUTRAL_NON_TOOL_ITEM_KINDS);
+
+const isNeutralToolItemKind = (itemKind: string): boolean => !nonToolItemKinds.has(itemKind);
+
+/**
+ * The bounded one-line label HRA keeps for a tool call. It is assembled only
+ * from values the protocol layer already reduced to safe labels: the item
+ * kind, the MCP server and tool names, and the closed-vocabulary command
+ * class. No raw argument reaches it.
+ */
+const neutralToolSummary = (fact: Readonly<{
+  commandClass?: string;
+  itemKind: string;
+  server?: string;
+  tool?: string;
+}>): string => {
+  const target = fact.tool === undefined
+    ? undefined
+    : fact.server === undefined ? fact.tool : `${fact.server}/${fact.tool}`;
+  const detail = fact.commandClass ?? target;
+  return (detail === undefined ? fact.itemKind : `${fact.itemKind}: ${detail}`).slice(0, 256);
+};
+
+/**
+ * The most stored event pages one transcript page reads before it answers.
+ * A transcript is bounded twice: by the records it returns and by the events
+ * it is willing to walk to find them.
+ */
+const TRANSCRIPT_EVENT_PAGE_BUDGET = 20;
+
+/** The turn the handoff seed opened, when the provider named one. */
+const seededTurnId = (value: unknown): string | null => {
+  const parsed = z.object({ turnId: z.string().min(1).max(200) }).safeParse(value);
+  return parsed.success ? parsed.data.turnId : null;
+};
+
+const sessionSwitchReceiptSchema = z.object({
+  providerThreadId: z.string().min(1).max(200),
+  sessionId: sessionIdSchema,
+  toProvider: providerSchema,
+}).strict();
+
+/**
+ * The preset a switch uses when the operator named none: the session's own
+ * tier when the target provider has one, and otherwise that provider's
+ * highest tier. A preset the target cannot run is still refused, never
+ * silently downgraded.
+ */
+const defaultPresetForProviderSwitch = (provider: Provider, current: Preset): Preset => {
+  const supported = presetsForProvider(provider);
+  const sameTier = supported.find((preset) => presetTiers[preset] === presetTiers[current]);
+  const fallback = supported[supported.length - 1];
+  if (sameTier !== undefined) return sameTier;
+  if (fallback === undefined) throw new Error(`No preset exists for the ${provider} provider.`);
+  return fallback;
+};
+
 const loginReceiptSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("pending"),
@@ -665,6 +756,7 @@ type RemoteSessionCommand = Extract<LocalCommand, { kind:
   | "session.stop"
   | "session.rename"
   | "session.preset"
+  | "session.switch"
   | "session.fast"
   | "interaction.resolve"
 }>;
@@ -693,7 +785,9 @@ export const BACKGROUND_DIAGNOSTIC_CODES = [
   "session_state_tracking_failed",
   "usage_refresh_failed",
   "usage_poll_account_failed",
+  "provider_switch_seed_failed",
   "usage_poll_tick_failed",
+  "user_message_record_failed",
 ] as const;
 export type BackgroundDiagnosticCode = (typeof BACKGROUND_DIAGNOSTIC_CODES)[number];
 export type BackgroundDiagnosticCause =
@@ -1081,6 +1175,8 @@ export class HraService {
         case "session.note.set": return { session: await this.#updateSession(command.session, (session) => ({ note: command.note, expectedRevision: session.revision })) };
         case "session.note.clear": return { session: await this.#updateSession(command.session, (session) => ({ note: "", expectedRevision: session.revision })) };
         case "session.preset": return { session: await this.#updateSession(command.session, (session) => ({ preset: command.preset, expectedRevision: session.revision })) };
+        case "session.switch": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#switchProvider(command, context.signal)); }
+        case "session.transcript": return this.#readTranscript(command.session, command.after, command.limit);
         case "session.fast": return { session: await this.#updateSession(command.session, (session) => ({ fastEnabled: command.enabled, expectedRevision: session.revision })) };
         case "session.project": {
           const project = this.#store.requireProject(command.project);
@@ -1511,6 +1607,7 @@ export class HraService {
             sessionId: session.id,
           }),
         };
+        case "session.switch": return await this.#switchProvider(command, context.signal);
         case "session.fast": return {
           session: this.#store.updateSessionMetadata({
             expectedRevision: session.revision,
@@ -3088,6 +3185,15 @@ export class HraService {
             kind: fact.subagent.kind,
           };
         }
+        // A tool-shaped item carries the stable call identity a later result
+        // binds back to, plus a classified one-line summary. Both are built
+        // only from fields the protocol layer already reduced to safe labels.
+        const toolIdentity = isNeutralToolItemKind(fact.itemKind)
+          ? {
+              callId: fact.itemId,
+              summary: neutralToolSummary(fact),
+            }
+          : {};
         return fact.type === "itemStarted"
           ? {
               type: "item_started",
@@ -3099,6 +3205,7 @@ export class HraService {
               ...(fact.liveAcceptanceCommandDigest === undefined
                 ? {}
                 : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
+              ...toolIdentity,
             }
           : {
               type: "item_completed",
@@ -3111,6 +3218,7 @@ export class HraService {
                 ? {}
                 : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
               ...(fact.status === undefined ? {} : { status: fact.status }),
+              ...toolIdentity,
             };
       }
       // Only a spawned subagent thread reaches here, and only its bounded
@@ -6594,13 +6702,290 @@ export class HraService {
     };
   }
 
+  /**
+   * Read one bounded page of the provider-neutral conversation.
+   *
+   * Everything here comes from HRA's own event stream. Nothing asks a
+   * provider, so a session whose provider thread is gone, whose provider is
+   * unavailable, or which has already been switched still answers.
+   */
+  #readTranscript(
+    selector: string,
+    after: number | undefined,
+    limit: number,
+  ): SessionTranscript {
+    const session = this.#store.requireSession(selector);
+    const events: SessionEvent[] = [];
+    let cursor = after ?? null;
+    let exhausted = false;
+    for (let page = 0; page < TRANSCRIPT_EVENT_PAGE_BUDGET; page += 1) {
+      const list = this.#store.listSessionEvents({
+        sessionId: session.id,
+        afterSequence: cursor,
+        limit: SESSION_EVENT_PAGE_LIMIT,
+      });
+      if (list.events.length === 0) {
+        exhausted = true;
+        break;
+      }
+      events.push(...list.events);
+      cursor = list.events[list.events.length - 1]?.sequence ?? cursor;
+      if (page === TRANSCRIPT_EVENT_PAGE_BUDGET - 1) break;
+    }
+    const transcript = buildSessionTranscript({ sessionId: session.id, events, limit });
+    const nextSequence = transcript.nextSequence !== null
+      ? transcript.nextSequence
+      : exhausted || transcript.throughSequence === null
+        ? null
+        : transcript.throughSequence + 1;
+    return sessionTranscriptSchema.parse({ ...transcript, nextSequence });
+  }
+
+  /**
+   * Move one live conversation from its current provider to another one.
+   *
+   * What this does, in order: refuse an unsafe or impossible switch, build the
+   * neutral transcript and render the bounded handoff seed from it, release
+   * the outgoing provider's hold on the thread, start a thread on the target
+   * provider and account, commit the whole rebinding in one transaction,
+   * append the `provider_switched` record, and send the seed as the first user
+   * message of the new thread.
+   *
+   * What it cannot do is carry the provider's own state across. The target
+   * gets HRA's record of the conversation, not the source provider's thread,
+   * hidden reasoning, or cached context — `docs/providers/portability.md`
+   * states that boundary.
+   */
+  async #switchProvider(
+    command: Extract<LocalCommand, { kind: "session.switch" }>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const session = this.#requireBoundSession(command.session);
+    const currentProfile = this.#store.requireProfile(session.profileId);
+    const targetProfile = command.account === undefined
+      ? currentProfile
+      : this.#store.requireProfile(command.account);
+    this.#assertSignedIn(targetProfile);
+    if (
+      session.provider === command.provider
+      && targetProfile.id === currentProfile.id
+      && (command.preset === undefined || command.preset === session.preset)
+    ) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        `That session already runs on ${command.provider} with the \`${session.preset}\` preset.`,
+      );
+    }
+    // A switch mid-turn would strand the running turn on the outgoing
+    // provider with no way to attribute its result.
+    if (session.state === "active" || session.activeTurnId !== undefined) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "That session has an active turn. Stop it with `hra session stop` before switching provider.",
+      );
+    }
+    if (session.state === "recovery_required" || session.state === "terminal") {
+      throw new CommandFailure(
+        "CONFLICT",
+        `A ${session.state === "terminal" ? "terminal" : "quarantined"} session cannot switch provider.`,
+      );
+    }
+    const preset = command.preset ?? defaultPresetForProviderSwitch(command.provider, session.preset);
+    if (!isPresetSupportedByProvider(command.provider, preset)) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        new PresetProviderMismatchError(command.provider, preset).message,
+      );
+    }
+    const project = session.projectId === undefined
+      ? undefined
+      : this.#store.requireProject(session.projectId);
+    const projectRoot = project === undefined
+      ? undefined
+      : await this.#requireUsableProjectRoot(project.rootPath);
+
+    const transcript = this.#readTranscript(session.id, undefined, TRANSCRIPT_PAGE_LIMIT);
+    const seed = renderTranscriptSeed({
+      transcript,
+      fromProvider: session.provider,
+      toProvider: command.provider,
+    });
+
+    const runtime = this.#sessionRuntime(command.provider);
+    const key = command.idempotencyKey ?? randomUUID();
+    const fromProvider = session.provider;
+    const fromPreset = session.preset;
+    let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
+    let started:
+      | (CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile })
+      | undefined;
+    const outcome = await this.#effect<z.infer<typeof sessionSwitchReceiptSchema>>({
+      kind: "session.switch",
+      authorityId: session.id,
+      authorityGeneration: targetProfile.processGeneration,
+      request: {
+        provider: command.provider,
+        preset,
+        targetProfileId: targetProfile.id,
+        seedDigest: seed.digest,
+      },
+      idempotencyKey: key,
+      effect: async () => {
+        // The target thread is started before the source is released. A target
+        // that refuses then leaves the session exactly where it was, still
+        // observed and still runnable, instead of stranding it with a released
+        // thread it can no longer resume.
+        review = await this.#fencedEffect(async () => await runtime.reviewSessionStart({
+          authority: authorityFor(this.#paths, targetProfile),
+          ...(projectRoot === undefined ? {} : { projectRoot }),
+          preset,
+          fast: session.fastEnabled,
+          signal,
+        }));
+        const runtimeReview = review;
+        started = await this.#fencedEffect(async () => await runtime.startSession({
+          authority: authorityFor(this.#paths, targetProfile),
+          ...(projectRoot === undefined ? {} : { projectRoot }),
+          review: runtimeReview,
+          signal,
+        }));
+        // Now release the outgoing provider: a per-session runtime process is
+        // stopped rather than left running behind an abandoned thread.
+        await this.#endProviderSession(session, currentProfile, signal);
+        return {
+          providerThreadId: started.providerThreadId,
+          sessionId: session.id,
+          toProvider: command.provider,
+        };
+      },
+      receipt: (value) => sessionSwitchReceiptSchema.parse(value),
+      restore: (value) => sessionSwitchReceiptSchema.parse(value),
+      commit: (attemptId) => {
+        if (started === undefined) {
+          throw new Error("Provider switch commit lost its exact provider projection.");
+        }
+        const current = this.#store.requireSession(session.id);
+        this.#store.completeSessionProviderSwitch({
+          attemptId,
+          sessionId: current.id,
+          expectedSessionRevision: current.revision,
+          provider: command.provider,
+          profileId: targetProfile.id,
+          preset,
+          providerThreadId: started.providerThreadId,
+          state: started.status,
+          ...(started.activeTurnId === undefined ? {} : { activeTurnId: started.activeTurnId }),
+          ...(started.providerUpdatedAt === undefined
+            ? {}
+            : { providerUpdatedAt: started.providerUpdatedAt }),
+          runtimeProfile: started.effectiveRuntimeProfile,
+          receipt: {
+            providerThreadId: started.providerThreadId,
+            sessionId: current.id,
+            toProvider: command.provider,
+          },
+        });
+      },
+      onAmbiguous: () => this.#quarantineSession(session.id),
+    });
+
+    const switched = this.#store.requireSession(outcome.sessionId);
+    this.#appendSessionEvent(
+      authorityFor(this.#paths, targetProfile),
+      switched.id,
+      null,
+      {
+        type: "provider_switched",
+        fromProvider,
+        toProvider: command.provider,
+        fromPreset,
+        toPreset: preset,
+        accountChanged: targetProfile.id !== currentProfile.id,
+        transcriptDigest: transcript.digest,
+        seedDigest: seed.digest,
+        seedOmittedRecords: seed.omittedRecords,
+      },
+    );
+    await this.#ensureSessionObservedLocked(switched.id, signal);
+    // The handoff summary is an ordinary first turn on the new thread, so it
+    // records its own `user_message` and produces an ordinary reply. The
+    // rebinding is already durable at this point, so a seed the new provider
+    // refuses is reported as an undelivered seed rather than raised as a
+    // failed switch the operator would wrongly retry.
+    let seeded: unknown;
+    let seedFailure: string | undefined;
+    try {
+      seeded = await this.#send(
+        switched.id,
+        seed.text,
+        undefined,
+        signal,
+        undefined,
+        "provider_switch",
+      );
+    } catch (error: unknown) {
+      seedFailure = error instanceof CommandFailure
+        ? error.code
+        : error instanceof Error ? error.name : "error";
+      this.recordBackgroundDiagnostic("provider_switch_seed_failed", error);
+    }
+    return {
+      session: this.#store.requireSession(switched.id),
+      from: { provider: fromProvider, preset: fromPreset, account: currentProfile.id },
+      to: { provider: command.provider, preset, account: targetProfile.id },
+      seed: {
+        delivered: seedFailure === undefined,
+        digest: seed.digest,
+        ...(seedFailure === undefined ? {} : { failureCode: seedFailure }),
+        includedRecords: seed.includedRecords,
+        omittedRecords: seed.omittedRecords,
+      },
+      transcriptDigest: transcript.digest,
+      turnId: seededTurnId(seeded),
+      idempotencyKey: key,
+    };
+  }
+
+  /**
+   * Release the outgoing provider's hold on a session's thread and close
+   * HRA's live view of it. The thread itself is never deleted.
+   */
+  async #endProviderSession(
+    session: SessionRecord & { providerThreadId: string },
+    profile: ProfileRecord,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const connectionId = this.#sessionProviderConnections.get(session.id) ?? null;
+    this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
+      accountId: profile.id,
+      providerConnectionId: connectionId,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    }));
+    this.#appendSessionEvent(authorityFor(this.#paths, profile), session.id, connectionId, {
+      type: "connection",
+      state: "disconnected",
+      reason: "provider switch",
+    });
+    this.#sessionProviderConnections.delete(session.id);
+    this.#sessionObservationFailures.delete(session.id);
+    this.#sessionResubscriptionConnections.delete(session.id);
+    this.#sessionsAwaitingResubscription.delete(session.id);
+    this.#forgetSessionFactEpoch(session.id);
+    await this.#runtimeForSession(session).endSession({
+      authority: authorityFor(this.#paths, profile),
+      providerThreadId: session.providerThreadId,
+      signal,
+    });
+  }
+
   async #send(
     selector: string,
     message: string,
     idempotencyKey: string | undefined,
     signal: AbortSignal,
     beforeEffect?: (attemptId: MutationAttemptRecord["id"]) => void,
-    actor: "human" | "autorespond" = "human",
+    actor: SessionMessageActor = "human",
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
@@ -6690,8 +7075,42 @@ export class HraService {
       });
     }, onAmbiguous: () => this.#quarantineSession(session.id) });
     const reconciled = this.#store.requireSession(session.id);
+    this.#recordUserMessage(reconciled.id, profile, result.turnId, actor, message);
     if (reconciled.state === "idle") this.#scheduleQueueDispatch(reconciled);
     return { session: reconciled, turnId: result.turnId, effectiveRuntimeProfile: result.effectiveRuntimeProfile ?? null, idempotencyKey: key };
+  }
+
+  /**
+   * Append the neutral record of one message HRA sent. It is written after the
+   * provider accepted the message, so the transcript never claims HRA sent
+   * something the provider rejected, and it carries the exact actor that
+   * authored it. A failure here is a background diagnostic: an already
+   * dispatched turn is never failed for a missing transcript record.
+   */
+  #recordUserMessage(
+    sessionId: SessionRecord["id"],
+    profile: ProfileRecord,
+    turnId: string | null,
+    actor: SessionMessageActor,
+    message: string,
+  ): void {
+    try {
+      const text = message.slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS);
+      this.#appendSessionEvent(
+        authorityFor(this.#paths, profile),
+        sessionId,
+        this.#sessionProviderConnections.get(sessionId) ?? null,
+        {
+          type: "user_message",
+          turnId,
+          actor,
+          text,
+          omittedCharacters: message.length - text.length,
+        },
+      );
+    } catch (error: unknown) {
+      this.recordBackgroundDiagnostic("user_message_record_failed", error);
+    }
   }
 
   async #steer(
@@ -6734,6 +7153,7 @@ export class HraService {
         },
       });
     }, receipt: (value) => steeredReceiptSchema.parse(value), restore: (value) => steeredReceiptSchema.parse(value), onAmbiguous: () => this.#quarantineSession(session.id) });
+    this.#recordUserMessage(session.id, profile, result.activeTurnId, "human", message);
     return { steered: true, turnId: result.activeTurnId, idempotencyKey: key };
   }
 

@@ -449,6 +449,19 @@ const renderSingleEvent = (event: SessionEvent): string => {
       ...(body.role === undefined ? [] : [`  role ${line(body.role)}`]),
       ...(body.depth === undefined ? [] : [`  depth ${String(body.depth)}`]),
     ].join("\n");
+    case "user_message": return [
+      body.actor === "human" ? "You" : body.actor === "autorespond" ? "Autorespond" : "Handoff",
+      indented(body.text),
+      ...(body.omittedCharacters === 0
+        ? []
+        : [`  ${String(body.omittedCharacters)} characters omitted`]),
+    ].join("\n");
+    case "provider_switched": return [
+      `Provider switched: ${line(body.fromProvider)} to ${line(body.toProvider)}`,
+      `  preset ${line(body.fromPreset)} to ${line(body.toPreset)}`,
+      `  account ${body.accountChanged ? "changed" : "unchanged"}`,
+      `  seed ${line(body.seedDigest)}, ${String(body.seedOmittedRecords)} records omitted`,
+    ].join("\n");
   }
 };
 
@@ -2350,6 +2363,18 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       : projected.protectedOutput?.status === "shown_in_protected_terminal"
         ? "Protected approval detail was shown in the foreground terminal.\n"
         : "Protected approval detail is unavailable.\n");
+  } else if (command.kind === "session.switch") {
+    const from = object(value.from);
+    const to = object(value.to);
+    const seed = object(value.seed);
+    output.writeStdout([
+      `Switched ${line(value.sessionId ?? object(value.session)?.id)} from ${line(from?.provider)} (${line(from?.preset)}) to ${line(to?.provider)} (${line(to?.preset)}).`,
+      `Account: ${line(from?.account)} to ${line(to?.account)}.`,
+      seed?.delivered === false
+        ? `Handoff summary was NOT delivered (${line(seed.failureCode)}). Send it again with \`hra session send\`.`
+        : `Handoff summary: ${line(seed?.includedRecords)} records sent, ${line(seed?.omittedRecords)} omitted.`,
+      "The new provider has HRA's record of the conversation, not the old provider's thread or cached context.",
+    ].join("\n").concat("\n"));
   } else if (command.kind === "session.note.get") {
     output.writeStdout(`${line(value.note)}\n`);
   } else if (command.kind === "daemon.status") {

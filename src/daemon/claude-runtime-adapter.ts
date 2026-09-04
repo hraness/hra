@@ -386,6 +386,26 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     return this.#projection(this.#requireSession(input.authority, input.providerThreadId));
   }
 
+  /**
+   * Stop the pinned Claude Code process that served one session and forget it.
+   * A Claude session is one live process, so leaving a switched-away session
+   * running would leak it. An unknown thread is already released.
+   */
+  async endSession(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    signal: AbortSignal;
+  }): Promise<void> {
+    void input.signal;
+    const session = this.#sessions.get(input.providerThreadId);
+    if (session === undefined) return;
+    if (session.authority.id !== input.authority.id) {
+      throw new ClaudeError("PROTOCOL_ERROR", "That Claude session belongs to another account.");
+    }
+    this.#sessions.delete(input.providerThreadId);
+    await session.client.close();
+  }
+
   /** Widens the runtime-resolution failure into one actionable instruction. */
   async #admitRuntime(configDir: string): Promise<PinnedClaudeRuntime> {
     try {

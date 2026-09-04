@@ -9,6 +9,7 @@ import {
   SESSION_EVENT_WAIT_MAX_MS,
   sessionEventCursorWireSchema,
 } from "./session-events";
+import { TRANSCRIPT_PAGE_LIMIT } from "./transcript";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "./usage-metrics";
 import {
   sessionTaskIntervalMinutesSchema,
@@ -233,6 +234,30 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.note.set"), session: selectorSchema, note: noteSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.note.clear"), session: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.preset"), session: selectorSchema, preset: presetSchema, idempotencyKey: idempotencyKeySchema }).strict(),
+  /**
+   * Move one live conversation to another provider. `preset` and `account`
+   * are optional: an omitted preset keeps the session's tier when the target
+   * supports it, and an omitted account keeps the session's account, whose
+   * profile directory already isolates both providers' credentials.
+   */
+  z.object({
+    kind: z.literal("session.switch"),
+    session: selectorSchema,
+    provider: providerSchema,
+    preset: presetSchema.optional(),
+    account: selectorSchema.optional(),
+    idempotencyKey: idempotencyKeySchema,
+  }).strict(),
+  /**
+   * One bounded page of the provider-neutral conversation HRA rebuilt from its
+   * own session events. `after` is an event sequence, not a record index.
+   */
+  z.object({
+    kind: z.literal("session.transcript"),
+    session: selectorSchema,
+    after: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    limit: z.number().int().min(1).max(TRANSCRIPT_PAGE_LIMIT),
+  }).strict(),
   z.object({ kind: z.literal("session.fast"), session: selectorSchema, enabled: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.project"), session: selectorSchema, project: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({

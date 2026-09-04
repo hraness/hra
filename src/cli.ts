@@ -28,6 +28,7 @@ import {
   type ProjectionRecoveryCliInvocation,
   type ProtectedInputSource,
   type RemoteCliCommand,
+  type SessionExportCliInvocation,
 } from "./cli/parser";
 import {
   parseAccountLoginAuthorityList,
@@ -83,6 +84,14 @@ import {
 } from "./cloud/index";
 import { allowlistedEnvironment, resolvePinnedCodexRuntime } from "./codex/index";
 import { localCommandSchema, type CommandResponse, type LocalCommand } from "./domain/contracts";
+import { providerSchema, type Provider } from "./domain/presets";
+import {
+  digestTranscriptRecords,
+  sessionTranscriptSchema,
+  TRANSCRIPT_PAGE_LIMIT,
+  type TranscriptRecord,
+} from "./domain/transcript";
+import { transcriptToTrajectory } from "./domain/trajectory";
 import {
   PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES,
 } from "./domain/interactions";
@@ -2593,6 +2602,108 @@ async function editSessionNote(
   }
 }
 
+/**
+ * The most transcript pages one export reads. An export is bounded twice: by
+ * this budget and by the records one page returns.
+ */
+const SESSION_EXPORT_PAGE_BUDGET = 20;
+
+/**
+ * `hra session export` reads the provider-neutral transcript in bounded pages
+ * and writes one document: the letta-ai trajectory v1 shape by default, or
+ * HRA's own neutral record shape with `--format json`.
+ *
+ * Everything written comes from HRA's own storage. No provider is asked, so a
+ * session whose provider thread is gone still exports.
+ */
+async function exportSessionTranscript(
+  invocation: SessionExportCliInvocation,
+  output: Output,
+  callDaemon: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>,
+): Promise<number> {
+  const records: TranscriptRecord[] = [];
+  let sessionId: string | null = null;
+  let after: number | undefined;
+  let omittedRecords = 0;
+  let omittedCharacters = 0;
+  let truncated = false;
+  for (let page = 0; page < SESSION_EXPORT_PAGE_BUDGET; page += 1) {
+    const response = await callDaemon({
+      kind: "session.transcript",
+      session: invocation.session,
+      ...(after === undefined ? {} : { after }),
+      limit: TRANSCRIPT_PAGE_LIMIT,
+    });
+    if (!response.ok) return renderFailure(response.error, invocation.json, output);
+    const parsed = sessionTranscriptSchema.safeParse(response.data);
+    if (!parsed.success) {
+      return renderFailure({
+        code: "INTERNAL",
+        message: "The daemon returned a transcript page HRA could not validate.",
+      }, invocation.json, output);
+    }
+    const transcript = parsed.data;
+    sessionId ??= transcript.sessionId;
+    if (transcript.sessionId !== sessionId) {
+      return renderFailure({
+        code: "CONFLICT",
+        message: "The transcript changed session identity between pages.",
+      }, invocation.json, output);
+    }
+    records.push(...transcript.records);
+    omittedRecords += transcript.omittedRecords;
+    omittedCharacters += transcript.omittedCharacters;
+    if (transcript.nextSequence === null) break;
+    after = transcript.nextSequence - 1;
+    if (page === SESSION_EXPORT_PAGE_BUDGET - 1) truncated = true;
+  }
+  if (sessionId === null) {
+    return renderFailure({
+      code: "NOT_FOUND",
+      message: "That session has no transcript.",
+    }, invocation.json, output);
+  }
+  const transcript = sessionTranscriptSchema.parse({
+    version: 1,
+    sessionId,
+    records: records.slice(0, TRANSCRIPT_PAGE_LIMIT),
+    throughSequence: records[records.length - 1]?.throughSequence ?? null,
+    nextSequence: null,
+    omittedRecords: omittedRecords + Math.max(0, records.length - TRANSCRIPT_PAGE_LIMIT),
+    omittedCharacters,
+    digest: digestTranscriptRecords(records.slice(0, TRANSCRIPT_PAGE_LIMIT)),
+  });
+  const document = invocation.format === "trajectory"
+    ? transcriptToTrajectory({
+      transcript,
+      provider: await exportedSessionProvider(invocation.session, callDaemon),
+      createdAt: Date.now(),
+    })
+    : transcript;
+  const serialized = `${safeJson(document, 2)}\n`;
+  if (invocation.out === undefined) {
+    output.writeStdout(serialized);
+  } else {
+    await writeFile(resolve(invocation.out), serialized, { encoding: "utf8", mode: 0o600 });
+    output.writeStderr(`Wrote ${String(records.length)} transcript records${
+      truncated ? " (truncated at the export bound)" : ""}.\n`);
+  }
+  return 0;
+}
+
+/** The provider the session runs on now; it labels the trajectory meta record. */
+async function exportedSessionProvider(
+  session: string,
+  callDaemon: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>,
+): Promise<Provider> {
+  const response = await callDaemon({ kind: "session.show", session, detail: false });
+  if (!response.ok) return "codex";
+  const parsed = z.object({
+    session: z.object({ provider: providerSchema }).passthrough(),
+  }).passthrough().safeParse(response.data);
+  return parsed.success ? parsed.data.session.provider : "codex";
+}
+
 function remoteFailure(error: unknown, json: boolean, output: Output): number {
   const message = error instanceof Error ? error.message : "Cloud remote operation failed.";
   const code = /not found/iu.test(message)
@@ -2642,6 +2753,11 @@ function remotePayload(command: RemoteCliCommand): RemoteCommandPayload | null {
     case "remote.steer": return { kind: "steer", message: command.message };
     case "remote.stop": return { kind: "stop" };
     case "remote.preset": return { kind: "set_model", preset: command.preset };
+    case "remote.provider": return {
+      kind: "set_provider",
+      provider: command.provider,
+      ...(command.preset === undefined ? {} : { preset: command.preset }),
+    };
     case "remote.fast": return { enabled: command.enabled, kind: "set_fast" };
   }
 }
@@ -5095,6 +5211,9 @@ async function executeInvocation(
   }
   if (invocation.kind === "session.events.follow" || invocation.kind === "session.events.watch") {
     return await executeSessionEventObserver(invocation, output, input);
+  }
+  if (invocation.kind === "session.export") {
+    return await exportSessionTranscript(invocation, output, callDaemon);
   }
   if (invocation.kind === "work.events.follow") {
     return await executeWorkEventObserver(invocation, output, input);

@@ -447,11 +447,21 @@ describe("session events", () => {
       nextCursor: "old-3",
       events: [event(3)],
     }))).toThrow("SESSION_EVENT_CONTINUITY_SEQUENCE_MISMATCH");
-    expect(() => advanceSessionEventContinuity(first, page({
+    // `hra session switch` can move one conversation to another account, so a
+    // page under a new account continues the same stream instead of failing.
+    // Sequence and epoch continuity are still enforced across that boundary.
+    const switched = advanceSessionEventContinuity(first, page({
       requestedCursor: "old-1",
       nextCursor: "old-2",
       events: [event(2, oldEpoch, otherAccountId)],
-    }))).toThrow("SESSION_EVENT_CONTINUITY_ACCOUNT_CHANGED");
+    }));
+    expect(switched.accountId).toBe(otherAccountId);
+    expect(switched.expectedSequence).toBe(3);
+    expect(() => advanceSessionEventContinuity(switched, page({
+      requestedCursor: "old-2",
+      nextCursor: "old-4",
+      events: [event(4, oldEpoch, otherAccountId)],
+    }))).toThrow("SESSION_EVENT_CONTINUITY_SEQUENCE_MISMATCH");
 
     const awaitingRestoredEpoch = advanceSessionEventContinuity(first, page({
       requestedCursor: "old-1",
@@ -464,11 +474,17 @@ describe("session events", () => {
       nextCursor: "restored-1",
       events: [event(1)],
     }))).toThrow("SESSION_EVENT_CONTINUITY_RESTORED_EPOCH_DID_NOT_CHANGE");
-    expect(() => advanceSessionEventContinuity(awaitingRestoredEpoch, page({
+    // A restored stream under a switched account still has to change epoch.
+    expect(advanceSessionEventContinuity(awaitingRestoredEpoch, page({
       requestedCursor: "restored-0",
       nextCursor: "restored-foreign-account",
       events: [event(1, newEpoch, otherAccountId)],
-    }))).toThrow("SESSION_EVENT_CONTINUITY_ACCOUNT_CHANGED");
+    })).accountId).toBe(otherAccountId);
+    expect(() => advanceSessionEventContinuity(awaitingRestoredEpoch, page({
+      requestedCursor: "restored-0",
+      nextCursor: "restored-foreign-account",
+      events: [event(1, oldEpoch, otherAccountId)],
+    }))).toThrow("SESSION_EVENT_CONTINUITY_RESTORED_EPOCH_DID_NOT_CHANGE");
 
     const restored = advanceSessionEventContinuity(awaitingRestoredEpoch, page({
       requestedCursor: "restored-0",

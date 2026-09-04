@@ -79,6 +79,20 @@ export type SessionEventWatchCliInvocation = Readonly<{
   kind: "session.events.watch";
 }>;
 
+/**
+ * `hra session export` reads the provider-neutral transcript in bounded pages
+ * and writes one document. It is a client-side flow over the paged
+ * `session.transcript` command rather than one round trip, so the whole
+ * conversation never has to fit in a single local response.
+ */
+export type SessionExportCliInvocation = Readonly<{
+  format: "trajectory" | "json";
+  json: boolean;
+  kind: "session.export";
+  out?: string;
+  session: string;
+}>;
+
 export type WorkApplyCliInvocation = Readonly<{
   input: ProtectedInputSource;
   json: true;
@@ -117,6 +131,7 @@ export type CliInvocation =
   | AccountLoginCliInvocation
   | SessionEventFollowCliInvocation
   | SessionEventWatchCliInvocation
+  | SessionExportCliInvocation
   | WorkApplyCliInvocation
   | WorkEventFollowCliInvocation
   | InteractionRequiredInvocation
@@ -149,6 +164,12 @@ export type RemoteCliCommand =
     }>
   | Readonly<{ kind: "remote.stop"; session: string }>
   | Readonly<{ kind: "remote.preset"; preset: "low" | "high" | "ultra" | "fable-max"; session: string }>
+  | Readonly<{
+      kind: "remote.provider";
+      preset?: "low" | "high" | "ultra" | "fable-max";
+      provider: "codex" | "claude";
+      session: string;
+    }>
   | Readonly<{ enabled: boolean; kind: "remote.fast"; session: string }>;
 
 export class CliUsageError extends Error {
@@ -305,6 +326,8 @@ Usage:
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
   hra session preset <session> <low|high|ultra|fable-max>
+  hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]
+  hra session export <session> [--format <trajectory|json>] [--out <path>]
   hra session fast <session> <on|off>
   hra session project <session> <project>
   hra session task list <session>
@@ -316,6 +339,8 @@ Usage:
 Examples:
   hra session start personal --project jungle --preset high
   hra session start personal --provider claude --preset fable-max
+  hra session switch my-session --provider claude
+  hra session export my-session --format trajectory --out ./trajectory.json
   hra session watch my-session
   hra session watch my-session --jsonl
   hra session events my-session --wait-ms 30000 --jsonl
@@ -369,6 +394,7 @@ Usage:
   hra remote stop <cloud-session>
   hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <once|decline|cancel>
   hra remote preset <cloud-session> <low|high|ultra|fable-max>
+  hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
   hra remote fast <cloud-session> <on|off>
   hra remote allow|deny <device-commands|account-linking>
   hra remote policy
@@ -1025,7 +1051,11 @@ const parseSession = (
   cursor: Cursor,
   jsonl: boolean,
   idempotencyKey: string | undefined,
-): LocalCommand | SessionEventFollowCliInvocation | SessionEventWatchCliInvocation => {
+  jsonRequested: boolean,
+): LocalCommand
+  | SessionEventFollowCliInvocation
+  | SessionEventWatchCliInvocation
+  | SessionExportCliInvocation => {
   const action = take(cursor, "session action");
   switch (action) {
     case "list": {
@@ -1115,6 +1145,42 @@ const parseSession = (
     case "abandon": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.abandon", session }; }
     case "note": return parseSessionNote(cursor);
     case "preset": { const session = take(cursor, "session"); const preset = take(cursor, "preset"); finish(cursor); return command({ kind: "session.preset", session, preset }); }
+    case "export": {
+      const format = option(cursor, "--format") ?? "trajectory";
+      const out = option(cursor, "--out");
+      const session = take(cursor, "session");
+      finish(cursor);
+      if (format !== "trajectory" && format !== "json") {
+        throw new CliUsageError("Export format must be `trajectory` or `json`.");
+      }
+      if (out !== undefined && (out.length === 0 || out.length > 1_024)) {
+        throw new CliUsageError("Export output path must be between 1 and 1024 characters.");
+      }
+      return {
+        format,
+        json: jsonRequested,
+        kind: "session.export",
+        ...(out === undefined ? {} : { out }),
+        session,
+      };
+    }
+    case "switch": {
+      const provider = option(cursor, "--provider");
+      const preset = option(cursor, "--preset");
+      const account = option(cursor, "--account");
+      const session = take(cursor, "session");
+      finish(cursor);
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      return command({
+        kind: "session.switch",
+        session,
+        provider,
+        ...(preset === undefined ? {} : { preset }),
+        ...(account === undefined ? {} : { account }),
+      });
+    }
     case "fast": { const session = take(cursor, "session"); const value = take(cursor, "on or off"); finish(cursor); if (value !== "on" && value !== "off") throw new CliUsageError("Fast must be `on` or `off`."); return { kind: "session.fast", session, enabled: value === "on" }; }
     case "project": { const session = take(cursor, "session"); const project = take(cursor, "project"); finish(cursor); return { kind: "session.project", session, project }; }
     case "task": return parseSessionTask(cursor, idempotencyKey);
@@ -1489,6 +1555,27 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
       }
       return { kind: "remote.preset", session, preset };
     }
+    case "provider": {
+      const preset = option(cursor, "--preset");
+      const session = take(cursor, "session");
+      const provider = take(cursor, "provider");
+      finish(cursor);
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      if (
+        preset !== undefined
+        && preset !== "low" && preset !== "high" && preset !== "ultra" && preset !== "fable-max"
+      ) {
+        throw new CliUsageError("Preset must be `low`, `high`, `ultra`, or `fable-max`.");
+      }
+      return {
+        kind: "remote.provider",
+        ...(preset === undefined ? {} : { preset }),
+        provider,
+        session,
+      };
+    }
     case "fast": {
       const session = take(cursor, "session");
       const value = take(cursor, "on or off");
@@ -1637,7 +1724,16 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   else if (group === "plugin") parsed = parsePlugin(cursor);
   else if (group === "project") parsed = parseProject(cursor, cwd);
   else if (group === "session") {
-    const sessionCommand = parseSession(cursor, jsonl, idempotencyKey);
+    const sessionCommand = parseSession(cursor, jsonl, idempotencyKey, json);
+    if (sessionCommand.kind === "session.export") {
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by session.export.");
+      }
+      if (jsonl) {
+        throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
+      }
+      return sessionCommand;
+    }
     if (sessionCommand.kind === "session.events.follow") {
       if (json) {
         throw new CliUsageError("Event following is already JSON Lines and cannot be combined with --json.");

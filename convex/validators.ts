@@ -41,6 +41,7 @@ export const commandKind = v.union(
   v.literal("steer"),
   v.literal("stop"),
   v.literal("set_model"),
+  v.literal("set_provider"),
   v.literal("set_fast"),
   v.literal("resolve_interaction"),
   v.literal("send_or_steer"),
