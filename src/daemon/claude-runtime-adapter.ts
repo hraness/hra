@@ -16,6 +16,7 @@ import {
   type PinnedClaudeRuntime,
   type ResolvePinnedClaudeRuntimeOptions,
 } from "../claude/index";
+import type { PreparedAttachment } from "../domain/attachments";
 import type {
   InteractionKind,
   InteractionResolution,
@@ -307,6 +308,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     projectRoot?: string;
     review: ClaudeRuntimeStartReview;
     message: string;
+    attachments?: readonly PreparedAttachment[];
     clientMessageId: string;
     signal: AbortSignal;
   }): Promise<{
@@ -323,7 +325,12 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     // HRA mints the turn id: Claude's own `result` line is the only turn
     // boundary it publishes, and it carries no id of its own.
     const turnId = randomUUID();
-    await session.client.startTurn({ message: input.message, turnId });
+    const startAttachments = input.attachments ?? [];
+    await session.client.startTurn({
+      ...(startAttachments.length === 0 ? {} : { attachments: startAttachments }),
+      message: input.message,
+      turnId,
+    });
     this.#appendUserMessage(session, turnId, input.message, input.clientMessageId);
     session.activeTurnId = turnId;
     session.status = "active";
@@ -340,6 +347,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     providerThreadId: string;
     activeTurnId: string;
     message: string;
+    attachments?: readonly PreparedAttachment[];
     clientMessageId: string;
     signal: AbortSignal;
   }): Promise<void> {
@@ -348,7 +356,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     if (session.activeTurnId !== input.activeTurnId) {
       throw new ClaudeError("INVALID_INPUT", "That Claude turn is no longer active.");
     }
-    await session.client.steer(input.message);
+    await session.client.steer(input.message, input.attachments ?? []);
     this.#appendUserMessage(session, input.activeTurnId, input.message, input.clientMessageId);
   }
 
@@ -384,6 +392,26 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     signal: AbortSignal;
   }): Promise<CodexSessionProjection> {
     return this.#projection(this.#requireSession(input.authority, input.providerThreadId));
+  }
+
+  /**
+   * Stop the pinned Claude Code process that served one session and forget it.
+   * A Claude session is one live process, so leaving a switched-away session
+   * running would leak it. An unknown thread is already released.
+   */
+  async endSession(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    signal: AbortSignal;
+  }): Promise<void> {
+    void input.signal;
+    const session = this.#sessions.get(input.providerThreadId);
+    if (session === undefined) return;
+    if (session.authority.id !== input.authority.id) {
+      throw new ClaudeError("PROTOCOL_ERROR", "That Claude session belongs to another account.");
+    }
+    this.#sessions.delete(input.providerThreadId);
+    await session.client.close();
   }
 
   /** Widens the runtime-resolution failure into one actionable instruction. */

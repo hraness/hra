@@ -10,6 +10,7 @@ const allowedPublicScopes = new Set([
   "auth",
   "convex-dev",
   "eslint",
+  "letta-ai",
   "openai",
   "tailwindcss",
   "types",

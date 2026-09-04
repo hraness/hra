@@ -11,7 +11,7 @@ import { Card } from "./ui/card";
  * a general interface primitive: a titled section, a labelled row with a
  * control on the right, and a segmented three-way choice. Every visual is a
  * Tailwind class in the one same-origin stylesheet, and the one icon is inline
- * SVG rather than an image, because `img-src` is `'none'`.
+ * SVG rather than an image, because `img-src` names no remote origin.
  */
 
 export function SettingsSection({

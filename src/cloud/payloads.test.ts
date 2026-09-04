@@ -75,6 +75,21 @@ describe("closed encrypted payloads", () => {
     expect(parseRemoteCommandPayload({ kind: "set_model", preset: "fable" })).toBeNull();
   });
 
+  test("admits a provider switch with an optional preset and refuses anything else", () => {
+    expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "claude" }))
+      .toEqual({ kind: "set_provider", provider: "claude" });
+    expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "fable-max", provider: "claude" }))
+      .toEqual({ kind: "set_provider", preset: "fable-max", provider: "claude" });
+    expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "gemini" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "fable", provider: "claude" }))
+      .toBeNull();
+    // A remote caller never picks the account: account selection is
+    // user-directed and stays on the custodian machine.
+    expect(parseRemoteCommandPayload({ account: "work", kind: "set_provider", provider: "claude" }))
+      .toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_provider" })).toBeNull();
+  });
+
   test("rejects generic RPC and provider method smuggling", () => {
     const absoluteSecretPath = ["", "Users", "name", ".ssh"].join("/");
     expect(parseRemoteCommandPayload({ kind: "rpc", method: "danger" })).toBeNull();

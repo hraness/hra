@@ -12,8 +12,11 @@ import { neutraliseText, safeHref, splitMarkdownBlocks } from "./sanitise";
  * this bundle to put them back. `urlTransform` refuses every href that is not an
  * absolute `https:` URL, and the anchor component checks again before it emits
  * one, so a plugin that bypassed the transform still cannot produce a live
- * `javascript:` link. Images never become an element: `img-src 'none'` would
- * block the request anyway, so the alt text is the rendering.
+ * `javascript:` link. Images never become an element: `img-src` names no origin,
+ * so a remote image would be blocked anyway, and projection text is
+ * attacker-influenced by construction, so the alt text is the rendering. The
+ * only images this app renders are attachment thumbnails from bytes the tab
+ * already holds, and those go through `components/attachment-chips.tsx`.
  *
  * Every element is styled through a class. The policy is `style-src 'self'`, so
  * a style attribute anywhere in this tree would be a silently broken page.
@@ -79,7 +82,9 @@ const components: Components = {
   hr() {
     return <hr className="my-3 border-line" />;
   },
-  // `img-src 'none'`: the alt text is the whole rendering.
+  // Projection text never resolves an image: the alt text is the whole
+  // rendering. `img-src data: blob:` exists for attachment thumbnails, not for
+  // this surface.
   img({ alt }) {
     const label = typeof alt === "string" && alt.length > 0 ? alt : "image";
     return <span className="text-ink-muted italic">[{label}]</span>;

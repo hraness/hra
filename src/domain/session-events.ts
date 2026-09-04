@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
+import { presetSchema, providerSchema } from "./presets";
 import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "./values";
 
 export const SESSION_EVENT_PAGE_LIMIT = 200;
@@ -80,6 +81,26 @@ const planStepSchema = z.object({
   status: z.enum(["pending", "in_progress", "completed"]),
 }).strict();
 
+/**
+ * The most a single `user_message` event retains. A local message may be far
+ * larger than one event's byte bound, so the retained prefix is capped here
+ * and the remainder is stated as an exact omission count rather than dropped
+ * silently.
+ */
+export const SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS = 16_384;
+
+/** Who authored the message HRA sent to the provider. */
+export const sessionMessageActorSchema = z.enum([
+  "human",
+  "autorespond",
+  "provider_switch",
+]);
+
+export type SessionMessageActor = z.infer<typeof sessionMessageActorSchema>;
+
+/** Bounded one-line label for a tool call. Never a raw argument or output. */
+const toolSummarySchema = boundedText(256);
+
 export const sessionEventBodySchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("connection"),
@@ -115,6 +136,12 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     server: providerToolLabelSchema.optional(),
     tool: providerToolLabelSchema.optional(),
     liveAcceptanceCommandDigest: digestSchema.optional(),
+    // Present only on a tool-shaped item. It is the stable identity a later
+    // result binds back to this call, and it is the same opaque value on the
+    // started and completed events of one call.
+    callId: publicProviderIdentifierSchema.optional(),
+    // A classified, bounded, redacted one-line label. Never a raw argument.
+    summary: toolSummarySchema.optional(),
   }).strict(),
   z.object({
     type: z.literal("item_completed"),
@@ -125,6 +152,38 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     tool: providerToolLabelSchema.optional(),
     liveAcceptanceCommandDigest: digestSchema.optional(),
     status: boundedText(128).optional(),
+    callId: publicProviderIdentifierSchema.optional(),
+    summary: toolSummarySchema.optional(),
+  }).strict(),
+  /**
+   * Exactly what HRA sent to the provider, with the actor that authored it.
+   * This is the record that lets HRA rebuild a conversation from its own
+   * storage rather than asking the provider for its transcript.
+   */
+  z.object({
+    type: z.literal("user_message"),
+    // Null until the provider names the turn the message opened.
+    turnId: publicProviderIdentifierSchema.nullable(),
+    actor: sessionMessageActorSchema,
+    text: boundedText(SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS),
+    omittedCharacters: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  }).strict(),
+  /**
+   * One session moved from one provider to another. The seed digest binds the
+   * exact handoff summary the target provider was given as its first user
+   * message; the transcript digest binds the neutral conversation that summary
+   * was rendered from.
+   */
+  z.object({
+    type: z.literal("provider_switched"),
+    fromProvider: providerSchema,
+    toProvider: providerSchema,
+    fromPreset: presetSchema,
+    toPreset: presetSchema,
+    accountChanged: z.boolean(),
+    transcriptDigest: digestSchema,
+    seedDigest: digestSchema,
+    seedOmittedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   }).strict(),
   z.object({
     type: z.literal("assistant_delta"),
@@ -417,10 +476,11 @@ export const advanceSessionEventContinuity = (
   }
 
   for (const event of page.events) {
-    if (accountId !== null && event.accountId !== accountId) {
-      throw new Error("SESSION_EVENT_CONTINUITY_ACCOUNT_CHANGED");
-    }
-    accountId ??= event.accountId;
+    // A session may legitimately change account: `hra session switch` moves
+    // one conversation to another provider, and the target provider may be a
+    // different HRA account. Continuity therefore follows the account rather
+    // than pinning it; one page still never mixes two accounts.
+    accountId = event.accountId;
 
     if (requiredEpochChangeFrom !== null) {
       if (event.streamEpoch === requiredEpochChangeFrom) {

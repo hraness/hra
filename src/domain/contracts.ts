@@ -2,6 +2,7 @@ import { isAbsolute, normalize } from "node:path";
 
 import { z } from "zod";
 
+import { attachmentReferenceListSchema } from "./attachment-schemas";
 import { presetSchema, providerSchema } from "./presets";
 import { interactionResolutionSchema } from "./interactions";
 import {
@@ -9,6 +10,7 @@ import {
   SESSION_EVENT_WAIT_MAX_MS,
   sessionEventCursorWireSchema,
 } from "./session-events";
+import { TRANSCRIPT_PAGE_LIMIT } from "./transcript";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "./usage-metrics";
 import {
   sessionTaskIntervalMinutesSchema,
@@ -220,9 +222,13 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
   z.object({ kind: z.literal("session.start"), account: selectorSchema, project: selectorSchema.optional(), provider: providerSchema.optional(), preset: presetSchema, fast: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
-  z.object({ kind: z.literal("session.send"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
-  z.object({ kind: z.literal("session.queue"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
-  z.object({ kind: z.literal("session.steer"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
+  // `attachments` is optional and absent by default, so a message with no
+  // attachment serializes exactly as it did before attachments existed. The
+  // references name digests in local custody; no path ever crosses this
+  // boundary.
+  z.object({ kind: z.literal("session.send"), session: selectorSchema, message: messageSchema, attachments: attachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.queue"), session: selectorSchema, message: messageSchema, attachments: attachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.steer"), session: selectorSchema, message: messageSchema, attachments: attachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.stop"), session: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.rename"), session: selectorSchema, name: titleSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.archive"), session: selectorSchema, archived: z.boolean() }).strict(),
@@ -233,6 +239,30 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.note.set"), session: selectorSchema, note: noteSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.note.clear"), session: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.preset"), session: selectorSchema, preset: presetSchema, idempotencyKey: idempotencyKeySchema }).strict(),
+  /**
+   * Move one live conversation to another provider. `preset` and `account`
+   * are optional: an omitted preset keeps the session's tier when the target
+   * supports it, and an omitted account keeps the session's account, whose
+   * profile directory already isolates both providers' credentials.
+   */
+  z.object({
+    kind: z.literal("session.switch"),
+    session: selectorSchema,
+    provider: providerSchema,
+    preset: presetSchema.optional(),
+    account: selectorSchema.optional(),
+    idempotencyKey: idempotencyKeySchema,
+  }).strict(),
+  /**
+   * One bounded page of the provider-neutral conversation HRA rebuilt from its
+   * own session events. `after` is an event sequence, not a record index.
+   */
+  z.object({
+    kind: z.literal("session.transcript"),
+    session: selectorSchema,
+    after: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    limit: z.number().int().min(1).max(TRANSCRIPT_PAGE_LIMIT),
+  }).strict(),
   z.object({ kind: z.literal("session.fast"), session: selectorSchema, enabled: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.project"), session: selectorSchema, project: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({

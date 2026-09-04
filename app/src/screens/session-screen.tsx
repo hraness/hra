@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
-import { BackIcon, KebabIcon, StopIcon } from "../components/icons";
+import { ComposerAttachmentChips } from "../components/attachment-chips";
+import { AttachIcon, BackIcon, KebabIcon, StopIcon } from "../components/icons";
 import { InteractionPanel } from "../components/interaction-panel";
 import { ScheduledTasksBadge } from "../components/scheduled-tasks-badge";
 import { StateIndicator } from "../components/state-indicator";
@@ -8,11 +9,28 @@ import { TranscriptView } from "../components/transcript-view";
 import { Button } from "../components/ui/button";
 import { Sheet } from "../components/ui/sheet";
 import { Textarea } from "../components/ui/textarea";
-import { useSubmitCommand } from "../data/commands";
+import { useCommandState, useSubmitCommand } from "../data/commands";
+import { useComposerAttachments } from "../data/composer-attachments";
+import { holdSentAttachment } from "../data/sent-attachments";
 import { useSessionHead } from "../data/session-heads";
 import { useSessionModel } from "../data/session-model-hook";
 import type { ModelPreset, RemoteCommandPayload } from "../hra/cloud";
 import { cn } from "../lib/cn";
+import {
+  attachmentAcceptAttribute,
+  attachmentSendSupported,
+  buildSendPayload,
+  defaultMessageForAttachments,
+} from "../model/attachments";
+import {
+  buildSetProviderPayload,
+  providerSwitchDisabledReason,
+  providerSwitchNote,
+  providerSwitchNotice,
+  providerSwitchOptions,
+  providerSwitchSupported,
+  type SessionProvider,
+} from "../model/provider-switch";
 import { deriveTranscript } from "../model/transcript";
 import { shortSessionLabel } from "../model/session-view";
 import { navigateBack } from "../routing/router";
@@ -37,17 +55,25 @@ function failureMessage(failure: unknown): string {
 }
 
 function ChoiceRow({
+  disabled = false,
   label,
   onSelect,
   selected,
-}: Readonly<{ label: string; onSelect: () => void; selected: boolean }>): ReactNode {
+}: Readonly<{
+  disabled?: boolean;
+  label: string;
+  onSelect: () => void;
+  selected: boolean;
+}>): ReactNode {
   return (
     <button
       aria-pressed={selected}
       className={cn(
         "flex min-h-11 w-full items-center justify-between rounded-md border px-3 text-left text-sm",
+        "disabled:cursor-not-allowed disabled:opacity-50",
         selected ? "border-accent text-accent" : "border-line text-ink",
       )}
+      disabled={disabled}
       onClick={onSelect}
       type="button"
     >
@@ -84,6 +110,10 @@ export function SessionScreen({
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [decisionCommandId, setDecisionCommandId] = useState<string | null>(null);
+  const [provider, setProvider] = useState<SessionProvider | null>(null);
+  const [providerCommandId, setProviderCommandId] = useState<string | null>(null);
+  const attach = useComposerAttachments();
+  const pickerRef = useRef<HTMLInputElement>(null);
 
   const title = model.title ?? shortSessionLabel(sessionPublicId);
   const entries = useMemo(
@@ -134,12 +164,51 @@ export function SessionScreen({
     element.scrollTop = element.scrollHeight;
   }, [entries]);
 
+  const providerCommand = useCommandState(providerCommandId);
+  const providerDisabledReason = providerSwitchDisabledReason({
+    sending,
+    supported: providerSwitchSupported(),
+    turnActive: model.turnActive,
+  });
+  const providerNotice = providerSwitchNotice(providerCommand, provider);
+
+  const attachments = attach.attachments;
+  const typed = message.trim();
+  // Attachments alone are a message: with nothing typed, the file names are the
+  // text, which is factual rather than a sentence invented on the reader's
+  // behalf. The daemon refuses an empty message, so something has to be there.
+  const outgoing = typed.length > 0 ? typed : defaultMessageForAttachments(attachments);
+  const canSend = head !== null && !sending && !attach.busy && outgoing.length > 0;
+
   const send = (event: { preventDefault: () => void }) => {
     event.preventDefault();
-    const text = message.trim();
-    if (text.length === 0 || sending) return;
-    void run({ kind: "send_or_steer", message: text })
-      .then((commandPublicId) => { if (commandPublicId !== null) setMessage(""); });
+    if (!canSend) return;
+    if (attach.sendRefusal !== null) {
+      setNotice(attach.sendRefusal);
+      return;
+    }
+    if (attachments.length > 0 && !attachmentSendSupported()) {
+      setNotice(
+        "This build does not carry attachments to the machine yet. "
+        + "Send the message without them, or update the machine.",
+      );
+      return;
+    }
+    void run(buildSendPayload({ attachments, message: outgoing }))
+      .then((commandPublicId) => {
+        if (commandPublicId === null) return;
+        // Only this tab can show these bytes again, and only until it reloads.
+        for (const item of attachments) {
+          if (item.kind !== "image") continue;
+          holdSentAttachment({
+            bytes: item.bytes,
+            digest: item.digest,
+            mediaType: item.mediaType,
+          });
+        }
+        setMessage("");
+        attach.clear();
+      });
   };
 
   return (
@@ -197,12 +266,48 @@ export function SessionScreen({
         {notice === null ? null : (
           <p className="text-xs text-ink-muted" role="status">{notice}</p>
         )}
-        <form className="flex items-end gap-2" onSubmit={send}>
+        {attach.notice === null ? null : (
+          <p className="text-xs text-danger" role="status">{attach.notice}</p>
+        )}
+        <ComposerAttachmentChips attachments={attachments} onRemove={attach.remove} />
+        {attach.busy ? (
+          <p className="text-xs text-ink-muted" role="status">Preparing the attachments.</p>
+        ) : null}
+        <form
+          className={cn(
+            "flex items-end gap-2 rounded-md",
+            attach.dragging ? "outline-2 outline-offset-2 outline-accent" : "",
+          )}
+          onDragLeave={attach.onDragLeave}
+          onDragOver={attach.onDragOver}
+          onDrop={attach.onDrop}
+          onSubmit={send}
+        >
+          <input
+            accept={attachmentAcceptAttribute}
+            aria-hidden="true"
+            className="hidden"
+            multiple
+            onChange={attach.onPick}
+            ref={pickerRef}
+            tabIndex={-1}
+            type="file"
+          />
+          <Button
+            aria-label="Attach a file"
+            disabled={head === null}
+            onClick={() => { pickerRef.current?.click(); }}
+            size="icon"
+            variant="ghost"
+          >
+            <AttachIcon />
+          </Button>
           <Textarea
             aria-label="Message this session"
             disabled={head === null}
             onChange={(event) => { setMessage(event.target.value); }}
-            placeholder="Send or steer"
+            onPaste={attach.onPaste}
+            placeholder="Send or steer. Paste or drop an image or a text file to attach it."
             value={message}
           />
           {model.turnActive ? (
@@ -216,7 +321,7 @@ export function SessionScreen({
               <StopIcon />
             </Button>
           ) : null}
-          <Button disabled={head === null || sending || message.trim().length === 0} type="submit">
+          <Button disabled={!canSend} type="submit">
             Send
           </Button>
         </form>
@@ -257,6 +362,30 @@ export function SessionScreen({
             />
           ))}
         </div>
+
+        <h2 className="mt-4 text-base font-semibold">Provider</h2>
+        <p className="mt-1 text-xs text-ink-muted">{providerSwitchNote}</p>
+        <div className="mt-2 flex flex-col gap-2">
+          {providerSwitchOptions.map((option) => (
+            <ChoiceRow
+              disabled={providerDisabledReason !== null}
+              key={option.provider}
+              label={option.label}
+              onSelect={() => {
+                setProvider(option.provider);
+                void run(buildSetProviderPayload({ provider: option.provider }))
+                  .then((commandPublicId) => { setProviderCommandId(commandPublicId); });
+              }}
+              selected={provider === option.provider}
+            />
+          ))}
+        </div>
+        {providerDisabledReason === null ? null : (
+          <p className="mt-2 text-xs text-ink-muted">{providerDisabledReason}</p>
+        )}
+        {providerNotice === null ? null : (
+          <p className="mt-2 text-xs text-ink-muted" role="status">{providerNotice.text}</p>
+        )}
       </Sheet>
     </div>
   );

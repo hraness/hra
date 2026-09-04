@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 
 import { CODEX_PIN } from "../codex/pin";
+import { ATTACHMENT_MAX_COUNT } from "../domain/attachments";
 import type { LocalCommand } from "../domain/contracts";
 import { localCommandSchema } from "../domain/contracts";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
@@ -67,6 +68,21 @@ export type ProtectedAuthLoginCliInvocation = Readonly<{
   kind: "auth.login-protected";
 }>;
 
+/**
+ * `hra session send|queue|steer --attach <path>`. The parser hands back the
+ * exact command plus the paths it was given; the composition entry reads,
+ * sniffs, bounds, and stores each file, then reissues the command with the
+ * resulting digest references.
+ */
+export type SessionAttachmentCliInvocation = Readonly<{
+  attach: readonly string[];
+  command: Extract<LocalCommand, {
+    kind: "session.send" | "session.queue" | "session.steer";
+  }>;
+  json: boolean;
+  kind: "session.attach";
+}>;
+
 export type SessionEventFollowCliInvocation = Readonly<{
   command: Extract<LocalCommand, { kind: "session.events" }>;
   jsonl: true;
@@ -77,6 +93,20 @@ export type SessionEventWatchCliInvocation = Readonly<{
   command: Extract<LocalCommand, { kind: "session.events" }>;
   jsonl: boolean;
   kind: "session.events.watch";
+}>;
+
+/**
+ * `hra session export` reads the provider-neutral transcript in bounded pages
+ * and writes one document. It is a client-side flow over the paged
+ * `session.transcript` command rather than one round trip, so the whole
+ * conversation never has to fit in a single local response.
+ */
+export type SessionExportCliInvocation = Readonly<{
+  format: "trajectory" | "json";
+  json: boolean;
+  kind: "session.export";
+  out?: string;
+  session: string;
 }>;
 
 export type WorkApplyCliInvocation = Readonly<{
@@ -115,8 +145,10 @@ export type CliInvocation =
   | ProtectedInteractionCliInvocation
   | ProtectedInteractionInspectCliInvocation
   | AccountLoginCliInvocation
+  | SessionAttachmentCliInvocation
   | SessionEventFollowCliInvocation
   | SessionEventWatchCliInvocation
+  | SessionExportCliInvocation
   | WorkApplyCliInvocation
   | WorkEventFollowCliInvocation
   | InteractionRequiredInvocation
@@ -149,6 +181,12 @@ export type RemoteCliCommand =
     }>
   | Readonly<{ kind: "remote.stop"; session: string }>
   | Readonly<{ kind: "remote.preset"; preset: "low" | "high" | "ultra" | "fable-max"; session: string }>
+  | Readonly<{
+      kind: "remote.provider";
+      preset?: "low" | "high" | "ultra" | "fable-max";
+      provider: "codex" | "claude";
+      session: string;
+    }>
   | Readonly<{ enabled: boolean; kind: "remote.fast"; session: string }>;
 
 export class CliUsageError extends Error {
@@ -298,13 +336,15 @@ Usage:
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]
-  hra session send|queue|steer <session> <message>
+  hra session send|queue|steer <session> [--attach <path>]... <message>
   hra session stop|recover|abandon <session>
   hra session archive|unarchive <session>
   hra session rename <session> <name>
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
   hra session preset <session> <low|high|ultra|fable-max>
+  hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]
+  hra session export <session> [--format <trajectory|json>] [--out <path>]
   hra session fast <session> <on|off>
   hra session project <session> <project>
   hra session task list <session>
@@ -316,10 +356,13 @@ Usage:
 Examples:
   hra session start personal --project jungle --preset high
   hra session start personal --provider claude --preset fable-max
+  hra session switch my-session --provider claude
+  hra session export my-session --format trajectory --out ./trajectory.json
   hra session watch my-session
   hra session watch my-session --jsonl
   hra session events my-session --wait-ms 30000 --jsonl
   hra session send my-session -- "run --help exactly"
+  hra session send my-session --attach diagram.png --attach notes.md "what changed here?"
   hra session task create my-session --name daily-review --every-minutes 1440 -- "review the release queue"`,
   work: `HRA work
 
@@ -369,6 +412,7 @@ Usage:
   hra remote stop <cloud-session>
   hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <once|decline|cancel>
   hra remote preset <cloud-session> <low|high|ultra|fable-max>
+  hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
   hra remote fast <cloud-session> <on|off>
   hra remote allow|deny <device-commands|account-linking>
   hra remote policy
@@ -589,6 +633,29 @@ const option = (cursor: Cursor, name: string): string | undefined => {
   if (value === undefined || isOption(value)) throw new CliUsageError(`Missing value for ${name}.`);
   cursor.values.splice(index, 2);
   return decode(value);
+};
+
+/*
+ * A repeatable option. Every occurrence is consumed before the positional
+ * words are read, so `--attach` may appear anywhere ahead of the message and
+ * the message itself still reaches `remainder` unchanged. A literal word after
+ * `--` carries the literal prefix and can never be mistaken for the option.
+ */
+const repeatedOption = (cursor: Cursor, name: string, limit: number): readonly string[] => {
+  const values: string[] = [];
+  for (;;) {
+    const index = cursor.values.indexOf(name);
+    if (index < 0) return values;
+    const value = cursor.values[index + 1];
+    if (value === undefined || isOption(value)) {
+      throw new CliUsageError(`Missing value for ${name}.`);
+    }
+    if (values.length >= limit) {
+      throw new CliUsageError(`At most ${String(limit)} ${name} values are accepted.`);
+    }
+    cursor.values.splice(index, 2);
+    values.push(decode(value));
+  }
 };
 
 const boundedDecimal = (
@@ -1025,7 +1092,13 @@ const parseSession = (
   cursor: Cursor,
   jsonl: boolean,
   idempotencyKey: string | undefined,
-): LocalCommand | SessionEventFollowCliInvocation | SessionEventWatchCliInvocation => {
+  jsonRequested: boolean,
+):
+  | LocalCommand
+  | SessionEventFollowCliInvocation
+  | SessionEventWatchCliInvocation
+  | SessionExportCliInvocation
+  | Omit<SessionAttachmentCliInvocation, "json"> => {
   const action = take(cursor, "session action");
   switch (action) {
     case "list": {
@@ -1104,9 +1177,26 @@ const parseSession = (
       finish(cursor);
       return command({ kind: "session.start", account, project, provider, preset, fast });
     }
-    case "send": { const session = take(cursor, "session"); return command({ kind: "session.send", session, message: remainder(cursor, "message") }); }
-    case "queue": { const session = take(cursor, "session"); return command({ kind: "session.queue", session, message: remainder(cursor, "message") }); }
-    case "steer": { const session = take(cursor, "session"); return command({ kind: "session.steer", session, message: remainder(cursor, "message") }); }
+    case "send":
+    case "queue":
+    case "steer": {
+      // Attachment paths are read, sniffed, bounded, and written into local
+      // content-addressed custody by the CLI composition entry. The parser
+      // never opens a file and never puts a path into a command.
+      const attach = repeatedOption(cursor, "--attach", ATTACHMENT_MAX_COUNT);
+      const session = take(cursor, "session");
+      const kind = action === "send"
+        ? "session.send" as const
+        : action === "queue" ? "session.queue" as const : "session.steer" as const;
+      const parsed = command({ kind, session, message: remainder(cursor, "message") });
+      if (attach.length === 0) return parsed;
+      if (
+        parsed.kind !== "session.send"
+        && parsed.kind !== "session.queue"
+        && parsed.kind !== "session.steer"
+      ) throw new CliUsageError("Session message command is invalid.");
+      return { attach, command: parsed, kind: "session.attach" };
+    }
     case "stop": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.stop", session }; }
     case "rename": { const session = take(cursor, "session"); return command({ kind: "session.rename", session, name: remainder(cursor, "name") }); }
     case "archive": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.archive", session, archived: true }; }
@@ -1115,6 +1205,42 @@ const parseSession = (
     case "abandon": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.abandon", session }; }
     case "note": return parseSessionNote(cursor);
     case "preset": { const session = take(cursor, "session"); const preset = take(cursor, "preset"); finish(cursor); return command({ kind: "session.preset", session, preset }); }
+    case "export": {
+      const format = option(cursor, "--format") ?? "trajectory";
+      const out = option(cursor, "--out");
+      const session = take(cursor, "session");
+      finish(cursor);
+      if (format !== "trajectory" && format !== "json") {
+        throw new CliUsageError("Export format must be `trajectory` or `json`.");
+      }
+      if (out !== undefined && (out.length === 0 || out.length > 1_024)) {
+        throw new CliUsageError("Export output path must be between 1 and 1024 characters.");
+      }
+      return {
+        format,
+        json: jsonRequested,
+        kind: "session.export",
+        ...(out === undefined ? {} : { out }),
+        session,
+      };
+    }
+    case "switch": {
+      const provider = option(cursor, "--provider");
+      const preset = option(cursor, "--preset");
+      const account = option(cursor, "--account");
+      const session = take(cursor, "session");
+      finish(cursor);
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      return command({
+        kind: "session.switch",
+        session,
+        provider,
+        ...(preset === undefined ? {} : { preset }),
+        ...(account === undefined ? {} : { account }),
+      });
+    }
     case "fast": { const session = take(cursor, "session"); const value = take(cursor, "on or off"); finish(cursor); if (value !== "on" && value !== "off") throw new CliUsageError("Fast must be `on` or `off`."); return { kind: "session.fast", session, enabled: value === "on" }; }
     case "project": { const session = take(cursor, "session"); const project = take(cursor, "project"); finish(cursor); return { kind: "session.project", session, project }; }
     case "task": return parseSessionTask(cursor, idempotencyKey);
@@ -1489,6 +1615,27 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
       }
       return { kind: "remote.preset", session, preset };
     }
+    case "provider": {
+      const preset = option(cursor, "--preset");
+      const session = take(cursor, "session");
+      const provider = take(cursor, "provider");
+      finish(cursor);
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      if (
+        preset !== undefined
+        && preset !== "low" && preset !== "high" && preset !== "ultra" && preset !== "fable-max"
+      ) {
+        throw new CliUsageError("Preset must be `low`, `high`, `ultra`, or `fable-max`.");
+      }
+      return {
+        kind: "remote.provider",
+        ...(preset === undefined ? {} : { preset }),
+        provider,
+        session,
+      };
+    }
     case "fast": {
       const session = take(cursor, "session");
       const value = take(cursor, "on or off");
@@ -1629,6 +1776,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     return { kind: "command", command: { kind: "autorespond.set", mode, ...(session === undefined ? {} : { session }) }, json };
   }
   let parsed: LocalCommand;
+  let sessionAttach: readonly string[] = [];
   if (group === "account") {
     const account = parseAccount(cursor, idempotencyKey, json);
     if (account.kind === "account.login-handoff") return account;
@@ -1637,7 +1785,16 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   else if (group === "plugin") parsed = parsePlugin(cursor);
   else if (group === "project") parsed = parseProject(cursor, cwd);
   else if (group === "session") {
-    const sessionCommand = parseSession(cursor, jsonl, idempotencyKey);
+    const sessionCommand = parseSession(cursor, jsonl, idempotencyKey, json);
+    if (sessionCommand.kind === "session.export") {
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by session.export.");
+      }
+      if (jsonl) {
+        throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
+      }
+      return sessionCommand;
+    }
     if (sessionCommand.kind === "session.events.follow") {
       if (json) {
         throw new CliUsageError("Event following is already JSON Lines and cannot be combined with --json.");
@@ -1659,7 +1816,12 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     if (jsonl) {
       throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
     }
-    parsed = sessionCommand;
+    if (sessionCommand.kind === "session.attach") {
+      sessionAttach = sessionCommand.attach;
+      parsed = sessionCommand.command;
+    } else {
+      parsed = sessionCommand;
+    }
   }
   else if (group === "work") {
     if (idempotencyKey !== undefined) {
@@ -1828,6 +1990,14 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       ? parsed.idempotencyKey
       : randomUUID();
     parsed = command({ ...parsed, idempotencyKey: idempotencyKey ?? generated });
+  }
+  if (sessionAttach.length > 0) {
+    if (
+      parsed.kind !== "session.send"
+      && parsed.kind !== "session.queue"
+      && parsed.kind !== "session.steer"
+    ) throw new CliUsageError("Only session send, queue, and steer accept --attach.");
+    return { attach: sessionAttach, command: parsed, json, kind: "session.attach" };
   }
   return { kind: "command", command: parsed, json };
 }

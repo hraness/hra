@@ -1,3 +1,4 @@
+import { formatAttachmentSize } from "../domain/attachments";
 import {
   publicSessionListPageSchema,
   signedOutSessionListMetadataSchema,
@@ -222,6 +223,26 @@ const duration = (value: unknown): string => {
 const indented = (value: string): string =>
   terminalSafe(value, true).split("\n").map((part) => `  ${part}`).join("\n");
 
+/*
+ * The attachment manifest for one message: name, declared media type, and
+ * size. Never the bytes, never a digest the human did not ask for, and never a
+ * path — a renderer that could print bytes is a renderer that can leak them.
+ */
+const renderAttachments = (value: unknown): string => {
+  if (!Array.isArray(value)) return "";
+  const rows = value.flatMap((entry) => {
+    const attachment = object(entry);
+    if (
+      attachment === null
+      || typeof attachment.name !== "string"
+      || typeof attachment.mediaType !== "string"
+      || typeof attachment.byteLength !== "number"
+    ) return [];
+    return [`  attached: ${line(attachment.name)}  ${line(attachment.mediaType)}  ${formatAttachmentSize(attachment.byteLength)}`];
+  });
+  return rows.length === 0 ? "" : `\n${rows.join("\n")}`;
+};
+
 const renderMessage = (value: unknown): string | null => {
   const message = object(value);
   if (message === null) return null;
@@ -232,7 +253,7 @@ const renderMessage = (value: unknown): string | null => {
     ? ""
     : `\n  … [${String(omission.omittedUtf8Bytes)} UTF-8 bytes omitted]`;
   const turn = typeof message.turnId === "string" ? `  ${line(message.turnId)}` : "";
-  return `${message.role === "user" ? "You" : "Codex"}${turn}\n${indented(message.text)}${omitted}`;
+  return `${message.role === "user" ? "You" : "Codex"}${turn}\n${indented(message.text)}${omitted}${renderAttachments(message.attachments)}`;
 };
 
 const stringArray = (value: unknown): readonly string[] =>
@@ -448,6 +469,19 @@ const renderSingleEvent = (event: SessionEvent): string => {
       ...(body.nickname === undefined ? [] : [`  nickname ${line(body.nickname)}`]),
       ...(body.role === undefined ? [] : [`  role ${line(body.role)}`]),
       ...(body.depth === undefined ? [] : [`  depth ${String(body.depth)}`]),
+    ].join("\n");
+    case "user_message": return [
+      body.actor === "human" ? "You" : body.actor === "autorespond" ? "Autorespond" : "Handoff",
+      indented(body.text),
+      ...(body.omittedCharacters === 0
+        ? []
+        : [`  ${String(body.omittedCharacters)} characters omitted`]),
+    ].join("\n");
+    case "provider_switched": return [
+      `Provider switched: ${line(body.fromProvider)} to ${line(body.toProvider)}`,
+      `  preset ${line(body.fromPreset)} to ${line(body.toPreset)}`,
+      `  account ${body.accountChanged ? "changed" : "unchanged"}`,
+      `  seed ${line(body.seedDigest)}, ${String(body.seedOmittedRecords)} records omitted`,
     ].join("\n");
   }
 };
@@ -2350,6 +2384,18 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       : projected.protectedOutput?.status === "shown_in_protected_terminal"
         ? "Protected approval detail was shown in the foreground terminal.\n"
         : "Protected approval detail is unavailable.\n");
+  } else if (command.kind === "session.switch") {
+    const from = object(value.from);
+    const to = object(value.to);
+    const seed = object(value.seed);
+    output.writeStdout([
+      `Switched ${line(value.sessionId ?? object(value.session)?.id)} from ${line(from?.provider)} (${line(from?.preset)}) to ${line(to?.provider)} (${line(to?.preset)}).`,
+      `Account: ${line(from?.account)} to ${line(to?.account)}.`,
+      seed?.delivered === false
+        ? `Handoff summary was NOT delivered (${line(seed.failureCode)}). Send it again with \`hra session send\`.`
+        : `Handoff summary: ${line(seed?.includedRecords)} records sent, ${line(seed?.omittedRecords)} omitted.`,
+      "The new provider has HRA's record of the conversation, not the old provider's thread or cached context.",
+    ].join("\n").concat("\n"));
   } else if (command.kind === "session.note.get") {
     output.writeStdout(`${line(value.note)}\n`);
   } else if (command.kind === "daemon.status") {

@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 
+import {
+  attachmentFencedText,
+  type PreparedAttachment,
+} from "../domain/attachments.ts";
 import type { InteractionDisplay, InteractionKind } from "../domain/interactions.ts";
 import { redactAbsolutePaths } from "../domain/text-safety.ts";
 import { redactCompleteSensitiveText } from "../sensitive-text.ts";
@@ -726,10 +730,36 @@ export const claudeControlResponseLine = (
     type: "control_response",
   })}\n`;
 
-/** Steering and sending are the same wire shape: another `user` line. */
-export const claudeUserLine = (text: string): string =>
+/*
+ * Steering and sending are the same wire shape: another `user` line.
+ *
+ * Claude Code speaks Anthropic content blocks, so an image attachment is an
+ * `image` block carrying its own base64 bytes and a text-ish attachment is a
+ * further `text` block with a header naming the file. The message text is
+ * always the first block, and with no attachment the emitted line is byte for
+ * byte what HRA sent before attachments existed.
+ */
+export const claudeUserLine = (
+  text: string,
+  attachments: readonly PreparedAttachment[] = [],
+): string =>
   `${JSON.stringify({
-    message: { content: [{ text, type: "text" }], role: "user" },
+    message: {
+      content: [
+        { text, type: "text" },
+        ...attachments.map((attachment) => attachment.kind === "image"
+          ? {
+              source: {
+                data: attachment.base64,
+                media_type: attachment.mediaType,
+                type: "base64",
+              },
+              type: "image",
+            }
+          : { text: attachmentFencedText(attachment), type: "text" }),
+      ],
+      role: "user",
+    },
     type: "user",
   })}\n`;
 

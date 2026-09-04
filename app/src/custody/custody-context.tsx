@@ -22,6 +22,7 @@ import {
   presenceHeartbeat,
   registerDevice,
 } from "../data/functions";
+import { releaseHeldAttachments } from "../data/sent-attachments";
 import { clearSessionMetadataCache } from "../data/session-metadata";
 import {
   parseAccountContext,
@@ -179,6 +180,10 @@ export function CustodyProvider({ children }: Readonly<{ children: ReactNode }>)
     // leave plaintext readable behind the lock screen.
     clearCompactHistoryCache();
     clearSessionMetadataCache();
+    // The same argument covers the attachment bytes this tab sent: they are
+    // reader-supplied file contents held in memory for the transcript
+    // thumbnails, and they must not survive the lock either.
+    releaseHeldAttachments();
   }, [disconnectPresence]);
 
   const reportAuthorityFailure = useCallback((failure: unknown) => {

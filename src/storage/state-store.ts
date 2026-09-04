@@ -16,6 +16,17 @@ import { z } from "zod";
 
 import { redactAbsolutePaths } from "../domain/text-safety";
 import {
+  attachmentDigestSchema,
+  attachmentMediaTypeSchema,
+  attachmentNameSchema,
+} from "../domain/attachment-schemas";
+import {
+  ATTACHMENT_MAX_BYTES,
+  ATTACHMENT_MAX_COUNT,
+  type AttachmentManifestEntry,
+  type AttachmentMediaType,
+} from "../domain/attachments";
+import {
   INTERACTION_MAX_PENDING_MS,
   interactionDisplaySchema,
   interactionIntendedTerminalStateSchema,
@@ -798,7 +809,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 33;
+const currentSchemaVersion = 34;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -2381,6 +2392,108 @@ const schemaVersion33AccountLinkingAllowedColumn =
   "ALTER TABLE daemon_state ADD COLUMN account_linking_allowed INTEGER NOT NULL DEFAULT 0 "
   + "CHECK(account_linking_allowed IN (0,1))";
 
+/*
+ * Attachments (W5). Two additive tables and nothing else.
+ *
+ * `attachments` is local custody accounting for one content-addressed blob:
+ * its digest, the canonical media type its own leading bytes prove, its
+ * length, when it was first admitted, and how many messages still reference
+ * it. The bytes themselves are never here; they are mode-0600 files under the
+ * state root (`src/storage/attachment-store.ts`). `media_type` is the
+ * canonical, bytes-derived type, so one digest has exactly one row even when
+ * two messages declare the same bytes as `text/markdown` and `text/csv`.
+ *
+ * `message_attachments` is the per-message manifest keyed by the client
+ * message id the provider turn was dispatched under (an `attempt_` id for a
+ * send or steer, a `queue_` id for a queued message). It carries the declared
+ * name and media type — what the user sees and what the provider is told —
+ * and never any bytes, so the queue-message scrub trigger has nothing to
+ * scrub here. The two triggers keep `reference_count` exact; a blob whose
+ * count reaches zero is swept from disk by the daemon.
+ */
+const schemaVersion34Attachments = `
+CREATE TABLE IF NOT EXISTS attachments (
+  digest TEXT PRIMARY KEY CHECK(length(digest) = 64 AND digest GLOB '[0-9a-f]*'),
+  media_type TEXT NOT NULL CHECK(media_type IN ('image/png','image/jpeg','image/gif','image/webp','text/plain')),
+  byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 1 AND 5242880),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  reference_count INTEGER NOT NULL DEFAULT 0 CHECK(reference_count >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS message_attachments (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL CHECK(length(source_id) BETWEEN 1 AND 200),
+  position INTEGER NOT NULL CHECK(position BETWEEN 0 AND 7),
+  digest TEXT NOT NULL REFERENCES attachments(digest),
+  name TEXT NOT NULL CHECK(length(CAST(name AS BLOB)) BETWEEN 1 AND 255),
+  media_type TEXT NOT NULL CHECK(media_type IN ('image/png','image/jpeg','image/gif','image/webp','text/plain','text/markdown','text/csv','application/json')),
+  byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 1 AND 5242880),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  PRIMARY KEY (session_id, source_id, position)
+) STRICT;
+CREATE INDEX IF NOT EXISTS message_attachments_digest ON message_attachments(digest);
+CREATE INDEX IF NOT EXISTS message_attachments_recent ON message_attachments(session_id, created_at DESC);
+CREATE TRIGGER IF NOT EXISTS message_attachments_reference_increment
+AFTER INSERT ON message_attachments
+BEGIN
+  UPDATE attachments SET reference_count = reference_count + 1 WHERE digest = NEW.digest;
+END;
+CREATE TRIGGER IF NOT EXISTS message_attachments_reference_decrement
+AFTER DELETE ON message_attachments
+BEGIN
+  UPDATE attachments SET reference_count = MAX(reference_count - 1, 0) WHERE digest = OLD.digest;
+END;
+CREATE TRIGGER IF NOT EXISTS message_attachments_immutable_update
+BEFORE UPDATE ON message_attachments
+BEGIN SELECT RAISE(ABORT, 'message attachments are immutable'); END;
+`;
+
+/** Per-session attachment-carrying message sources kept for projection. */
+export const MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP = 200;
+
+/**
+ * One attachment as local custody records it: the declared presentation the
+ * user and the provider see, plus the canonical, bytes-derived media type the
+ * blob store filed it under.
+ */
+export const storedMessageAttachmentSchema = z.object({
+  byteLength: z.number().int().min(1).max(ATTACHMENT_MAX_BYTES),
+  canonicalMediaType: attachmentMediaTypeSchema,
+  digest: attachmentDigestSchema,
+  mediaType: attachmentMediaTypeSchema,
+  name: attachmentNameSchema,
+}).strict();
+
+export type StoredMessageAttachment = z.infer<typeof storedMessageAttachmentSchema>;
+
+const storedMessageAttachmentListSchema = z
+  .array(storedMessageAttachmentSchema)
+  .max(ATTACHMENT_MAX_COUNT);
+
+const messageAttachmentRowSchema = z.object({
+  byte_length: z.number().int().min(1).max(ATTACHMENT_MAX_BYTES),
+  digest: attachmentDigestSchema,
+  media_type: attachmentMediaTypeSchema,
+  name: attachmentNameSchema,
+});
+
+const attachmentCustodyRowSchema = z.object({
+  byte_length: z.number().int().min(1).max(ATTACHMENT_MAX_BYTES),
+  digest: attachmentDigestSchema,
+  media_type: attachmentMediaTypeSchema,
+  reference_count: z.number().int().min(0),
+});
+
+export type AttachmentCustodyRow = Readonly<{
+  byteLength: number;
+  canonicalMediaType: AttachmentMediaType;
+  digest: string;
+  referenceCount: number;
+}>;
+
+const applySchemaVersion34Attachments = (database: Database): void => {
+  database.exec(schemaVersion34Attachments);
+};
+
 const applySchemaVersion33DeviceCommands = (database: Database): void => {
   if (!hasTableColumn(database, "daemon_state", "device_commands_allowed")) {
     database.exec(schemaVersion33DeviceCommandsAllowedColumn);
@@ -3769,6 +3882,13 @@ const migrateWritableDatabase = (
       version = 33;
     }
 
+    if (version < 34) {
+      applySchemaVersion34Attachments(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(34, now());
+      database.exec("PRAGMA user_version = 34");
+      version = 34;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -3808,6 +3928,7 @@ const migrateWritableDatabase = (
     database.exec(schemaVersion31Objects);
     applySchemaVersion31Archive(database);
     applySchemaVersion33DeviceCommands(database);
+    applySchemaVersion34Attachments(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -5598,6 +5719,143 @@ export class StateStore {
     ).get(sessionIdSchema.parse(sessionId), parsedSourceId.data) !== null;
   }
 
+  /*
+   * Attachment custody.
+   *
+   * `recordMessageAttachments` is the only writer. It admits each blob's
+   * accounting row, then links it to the exact client message id the turn is
+   * dispatched under. Both happen in one immediate transaction with the
+   * caller's other durable evidence, so a manifest never survives a turn that
+   * never started and a turn never starts with a manifest that was not
+   * recorded.
+   */
+  recordMessageAttachments(input: {
+    sessionId: SessionId;
+    sourceId: string;
+    attachments: readonly StoredMessageAttachment[];
+  }): void {
+    const parsedSessionId = sessionIdSchema.parse(input.sessionId);
+    const parsedSourceId = z.string().min(1).max(200).parse(input.sourceId);
+    const parsed = storedMessageAttachmentListSchema.parse(input.attachments);
+    if (parsed.length === 0) return;
+    const now = this.#now();
+    const write = this.#database.transaction(() => {
+      for (const [position, attachment] of parsed.entries()) {
+        this.#database.query(
+          `INSERT INTO attachments(digest,media_type,byte_length,created_at,reference_count)
+           VALUES (?,?,?,?,0)
+           ON CONFLICT(digest) DO NOTHING`,
+        ).run(
+          attachment.digest,
+          attachment.canonicalMediaType,
+          attachment.byteLength,
+          now,
+        );
+        this.#database.query(
+          `INSERT INTO message_attachments(session_id,source_id,position,digest,name,media_type,byte_length,created_at)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(session_id,source_id,position) DO NOTHING`,
+        ).run(
+          parsedSessionId,
+          parsedSourceId,
+          position,
+          attachment.digest,
+          attachment.name,
+          attachment.mediaType,
+          attachment.byteLength,
+          now,
+        );
+      }
+      this.#database.query(
+        `DELETE FROM message_attachments WHERE session_id=? AND source_id NOT IN (
+           SELECT source_id FROM (
+             SELECT source_id, MAX(created_at) AS recent FROM message_attachments
+             WHERE session_id=? GROUP BY source_id ORDER BY recent DESC, source_id DESC LIMIT ?))`,
+      ).run(parsedSessionId, parsedSessionId, MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP);
+    });
+    write.immediate();
+  }
+
+  /** The bounded, byte-free manifest for one dispatched message. */
+  messageAttachmentManifest(
+    sessionId: SessionId,
+    sourceId: string,
+  ): readonly AttachmentManifestEntry[] {
+    const parsedSourceId = z.string().min(1).max(200).safeParse(sourceId);
+    if (!parsedSourceId.success) return [];
+    const rows = this.#database.query(
+      `SELECT digest,name,media_type,byte_length FROM message_attachments
+       WHERE session_id=? AND source_id=? ORDER BY position ASC`,
+    ).all(sessionIdSchema.parse(sessionId), parsedSourceId.data);
+    return rows.map((row) => {
+      const parsed = messageAttachmentRowSchema.parse(row);
+      return {
+        byteLength: parsed.byte_length,
+        digest: parsed.digest,
+        mediaType: parsed.media_type,
+        name: parsed.name,
+      };
+    });
+  }
+
+  /** The canonical media type a stored digest was admitted under, if any. */
+  attachmentCustody(digest: string): AttachmentCustodyRow | null {
+    const parsed = attachmentDigestSchema.safeParse(digest);
+    if (!parsed.success) return null;
+    const row = this.#database.query(
+      "SELECT digest,media_type,byte_length,reference_count FROM attachments WHERE digest=?",
+    ).get(parsed.data);
+    if (row === null) return null;
+    const value = attachmentCustodyRowSchema.parse(row);
+    return {
+      byteLength: value.byte_length,
+      canonicalMediaType: value.media_type,
+      digest: value.digest,
+      referenceCount: value.reference_count,
+    };
+  }
+
+  /** Every digest local custody still accounts for, for the blob sweep. */
+  accountedAttachmentDigests(): ReadonlySet<string> {
+    const rows = this.#database.query(
+      "SELECT digest FROM attachments LIMIT 100000",
+    ).all();
+    const digests = new Set<string>();
+    for (const row of rows) {
+      const parsed = z.object({ digest: z.string() }).safeParse(row);
+      if (parsed.success) digests.add(parsed.data.digest);
+    }
+    return digests;
+  }
+
+  /** Accounting rows no message references any more, oldest first. */
+  listUnreferencedAttachments(limit = 256): readonly AttachmentCustodyRow[] {
+    const bounded = z.number().int().min(1).max(4_096).parse(limit);
+    const rows = this.#database.query(
+      `SELECT digest,media_type,byte_length,reference_count FROM attachments
+       WHERE reference_count = 0 ORDER BY created_at ASC LIMIT ?`,
+    ).all(bounded);
+    return rows.map((row) => {
+      const value = attachmentCustodyRowSchema.parse(row);
+      return {
+        byteLength: value.byte_length,
+        canonicalMediaType: value.media_type,
+        digest: value.digest,
+        referenceCount: value.reference_count,
+      };
+    });
+  }
+
+  /** Drops an accounting row that nothing references. Returns whether it went. */
+  forgetAttachment(digest: string): boolean {
+    const parsed = attachmentDigestSchema.safeParse(digest);
+    if (!parsed.success) return false;
+    const result = this.#database.query(
+      "DELETE FROM attachments WHERE digest=? AND reference_count = 0",
+    ).run(parsed.data);
+    return result.changes > 0;
+  }
+
   listAutorespondEvidence(input: { sessionId?: SessionId; limit?: number } = {}): readonly AutorespondEvidenceRow[] {
     const limit = z.number().int().min(1).max(200).parse(input.limit ?? 20);
     const rows = input.sessionId === undefined
@@ -5701,6 +5959,88 @@ export class StateStore {
     const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], fast ? 1 : 0, project, now, current.id, current.revision);
     if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
     return this.requireSession(current.id);
+  }
+
+  /**
+   * Rebind one session to another provider, in one transaction.
+   *
+   * A session's provider, account, preset, and provider thread all move
+   * together: they are one binding, and half of it is never durable on its
+   * own. The order inside the transaction matters. `sessions` is updated
+   * first so that `session_runtime_profile_authority_guard` — which requires
+   * a runtime profile's account to equal the session's account — sees the new
+   * binding when the target provider's reviewed profile is inserted. The
+   * conversation-automation row follows the new provider thread, otherwise a
+   * scheduled session task would keep addressing the abandoned one.
+   *
+   * The caller has already proved the target provider accepted a thread; this
+   * method never talks to a provider and never invents a preset the target
+   * cannot run.
+   */
+  completeSessionProviderSwitch(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    expectedSessionRevision: number;
+    provider: Provider;
+    profileId: ProfileId;
+    preset: Preset;
+    providerThreadId: string;
+    state: "active" | "idle" | "terminal";
+    activeTurnId?: string;
+    providerUpdatedAt?: number;
+    runtimeProfile: ReviewedRuntimeProfile;
+    receipt: unknown;
+  }): SessionRecord {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const provider = providerSchema.parse(input.provider);
+    const profileId = profileIdSchema.parse(input.profileId);
+    const preset = presetSchema.parse(input.preset);
+    assertPresetSupportedByProvider(provider, preset);
+    const runtimeProfile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
+    if (reviewedRuntimeProfileProvider(runtimeProfile) !== provider) {
+      throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_PROVIDER_MISMATCH");
+    }
+    if (runtimeProfile.profileId !== profileId) {
+      throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_ACCOUNT_MISMATCH");
+    }
+    const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
+    const receiptJson = JSON.stringify(input.receipt);
+    const now = this.#now();
+    const transaction = this.#database.transaction(() => {
+      const bound = this.#database.query(
+        `UPDATE sessions
+         SET provider=?,profile_id=?,preset=?,provider_thread_id=?,state=?,active_turn_id=?,
+             provider_updated_at=?,revision=revision+1,updated_at=?
+         WHERE id=? AND revision=? AND state NOT IN ('recovery_required','terminal')`,
+      ).run(
+        provider,
+        profileId,
+        presetTiers[preset],
+        providerThreadId,
+        input.state,
+        input.activeTurnId ?? null,
+        input.providerUpdatedAt ?? null,
+        now,
+        sessionId,
+        z.number().int().positive().parse(input.expectedSessionRevision),
+      );
+      if (bound.changes !== 1) throw new Error("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
+      this.#database.query(
+        `UPDATE session_conversation_automation
+         SET provider_thread_id=? WHERE session_id=?`,
+      ).run(providerThreadId, sessionId);
+      this.#insertSessionRuntimeProfile(
+        { sessionId, sourceKind: "session_start", sourceId: attemptId, profile: runtimeProfile },
+        now,
+      );
+      const applied = this.#database.query(
+        "UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=? WHERE id=? AND state='effect_started'",
+      ).run(receiptJson, now, attemptId);
+      if (applied.changes !== 1) throw new Error("SESSION_PROVIDER_SWITCH_RECEIPT_CAS_CONFLICT");
+    });
+    transaction.immediate();
+    return this.requireSession(sessionId);
   }
 
   setSessionTurnState(input: { sessionId: SessionId; expectedRevision: number; state: "active" | "idle" | "terminal" | "recovery_required"; activeTurnId?: string }): SessionRecord {
@@ -8875,6 +9215,7 @@ export class StateStore {
       ).all(sessionId, startSequence, limit);
       const events: SessionEvent[] = [];
       let pageBytes = 0;
+      let pageAccountId: string | null = null;
       for (const row of rows) {
         const parsed = z.object({
           event_json: z.string(),
@@ -8888,6 +9229,12 @@ export class StateStore {
         );
         const nextBytes = utf8Bytes(JSON.stringify(next));
         if (events.length > 0 && pageBytes + nextBytes > SESSION_EVENT_PAGE_BYTES) break;
+        // A session that switched provider to another account has events from
+        // both accounts in one stream. One page still never mixes account
+        // identities, so the page ends at the boundary and the next page
+        // opens under the new account.
+        if (pageAccountId !== null && next.accountId !== pageAccountId) break;
+        pageAccountId = next.accountId;
         if (next.sessionId !== sessionId || next.streamEpoch !== stream.stream_epoch) {
           throw new Error("SESSION_EVENT_STORED_AUTHORITY_MISMATCH");
         }

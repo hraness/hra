@@ -11,7 +11,7 @@ const distributionRoot = join(appRoot, "dist");
 /*
  * The shipped bundle has to survive the F1 Content Security Policy:
  *
- *   default-src 'none'; script-src 'self'; style-src 'self'; img-src 'none';
+ *   default-src 'none'; script-src 'self'; style-src 'self'; img-src data: blob:;
  *   connect-src <the three pinned Convex origins>; worker-src 'none'
  *
  * A violation is invisible at build time and fails silently in a browser, so
@@ -152,6 +152,19 @@ describe("bundle invariants", () => {
     expect([...unexpected]).toEqual([]);
   });
 
+  /*
+   * `img-src` no longer says `'none'`, so the second half of that guarantee is
+   * that nothing in the bundle names a remote image to begin with. The origin
+   * allowlist above already covers every absolute URL; this states the image
+   * case directly, because a single `src="https://..."` slipping in is the one
+   * way the relaxed directive could start mattering.
+   */
+  test("no output names a remote src, so no image request can leave the tab", () => {
+    for (const artifact of artifacts) {
+      expect(artifact.text).not.toMatch(/src\s*=\s*["'`]https?:\/\//u);
+    }
+  });
+
   test("names the pinned deployment", () => {
     const scripts = artifacts.filter((artifact) => artifact.name.endsWith(".js"));
     expect(scripts.some((artifact) =>
@@ -159,18 +172,26 @@ describe("bundle invariants", () => {
   });
 });
 
+type ProjectConfiguration = Readonly<{
+  headers: { headers: { key: string; value: string }[]; source: string }[];
+  outputDirectory: string;
+}>;
+
+async function readProjectConfiguration(): Promise<ProjectConfiguration> {
+  return JSON.parse(await readFile(join(appRoot, "vercel.json"), "utf8")) as ProjectConfiguration;
+}
+
+function headerFinder(configuration: ProjectConfiguration) {
+  const all = configuration.headers.flatMap((entry) =>
+    entry.headers.map((header) => [entry.source, header.key, header.value] as const));
+  return (source: string, key: string) =>
+    all.find(([entrySource, entryKey]) => entrySource === source && entryKey === key)?.[2];
+}
+
 describe("vercel project headers", () => {
   test("serve the F1 policy, the referrer policy, and the clipboard denial", async () => {
-    const configuration = JSON.parse(
-      await readFile(join(appRoot, "vercel.json"), "utf8"),
-    ) as {
-      headers: { headers: { key: string; value: string }[]; source: string }[];
-      outputDirectory: string;
-    };
-    const all = configuration.headers.flatMap((entry) =>
-      entry.headers.map((header) => [entry.source, header.key, header.value] as const));
-    const find = (source: string, key: string) =>
-      all.find(([entrySource, entryKey]) => entrySource === source && entryKey === key)?.[2];
+    const configuration = await readProjectConfiguration();
+    const find = headerFinder(configuration);
 
     expect(configuration.outputDirectory).toBe("dist");
     expect(find("/(.*)", "Content-Security-Policy")).toBe(
@@ -178,7 +199,7 @@ describe("vercel project headers", () => {
       + "connect-src https://qualified-hummingbird-537.convex.cloud "
       + "wss://qualified-hummingbird-537.convex.cloud "
       + "https://qualified-hummingbird-537.convex.site; "
-      + "style-src 'self'; img-src 'none'; font-src 'self'; base-uri 'none'; object-src 'none'; "
+      + "style-src 'self'; img-src data: blob:; font-src 'self'; base-uri 'none'; object-src 'none'; "
       + "form-action 'none'; worker-src 'none'; manifest-src 'none'; frame-ancestors 'none'",
     );
     expect(find("/(.*)", "Referrer-Policy")).toBe("no-referrer");
@@ -186,5 +207,31 @@ describe("vercel project headers", () => {
     expect(find("/(.*)", "Permissions-Policy")).toContain("clipboard-read=()");
     expect(find("/", "Cache-Control")).toBe("no-store");
     expect(find("/index.html", "Cache-Control")).toBe("no-store");
+  });
+
+  /*
+   * Attachments need an `img` element, so `img-src` moved off `'none'`. What it
+   * moved to is the narrowest thing that renders a thumbnail: two schemes and no
+   * origin at all. A `data:` or `blob:` URL resolves to bytes this page already
+   * holds, minted in this tab; neither can fetch anything, so no image request
+   * ever leaves the browser and no third party learns that an image was viewed.
+   * A host, a wildcard, or `'self'` appearing here would be a real widening and
+   * fails this test.
+   */
+  test("img-src resolves only bytes the page already holds", async () => {
+    const policy = headerFinder(await readProjectConfiguration())("/(.*)", "Content-Security-Policy")
+      ?? "";
+    const directive = policy
+      .split(";")
+      .map((entry) => entry.trim())
+      .find((entry) => entry.startsWith("img-src "));
+    expect(directive).toBe("img-src data: blob:");
+    const sources = (directive ?? "").slice("img-src ".length).split(/\s+/u);
+    expect(sources).toEqual(["data:", "blob:"]);
+    for (const source of sources) {
+      expect(source.includes("//")).toBe(false);
+      expect(source.includes("*")).toBe(false);
+      expect(source.startsWith("http")).toBe(false);
+    }
   });
 });

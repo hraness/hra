@@ -162,6 +162,11 @@ export class LiveBatcher {
         this.#flush = true;
         return;
       }
+      // The neutral transcript records (`user_message`, `provider_switched`)
+      // are durable local history, not live detail: the hosted compact lane
+      // already carries the user message it projects from the provider.
+      case "user_message":
+      case "provider_switched":
       case "connection":
       case "gap":
       case "session_status":
