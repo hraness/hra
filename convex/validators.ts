@@ -27,6 +27,8 @@ export const commandKind = v.union(
   v.literal("stop"),
   v.literal("set_model"),
   v.literal("set_fast"),
+  v.literal("resolve_interaction"),
+  v.literal("send_or_steer"),
 );
 export const commandState = v.union(
   v.literal("pending"),
@@ -105,6 +107,7 @@ export const quotaUserResource = v.union(
   v.literal("session_head"),
   v.literal("session_chunk"),
   v.literal("nonterminal_command"),
+  v.literal("live_chunk"),
 );
 export const quotaAccountResource = v.literal("usage_snapshot");
 export const maintenanceCategory = v.union(
@@ -121,6 +124,7 @@ export const maintenanceCategory = v.union(
   v.literal("usage_snapshots"),
   v.literal("account_deletion_receipts"),
   v.literal("device_revocation_jobs"),
+  v.literal("live_tail_chunks"),
 );
 
 export const encryptedEnvelope = v.object({

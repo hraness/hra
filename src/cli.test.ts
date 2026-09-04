@@ -4338,7 +4338,8 @@ describe("CLI entry point", () => {
     expect(rendered).toContain("\\u{202e}");
     expect(rendered).toContain("Interaction 70000000-0000-4000-8000-000000000001  permission approval");
     expect(rendered).toContain("pending  revision 3  blocking");
-    expect(rendered).toContain("Resolve on the execution device. Remote interaction responses are not enabled.");
+    expect(rendered).toContain("Decide remotely with `hra remote resolve");
+    expect(rendered).toContain("--interaction 70000000-0000-4000-8000-000000000001 --revision 3 --decision once|decline|cancel");
   });
 
   test("remote human output reduces recovered interactions to the safest latest revision", () => {

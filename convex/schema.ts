@@ -182,6 +182,10 @@ export default defineSchema({
     compactTailDigest: v.optional(v.string()),
     createdAt: v.number(),
     detailHeadSequence: v.number(),
+    // Bumped whenever the live_tail sweeper prunes detail chunks below the
+    // digest chain's current tail. Mirrors compactStreamEpoch, but is only
+    // ever advanced by the retention sweeper, never by a device.
+    detailStreamEpoch: v.optional(v.number()),
     detailTailDigest: v.optional(v.string()),
     executionDeviceId: v.id("devices"),
     metadata: v.optional(encryptedEnvelope),
@@ -206,6 +210,10 @@ export default defineSchema({
     createdAt: v.number(),
     digest: v.string(),
     envelope: encryptedEnvelope,
+    // Set only on detail-stream (live_tail) chunks; the sweeper in
+    // convex/maintenance.ts deletes rows past this deadline. Absent on
+    // compact-stream chunks, which never expire on their own.
+    expiresAt: v.optional(v.number()),
     firstSequence: v.number(),
     lastSequence: v.number(),
     previousDigest: v.optional(v.string()),
@@ -217,6 +225,7 @@ export default defineSchema({
   })
     .index("by_session_stream_and_first", ["sessionId", "stream", "firstSequence"])
     .index("by_session_stream_and_last", ["sessionId", "stream", "lastSequence"])
+    .index("by_stream_and_expires_at", ["stream", "expiresAt"])
     .index("by_user", ["userId"]),
   sessionStreamEpochs: defineTable({
     authority: v.object({
@@ -233,11 +242,19 @@ export default defineSchema({
     predecessorEpoch: v.number(),
     projectionRevision: v.optional(v.number()),
     publicId: v.string(),
-    reason: v.literal("projection_cache_recovery"),
+    // "projection_cache_recovery" is device-initiated (compact stream only,
+    // see beginCompactEpoch). "live_tail_retention" is system-initiated by
+    // the maintenance sweeper when it prunes expired detail chunks (see
+    // convex/maintenance.ts); it never carries an idempotencyKey/
+    // requestDigest a client can replay against.
+    reason: v.union(
+      v.literal("projection_cache_recovery"),
+      v.literal("live_tail_retention"),
+    ),
     requestDigest: v.string(),
     sessionId: v.id("sessionHeads"),
     sourceDeviceId: v.id("devices"),
-    stream: v.literal("compact"),
+    stream: syncStream,
     userId: v.id("users"),
   })
     .index("by_public_id", ["publicId"])

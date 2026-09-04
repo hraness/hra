@@ -28,6 +28,7 @@ import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
   protectedInteractionDetailDocumentSchema,
+  computeInteractionPresentation,
   publicInteractionSchema,
   type InteractionRecord,
   type InteractionIntendedTerminalState,
@@ -151,6 +152,8 @@ import {
   SessionEventStreamRedactor,
   type SessionEventWrite,
 } from "./streaming-redaction";
+import { SessionStateTracker } from "./session-state-tracker";
+import { decideAutorespond, permissionNamesOf } from "./autorespond";
 
 export class CommandFailure extends Error {
   readonly [commandFailureBrand] = true as const;
@@ -571,6 +574,7 @@ type RemoteSessionCommand = Extract<LocalCommand, { kind:
   | "session.rename"
   | "session.preset"
   | "session.fast"
+  | "interaction.resolve"
 }>;
 const restoreLoginReceipt = (value: unknown): LoginOutcome => {
   const parsed = loginReceiptSchema.parse(value);
@@ -588,9 +592,11 @@ const restoreLoginReceipt = (value: unknown): LoginOutcome => {
 /** Background tasks that swallow their own rejection record one of these closed codes. */
 export const BACKGROUND_DIAGNOSTIC_CODES = [
   "account_fact_apply_failed",
+  "autorespond_failed",
   "queue_dispatch_failed",
   "queue_pre_effect_retry_failed",
   "recovery_observation_failed",
+  "session_state_tracking_failed",
   "usage_refresh_failed",
   "usage_poll_account_failed",
   "usage_poll_tick_failed",
@@ -637,6 +643,7 @@ export class HraService {
   readonly #workWaiters: WorkEventWaiters;
   readonly #eventRedactor: SessionEventStreamRedactor;
   readonly #sessionTasks: SessionTaskStore;
+  readonly #sessionStateTracker = new SessionStateTracker(() => this.#now());
   readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
   readonly #daemonGeneration: number;
   readonly #now: () => number;
@@ -854,6 +861,46 @@ export class HraService {
             async () => await this.#sessionStatus(session.id, context.signal),
             { allowDuringProjectionRecovery: true },
           );
+        }
+        case "session.state": {
+          const session = this.#store.requireSession(command.session);
+          const durable = this.#store.readSessionState(session.id);
+          return {
+            version: 1,
+            session: session.id,
+            state: durable?.state ?? null,
+            attention: durable?.attention ?? false,
+            reason: durable?.reason ?? "",
+            verbatimRequired: durable?.verbatimRequired ?? false,
+            lastActivityAt: durable?.lastActivityAt ?? null,
+            revision: durable?.revision ?? 0,
+          };
+        }
+        case "autorespond.status": {
+          const session = command.session === undefined ? null : this.#store.requireSession(command.session);
+          const mode = session === null
+            ? { mode: this.#store.readDefaultApprovalMode(), source: "default" as const }
+            : this.#store.readSessionApprovalMode(session.id);
+          return {
+            version: 1,
+            ...(session === null ? {} : { session: session.id }),
+            mode: mode.mode,
+            source: mode.source,
+            counts: this.#store.countAutorespondEvidence(session === null ? {} : { sessionId: session.id }),
+            ...(session === null ? {} : { budgets: this.#store.readAutorespondBudgets(session.id) }),
+            recent: this.#store.listAutorespondEvidence({ ...(session === null ? {} : { sessionId: session.id }), limit: 20 }),
+          };
+        }
+        case "autorespond.set": {
+          if (command.session === undefined) {
+            if (command.mode === null) throw new CommandFailure("INVALID_INPUT", "The default approval mode cannot be cleared.");
+            this.#store.setDefaultApprovalMode(command.mode);
+            return { version: 1, mode: command.mode, source: "default" };
+          }
+          const session = this.#store.requireSession(command.session);
+          this.#store.setSessionApprovalMode(session.id, command.mode);
+          const effective = this.#store.readSessionApprovalMode(session.id);
+          return { version: 1, session: session.id, mode: effective.mode, source: effective.source };
         }
         case "session.events": return await this.#sessionEvents(command, context.signal);
         case "session.interactions": {
@@ -1282,7 +1329,7 @@ export class HraService {
       })
       .strict()
       .parse(expectedAuthority);
-    if (command.session !== expected.sessionId) {
+    if (command.kind !== "interaction.resolve" && command.session !== expected.sessionId) {
       throw new CommandFailure("CONFLICT", "The remote command selector does not match its exact session authority.");
     }
     return await this.#serializeSessionAuthority({ id: expected.sessionId, profileId: expected.profileId }, async () => {
@@ -1317,6 +1364,16 @@ export class HraService {
             sessionId: session.id,
           }),
         };
+        case "interaction.resolve": {
+          // A remote decision must name an interaction of this exact session;
+          // the ordinary resolve path then enforces revision, state, deadline,
+          // and provider-offered decisions.
+          const interaction = this.#store.requireInteraction(command.interaction);
+          if (interaction.sessionId !== session.id) {
+            throw new CommandFailure("CONFLICT", "The remote decision names an interaction of another session.");
+          }
+          return await this.#resolveInteraction(command, { signal: context.signal });
+        }
       }
     });
   }
@@ -2127,6 +2184,7 @@ export class HraService {
           blocking: admitted.record.blocking,
           summary: admitted.record.display.summary,
         });
+        this.#scheduleAutorespond(admitted.record);
       }
       this.#wakeInteractionDeadlinePump();
       return;
@@ -2266,6 +2324,88 @@ export class HraService {
     await this.#daemonAuthority.assertCurrent();
   }
 
+  /*
+   * Autorespond: answer a freshly admitted approval on behalf of the human
+   * when the session's approval mode allows it. Runs in the background behind
+   * the interaction's own serialization key; the ordinary resolve path enforces
+   * revision, deadline, and provider-offered decisions, and every attempt
+   * leaves an evidence row whether it accepted or escalated.
+   */
+  #scheduleAutorespond(record: InteractionRecord): void {
+    if (record.sessionId === null) return;
+    if (
+      record.kind !== "command_approval"
+      && record.kind !== "file_change_approval"
+      && record.kind !== "permission_approval"
+    ) return;
+    const sessionId = record.sessionId;
+    const tracked = this.#autorespondAdmitted(record, sessionId).then(
+      () => undefined,
+      (error: unknown) => {
+        if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+        else this.recordBackgroundDiagnostic("autorespond_failed", error);
+      },
+    );
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  async #autorespondAdmitted(record: InteractionRecord, sessionId: SessionRecord["id"]): Promise<void> {
+    const startedAt = this.#now();
+    const { mode } = this.#store.readSessionApprovalMode(sessionId);
+    const budgets = this.#store.readAutorespondBudgets(sessionId, startedAt);
+    const decision = decideAutorespond({ budgets, display: record.display, kind: record.kind, mode });
+    const kind = record.kind as "command_approval" | "file_change_approval" | "permission_approval";
+    if (decision.action === "escalate") {
+      if (decision.code !== "manual_mode" && decision.code !== "not_an_approval") {
+        this.#store.recordAutorespondEvidence({
+          approvalClass: decision.approvalClass,
+          decision: decision.code,
+          interactionId: record.publicId,
+          kind,
+          latencyMs: this.#now() - startedAt,
+          mode,
+          outcome: "refused",
+          sessionId,
+          subagent: false,
+        });
+      }
+      return;
+    }
+    const resolution = record.kind === "permission_approval"
+      ? { kind: "permission_grant" as const, permissions: permissionNamesOf(record.display), scope: null }
+      : { kind: "approval_decision" as const, decision: decision.decision };
+    let outcome: "accepted" | "refused" = "accepted";
+    try {
+      await this.#resolveInteraction(
+        {
+          kind: "interaction.resolve",
+          interaction: record.publicId,
+          expectedRevision: record.revision,
+          resolution,
+        },
+        { signal: this.#backgroundAbort.signal },
+      );
+      this.#store.markInteractionResolvedBy(record.publicId, "autorespond");
+      this.#store.bumpAutorespondCounter(sessionId);
+    } catch (error: unknown) {
+      outcome = "refused";
+      if (!(error instanceof CommandFailure)) throw error;
+    } finally {
+      this.#store.recordAutorespondEvidence({
+        approvalClass: decision.approvalClass,
+        decision: decision.decision,
+        interactionId: record.publicId,
+        kind,
+        latencyMs: this.#now() - startedAt,
+        mode,
+        outcome,
+        sessionId,
+        subagent: false,
+      });
+    }
+  }
+
   #appendSessionEvent(
     authority: ProfileAuthority,
     sessionId: SessionRecord["id"],
@@ -2288,6 +2428,58 @@ export class HraService {
     for (const write of writes) {
       this.#store.appendPublicSessionEvent(write);
       this.#eventWaiters.notify(write.sessionId);
+      this.#trackSessionState(write);
+    }
+  }
+
+  /*
+   * Classify the session after every persisted event. The tracker decides
+   * whether the state changed; a change is persisted as the session's durable
+   * latest state and appended as one `session_state` event. Failures here are
+   * background diagnostics, never a reason to drop the originating event.
+   */
+  #trackSessionState(write: SessionEventWrite): void {
+    if (write.body.type === "session_state") return;
+    try {
+      if (this.#sessionStateTracker.snapshot(write.sessionId) === null) {
+        const durable = this.#store.readSessionState(write.sessionId);
+        if (durable !== null) {
+          this.#sessionStateTracker.seed(write.sessionId, {
+            state: durable.state,
+            attention: durable.attention,
+            reason: durable.reason,
+            verbatimRequired: durable.verbatimRequired,
+            verbatimLiteral: durable.verbatimLiteral ?? undefined,
+            lastActivityAt: durable.lastActivityAt,
+            revision: durable.revision,
+          });
+        }
+      }
+      const pending = write.body.type === "interaction_requested"
+        || write.body.type === "interaction_state"
+        || write.body.type === "turn_completed"
+        ? this.#store.listInteractions({ sessionId: write.sessionId, pendingOnly: true, limit: 1 })[0]
+        : undefined;
+      const body = this.#sessionStateTracker.observe(write.sessionId, write.body, {
+        ...(pending === undefined ? {} : { pendingInteraction: { kind: pending.kind } }),
+      });
+      if (body === null) return;
+      const snapshot = this.#sessionStateTracker.snapshot(write.sessionId);
+      if (snapshot === null) return;
+      this.#store.upsertSessionState({
+        sessionId: write.sessionId,
+        state: snapshot.state,
+        attention: snapshot.attention,
+        reason: snapshot.reason,
+        verbatimRequired: snapshot.verbatimRequired,
+        verbatimLiteral: snapshot.verbatimLiteral,
+        lastActivityAt: snapshot.lastActivityAt,
+        revision: snapshot.revision,
+      });
+      this.#store.appendPublicSessionEvent({ ...write, body });
+      this.#eventWaiters.notify(write.sessionId);
+    } catch (error: unknown) {
+      this.recordBackgroundDiagnostic("session_state_tracking_failed", error);
     }
   }
 
@@ -5040,6 +5232,8 @@ export class HraService {
       revision: interaction.revision,
       blocking: interaction.blocking,
       display: interaction.display,
+      presentation: computeInteractionPresentation(interaction.display),
+      resolvedBy: interaction.resolvedBy ?? null,
       responseRecorded: interaction.responseDigest !== null,
       context: {
         turnId: interaction.authority.turnId === null
@@ -5909,6 +6103,9 @@ export class HraService {
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
+    // A human-authored message is the only thing that resets the consecutive
+    // autorespond counter for a session.
+    this.#store.resetAutorespondCounter(session.id);
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let review: RuntimeStartReview | undefined;

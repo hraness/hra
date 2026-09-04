@@ -43,6 +43,7 @@ export const USER_QUOTA_RESOURCES = [
   "session_head",
   "session_chunk",
   "nonterminal_command",
+  "live_chunk",
 ] as const;
 
 export type UserQuotaResource = typeof USER_QUOTA_RESOURCES[number];
@@ -87,6 +88,10 @@ export const USER_RESOURCE_QUOTAS = {
   session_head: 10_000,
   session_chunk: 250_000,
   nonterminal_command: 256,
+  // The live (detail-stream) tail is a bounded sub-quota of session_chunk:
+  // every detail chunk also charges session_chunk, so live_chunk can never
+  // exceed session_chunk, but it caps live-tail growth far tighter.
+  live_chunk: 20_000,
 } as const satisfies Readonly<Record<UserQuotaResource, number>>;
 
 export const ACCOUNT_RESOURCE_QUOTAS = {
@@ -661,6 +666,29 @@ export async function releaseSessionChunkQuotaForDelete(
   document: LogicalDocument,
 ): Promise<void> {
   await releaseUserResourceDelete(ctx, userId, "chunk", "session_chunk", document);
+}
+
+/**
+ * The live_chunk resource is a per-user counter over detail-stream chunks
+ * only. It rides on top of the session_chunk logical-byte and record charge
+ * already applied by reserve/releaseSessionChunkQuotaForInsert/ForDelete
+ * (called separately for every chunk regardless of stream): this function
+ * adjusts only the additional live_chunk resource counter, never the
+ * category ledger, so a detail chunk is never charged twice for the same
+ * logical bytes.
+ */
+export async function reserveLiveChunkResourceForInsert(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+): Promise<void> {
+  await applyUserResourceDelta(ctx, userId, "live_chunk", 1);
+}
+
+export async function releaseLiveChunkResourceForDelete(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+): Promise<void> {
+  await applyUserResourceDelta(ctx, userId, "live_chunk", -1);
 }
 
 export async function reserveNonterminalCommandQuotaForInsert(

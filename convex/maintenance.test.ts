@@ -813,12 +813,13 @@ describe("bounded cloud retention", () => {
       deviceRevocationJobs: 1,
       expiredPendingCommands: 1,
       idempotencyReceipts: 1,
+      liveTailChunks: 0,
       otpChallenges: 1,
       securityEvents: 1,
       terminalCommands: 1,
       usageSnapshots: 1,
       processed: 13,
-      visitedCategories: 13,
+      visitedCategories: 14,
     });
     expect(await runtime.run(async (ctx) => {
       const service = await ctx.db.query("storageUsageService")
@@ -861,6 +862,7 @@ describe("bounded cloud retention", () => {
       userResources: [
         { records: 1, resource: "codex_account" },
         { records: 1, resource: "device" },
+        { records: 0, resource: "live_chunk" },
         { records: 0, resource: "nonterminal_command" },
         { records: 0, resource: "session_chunk" },
         { records: 1, resource: "session_head" },

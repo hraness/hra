@@ -163,6 +163,46 @@ describe("session events", () => {
     })).toThrow();
   });
 
+  test("accepts a revisioned session state and rejects an out-of-range or overlong reason", () => {
+    const parsed = sessionEventBodySchema.parse({
+      type: "session_state",
+      state: "needs_approval",
+      attention: true,
+      reason: "Turn asked for a single approval.",
+      verbatimRequired: false,
+      lastActivityAt: Date.now(),
+      revision: 1,
+    });
+    expect(parsed).toMatchObject({ type: "session_state", state: "needs_approval", revision: 1 });
+    expect(() => sessionEventBodySchema.parse({
+      type: "session_state",
+      state: "invalid_state",
+      attention: true,
+      reason: "x",
+      verbatimRequired: false,
+      lastActivityAt: Date.now(),
+      revision: 1,
+    })).toThrow();
+    expect(() => sessionEventBodySchema.parse({
+      type: "session_state",
+      state: "done",
+      attention: false,
+      reason: "x".repeat(257),
+      verbatimRequired: false,
+      lastActivityAt: Date.now(),
+      revision: 1,
+    })).toThrow();
+    expect(() => sessionEventBodySchema.parse({
+      type: "session_state",
+      state: "done",
+      attention: false,
+      reason: "x",
+      verbatimRequired: false,
+      lastActivityAt: Date.now(),
+      revision: 0,
+    })).toThrow();
+  });
+
   test("keeps all public envelopes bounded and session-account fenced", () => {
     const parsed = sessionEventSchema.parse({
       version: 1,

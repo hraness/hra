@@ -196,6 +196,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   }).strict(),
   z.object({ kind: z.literal("session.show"), session: selectorSchema, detail: z.boolean() }).strict(),
   z.object({ kind: z.literal("session.status"), session: selectorSchema }).strict(),
+  z.object({ kind: z.literal("session.state"), session: selectorSchema }).strict(),
   z.object({
     kind: z.literal("session.events"),
     session: selectorSchema,
@@ -274,6 +275,15 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     idempotencyKey: requiredIdempotencyKeySchema,
   }).strict(),
   z.object({ kind: z.literal("turn.inspect"), session: selectorSchema, turn: selectorSchema }).strict(),
+  z.object({
+    kind: z.literal("autorespond.status"),
+    session: selectorSchema.optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("autorespond.set"),
+    session: selectorSchema.optional(),
+    mode: z.enum(["auto:all", "auto:workspace", "manual"]).nullable(),
+  }).strict(),
   z.object({
     kind: z.literal("interaction.list"),
     session: selectorSchema.optional(),
