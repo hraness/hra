@@ -225,13 +225,13 @@ export const siteDocumentPaths: readonly string[] = [
 export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.4.1/hraness-hra-0.4.1.tgz",
+  "https://github.com/hraness/hra/releases/download/v0.5.0/hraness-hra-0.5.0.tgz",
 );
 
 const productName = "HRA";
 const tagline = "Control plane for coding-agent subscriptions";
 const providerRoadmap = "Codex today, Claude next.";
-const releaseVersion = "0.4.1";
+const releaseVersion = "0.5.0";
 
 /** Toolchain and runtime pins come from `package.json`, so badges cannot drift from the manifest. */
 export const publicPins = {
@@ -373,7 +373,7 @@ export const publicContent: PublicContent = {
       label: `Immutable local CLI release candidate; hosted sync live as an ${hostedBetaLabel}`,
       content: [
         text("The exact install command below works once GitHub exposes the immutable "),
-        code("v0.4.1"),
+        code("v0.5.0"),
         text(" GitHub Release and its verified archive. The website and optional hosted sync are live; the public CLI stays immutable once admitted."),
       ],
     },
@@ -413,10 +413,10 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("The single install command streams the exact v0.4.1 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.4.1 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
+          text("The single install command streams the exact v0.5.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.5.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
         ),
         paragraph(
-          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.4.1. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
+          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.5.0. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
         ),
         {
           kind: "commands",
@@ -609,7 +609,7 @@ export const publicContent: PublicContent = {
           label: "Local release boundary",
           content: [
             text("These commands are part of the immutable "),
-            code("v0.4.1"),
+            code("v0.5.0"),
             text(" local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol."),
           ],
         },
@@ -1340,7 +1340,7 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     content.thesis,
     content.statusLine,
     "",
-    `Install after the v0.4.1 beta tag is live: ${content.installCommand}`,
+    `Install after the v0.5.0 beta tag is live: ${content.installCommand}`,
     `Initialize: ${content.initCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
     "",
