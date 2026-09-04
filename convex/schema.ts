@@ -8,6 +8,7 @@ import {
   accountDeletionState,
   authAdmissionState,
   authAttemptKind,
+  authSubjectAdmittedBy,
   authSubjectStatus,
   challengeDeliveryState,
   commandKind,
@@ -19,6 +20,7 @@ import {
   invitePurpose,
   inviteState,
   maintenanceCategory,
+  newIdentityAdmissionState,
   quotaCategory,
   quotaAccountResource,
   quotaEnforcement,
@@ -40,10 +42,14 @@ export default defineSchema({
     .index("sessionId", ["sessionId"]),
   authSubjects: defineTable({
     admissionInviteId: v.optional(v.id("authInvites")),
+    admittedBy: v.optional(authSubjectAdmittedBy),
     authEpoch: v.number(),
     createdAt: v.number(),
     emailDigest: v.string(),
     status: authSubjectStatus,
+    // Lifetime count of code sends for an address that has never verified. It
+    // stops here and is never reset while the subject stays unverified.
+    unverifiedSendCount: v.optional(v.number()),
     updatedAt: v.number(),
     userId: v.optional(v.id("users")),
     verifiedAt: v.optional(v.number()),
@@ -473,6 +479,11 @@ export default defineSchema({
     bootstrapInvitePublicId: v.optional(v.string()),
     key: v.literal("global"),
     lastMutationId: v.optional(v.string()),
+    // Absent means invite_only. The rolling window counts identities admitted
+    // in the last 24 hours through either the invite or the open path.
+    newIdentityAdmissions: v.optional(newIdentityAdmissionState),
+    newIdentityWindowCount: v.optional(v.number()),
+    newIdentityWindowStartedAt: v.optional(v.number()),
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
   storageResourceUsageByUser: defineTable({

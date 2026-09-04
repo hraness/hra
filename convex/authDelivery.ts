@@ -6,6 +6,7 @@ import {
   authOtpLifetimeMs,
   isAuthDigest,
   maximumLiveOtpChallenges,
+  unverifiedLifetimeSendLimit,
   type AuthAttemptKind,
 } from "./authPolicy";
 import {
@@ -13,7 +14,11 @@ import {
   consumeBoundIdentityInvite,
   requireBoundIdentityInvite,
 } from "./authInvites";
-import { requireAuthAdmissionsOpen } from "./admissionControl";
+import {
+  newIdentityAdmissionsOf,
+  recordNewIdentityAdmission,
+  requireAuthAdmissionsOpen,
+} from "./admissionControl";
 import { timingSafeEqualAuthDigest } from "./authEmail";
 import {
   adjustParentAttributedQuotaForPatch,
@@ -82,6 +87,46 @@ async function countGlobalAttempts(
     .then((matches) => matches.length);
 }
 
+/**
+ * One verified email owns exactly one identity. The email digest indexes at
+ * most one subject and that subject is the only one bound to its user, so a
+ * second identity can never be verified onto the same address or user.
+ */
+async function requireSingleActiveIdentity(
+  ctx: MutationCtx,
+  input: Readonly<{
+    emailDigest: string;
+    subjectId: Id<"authSubjects">;
+    userId: Id<"users">;
+  }>,
+): Promise<void> {
+  const byEmail = await ctx.db
+    .query("authSubjects")
+    .withIndex("by_email_digest", (query) => query.eq("emailDigest", input.emailDigest))
+    .take(2);
+  if (byEmail.length !== 1 || byEmail[0]?._id !== input.subjectId) {
+    rejectAuthentication();
+  }
+  if (byEmail[0].status !== "active") rejectAuthentication();
+  const byUser = await ctx.db
+    .query("authSubjects")
+    .withIndex("by_user", (query) => query.eq("userId", input.userId))
+    .take(2);
+  if (byUser.length > 1) rejectAuthentication();
+  const bound = byUser[0];
+  if (bound !== undefined && bound._id !== input.subjectId) rejectAuthentication();
+}
+
+/**
+ * An unverified subject may proceed without an invitation only when it was
+ * itself admitted through open sign-up. An absent marker never satisfies this.
+ */
+function requireAdmittedWithoutInvite(
+  subject: Readonly<{ admittedBy?: "open" }>,
+): void {
+  if (subject.admittedBy !== "open") rejectAuthentication();
+}
+
 async function subjectIsVerified(
   ctx: MutationCtx,
   subject: NonNullable<Awaited<ReturnType<typeof subjectByEmail>>>,
@@ -121,19 +166,44 @@ export const reserveEmailAttempt = internalMutation({
     if (args.inviteCapabilityDigest !== undefined) {
       requireDigest(args.inviteCapabilityDigest);
     }
-    await requireAuthAdmissionsOpen(ctx);
+    const control = await requireAuthAdmissionsOpen(ctx);
     const now = Date.now();
     let subject = await subjectByEmail(ctx, args.emailDigest);
     let inviteBinding: "bound" | "not_required" | "replay" = "not_required";
+    // `subjectIsVerified` may backfill `verifiedAt`, which leaves the local row
+    // stale, so verification is tracked here rather than re-read below.
+    let verified = false;
     if (args.kind === "verify") {
       if (subject?.status !== "active" || args.inviteCapabilityDigest !== undefined) {
         rejectAuthentication();
       }
     } else if (subject?.status === "active" && await subjectIsVerified(ctx, subject)) {
+      verified = true;
       if (args.inviteCapabilityDigest !== undefined) rejectAuthentication();
+    } else if (args.inviteCapabilityDigest === undefined) {
+      // Open sign-up. The control is read only here, where a first
+      // `authSubjects` row would be inserted; every later step keeps its own
+      // rules, and `authAdmissions: frozen` has already refused above.
+      if (subject !== null && subject.status !== "active") rejectAuthentication();
+      if (newIdentityAdmissionsOf(control) !== "open") rejectAuthentication();
+      if (subject === null) {
+        const subjectId = await ctx.db.insert("authSubjects", {
+          admittedBy: "open",
+          authEpoch: 1,
+          createdAt: now,
+          emailDigest: args.emailDigest,
+          status: "active",
+          updatedAt: now,
+        });
+        subject = await ctx.db.get(subjectId);
+        if (subject === null) rejectAuthentication();
+        await reserveServiceQuotaForInsert(ctx, subject);
+        await recordNewIdentityAdmission(ctx, control, now);
+      } else if (subject.admissionInviteId === undefined) {
+        requireAdmittedWithoutInvite(subject);
+      }
     } else {
       if (subject !== null && subject.status !== "active") rejectAuthentication();
-      if (args.inviteCapabilityDigest === undefined) rejectAuthentication();
       const binding = await bindIdentityInviteToEmail(ctx, {
         capabilityDigest: args.inviteCapabilityDigest,
         emailDigest: args.emailDigest,
@@ -154,6 +224,7 @@ export const reserveEmailAttempt = internalMutation({
         subject = await ctx.db.get(subjectId);
         if (subject === null) rejectAuthentication();
         await reserveServiceQuotaForInsert(ctx, subject);
+        await recordNewIdentityAdmission(ctx, control, now);
       } else if (subject.admissionInviteId === undefined) {
         const patch = {
           admissionInviteId: binding.inviteId,
@@ -170,6 +241,21 @@ export const reserveEmailAttempt = internalMutation({
     }
     if (subject?.status !== "active") rejectAuthentication();
 
+    // Lifetime ceiling for an address that has never verified. Attempt events
+    // expire, this counter does not, so a slow sender cannot mine codes
+    // forever by staying inside every rolling window.
+    const unverifiedSends = args.kind === "send" && !verified
+      ? subject.unverifiedSendCount ?? 0
+      : null;
+    if (
+      unverifiedSends !== null
+      && (
+        !Number.isSafeInteger(unverifiedSends)
+        || unverifiedSends < 0
+        || unverifiedSends >= unverifiedLifetimeSendLimit
+      )
+    ) rejectAuthentication();
+
     const policy = authAttemptPolicies[args.kind];
     for (const window of policy.perEmail) {
       if (await countEmailAttempts(ctx, {
@@ -185,6 +271,18 @@ export const reserveEmailAttempt = internalMutation({
         kind: args.kind,
         limit: window.limit,
       }) >= window.limit) rejectAuthentication();
+    }
+    if (unverifiedSends !== null) {
+      const patch = {
+        unverifiedSendCount: unverifiedSends + 1,
+        updatedAt: now,
+      };
+      if (subject.userId === undefined) {
+        await adjustServiceQuotaForPatch(ctx, subject, patch);
+      } else {
+        await adjustQuotaForPatch(ctx, subject.userId, "identity", subject, patch);
+      }
+      await ctx.db.patch(subject._id, patch);
     }
     const attemptId = await ctx.db.insert("authEmailAttemptEvents", {
       authEpoch: subject.authEpoch,
@@ -230,12 +328,20 @@ export const storeOtpChallenge = internalMutation({
       || args.expiresAt > now + authOtpLifetimeMs
     ) rejectAuthentication();
     if (subject.verifiedAt === undefined) {
-      if (subject.admissionInviteId === undefined) rejectAuthentication();
-      await requireBoundIdentityInvite(ctx, {
-        emailDigest: args.emailDigest,
-        inviteId: subject.admissionInviteId,
-      });
+      if (subject.admissionInviteId === undefined) {
+        requireAdmittedWithoutInvite(subject);
+      } else {
+        await requireBoundIdentityInvite(ctx, {
+          emailDigest: args.emailDigest,
+          inviteId: subject.admissionInviteId,
+        });
+      }
     }
+    await requireSingleActiveIdentity(ctx, {
+      emailDigest: args.emailDigest,
+      subjectId: subject._id,
+      userId: args.userId,
+    });
     if (subject.userId === undefined) {
       const patch = { userId: args.userId, updatedAt: now };
       await transferServiceQuotaToUserForPatch(
@@ -353,12 +459,20 @@ export const consumeOtpChallenge = internalMutation({
         stored.accountId !== account._id || stored.userId !== user._id)
     ) rejectAuthentication();
     if (subject.verifiedAt === undefined) {
-      if (subject.admissionInviteId === undefined) rejectAuthentication();
-      await consumeBoundIdentityInvite(ctx, {
-        emailDigest: args.emailDigest,
-        inviteId: subject.admissionInviteId,
-      });
+      if (subject.admissionInviteId === undefined) {
+        requireAdmittedWithoutInvite(subject);
+      } else {
+        await consumeBoundIdentityInvite(ctx, {
+          emailDigest: args.emailDigest,
+          inviteId: subject.admissionInviteId,
+        });
+      }
     }
+    await requireSingleActiveIdentity(ctx, {
+      emailDigest: args.emailDigest,
+      subjectId: subject._id,
+      userId: user._id,
+    });
     const accountPatch = { emailVerified: account.providerAccountId };
     await adjustQuotaForPatch(ctx, user._id, "identity", account, accountPatch);
     await ctx.db.patch(account._id, accountPatch);
