@@ -27,6 +27,7 @@ export {
 
 export {
   cloudLimits,
+  COMMAND_KINDS,
   hasExactKeys,
   isBase64Url,
   isFiniteTimestamp,
@@ -53,8 +54,10 @@ export {
   sessionChunkAad,
   type CompactInteractionKind,
   type CompactInteractionState,
+  type CompactMessageActor,
   type CompactSessionEvent,
   type DetailSessionEvent,
+  type GitAction,
   type ModelPreset,
   type SessionChunkAuthority,
   type SessionStateValue,

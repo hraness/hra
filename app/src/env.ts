@@ -28,7 +28,10 @@ export const pageSize = 100;
 /** How many detail chunks the live tail subscribes to. */
 export const liveTailChunkLimit = 24;
 
-/** How many rendered lines of streaming text a session row keeps. */
+/** How many compact chunks a grid card subscribes to for its prompt and interactions. */
+export const compactTailChunkLimit = 6;
+
+/** How many rendered lines of streaming text a session card keeps. */
 export const streamingTailLines = 40;
 
 /** How often the enrollment screen re-reads its own registration. */

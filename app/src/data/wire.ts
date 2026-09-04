@@ -5,6 +5,7 @@
  */
 import {
   cloudLimits,
+  COMMAND_KINDS,
   isFiniteTimestamp,
   isOpaqueIdentifier,
   isRecord,
@@ -28,16 +29,12 @@ export type SessionStatus = "active" | "idle" | "terminal" | "orphaned";
 
 const deviceStatuses = new Set<DeviceStatus>(["pending", "active", "revoked"]);
 const sessionStatuses = new Set<SessionStatus>(["active", "idle", "terminal", "orphaned"]);
-const commandKinds = new Set<CommandKind>([
-  "send",
-  "queue",
-  "steer",
-  "stop",
-  "set_model",
-  "set_fast",
-  "resolve_interaction",
-  "send_or_steer",
-]);
+/**
+ * Derived from the one ordered list in `src/cloud/contracts` rather than
+ * restated here, so the settings and session commands added in round one parse
+ * instead of failing this check and hiding their own command status.
+ */
+const commandKinds = new Set<CommandKind>(COMMAND_KINDS);
 const commandStates = new Set<CommandState>([
   "pending",
   "prepared",
