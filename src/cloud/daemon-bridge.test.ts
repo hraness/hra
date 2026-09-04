@@ -4542,6 +4542,37 @@ describe("cloud daemon bridge", () => {
     expect(executor.calls).toEqual([]);
   });
 
+  test("a close that lands during a cycle ends the wake-gated wait at once", async () => {
+    const manual = manualPushWake();
+    let closing: Promise<void> | undefined;
+    const bridge = {
+      async close() { await manual.wake.close(); },
+      async cycle() {
+        // The daemon shuts down while this cycle is still running, so the
+        // abort precedes the wait; the loop must not sleep the full interval.
+        closing ??= lifecycle.close();
+        return {
+          commandsApplied: 0,
+          commandsUnsettled: 0,
+          errors: [],
+          online: true,
+          remoteSessions: [],
+          sessionsUploaded: 0,
+          usageUploaded: 0,
+        };
+      },
+      async pullRemoteSessions() { return []; },
+      pushWake() { return manual.wake; },
+    };
+    const lifecycle = new PollingCloudDaemonLifecycle({ bridge, intervalMs: 15_000 });
+    const startedAt = Date.now();
+    lifecycle.start();
+    await until(() => closing !== undefined, "the cycle to request shutdown");
+    await closing;
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(manual.wake.status().state).toBe("closed");
+  });
+
   test("close aborts and joins the polling lifecycle", async () => {
     let calls = 0;
     let closeCalls = 0;

@@ -26,6 +26,8 @@ import {
 export const pushWakeQuery: CloudQuery = "commands:listPendingForTarget";
 
 /** A wake only needs to notice that the set changed, not read all of it. */
+/** Longest a subscriber close may wait for the websocket to settle. */
+export const pushWakeCloseDeadlineMs = 1_000;
 export const pushWakePendingLimit = 8;
 
 export const pushWakeInitialBackoffMs = 1_000;
@@ -323,7 +325,19 @@ export function createConvexPushWakeSubscriber(input: Readonly<{
         } catch {
           // The client may already have torn the subscription down.
         }
-        await client.close();
+        // A socket that never connected (offline daemon, refused token) can
+        // keep `close()` pending far longer than the daemon's shutdown budget,
+        // so the wait is bounded: the client is dropped either way.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<void>((resolvePromise) => {
+          timer = setTimeout(resolvePromise, pushWakeCloseDeadlineMs);
+          timer.unref();
+        });
+        try {
+          await Promise.race([client.close().catch(() => undefined), deadline]);
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
       },
     };
   };

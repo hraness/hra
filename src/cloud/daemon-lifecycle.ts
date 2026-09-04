@@ -162,6 +162,9 @@ export class PollingCloudDaemonLifecycle implements CloudDaemonLifecycle {
       await abortableDelay(intervalMs, signal);
       return;
     }
+    // The lifecycle may have been closed while the cycle ran; a listener added
+    // now would never fire, so an already-aborted signal ends the wait at once.
+    if (signal.aborted) return;
     const gate = new AbortController();
     const forward = (): void => { gate.abort(signal.reason); };
     signal.addEventListener("abort", forward, { once: true });
