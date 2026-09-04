@@ -5,7 +5,7 @@
  */
 import {
   cloudLimits,
-  COMMAND_KINDS,
+  isCommandKind,
   isFiniteTimestamp,
   isOpaqueIdentifier,
   isRecord,
@@ -29,12 +29,6 @@ export type SessionStatus = "active" | "idle" | "terminal" | "orphaned";
 
 const deviceStatuses = new Set<DeviceStatus>(["pending", "active", "revoked"]);
 const sessionStatuses = new Set<SessionStatus>(["active", "idle", "terminal", "orphaned"]);
-/**
- * Derived from the one ordered list in `src/cloud/contracts` rather than
- * restated here, so the settings and session commands added in round one parse
- * instead of failing this check and hiding their own command status.
- */
-const commandKinds = new Set<CommandKind>(COMMAND_KINDS);
 const commandStates = new Set<CommandState>([
   "pending",
   "prepared",
@@ -307,8 +301,7 @@ export function parseCommandRecord(value: unknown): CommandRecord | null {
     !isRecord(value)
     || !isFiniteTimestamp(value.createdAt)
     || !isFiniteTimestamp(value.deadline)
-    || typeof value.kind !== "string"
-    || !commandKinds.has(value.kind as CommandKind)
+    || !isCommandKind(value.kind)
     || !isUuidV7(value.publicId)
     || !isOpaqueIdentifier(value.sessionPublicId)
     || typeof value.state !== "string"
@@ -321,7 +314,7 @@ export function parseCommandRecord(value: unknown): CommandRecord | null {
   return {
     createdAt: value.createdAt,
     deadline: value.deadline,
-    kind: value.kind as CommandKind,
+    kind: value.kind,
     publicId: value.publicId,
     resultCode: typeof value.resultCode === "string" ? value.resultCode : null,
     sessionPublicId: value.sessionPublicId,

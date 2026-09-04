@@ -10,6 +10,7 @@
 export {
   canonicalDevicePublicKeyJson,
   decodeBase64Url,
+  decryptBytes,
   deviceBindMessage,
   encodeBase64Url,
   encryptBytes,
@@ -30,6 +31,7 @@ export {
   COMMAND_KINDS,
   hasExactKeys,
   isBase64Url,
+  isCommandKind,
   isFiniteTimestamp,
   isOpaqueIdentifier,
   isRecord,
@@ -65,9 +67,17 @@ export {
 
 export {
   cloudPayloadAad,
+  decryptDeviceRegistry,
   decryptSessionMetadata,
+  deviceRegistryLimits,
   encryptRemoteCommand,
+  parseDeviceRegistryPayload,
+  parseRemoteCommandPayload,
   type CloudPayloadAuthority,
+  type DeviceRegistryAccount,
+  type DeviceRegistryPayload,
+  type DeviceRegistryProject,
+  type DeviceRegistryScheduledTask,
   type RemoteCommandPayload,
   type SessionMetadataPayload,
 } from "../../../src/cloud/payloads";

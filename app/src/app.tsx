@@ -10,7 +10,7 @@ import { ErrorBoundary } from "./components/error-boundary";
 import { CustodyProvider, useCustody } from "./custody/custody-context";
 import { EnrollmentScreen } from "./custody/enrollment-screen";
 import { LockScreen } from "./custody/lock-screen";
-import { useRoute } from "./routing/router";
+import { navigateBack, useRoute } from "./routing/router";
 import { GridScreen } from "./screens/grid-screen";
 import { SessionScreen } from "./screens/session-screen";
 import { SettingsScreen } from "./screens/settings-screen";
@@ -38,7 +38,7 @@ function RoutedScreens() {
     case "session":
       return <SessionScreen key={route.sessionPublicId} sessionPublicId={route.sessionPublicId} />;
     case "settings":
-      return <SettingsScreen />;
+      return <SettingsScreen onBack={navigateBack} />;
     case "grid":
       return (
         <GridScreen onSelect={setSelectedSessionId} selectedSessionId={selectedSessionId} />
