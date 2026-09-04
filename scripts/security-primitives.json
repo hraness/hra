@@ -47,6 +47,11 @@
     "mode0600": 7,
     "assertCurrent": 3
   },
+  "src/daemon/gateway-key-custody.ts": {
+    "O_NOFOLLOW": 2,
+    "fsync": 1,
+    "mode0600": 1
+  },
   "src/daemon/local-transport.ts": {
     "timingSafeEqual": 1,
     "O_NOFOLLOW": 2,
@@ -119,7 +124,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 71,
+    "immediateTransaction": 73,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 2
