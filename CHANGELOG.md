@@ -2,9 +2,17 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## v0.4.1
+
+Patch release for the local state schema migration. Release candidate until the release workflow admits the tag.
+
+- Installing a newer build over an existing install no longer deadlocks the daemon. `hra daemon start` and `hra daemon run` prove initialization with a read-only store open, which refuses a schema difference rather than migrating it, and nothing in the product ever migrated the store. The daemon path now classifies that refusal, opens the store writable exactly once under its own locking and scrub rules, and repeats the read-only proof.
+- A status read never migrates. It fails with both schema versions named and `hra daemon start` as its next command, and a store written by a newer build stays a hard refusal that names both versions and asks for the newer HRA.
+- `hra doctor --offline` reports a pending migration and a newer on-disk schema by name instead of the opaque local-database line, and appends the short `STATE_...` code of any other named local state failure. It still prints no path and no stack.
+
 ## v0.4.0
 
-HRA Web v1 waves 1 and 2: live session projection, session state, autorespond, remote decisions, and the browser client. Release candidate until the release workflow admits the tag.
+HRA Web v1 waves 1 and 2: live session projection, session state, autorespond, remote decisions, and the browser client. Admitted 2026-09-04 as immutable GitHub Release `v0.4.0` and npm `latest`.
 
 Daemon and CLI:
 

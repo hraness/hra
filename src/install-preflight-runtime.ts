@@ -28,13 +28,13 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 export const HRA_INSTALL_BUN_VERSION = "1.3.14";
 export const HRA_INSTALL_PACKAGE_NAME = "@hraness/hra";
 const HRA_LEGACY_INSTALL_PACKAGE_NAME = "hra";
-export const HRA_INSTALL_PACKAGE_VERSION = "0.4.0";
+export const HRA_INSTALL_PACKAGE_VERSION = "0.4.1";
 export const HRA_INSTALL_CLI_SHA256 = "a430c9c898f99903b28217b4ff0701f113be55cddcb6253cb907a2b9ec0bfce3";
-export const HRA_INSTALL_NORMALIZER_SHA256 = "14722a44adab49ee904a7c770efad5007f6e9ae899db20698539cf180e350e9c";
-export const HRA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/hra/releases/download/v0.4.0/hraness-hra-0.4.0.tgz";
-export const HRA_INSTALL_ARCHIVE_NAME = "hraness-hra-0.4.0.tgz";
-export const HRA_INSTALL_RELEASE_API_URL = "https://api.github.com/repos/hraness/hra/releases/tags/v0.4.0";
-export const HRA_INSTALL_RELEASE_TAG = "v0.4.0";
+export const HRA_INSTALL_NORMALIZER_SHA256 = "4e61fad8e4c4f20b94975ead0ee732e31a5afdbce54e10f7ffc9cf670ab3671e";
+export const HRA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/hra/releases/download/v0.4.1/hraness-hra-0.4.1.tgz";
+export const HRA_INSTALL_ARCHIVE_NAME = "hraness-hra-0.4.1.tgz";
+export const HRA_INSTALL_RELEASE_API_URL = "https://api.github.com/repos/hraness/hra/releases/tags/v0.4.1";
+export const HRA_INSTALL_RELEASE_TAG = "v0.4.1";
 export const HRA_INSTALL_REPOSITORY_API_URL = "https://api.github.com/repos/hraness/hra";
 export const HRA_INSTALL_REPOSITORY_ID = 1_343_008_607;
 export const HRA_INSTALL_SUCCESS = "hra-install-safe";
@@ -651,7 +651,7 @@ if (testMode === "normal") {
     heldArchiveIdentity = verifiedArchive.identity;
     archiveSnapshot = verifiedArchive.snapshot;
     if (archiveSnapshot === undefined) throw new Error("The private HRA archive snapshot is unavailable.");
-    const route = "/" + randomUUID() + "/hraness-hra-0.4.0.tgz";
+    const route = "/" + randomUUID() + "/hraness-hra-0.4.1.tgz";
     let requests = 0;
     archiveServer = Bun.serve({
       hostname: "127.0.0.1",
@@ -3400,7 +3400,7 @@ const installIntoStage = async (input: Readonly<{
       || stagedArchivePort > 65_535
       || stagedArchiveUrl.search !== ""
       || stagedArchiveUrl.hash !== ""
-      || !/^\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/hraness-hra-0\.4\.0\.tgz$/u.test(stagedArchiveUrl.pathname)
+      || !/^\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/hraness-hra-0\.4\.1\.tgz$/u.test(stagedArchiveUrl.pathname)
     ) throw new InstallPreflightError("Bun staging left its descriptor-bound loopback archive authority.");
     await unlinkHeldChild(stageCustody, globalInstallRoot, "bun.lock", { missing: true });
     await stageCustody.assertAll();
