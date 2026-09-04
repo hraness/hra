@@ -870,6 +870,8 @@ function parseCommandKind(value: unknown): CommandKind | null {
     || value === "stop"
     || value === "set_model"
     || value === "set_fast"
+    || value === "resolve_interaction"
+    || value === "send_or_steer"
     ? value
     : null;
 }

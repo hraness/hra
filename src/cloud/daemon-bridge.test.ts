@@ -115,6 +115,7 @@ type FakeCommand = {
   payload: EncryptedEnvelope;
   publicId: string;
   requestDigest: string;
+  requestingDevicePublicId?: string;
   resultCode?: string;
   resultDigest?: string;
   sessionPublicId: string;
@@ -156,6 +157,7 @@ class FakeCloud {
   sessionHeadListCalls = 0;
   readonly commands = new Map<string, FakeCommand>();
   readonly failingCommandGets = new Set<string>();
+  readonly revokedDevices = new Set<string>();
   readonly failingHeadGets = new Set<string>();
   readonly headGetCalls: string[] = [];
   readonly commandGetCalls: string[] = [];
@@ -214,11 +216,11 @@ class FakeCloud {
       publicId,
       requestDigest: "d".repeat(64),
       sessionPublicId,
+      requestingDevicePublicId,
       state: "pending",
       targetDevicePublicId: head.executionDevicePublicId,
       updatedAt: this.now,
     });
-    void requestingDevicePublicId;
   }
 
   connect(devicePublicId: string): CloudTransport {
@@ -761,8 +763,18 @@ class FakeCloud {
             : {
                 ...publicCommand(command),
                 requestDigest: command.requestDigest,
+                ...(command.requestingDevicePublicId === undefined
+                  ? {}
+                  : { requestingDevicePublicId: command.requestingDevicePublicId }),
                 targetDevicePublicId: command.targetDevicePublicId,
               };
+        }
+        if (name === "devices:get") {
+          const publicId = args.publicId as string;
+          return {
+            publicId,
+            status: this.revokedDevices.has(publicId) ? "revoked" : "active",
+          };
         }
         if (name === "usage:getAccountBinding") {
           const publicId = args.publicId as string;
@@ -4325,6 +4337,52 @@ describe("cloud daemon bridge", () => {
 
     expect(executor.calls.map((call) => call.idempotencyKey)).toEqual([commandPublicId]);
     expect(cloud.requireCommand(commandPublicId).state).toBe("applied");
+  });
+
+  test("honours a remote decision only while its requesting device is active", async () => {
+    const decision = {
+      decision: "once" as const,
+      interactionId: "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b",
+      kind: "resolve_interaction" as const,
+      revision: 1,
+    };
+    for (const revoked of [true, false]) {
+      const cloud = new FakeCloud();
+      const executor = new RecordingExecutor();
+      const sessionPublicId = "session_remote_decision";
+      cloud.heads.set(sessionPublicId, {
+        compactHeadSequence: 0,
+        createdAt: fixedNow,
+        detailHeadSequence: 0,
+        executionDevicePublicId: "device_11111111",
+        metadataRevision: 0,
+        projectionRevision: 0,
+        publicId: sessionPublicId,
+        state: "idle",
+        updatedAt: fixedNow,
+      });
+      if (revoked) cloud.revokedDevices.add("device_22222222");
+      const commandPublicId = uuidV7(7_104);
+      await cloud.enqueue("device_22222222", sessionPublicId, commandPublicId, decision);
+      const adapter = bridge({
+        cloud,
+        device: "device_11111111",
+        executor,
+        journal: new MemoryCloudDaemonJournal(),
+        local: new EmptyLocal(sessionPublicId),
+      });
+      const result = await adapter.cycle(new AbortController().signal);
+      expect(result.errors).toEqual([]);
+      const command = cloud.requireCommand(commandPublicId);
+      if (revoked) {
+        expect(executor.calls).toHaveLength(0);
+        expect(command.state).toBe("failed");
+        expect(command.resultCode).toBe("REQUESTING_DEVICE_INACTIVE");
+      } else {
+        expect(executor.calls.map((call) => call.idempotencyKey)).toEqual([commandPublicId]);
+        expect(command.state).toBe("applied");
+      }
+    }
   });
 
   test("reports an offline cycle without modifying durable command state", async () => {
