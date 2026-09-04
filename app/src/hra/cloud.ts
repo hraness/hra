@@ -49,12 +49,15 @@ export {
 } from "../../../src/cloud/contracts";
 
 export {
+  compactInteractionDetailLimits,
   decryptCompactEvents,
   decryptDetailEvents,
   parseCompactSessionEvent,
   parseDetailSessionEvent,
   sessionChunkAad,
+  type CompactInteractionDecision,
   type CompactInteractionKind,
+  type CompactInteractionQuestion,
   type CompactInteractionState,
   type CompactMessageActor,
   type CompactSessionEvent,

@@ -20,9 +20,19 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { readCodexAutomations, type CodexAutomation } from "../codex/automations";
+import { isNetworkOrExternalPermission } from "../daemon/autorespond";
 import { parseAccountUsage, parseRateLimits, type RateLimitSnapshot } from "../codex/protocol";
 import type { LocalCommand } from "../domain/contracts";
-import type { InteractionRecord } from "../domain/interactions";
+import {
+  classifyPermissionCategory,
+  computeInteractionCommandClass,
+  computeInteractionPresentation,
+  computeRemoteAvailableDecisions,
+  computeRemoteInteractionQuestions,
+  mcpFieldIsRemotelyAnswerable,
+  type InteractionDisplay,
+  type InteractionRecord,
+} from "../domain/interactions";
 import {
   deviceRegistryLimits,
   type DeviceRegistryPayload,
@@ -79,8 +89,16 @@ import type {
   CloudRemoteSessionSelector,
 } from "./local-control";
 import {
+  COMPACT_INTERACTION_DETAIL_VERSION,
+  compactInteractionDetailLimits,
+  detailProjectionIsSafe,
+  isCompactInteractionBaselineShape,
+  compactInteractionDetailOf,
   isProjectRelativePath,
+  parseCompactSessionEvent,
   parseCompactSessionEvents,
+  type CompactInteractionDecision,
+  type CompactInteractionQuestion,
   type CompactMessageActor,
   type CompactSessionEvent,
   type GitAction,
@@ -130,10 +148,17 @@ type CompactSessionEventBody =
       turnId: string;
     }>
   | Readonly<{
+      availableDecisions?: readonly CompactInteractionDecision[];
       blocking: boolean;
+      commandClass?: string;
+      detailMarkdown?: string;
+      detailVersion?: number;
+      headline?: string;
       interactionId: string;
       interactionKind: InteractionRecord["kind"];
       kind: "interaction_state";
+      label?: string;
+      questions?: readonly CompactInteractionQuestion[];
       revision: number;
       state: InteractionRecord["state"];
       summary: string;
@@ -614,10 +639,183 @@ function compactInteractionSummary(kind: InteractionRecord["kind"]): string {
   }
 }
 
+function boundedLine(value: string, maximum: number): string {
+  // `boundedText` can introduce a line feed with its truncation marker, so the
+  // collapse runs on both sides of it: every field below is a single line.
+  return boundedText(value.replace(/\s+/gu, " ").trim(), maximum)
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function projectionLine(label: string, value: string, maximum = 240): string | null {
+  const text = boundedLine(value, maximum);
+  const name = boundedLine(label, 64);
+  return text.length === 0 || name.length === 0 ? null : `- ${name}: ${text}`;
+}
+
+function interactionDetailMarkdown(display: InteractionDisplay): string {
+  const lines: (string | null)[] = [];
+  switch (display.kind) {
+    case "command_approval":
+      lines.push(projectionLine("Runs", display.commandClass, 128));
+      if (isProjectRelativePath(display.workingDirectory)) {
+        lines.push(projectionLine("Directory", display.workingDirectory));
+      }
+      if (display.reason !== null) lines.push(projectionLine("Reason", display.reason));
+      break;
+    case "file_change_approval":
+      if (isProjectRelativePath(display.grantRoot)) {
+        lines.push(projectionLine("Grant root", display.grantRoot));
+      }
+      if (display.reason !== null) lines.push(projectionLine("Reason", display.reason));
+      lines.push("- HRA cannot show the exact affected paths for this provider version.");
+      break;
+    case "permission_approval": {
+      // The categories are classed, never named: a permission value never
+      // enters the projection, and the class is what a remote decision is
+      // taken on and re-verified against.
+      const classes = [...new Set(display.requested
+        .map((permission) => classifyPermissionCategory(permission.name)))].sort();
+      lines.push(projectionLine(
+        display.requested.length === 1 ? "Requested category" : "Requested categories",
+        classes.length === 0 ? "none" : classes.join(", "),
+      ));
+      if (display.reason !== null) lines.push(projectionLine("Reason", display.reason));
+      break;
+    }
+    case "user_input":
+      for (const question of display.questions) {
+        lines.push(projectionLine(
+          question.header,
+          question.secret ? "answered on the machine" : question.question,
+        ));
+      }
+      break;
+    case "mcp_elicitation": {
+      // An MCP form is declared as possibly carrying protected values, and its
+      // server name and field names are provider text. Neither the server nor
+      // an unanswerable field is named here; only the fields this device could
+      // actually fill are named at all, and they are named by the `questions`
+      // list rather than by this prose.
+      const answerable = (display.fields ?? []).filter(mcpFieldIsRemotelyAnswerable).length;
+      const total = display.fields?.length ?? 0;
+      lines.push("- This form may contain protected values.");
+      lines.push(answerable === 0 || answerable !== total
+        ? "- It is completed on the machine running the session."
+        : `- ${String(answerable)} text value${answerable === 1 ? "" : "s"} can be answered from here.`);
+      break;
+    }
+  }
+  return boundedText(
+    lines.filter((line): line is string => line !== null).join("\n"),
+    compactInteractionDetailLimits.detailMarkdownCharacters,
+  );
+}
+
+type CompactInteractionDetailBody = Readonly<{
+  availableDecisions?: readonly CompactInteractionDecision[];
+  commandClass?: string;
+  detailMarkdown?: string;
+  detailVersion?: number;
+  headline?: string;
+  label?: string;
+  questions?: readonly CompactInteractionQuestion[];
+}>;
+
+/**
+ * The projected detail block for one interaction.
+ *
+ * The stored display is already sanitised (`sanitizeInteractionDisplay` ran
+ * before it became durable), so this function adds no new provider text; what
+ * it does is decide which of that text a device that cannot see the exact
+ * command, the exact affected paths, or the exact permission values is allowed
+ * to be shown, and then re-check the result against the projection's own text
+ * rules. Anything path shaped is dropped unless it is project relative, and
+ * anything that still fails `detailProjectionIsSafe` or the compact parser
+ * drops the whole detail block, which leaves the browser with the base event
+ * and therefore with no buttons.
+ */
+function compactInteractionDetail(display: InteractionDisplay): CompactInteractionDetailBody {
+  const presentation = computeInteractionPresentation(display);
+  const commandClass = computeInteractionCommandClass(display);
+  const decisions = computeRemoteAvailableDecisions(display)
+    .slice(0, compactInteractionDetailLimits.decisions);
+  // A user-input question is listed whether or not it is secret, so the reader
+  // knows what is being asked and gets no input for the secret ones. An MCP
+  // form field is different: its name is provider text on a form declared as
+  // possibly protected, so only the fields this device could actually fill are
+  // named at all.
+  const provided = display.kind === "mcp_elicitation"
+    ? computeRemoteInteractionQuestions(display).filter((question) => !question.secret)
+    : computeRemoteInteractionQuestions(display);
+  // A question id is the provider's exact identifier and is never rewritten:
+  // an id that bounding or redaction would change cannot be answered remotely,
+  // and one unusable id drops the whole list rather than offering the browser
+  // a partial answer set the daemon's id-matching rule would then refuse.
+  const questions = provided.length > compactInteractionDetailLimits.questions
+    || provided.some((question) =>
+      question.id.length === 0
+      || boundedLine(question.id, compactInteractionDetailLimits.questionIdCharacters)
+        !== question.id)
+    ? []
+    : provided.map((question) => {
+        const label = boundedLine(
+          question.label,
+          compactInteractionDetailLimits.questionLabelCharacters,
+        );
+        return {
+          id: question.id,
+          label: label.length === 0 ? question.id : label,
+          secret: question.secret,
+        };
+      });
+  const candidate: CompactInteractionDetailBody = {
+    ...(decisions.length === 0 ? {} : { availableDecisions: decisions }),
+    ...(commandClass === null
+      ? {}
+      : {
+          commandClass: boundedLine(
+            commandClass,
+            compactInteractionDetailLimits.commandClassCharacters,
+          ),
+        }),
+    detailMarkdown: interactionDetailMarkdown(display),
+    detailVersion: COMPACT_INTERACTION_DETAIL_VERSION,
+    headline: boundedLine(
+      presentation.headline,
+      compactInteractionDetailLimits.headlineCharacters,
+    ),
+    label: boundedLine(presentation.label, compactInteractionDetailLimits.labelCharacters),
+    ...(questions.length === 0 ? {} : { questions }),
+  };
+  if (!detailProjectionIsSafe(candidate)) return {};
+  // Last gate: the wire parser itself. A detail block the compact parser would
+  // reject is dropped here rather than failing the whole interaction event,
+  // so an unexpected provider string can cost the browser its buttons but can
+  // never stall the projection.
+  const probe = parseCompactSessionEvent({
+    blocking: true,
+    interactionId: "00000000-0000-4000-8000-000000000000",
+    interactionKind: display.kind,
+    kind: "interaction_state",
+    revision: 1,
+    sequence: 1,
+    state: "pending",
+    summary: compactInteractionSummary(display.kind),
+    ...candidate,
+  });
+  if (probe === null || probe.kind !== "interaction_state") return {};
+  return compactInteractionDetailOf(probe);
+}
+
 function recoveryInteractionBody(
   interaction: CloudProjectionRecoveryBaselineInteraction,
 ): CompactSessionEventBody {
+  // The baseline carries the detail the live path would have produced for the
+  // same interaction revision, so a recovered row digests identically to the
+  // row a later ordinary ingest of that revision writes.
   return {
+    ...compactInteractionDetailOf({ ...interaction, kind: "interaction_state", sequence: 1 }),
     blocking: interaction.blocking,
     interactionId: interaction.interactionId,
     interactionKind: interaction.interactionKind,
@@ -642,17 +840,9 @@ function parseRecoveryBaselineInteractions(
     || value.length > maximumProjectionRecoveryBaselineInteractions
   ) throw new Error("Invalid cloud projection recovery interaction baseline.");
   const parsed = value.map((candidate) => {
-    if (
-      !isRecord(candidate)
-      || !hasExactKeys(candidate, [
-        "blocking",
-        "interactionId",
-        "interactionKind",
-        "revision",
-        "state",
-        "summary",
-      ])
-    ) throw new Error("Invalid cloud projection recovery interaction baseline.");
+    if (!isCompactInteractionBaselineShape(candidate)) {
+      throw new Error("Invalid cloud projection recovery interaction baseline.");
+    }
     const [event] = parseCompactSessionEvents([{
       ...candidate,
       kind: "interaction_state",
@@ -662,6 +852,7 @@ function parseRecoveryBaselineInteractions(
       throw new Error("Invalid cloud projection recovery interaction baseline.");
     }
     return {
+      ...compactInteractionDetailOf(event),
       blocking: event.blocking,
       interactionId: event.interactionId,
       interactionKind: event.interactionKind,
@@ -725,7 +916,11 @@ function compactSessionEventBody(event: CompactSessionEvent): CompactSessionEven
     };
   }
   if (event.kind === "interaction_state") {
+    // The optional detail keys are spread in place, so an event that carries
+    // none of them digests byte for byte as it did before the detail existed
+    // and a cache written by an older build still verifies.
     return {
+      ...compactInteractionDetailOf(event),
       blocking: event.blocking,
       interactionId: event.interactionId,
       interactionKind: event.interactionKind,
@@ -1425,6 +1620,7 @@ class CloudProjectionCache {
     }
     const recordId = `hraix_${sha256(`${interaction.publicId}:${String(interaction.revision)}`)}`;
     this.ingestTurn(sessionPublicId, recordId, [{
+      ...compactInteractionDetail(interaction.display),
       blocking: interaction.blocking,
       interactionId: interaction.publicId,
       interactionKind: interaction.kind,
@@ -2355,6 +2551,7 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
           throw new Error("Cloud projection recovery interaction authority changed.");
         }
         return {
+          ...compactInteractionDetail(interaction.display),
           blocking: interaction.blocking,
           interactionId: interaction.publicId,
           interactionKind: interaction.kind,
@@ -3244,6 +3441,20 @@ type RemoteInteractionVerification =
  * command's session, still be pending at the requested revision, be inside
  * its deadline, and the decision must be one the provider offered. Session
  * scope is never accepted remotely, and questions marked secret are refused.
+ *
+ * What each kind admits, and the code every refusal carries:
+ *
+ * | kind                 | decision                                   | answers                                     |
+ * | -------------------- | ------------------------------------------ | ------------------------------------------- |
+ * | command_approval     | provider's `availableDecisions`, class re-verified | INTERACTION_ANSWERS_NOT_REMOTE      |
+ * | file_change_approval | `decline` only (no diff exists to judge)    | INTERACTION_ANSWERS_NOT_REMOTE              |
+ * | permission_approval  | `once`/`decline`, workspace-only class only | INTERACTION_ANSWERS_NOT_REMOTE              |
+ * | user_input           | INTERACTION_DECISION_NOT_REMOTE            | non-secret questions, exact provider ids    |
+ * | mcp_elicitation      | INTERACTION_DECISION_NOT_REMOTE            | plain-text `form` fields, exact field names |
+ *
+ * The class a remote approval is taken on is recomputed here from the live
+ * record rather than trusted from the projection, and the revision check binds
+ * that record to the one the requesting device actually saw.
  */
 function verifyRemoteInteraction(
   store: StateStore,
@@ -3261,29 +3472,130 @@ function verifyRemoteInteraction(
   if (interaction.state !== "pending") return { kind: "refused", code: "INTERACTION_ALREADY_RESOLVED" };
   if (interaction.revision !== payload.revision) return { kind: "refused", code: "INTERACTION_REVISION_STALE" };
   if (now >= interaction.deadlineAt) return { kind: "refused", code: "INTERACTION_EXPIRED" };
-  if ("decision" in payload) {
-    const display = interaction.display;
-    if (display.kind !== "command_approval" && display.kind !== "file_change_approval") {
-      return { kind: "refused", code: "INTERACTION_DECISION_NOT_REMOTE" };
-    }
-    if (!display.availableDecisions.includes(payload.decision)) {
-      return { kind: "refused", code: "INTERACTION_DECISION_UNAVAILABLE" };
-    }
-    return { kind: "verified", resolution: { kind: "approval_decision", decision: payload.decision } };
+  return "decision" in payload
+    ? verifyRemoteInteractionDecision(interaction.display, payload.decision)
+    : verifyRemoteInteractionAnswers(interaction.display, payload.answers);
+}
+
+function verifyRemoteInteractionDecision(
+  display: InteractionDisplay,
+  decision: "once" | "decline" | "cancel",
+): RemoteInteractionVerification {
+  // `parseRemoteCommandPayload` cannot encode session scope, so this is depth
+  // rather than a live path: it keeps the refusal explicit at the boundary
+  // that would otherwise have to trust the parser.
+  if ((decision as string) === "session") {
+    return { kind: "refused", code: "INTERACTION_SESSION_SCOPE_NOT_REMOTE" };
   }
-  if (interaction.display.kind !== "user_input") {
+  if (display.kind === "user_input" || display.kind === "mcp_elicitation") {
+    return { kind: "refused", code: "INTERACTION_DECISION_NOT_REMOTE" };
+  }
+  if (display.kind === "permission_approval") {
+    if (decision !== "once" && decision !== "decline") {
+      return { kind: "refused", code: "INTERACTION_PERMISSION_DECISION_UNAVAILABLE" };
+    }
+    // Re-verification at apply time: the class exists only when every
+    // requested category is recognisably workspace-local. A network, MCP, or
+    // unrecognised category has no class and therefore no remote decision,
+    // whichever way the decision points.
+    if (
+      computeInteractionCommandClass(display) === null
+      || isNetworkOrExternalPermission(display)
+    ) {
+      return { kind: "refused", code: "INTERACTION_PERMISSION_CLASS_UNVERIFIED" };
+    }
+    return decision === "decline"
+      ? { kind: "verified", resolution: { kind: "approval_decision", decision } }
+      : {
+          kind: "verified",
+          resolution: {
+            kind: "permission_grant",
+            permissions: display.requested.map((permission) => permission.name),
+            scope: null,
+          },
+        };
+  }
+  if (display.kind === "file_change_approval" && decision !== "decline") {
+    // The pinned provider callback exposes no diff and no affected paths, so
+    // nothing a device could have read justifies accepting one.
+    return { kind: "refused", code: "INTERACTION_FILE_CHANGE_ACCEPT_NOT_REMOTE" };
+  }
+  if (!display.availableDecisions.includes(decision)) {
+    return { kind: "refused", code: "INTERACTION_DECISION_UNAVAILABLE" };
+  }
+  if (
+    display.kind === "command_approval"
+    && decision === "once"
+    && computeInteractionCommandClass(display) === null
+  ) {
+    return { kind: "refused", code: "INTERACTION_COMMAND_CLASS_UNVERIFIED" };
+  }
+  return { kind: "verified", resolution: { kind: "approval_decision", decision } };
+}
+
+function verifyRemoteInteractionAnswers(
+  display: InteractionDisplay,
+  submitted: Readonly<Record<string, Readonly<{ answers: readonly string[] }>>>,
+): RemoteInteractionVerification {
+  if (display.kind !== "user_input" && display.kind !== "mcp_elicitation") {
     return { kind: "refused", code: "INTERACTION_ANSWERS_NOT_REMOTE" };
   }
-  const secretQuestions = new Set(
-    interaction.display.questions.filter((question) => question.secret).map((question) => question.id),
+  const questions = computeRemoteInteractionQuestions(display);
+  const secret = new Set(
+    questions.filter((question) => question.secret).map((question) => question.id),
   );
-  for (const questionId of Object.keys(payload.answers)) {
-    if (secretQuestions.has(questionId)) return { kind: "refused", code: "INTERACTION_SECRET_ANSWER_REFUSED" };
+  for (const questionId of Object.keys(submitted)) {
+    if (secret.has(questionId)) {
+      return { kind: "refused", code: "INTERACTION_SECRET_ANSWER_REFUSED" };
+    }
   }
-  const answers = Object.fromEntries(
-    Object.entries(payload.answers).map(([questionId, answer]) => [questionId, { answers: [...answer.answers] }]),
-  );
-  return { kind: "verified", resolution: { kind: "user_answers", answers } };
+  if (display.kind === "user_input") {
+    // The local resolve path requires an answer for every question the
+    // provider asked, so one secret question makes the whole set unanswerable
+    // from a device: a complete set would have to carry the secret value and
+    // an incomplete one would be refused there instead of here.
+    if (secret.size > 0) {
+      return { kind: "refused", code: "INTERACTION_SECRET_ANSWER_REFUSED" };
+    }
+    // The id-matching rule itself stays where it already lives, on the local
+    // resolve path, so a remote answer is held to exactly the same rule a
+    // local one is.
+    const answers = Object.fromEntries(
+      Object.entries(submitted).map(([questionId, answer]) => [
+        questionId,
+        { answers: [...answer.answers] },
+      ]),
+    );
+    return { kind: "verified", resolution: { kind: "user_answers", answers } };
+  }
+  // An MCP form is answerable from a device only when HRA can complete it at
+  // all and every value it needs is plain text: a typed field cannot be
+  // reconstructed from a text answer, and a missing required field would fail
+  // the provider's own contract after the decision had already been taken.
+  if (display.mode !== "form" || display.fields === undefined || questions.length === 0) {
+    return { kind: "refused", code: "INTERACTION_ELICITATION_NOT_REMOTE" };
+  }
+  const known = new Set(questions.map((question) => question.id));
+  if (Object.keys(submitted).some((name) => !known.has(name))) {
+    return { kind: "refused", code: "INTERACTION_ELICITATION_NOT_REMOTE" };
+  }
+  const content: Record<string, string> = {};
+  for (const field of display.fields) {
+    const answer = submitted[field.name];
+    if (answer === undefined) {
+      if (field.required) return { kind: "refused", code: "INTERACTION_ELICITATION_NOT_REMOTE" };
+      continue;
+    }
+    const [value] = answer.answers;
+    if (answer.answers.length !== 1 || typeof value !== "string") {
+      return { kind: "refused", code: "INTERACTION_ELICITATION_NOT_REMOTE" };
+    }
+    content[field.name] = value;
+  }
+  return {
+    kind: "verified",
+    resolution: { kind: "mcp_submission", action: "accept", content },
+  };
 }
 
 export class BridgedCloudControl implements CloudControlPort, CloudRemoteControlPort {

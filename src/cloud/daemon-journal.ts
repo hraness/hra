@@ -17,6 +17,8 @@ import {
 } from "./contracts";
 import type { CloudSecretCustodyPort } from "./local-control";
 import {
+  compactInteractionDetailOf,
+  isCompactInteractionBaselineShape,
   parseCompactSessionEvent,
   type CompactInteractionEvent,
 } from "./projection";
@@ -1029,17 +1031,9 @@ function parseProjectionRecoveryBaselineTurn(
 function parseProjectionRecoveryBaselineInteraction(
   value: unknown,
 ): CloudProjectionRecoveryBaselineInteraction {
-  if (
-    !isRecord(value)
-    || !hasExactKeys(value, [
-      "blocking",
-      "interactionId",
-      "interactionKind",
-      "revision",
-      "state",
-      "summary",
-    ])
-  ) throw new Error("Cloud daemon journal is corrupt.");
+  if (!isCompactInteractionBaselineShape(value)) {
+    throw new Error("Cloud daemon journal is corrupt.");
+  }
   const parsed = parseCompactSessionEvent({
     ...value,
     kind: "interaction_state",
@@ -1049,6 +1043,7 @@ function parseProjectionRecoveryBaselineInteraction(
     throw new Error("Cloud daemon journal is corrupt.");
   }
   return {
+    ...compactInteractionDetailOf(parsed),
     blocking: parsed.blocking,
     interactionId: parsed.interactionId,
     interactionKind: parsed.interactionKind,

@@ -6,7 +6,12 @@
  * ordering ladder, the composer target rule, and the interaction affordance
  * table are all provable under `bun test ./app`.
  */
-import type { CompactInteractionKind, SessionStateValue } from "../hra/cloud";
+import type {
+  CompactInteractionDecision,
+  CompactInteractionKind,
+  CompactInteractionQuestion,
+  SessionStateValue,
+} from "../hra/cloud";
 
 export type SessionTone = "neutral" | "accent" | "attention" | "danger";
 
@@ -120,67 +125,128 @@ export const interactionKindLabel: Readonly<Record<CompactInteractionKind, strin
     user_input: "Question",
   });
 
-export type InteractionAffordance =
-  /** Approve at `once` scope and decline are both offered. */
-  | Readonly<{ kind: "approve_or_decline" }>
-  /** Only a refusal is accepted remotely. */
-  | Readonly<{ kind: "decline_only" }>
-  /** A free-text answer, which the daemon keys by the provider's question ids. */
-  | Readonly<{ kind: "answers" }>
-  /** Nothing this device may resolve: the reader goes to the machine. */
-  | Readonly<{ kind: "local_only" }>;
+export type InteractionAffordance = Readonly<{
+  /** The questions this device may answer, in provider order. */
+  answerable: readonly CompactInteractionQuestion[];
+  /** The decision buttons this device may show, in display order. */
+  decisions: readonly CompactInteractionDecision[];
+  /** Questions that are shown but never given an input here. */
+  locked: readonly CompactInteractionQuestion[];
+  /** Why anything is withheld, for the "resolve on the machine" note. */
+  reasons: readonly string[];
+}>;
+
+const decisionOrder: readonly CompactInteractionDecision[] = ["once", "decline"];
+
+const orderedDecisions = (
+  offered: readonly CompactInteractionDecision[],
+  allowed: readonly CompactInteractionDecision[],
+): readonly CompactInteractionDecision[] =>
+  decisionOrder.filter((decision) =>
+    offered.includes(decision) && allowed.includes(decision));
 
 /**
  * What a browser may offer for a pending interaction.
  *
- * The daemon verifies every remote decision before applying it, and its rules
- * are narrower than the command payload union, so the buttons are derived from
- * what will actually be accepted rather than from what can be encoded:
+ * This is the mirror of `verifyRemoteInteraction` in
+ * `src/cloud/daemon-adapters.ts`: a button appears only where the daemon would
+ * accept the decision, so a reader is never offered an action that comes back
+ * as a refusal code. The rules, and the projection field each one reads:
  *
- * - `command_approval` accepts `once`, `decline`, and `cancel` remotely,
- *   subject to the provider's own `availableDecisions`, which the compact
- *   projection does not carry. An unavailable decision comes back as a failed
- *   command with a result code rather than a silent no-op.
- * - `file_change_approval` accepts a remote decision, but the local resolver
- *   refuses `once` and `session` for it because the pinned provider callback
- *   exposes no affected paths or diff. Only a refusal is offered.
- * - `permission_approval` is refused remotely outright
- *   (`INTERACTION_DECISION_NOT_REMOTE`): granting a permission needs the exact
- *   requested permission values, which never enter the projection.
- * - `user_input` is answerable remotely, but only with the provider's exact
- *   question ids, and the compact `interaction_state` event carries a fixed
- *   per-kind summary with no question list. Until the projection carries the
- *   questions, the answer field is shown disabled with the reason.
- * - `mcp_elicitation` is form input against an MCP server and stays local.
+ * - `command_approval` accepts `once` and `decline` from the provider's own
+ *   `availableDecisions`, and `once` only while a `commandClass` is present:
+ *   the daemon recomputes that class at apply time and refuses without one
+ *   (`INTERACTION_COMMAND_CLASS_UNVERIFIED`).
+ * - `file_change_approval` offers only a refusal. The pinned provider callback
+ *   exposes no diff and no affected paths, so nothing this device could have
+ *   read would justify accepting
+ *   (`INTERACTION_FILE_CHANGE_ACCEPT_NOT_REMOTE`).
+ * - `permission_approval` accepts `once` and `decline` only while a
+ *   `commandClass` is present, which the daemon emits only when every
+ *   requested category is recognisably workspace-local. A network, MCP, or
+ *   unrecognised category carries no class and no button
+ *   (`INTERACTION_PERMISSION_CLASS_UNVERIFIED`). The exact requested values
+ *   never enter the projection either way.
+ * - `user_input` and `mcp_elicitation` are answered by the provider's exact
+ *   question ids, which the projection now carries. A question marked `secret`
+ *   is listed so the reader knows what is being asked and is given no input:
+ *   the daemon refuses a secret answer outright
+ *   (`INTERACTION_SECRET_ANSWER_REFUSED`).
  *
- * Secret questions are refused by the daemon
- * (`INTERACTION_SECRET_ANSWER_REFUSED`). The projection gives the browser no
- * way to tell a secret question from an ordinary one, which is the second
- * reason answers are offered for `user_input` alone and never for a form.
+ * An interaction projected by an older daemon carries none of these fields. It
+ * gets no buttons and the note instead, which is the same answer this function
+ * gives for anything the daemon would refuse.
  */
-export function interactionAffordance(kind: CompactInteractionKind): InteractionAffordance {
-  switch (kind) {
-    case "command_approval": return { kind: "approve_or_decline" };
-    case "file_change_approval": return { kind: "decline_only" };
-    case "user_input": return { kind: "answers" };
-    case "permission_approval":
-    case "mcp_elicitation": return { kind: "local_only" };
+export function interactionAffordance(
+  interaction: Readonly<{
+    availableDecisions: readonly CompactInteractionDecision[] | null;
+    commandClass: string | null;
+    interactionKind: CompactInteractionKind;
+    questions: readonly CompactInteractionQuestion[] | null;
+  }>,
+): InteractionAffordance {
+  const offered = interaction.availableDecisions ?? [];
+  const questions = interaction.questions ?? [];
+  const answerable = questions.filter((question) => !question.secret);
+  const locked = questions.filter((question) => question.secret);
+  const reasons: string[] = [];
+  switch (interaction.interactionKind) {
+    case "command_approval": {
+      const decisions = orderedDecisions(
+        offered,
+        interaction.commandClass === null ? ["decline"] : ["once", "decline"],
+      );
+      if (interaction.commandClass === null) {
+        reasons.push("Approving needs the command class, which this projection does not carry.");
+      }
+      if (decisions.length === 0) {
+        reasons.push("This request offers no decision that can be taken from here.");
+      }
+      return { answerable: [], decisions, locked: [], reasons };
+    }
+    case "file_change_approval": {
+      const decisions = orderedDecisions(offered, ["decline"]);
+      reasons.push("Approving a file change needs the exact diff, which stays on the machine.");
+      return { answerable: [], decisions, locked: [], reasons };
+    }
+    case "permission_approval": {
+      const decisions = interaction.commandClass === null
+        ? []
+        : orderedDecisions(offered, ["once", "decline"]);
+      if (interaction.commandClass === null) {
+        reasons.push("This permission request asks for a category outside the workspace, so it is decided on the machine.");
+      }
+      return { answerable: [], decisions, locked: [], reasons };
+    }
+    case "user_input": {
+      // The daemon requires an answer for every question the provider asked,
+      // so one secret question makes the whole set local: a partial answer
+      // would be refused and a complete one would carry the protected value.
+      const offerable = locked.length === 0 ? answerable : [];
+      if (offerable.length === 0) {
+        reasons.push("This question is answered on the machine running the session.");
+      }
+      if (locked.length > 0) {
+        reasons.push(locked.length === 1
+          ? "One answer is protected, so the whole question is answered there."
+          : `${String(locked.length)} answers are protected, so the whole question is answered there.`);
+      }
+      return { answerable: offerable, decisions: [], locked, reasons };
+    }
+    case "mcp_elicitation": {
+      // An MCP form leaves out the values it cannot carry: an optional field
+      // may go unanswered, so the text fields are still offered.
+      if (answerable.length === 0) {
+        reasons.push("This MCP form is completed on the machine running the session.");
+      }
+      return { answerable, decisions: [], locked, reasons };
+    }
   }
 }
 
-/** Why an affordance is withheld, rendered next to the panel. */
-export function interactionRestriction(kind: CompactInteractionKind): string | null {
-  switch (kind) {
-    case "command_approval": return null;
-    case "file_change_approval":
-      return "Approving a file change needs the exact diff, which stays on the machine.";
-    case "permission_approval":
-      return "Granting a permission needs the exact requested values, which never leave the machine.";
-    case "user_input":
-      return "Answering needs the provider's question identifiers, which this projection does not carry yet.";
-    case "mcp_elicitation":
-      return "MCP form input is completed on the machine.";
-  }
+/** Whether this device can resolve the interaction at all. */
+export function interactionIsLocalOnly(affordance: InteractionAffordance): boolean {
+  return affordance.decisions.length === 0 && affordance.answerable.length === 0;
 }
 
 /** The one-line `turn_summary` marker under a finished turn. */

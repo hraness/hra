@@ -178,6 +178,52 @@ describe("sessionModelReducer", () => {
     expect(resolved.pendingInteractions).toEqual([]);
   });
 
+  test("carries the projected interaction detail and nulls what an older writer omits", () => {
+    const detailed = foldCompact([{
+      availableDecisions: ["once", "decline"],
+      blocking: true,
+      commandClass: "git commit",
+      detailMarkdown: "- Runs: git commit",
+      detailVersion: 1,
+      headline: "Allow git commit",
+      interactionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3302",
+      interactionKind: "command_approval",
+      kind: "interaction_state",
+      label: "Command approval",
+      revision: 1,
+      sequence: 1,
+      state: "pending",
+      summary: "Codex requests command approval",
+    }]);
+    expect(detailed.pendingInteractions[0]).toMatchObject({
+      availableDecisions: ["once", "decline"],
+      commandClass: "git commit",
+      detailMarkdown: "- Runs: git commit",
+      headline: "Allow git commit",
+      label: "Command approval",
+      questions: null,
+    });
+
+    const plain = foldCompact([{
+      blocking: true,
+      interactionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3303",
+      interactionKind: "command_approval",
+      kind: "interaction_state",
+      revision: 1,
+      sequence: 1,
+      state: "pending",
+      summary: "run the build",
+    }]);
+    expect(plain.pendingInteractions[0]).toMatchObject({
+      availableDecisions: null,
+      commandClass: null,
+      detailMarkdown: null,
+      headline: null,
+      label: null,
+      questions: null,
+    });
+  });
+
   test("a stale interaction revision does not reopen a resolved interaction", () => {
     const resolved = foldCompact([
       {

@@ -12,17 +12,31 @@
  * revision always wins, so a stale revision is dropped here.
  */
 import type {
+  CompactInteractionDecision,
   CompactInteractionKind,
+  CompactInteractionQuestion,
   CompactInteractionState,
   CompactSessionEvent,
   DetailSessionEvent,
   SessionStateValue,
 } from "../hra/cloud";
 
+/**
+ * One open interaction, as the projection describes it. Every optional field
+ * is detail a newer daemon carries and an older one does not, so the view
+ * derives what it may offer from what is actually present rather than from the
+ * kind alone (see `interactionAffordance`).
+ */
 export type PendingInteraction = Readonly<{
+  availableDecisions: readonly CompactInteractionDecision[] | null;
   blocking: boolean;
+  commandClass: string | null;
+  detailMarkdown: string | null;
+  headline: string | null;
   interactionId: string;
   interactionKind: CompactInteractionKind;
+  label: string | null;
+  questions: readonly CompactInteractionQuestion[] | null;
   revision: number;
   state: CompactInteractionState;
   summary: string;
@@ -124,9 +138,15 @@ function upsertInteraction(
     ? [
         ...without,
         {
+          availableDecisions: event.availableDecisions ?? null,
           blocking: event.blocking,
+          commandClass: event.commandClass ?? null,
+          detailMarkdown: event.detailMarkdown ?? null,
+          headline: event.headline ?? null,
           interactionId: event.interactionId,
           interactionKind: event.interactionKind,
+          label: event.label ?? null,
+          questions: event.questions ?? null,
           revision: event.revision,
           state: event.state,
           summary: event.summary,

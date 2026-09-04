@@ -5,7 +5,7 @@ import {
   formatDuration,
   interactionAffordance,
   interactionKindLabel,
-  interactionRestriction,
+  interactionIsLocalOnly,
   isIdleSession,
   orderSessionCards,
   resolveComposerTarget,
@@ -158,43 +158,115 @@ describe("isIdleSession", () => {
 });
 
 describe("interaction affordances", () => {
-  test("every kind has a label and an affordance", () => {
-    for (const kind of allInteractionKinds) {
-      expect(interactionKindLabel[kind].length).toBeGreaterThan(0);
-      expect(interactionAffordance(kind).kind).toBeDefined();
+  const pending = (
+    overrides: Partial<Parameters<typeof interactionAffordance>[0]> = {},
+  ): Parameters<typeof interactionAffordance>[0] => ({
+    availableDecisions: null,
+    commandClass: null,
+    interactionKind: "command_approval",
+    questions: null,
+    ...overrides,
+  });
+
+  test("every kind has a label and a derivable affordance", () => {
+    for (const interactionKind of allInteractionKinds) {
+      expect(interactionKindLabel[interactionKind].length).toBeGreaterThan(0);
+      const affordance = interactionAffordance(pending({ interactionKind }));
+      expect(affordance.decisions).toEqual([]);
+      expect(affordance.answerable).toEqual([]);
     }
   });
 
-  test("only a command approval offers an approve button", () => {
-    const approving = allInteractionKinds
-      .filter((kind) => interactionAffordance(kind).kind === "approve_or_decline");
-    expect(approving).toEqual(["command_approval"]);
+  test("an interaction projected without detail offers nothing and says so", () => {
+    for (const interactionKind of allInteractionKinds) {
+      const affordance = interactionAffordance(pending({ interactionKind }));
+      expect(interactionIsLocalOnly(affordance)).toBe(true);
+      expect(affordance.reasons.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("a command approval offers approve only with a class the daemon can re-verify", () => {
+    expect(interactionAffordance(pending({
+      availableDecisions: ["once", "decline"],
+      commandClass: "git commit",
+    })).decisions).toEqual(["once", "decline"]);
+    const classless = interactionAffordance(pending({
+      availableDecisions: ["once", "decline"],
+    }));
+    expect(classless.decisions).toEqual(["decline"]);
+    expect(classless.reasons.join(" ")).toContain("command class");
+  });
+
+  test("a decision the provider did not offer never becomes a button", () => {
+    expect(interactionAffordance(pending({
+      availableDecisions: ["decline"],
+      commandClass: "bun test",
+    })).decisions).toEqual(["decline"]);
   });
 
   test("a file change approval may only be declined from a browser", () => {
-    expect(interactionAffordance("file_change_approval")).toEqual({ kind: "decline_only" });
+    const affordance = interactionAffordance(pending({
+      availableDecisions: ["once", "decline"],
+      commandClass: "unused",
+      interactionKind: "file_change_approval",
+    }));
+    expect(affordance.decisions).toEqual(["decline"]);
+    expect(affordance.reasons.join(" ")).toContain("exact diff");
   });
 
-  test("permission requests and MCP forms stay on the machine", () => {
-    expect(interactionAffordance("permission_approval")).toEqual({ kind: "local_only" });
-    expect(interactionAffordance("mcp_elicitation")).toEqual({ kind: "local_only" });
+  test("a permission approval is decidable only with a workspace class", () => {
+    expect(interactionAffordance(pending({
+      availableDecisions: ["once", "decline"],
+      commandClass: "permission:workspace",
+      interactionKind: "permission_approval",
+    })).decisions).toEqual(["once", "decline"]);
+    const external = interactionAffordance(pending({
+      availableDecisions: ["once", "decline"],
+      interactionKind: "permission_approval",
+    }));
+    expect(external.decisions).toEqual([]);
+    expect(interactionIsLocalOnly(external)).toBe(true);
   });
 
-  test("answers are offered for user input alone", () => {
-    const answerable = allInteractionKinds
-      .filter((kind) => interactionAffordance(kind).kind === "answers");
-    expect(answerable).toEqual(["user_input"]);
+  test("a secret question is listed and never becomes an answer id", () => {
+    const questions = [
+      { id: "where", label: "Where", secret: false },
+      { id: "token", label: "Token", secret: true },
+    ] as const;
+    // A provider question set is answered whole, so one protected answer
+    // sends the whole question to the machine.
+    const asked = interactionAffordance(pending({ interactionKind: "user_input", questions }));
+    expect(asked.answerable).toEqual([]);
+    expect(asked.locked.map((question) => question.id)).toEqual(["token"]);
+    expect(interactionIsLocalOnly(asked)).toBe(true);
+    expect(asked.reasons.length).toBeGreaterThan(0);
+
+    // An MCP form leaves out what it cannot carry, so its text fields stay
+    // answerable while the protected ones are never offered.
+    const form = interactionAffordance(pending({
+      interactionKind: "mcp_elicitation",
+      questions,
+    }));
+    expect(form.answerable.map((question) => question.id)).toEqual(["where"]);
+    expect(form.decisions).toEqual([]);
   });
 
-  test("every withheld affordance states a reason", () => {
-    for (const kind of allInteractionKinds) {
-      const restriction = interactionRestriction(kind);
-      if (interactionAffordance(kind).kind === "approve_or_decline") {
-        expect(restriction).toBeNull();
-      } else {
-        expect(restriction?.length ?? 0).toBeGreaterThan(0);
-      }
-    }
+  test("a question set that is entirely secret leaves nothing to answer", () => {
+    const affordance = interactionAffordance(pending({
+      interactionKind: "user_input",
+      questions: [{ id: "token", label: "Token", secret: true }],
+    }));
+    expect(interactionIsLocalOnly(affordance)).toBe(true);
+    expect(affordance.reasons.length).toBeGreaterThan(0);
+  });
+
+  test("an approval kind never gains an answer field from a stray question list", () => {
+    const affordance = interactionAffordance(pending({
+      availableDecisions: ["decline"],
+      interactionKind: "file_change_approval",
+      questions: [{ id: "where", label: "Where", secret: false }],
+    }));
+    expect(affordance.answerable).toEqual([]);
   });
 });
 
