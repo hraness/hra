@@ -1,6 +1,6 @@
 # Privacy
 
-This policy describes the HRA beta data boundary. The hosted sync service is live as an invite-only beta. Besides completed turns, the daemon streams the current turn's assistant text to the hosted service in encrypted, redacted batches that expire within six hours; reasoning summaries are included only when you enable show-thinking for a session, and raw reasoning is never uploaded.
+This policy describes the HRA beta data boundary. The hosted sync service is live as an open beta. Besides completed turns, the daemon streams the current turn's assistant text to the hosted service in encrypted, redacted batches that expire within six hours; reasoning summaries are included only when you enable show-thinking for a session, and raw reasoning is never uploaded.
 
 Cloud sync is optional. Local account profiles, Codex credentials, and local execution continue to work without it. HRA identity is separate from every Codex account.
 
@@ -36,6 +36,6 @@ Compact-projection recovery is append-only. It preserves every older encrypted c
 
 Codex activity remains subject to OpenAI's own service and privacy terms.
 
-> **Hosted sync status.** The hosted sync endpoint is live as an invite-only beta. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. The first identity and device were admitted on the production deployment on 2026-09-03; new identities need an invitation from an existing member.
+> **Hosted sync status.** The hosted sync endpoint is live as an open beta. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. Anyone can create an identity with an email address and a one-time code; an invitation is optional.
 
 Report a suspected boundary violation through [private vulnerability reporting](https://github.com/hraness/hra/security/advisories/new).

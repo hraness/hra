@@ -73,7 +73,7 @@ describe("public content contract", () => {
       "HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.",
     );
     expect(publicContent.statusLine).toContain(`v${publicContent.releaseVersion}`);
-    expect(publicContent.statusLine).toContain("hosted sync is live as an invite-only beta");
+    expect(publicContent.statusLine).toContain("hosted sync is live as an open beta");
     expect(markdown.indexOf(publicContent.thesis)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
     expect(markdown.indexOf(publicContent.statusLine)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
     expect(markdown).toContain(`## ${publicContent.hero.heading}`);
@@ -218,7 +218,7 @@ describe("public content contract", () => {
     }
   });
 
-  test("marks the local release ready while the website and invite-only hosted sync stay live", () => {
+  test("marks the local release ready while the website and open hosted sync stay live", () => {
     expect(publicReleaseState).toBe("release-ready");
     expect(publicContent.endpoints).toEqual({
       betaTag: "release-ready",
@@ -228,7 +228,7 @@ describe("public content contract", () => {
     });
     expect(renderReadmeMarkdown()).toContain("The local CLI v0.4.1 is release-ready for macOS and Linux");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Immutable local CLI release candidate; hosted sync live as an invite-only beta");
+      expect(surface).toContain("Immutable local CLI release candidate; hosted sync live as an open beta");
       expect(surface).toContain("works once GitHub exposes the immutable");
       expect(surface).toContain("public CLI stays immutable once admitted");
       expect(surface).not.toContain("beta-not-yet-live");
@@ -244,28 +244,28 @@ describe("public content contract", () => {
   });
 
   test("states one hosted sign-up claim everywhere and switches it in one place", () => {
-    expect(publicContent.hostedSignup).toBe("invite_only");
+    expect(publicContent.hostedSignup).toBe("open");
     for (const surface of [
       renderReadmeMarkdown(),
       renderSiteHtml(),
       renderPrivacyMarkdown(),
     ]) {
-      expect(surface).not.toContain("open beta");
+      expect(surface).not.toContain("invite-only beta");
     }
     expect(renderReadmeMarkdown()).toContain(
-      "new identities need an invitation from an existing member",
+      "Anyone can create an identity with an email address and a one-time code",
     );
     expect(renderPrivacyMarkdown()).toContain(
-      "The hosted sync service is live as an invite-only beta",
+      "The hosted sync service is live as an open beta",
     );
-    // The open-beta wording is one constant away, and nothing else changes.
+    // The invite-only wording is one constant away, and nothing else changes.
     expect(hostedSignupCopy(publicContent.hostedSignup)).toEqual({
-      admissionClaim: "The first identity and device were admitted on the production deployment on 2026-09-03; new identities need an invitation from an existing member.",
-      betaLabel: "invite-only beta",
-    });
-    expect(hostedSignupCopy("open")).toEqual({
       admissionClaim: "Anyone can create an identity with an email address and a one-time code; an invitation is optional.",
       betaLabel: "open beta",
+    });
+    expect(hostedSignupCopy("invite_only")).toEqual({
+      admissionClaim: "The first identity and device were admitted on the production deployment on 2026-09-03; new identities need an invitation from an existing member.",
+      betaLabel: "invite-only beta",
     });
   });
 

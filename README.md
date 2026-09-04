@@ -2,7 +2,7 @@
 [![npm version](https://img.shields.io/npm/v/%40hraness%2Fhra)](https://www.npmjs.com/package/@hraness/hra) [![provenance: sigstore](https://img.shields.io/badge/provenance-sigstore-2e7d32)](https://www.npmjs.com/package/@hraness/hra#provenance) [![CI](https://img.shields.io/github/actions/workflow/status/hraness/hra/ci.yml?branch=main&label=CI)](https://github.com/hraness/hra/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/npm/l/%40hraness%2Fhra)](https://github.com/hraness/hra/blob/main/LICENSE) [![Bun 1.3.14](https://img.shields.io/badge/Bun-1.3.14-14151a)](https://bun.sh) [![runtimes: Codex 0.149.0](https://img.shields.io/badge/runtimes-Codex%200.149.0-0b5fa5)](https://www.npmjs.com/package/@openai/codex/v/0.149.0)\
 HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.
 
-Status: public beta. The local CLI v0.4.1 is release-ready for macOS and Linux; hosted sync is live as an invite-only beta.
+Status: public beta. The local CLI v0.4.1 is release-ready for macOS and Linux; hosted sync is live as an open beta.
 
 ```sh
 test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.4.1/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.4.1/hraness-hra-0.4.1.tgz b6e914d74d53483db01e1867880b93bc594ce7e162667312a188134d587e4126)" = hra-install-safe
@@ -20,7 +20,7 @@ hra init --yes
 
 Give each account its own Codex home, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.
 
-macOS and Linux CLI · macOS desktop switching · local v0.4.1 release-ready · hosted sync live (invite-only beta)
+macOS and Linux CLI · macOS desktop switching · local v0.4.1 release-ready · hosted sync live (open beta)
 
 ### One request, one exact account and session
 
@@ -29,7 +29,7 @@ macOS and Linux CLI · macOS desktop switching · local v0.4.1 release-ready · 
 3. **Direct:** `hra session send <session-id> -- "Review this project."`. Send work to that session without switching account authority.
 4. **Observe:** `hra session watch <session-id> --cursor <status-cursor> --jsonl`. Follow safe live updates from the cursor returned by status.
 
-> **Immutable local CLI release candidate; hosted sync live as an invite-only beta.** The exact install command below works once GitHub exposes the immutable `v0.4.1` GitHub Release and its verified archive. The website and optional hosted sync are live; the public CLI stays immutable once admitted.
+> **Immutable local CLI release candidate; hosted sync live as an open beta.** The exact install command below works once GitHub exposes the immutable `v0.4.1` GitHub Release and its verified archive. The website and optional hosted sync are live; the public CLI stays immutable once admitted.
 
 HRA is one Bun CLI plus a local daemon. It keeps Codex accounts isolated, gives you a compact session interface, and optionally syncs encrypted session projections and commands across your enrolled machines.
 
@@ -194,7 +194,7 @@ Local SQLite is the only execution authority for work admission, claims, fences,
 
 ## Cloud sign-in and device pairing
 
-The hosted endpoint is live as an invite-only beta. An unset `HRA_CONVEX_URL` selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. After deliberately disabling a bound state root, `hra sync status` and `hra doctor` report its exact restart prerequisite: unset `HRA_CONVEX_URL` for the hosted deployment, or restore the bound URL for a self-managed deployment. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:
+The hosted endpoint is live as an open beta. An unset `HRA_CONVEX_URL` selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. After deliberately disabling a bound state root, `hra sync status` and `hra doctor` report its exact restart prerequisite: unset `HRA_CONVEX_URL` for the hosted deployment, or restore the bound URL for a self-managed deployment. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:
 
 ```text
 hra auth login --input-stdin
@@ -395,7 +395,7 @@ Compact-projection recovery is append-only. It preserves every older encrypted c
 
 Codex activity remains subject to OpenAI's own service and privacy terms.
 
-> **Hosted sync status.** The hosted sync endpoint is live as an invite-only beta. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. The first identity and device were admitted on the production deployment on 2026-09-03; new identities need an invitation from an existing member.
+> **Hosted sync status.** The hosted sync endpoint is live as an open beta. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. Anyone can create an identity with an email address and a one-time code; an invitation is optional.
 
 ## Command reference
 

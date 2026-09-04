@@ -134,7 +134,7 @@ const list = (...items: readonly (readonly InlineContent[])[]): ContentBlock => 
  * the authority refuses an uninvited identity, and "open beta" only once it
  * admits one. Every surface below derives its wording from this constant.
  */
-const hostedSignup: HostedSignup = "invite_only";
+const hostedSignup: HostedSignup = "open";
 
 /** The exact public wording for each hosted sign-up state. */
 export const hostedSignupCopy = (signup: HostedSignup): Readonly<{
