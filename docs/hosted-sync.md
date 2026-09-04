@@ -463,3 +463,109 @@ These constants are hard authority. A stored counter above the constant reads
 as corrupt and fails closed, so never lower a ceiling below what a deployment
 already stores. Read current usage first, and deploy a tier change through the
 attested candidate chain before it can matter.
+
+## Device commands
+
+A session command names a session and is fenced by that session's execution
+lease. A **device command** names a machine and has no session: it is how a
+browser asks a machine to start a session before one exists, to relay a
+provider login, or to refresh usage. It lives in its own hosted table,
+`deviceCommands`, with its own port (`convex/deviceCommands.ts`) and its own
+authority model.
+
+The lifecycle is the one every command already uses (enqueue, acknowledge,
+prepare, effect started, settle, expire) with the same closed state union and
+the same rule that an effect which may have begun is quarantined as
+`ambiguous`, never retried. What differs is the fence. There is no lease, so a
+device command binds the target daemon's own boot authority at `prepare`; only
+a strictly later boot may take over a command that has not started, and a boot
+that finds a command it left at `effect_started` may only close it as
+`ambiguous`. That is what stops a `session_start` that may or may not have run
+from silently starting a second session.
+
+### Kinds
+
+| Kind | Payload | Result |
+| --- | --- | --- |
+| `session_start` | `{accountPublicId, projectPublicId, prompt, preset, provider}` | `{sessionPublicId}` |
+| `account_login_start` | `{accountPublicId}` | `{loginUrl, expiresAt}`, single use |
+| `account_login_status` | none | `{status, instruction}` |
+| `usage_refresh` | none | `{accountsRefreshed}` |
+
+Addressing is by the cloud public ids the device registry already projects
+(`DeviceRegistryPayload.accounts` and `.projects`). A filesystem path is
+refused by the payload parser, so a project root can never reach the hosted
+deployment. `account_login_status` deliberately carries no account: a machine
+relays at most one login at a time, so the poll asks what the machine is doing
+rather than naming an account.
+
+`session_start` runs as start-then-send under one idempotency key. The two
+local effects use keys derived deterministically from the device command's own
+public id, so a replay reaches the same two local mutations. Once the start has
+committed, a failure in the send is settled `ambiguous` and carries no session
+id: the honest instruction is to look at the grid, not to retry.
+
+### Guards
+
+Every guard is local. Nothing hosted and no browser can change one.
+
+| Guard | Refusal code |
+| --- | --- |
+| Per-device kill switch (`hra remote deny device-commands`) | `DEVICE_COMMANDS_DENIED` |
+| Requesting device revoked after enqueue | `REQUESTING_DEVICE_INACTIVE` |
+| Account linking without the local opt-in | `ACCOUNT_LINKING_DENIED` |
+| Account not in the projected registry | `DEVICE_COMMAND_ACCOUNT_UNKNOWN` |
+| Account signed out on the machine | `DEVICE_COMMAND_ACCOUNT_SIGNED_OUT` |
+| Provider does not match the projected account | `DEVICE_COMMAND_PROVIDER_UNSUPPORTED` |
+| Project not in the projected registry | `DEVICE_COMMAND_PROJECT_UNKNOWN` |
+| Per-device daily cap (100 admitted commands) | `DEVICE_COMMAND_DAILY_CAP` |
+| Login URL that cannot be completed on another device | `ACCOUNT_LOGIN_RELAY_UNAVAILABLE` |
+
+The cap is checked last, so a refused or malformed request never consumes the
+day's budget. A browser device can never be a device command target
+(`DEVICE_COMMAND_TARGET_NOT_EXECUTOR`) and can never execute the lifecycle
+(`BROWSER_DEVICE_CANNOT_EXECUTE`).
+
+Two further guards are not refusals. The first `session_start` from each device
+raises a local notice on the machine, written once and never repeated for that
+device; HRA has no desktop notification facility today, so the default notice
+is a daemon diagnostic and the CLI injects a real notifier when one exists. And
+a browser-started session inherits its project's approval mode, applied before
+the prompt is sent, so the first turn is already governed by it.
+
+The relayed login URL is account-key encrypted like every other payload, is
+`https` only with no credentials in its authority, expires five minutes after
+it is issued, and is released by the hosted row exactly once
+(`deviceCommands:consumeResult` erases the ciphertext in the same
+transaction). When the machine's provider login offers a URL that cannot be
+completed elsewhere, the command fails closed and the browser falls back to
+one-way status polling and the CLI instruction.
+
+### Operator switches
+
+```sh
+hra remote policy                      # what this machine currently allows
+hra remote deny device-commands        # stop accepting commands from other devices
+hra remote allow device-commands       # accept them again (the shipped default)
+hra remote allow account-linking       # permit relaying a provider login
+hra remote deny account-linking        # refuse it again (the shipped default)
+```
+
+Both switches are stored in `daemon_state` on the machine and published into
+that machine's encrypted device registry, so the web settings screen shows the
+current state and offers the CLI instruction rather than a button the daemon
+would refuse. Device commands are allowed by default because a browser device
+is already an enrolled key holder; account linking is denied by default because
+relaying a login URL is the one command that hands a credential path to another
+surface.
+
+### Retention and erasure
+
+`deviceCommands` is classified exactly like `sessionCommands`: quota category
+`command`, retention class `command_recovery`, deletion order 10. A pending row
+past its deadline is expired by the `pending_device_commands` maintenance
+category; a terminal row the requester has acknowledged is deleted by
+`terminal_device_commands` after the same 30-day retention. Account deletion
+erases the table with the other command state, and device revocation cancels
+pending rows the revoked device owns while quarantining any that had already
+started.

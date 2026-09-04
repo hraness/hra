@@ -60,6 +60,7 @@ export const HOSTED_TABLE_LIFECYCLE = {
   sessionStreamEpochs: { owner: "user", quota: "chunk", retention: "encrypted_history", deletionOrder: 20, disposition: "erase" },
   executionLeases: { owner: "user", quota: "session", retention: "lease_expiry", deletionOrder: 10, disposition: "erase" },
   sessionCommands: { owner: "user", quota: "command", retention: "command_recovery", deletionOrder: 10, disposition: "erase" },
+  deviceCommands: { owner: "user", quota: "command", retention: "command_recovery", deletionOrder: 10, disposition: "erase" },
   codexAccounts: { owner: "user", quota: "account", retention: "active", deletionOrder: 50, disposition: "erase" },
   deviceAccountBindings: { owner: "user", quota: "account", retention: "active", deletionOrder: 40, disposition: "erase" },
   accountUsageSnapshots: { owner: "user", quota: "usage", retention: "usage_90d_daily", deletionOrder: 40, disposition: "erase" },

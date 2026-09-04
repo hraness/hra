@@ -300,6 +300,15 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     key: gatewayKeySchema,
   }).strict(),
   z.object({ kind: z.literal("autorespond.gateway-clear") }).strict(),
+  // The two local device-command switches. They are set here and nowhere else:
+  // no hosted command and no browser can reach them, which is what makes the
+  // kill switch and the account-linking opt-in meaningful.
+  z.object({
+    kind: z.literal("remote.policy-set"),
+    allowed: z.boolean(),
+    switch: z.enum(["device-commands", "account-linking"]),
+  }).strict(),
+  z.object({ kind: z.literal("remote.policy-status") }).strict(),
   z.object({
     kind: z.literal("interaction.list"),
     session: selectorSchema.optional(),

@@ -6,6 +6,7 @@ import {
   copyFile,
   link,
   lstat,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -3476,6 +3477,307 @@ describe("settings commands and the device registry", () => {
     } finally {
       adapter.close();
       value.store.close();
+    }
+  });
+});
+
+/*
+ * Device command guards. Every one of them is decided locally, before any
+ * effect: the two `hra remote allow|deny` switches, the requesting device's
+ * day bucket, and the account and project the registry projected. Each refusal
+ * has its own closed code so the browser can name the operator switch.
+ */
+async function deviceCommandFixture() {
+  const value = await fixture();
+  const root = join(value.paths.root, "device-command-project");
+  await mkdir(root, { recursive: true });
+  const project = await value.store.createProject("Control plane", root, true);
+  const account = value.store.listProfiles()[0];
+  if (account === undefined) throw new Error("missing account fixture");
+  const executed: LocalCommand[] = [];
+  const notices: string[] = [];
+  const adapter = new StateBackedCloudDaemonAdapter({
+    codex: value.codex,
+    executeLocal: (command) => {
+      executed.push(command);
+      return Promise.resolve(command.kind === "session.start"
+        ? { session: { id: value.sessionId } }
+        : {});
+    },
+    executeRemote: () => Promise.resolve({}),
+    notifyOperator: (input) => { notices.push(input.title); return Promise.resolve(); },
+    now: () => 1_760_000_000_000,
+    paths: value.paths,
+    store: value.store,
+  });
+  const sessionStart = {
+    accountPublicId: account.id,
+    kind: "session_start" as const,
+    preset: "ultra" as const,
+    projectPublicId: project.id,
+    prompt: "continue the migration",
+    provider: "codex" as const,
+  };
+  return { account, adapter, executed, notices, project, sessionStart, value };
+}
+
+describe("device command execution", () => {
+  test("starts a session then sends its prompt, inheriting the project approval mode", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      world.value.store.setDefaultApprovalMode("manual");
+      world.value.store.setProjectApprovalMode(world.project.id, "auto:workspace");
+      const outcome = await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000001",
+        payload: world.sessionStart,
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      expect(outcome).toMatchObject({
+        code: "APPLIED",
+        result: { kind: "session_start", sessionPublicId: world.value.sessionId },
+        state: "applied",
+      });
+      expect(world.executed.map((command) => command.kind))
+        .toEqual(["session.start", "session.send"]);
+      // One device command, two local effects, two distinct derived keys.
+      const keys = world.executed.map((command) =>
+        (command as { idempotencyKey?: string }).idempotencyKey);
+      expect(new Set(keys).size).toBe(2);
+      expect(world.value.store.readSessionApprovalMode(world.value.sessionId as SessionId))
+        .toEqual({ mode: "auto:workspace", source: "session" });
+      // The desktop notice fires on the first session start from this device.
+      expect(world.notices).toEqual(["HRA: new device started a session"]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("quarantines a send that may or may not have reached the started session", async () => {
+    const value = await fixture();
+    const root = join(value.paths.root, "ambiguous-project");
+    await mkdir(root, { recursive: true });
+    const project = await value.store.createProject("Ambiguous", root, true);
+    const account = value.store.listProfiles()[0];
+    if (account === undefined) throw new Error("missing account fixture");
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeLocal: (command) => command.kind === "session.start"
+        ? Promise.resolve({ session: { id: value.sessionId } })
+        : Promise.reject(new Error("the provider connection dropped")),
+      executeRemote: () => Promise.resolve({}),
+      notifyOperator: () => Promise.resolve(),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const outcome = await adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000002",
+        payload: {
+          accountPublicId: account.id,
+          kind: "session_start",
+          preset: "ultra",
+          projectPublicId: project.id,
+          prompt: "continue",
+          provider: "codex",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      // The session exists, so this is never a clean failure and never carries
+      // a session id a client could treat as a completed start.
+      expect(outcome).toEqual({ code: "LOCAL_SESSION_SEND_INDETERMINATE", state: "ambiguous" });
+      expect(outcome.result).toBeUndefined();
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("the kill switch refuses every device command with its own code", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      world.value.store.setDeviceCommandsAllowed(false);
+      const signal = new AbortController().signal;
+      for (const payload of [
+        world.sessionStart,
+        { kind: "usage_refresh" as const },
+        { kind: "account_login_status" as const },
+      ]) {
+        expect(await world.adapter.executeDeviceCommand({
+          idempotencyKey: "018bcfe5-6800-7000-8000-000000000003",
+          payload,
+          requestingDevicePublicId: "device_browser1",
+          signal,
+        })).toEqual({ code: "DEVICE_COMMANDS_DENIED", state: "failed" });
+      }
+      expect(world.executed).toEqual([]);
+      expect(world.notices).toEqual([]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("account linking needs the local opt-in and refuses a non-relayable URL", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      const signal = new AbortController().signal;
+      const payload = { accountPublicId: world.account.id, kind: "account_login_start" as const };
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000004",
+        payload,
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "ACCOUNT_LINKING_DENIED", state: "failed" });
+
+      world.value.store.setAccountLinkingAllowed(true);
+      // The daemon's login returned a loopback callback, which no other device
+      // can complete: the command fails closed rather than relaying it.
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000005",
+        payload,
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" });
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("relays a single-use https login URL when the machine has opted in", async () => {
+    const value = await fixture();
+    const account = value.store.listProfiles()[0];
+    if (account === undefined) throw new Error("missing account fixture");
+    value.store.setAccountLinkingAllowed(true);
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeLocal: () => Promise.resolve({
+        login: { loginId: "login_1", status: "pending", verificationUrl: "https://auth.example.test/device?code=abc" },
+      }),
+      executeRemote: () => Promise.resolve({}),
+      now: () => 1_760_000_000_000,
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const outcome = await adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000006",
+        payload: { accountPublicId: account.id, kind: "account_login_start" },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      expect(outcome).toMatchObject({ code: "APPLIED", singleUseResult: true, state: "applied" });
+      expect(outcome.result).toEqual({
+        expiresAt: 1_760_000_000_000 + 5 * 60 * 1_000,
+        kind: "account_login_start",
+        loginUrl: "https://auth.example.test/device?code=abc",
+      });
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("reports login status one way, with a CLI instruction and no account", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      world.value.store.setAccountLinkingAllowed(true);
+      const outcome = await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000007",
+        payload: { kind: "account_login_status" },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      expect(outcome).toMatchObject({ code: "APPLIED", state: "applied" });
+      expect(outcome.result).toMatchObject({ kind: "account_login_status", status: "idle" });
+      expect(JSON.stringify(outcome.result)).toContain("hra account login");
+      expect(world.executed).toEqual([]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("refuses addressing the registry does not carry", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      const signal = new AbortController().signal;
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000008",
+        payload: { ...world.sessionStart, accountPublicId: "acct_missing0001" },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "DEVICE_COMMAND_ACCOUNT_UNKNOWN", state: "failed" });
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000009",
+        payload: { ...world.sessionStart, projectPublicId: "proj_missing0001" },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "DEVICE_COMMAND_PROJECT_UNKNOWN", state: "failed" });
+      expect(world.executed).toEqual([]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("caps a device at its daily budget and refreshes usage for signed-in accounts", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      const signal = new AbortController().signal;
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000a",
+        payload: { kind: "usage_refresh" },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toMatchObject({ code: "APPLIED", result: { accountsRefreshed: 1 }, state: "applied" });
+
+      world.value.store.recordDeviceCommandAdmission({
+        dayCount: 100,
+        dayKey: Math.floor(1_760_000_000_000 / (24 * 60 * 60 * 1_000)),
+        devicePublicId: "device_browser1",
+        notifiedFirstSessionStart: false,
+      });
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000b",
+        payload: { kind: "usage_refresh" },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "DEVICE_COMMAND_DAILY_CAP", state: "failed" });
+      // A second device has its own budget.
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000c",
+        payload: { kind: "usage_refresh" },
+        requestingDevicePublicId: "device_browser2",
+        signal,
+      })).toMatchObject({ state: "applied" });
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("projects the two switches into the device registry", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      const signal = new AbortController().signal;
+      const before = await world.adapter.readDeviceRegistry({ signal });
+      expect(parseDeviceRegistryPayload(before)).toMatchObject({
+        accountLinkingAllowed: false,
+        deviceCommandsAllowed: true,
+      });
+      world.value.store.setDeviceCommandsAllowed(false);
+      world.value.store.setAccountLinkingAllowed(true);
+      expect(await world.adapter.readDeviceRegistry({ signal })).toMatchObject({
+        accountLinkingAllowed: true,
+        deviceCommandsAllowed: false,
+      });
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
     }
   });
 });

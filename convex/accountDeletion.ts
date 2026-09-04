@@ -108,6 +108,7 @@ export const ACCOUNT_DELETION_TABLE_STRATEGY = {
   sessionStreamEpochs: "user_index_immutable_erasure",
   executionLeases: "user_index",
   sessionCommands: "user_index",
+  deviceCommands: "user_index",
   codexAccounts: "user_index",
   deviceAccountBindings: "user_index",
   accountUsageSnapshots: "user_index",
@@ -245,6 +246,15 @@ async function deleteCommandsAndLeases(
   }
   let remaining = limit - commands.length;
   if (remaining === 0) return { deleted: limit, empty: false };
+  const deviceCommands = await ctx.db.query("deviceCommands")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const command of deviceCommands) {
+    await releaseCommandQuotaForDelete(ctx, userId, command);
+    await ctx.db.delete(command._id);
+  }
+  remaining -= deviceCommands.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
   const leases = await ctx.db.query("executionLeases")
     .withIndex("by_user", (builder) => builder.eq("userId", userId))
     .take(remaining);
@@ -253,7 +263,10 @@ async function deleteCommandsAndLeases(
     await ctx.db.delete(lease._id);
   }
   remaining -= leases.length;
-  return { deleted: limit - remaining, empty: commands.length === 0 && leases.length === 0 };
+  return {
+    deleted: limit - remaining,
+    empty: commands.length === 0 && deviceCommands.length === 0 && leases.length === 0,
+  };
 }
 
 async function deleteChunksAndEpochs(

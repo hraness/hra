@@ -171,6 +171,68 @@ export function commandPayloadAuthority(input: Readonly<{
   };
 }
 
+export const deviceCommandEnqueueDigestPurpose = "device-command-enqueue";
+
+/**
+ * A device command names a device, never a session, so its digested request
+ * has no `sessionPublicId`. The separate digest purpose keeps a session command
+ * request from ever verifying as a device command request.
+ */
+export type DeviceEnqueueRequest = Readonly<{
+  deadline: number;
+  expectedTargetDevicePublicId: string;
+  kind: string;
+  payload: EncryptedEnvelope;
+  publicId: string;
+}>;
+
+export function deviceEnqueueRequest(input: DeviceEnqueueRequest): DeviceEnqueueRequest {
+  return {
+    deadline: input.deadline,
+    expectedTargetDevicePublicId: input.expectedTargetDevicePublicId,
+    kind: input.kind,
+    payload: input.payload,
+    publicId: input.publicId,
+  };
+}
+
+export async function deviceEnqueueRequestDigest(
+  accountKey: Uint8Array,
+  request: DeviceEnqueueRequest,
+): Promise<string> {
+  return await hmacSha256Hex(
+    accountKey,
+    deviceCommandEnqueueDigestPurpose,
+    JSON.stringify(deviceEnqueueRequest(request)),
+  );
+}
+
+export function deviceCommandPayloadAuthority(input: Readonly<{
+  commandPublicId: string;
+  keyVersion: number;
+  userPublicId: string;
+}>): CloudPayloadAuthority {
+  return {
+    entityPublicId: input.commandPublicId,
+    keyVersion: input.keyVersion,
+    kind: "device_command",
+    userPublicId: input.userPublicId,
+  };
+}
+
+export function deviceCommandResultAuthority(input: Readonly<{
+  commandPublicId: string;
+  keyVersion: number;
+  userPublicId: string;
+}>): CloudPayloadAuthority {
+  return {
+    entityPublicId: input.commandPublicId,
+    keyVersion: input.keyVersion,
+    kind: "device_command_result",
+    userPublicId: input.userPublicId,
+  };
+}
+
 /**
  * The newest envelope written for this device at the account key version the
  * device is bound to. The daemon uses the same rule.

@@ -6,6 +6,7 @@ import {
   isOpaqueIdentifier,
   isRecord,
   type CommandKind,
+  type DeviceCommandKind,
   type EncryptedEnvelope,
 } from "./contracts";
 import { decryptBytes, encryptBytes } from "./crypto";
@@ -78,6 +79,176 @@ export type RemoteCommandPayload =
   | Readonly<{ kind: "rename_session"; name: string | null }>
   | Readonly<{ key: string; kind: "set_gateway_key" }>;
 
+/**
+ * Device command payloads. Addressing is by cloud public id only: a project is
+ * named by the `publicId` the device registry already projects, never by a
+ * filesystem path, and `containsAbsolutePath` refuses one anyway.
+ *
+ * `account_login_status` deliberately carries no account: a device relays at
+ * most one login at a time, so the poll asks "what is happening on this
+ * machine", which also keeps the polled account out of the projection.
+ */
+export type DeviceCommandPayload =
+  | Readonly<{
+      accountPublicId: string;
+      kind: "session_start";
+      preset: "low" | "high" | "ultra";
+      projectPublicId: string;
+      prompt: string;
+      provider: "codex" | "claude";
+    }>
+  | Readonly<{ accountPublicId: string; kind: "account_login_start" }>
+  | Readonly<{ kind: "account_login_status" }>
+  | Readonly<{ kind: "usage_refresh" }>;
+
+export type DeviceCommandLoginStatus =
+  | "idle"
+  | "pending"
+  | "relay_unavailable"
+  | "signed_in"
+  | "failed";
+
+/**
+ * What the daemon settles back to the requesting browser. `account_login_start`
+ * returns a relayed provider login URL: it is encrypted under the account key
+ * like every other payload, carries its own short expiry, and the hosted row
+ * releases it exactly once (`deviceCommands:consumeResult`).
+ */
+export type DeviceCommandResultPayload =
+  | Readonly<{ kind: "session_start"; sessionPublicId: string }>
+  | Readonly<{ expiresAt: number; kind: "account_login_start"; loginUrl: string }>
+  | Readonly<{
+      instruction: string;
+      kind: "account_login_status";
+      status: DeviceCommandLoginStatus;
+    }>
+  | Readonly<{ accountsRefreshed: number; kind: "usage_refresh" }>;
+
+export const deviceCommandLimits = Object.freeze({
+  instructionCharacters: 512,
+  loginUrlCharacters: 2_048,
+  promptCharacters: 16_000,
+} as const);
+
+// The relay is a provider login URL and nothing else: https only, no
+// credentials in the authority, no embedded fragment, and bounded.
+export function isRelayedLoginUrl(value: unknown): value is string {
+  if (
+    typeof value !== "string"
+    || value.length < 12
+    || value.length > deviceCommandLimits.loginUrlCharacters
+    || containsUnsafeTerminalScalar(value)
+  ) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === "https:"
+    && parsed.username === ""
+    && parsed.password === ""
+    && parsed.hostname.length > 0
+    && parsed.href === value;
+}
+
+export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload | null {
+  if (!isRecord(value)) return null;
+  if (
+    value.kind === "session_start"
+    && hasExactKeys(value, [
+      "accountPublicId",
+      "kind",
+      "preset",
+      "projectPublicId",
+      "prompt",
+      "provider",
+    ])
+    && isOpaqueIdentifier(value.accountPublicId)
+    && isOpaqueIdentifier(value.projectPublicId)
+    && (value.preset === "low" || value.preset === "high" || value.preset === "ultra")
+    && (value.provider === "codex" || value.provider === "claude")
+    && typeof value.prompt === "string"
+    && value.prompt.length >= 1
+    && value.prompt.length <= deviceCommandLimits.promptCharacters
+    && !containsAbsolutePath(value.prompt)
+    && !containsUnsafeTerminalScalar(value.prompt, true)
+  ) {
+    return {
+      accountPublicId: value.accountPublicId,
+      kind: value.kind,
+      preset: value.preset,
+      projectPublicId: value.projectPublicId,
+      prompt: value.prompt,
+      provider: value.provider,
+    };
+  }
+  if (
+    value.kind === "account_login_start"
+    && hasExactKeys(value, ["accountPublicId", "kind"])
+    && isOpaqueIdentifier(value.accountPublicId)
+  ) return { accountPublicId: value.accountPublicId, kind: value.kind };
+  if (
+    (value.kind === "account_login_status" || value.kind === "usage_refresh")
+    && hasExactKeys(value, ["kind"])
+  ) return { kind: value.kind };
+  return null;
+}
+
+export function deviceCommandPayloadKind(payload: DeviceCommandPayload): DeviceCommandKind {
+  return payload.kind;
+}
+
+export function parseDeviceCommandResultPayload(
+  value: unknown,
+): DeviceCommandResultPayload | null {
+  if (!isRecord(value)) return null;
+  if (
+    value.kind === "session_start"
+    && hasExactKeys(value, ["kind", "sessionPublicId"])
+    && isOpaqueIdentifier(value.sessionPublicId)
+  ) return { kind: value.kind, sessionPublicId: value.sessionPublicId };
+  if (
+    value.kind === "account_login_start"
+    && hasExactKeys(value, ["expiresAt", "kind", "loginUrl"])
+    && Number.isSafeInteger(value.expiresAt)
+    && (value.expiresAt as number) > 0
+    && isRelayedLoginUrl(value.loginUrl)
+  ) {
+    return {
+      expiresAt: value.expiresAt as number,
+      kind: value.kind,
+      loginUrl: value.loginUrl,
+    };
+  }
+  if (
+    value.kind === "account_login_status"
+    && hasExactKeys(value, ["instruction", "kind", "status"])
+    && typeof value.instruction === "string"
+    && value.instruction.length >= 1
+    && value.instruction.length <= deviceCommandLimits.instructionCharacters
+    && !containsAbsolutePath(value.instruction)
+    && !containsUnsafeTerminalScalar(value.instruction)
+    && (value.status === "idle"
+      || value.status === "pending"
+      || value.status === "relay_unavailable"
+      || value.status === "signed_in"
+      || value.status === "failed")
+  ) {
+    return { instruction: value.instruction, kind: value.kind, status: value.status };
+  }
+  if (
+    value.kind === "usage_refresh"
+    && hasExactKeys(value, ["accountsRefreshed", "kind"])
+    && Number.isSafeInteger(value.accountsRefreshed)
+    && (value.accountsRefreshed as number) >= 0
+    && (value.accountsRefreshed as number) <= deviceRegistryLimits.accounts
+  ) {
+    return { accountsRefreshed: value.accountsRefreshed as number, kind: value.kind };
+  }
+  return null;
+}
+
 export type SessionMetadataPayload = Readonly<{
   archived?: boolean;
   name: string | null;
@@ -111,9 +282,15 @@ export type DeviceRegistryScheduledTask = Readonly<{
  */
 export type DeviceRegistryPayload = Readonly<{
   accounts: readonly DeviceRegistryAccount[];
+  // Additive optional switches (W3 device commands). A registry written before
+  // device commands existed carries neither key; absent means the conservative
+  // reading, which is also the shipped default: the machine executes device
+  // commands, and it will not relay an account login.
+  accountLinkingAllowed?: boolean;
   daemonVersion: string;
   defaultApprovalMode: "auto:all" | "auto:workspace" | "manual";
   defaultPreset: "low" | "high" | "ultra";
+  deviceCommandsAllowed?: boolean;
   heartbeatAt: number;
   machineLabel: string;
   projects: readonly DeviceRegistryProject[];
@@ -136,7 +313,13 @@ export const deviceRegistryLimits = Object.freeze({
 export type CloudPayloadAuthority = Readonly<{
   entityPublicId: string;
   keyVersion: number;
-  kind: "command" | "device_registry" | "session_metadata" | "usage";
+  kind:
+    | "command"
+    | "device_command"
+    | "device_command_result"
+    | "device_registry"
+    | "session_metadata"
+    | "usage";
   userPublicId: string;
 }>;
 
@@ -368,9 +551,17 @@ function parseRegistryScheduledTasks(
 }
 
 export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayload | null {
+  if (!isRecord(value)) return null;
+  const hasAccountLinking = Object.hasOwn(value, "accountLinkingAllowed");
+  const hasDeviceCommands = Object.hasOwn(value, "deviceCommandsAllowed");
   if (
-    !isRecord(value)
-    || !hasExactKeys(value, [
+    (hasAccountLinking && typeof value.accountLinkingAllowed !== "boolean")
+    || (hasDeviceCommands && typeof value.deviceCommandsAllowed !== "boolean")
+  ) return null;
+  if (
+    !hasExactKeys(value, [
+      ...(hasAccountLinking ? ["accountLinkingAllowed"] : []),
+      ...(hasDeviceCommands ? ["deviceCommandsAllowed"] : []),
       "accounts",
       "daemonVersion",
       "defaultApprovalMode",
@@ -400,9 +591,15 @@ export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayloa
   if (accounts === null || projects === null || scheduledTasks === null) return null;
   return {
     accounts,
+    ...(hasAccountLinking
+      ? { accountLinkingAllowed: value.accountLinkingAllowed as boolean }
+      : {}),
     daemonVersion: value.daemonVersion,
     defaultApprovalMode: value.defaultApprovalMode,
     defaultPreset: value.defaultPreset,
+    ...(hasDeviceCommands
+      ? { deviceCommandsAllowed: value.deviceCommandsAllowed as boolean }
+      : {}),
     heartbeatAt: value.heartbeatAt,
     machineLabel: value.machineLabel,
     projects,
@@ -471,6 +668,53 @@ export async function decryptRemoteCommand(
   if (authority.kind !== "command") throw new Error("Invalid remote command authority.");
   const parsed = parseRemoteCommandPayload(await decryptJson(envelope, key, authority));
   if (parsed === null) throw new Error("Invalid remote command payload.");
+  return parsed;
+}
+
+export async function encryptDeviceCommand(
+  payload: DeviceCommandPayload,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<EncryptedEnvelope> {
+  if (authority.kind !== "device_command" || parseDeviceCommandPayload(payload) === null) {
+    throw new Error("Invalid device command payload.");
+  }
+  return await encryptJson(payload, key, authority);
+}
+
+export async function decryptDeviceCommand(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<DeviceCommandPayload> {
+  if (authority.kind !== "device_command") throw new Error("Invalid device command authority.");
+  const parsed = parseDeviceCommandPayload(await decryptJson(envelope, key, authority));
+  if (parsed === null) throw new Error("Invalid device command payload.");
+  return parsed;
+}
+
+export async function encryptDeviceCommandResult(
+  payload: DeviceCommandResultPayload,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<EncryptedEnvelope> {
+  if (
+    authority.kind !== "device_command_result"
+    || parseDeviceCommandResultPayload(payload) === null
+  ) throw new Error("Invalid device command result.");
+  return await encryptJson(payload, key, authority);
+}
+
+export async function decryptDeviceCommandResult(
+  envelope: EncryptedEnvelope,
+  key: Uint8Array,
+  authority: CloudPayloadAuthority,
+): Promise<DeviceCommandResultPayload> {
+  if (authority.kind !== "device_command_result") {
+    throw new Error("Invalid device command result authority.");
+  }
+  const parsed = parseDeviceCommandResultPayload(await decryptJson(envelope, key, authority));
+  if (parsed === null) throw new Error("Invalid device command result.");
   return parsed;
 }
 

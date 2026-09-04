@@ -398,6 +398,37 @@ describe("CLI parser", () => {
       .toThrow(CliUsageError);
   });
 
+  test("routes the device command switches to the daemon, not to the cloud", () => {
+    // These are local daemon state. Nothing hosted, and no browser, can set
+    // them, so they parse as ordinary local commands rather than as a remote
+    // invocation that would travel through the cloud transport.
+    expect(parseCli(["remote", "deny", "device-commands"])).toEqual({
+      kind: "command",
+      command: { allowed: false, kind: "remote.policy-set", switch: "device-commands" },
+      json: false,
+    });
+    expect(parseCli(["remote", "allow", "account-linking", "--json"])).toEqual({
+      kind: "command",
+      command: { allowed: true, kind: "remote.policy-set", switch: "account-linking" },
+      json: true,
+    });
+    expect(parseCli(["remote", "policy", "--json"])).toEqual({
+      kind: "command",
+      command: { kind: "remote.policy-status" },
+      json: true,
+    });
+    expect(() => parseCli(["remote", "allow", "everything"])).toThrow(CliUsageError);
+    expect(() => parseCli(["remote", "allow"])).toThrow(CliUsageError);
+    expect(() => parseCli(["remote", "policy", "extra"])).toThrow(CliUsageError);
+    expect(() => parseCli([
+      "remote",
+      "deny",
+      "device-commands",
+      "--idempotency-key",
+      "018bcfe5-6800-7000-8000-000000000001",
+    ])).toThrow(CliUsageError);
+  });
+
   test("binds a relative project directory to the invoking CLI cwd", () => {
     expect(parseCli(["project", "add", ".", "--name", "Workspace"], "/caller/workspace")).toEqual({
       kind: "command",

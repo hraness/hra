@@ -25,6 +25,8 @@ import type { LocalCommand } from "../domain/contracts";
 import type { InteractionRecord } from "../domain/interactions";
 import {
   deviceRegistryLimits,
+  isRelayedLoginUrl,
+  type DeviceCommandPayload,
   type DeviceRegistryPayload,
   type DeviceRegistryScheduledTask,
   type RemoteCommandPayload,
@@ -59,10 +61,13 @@ import {
   type AuthorityTuple,
 } from "./contracts";
 import type { CloudProjectionRecoveryBaselineInteraction } from "./daemon-journal";
+import { deviceCommandGuardDecision } from "./device-command-policy";
 import type {
   CloudCommandExecutionResult,
   CloudCommandExecutorPort,
   CloudDaemonBridge,
+  CloudDeviceCommandExecutionResult,
+  CloudDeviceCommandExecutorPort,
   CloudDaemonLocalSourcePort,
   CloudLocalCommandAuthority,
   CloudLocalSessionHead,
@@ -110,6 +115,16 @@ type ProviderRemoteLocalCommand = Extract<LocalCommand, Readonly<{
 type SettingCommandPayload = Extract<RemoteCommandPayload, Readonly<{
   kind: "set_approval_mode" | "set_show_thinking" | "set_default_preset" | "archive_session" | "set_gateway_key";
 }>>;
+
+/** Device commands run ordinary local commands, so they need the full union. */
+type DeviceEffectLocalCommand = Extract<LocalCommand, Readonly<{
+  kind: "session.start" | "session.send" | "account.login" | "account.usage";
+}>>;
+
+type LocalExecuteCommand = (
+  command: DeviceEffectLocalCommand,
+  options: Readonly<{ signal: AbortSignal }>,
+) => Promise<unknown>;
 
 type LocalExecuteRemote = (
   command: ProviderRemoteLocalCommand,
@@ -2147,6 +2162,10 @@ export type StateBackedCloudDaemonAdapterOptions = Readonly<{
   /** Local custody for the responder gateway key (default: none; `set_gateway_key` is refused). */
   gatewayKeyCustody?: CloudGatewayKeyCustody;
   executeRemote: LocalExecuteRemote;
+  /** Runs a local command through the daemon service (default: device commands are refused). */
+  executeLocal?: LocalExecuteCommand;
+  /** Local desktop notice on the first `session_start` from a device (default: a diagnostic). */
+  notifyOperator?: (input: Readonly<{ body: string; title: string }>) => Promise<void>;
   /** Project reasoning summary deltas to the live stream (default off). */
   liveThinking?: boolean;
   /** Display name for this machine in the device registry (default: the host name). */
@@ -2197,13 +2216,16 @@ function projectionCacheFailure(error: unknown): Exclude<CloudProjectionCacheSta
   };
 }
 
-export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort {
+export class StateBackedCloudDaemonAdapter
+implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceCommandExecutorPort {
   #cache: CloudProjectionCache | null;
   readonly #cachePath: string;
   readonly #cacheFileName: string;
   #cacheStatus: CloudProjectionCacheStatus;
   readonly #codex: CodexRuntimePort;
   readonly #executeRemote: LocalExecuteRemote;
+  readonly #executeLocal: LocalExecuteCommand;
+  readonly #notifyOperator: (input: Readonly<{ body: string; title: string }>) => Promise<void>;
   readonly #paths: StatePaths;
   readonly #projectionErrors = new Map<string, Error>();
   readonly #projectionRecoveryErrors = new Set<string>();
@@ -2259,6 +2281,17 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
     }
     this.#codex = options.codex;
     this.#executeRemote = options.executeRemote;
+    // Without an injected local executor no device command can reach the
+    // provider, so the adapter refuses every one of them rather than pretending
+    // a start happened.
+    this.#executeLocal = options.executeLocal ?? (() => {
+      throw new Error("The local command service is not available for device commands.");
+    });
+    // HRA has no desktop notification facility today (nothing in `src/` shells
+    // out to `osascript -e 'display notification'`, `terminal-notifier`, or
+    // `notify-send`). The default notice is therefore a daemon diagnostic; the
+    // CLI injects the real notifier when the daemon has one.
+    this.#notifyOperator = options.notifyOperator ?? (() => Promise.resolve());
     this.#paths = options.paths;
     this.#store = options.store;
   }
@@ -2963,11 +2996,14 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
         sessionPublicId,
       });
     }
+    const deviceCommandPolicy = this.#store.readDeviceCommandPolicy();
     return {
+      accountLinkingAllowed: deviceCommandPolicy.accountLinkingAllowed,
       accounts,
       daemonVersion: registryLabel(HRA_VERSION, "unknown", deviceRegistryLimits.versionCharacters),
       defaultApprovalMode: this.#store.readDefaultApprovalMode(),
       defaultPreset: this.#store.readDefaultPreset(),
+      deviceCommandsAllowed: deviceCommandPolicy.deviceCommandsAllowed,
       heartbeatAt: this.#registryNow(),
       machineLabel: this.#machineLabel,
       projects,
@@ -3232,6 +3268,237 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
         return { code: "APPLIED", state: "applied" };
     }
   }
+
+  /*
+   * Device commands. Every guard is evaluated here, before any effect, from
+   * purely local state: the two `hra remote allow|deny` switches, the requesting
+   * device's day bucket, and the account and project the registry projected.
+   * Only after `deviceCommandGuardDecision` admits the request does anything
+   * reach the provider.
+   */
+  async executeDeviceCommand(input: Readonly<{
+    idempotencyKey: string;
+    payload: DeviceCommandPayload;
+    requestingDevicePublicId: string;
+    signal: AbortSignal;
+  }>): Promise<CloudDeviceCommandExecutionResult> {
+    if (input.signal.aborted) throw input.signal.reason;
+    const policy = this.#store.readDeviceCommandPolicy();
+    const accounts = this.#store.listProfiles().flatMap((profile) => profile.state === "removed"
+      ? []
+      : [{ provider: "codex" as const, publicId: profile.id, status: profile.state }]);
+    const decision = deviceCommandGuardDecision({
+      accountLinkingAllowed: policy.accountLinkingAllowed,
+      accounts,
+      deviceCommandsAllowed: policy.deviceCommandsAllowed,
+      ledger: this.#store.readDeviceCommandLedger(input.requestingDevicePublicId),
+      now: this.#registryNow(),
+      payload: input.payload,
+      projectPublicIds: this.#store.listProjects().map((project) => project.id),
+      requestingDeviceActive: true,
+    });
+    if (decision.kind === "refused") return { code: decision.code, state: "failed" };
+    this.#store.recordDeviceCommandAdmission({
+      dayCount: decision.dayCount,
+      dayKey: decision.dayKey,
+      devicePublicId: input.requestingDevicePublicId,
+      notifiedFirstSessionStart: decision.notifyFirstSessionStart,
+    });
+    if (decision.notifyFirstSessionStart) {
+      await this.#notifyOperator({
+        body: "A browser device started its first session on this machine. Run `hra remote deny device-commands` to stop accepting them.",
+        title: "HRA: new device started a session",
+      });
+    }
+    try {
+      switch (input.payload.kind) {
+        case "session_start":
+          return await this.#startSessionForDevice(input.payload, input.idempotencyKey, input.signal);
+        case "account_login_start":
+          return await this.#startAccountLoginRelay(
+            input.payload.accountPublicId,
+            input.idempotencyKey,
+            input.signal,
+          );
+        case "account_login_status":
+          return this.#accountLoginStatus();
+        case "usage_refresh":
+          return await this.#refreshUsageForDevice(input.signal);
+      }
+    } catch (error: unknown) {
+      const code = isRecord(error) && typeof error.code === "string" ? error.code : "UNKNOWN";
+      if (code === "RECOVERY_REQUIRED" || code === "INTERNAL" || code === "UNKNOWN") {
+        return { code: `LOCAL_${code}`.slice(0, 64), state: "ambiguous" };
+      }
+      return { code: `LOCAL_${code.replace(/[^A-Z0-9_]/gu, "_")}`.slice(0, 64), state: "failed" };
+    }
+  }
+
+  /*
+   * Start-then-send under one idempotency key.
+   *
+   * The two effects are derived deterministically from the device command's own
+   * public id, so a replay reaches the same two local mutations rather than a
+   * second session. The quarantine rule is the important half: once the start
+   * has committed, a failure in the send can never be reported as `failed`,
+   * because a session does exist. It settles `ambiguous` carrying no result, and
+   * the browser reconciles by looking for the new session rather than retrying.
+   */
+  async #startSessionForDevice(
+    payload: Extract<DeviceCommandPayload, { kind: "session_start" }>,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<CloudDeviceCommandExecutionResult> {
+    const startKey = deriveDeviceEffectKey(idempotencyKey, "session-start");
+    const sendKey = deriveDeviceEffectKey(idempotencyKey, "session-send");
+    let sessionPublicId: string;
+    try {
+      const started = await this.#executeLocal({
+        account: payload.accountPublicId,
+        fast: false,
+        idempotencyKey: startKey,
+        kind: "session.start",
+        preset: payload.preset,
+        project: payload.projectPublicId,
+      }, { signal });
+      sessionPublicId = requireStartedSessionId(started);
+    } catch (error: unknown) {
+      const code = isRecord(error) && typeof error.code === "string" ? error.code : "UNKNOWN";
+      // Nothing was sent, and the start path already quarantines its own
+      // uncertain provider effect, so an uncertain start is ambiguous here too.
+      return code === "RECOVERY_REQUIRED" || code === "INTERNAL" || code === "UNKNOWN"
+        ? { code: "LOCAL_SESSION_START_INDETERMINATE", state: "ambiguous" }
+        : { code: `LOCAL_${code.replace(/[^A-Z0-9_]/gu, "_")}`.slice(0, 64), state: "failed" };
+    }
+    // The session exists from here on. Inheriting the project's approval mode
+    // happens before the prompt, so the first turn is already governed by it.
+    this.#store.setSessionApprovalMode(
+      sessionPublicId,
+      this.#store.readProjectApprovalMode(payload.projectPublicId).mode,
+    );
+    try {
+      await this.#executeLocal({
+        idempotencyKey: sendKey,
+        kind: "session.send",
+        message: payload.prompt,
+        session: sessionPublicId,
+      }, { signal });
+    } catch {
+      // A started session whose prompt may or may not have been delivered is
+      // exactly the ambiguous case: never retried, never reported as a clean
+      // failure, and the session id is withheld so no client treats it as a
+      // completed start.
+      return { code: "LOCAL_SESSION_SEND_INDETERMINATE", state: "ambiguous" };
+    }
+    return {
+      code: "APPLIED",
+      result: { kind: "session_start", sessionPublicId },
+      state: "applied",
+    };
+  }
+
+  async #startAccountLoginRelay(
+    accountPublicId: string,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<CloudDeviceCommandExecutionResult> {
+    const response = await this.#executeLocal({
+      account: accountPublicId,
+      deviceCode: false,
+      idempotencyKey: deriveDeviceEffectKey(idempotencyKey, "account-login"),
+      kind: "account.login",
+    }, { signal });
+    const loginUrl = relayedLoginUrlFrom(response);
+    // A login whose provider URL is a loopback callback cannot be completed on
+    // another device. Rather than relay something that cannot work, the command
+    // fails closed and the browser falls back to status polling and the CLI.
+    if (loginUrl === null) return { code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" };
+    return {
+      code: "APPLIED",
+      result: {
+        expiresAt: this.#registryNow() + relayedLoginLifetimeMs,
+        kind: "account_login_start",
+        loginUrl,
+      },
+      singleUseResult: true,
+      state: "applied",
+    };
+  }
+
+  #accountLoginStatus(): CloudDeviceCommandExecutionResult {
+    const pending = this.#store.listProfiles()
+      .some((profile) => profile.state === "login_pending");
+    return {
+      code: "APPLIED",
+      result: {
+        instruction: pending
+          ? "A login is in progress on this machine. Finish it in the browser it opened, or cancel it with `hra account login-cancel <account>`."
+          : "No login is in progress. Start one on this machine with `hra account login <account>`.",
+        kind: "account_login_status",
+        status: pending ? "pending" : "idle",
+      },
+      state: "applied",
+    };
+  }
+
+  async #refreshUsageForDevice(signal: AbortSignal): Promise<CloudDeviceCommandExecutionResult> {
+    let accountsRefreshed = 0;
+    for (const profile of this.#store.listProfiles()) {
+      if (profile.state !== "signed_in") continue;
+      await this.#executeLocal({
+        account: profile.id,
+        kind: "account.usage",
+        refresh: true,
+      }, { signal });
+      accountsRefreshed += 1;
+    }
+    return {
+      code: "APPLIED",
+      result: { accountsRefreshed, kind: "usage_refresh" },
+      state: "applied",
+    };
+  }
+}
+
+/** How long a relayed provider login URL stays usable. */
+const relayedLoginLifetimeMs = 5 * 60 * 1_000;
+
+/**
+ * A second effect key derived from the device command's own public id. The
+ * derivation is deterministic, so a replayed device command reaches the same
+ * two local mutation authorities instead of starting a second session.
+ */
+export function deriveDeviceEffectKey(idempotencyKey: string, purpose: string): string {
+  const digest = createHash("sha256")
+    .update(`hra-control-plane-device-command-effect:v1\n${purpose}\n${idempotencyKey}`)
+    .digest("hex");
+  return [
+    digest.slice(0, 8),
+    digest.slice(8, 12),
+    `4${digest.slice(13, 16)}`,
+    `${((Number.parseInt(digest.slice(16, 17), 16) & 0x3) | 0x8).toString(16)}${digest.slice(17, 20)}`,
+    digest.slice(20, 32),
+  ].join("-");
+}
+
+function requireStartedSessionId(value: unknown): string {
+  if (
+    !isRecord(value)
+    || !isRecord(value.session)
+    || typeof value.session.id !== "string"
+    || value.session.id.length === 0
+  ) throw new Error("Local session start did not return a session identity.");
+  return value.session.id;
+}
+
+/**
+ * The relayable provider login URL, or null when the daemon's login response
+ * has none or offers one that cannot be completed on another device.
+ */
+function relayedLoginUrlFrom(value: unknown): string | null {
+  if (!isRecord(value) || !isRecord(value.login)) return null;
+  const url: unknown = value.login.verificationUrl;
+  return isRelayedLoginUrl(url) ? url : null;
 }
 
 type RemoteInteractionVerification =
