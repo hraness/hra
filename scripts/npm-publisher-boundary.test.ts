@@ -18,8 +18,8 @@ const exactIdentity = {
   GITHUB_ACTIONS: "true",
   GITHUB_EVENT_NAME: "push",
   GITHUB_JOB: "publish",
-  GITHUB_REF: "refs/tags/v0.3.0",
-  GITHUB_REF_NAME: "v0.3.0",
+  GITHUB_REF: "refs/tags/v0.4.0",
+  GITHUB_REF_NAME: "v0.4.0",
   GITHUB_REF_TYPE: "tag",
   GITHUB_REPOSITORY: "hraness/hra",
   GITHUB_REPOSITORY_ID: "1343008607",
@@ -28,7 +28,7 @@ const exactIdentity = {
   GITHUB_SERVER_URL: "https://github.com",
   GITHUB_SHA: "a".repeat(40),
   GITHUB_WORKFLOW: "Release",
-  GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.3.0",
+  GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.4.0",
   GITHUB_WORKFLOW_SHA: "a".repeat(40),
   RUNNER_ENVIRONMENT: "github-hosted",
 } as const;
@@ -58,17 +58,17 @@ function fixedSpawn(input: Readonly<{
 
 describe("npm trusted-publisher boundary", () => {
   test("requires the exact GitHub-hosted HRA release identity", () => {
-    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.3.0", "a".repeat(40)))
+    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.4.0", "a".repeat(40)))
       .not.toThrow();
     for (const key of Object.keys(exactIdentity)) {
       expect(() => assertNpmPublisherIdentity(
         { ...exactIdentity, [key]: undefined },
-        "v0.3.0",
+        "v0.4.0",
         "a".repeat(40),
       ), key).toThrow("exact GitHub-hosted release OIDC identity");
     }
     expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.8", "a".repeat(40))).toThrow();
-    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.3.0", "b".repeat(40))).toThrow();
+    expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.4.0", "b".repeat(40))).toThrow();
   });
 
   test("accepts current and legacy GitHub-hosted OIDC endpoints", () => {
@@ -87,7 +87,7 @@ describe("npm trusted-publisher boundary", () => {
     ]) {
       expect(() => assertNpmPublisherIdentity(
         { ...exactIdentity, ACTIONS_ID_TOKEN_REQUEST_URL: url },
-        "v0.3.0",
+        "v0.4.0",
         "a".repeat(40),
       ), url).not.toThrow();
     }
@@ -128,7 +128,7 @@ describe("npm trusted-publisher boundary", () => {
     ]) {
       expect(() => assertNpmPublisherIdentity(
         { ...exactIdentity, ACTIONS_ID_TOKEN_REQUEST_URL: url },
-        "v0.3.0",
+        "v0.4.0",
         "a".repeat(40),
       ), url).toThrow("exact GitHub-hosted release OIDC identity");
     }
