@@ -135,6 +135,7 @@ import {
   SessionEventStreamRedactor,
   type SessionEventWrite,
 } from "./streaming-redaction";
+import { SessionStateTracker } from "./session-state-tracker";
 
 export class CommandFailure extends Error {
   readonly [commandFailureBrand] = true as const;
@@ -556,6 +557,7 @@ export const BACKGROUND_DIAGNOSTIC_CODES = [
   "queue_dispatch_failed",
   "queue_pre_effect_retry_failed",
   "recovery_observation_failed",
+  "session_state_tracking_failed",
   "usage_refresh_failed",
   "usage_poll_account_failed",
   "usage_poll_tick_failed",
@@ -601,6 +603,7 @@ export class HraService {
   readonly #work: WorkStore;
   readonly #workWaiters: WorkEventWaiters;
   readonly #eventRedactor: SessionEventStreamRedactor;
+  readonly #sessionStateTracker = new SessionStateTracker(() => this.#now());
   readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
   readonly #daemonGeneration: number;
   readonly #now: () => number;
@@ -814,6 +817,20 @@ export class HraService {
             async () => await this.#sessionStatus(session.id, context.signal),
             { allowDuringProjectionRecovery: true },
           );
+        }
+        case "session.state": {
+          const session = this.#store.requireSession(command.session);
+          const durable = this.#store.readSessionState(session.id);
+          return {
+            version: 1,
+            session: session.id,
+            state: durable?.state ?? null,
+            attention: durable?.attention ?? false,
+            reason: durable?.reason ?? "",
+            verbatimRequired: durable?.verbatimRequired ?? false,
+            lastActivityAt: durable?.lastActivityAt ?? null,
+            revision: durable?.revision ?? 0,
+          };
         }
         case "session.events": return await this.#sessionEvents(command, context.signal);
         case "session.interactions": {
@@ -1938,6 +1955,58 @@ export class HraService {
     for (const write of writes) {
       this.#store.appendPublicSessionEvent(write);
       this.#eventWaiters.notify(write.sessionId);
+      this.#trackSessionState(write);
+    }
+  }
+
+  /*
+   * Classify the session after every persisted event. The tracker decides
+   * whether the state changed; a change is persisted as the session's durable
+   * latest state and appended as one `session_state` event. Failures here are
+   * background diagnostics, never a reason to drop the originating event.
+   */
+  #trackSessionState(write: SessionEventWrite): void {
+    if (write.body.type === "session_state") return;
+    try {
+      if (this.#sessionStateTracker.snapshot(write.sessionId) === null) {
+        const durable = this.#store.readSessionState(write.sessionId);
+        if (durable !== null) {
+          this.#sessionStateTracker.seed(write.sessionId, {
+            state: durable.state,
+            attention: durable.attention,
+            reason: durable.reason,
+            verbatimRequired: durable.verbatimRequired,
+            verbatimLiteral: durable.verbatimLiteral ?? undefined,
+            lastActivityAt: durable.lastActivityAt,
+            revision: durable.revision,
+          });
+        }
+      }
+      const pending = write.body.type === "interaction_requested"
+        || write.body.type === "interaction_state"
+        || write.body.type === "turn_completed"
+        ? this.#store.listInteractions({ sessionId: write.sessionId, pendingOnly: true, limit: 1 })[0]
+        : undefined;
+      const body = this.#sessionStateTracker.observe(write.sessionId, write.body, {
+        ...(pending === undefined ? {} : { pendingInteraction: { kind: pending.kind } }),
+      });
+      if (body === null) return;
+      const snapshot = this.#sessionStateTracker.snapshot(write.sessionId);
+      if (snapshot === null) return;
+      this.#store.upsertSessionState({
+        sessionId: write.sessionId,
+        state: snapshot.state,
+        attention: snapshot.attention,
+        reason: snapshot.reason,
+        verbatimRequired: snapshot.verbatimRequired,
+        verbatimLiteral: snapshot.verbatimLiteral,
+        lastActivityAt: snapshot.lastActivityAt,
+        revision: snapshot.revision,
+      });
+      this.#store.appendPublicSessionEvent({ ...write, body });
+      this.#eventWaiters.notify(write.sessionId);
+    } catch (error: unknown) {
+      this.recordBackgroundDiagnostic("session_state_tracking_failed", error);
     }
   }
 

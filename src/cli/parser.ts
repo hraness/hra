@@ -264,6 +264,7 @@ Usage:
   hra session list [--account <profile>] [--limit <1..100>] [--cursor <cursor>]
   hra session show <session> [--detail]
   hra session status <session> [--json]
+  hra session state <session> [--json]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
@@ -860,6 +861,7 @@ const parseSession = (
     }
     case "show": { const detail = flag(cursor, "--detail"); const session = take(cursor, "session"); finish(cursor); return { kind: "session.show", session, detail }; }
     case "status": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.status", session }; }
+    case "state": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.state", session }; }
     case "events": {
       const followFlag = flag(cursor, "--follow");
       const follow = followFlag || jsonl;

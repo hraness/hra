@@ -628,6 +628,11 @@ describe("CLI parser", () => {
       json: false,
       kind: "command",
     });
+    expect(parseCli(["session", "state", "release", "--json"])).toEqual({
+      command: { kind: "session.state", session: "release" },
+      json: true,
+      kind: "command",
+    });
     expect(parseCli([
       "session",
       "events",

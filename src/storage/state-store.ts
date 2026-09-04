@@ -242,6 +242,29 @@ export type ProjectRecord = {
   updatedAt: number;
 };
 
+export const sessionStateRowSchema = z.object({
+  sessionId: sessionIdSchema,
+  state: z.enum([
+    "working",
+    "needs_approval",
+    "needs_answer",
+    "needs_action",
+    "done",
+    "done_followups",
+    "done_caveats",
+    "aborted",
+  ]),
+  attention: z.boolean(),
+  reason: z.string().max(256),
+  verbatimRequired: z.boolean(),
+  verbatimLiteral: z.string().max(200).nullable(),
+  lastActivityAt: z.number().int().nonnegative(),
+  revision: z.number().int().positive(),
+  updatedAt: z.number().int().nonnegative(),
+}).strict();
+
+export type SessionStateRow = z.infer<typeof sessionStateRowSchema>;
+
 export type SessionRecord = {
   id: SessionId;
   profileId: ProfileId;
@@ -870,6 +893,17 @@ CREATE TABLE IF NOT EXISTS sessions (
   UNIQUE(profile_id, provider_thread_id)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS sessions_recent ON sessions(updated_at DESC, id);
+CREATE TABLE IF NOT EXISTS session_states (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  state TEXT NOT NULL CHECK(state IN ('working','needs_approval','needs_answer','needs_action','done','done_followups','done_caveats','aborted')),
+  attention INTEGER NOT NULL CHECK(attention IN (0,1)),
+  reason TEXT NOT NULL CHECK(length(reason) <= 256),
+  verbatim_required INTEGER NOT NULL CHECK(verbatim_required IN (0,1)),
+  verbatim_literal TEXT CHECK(verbatim_literal IS NULL OR length(verbatim_literal) <= 200),
+  last_activity_at INTEGER NOT NULL CHECK(last_activity_at >= 0),
+  revision INTEGER NOT NULL CHECK(revision > 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
 CREATE TABLE IF NOT EXISTS queue_entries (
   id TEXT PRIMARY KEY CHECK(id GLOB 'queue_[0-9a-f]*' AND length(id) = 38),
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -4623,6 +4657,85 @@ export class StateStore {
     const result = this.#database.query("UPDATE sessions SET project_id=COALESCE(project_id,?),title=?,state=?,active_turn_id=?,provider_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=? AND (provider_updated_at IS NULL OR provider_updated_at < ?)").run(input.projectId ?? null, titleSchema.parse(input.title), input.state, input.activeTurnId ?? null, input.providerUpdatedAt, now, current.id, current.revision, input.providerUpdatedAt);
     if (result.changes !== 1) throw new Error("Session changed while importing the provider projection.");
     return this.requireSession(current.id);
+  }
+
+  upsertSessionState(input: {
+    sessionId: SessionId;
+    state: SessionStateRow["state"];
+    attention: boolean;
+    reason: string;
+    verbatimRequired: boolean;
+    verbatimLiteral: string | undefined;
+    lastActivityAt: number;
+    revision: number;
+  }): SessionStateRow {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const parsed = sessionStateRowSchema.parse({
+      sessionId,
+      state: input.state,
+      attention: input.attention,
+      reason: input.reason,
+      verbatimRequired: input.verbatimRequired,
+      verbatimLiteral: input.verbatimLiteral ?? null,
+      lastActivityAt: input.lastActivityAt,
+      revision: input.revision,
+      updatedAt: this.#now(),
+    });
+    const write = this.#database.transaction(() => {
+      if (this.#database.query("SELECT 1 FROM sessions WHERE id=?").get(sessionId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      const result = this.#database.query(
+        `INSERT INTO session_states(session_id,state,attention,reason,verbatim_required,verbatim_literal,last_activity_at,revision,updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           state=excluded.state,attention=excluded.attention,reason=excluded.reason,
+           verbatim_required=excluded.verbatim_required,verbatim_literal=excluded.verbatim_literal,
+           last_activity_at=excluded.last_activity_at,revision=excluded.revision,updated_at=excluded.updated_at
+         WHERE excluded.revision > session_states.revision`,
+      ).run(
+        parsed.sessionId,
+        parsed.state,
+        parsed.attention ? 1 : 0,
+        parsed.reason,
+        parsed.verbatimRequired ? 1 : 0,
+        parsed.verbatimLiteral,
+        parsed.lastActivityAt,
+        parsed.revision,
+        parsed.updatedAt,
+      );
+      if (result.changes !== 1) throw new Error("SESSION_STATE_REVISION_STALE");
+      return parsed;
+    });
+    return write.immediate();
+  }
+
+  readSessionState(sessionId: SessionId): SessionStateRow | null {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const row = this.#database.query("SELECT * FROM session_states WHERE session_id=?").get(parsedSessionId);
+    if (row === null) return null;
+    const record = z.object({
+      session_id: z.string(),
+      state: z.string(),
+      attention: z.number().int(),
+      reason: z.string(),
+      verbatim_required: z.number().int(),
+      verbatim_literal: z.string().nullable(),
+      last_activity_at: z.number().int(),
+      revision: z.number().int(),
+      updated_at: z.number().int(),
+    }).strict().parse(row);
+    return sessionStateRowSchema.parse({
+      sessionId: record.session_id,
+      state: record.state,
+      attention: record.attention === 1,
+      reason: record.reason,
+      verbatimRequired: record.verbatim_required === 1,
+      verbatimLiteral: record.verbatim_literal,
+      lastActivityAt: record.last_activity_at,
+      revision: record.revision,
+      updatedAt: record.updated_at,
+    });
   }
 
   bindSession(input: { sessionId: SessionId; expectedRevision: number; providerThreadId: string; state: "active" | "idle"; activeTurnId?: string; providerUpdatedAt?: number }): SessionRecord {
