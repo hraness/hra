@@ -211,10 +211,6 @@ const sanitizeCompleteBody = (
       code: safeInline(body.code),
       message: safe(body.message),
     };
-    case "session_state": return {
-      ...body,
-      reason: safeInline(body.reason),
-    };
     case "connection": return body.reason === undefined
       ? body
       : { ...body, reason: safe(body.reason) };
