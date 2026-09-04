@@ -220,6 +220,15 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.project"), session: selectorSchema, project: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("turn.inspect"), session: selectorSchema, turn: selectorSchema }).strict(),
   z.object({
+    kind: z.literal("autorespond.status"),
+    session: selectorSchema.optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("autorespond.set"),
+    session: selectorSchema.optional(),
+    mode: z.enum(["auto:all", "auto:workspace", "manual"]).nullable(),
+  }).strict(),
+  z.object({
     kind: z.literal("interaction.list"),
     session: selectorSchema.optional(),
     pending: z.boolean(),

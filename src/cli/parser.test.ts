@@ -1240,3 +1240,27 @@ describe("remote decisions and send-or-steer parsing", () => {
     });
   });
 });
+
+describe("autorespond parsing", () => {
+  test("maps on, workspace, off, default, and status to approval modes", () => {
+    expect(parseCli(["autorespond", "on"])).toEqual({
+      command: { kind: "autorespond.set", mode: "auto:all" },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli(["autorespond", "workspace", "--session", "sess_a"])).toMatchObject({
+      command: { kind: "autorespond.set", mode: "auto:workspace", session: "sess_a" },
+    });
+    expect(parseCli(["autorespond", "off"])).toMatchObject({ command: { kind: "autorespond.set", mode: "manual" } });
+    expect(parseCli(["autorespond", "default", "--session", "sess_a"])).toMatchObject({
+      command: { kind: "autorespond.set", mode: null, session: "sess_a" },
+    });
+    expect(parseCli(["autorespond", "status", "--json"])).toEqual({
+      command: { kind: "autorespond.status" },
+      json: true,
+      kind: "command",
+    });
+    expect(() => parseCli(["autorespond", "default"])).toThrow("--session");
+    expect(() => parseCli(["autorespond", "maybe"])).toThrow("Unknown autorespond action");
+  });
+});

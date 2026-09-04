@@ -2133,6 +2133,25 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(report.state === null
       ? "State: not classified yet.\n"
       : `State: ${line(report.state)}${report.attention ? " (needs you)" : ""}\nReason: ${line(report.reason)}\nRevision: ${String(report.revision)}\n`);
+  } else if (command.kind === "autorespond.status" || command.kind === "autorespond.set") {
+    const report = value as {
+      budgets?: { consecutive: number; lastDay: number; lastHour: number };
+      counts?: { accepted: number; refused: number };
+      mode?: unknown;
+      recent?: unknown[];
+      source?: unknown;
+    };
+    const rows = [`Approval mode: ${line(report.mode)} (${line(report.source)})`];
+    if (report.counts !== undefined) {
+      rows.push(`Autoresponses: ${String(report.counts.accepted)} accepted, ${String(report.counts.refused)} escalated`);
+    }
+    if (report.budgets !== undefined) {
+      rows.push(`Budgets: ${String(report.budgets.consecutive)} consecutive, ${String(report.budgets.lastHour)} this hour, ${String(report.budgets.lastDay)} today`);
+    }
+    if (Array.isArray(report.recent) && report.recent.length > 0) {
+      rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "kind", "approvalClass", "decision", "outcome", "sessionId"]));
+    }
+    output.writeStdout(`${rows.join("\n")}\n`);
   } else if (command.kind === "session.events") {
     const page = sessionEventPage(data);
     output.writeStdout(`${page === null ? "Event page data is unavailable." : renderSessionEventPageHuman(page)}\n`);

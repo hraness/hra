@@ -672,6 +672,9 @@ async function fixture(
   await initializeStatePaths(paths);
   const store = new StateStore(paths, { now });
   stores.push(store);
+  // The daemon defaults to answering approvals itself; these tests exercise
+  // the manual paths and opt in to autorespond explicitly where needed.
+  store.setDefaultApprovalMode("manual");
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
@@ -2711,10 +2714,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 29 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }]);
     } finally {
       inspector.close(false);
     }
@@ -10423,5 +10426,96 @@ describe("HraService", () => {
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "active", activeTurnId: "turn-next" });
     expect(store.nextPendingQueue(started.session.id)).toMatchObject({ id: queued.queued.id, state: "pending" });
     await expect(service.execute({ kind: "daemon.status" }, { signal })).rejects.toThrow("no longer accepts operations");
+  });
+});
+
+describe("HraService autorespond", () => {
+  const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
+    const startedAt = Date.now();
+    while (!predicate()) {
+      if (Date.now() - startedAt > timeoutMs) throw new Error("Timed out waiting for autorespond.");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  const requestCommandApproval = async (
+    value: Awaited<ReturnType<typeof fixture>>,
+    sessionId: string,
+    requestId: string,
+  ) => {
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const connectionId = "46000000-0000-4000-8000-000000000001";
+    await value.service.observeCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId,
+      provider: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "string" as const, value: requestId },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: createHash("sha256").update(requestId).digest("hex"),
+        threadId: session.providerThreadId,
+        turnId: "turn-autorespond",
+        itemId: `item-${requestId}`,
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Run the test suite",
+        reason: null,
+        commandClass: "bun test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+    });
+    const interaction = value.store.listInteractions({ sessionId, limit: 10 })
+      .find((candidate) => candidate.authority.requestId.value === requestId);
+    if (interaction === undefined) throw new Error("Expected a command approval interaction.");
+    return interaction;
+  };
+
+  test("accepts a command approval at once scope under auto:all and records evidence", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Autorespond");
+    value.store.setDefaultApprovalMode("auto:all");
+    const interaction = await requestCommandApproval(value, sessionId, "autorespond-1");
+    await waitFor(() => value.codex.resolvedInteractions.length === 1);
+    expect(value.codex.resolvedInteractions[0]).toMatchObject({
+      kind: "command_approval",
+      resolution: { kind: "approval_decision", decision: "once" },
+    });
+    await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === 1);
+    expect(value.store.listAutorespondEvidence({ sessionId })[0]).toMatchObject({
+      approvalClass: "command:bun test",
+      decision: "once",
+      kind: "command_approval",
+      mode: "auto:all",
+      outcome: "accepted",
+    });
+    expect(value.store.requireInteraction(interaction.publicId).state).not.toBe("pending");
+    expect(value.store.requireInteraction(interaction.publicId).resolvedBy).toBe("autorespond");
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
+  });
+
+  test("leaves approvals pending under manual mode", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Manual");
+    value.store.setSessionApprovalMode(sessionId, "manual");
+    const interaction = await requestCommandApproval(value, sessionId, "manual-1");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+    expect(value.store.requireInteraction(interaction.publicId).state).toBe("pending");
+    expect(value.store.listAutorespondEvidence({ sessionId })).toHaveLength(0);
   });
 });

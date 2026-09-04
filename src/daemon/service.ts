@@ -26,6 +26,7 @@ import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
   protectedInteractionDetailDocumentSchema,
+  computeInteractionPresentation,
   publicInteractionSchema,
   type InteractionRecord,
   type InteractionIntendedTerminalState,
@@ -136,6 +137,7 @@ import {
   type SessionEventWrite,
 } from "./streaming-redaction";
 import { SessionStateTracker } from "./session-state-tracker";
+import { decideAutorespond, permissionNamesOf } from "./autorespond";
 
 export class CommandFailure extends Error {
   readonly [commandFailureBrand] = true as const;
@@ -555,6 +557,7 @@ const restoreLoginReceipt = (value: unknown): LoginOutcome => {
 /** Background tasks that swallow their own rejection record one of these closed codes. */
 export const BACKGROUND_DIAGNOSTIC_CODES = [
   "account_fact_apply_failed",
+  "autorespond_failed",
   "queue_dispatch_failed",
   "queue_pre_effect_retry_failed",
   "recovery_observation_failed",
@@ -832,6 +835,32 @@ export class HraService {
             lastActivityAt: durable?.lastActivityAt ?? null,
             revision: durable?.revision ?? 0,
           };
+        }
+        case "autorespond.status": {
+          const session = command.session === undefined ? null : this.#store.requireSession(command.session);
+          const mode = session === null
+            ? { mode: this.#store.readDefaultApprovalMode(), source: "default" as const }
+            : this.#store.readSessionApprovalMode(session.id);
+          return {
+            version: 1,
+            ...(session === null ? {} : { session: session.id }),
+            mode: mode.mode,
+            source: mode.source,
+            counts: this.#store.countAutorespondEvidence(session === null ? {} : { sessionId: session.id }),
+            ...(session === null ? {} : { budgets: this.#store.readAutorespondBudgets(session.id) }),
+            recent: this.#store.listAutorespondEvidence({ ...(session === null ? {} : { sessionId: session.id }), limit: 20 }),
+          };
+        }
+        case "autorespond.set": {
+          if (command.session === undefined) {
+            if (command.mode === null) throw new CommandFailure("INVALID_INPUT", "The default approval mode cannot be cleared.");
+            this.#store.setDefaultApprovalMode(command.mode);
+            return { version: 1, mode: command.mode, source: "default" };
+          }
+          const session = this.#store.requireSession(command.session);
+          this.#store.setSessionApprovalMode(session.id, command.mode);
+          const effective = this.#store.readSessionApprovalMode(session.id);
+          return { version: 1, session: session.id, mode: effective.mode, source: effective.source };
         }
         case "session.events": return await this.#sessionEvents(command, context.signal);
         case "session.interactions": {
@@ -1805,6 +1834,7 @@ export class HraService {
           blocking: admitted.record.blocking,
           summary: admitted.record.display.summary,
         });
+        this.#scheduleAutorespond(admitted.record);
       }
       this.#wakeInteractionDeadlinePump();
       return;
@@ -1942,6 +1972,88 @@ export class HraService {
     this.#sessionsAwaitingResubscription.delete(current.id);
     await this.#cloud.supersedeCompactProjectionRecoveryForProviderDeletion(current.id);
     await this.#daemonAuthority.assertCurrent();
+  }
+
+  /*
+   * Autorespond: answer a freshly admitted approval on behalf of the human
+   * when the session's approval mode allows it. Runs in the background behind
+   * the interaction's own serialization key; the ordinary resolve path enforces
+   * revision, deadline, and provider-offered decisions, and every attempt
+   * leaves an evidence row whether it accepted or escalated.
+   */
+  #scheduleAutorespond(record: InteractionRecord): void {
+    if (record.sessionId === null) return;
+    if (
+      record.kind !== "command_approval"
+      && record.kind !== "file_change_approval"
+      && record.kind !== "permission_approval"
+    ) return;
+    const sessionId = record.sessionId;
+    const tracked = this.#autorespondAdmitted(record, sessionId).then(
+      () => undefined,
+      (error: unknown) => {
+        if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+        else this.recordBackgroundDiagnostic("autorespond_failed", error);
+      },
+    );
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  async #autorespondAdmitted(record: InteractionRecord, sessionId: SessionRecord["id"]): Promise<void> {
+    const startedAt = this.#now();
+    const { mode } = this.#store.readSessionApprovalMode(sessionId);
+    const budgets = this.#store.readAutorespondBudgets(sessionId, startedAt);
+    const decision = decideAutorespond({ budgets, display: record.display, kind: record.kind, mode });
+    const kind = record.kind as "command_approval" | "file_change_approval" | "permission_approval";
+    if (decision.action === "escalate") {
+      if (decision.code !== "manual_mode" && decision.code !== "not_an_approval") {
+        this.#store.recordAutorespondEvidence({
+          approvalClass: decision.approvalClass,
+          decision: decision.code,
+          interactionId: record.publicId,
+          kind,
+          latencyMs: this.#now() - startedAt,
+          mode,
+          outcome: "refused",
+          sessionId,
+          subagent: false,
+        });
+      }
+      return;
+    }
+    const resolution = record.kind === "permission_approval"
+      ? { kind: "permission_grant" as const, permissions: permissionNamesOf(record.display), scope: null }
+      : { kind: "approval_decision" as const, decision: decision.decision };
+    let outcome: "accepted" | "refused" = "accepted";
+    try {
+      await this.#resolveInteraction(
+        {
+          kind: "interaction.resolve",
+          interaction: record.publicId,
+          expectedRevision: record.revision,
+          resolution,
+        },
+        { signal: this.#backgroundAbort.signal },
+      );
+      this.#store.markInteractionResolvedBy(record.publicId, "autorespond");
+      this.#store.bumpAutorespondCounter(sessionId);
+    } catch (error: unknown) {
+      outcome = "refused";
+      if (!(error instanceof CommandFailure)) throw error;
+    } finally {
+      this.#store.recordAutorespondEvidence({
+        approvalClass: decision.approvalClass,
+        decision: decision.decision,
+        interactionId: record.publicId,
+        kind,
+        latencyMs: this.#now() - startedAt,
+        mode,
+        outcome,
+        sessionId,
+        subagent: false,
+      });
+    }
   }
 
   #appendSessionEvent(
@@ -4767,6 +4879,8 @@ export class HraService {
       revision: interaction.revision,
       blocking: interaction.blocking,
       display: interaction.display,
+      presentation: computeInteractionPresentation(interaction.display),
+      resolvedBy: interaction.resolvedBy ?? null,
       responseRecorded: interaction.responseDigest !== null,
       context: {
         turnId: interaction.authority.turnId === null
@@ -5635,6 +5749,9 @@ export class HraService {
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
+    // A human-authored message is the only thing that resets the consecutive
+    // autorespond counter for a session.
+    this.#store.resetAutorespondCounter(session.id);
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let review: RuntimeStartReview | undefined;
