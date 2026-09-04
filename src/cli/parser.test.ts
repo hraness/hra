@@ -5,6 +5,7 @@ import fc from "fast-check";
 import {
   CliUsageError,
   completeProtectedAuthLogin,
+  deviceMutationReplayCommand,
   completeProtectedInteraction,
   helpGroupNames,
   parseCli,
@@ -594,7 +595,13 @@ describe("CLI parser", () => {
   });
 
   test("generates and preserves one current UUIDv7 for each device mutation", () => {
-    const generated = parseCli(["device", "approve", "device_target"]);
+    const generated = parseCli([
+      "device",
+      "approve",
+      "device_target",
+      "--fingerprint",
+      "0000-1111-2222-3333-4444-5555-6666-7777",
+    ]);
     if (generated.kind !== "command" || generated.command.kind !== "device.approve") {
       throw new Error("Expected a device approval command.");
     }
@@ -617,9 +624,39 @@ describe("CLI parser", () => {
       "device",
       "approve",
       "device_target",
+      "--fingerprint",
+      "0000-1111-2222-3333-4444-5555-6666-7777",
       "--idempotency-key",
       "00000000-0000-4000-8000-000000000001",
     ])).toThrow("current UUIDv7");
+  });
+
+  test("binds device approval to a displayed key fingerprint", () => {
+    const fingerprint = "8144-52ea-9db6-227b-786f-8c8c-eec0-6435";
+    const approval = parseCli(["device", "approve", "device_target", "--fingerprint", fingerprint]);
+    if (approval.kind !== "command" || approval.command.kind !== "device.approve") {
+      throw new Error("Expected a device approval command.");
+    }
+    expect(approval.command.fingerprint).toBe(fingerprint);
+    expect(deviceMutationReplayCommand(approval.command, true)).toBe(
+      "hra device approve device_target"
+      + ` --fingerprint ${fingerprint}`
+      + ` --idempotency-key ${approval.command.idempotencyKey} --json`,
+    );
+
+    expect(() => parseCli(["device", "approve", "device_target"]))
+      .toThrow("requires --fingerprint");
+    expect(() => parseCli(["device", "approve", "device_target", "--fingerprint", "nope"]))
+      .toThrow("eight lower-case hex groups");
+    expect(() => parseCli([
+      "device",
+      "approve",
+      "device_target",
+      "--fingerprint",
+      fingerprint.toUpperCase(),
+    ])).toThrow("eight lower-case hex groups");
+    expect(() => parseCli(["device", "revoke", "device_target", "--fingerprint", fingerprint]))
+      .toThrow();
   });
 
   test("parses only the exact local account-key loss acknowledgement", () => {

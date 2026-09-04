@@ -11,6 +11,7 @@ import {
 } from "./contracts";
 import {
   decodeBase64Url,
+  deviceKeyFingerprint,
   encodeBase64Url,
   GcmMessageBudget,
   gcmMessageBudgetCheckpointInterval,
@@ -92,12 +93,22 @@ class MemoryCustody implements CloudSecretCustodyPort {
 type FakeDevice = {
   activatedAt?: number;
   credentialGeneration?: number;
+  deviceClass: "daemon" | "browser";
   encryptedLabel: EncryptedEnvelope;
   keyVersion: number;
   publicId: string;
   revision: number;
+  signingPublicKey: string;
   status: "pending" | "active" | "revoked";
   wrappingPublicKey: string;
+};
+
+const fixtureFingerprint = "0000-1111-2222-3333-4444-5555-6666-7777";
+
+const fingerprintOf = async (cloud: FakeCloud, publicId: string): Promise<string> => {
+  const device = cloud.devices.get(publicId);
+  if (device === undefined) throw new Error("missing device fixture");
+  return await deviceKeyFingerprint(device.signingPublicKey, device.wrappingPublicKey);
 };
 
 class FakeCloud {
@@ -258,6 +269,7 @@ class FakeCloud {
           if (
             !isRecord(args.encryptedLabel)
             || typeof args.publicId !== "string"
+            || typeof args.signingPublicKey !== "string"
             || typeof args.wrappingPublicKey !== "string"
           ) throw new Error("invalid registration fixture input");
           if (typeof args.idempotencyKey !== "string") {
@@ -278,6 +290,7 @@ class FakeCloud {
             if (existing === undefined) throw new Error("missing registration replay");
             boundDevice = existing.publicId;
             return {
+              deviceClass: existing.deviceClass,
               publicId: existing.publicId,
               revision: existing.revision,
               status: existing.status,
@@ -291,10 +304,12 @@ class FakeCloud {
           const device: FakeDevice = {
             ...(status === "active" ? { activatedAt: fixedNow } : {}),
             credentialGeneration: 1,
+            deviceClass: args.deviceClass === "browser" ? "browser" : "daemon",
             encryptedLabel: args.encryptedLabel as EncryptedEnvelope,
             keyVersion: 1,
             publicId: args.publicId,
             revision: 1,
+            signingPublicKey: args.signingPublicKey,
             status,
             wrappingPublicKey: args.wrappingPublicKey,
           };
@@ -311,7 +326,7 @@ class FakeCloud {
             this.failNextRegisterAfterEffect = false;
             throw new Error("lost registration response");
           }
-          return { publicId: device.publicId, revision: 1, status };
+          return { deviceClass: device.deviceClass, publicId: device.publicId, revision: 1, status };
         }
         if (name === "devices:approve") {
           if (
@@ -475,12 +490,14 @@ class FakeCloud {
         if (name === "devices:list" || name === "devices:listPage" || name === "devices:get") {
           const records = [...this.devices.values()].map((device) => ({
             ...(device.activatedAt === undefined ? {} : { activatedAt: device.activatedAt }),
+            deviceClass: device.deviceClass,
             encryptedLabel: device.encryptedLabel,
             keyVersion: device.keyVersion,
             lastSeenAt: fixedNow,
             online: device.status !== "revoked",
             publicId: device.publicId,
             revision: device.revision,
+            signingPublicKey: device.signingPublicKey,
             status: device.status,
             userPublicId: this.userPublicId,
             wrappingPublicKey: device.wrappingPublicKey,
@@ -891,6 +908,8 @@ describe("local cloud control", () => {
       devices: [{
         activatedAt: fixedNow,
         current: true,
+        deviceClass: "daemon",
+        fingerprint: await fingerprintOf(cloud, paired.device.publicId),
         keyVersion: 1,
         label: `HRA device ${paired.device.publicId.slice(-8)}`,
         labelSource: "encrypted",
@@ -924,7 +943,12 @@ describe("local cloud control", () => {
         labelSource: "fallback",
       });
 
-    await first.approveDevice(secondPair.device.publicId, deviceMutationKey(), signal);
+    await first.approveDevice(
+      secondPair.device.publicId,
+      deviceMutationKey(),
+      await fingerprintOf(cloud, secondPair.device.publicId),
+      signal,
+    );
     await second.pairDevice(signal);
     const active = parseCloudDeviceList(await second.listDevices(signal));
     expect(active?.devices.find((device) => device.publicId === firstPair.device.publicId))
@@ -1062,10 +1086,47 @@ describe("local cloud control", () => {
     expect(rewritten).toBe(true);
   });
 
+  test("refuses an approval whose fingerprint does not match the target key pair", async () => {
+    const cloud = new FakeCloud();
+    const first = control(cloud, new MemoryCustody());
+    const second = control(cloud, new MemoryCustody());
+    await authenticate(first);
+    await first.pairDevice(signal);
+    await authenticate(second);
+    const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
+    await expect(first.approveDevice(
+      secondPair.device.publicId,
+      deviceMutationKey(),
+      fixtureFingerprint,
+      signal,
+    )).rejects.toThrow("DEVICE_FINGERPRINT_MISMATCH");
+    await expect(first.approveDevice(
+      secondPair.device.publicId,
+      deviceMutationKey(),
+      "not-a-fingerprint",
+      signal,
+    )).rejects.toThrow("fingerprint is invalid");
+    expect(cloud.approvalAttempts).toHaveLength(0);
+    expect(cloud.devices.get(secondPair.device.publicId)?.status).toBe("pending");
+
+    const listed = parseCloudDeviceList(await first.listDevices(signal));
+    const pending = listed?.devices.find((device) =>
+      device.publicId === secondPair.device.publicId);
+    expect(pending?.deviceClass).toBe("daemon");
+    expect(pending?.fingerprint)
+      .toBe(await fingerprintOf(cloud, secondPair.device.publicId));
+    expect(await first.approveDevice(
+      secondPair.device.publicId,
+      deviceMutationKey(),
+      pending?.fingerprint ?? "",
+      signal,
+    )).toMatchObject({ device: { publicId: secondPair.device.publicId, status: "active" } });
+  });
+
   test("rejects a non-UUIDv7 caller key before a device mutation can reach cloud state", async () => {
     const cloud = new FakeCloud();
     const adapter = control(cloud, new MemoryCustody());
-    await expect(adapter.approveDevice("device_target", "not-a-uuid", signal))
+    await expect(adapter.approveDevice("device_target", "not-a-uuid", fixtureFingerprint, signal))
       .rejects.toThrow("idempotency key is invalid");
     await expect(adapter.revokeDevice("device_target", "not-a-uuid", signal))
       .rejects.toThrow("idempotency key is invalid");
@@ -1643,7 +1704,12 @@ describe("local cloud control", () => {
     });
     expect(accountKeyIsProvisional(pendingCustody)).toBe(true);
     expect(accountKey(pendingCustody)).not.toEqual(accountKey(firstCustody));
-    await first.approveDevice(registration.device.publicId, deviceMutationKey(), signal);
+    await first.approveDevice(
+      registration.device.publicId,
+      deviceMutationKey(),
+      await fingerprintOf(cloud, registration.device.publicId),
+      signal,
+    );
     expect(await pending.ensureDeviceRegistered(signal)).toMatchObject({
       device: { status: "active" },
       registered: true,
@@ -1699,7 +1765,12 @@ describe("local cloud control", () => {
     const registrationA = await installationA.ensureDeviceRegistered(signal) as {
       device: { publicId: string };
     };
-    await holderA.approveDevice(registrationA.device.publicId, deviceMutationKey(), signal);
+    await holderA.approveDevice(
+      registrationA.device.publicId,
+      deviceMutationKey(),
+      await fingerprintOf(cloudA, registrationA.device.publicId),
+      signal,
+    );
     await installationA.ensureDeviceRegistered(signal);
 
     let transportCalls = 0;
@@ -1811,7 +1882,12 @@ describe("local cloud control", () => {
     const registrationB = await installationB.ensureDeviceRegistered(signal) as {
       device: { publicId: string };
     };
-    await holderB.approveDevice(registrationB.device.publicId, deviceMutationKey(), signal);
+    await holderB.approveDevice(
+      registrationB.device.publicId,
+      deviceMutationKey(),
+      await fingerprintOf(cloudB, registrationB.device.publicId),
+      signal,
+    );
     await installationB.ensureDeviceRegistered(signal);
     expect(await installationB.status(signal)).toMatchObject({
       accountKey: { status: "pairing_required" },
@@ -2074,15 +2150,18 @@ describe("local cloud control", () => {
     expect(secondPair).toMatchObject({ paired: false, device: { status: "pending" } });
     const approvalKey = deviceMutationKey();
     cloud.failNextApproveAfterEffect = true;
+    const prefixFingerprint = await fingerprintOf(cloud, secondPair.device.publicId);
     await expect(first.approveDevice(
       secondPair.device.publicId.slice(0, 16),
       approvalKey,
+      prefixFingerprint,
       signal,
     ))
       .rejects.toThrow("lost approval response");
     expect(await first.approveDevice(
       secondPair.device.publicId.slice(0, 16),
       approvalKey,
+      prefixFingerprint,
       signal,
     ))
       .toMatchObject({
@@ -2183,7 +2262,12 @@ describe("local cloud control", () => {
     const approvalKey = deviceMutationKey();
 
     cloud.failNextApproveAfterEffect = true;
-    await expect(first.approveDevice(secondPair.device.publicId, approvalKey, signal))
+    await expect(first.approveDevice(
+      secondPair.device.publicId,
+      approvalKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
+      signal,
+    ))
       .rejects.toThrow("lost approval response");
     expect(deviceMutationCustody(firstCustody))
       .toMatchObject({
@@ -2198,6 +2282,7 @@ describe("local cloud control", () => {
     const recovered = await restarted.approveDevice(
       secondPair.device.publicId,
       approvalKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
       signal,
     ) as { device: unknown; replay: boolean };
     expect(recovered).toMatchObject({
@@ -2222,6 +2307,7 @@ describe("local cloud control", () => {
     expect(await responseLostAfterSettlement.approveDevice(
       secondPair.device.publicId,
       approvalKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
       signal,
     )).toEqual(recovered);
     expect(cloud.approvalAttempts).toHaveLength(1);
@@ -2238,7 +2324,12 @@ describe("local cloud control", () => {
     const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
     const approvalKey = deviceMutationKey();
     cloud.failNextApproveBeforeEffect = true;
-    await expect(first.approveDevice(secondPair.device.publicId, approvalKey, signal))
+    await expect(first.approveDevice(
+      secondPair.device.publicId,
+      approvalKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
+      signal,
+    ))
       .rejects.toThrow("approval unavailable before effect");
     const observation = firstCustody.values.get("cloud-device-mutation");
     const pending = deviceMutationCustody(firstCustody).pending;
@@ -2255,6 +2346,7 @@ describe("local cloud control", () => {
     expect(await restarted.approveDevice(
       secondPair.device.publicId,
       approvalKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
       signal,
     )).toMatchObject({
       device: { publicId: secondPair.device.publicId, status: "active" },
@@ -2277,7 +2369,12 @@ describe("local cloud control", () => {
     await first.pairDevice(signal);
     await authenticate(second);
     const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
-    await first.approveDevice(secondPair.device.publicId, deviceMutationKey(), signal);
+    await first.approveDevice(
+      secondPair.device.publicId,
+      deviceMutationKey(),
+      await fingerprintOf(cloud, secondPair.device.publicId),
+      signal,
+    );
     const revokeKey = deviceMutationKey();
 
     cloud.failNextRevokeAfterEffect = true;
@@ -2330,18 +2427,29 @@ describe("local cloud control", () => {
     const approved = await first.approveDevice(
       secondPair.device.publicId,
       callerKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
       signal,
     ) as { device: unknown };
 
     await expect(first.revokeDevice(secondPair.device.publicId, callerKey, signal))
       .rejects.toThrow("reused for a different request");
-    await expect(first.approveDevice(thirdPair.device.publicId, callerKey, signal))
+    await expect(first.approveDevice(
+      thirdPair.device.publicId,
+      callerKey,
+      await fingerprintOf(cloud, thirdPair.device.publicId),
+      signal,
+    ))
       .rejects.toThrow("reused for a different request");
     expect(cloud.revocationAttempts).toHaveLength(0);
     expect(cloud.devices.get(thirdPair.device.publicId)?.status).toBe("pending");
 
     await first.revokeDevice(secondPair.device.publicId, deviceMutationKey(), signal);
-    expect(await first.approveDevice(secondPair.device.publicId, callerKey, signal)).toEqual({
+    expect(await first.approveDevice(
+      secondPair.device.publicId,
+      callerKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
+      signal,
+    )).toEqual({
       device: approved.device,
       replay: true,
     });
@@ -2377,7 +2485,12 @@ describe("local cloud control", () => {
       }),
     });
     const newestKey = deviceMutationKey();
-    await first.approveDevice(secondPair.device.publicId, newestKey, signal);
+    await first.approveDevice(
+      secondPair.device.publicId,
+      newestKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
+      signal,
+    );
     const bounded = deviceMutationCustody(custody);
     expect(bounded.receipts).toHaveLength(128);
     expect(bounded.receipts.some((receipt) =>
@@ -2390,7 +2503,12 @@ describe("local cloud control", () => {
       generation: (custody.values.get("cloud-device-mutation")?.generation ?? 0) + 1,
       value: JSON.stringify({ padding: "x".repeat(64 * 1_024) }),
     });
-    await expect(first.approveDevice(secondPair.device.publicId, deviceMutationKey(), signal))
+    await expect(first.approveDevice(
+      secondPair.device.publicId,
+      deviceMutationKey(),
+      await fingerprintOf(cloud, secondPair.device.publicId),
+      signal,
+    ))
       .rejects.toThrow("custody is corrupt");
   });
 
@@ -2405,7 +2523,12 @@ describe("local cloud control", () => {
     await authenticate(second);
     const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
     const retiredPublicId = secondPair.device.publicId;
-    await first.approveDevice(retiredPublicId, deviceMutationKey(), signal);
+    await first.approveDevice(
+      retiredPublicId,
+      deviceMutationKey(),
+      await fingerprintOf(cloud, retiredPublicId),
+      signal,
+    );
     await second.pairDevice(signal);
     await first.revokeDevice(retiredPublicId, deviceMutationKey(), signal);
 
@@ -2437,7 +2560,12 @@ describe("local cloud control", () => {
     expect(history).not.toContain("signingPrivateKey");
     expect(history).not.toContain("wrappingPrivateKey");
 
-    await first.approveDevice(replacement.device.publicId, deviceMutationKey(), signal);
+    await first.approveDevice(
+      replacement.device.publicId,
+      deviceMutationKey(),
+      await fingerprintOf(cloud, replacement.device.publicId),
+      signal,
+    );
     expect(await second.pairDevice(signal)).toMatchObject({
       device: { publicId: replacement.device.publicId, status: "active" },
       paired: true,
@@ -2481,18 +2609,29 @@ describe("local cloud control", () => {
     const approvalKey = deviceMutationKey(localNow);
     cloud.failNextApproveBeforeEffect = true;
 
-    await expect(first.approveDevice(secondPair.device.publicId, approvalKey, signal))
+    await expect(first.approveDevice(
+      secondPair.device.publicId,
+      approvalKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
+      signal,
+    ))
       .rejects.toThrow("approval unavailable before effect");
     expect(cloud.approvalAttempts[0]?.idempotencyKey).toBe(approvalKey);
     localNow += 7 * 24 * 60 * 60 * 1_000 + 1;
 
-    await expect(first.approveDevice(secondPair.device.publicId, approvalKey, signal))
+    await expect(first.approveDevice(
+      secondPair.device.publicId,
+      approvalKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
+      signal,
+    ))
       .rejects.toThrow("idempotency key is expired");
     expect(cloud.approvalAttempts).toHaveLength(1);
     const freshApprovalKey = deviceMutationKey(localNow);
     expect(await first.approveDevice(
       secondPair.device.publicId,
       freshApprovalKey,
+      await fingerprintOf(cloud, secondPair.device.publicId),
       signal,
     )).toMatchObject({
       device: { publicId: secondPair.device.publicId, status: "active" },
@@ -2534,10 +2673,12 @@ describe("local cloud control", () => {
     for (let index = 0; index < 125; index += 1) {
       const publicId = `device_bulk_${String(index).padStart(4, "0")}`;
       cloud.devices.set(publicId, {
+        deviceClass: template.deviceClass,
         encryptedLabel: template.encryptedLabel,
         keyVersion: template.keyVersion,
         publicId,
         revision: 1,
+        signingPublicKey: template.signingPublicKey,
         status: "pending",
         wrappingPublicKey: template.wrappingPublicKey,
       });
@@ -2548,6 +2689,7 @@ describe("local cloud control", () => {
     expect(await adapter.approveDevice(
       "device_bulk_0124",
       deviceMutationKey(),
+      await fingerprintOf(cloud, "device_bulk_0124"),
       signal,
     )).toMatchObject({
       device: { publicId: "device_bulk_0124", status: "active" },
@@ -2641,7 +2783,12 @@ describe("local cloud control", () => {
     const pendingDevice = [...cloud.devices.values()].find((device) =>
       device.status === "pending");
     if (pendingDevice === undefined) throw new Error("missing pending device fixture");
-    await first.approveDevice(pendingDevice.publicId, deviceMutationKey(), signal);
+    await first.approveDevice(
+      pendingDevice.publicId,
+      deviceMutationKey(),
+      await fingerprintOf(cloud, pendingDevice.publicId),
+      signal,
+    );
 
     await second.logout(signal);
     await authenticate(second);

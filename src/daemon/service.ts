@@ -1078,7 +1078,7 @@ export class HraService {
         case "device.pair": return await this.#fencedEffect(async () => await this.#cloud.pairDevice(context.signal));
         case "device.key-loss": return await this.#fencedEffect(async () =>
           await this.#cloud.acknowledgeNoAccountKeyHolders(context.signal));
-        case "device.approve": return await this.#fencedEffect(async () => await this.#cloud.approveDevice(command.device, command.idempotencyKey, context.signal));
+        case "device.approve": return await this.#fencedEffect(async () => await this.#cloud.approveDevice(command.device, command.idempotencyKey, command.fingerprint, context.signal));
         case "device.revoke": return await this.#fencedEffect(async () => await this.#cloud.revokeDevice(command.device, command.idempotencyKey, context.signal));
         case "sync.status": return await this.#fencedEffect(async () => await this.#cloud.status(context.signal));
         case "sync.now": return await this.#fencedEffect(async () => await this.#cloud.sync(context.signal));

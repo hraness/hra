@@ -210,11 +210,11 @@ The CLI stores HRA's revocable device credential, workspace encryption key, and 
 
 After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority.
 
-On an already active machine, list devices and approve the pending device by its exact ID or unique prefix:
+On an already active machine, list devices and approve the pending device by its exact ID or unique prefix. The listing shows each device's class, daemon or browser, and the fingerprint of its two public keys. Approval requires that exact fingerprint, so the machine you approve is the one whose fingerprint you read:
 
 ```text
 hra device list
-hra device approve <pending-device-id-or-prefix> [--idempotency-key <current-uuidv7>]
+hra device approve <pending-device-id-or-prefix> --fingerprint <value> [--idempotency-key <current-uuidv7>]
 ```
 
 After approval, run `hra device pair` on the new machine to retrieve and unwrap its encryption-key envelope. Use `hra device revoke <device-id-or-prefix>` from a different active machine to revoke a device.
@@ -408,7 +408,8 @@ hra auth status|logout
 hra auth delete --acknowledge-erasure
 hra device list|pair
 hra device key-loss --acknowledge-no-key-holders
-hra device approve|revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]
+hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <current-uuidv7>]
+hra device revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]
 hra account add <label>
 hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
 hra account login-cancel <profile>

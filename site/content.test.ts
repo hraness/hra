@@ -277,7 +277,8 @@ describe("public content contract", () => {
       expect(surface).not.toContain("auth login --code");
     }
     expect(markdown).toContain(
-      "hra device approve <pending-device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
+      "hra device approve <pending-device-id-or-prefix> --fingerprint <value>"
+      + " [--idempotency-key <current-uuidv7>]",
     );
     expect(html).toContain("hra device approve &lt;pending-device-id-or-prefix&gt;");
     for (const claim of [

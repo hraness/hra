@@ -380,12 +380,13 @@ Usage:
   hra device list
   hra device pair
   hra device key-loss --acknowledge-no-key-holders
-  hra device approve|revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]
+  hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <uuidv7>] [--json]
+  hra device revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]
 
 Examples:
   hra device pair
   hra device key-loss --acknowledge-no-key-holders
-  hra device approve <pending-device-prefix>`,
+  hra device approve <pending-device-prefix> --fingerprint <value>`,
   sync: `HRA sync
 
 Usage:
@@ -520,6 +521,8 @@ const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
 const literal = (value: string): string => `${literalPrefix}${value}`;
 const decode = (value: string): string => value.startsWith(literalPrefix) ? value.slice(literalPrefix.length) : value;
 const isOption = (value: string): boolean => !value.startsWith(literalPrefix) && value.startsWith("--");
+
+const deviceKeyFingerprintPattern = /^[0-9a-f]{4}(?:-[0-9a-f]{4}){7}$/u;
 
 const isCurrentUuidV7 = (value: string, now = Date.now()): boolean => {
   if (!isUuidV7(value) || !Number.isSafeInteger(now) || now < 0) return false;
@@ -706,6 +709,7 @@ export const deviceMutationReplayCommand = (
 ): string => [
   `hra device ${command.kind === "device.approve" ? "approve" : "revoke"}`,
   shellArgument(command.device),
+  ...(command.kind === "device.approve" ? ["--fingerprint", command.fingerprint] : []),
   "--idempotency-key",
   command.idempotencyKey,
   ...(json ? ["--json"] : []),
@@ -1639,12 +1643,23 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       };
     } else if (action === "approve" || action === "revoke") {
       const device = take(cursor, "device");
+      // Approval binds to the key fingerprint the operator was shown, so an
+      // enrolling device cannot substitute another key pair behind its ID.
+      const fingerprint = action === "approve" ? option(cursor, "--fingerprint") : undefined;
       finish(cursor);
+      if (action === "approve" && fingerprint === undefined) {
+        throw new CliUsageError("Device approval requires --fingerprint <value> from hra device list.");
+      }
+      if (fingerprint !== undefined && !deviceKeyFingerprintPattern.test(fingerprint)) {
+        throw new CliUsageError("Device approval --fingerprint must be eight lower-case hex groups of four separated by hyphens.");
+      }
       const deviceMutationKey = idempotencyKey ?? createCloudUuidV7();
       if (!isCurrentUuidV7(deviceMutationKey)) {
         throw new CliUsageError("Device mutation --idempotency-key must be a current UUIDv7.");
       }
-      parsed = { device, idempotencyKey: deviceMutationKey, kind: `device.${action}` };
+      parsed = action === "approve" && fingerprint !== undefined
+        ? { device, fingerprint, idempotencyKey: deviceMutationKey, kind: "device.approve" }
+        : { device, idempotencyKey: deviceMutationKey, kind: "device.revoke" };
     } else {
       throw new CliUsageError("Unknown device action. Run `hra device --help` for supported actions.");
     }

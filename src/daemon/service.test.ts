@@ -425,6 +425,7 @@ class FakeCloud implements CloudControlPort {
   deleteAccountCalls = 0;
   keyLossCalls = 0;
   keyLossError?: AccountKeyLossPreconditionError;
+  readonly deviceApprovalFingerprints: string[] = [];
   readonly deviceMutations: Array<Readonly<{
     device: string;
     idempotencyKey: string;
@@ -510,7 +511,13 @@ class FakeCloud implements CloudControlPort {
     if (this.keyLossError !== undefined) throw this.keyLossError;
     return { acknowledgedNoKeyHolders: true, localOnly: true };
   }
-  async approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
+  async approveDevice(
+    device: string,
+    idempotencyKey: string,
+    fingerprint: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    this.deviceApprovalFingerprints.push(fingerprint);
     return await this.#mutateDevice("approve", device, idempotencyKey, signal);
   }
   async revokeDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
@@ -836,11 +843,18 @@ describe("HraService", () => {
       const idempotencyKey = kind === "approve"
         ? "018bcfe5-6800-7000-8000-000000000041"
         : "018bcfe5-6800-7000-8000-000000000042";
-      const command = {
-        device: `device_${kind}`,
-        idempotencyKey,
-        kind: `device.${kind}`,
-      } as const;
+      const command = kind === "approve"
+        ? {
+            device: "device_approve",
+            fingerprint: "0000-1111-2222-3333-4444-5555-6666-7777",
+            idempotencyKey,
+            kind: "device.approve",
+          } as const
+        : {
+            device: "device_revoke",
+            idempotencyKey,
+            kind: "device.revoke",
+          } as const;
       cloud.loseNextDeviceMutationResponses.add(kind);
 
       await expect(service.execute(command, { signal }))
@@ -863,12 +877,14 @@ describe("HraService", () => {
     const idempotencyKey = "018bcfe5-6800-7000-8000-000000000043";
     await expect(service.execute({
       device: "device_original",
+      fingerprint: "0000-1111-2222-3333-4444-5555-6666-7777",
       idempotencyKey,
       kind: "device.approve",
     }, { signal })).resolves.toMatchObject({ approved: true, idempotencyKey });
 
     await expect(service.execute({
       device: "device_changed",
+      fingerprint: "0000-1111-2222-3333-4444-5555-6666-7777",
       idempotencyKey,
       kind: "device.approve",
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });

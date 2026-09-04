@@ -19,6 +19,7 @@ import {
 } from "../src/cloud/commands";
 import {
   rejectAuthority,
+  requireDaemonDevice,
   requireDeviceAuthority,
 } from "./authority";
 import { validateIdempotencyInput } from "./idempotency";
@@ -423,7 +424,7 @@ async function requireCommandExecutionAuthority(
   commandPublicId: string,
   authorityTupleValue: AuthorityTuple,
 ) {
-  const authority = await requireDeviceAuthority(ctx);
+  const authority = await requireDaemonDevice(ctx);
   if (!isUuidV7(commandPublicId)) rejectAuthority();
   const command = await commandByPublicId(ctx, commandPublicId);
   if (

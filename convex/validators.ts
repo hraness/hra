@@ -13,6 +13,9 @@ export const deviceStatus = v.union(
   v.literal("active"),
   v.literal("revoked"),
 );
+// A device row written before browser enrollment carries no class. An absent
+// field therefore means `daemon`, and `deviceClassOf` is the only reader.
+export const deviceClass = v.union(v.literal("daemon"), v.literal("browser"));
 export const sessionStatus = v.union(
   v.literal("active"),
   v.literal("idle"),

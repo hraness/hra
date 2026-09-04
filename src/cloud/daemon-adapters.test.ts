@@ -3118,10 +3118,10 @@ describe("bridged cloud control", () => {
         calls.push("key-loss");
         return Promise.resolve({ localOnly: true });
       },
-      approveDevice: (device, idempotencyKey, signal) => {
+      approveDevice: (device, idempotencyKey, fingerprint, signal) => {
         expect(signal.aborted).toBe(false);
         deviceSignals.push(signal);
-        calls.push(`approve:${device}:${idempotencyKey}`);
+        calls.push(`approve:${device}:${idempotencyKey}:${fingerprint}`);
         return Promise.resolve({ approved: true });
       },
       revokeDevice: (device, idempotencyKey, signal) => {
@@ -3193,16 +3193,21 @@ describe("bridged cloud control", () => {
     calls.length = 0;
     const deviceSignal = new AbortController().signal;
     const approvalKey = "018bcfe5-6800-7000-8000-000000000031";
+    const approvalFingerprint = "0000-1111-2222-3333-4444-5555-6666-7777";
     const revocationKey = "018bcfe5-6800-7000-8000-000000000032";
     expect(await combined.acknowledgeNoAccountKeyHolders(deviceSignal))
       .toEqual({ localOnly: true });
-    expect(await combined.approveDevice("device_pending", approvalKey, deviceSignal))
-      .toEqual({ approved: true });
+    expect(await combined.approveDevice(
+      "device_pending",
+      approvalKey,
+      approvalFingerprint,
+      deviceSignal,
+    )).toEqual({ approved: true });
     expect(await combined.revokeDevice("device_active", revocationKey, deviceSignal))
       .toEqual({ revoked: true });
     expect(calls).toEqual([
       "key-loss",
-      `approve:device_pending:${approvalKey}`,
+      `approve:device_pending:${approvalKey}:${approvalFingerprint}`,
       `revoke:device_active:${revocationKey}`,
     ]);
     expect(deviceSignals).toEqual([deviceSignal, deviceSignal]);

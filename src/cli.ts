@@ -1528,9 +1528,15 @@ class DiagnosedUnavailableCloudControl extends UnavailableCloudControl {
   override deleteAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   override listDevices(): Promise<never> { return Promise.reject(this.#unavailable()); }
   override pairDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  override approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<never> {
+  override approveDevice(
+    device: string,
+    idempotencyKey: string,
+    fingerprint: string,
+    signal: AbortSignal,
+  ): Promise<never> {
     void device;
     void idempotencyKey;
+    void fingerprint;
     void signal;
     return Promise.reject(this.#unavailable());
   }

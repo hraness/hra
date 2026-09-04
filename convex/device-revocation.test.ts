@@ -28,6 +28,7 @@ type DrainResult = Readonly<{
 }>;
 
 const revokeDevice = makeFunctionReference<"mutation", Args, Readonly<{
+  deviceClass: "daemon" | "browser";
   publicId: string;
   revision: number;
   status: "revoked";
@@ -393,6 +394,7 @@ describe("status-first device revocation", () => {
     const world = await revocationWorld();
     const first = await world.actor.mutation(revokeDevice, world.revokeRequest);
     expect(first).toEqual({
+      deviceClass: "daemon",
       publicId: "device_target01",
       revision: 2,
       status: "revoked",

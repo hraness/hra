@@ -210,7 +210,7 @@ export interface CloudControlPort {
   listDevices(signal: AbortSignal): Promise<unknown>;
   pairDevice(signal: AbortSignal): Promise<unknown>;
   acknowledgeNoAccountKeyHolders(signal: AbortSignal): Promise<unknown>;
-  approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown>;
+  approveDevice(device: string, idempotencyKey: string, fingerprint: string, signal: AbortSignal): Promise<unknown>;
   revokeDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown>;
 }
 
@@ -290,9 +290,15 @@ export class UnavailableCloudControl implements CloudControlPort {
   acknowledgeNoAccountKeyHolders(): Promise<never> {
     return Promise.reject(this.#unavailable());
   }
-  approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<never> {
+  approveDevice(
+    device: string,
+    idempotencyKey: string,
+    fingerprint: string,
+    signal: AbortSignal,
+  ): Promise<never> {
     void device;
     void idempotencyKey;
+    void fingerprint;
     void signal;
     return Promise.reject(this.#unavailable());
   }

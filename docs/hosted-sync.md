@@ -315,7 +315,7 @@ Any other state is an incident and must remain quarantined for inspection.
 
 Read the capability file only into HRA's protected authentication JSON input. Never print it, substitute it into argv, copy it into an environment variable, or route it through a log. Complete the verified-email code flow and confirm the identity and first device are active. Consuming this specific bound invitation atomically records a durable bootstrap-accepted timestamp in service control. Later friend invitation issuance depends on that durable fact, so maintenance may remove the terminal invitation receipt without relocking the service. Then remove the one-time capability file.
 
-Continue launch acceptance with a second pending device approved by the active device, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. Hosted acceptance does not authorize domain movement or publication. Those effects require a future current-project-only release design; retired HRA v0 resources cannot satisfy one of its gates.
+Continue launch acceptance with a second pending device approved by the active device against the key fingerprint that `hra device list` shows for it, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. Hosted acceptance does not authorize domain movement or publication. Those effects require a future current-project-only release design; retired HRA v0 resources cannot satisfy one of its gates.
 
 ## Operate friend-beta invitations
 
