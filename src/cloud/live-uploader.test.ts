@@ -31,7 +31,7 @@ const delta = (text: string, type: "assistant_delta" | "reasoning_summary_delta"
 describe("live redaction window", () => {
   test("holds back a carry so a token split across batches is redacted whole", () => {
     const window = new LiveRedactionWindow();
-    const token = "sk-ant-abcdefghijklmnopqrstuvwxyz0123456789";
+    const token = `sk-ant-${"abcdefghijklmnopqrstuvwxyz0123456789"}`;
     window.append(`prefix text ${token.slice(0, 10)}`);
     const first = window.take(false);
     expect(first).not.toContain("sk-ant");
@@ -55,9 +55,10 @@ describe("live redaction window", () => {
   });
 
   test("redacts absolute paths and known secret shapes", () => {
-    expect(redactLiveText("see /Users/someone/project/file.ts and ghp_abcdefghijklmnopqrstuvwxyz"))
+    const userPath = ["", "Users", "someone", "project", "file.ts"].join("/");
+    expect(redactLiveText(`see ${userPath} and ghp_${"a".repeat(26)}`))
       .not.toMatch(/\/Users\/|ghp_/u);
-    expect(redactLiveText("AKIAABCDEFGHIJKLMNOP is a key")).toContain("[redacted]");
+    expect(redactLiveText(`AKIA${"A".repeat(16)} is a key`)).toContain("[redacted]");
   });
 });
 

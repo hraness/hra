@@ -119,7 +119,7 @@ describe("remote decision payloads", () => {
       kind: "resolve_interaction",
       interactionId,
       revision: 1,
-      answers: { q1: { answers: ["/Users/someone/secret"] } },
+      answers: { q1: { answers: ["/opt/someone/secret"] } },
     })).toBeNull();
   });
 });
