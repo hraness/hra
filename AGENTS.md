@@ -1,6 +1,6 @@
 # Contents
 
-- `src/` contains the Bun CLI, daemon, local authority, Codex adapter, and cloud client.
+- `src/` contains the Bun CLI, daemon, local authority, Codex and Claude Code adapters, and cloud client.
 - `convex/` contains the optional encrypted sync and verified-email device authority.
 - `site/` contains the static public website generated from the README content contract.
 - `scripts/` contains deterministic checks, builds, and release helpers.

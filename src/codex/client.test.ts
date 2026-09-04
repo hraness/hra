@@ -179,7 +179,7 @@ class FakeProcess implements CodexProcess {
   }
 }
 
-function successfulFake(codexHome: string, userAgent = "codex-cli/0.149.0"): FakeProcess {
+function successfulFake(codexHome: string, userAgent = "codex-cli/0.153.2"): FakeProcess {
   return new FakeProcess((message, process) => {
     if (message.method === "initialize") {
       process.respond({
@@ -260,7 +260,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -324,7 +324,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -368,7 +368,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -402,7 +402,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -448,7 +448,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -517,7 +517,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -661,7 +661,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -713,7 +713,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -745,7 +745,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -805,7 +805,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -842,7 +842,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -887,7 +887,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -988,7 +988,7 @@ describe("CodexAppServerClient", () => {
   test("accepts the pinned desktop user agent and rejects protocol version drift", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const pinned = createClient({
-      process: successfulFake(codexHome, "Codex Desktop/0.149.0 (Mac OS 26.5; arm64) dumb (hra; 0.4.1)"),
+      process: successfulFake(codexHome, "Codex Desktop/0.153.2 (Mac OS 26.5; arm64) dumb (hra; 0.4.1)"),
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: codexHome,
       isAuthorityCurrent: () => true,
@@ -1204,7 +1204,7 @@ describe("CodexAppServerClient", () => {
         target.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -2314,7 +2314,7 @@ describe("CodexAppServerClient", () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list" || message.method === "app/list") {
         target.respond({ id: message.id, result: { data: [], nextCursor: null } });
       }
@@ -2341,7 +2341,7 @@ describe("CodexAppServerClient", () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       }
     });
     const client = createClient({
@@ -2394,7 +2394,7 @@ describe("CodexAppServerClient", () => {
     let stalledRequestId: unknown;
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "model/list") {
         modelPage += 1;
         if (modelPage === 1) {
@@ -2618,7 +2618,7 @@ describe("CodexAppServerClient", () => {
         target.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -2659,7 +2659,7 @@ describe("CodexAppServerClient", () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "model/list" || message.method === "experimentalFeature/list") {
         target.respond({ id: message.id, result: { data: [], nextCursor: null } });
       }
@@ -2698,7 +2698,7 @@ describe("CodexAppServerClient", () => {
     const stalled = deferred<undefined>();
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "config/read") {
         configRead += 1;
         if (configRead === 1) {
@@ -2755,7 +2755,7 @@ describe("CodexAppServerClient", () => {
     let appPage = 0;
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
         target.respond({ id: message.id, result: { data: [], nextCursor: null } });
       } else if (message.method === "app/list") {
@@ -2838,7 +2838,7 @@ describe("CodexAppServerClient", () => {
     let appPage = 0;
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
         target.respond({ id: message.id, result: { data: [], nextCursor: null } });
       } else if (message.method === "app/list") {
@@ -2898,7 +2898,7 @@ describe("CodexAppServerClient", () => {
     let appPage = 0;
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
         target.respond({ id: message.id, result: { data: [], nextCursor: null } });
       } else if (message.method === "app/list") {
@@ -2938,7 +2938,7 @@ describe("CodexAppServerClient", () => {
     let appPage = 0;
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
         target.respond({ id: message.id, result: { data: [], nextCursor: null } });
       } else if (message.method === "app/list") {
@@ -2979,7 +2979,7 @@ describe("CodexAppServerClient", () => {
     let modelPage = 0;
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "model/list") {
         modelPage += 1;
         target.respond({
@@ -3015,7 +3015,7 @@ describe("CodexAppServerClient", () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
         target.respond({ id: message.id, result: { data: [], nextCursor: null } });
       } else if (message.method === "app/list") {
@@ -3054,7 +3054,7 @@ describe("CodexAppServerClient", () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "plugin/list") {
         target.respond({
           id: message.id,
@@ -3122,7 +3122,7 @@ describe("CodexAppServerClient", () => {
     let turnListCalls = 0;
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "thread/turns/list") {
         turnListCalls += 1;
         const turn = { id: "turn", items: [], status: "completed", startedAt: 1, completedAt: 2, durationMs: 1_000 };
@@ -3182,7 +3182,7 @@ describe("CodexAppServerClient", () => {
     };
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "thread/start") {
         target.respond({
           id: message.id,
@@ -3242,7 +3242,7 @@ describe("CodexAppServerClient", () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess((message, target) => {
       if (message.method === "initialize") {
-        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "thread/start") {
         target.respond({ id: message.id, result: {
           thread: { id: "thread-unsafe", sessionId: "thread-unsafe", preview: "", ephemeral: false, historyMode: "paginated", modelProvider: "openai", createdAt: 1, updatedAt: 1, status: { type: "idle" }, cwd: "/workspace/project", name: null, turns: [] },
@@ -3284,7 +3284,7 @@ describe("CodexAppServerClient", () => {
         target.respond({
           id: message.id,
           result: {
-            userAgent: "codex-cli/0.149.0",
+            userAgent: "codex-cli/0.153.2",
             codexHome,
             platformFamily: "unix",
             platformOs: "macos",
@@ -3339,7 +3339,7 @@ describe("CodexAppServerClient", () => {
           target.respond({
             id: message.id,
             result: {
-              userAgent: "codex-cli/0.149.0",
+              userAgent: "codex-cli/0.153.2",
               codexHome,
               platformFamily: "unix",
               platformOs: "macos",

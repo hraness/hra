@@ -10,7 +10,18 @@ import {
 } from "./contracts";
 import { decryptBytes, encryptBytes } from "./crypto";
 
-export type ModelPreset = "low" | "high" | "ultra";
+/**
+ * The wire model preset. `fable-max` (W3) is the Claude Fable preset; adding
+ * it widens the compact projection format, so a reader older than this build
+ * rejects a chunk whose `turn_summary.model` names it. The parser tolerates
+ * unknown *keys* (see `maximumUnknownKeySlack`), never unknown enum values.
+ */
+export type ModelPreset = "low" | "high" | "ultra" | "fable-max";
+
+const modelPresets = new Set<ModelPreset>(["low", "high", "ultra", "fable-max"]);
+
+export const isModelPreset = (value: unknown): value is ModelPreset =>
+  typeof value === "string" && modelPresets.has(value as ModelPreset);
 
 export type GitAction = Readonly<{
   commit?: string;
@@ -35,11 +46,63 @@ export type CompactInteractionState =
   | "expired"
   | "resolution_unknown";
 
+/** The remote decision vocabulary. Session scope never enters a projection. */
+export type CompactInteractionDecision = "once" | "decline";
+
+/**
+ * One question a device may see. A `secret` question is listed so the reader
+ * knows what is being asked and offers no input: its value is typed on the
+ * custodian machine only, and the daemon refuses a remote answer for it.
+ */
+export type CompactInteractionQuestion = Readonly<{
+  id: string;
+  label: string;
+  secret: boolean;
+}>;
+
+/**
+ * The detail contract revision. A reader that does not recognise the value
+ * ignores every detail field and renders the base event, so a later writer can
+ * change the detail shape without breaking this parser and without a reader
+ * misreading a field it does not understand.
+ */
+export const COMPACT_INTERACTION_DETAIL_VERSION = 1;
+
+export const compactInteractionDetailLimits = Object.freeze({
+  commandClassCharacters: 128,
+  decisions: 2,
+  detailMarkdownCharacters: 2_048,
+  headlineCharacters: 256,
+  labelCharacters: 64,
+  questionIdCharacters: 128,
+  questionLabelCharacters: 256,
+  questions: 8,
+} as const);
+
+/**
+ * The `interaction_state` event.
+ *
+ * The required fields are the original (v1) observation-only shape. Every
+ * detail field below is optional and additive: an older reader ignores them,
+ * a newer reader renders them, and a chunk that mixes both shapes decodes.
+ * The detail says what is being asked and what may be decided; it never says
+ * what the exact command text, the exact affected paths, or the exact
+ * requested permission values are.
+ */
 export type CompactInteractionEvent = Readonly<{
+  /** The decisions the provider offered, reduced to the remote vocabulary. */
+  availableDecisions?: readonly CompactInteractionDecision[];
   blocking: boolean;
+  /** The bounded class a remote approval may be taken on, when there is one. */
+  commandClass?: string;
+  detailMarkdown?: string;
+  detailVersion?: number;
+  headline?: string;
   interactionId: string;
   interactionKind: CompactInteractionKind;
   kind: "interaction_state";
+  label?: string;
+  questions?: readonly CompactInteractionQuestion[];
   revision: number;
   sequence: number;
   state: CompactInteractionState;
@@ -118,10 +181,11 @@ const maximumUnknownKeySlack = 12;
 function hasRequiredKeys(
   value: Readonly<Record<string, unknown>>,
   required: readonly string[],
+  knownOptionalKeys = 0,
 ): boolean {
   try {
     const keys = Reflect.ownKeys(value);
-    if (keys.length > required.length + maximumUnknownKeySlack) return false;
+    if (keys.length > required.length + knownOptionalKeys + maximumUnknownKeySlack) return false;
     return required.every((key) => Object.hasOwn(value, key));
   } catch {
     return false;
@@ -143,6 +207,199 @@ export function isProjectRelativePath(value: unknown): value is string {
   ) return false;
   const segments = value.split("/");
   return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+/**
+ * Bounded projection text: within its character bound, free of local absolute
+ * paths, free of control and bidirectional scalars, and not secret shaped.
+ * Every string a reader renders passes through here.
+ */
+function isBoundedSafeText(
+  value: unknown,
+  maximum: number,
+  allowLineFeeds = false,
+): value is string {
+  return typeof value === "string"
+    && value.length <= maximum
+    && !containsAbsolutePath(value)
+    && !containsUnsafeTerminalScalar(value, allowLineFeeds)
+    && !forbiddenSecretValuePattern.test(value);
+}
+
+function parseCompactInteractionQuestions(
+  value: unknown,
+): readonly CompactInteractionQuestion[] | null {
+  if (
+    !Array.isArray(value)
+    || value.length < 1
+    || value.length > compactInteractionDetailLimits.questions
+  ) return null;
+  const questions: CompactInteractionQuestion[] = [];
+  for (const candidate of value) {
+    if (
+      !isRecord(candidate)
+      || !hasRequiredKeys(candidate, ["id", "label", "secret"])
+      || !isBoundedSafeText(candidate.id, compactInteractionDetailLimits.questionIdCharacters)
+      || candidate.id.length < 1
+      || !isBoundedSafeText(
+        candidate.label,
+        compactInteractionDetailLimits.questionLabelCharacters,
+      )
+      || candidate.label.length < 1
+      || typeof candidate.secret !== "boolean"
+    ) return null;
+    questions.push({ id: candidate.id, label: candidate.label, secret: candidate.secret });
+  }
+  return new Set(questions.map((question) => question.id)).size === questions.length
+    ? questions
+    : null;
+}
+
+function parseCompactInteractionDecisions(
+  value: unknown,
+): readonly CompactInteractionDecision[] | null {
+  if (
+    !Array.isArray(value)
+    || value.length < 1
+    || value.length > compactInteractionDetailLimits.decisions
+    || !value.every((entry) => entry === "once" || entry === "decline")
+    || new Set(value as readonly string[]).size !== value.length
+  ) return null;
+  return value as readonly CompactInteractionDecision[];
+}
+
+/** The optional detail keys, counted into the event's key allowance. */
+export const COMPACT_INTERACTION_DETAIL_KEYS = Object.freeze([
+  "availableDecisions",
+  "commandClass",
+  "detailMarkdown",
+  "detailVersion",
+  "headline",
+  "label",
+  "questions",
+] as const);
+
+const compactInteractionDetailKeys = COMPACT_INTERACTION_DETAIL_KEYS;
+
+export type CompactInteractionDetail = Omit<
+  CompactInteractionEvent,
+  "blocking" | "interactionId" | "interactionKind" | "kind" | "revision" | "sequence" | "state" | "summary"
+>;
+
+/**
+ * The optional detail subset of one parsed interaction event. Every producer
+ * of an interaction body spreads exactly this, so a body that carries no
+ * detail is byte identical to the body an older build wrote and its digest
+ * still verifies.
+ */
+const compactInteractionBaselineRequiredKeys = [
+  "blocking",
+  "interactionId",
+  "interactionKind",
+  "revision",
+  "state",
+  "summary",
+] as const;
+
+const compactInteractionBaselineKeys = new Set<string>([
+  ...compactInteractionBaselineRequiredKeys,
+  ...COMPACT_INTERACTION_DETAIL_KEYS,
+]);
+
+/**
+ * The projection-recovery baseline shape: one interaction event without its
+ * `kind` and `sequence`, carrying the required fields and at most the known
+ * detail keys. It is exact rather than tolerant because a baseline is local
+ * journal state this daemon wrote itself, not a wire value from another
+ * writer, and a stray key there means the journal is corrupt.
+ */
+export function isCompactInteractionBaselineShape(
+  value: unknown,
+): value is Readonly<Record<string, unknown>> {
+  if (!isRecord(value)) return false;
+  let keys: readonly (string | symbol)[];
+  try {
+    keys = Reflect.ownKeys(value);
+  } catch {
+    return false;
+  }
+  return keys.every((key) => typeof key === "string" && compactInteractionBaselineKeys.has(key))
+    && compactInteractionBaselineRequiredKeys.every((key) => Object.hasOwn(value, key));
+}
+
+export function compactInteractionDetailOf(
+  event: CompactInteractionEvent,
+): CompactInteractionDetail {
+  return {
+    ...(event.availableDecisions === undefined
+      ? {}
+      : { availableDecisions: event.availableDecisions }),
+    ...(event.commandClass === undefined ? {} : { commandClass: event.commandClass }),
+    ...(event.detailMarkdown === undefined ? {} : { detailMarkdown: event.detailMarkdown }),
+    ...(event.detailVersion === undefined ? {} : { detailVersion: event.detailVersion }),
+    ...(event.headline === undefined ? {} : { headline: event.headline }),
+    ...(event.label === undefined ? {} : { label: event.label }),
+    ...(event.questions === undefined ? {} : { questions: event.questions }),
+  };
+}
+
+/**
+ * The optional detail block, parsed in the event's own key order.
+ *
+ * A recognised field that is malformed rejects the whole event, exactly as a
+ * malformed required field does: a reader must never render a value that did
+ * not pass these bounds. A detail revision this parser does not recognise is
+ * different: the base event still parses and the detail is dropped, which is
+ * what keeps an older reader working against a newer writer.
+ */
+function parseCompactInteractionDetail(
+  value: Readonly<Record<string, unknown>>,
+): CompactInteractionDetail | null {
+  if (value.detailVersion !== undefined && !isSafePositiveInteger(value.detailVersion)) return null;
+  if (
+    value.detailVersion !== undefined
+    && value.detailVersion !== COMPACT_INTERACTION_DETAIL_VERSION
+  ) return {};
+  const availableDecisions = value.availableDecisions === undefined
+    ? undefined
+    : parseCompactInteractionDecisions(value.availableDecisions);
+  if (availableDecisions === null) return null;
+  const questions = value.questions === undefined
+    ? undefined
+    : parseCompactInteractionQuestions(value.questions);
+  if (questions === null) return null;
+  if (
+    (value.commandClass !== undefined
+      && (!isBoundedSafeText(
+        value.commandClass,
+        compactInteractionDetailLimits.commandClassCharacters,
+      ) || value.commandClass.length < 1))
+    || (value.detailMarkdown !== undefined
+      && !isBoundedSafeText(
+        value.detailMarkdown,
+        compactInteractionDetailLimits.detailMarkdownCharacters,
+        true,
+      ))
+    || (value.headline !== undefined
+      && (!isBoundedSafeText(value.headline, compactInteractionDetailLimits.headlineCharacters)
+        || value.headline.length < 1))
+    || (value.label !== undefined
+      && (!isBoundedSafeText(value.label, compactInteractionDetailLimits.labelCharacters)
+        || value.label.length < 1))
+  ) return null;
+  return {
+    ...(availableDecisions === undefined ? {} : { availableDecisions }),
+    ...(value.commandClass === undefined ? {} : { commandClass: value.commandClass }),
+    ...(value.detailMarkdown === undefined
+      ? {}
+      : { detailMarkdown: value.detailMarkdown }),
+    ...(value.detailVersion === undefined
+      ? {}
+      : { detailVersion: COMPACT_INTERACTION_DETAIL_VERSION }),
+    ...(value.headline === undefined ? {} : { headline: value.headline }),
+    ...(value.label === undefined ? {} : { label: value.label }),
+    ...(questions === undefined ? {} : { questions }),
+  };
 }
 
 function parseGitAction(value: unknown): GitAction | null {
@@ -215,16 +472,20 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
   }
   if (
     value.kind === "interaction_state"
-    && hasRequiredKeys(value, [
-      "blocking",
-      "interactionId",
-      "interactionKind",
-      "kind",
-      "revision",
-      "sequence",
-      "state",
-      "summary",
-    ])
+    && hasRequiredKeys(
+      value,
+      [
+        "blocking",
+        "interactionId",
+        "interactionKind",
+        "kind",
+        "revision",
+        "sequence",
+        "state",
+        "summary",
+      ],
+      compactInteractionDetailKeys.length,
+    )
     && typeof value.blocking === "boolean"
     && typeof value.interactionId === "string"
     && interactionIdPattern.test(value.interactionId)
@@ -234,17 +495,24 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
     && isSafePositiveInteger(value.sequence)
     && typeof value.state === "string"
     && compactInteractionStates.has(value.state as CompactInteractionState)
-    && typeof value.summary === "string"
-    && value.summary.length <= 512
-    && !containsAbsolutePath(value.summary)
-    && !containsUnsafeTerminalScalar(value.summary, true)
-    && !forbiddenSecretValuePattern.test(value.summary)
+    && isBoundedSafeText(value.summary, 512, true)
   ) {
+    const detail = parseCompactInteractionDetail(value);
+    if (detail === null) return null;
     return {
+      ...(detail.availableDecisions === undefined
+        ? {}
+        : { availableDecisions: detail.availableDecisions }),
       blocking: value.blocking,
+      ...(detail.commandClass === undefined ? {} : { commandClass: detail.commandClass }),
+      ...(detail.detailMarkdown === undefined ? {} : { detailMarkdown: detail.detailMarkdown }),
+      ...(detail.detailVersion === undefined ? {} : { detailVersion: detail.detailVersion }),
+      ...(detail.headline === undefined ? {} : { headline: detail.headline }),
       interactionId: value.interactionId,
       interactionKind: value.interactionKind as CompactInteractionKind,
       kind: value.kind,
+      ...(detail.label === undefined ? {} : { label: detail.label }),
+      ...(detail.questions === undefined ? {} : { questions: detail.questions }),
       revision: value.revision,
       sequence: value.sequence,
       state: value.state as CompactInteractionState,
@@ -263,10 +531,7 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
     ])
     || ((value.fast === undefined) !== (value.model === undefined))
     || (value.fast !== undefined && typeof value.fast !== "boolean")
-    || (value.model !== undefined
-      && value.model !== "low"
-      && value.model !== "high"
-      && value.model !== "ultra")
+    || (value.model !== undefined && !isModelPreset(value.model))
     || !isSafeNonNegativeInteger(value.runtimeMs)
     || value.runtimeMs > 7 * 24 * 60 * 60 * 1_000
     || !isSafePositiveInteger(value.sequence)
@@ -285,9 +550,7 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
     filesTouched: value.filesTouched,
     gitActions: gitActions as GitAction[],
     kind: value.kind,
-    ...(value.model === "low" || value.model === "high" || value.model === "ultra"
-      ? { model: value.model }
-      : {}),
+    ...(isModelPreset(value.model) ? { model: value.model } : {}),
     runtimeMs: value.runtimeMs,
     sequence: value.sequence,
     turnId: value.turnId,
@@ -439,11 +702,7 @@ const subagentActivityKinds = new Set<DetailSubagentActivityKind>([
 ]);
 
 const boundedDetailText = (maximum: number) => (value: unknown): value is string =>
-  typeof value === "string"
-  && value.length <= maximum
-  && !containsAbsolutePath(value)
-  && !containsUnsafeTerminalScalar(value, true)
-  && !forbiddenSecretValuePattern.test(value);
+  isBoundedSafeText(value, maximum, true);
 
 export function parseDetailSessionEvent(value: unknown): DetailSessionEvent | null {
   if (!isRecord(value)) return null;

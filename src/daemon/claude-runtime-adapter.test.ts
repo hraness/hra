@@ -1,0 +1,495 @@
+import { describe, expect, test } from "bun:test";
+
+import type { ClaudeProcess, PinnedClaudeRuntime } from "../claude/index";
+import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
+import { PresetProviderMismatchError } from "../domain/presets";
+import { effectiveClaudeRuntimeProfileSchema } from "../domain/runtime-profile";
+import {
+  PinnedClaudeRuntimeManager,
+  type ClaudeSessionFact,
+} from "./claude-runtime-adapter";
+import type { ProfileAuthority } from "./ports";
+
+const CONFIG_DIR = "/var/hra/profiles/acct/claude";
+const PROJECT_ROOT = "/var/hra/projects/demo";
+
+const authority: ProfileAuthority = {
+  codexHome: "/var/hra/profiles/acct/codex",
+  desktopUserData: "/var/hra/profiles/acct/desktop",
+  generation: 3,
+  id: "acct_00000000000000000000000000000000",
+};
+
+class FakeClaudeProcess implements ClaudeProcess {
+  readonly written: string[] = [];
+  #push: ((chunk: Uint8Array) => void) | undefined;
+  #finish: (() => void) | undefined;
+  #resolveExit: ((code: number) => void) | undefined;
+  readonly exited: Promise<number>;
+  readonly stdout: AsyncIterable<Uint8Array>;
+  readonly stderr: AsyncIterable<Uint8Array> = { async *[Symbol.asyncIterator]() { /* silent */ } };
+
+  constructor() {
+    this.exited = new Promise((resolve) => { this.#resolveExit = resolve; });
+    const queue: Uint8Array[] = [];
+    let waiter: (() => void) | undefined;
+    let done = false;
+    this.#push = (chunk) => { queue.push(chunk); waiter?.(); waiter = undefined; };
+    this.#finish = () => { done = true; waiter?.(); waiter = undefined; };
+    this.stdout = {
+      async *[Symbol.asyncIterator]() {
+        for (;;) {
+          const chunk = queue.shift();
+          if (chunk !== undefined) { yield chunk; continue; }
+          if (done) return;
+          await new Promise<void>((resolve) => { waiter = resolve; });
+        }
+      },
+    };
+  }
+
+  emit(...lines: readonly unknown[]): void {
+    this.#push?.(new TextEncoder().encode(lines.map((line) => `${JSON.stringify(line)}\n`).join("")));
+  }
+
+  async write(bytes: Uint8Array): Promise<void> {
+    this.written.push(new TextDecoder().decode(bytes));
+  }
+
+  terminate(): void {
+    this.#finish?.();
+    this.#resolveExit?.(0);
+  }
+
+  forceTerminate(): void { this.terminate(); }
+}
+
+const runtime: PinnedClaudeRuntime = {
+  argv: ["/usr/local/bin/claude", "--print"],
+  effort: CLAUDE_PIN_EFFORT,
+  executablePath: "/usr/local/bin/claude",
+  model: CLAUDE_PIN_MODEL,
+  version: CLAUDE_PIN,
+};
+
+const settle = async (): Promise<void> => {
+  for (let index = 0; index < 12; index += 1) await Promise.resolve();
+  await new Promise((resolve) => { setTimeout(resolve, 1); });
+};
+
+const harness = (options: { isCurrent?: () => boolean } = {}) => {
+  const facts: ClaudeSessionFact[] = [];
+  const processes: FakeClaudeProcess[] = [];
+  const manager = new PinnedClaudeRuntimeManager({
+    configDirFor: () => CONFIG_DIR,
+    isCurrent: options.isCurrent ?? (() => true),
+    now: () => 1_700_000_000_000,
+    observer: { fact: (_authority, fact) => { facts.push(fact); } },
+    processFactory: () => {
+      const process = new FakeClaudeProcess();
+      processes.push(process);
+      return process;
+    },
+    resolveRuntime: async () => runtime,
+  });
+  return { facts, manager, processes };
+};
+
+const signal = (): AbortSignal => new AbortController().signal;
+
+const startSession = async (
+  manager: PinnedClaudeRuntimeManager,
+): Promise<string> => {
+  const review = await manager.reviewSessionStart({
+    authority,
+    fast: false,
+    preset: "fable-max",
+    projectRoot: PROJECT_ROOT,
+    signal: signal(),
+  });
+  const started = await manager.startSession({ authority, review, signal: signal() });
+  return started.providerThreadId;
+};
+
+const startTurn = async (
+  manager: PinnedClaudeRuntimeManager,
+  providerThreadId: string,
+  message: string,
+): Promise<string> => {
+  const review = await manager.reviewTurnStart({
+    authority,
+    fast: false,
+    preset: "fable-max",
+    projectRoot: PROJECT_ROOT,
+    providerThreadId,
+    signal: signal(),
+  });
+  const turn = await manager.startTurn({
+    authority,
+    clientMessageId: "client-1",
+    message,
+    providerThreadId,
+    review,
+    signal: signal(),
+  });
+  return turn.turnId;
+};
+
+describe("pinned Claude runtime manager", () => {
+  test("reviews, starts, runs, and completes one full turn", async () => {
+    const { facts, manager, processes } = harness();
+    const review = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    expect(review.kind).toBe("session_start");
+    expect(effectiveClaudeRuntimeProfileSchema.parse(review.effectiveRuntimeProfile)).toEqual({
+      claudeVersion: CLAUDE_PIN,
+      inputFormat: "stream-json",
+      isolatedConfigDir: true,
+      model: CLAUDE_PIN_MODEL,
+      observedAt: 1_700_000_000_000,
+      outputFormat: "stream-json",
+      permissionMode: "default",
+      preset: "fable-max",
+      processGeneration: 3,
+      profileId: authority.id,
+      reasoningEffort: "max",
+    });
+    expect(manager.pinnedVersion()).toBe(CLAUDE_PIN);
+
+    const started = await manager.startSession({ authority, review, signal: signal() });
+    expect(started.status).toBe("idle");
+    expect(started.projectRoot).toBe(PROJECT_ROOT);
+
+    const turnId = await startTurn(manager, started.providerThreadId, "say ok");
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+    expect(JSON.parse(process.written[0] ?? "") as unknown).toEqual({
+      message: { content: [{ text: "say ok", type: "text" }], role: "user" },
+      type: "user",
+    });
+    expect((await manager.readSession({
+      authority,
+      detail: false,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    })).activeTurnId).toBe(turnId);
+
+    process.emit(
+      {
+        claude_code_version: CLAUDE_PIN,
+        model: CLAUDE_PIN_MODEL,
+        permissionMode: "default",
+        session_id: "sess",
+        subtype: "init",
+        tools: ["Bash"],
+        type: "system",
+      },
+      {
+        message: {
+          content: [{ text: "ok", type: "text" }],
+          id: "msg_1",
+          model: CLAUDE_PIN_MODEL,
+          role: "assistant",
+          type: "message",
+        },
+        parent_tool_use_id: null,
+        session_id: "sess",
+        type: "assistant",
+      },
+      {
+        duration_ms: 2_259,
+        is_error: false,
+        num_turns: 1,
+        result: "ok",
+        session_id: "sess",
+        stop_reason: "end_turn",
+        terminal_reason: "completed",
+        type: "result",
+        usage: { input_tokens: 2, output_tokens: 4 },
+      },
+    );
+    await settle();
+
+    expect(facts.map((fact) => fact.type)).toEqual([
+      "turnStarted",
+      "sessionBootstrapped",
+      "assistantDelta",
+      "tokenUsageUpdated",
+      "turnCompleted",
+      "turnSummary",
+    ]);
+    expect(facts.every((fact) => fact.providerThreadId === started.providerThreadId)).toBe(true);
+    const observation = await manager.observeSession({
+      authority,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    });
+    expect(observation.projection.status).toBe("idle");
+    expect(observation.projection.activeTurnId).toBeUndefined();
+    await manager.close();
+  });
+
+  test("refuses a preset the Claude provider does not support", async () => {
+    const { manager } = harness();
+    await expect(manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "ultra",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toThrow(PresetProviderMismatchError);
+    await expect(manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "low",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toThrow("does not support the `low` model preset");
+    // Fast mode is a Codex service tier; Claude refuses it rather than ignoring it.
+    await expect(manager.reviewSessionStart({
+      authority,
+      fast: true,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toThrow("no HRA fast mode");
+    await manager.close();
+  });
+
+  test("maps every can_use_tool request onto its HRA interaction kind", async () => {
+    const { facts, manager, processes } = harness();
+    const providerThreadId = await startSession(manager);
+    await startTurn(manager, providerThreadId, "work");
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+
+    const ask = (requestId: string, toolName: string, input: unknown, extra: object = {}): void => {
+      process.emit({
+        request: {
+          display_name: toolName,
+          input,
+          subtype: "can_use_tool",
+          tool_name: toolName,
+          tool_use_id: `toolu_${requestId}`,
+          ...extra,
+        },
+        request_id: requestId,
+        type: "control_request",
+      });
+    };
+    ask("r-bash", "Bash", { command: "true" });
+    ask("r-edit", "Edit", { file_path: "notes.md" });
+    ask("r-write", "Write", { file_path: "notes.md" });
+    ask("r-notebook", "NotebookEdit", { notebook_path: "a.ipynb" });
+    ask("r-fetch", "WebFetch", { url: "https://example.com" });
+    ask("r-ask", "AskUserQuestion", {
+      questions: [{
+        header: "Indent",
+        multiSelect: false,
+        options: [{ description: "", label: "tabs" }, { description: "", label: "spaces" }],
+        question: "Tabs or spaces?",
+      }],
+    }, { requires_user_interaction: true });
+    await settle();
+
+    expect(facts.filter((fact) => fact.type === "interactionRequested").map((fact) => fact.kind))
+      .toEqual([
+        "command_approval",
+        "file_change_approval",
+        "file_change_approval",
+        "file_change_approval",
+        "permission_approval",
+        "user_input",
+      ]);
+
+    // Answering goes through the provider authority, which fences the exact
+    // request the daemon recorded.
+    const bashAuthority = manager.interactionAuthority(providerThreadId, "r-bash");
+    expect(typeof bashAuthority.connectionId).toBe("string");
+    expect(bashAuthority).toMatchObject({
+      itemId: "toolu_r-bash",
+      method: "claude/control_request/can_use_tool",
+      processGeneration: 3,
+      profileId: authority.id,
+      requestId: { type: "string", value: "r-bash" },
+      threadId: providerThreadId,
+    });
+    const validated = await manager.validateInteractionResolution({
+      authority,
+      kind: "command_approval",
+      provider: bashAuthority,
+      resolution: { decision: "once", kind: "approval_decision" },
+      signal: signal(),
+    });
+    const written = await manager.resolveInteraction({
+      authority,
+      deadlineAt: 1_700_000_100_000,
+      kind: "command_approval",
+      provider: bashAuthority,
+      resolution: { decision: "once", kind: "approval_decision" },
+      signal: signal(),
+    });
+    expect(written).toEqual({ responseWritten: true });
+    expect(validated.responseDigest).toMatch(/^[a-f0-9]{64}$/u);
+    expect(JSON.parse(process.written.at(-1) ?? "") as unknown).toEqual({
+      response: {
+        request_id: "r-bash",
+        response: { behavior: "allow", toolUseID: "toolu_r-bash", updatedInput: { command: "true" } },
+        subtype: "success",
+      },
+      type: "control_response",
+    });
+
+    // A session-scoped grant is refused: Claude's control response can only
+    // ever authorise this one tool use.
+    const editAuthority = manager.interactionAuthority(providerThreadId, "r-edit");
+    await expect(manager.resolveInteraction({
+      authority,
+      deadlineAt: 1_700_000_100_000,
+      kind: "file_change_approval",
+      provider: editAuthority,
+      resolution: { decision: "session", kind: "approval_decision" },
+      signal: signal(),
+    })).rejects.toThrow("session scope is not available");
+
+    // A declined approval writes a deny with no updated input.
+    await manager.resolveInteraction({
+      authority,
+      deadlineAt: 1_700_000_100_000,
+      kind: "file_change_approval",
+      provider: editAuthority,
+      resolution: { decision: "decline", kind: "approval_decision" },
+      signal: signal(),
+    });
+    expect(JSON.parse(process.written.at(-1) ?? "") as unknown).toMatchObject({
+      response: { response: { behavior: "deny", toolUseID: "toolu_r-edit" } },
+    });
+
+    // A question is answered by id; the wire map is keyed by question text.
+    const askAuthority = manager.interactionAuthority(providerThreadId, "r-ask");
+    await manager.resolveInteraction({
+      authority,
+      deadlineAt: 1_700_000_100_000,
+      kind: "user_input",
+      provider: askAuthority,
+      resolution: { answers: { q0: { answers: ["spaces"] } }, kind: "user_answers" },
+      signal: signal(),
+    });
+    expect(JSON.parse(process.written.at(-1) ?? "") as unknown).toMatchObject({
+      response: { response: { updatedInput: { answers: { "Tabs or spaces?": "spaces" } } } },
+    });
+    await manager.close();
+  });
+
+  test("times an unanswered request out with a deny", async () => {
+    const { manager, processes } = harness();
+    const providerThreadId = await startSession(manager);
+    await startTurn(manager, providerThreadId, "work");
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+    process.emit({
+      request: {
+        display_name: "Bash",
+        input: { command: "true" },
+        subtype: "can_use_tool",
+        tool_name: "Bash",
+        tool_use_id: "toolu_1",
+      },
+      request_id: "req-1",
+      type: "control_request",
+    });
+    await settle();
+    const provider = manager.interactionAuthority(providerThreadId, "req-1");
+    const validated = await manager.validateInteractionTimeout({ authority, provider, signal: signal() });
+    expect(validated.responseDigest).toMatch(/^[a-f0-9]{64}$/u);
+    await manager.timeoutInteraction({ authority, provider, signal: signal() });
+    expect(JSON.parse(process.written.at(-1) ?? "") as unknown).toMatchObject({
+      response: { response: { behavior: "deny" } },
+    });
+    await manager.close();
+  });
+
+  test("steers and interrupts the in-flight turn", async () => {
+    const { manager, processes } = harness();
+    const providerThreadId = await startSession(manager);
+    const turnId = await startTurn(manager, providerThreadId, "count to 40");
+    await manager.steer({
+      activeTurnId: turnId,
+      authority,
+      clientMessageId: "client-2",
+      message: "stop counting now",
+      providerThreadId,
+      signal: signal(),
+    });
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+    expect(JSON.parse(process.written[1] ?? "") as unknown).toEqual({
+      message: { content: [{ text: "stop counting now", type: "text" }], role: "user" },
+      type: "user",
+    });
+    await manager.interrupt({ activeTurnId: turnId, authority, providerThreadId, signal: signal() });
+    expect(JSON.parse(process.written.at(-1) ?? "") as unknown)
+      .toMatchObject({ request: { subtype: "interrupt" }, type: "control_request" });
+    await expect(manager.steer({
+      activeTurnId: "another-turn",
+      authority,
+      clientMessageId: "client-3",
+      message: "no",
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("no longer active");
+    await manager.close();
+  });
+
+  test("fences every operation on the exact account authority", async () => {
+    let current = true;
+    const { manager } = harness({ isCurrent: () => current });
+    const providerThreadId = await startSession(manager);
+    current = false;
+    await expect(manager.readSession({
+      authority,
+      detail: false,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("authority changed");
+    current = true;
+    await expect(manager.readSession({
+      authority: { ...authority, generation: 4 },
+      detail: false,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("another authority");
+    await manager.close();
+  });
+
+  test("refuses a review that names no project directory", async () => {
+    const { manager } = harness();
+    await expect(manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      signal: signal(),
+    })).rejects.toThrow("requires a project directory");
+    await manager.close();
+  });
+
+  test("consumes a runtime review exactly once", async () => {
+    const { manager } = harness();
+    const review = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    await manager.startSession({ authority, review, signal: signal() });
+    await expect(manager.startSession({ authority, review, signal: signal() }))
+      .rejects.toThrow("no longer usable");
+    await manager.close();
+  });
+});

@@ -91,6 +91,30 @@ export function isCommandKind(value: unknown): value is CommandKind {
   return typeof value === "string" && (COMMAND_KINDS as readonly string[]).includes(value);
 }
 
+/**
+ * Device commands are addressed to a device rather than to a session. They are
+ * a separate closed union from `CommandKind` on purpose: the two travel over
+ * different tables, carry different authority, and must never be substituted
+ * for one another by a parser that accepts "any command kind".
+ */
+export type DeviceCommandKind =
+  | "session_start"
+  | "account_login_start"
+  | "account_login_status"
+  | "usage_refresh";
+
+export const DEVICE_COMMAND_KINDS: readonly DeviceCommandKind[] = Object.freeze([
+  "session_start",
+  "account_login_start",
+  "account_login_status",
+  "usage_refresh",
+] as const);
+
+export function isDeviceCommandKind(value: unknown): value is DeviceCommandKind {
+  return typeof value === "string"
+    && (DEVICE_COMMAND_KINDS as readonly string[]).includes(value);
+}
+
 export type CommandState =
   | "pending"
   | "prepared"

@@ -85,6 +85,25 @@ describe("encrypted session projections", () => {
     ));
   });
 
+  test("carries the fable-max preset in a turn summary", () => {
+    // W3: adding a preset widens the compact projection format. The parser is
+    // forward compatible for unknown *keys*, never for unknown enum values, so
+    // a reader older than this build rejects the chunk below and a reader from
+    // this build accepts it.
+    const claudeTurn = [{
+      fast: false,
+      filesTouched: [],
+      gitActions: [],
+      kind: "turn_summary",
+      model: "fable-max",
+      runtimeMs: 2_259,
+      sequence: 1,
+      turnId: "turn_12345678",
+    }] as const;
+    expect(parseCompactSessionEvents(claudeTurn)).toEqual(claudeTurn);
+    expect(parseCompactSessionEvents([{ ...claudeTurn[0], model: "fable" }])).toBeNull();
+  });
+
   test("requires contiguous closed compact events", () => {
     expect(parseCompactSessionEvents(events)).toEqual(events);
     expect(parseCompactSessionEvents([events[0], { ...events[1], sequence: 3 }])).toBeNull();
@@ -146,6 +165,101 @@ describe("encrypted session projections", () => {
       ...interaction,
       summary: ["Bearer", "secret-token-value"].join(" "),
     }])).toBeNull();
+  });
+
+  test("carries bounded interaction detail and refuses a path or secret shaped one", () => {
+    const base = {
+      blocking: true,
+      interactionId: "70000000-0000-4000-8000-000000000001",
+      interactionKind: "command_approval",
+      kind: "interaction_state",
+      revision: 3,
+      sequence: 1,
+      state: "pending",
+      summary: "Codex requests command approval",
+    } as const;
+    const detailed = {
+      ...base,
+      availableDecisions: ["once", "decline"],
+      commandClass: "git commit",
+      detailMarkdown: "- Runs: git commit\n- Directory: src/cloud",
+      detailVersion: 1,
+      headline: "Allow git commit",
+      label: "Command approval",
+    } as const;
+    expect(parseCompactSessionEvents([detailed])).toEqual([detailed]);
+
+    const questioned = {
+      ...base,
+      interactionKind: "user_input",
+      questions: [
+        { id: "where", label: "Where should it run", secret: false },
+        { id: "token", label: "Provider token", secret: true },
+      ],
+    } as const;
+    expect(parseCompactSessionEvents([questioned])).toEqual([questioned]);
+
+    // An older reader ignores the whole block; a newer one that does not know
+    // the revision must ignore it too rather than misread a field.
+    expect(parseCompactSessionEvents([{ ...detailed, detailVersion: 2 }])).toEqual([base]);
+
+    // Path-shaped and secret-shaped detail is refused outright: the emitter
+    // redacts before it writes, so a value that reaches here unredacted is a
+    // writer that cannot be trusted with the rest of the event either.
+    const absoluteFixture = ["", "opt", "private", "repo"].join("/");
+    const secretFixture = ["Bearer", "secret-token-value"].join(" ");
+    for (const unsafe of [
+      { detailMarkdown: `- Directory: ${absoluteFixture}` },
+      { detailMarkdown: `- Reason: ${secretFixture}` },
+      { headline: `Allow rm at ${absoluteFixture}` },
+      { headline: secretFixture },
+      { commandClass: absoluteFixture },
+      { label: "Commandapproval" },
+      { headline: "owned\u202etxt" },
+    ]) expect(parseCompactSessionEvents([{ ...detailed, ...unsafe }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...questioned,
+      questions: [{ id: "where", label: absoluteFixture, secret: false }],
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...questioned,
+      questions: [{ id: absoluteFixture, label: "Where", secret: false }],
+    }])).toBeNull();
+
+    // The remote decision vocabulary is closed: session scope cannot be
+    // written into a projection at all, and a decision must be a decision.
+    for (const decisions of [["session"], ["cancel"], ["once", "once"], [], "once"]) {
+      expect(parseCompactSessionEvents([{ ...detailed, availableDecisions: decisions }])).toBeNull();
+    }
+
+    // Every field is bounded and every list is capped.
+    expect(parseCompactSessionEvents([{ ...detailed, detailMarkdown: "x".repeat(2_049) }])).toBeNull();
+    expect(parseCompactSessionEvents([{ ...detailed, headline: "x".repeat(257) }])).toBeNull();
+    expect(parseCompactSessionEvents([{ ...detailed, label: "x".repeat(65) }])).toBeNull();
+    expect(parseCompactSessionEvents([{ ...detailed, commandClass: "x".repeat(129) }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...questioned,
+      questions: Array.from({ length: 9 }, (_, index) => ({
+        id: `q${String(index)}`,
+        label: "Which",
+        secret: false,
+      })),
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...questioned,
+      questions: [{ id: "a", label: "A", secret: false }, { id: "a", label: "B", secret: false }],
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...questioned,
+      questions: [{ id: "a", label: "A" }],
+    }])).toBeNull();
+
+    // An older writer's detail-free event and a newer writer's detailed one
+    // decode together, and an unknown key on either is still tolerated.
+    expect(parseCompactSessionEvents([
+      base,
+      { ...detailed, hypotheticalFutureField: true, sequence: 2 },
+    ])).toEqual([base, { ...detailed, sequence: 2 }]);
   });
 
   test("versions the user_message actor and mixes old and new chunk shapes", () => {

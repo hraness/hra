@@ -1,5 +1,8 @@
-import type { Preset } from "../domain/presets";
-import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
+import type { Preset, Provider } from "../domain/presets";
+import type {
+  EffectiveClaudeRuntimeProfile,
+  EffectiveRuntimeProfile,
+} from "../domain/runtime-profile";
 import type { AccountRateLimitResetOutcome } from "../domain/usage-metrics";
 import type { CodexTurnStatus } from "../codex/protocol";
 import type { CodexPluginCatalog } from "../codex/protocol";
@@ -18,11 +21,20 @@ export type ProfileAuthority = {
   desktopUserData: string;
 };
 
-export type RuntimeStartReview = {
+/**
+ * The reviewed profile a provider proved before a session or turn may start.
+ * It is parameterised only by the profile document each provider reviews;
+ * every other field of the seam is provider-neutral.
+ */
+export type RuntimeStartReviewOf<Profile> = {
   readonly reviewId: string;
   readonly kind: "session_start" | "turn_start";
-  readonly effectiveRuntimeProfile: EffectiveRuntimeProfile;
+  readonly effectiveRuntimeProfile: Profile;
 };
+
+export type RuntimeStartReview = RuntimeStartReviewOf<EffectiveRuntimeProfile>;
+
+export type ClaudeRuntimeStartReview = RuntimeStartReviewOf<EffectiveClaudeRuntimeProfile>;
 
 export type CodexAccountProjection = {
   signedIn: boolean;
@@ -120,7 +132,73 @@ export type CodexSessionPage = {
   readonly nextCursor: string | null;
 };
 
-export interface CodexRuntimePort {
+/**
+ * The provider-neutral session seam. Everything a session needs to exist,
+ * take turns, be steered, be stopped, and answer a brokered interaction lives
+ * here; every provider-specific capability (Codex sign-in, plugins, thread
+ * listing) stays on that provider's own port. `Profile` is the reviewed
+ * runtime-profile document the provider proves before it runs.
+ *
+ * D4/W3 seam: `CodexRuntimePort` and `ClaudeRuntimePort` are the two
+ * implementations, and the daemon selects one per session by the session's
+ * recorded provider.
+ */
+export interface SessionRuntimePort<Profile> {
+  readonly provider: Provider;
+  reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
+  startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: Profile }>;
+  observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation>;
+  readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
+  reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
+  startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; message: string; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurnStatus; effectiveRuntimeProfile: Profile }>;
+  steer(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; message: string; clientMessageId: string; signal: AbortSignal }): Promise<void>;
+  interrupt(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; signal: AbortSignal }): Promise<void>;
+  inspectInteractionAuthority(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    kind: InteractionKind;
+    signal: AbortSignal;
+  }): Promise<LiveInteractionApprovalAuthority>;
+  validateInteractionResolution(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    kind: InteractionKind;
+    resolution: InteractionResolution;
+    signal: AbortSignal;
+  }): Promise<{ responseDigest: string }>;
+  resolveInteraction(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    kind: InteractionKind;
+    resolution: InteractionResolution;
+    deadlineAt: number;
+    signal: AbortSignal;
+  }): Promise<{ responseWritten: true }>;
+  validateInteractionTimeout(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    signal: AbortSignal;
+  }): Promise<{ responseDigest: string }>;
+  timeoutInteraction(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    signal: AbortSignal;
+  }): Promise<{ responseWritten: true }>;
+  close(): Promise<void>;
+}
+
+/**
+ * The Claude Code implementation of the neutral seam. It adds only what the
+ * neutral seam cannot express: the pinned CLI version this machine admitted.
+ */
+export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRuntimeProfile> {
+  readonly provider: "claude";
+  readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
+  pinnedVersion(): string;
+}
+
+export interface CodexRuntimePort extends SessionRuntimePort<EffectiveRuntimeProfile> {
+  readonly provider: "codex";
   login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<CodexLoginOutcome>;
   cancelLogin(input: { authority: ProfileAuthority; loginId: string; signal: AbortSignal }): Promise<{ status: "canceled" | "not_found" }>;
   logout(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<void>;
@@ -138,14 +216,6 @@ export interface CodexRuntimePort {
     cursor?: string;
     signal: AbortSignal;
   }): Promise<CodexSessionPage>;
-  reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview>;
-  startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReview; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }>;
-  observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation>;
-  readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
-  reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview>;
-  startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReview; message: string; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurnStatus; effectiveRuntimeProfile: EffectiveRuntimeProfile }>;
-  steer(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; message: string; clientMessageId: string; signal: AbortSignal }): Promise<void>;
-  interrupt(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; signal: AbortSignal }): Promise<void>;
   rename(input: { authority: ProfileAuthority; providerThreadId: string; name: string; signal: AbortSignal }): Promise<void>;
   inspectTurn(input: { authority: ProfileAuthority; providerThreadId: string; turnId: string; signal: AbortSignal }): Promise<unknown>;
   inspectInteractionAuthority(input: {
@@ -223,6 +293,7 @@ export type CompactProjectionRecoveryBlocker = Pick<
 > & Pick<CloudControlPort, "readCompactProjectionRecoveryReceipt">;
 
 export class UnavailableCodexRuntime implements CodexRuntimePort {
+  readonly provider = "codex" as const;
   #unavailable(): never { throw new Error("The Codex runtime is unavailable on this machine."); }
   login(): Promise<never> { return Promise.reject(this.#unavailable()); }
   cancelLogin(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -242,6 +313,36 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   interrupt(): Promise<never> { return Promise.reject(this.#unavailable()); }
   rename(): Promise<never> { return Promise.reject(this.#unavailable()); }
   inspectTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  inspectInteractionAuthority(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  validateInteractionResolution(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  resolveInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  validateInteractionTimeout(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  timeoutInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  async close(): Promise<void> {}
+}
+
+/**
+ * The default Claude seam on a machine with no admitted `claude` binary. A
+ * session that names the Claude provider is refused with one clear message
+ * instead of silently falling back to another provider.
+ */
+export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
+  readonly provider = "claude" as const;
+  #unavailable(): never {
+    throw new Error(
+      "The Claude Code runtime is unavailable on this machine. Install the pinned `claude` release, then sign in inside the account's isolated profile.",
+    );
+  }
+  pinnedVersion(): string { return this.#unavailable(); }
+  readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  reviewTurnStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  startTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  steer(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  interrupt(): Promise<never> { return Promise.reject(this.#unavailable()); }
   inspectInteractionAuthority(): Promise<never> { return Promise.reject(this.#unavailable()); }
   validateInteractionResolution(): Promise<never> { return Promise.reject(this.#unavailable()); }
   resolveInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }

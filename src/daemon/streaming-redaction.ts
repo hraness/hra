@@ -75,6 +75,12 @@ export const sanitizeProviderProse = (
   return output;
 };
 
+/** The projected subagent nickname and role bound in `session-events.ts`. */
+const subagentLabelMaximumCharacters = 120;
+
+const sanitizeSubagentLabel = (value: string): string =>
+  sanitizeProviderProse(value, false).slice(0, subagentLabelMaximumCharacters);
+
 const sanitizeProviderToolLabel = (value: string): string => {
   const sanitized = sanitizeProviderProse(value, false);
   let output = "";
@@ -283,6 +289,17 @@ const sanitizeCompleteBody = (
     case "gap":
     case "interaction_state":
       return body;
+    case "subagent_activity": return {
+      ...body,
+      turnId: publicId(body.turnId),
+      agentId: publicId(body.agentId),
+      ...(body.nickname === undefined
+        ? {}
+        : { nickname: sanitizeSubagentLabel(body.nickname) }),
+      ...(body.role === undefined
+        ? {}
+        : { role: sanitizeSubagentLabel(body.role) }),
+    };
     case "session_state": return {
       ...body,
       reason: safe(body.reason),

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   hasExactKeys,
   isCommandKind,
+  isDeviceCommandKind,
   isDigest,
   isOpaqueIdentifier,
   isRecord,
@@ -13,10 +14,13 @@ import {
   parseEncryptedEnvelope,
   type AuthorityTuple,
   type CommandKind,
+  type DeviceCommandKind,
   type EncryptedEnvelope,
 } from "./contracts";
 import type { CloudSecretCustodyPort } from "./local-control";
 import {
+  compactInteractionDetailOf,
+  isCompactInteractionBaselineShape,
   parseCompactSessionEvent,
   type CompactInteractionEvent,
 } from "./projection";
@@ -27,6 +31,10 @@ const journalSlot = "cloud-daemon-journal";
 // consuming the effect-recovery journal's reserved terminal capacity.
 const sessionSyncCursorSlot = "cloud-session-sync-cursor";
 const maximumJournalCommands = 100;
+// Device commands are foreground requests from a browser, one or two at a
+// time. A small ceiling keeps their worst-case terminal reservation from
+// crowding the session-command journal it shares a slot with.
+const maximumJournalDeviceCommands = 16;
 const maximumJournalProjectionRecoveries = 25;
 const maximumProjectionRecoveryBaselineTurns = 128;
 const maximumProjectionRecoveryBaselineInteractions = 200;
@@ -58,6 +66,29 @@ export type CloudCommandJournalEntry = Readonly<{
   localAuthorityDigest: string;
   payloadDigest: string;
   sessionPublicId: string;
+}> & (
+  | Readonly<{ phase: "prepared" }>
+  | Readonly<{ phase: "effect_started" }>
+  | Readonly<{
+      phase: "terminal";
+      resultCode: string;
+      resultDigest: string;
+      terminalState: "applied" | "failed" | "ambiguous";
+    }>
+);
+
+/**
+ * The device-command mirror of `CloudCommandJournalEntry`. It has no session
+ * and no local session authority, so it binds the requesting device instead:
+ * the durable record of "this browser asked this machine to do this, under this
+ * boot authority, and the effect may already have begun".
+ */
+export type CloudDeviceCommandJournalEntry = Readonly<{
+  authority: AuthorityTuple;
+  commandPublicId: string;
+  kind: DeviceCommandKind;
+  payloadDigest: string;
+  requestingDevicePublicId: string;
 }> & (
   | Readonly<{ phase: "prepared" }>
   | Readonly<{ phase: "effect_started" }>
@@ -217,6 +248,16 @@ export type IdentityBoundCloudProjectionRecovery = (
 
 export type CloudDaemonJournalState = Readonly<{
   commands: readonly CloudCommandJournalEntry[];
+  deviceCommands: readonly CloudDeviceCommandJournalEntry[];
+  pendingUsageAccount: PendingCloudUsageAccount | null;
+  projectionRecoveries: readonly CloudProjectionRecoveryJournalEntry[];
+  projectionRecoveryReceipts: readonly CloudProjectionRecoveryTerminalReceipt[];
+  usageAccounts: readonly CloudUsageAccountCursor[];
+  version: 4;
+}>;
+
+export type LegacyCloudDaemonJournalV3State = Readonly<{
+  commands: readonly CloudCommandJournalEntry[];
   pendingUsageAccount: PendingCloudUsageAccount | null;
   projectionRecoveries: readonly CloudProjectionRecoveryJournalEntry[];
   projectionRecoveryReceipts: readonly CloudProjectionRecoveryTerminalReceipt[];
@@ -244,7 +285,8 @@ export type LegacyCloudDaemonJournalState = LegacyCloudDaemonJournalV1State;
 export type CloudDaemonJournalInputState =
   | CloudDaemonJournalState
   | LegacyCloudDaemonJournalV1State
-  | LegacyCloudDaemonJournalV2State;
+  | LegacyCloudDaemonJournalV2State
+  | LegacyCloudDaemonJournalV3State;
 
 export type CloudDaemonJournalObservation = Readonly<{
   generation: number | null;
@@ -468,12 +510,110 @@ export function advanceCloudSessionRemoteCursor(
 export function emptyCloudDaemonJournal(): CloudDaemonJournalState {
   return {
     commands: [],
+    deviceCommands: [],
     pendingUsageAccount: null,
     projectionRecoveries: [],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 3,
+    version: 4,
   };
+}
+
+function maximumTerminalDeviceCommandEntry(
+  entry: CloudDeviceCommandJournalEntry,
+): CloudDeviceCommandJournalEntry {
+  return parseDeviceCommand({
+    ...entry,
+    authority: {
+      bootGeneration: Number.MAX_SAFE_INTEGER,
+      bootId: "b".repeat(96),
+      fence: Number.MAX_SAFE_INTEGER,
+    },
+    phase: "terminal",
+    resultCode: "R".repeat(64),
+    resultDigest: "f".repeat(64),
+    terminalState: "ambiguous",
+  });
+}
+
+function sameDeviceCommandBase(
+  left: CloudDeviceCommandJournalEntry,
+  right: CloudDeviceCommandJournalEntry,
+): boolean {
+  return left.commandPublicId === right.commandPublicId
+    && left.kind === right.kind
+    && left.payloadDigest === right.payloadDigest
+    && left.requestingDevicePublicId === right.requestingDevicePublicId;
+}
+
+export function addCloudDeviceCommandJournalEntry(
+  state: CloudDaemonJournalState,
+  entry: CloudDeviceCommandJournalEntry,
+): CloudDaemonJournalState {
+  const canonical = parseCloudDaemonJournal(state);
+  const canonicalEntry = parseDeviceCommand(entry);
+  const current = canonical.deviceCommands.find((candidate) =>
+    candidate.commandPublicId === canonicalEntry.commandPublicId);
+  if (current !== undefined) {
+    if (JSON.stringify(current) !== JSON.stringify(canonicalEntry)) {
+      throw new Error("Cloud device command journal conflict.");
+    }
+    return canonical;
+  }
+  if (canonical.deviceCommands.length >= maximumJournalDeviceCommands) {
+    throw new Error("Cloud device command journal is full.");
+  }
+  const next = parseCloudDaemonJournal({
+    ...canonical,
+    deviceCommands: [...canonical.deviceCommands, canonicalEntry],
+  });
+  assertCloudDaemonJournalFutureCapacity(next);
+  return next;
+}
+
+export function transitionCloudDeviceCommandJournalEntry(
+  state: CloudDaemonJournalState,
+  replacement: CloudDeviceCommandJournalEntry,
+): CloudDaemonJournalState {
+  const canonical = parseCloudDaemonJournal(state);
+  const canonicalReplacement = parseDeviceCommand(replacement);
+  const index = canonical.deviceCommands.findIndex((candidate) =>
+    candidate.commandPublicId === canonicalReplacement.commandPublicId);
+  const current = canonical.deviceCommands[index];
+  if (index < 0 || current === undefined) {
+    throw new Error("Cloud device command journal entry is missing.");
+  }
+  if (JSON.stringify(current) === JSON.stringify(canonicalReplacement)) return canonical;
+  if (
+    !sameDeviceCommandBase(current, canonicalReplacement)
+    || !(
+      (current.phase === "prepared"
+        && (canonicalReplacement.phase === "effect_started"
+          || canonicalReplacement.phase === "terminal"))
+      || (current.phase === "effect_started" && canonicalReplacement.phase === "terminal")
+    )
+    || (canonicalReplacement.phase === "effect_started"
+      && JSON.stringify(current.authority) !== JSON.stringify(canonicalReplacement.authority))
+  ) throw new Error("Cloud device command journal transition is invalid.");
+  const deviceCommands = [...canonical.deviceCommands];
+  deviceCommands[index] = canonicalReplacement;
+  const next = parseCloudDaemonJournal({ ...canonical, deviceCommands });
+  if (canonicalReplacement.phase !== "terminal") {
+    assertCloudDaemonJournalFutureCapacity(next);
+  }
+  return next;
+}
+
+export function removeCloudDeviceCommandJournalEntry(
+  state: CloudDaemonJournalState,
+  commandPublicId: string,
+): CloudDaemonJournalState {
+  const canonical = parseCloudDaemonJournal(state);
+  return parseCloudDaemonJournal({
+    ...canonical,
+    deviceCommands: canonical.deviceCommands.filter((entry) =>
+      entry.commandPublicId !== commandPublicId),
+  });
 }
 
 function maximumTerminalCommandEntry(
@@ -525,6 +665,9 @@ export function assertCloudDaemonJournalFutureCapacity(
     commands: canonical.commands.map((entry) => entry.phase === "terminal"
       ? entry
       : maximumTerminalCommandEntry(entry)),
+    deviceCommands: canonical.deviceCommands.map((entry) => entry.phase === "terminal"
+      ? entry
+      : maximumTerminalDeviceCommandEntry(entry)),
     projectionRecoveries: canonical.projectionRecoveries.map((entry) =>
       entry.phase === "applied"
         ? entry
@@ -868,6 +1011,66 @@ function parseCommandKind(value: unknown): CommandKind | null {
   return isCommandKind(value) ? value : null;
 }
 
+function parseDeviceCommand(value: unknown): CloudDeviceCommandJournalEntry {
+  if (!isRecord(value)) throw new Error("Cloud daemon journal is corrupt.");
+  const terminal = value.phase === "terminal";
+  const expected = terminal
+    ? [
+        "authority",
+        "commandPublicId",
+        "kind",
+        "payloadDigest",
+        "phase",
+        "requestingDevicePublicId",
+        "resultCode",
+        "resultDigest",
+        "terminalState",
+      ]
+    : [
+        "authority",
+        "commandPublicId",
+        "kind",
+        "payloadDigest",
+        "phase",
+        "requestingDevicePublicId",
+      ];
+  const authority = parseAuthorityTuple(value.authority);
+  if (
+    !hasExactKeys(value, expected)
+    || authority === null
+    || !isUuidV7(value.commandPublicId)
+    || !isDeviceCommandKind(value.kind)
+    || !isDigest(value.payloadDigest)
+    || (value.phase !== "prepared"
+      && value.phase !== "effect_started"
+      && value.phase !== "terminal")
+    || !isOpaqueIdentifier(value.requestingDevicePublicId)
+  ) throw new Error("Cloud daemon journal is corrupt.");
+  const base = {
+    authority,
+    commandPublicId: value.commandPublicId,
+    kind: value.kind,
+    payloadDigest: value.payloadDigest,
+    requestingDevicePublicId: value.requestingDevicePublicId,
+  };
+  if (value.phase !== "terminal") return { ...base, phase: value.phase };
+  if (
+    typeof value.resultCode !== "string"
+    || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(value.resultCode)
+    || !isDigest(value.resultDigest)
+    || (value.terminalState !== "applied"
+      && value.terminalState !== "failed"
+      && value.terminalState !== "ambiguous")
+  ) throw new Error("Cloud daemon journal is corrupt.");
+  return {
+    ...base,
+    phase: value.phase,
+    resultCode: value.resultCode,
+    resultDigest: value.resultDigest,
+    terminalState: value.terminalState,
+  };
+}
+
 function parseCommand(value: unknown): CloudCommandJournalEntry {
   if (!isRecord(value)) throw new Error("Cloud daemon journal is corrupt.");
   const terminal = value.phase === "terminal";
@@ -1029,17 +1232,9 @@ function parseProjectionRecoveryBaselineTurn(
 function parseProjectionRecoveryBaselineInteraction(
   value: unknown,
 ): CloudProjectionRecoveryBaselineInteraction {
-  if (
-    !isRecord(value)
-    || !hasExactKeys(value, [
-      "blocking",
-      "interactionId",
-      "interactionKind",
-      "revision",
-      "state",
-      "summary",
-    ])
-  ) throw new Error("Cloud daemon journal is corrupt.");
+  if (!isCompactInteractionBaselineShape(value)) {
+    throw new Error("Cloud daemon journal is corrupt.");
+  }
   const parsed = parseCompactSessionEvent({
     ...value,
     kind: "interaction_state",
@@ -1049,6 +1244,7 @@ function parseProjectionRecoveryBaselineInteraction(
     throw new Error("Cloud daemon journal is corrupt.");
   }
   return {
+    ...compactInteractionDetailOf(parsed),
     blocking: parsed.blocking,
     interactionId: parsed.interactionId,
     interactionKind: parsed.interactionKind,
@@ -1524,37 +1720,50 @@ function migrateLegacyProjectionRecovery(
   return { ...entry, ...identity };
 }
 
+function journalExactKeys(version: 1 | 2 | 3 | 4): readonly string[] {
+  if (version === 1) return ["commands", "pendingUsageAccount", "usageAccounts", "version"];
+  if (version === 2) {
+    return [
+      "commands",
+      "pendingUsageAccount",
+      "projectionRecoveries",
+      "usageAccounts",
+      "version",
+    ];
+  }
+  const three = [
+    "commands",
+    "pendingUsageAccount",
+    "projectionRecoveries",
+    "projectionRecoveryReceipts",
+    "usageAccounts",
+    "version",
+  ];
+  return version === 3 ? three : ["deviceCommands", ...three];
+}
+
 function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalState {
   if (
     !isRecord(value)
-    || (value.version !== 1 && value.version !== 2 && value.version !== 3)
-    || !hasExactKeys(value, value.version === 1
-      ? ["commands", "pendingUsageAccount", "usageAccounts", "version"]
-      : value.version === 2
-        ? [
-            "commands",
-            "pendingUsageAccount",
-            "projectionRecoveries",
-            "usageAccounts",
-            "version",
-          ]
-        : [
-          "commands",
-          "pendingUsageAccount",
-          "projectionRecoveries",
-          "projectionRecoveryReceipts",
-          "usageAccounts",
-          "version",
-        ])
+    || (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== 4)
+    || !hasExactKeys(value, journalExactKeys(value.version))
     || !Array.isArray(value.commands)
     || value.commands.length > maximumJournalCommands
     || !Array.isArray(value.usageAccounts)
     || value.usageAccounts.length > 100
   ) throw new Error("Cloud daemon journal is corrupt.");
   const commands = value.commands.map(parseCommand);
+  let deviceCommands: readonly CloudDeviceCommandJournalEntry[] = [];
+  if (value.version === 4) {
+    if (
+      !Array.isArray(value.deviceCommands)
+      || value.deviceCommands.length > maximumJournalDeviceCommands
+    ) throw new Error("Cloud daemon journal is corrupt.");
+    deviceCommands = value.deviceCommands.map(parseDeviceCommand);
+  }
   let projectionRecoveries: readonly CloudProjectionRecoveryJournalEntry[] = [];
   let projectionRecoveryReceipts: readonly CloudProjectionRecoveryTerminalReceipt[] = [];
-  if (value.version === 3) {
+  if (value.version === 3 || value.version === 4) {
     if (
       !Array.isArray(value.projectionRecoveries)
       || value.projectionRecoveries.length > maximumJournalProjectionRecoveries
@@ -1593,6 +1802,8 @@ function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalSta
   ];
   if (
     new Set(commands.map((entry) => entry.commandPublicId)).size !== commands.length
+    || new Set(deviceCommands.map((entry) => entry.commandPublicId)).size
+      !== deviceCommands.length
     || new Set(projectionRecoveries.map((entry) => entry.epochPublicId)).size
       !== projectionRecoveries.length
     || new Set(recoveryIdempotencyKeys).size !== recoveryIdempotencyKeys.length
@@ -1602,11 +1813,12 @@ function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalSta
   ) throw new Error("Cloud daemon journal is corrupt.");
   const parsed: CloudDaemonJournalState = {
     commands,
+    deviceCommands,
     pendingUsageAccount: parsePendingUsageAccount(value.pendingUsageAccount),
     projectionRecoveries,
     projectionRecoveryReceipts,
     usageAccounts,
-    version: 3,
+    version: 4,
   };
   return parsed;
 }
@@ -1625,6 +1837,22 @@ function legacyProjectionRecoveryForStorage(
 function serializeCloudDaemonJournalForCustody(state: CloudDaemonJournalState): string {
   const canonical = JSON.stringify(state);
   if (serializedJournalFits(canonical)) return canonical;
+
+  // Every shrinking fallback drops the device-command array, so it can only be
+  // taken while that array is empty. A journal holding device-command evidence
+  // is never silently downgraded to a version that cannot carry it.
+  if (state.deviceCommands.length > 0) throw new Error("Cloud daemon journal is corrupt.");
+
+  const legacyV3: LegacyCloudDaemonJournalV3State = {
+    commands: state.commands,
+    pendingUsageAccount: state.pendingUsageAccount,
+    projectionRecoveries: state.projectionRecoveries,
+    projectionRecoveryReceipts: state.projectionRecoveryReceipts,
+    usageAccounts: state.usageAccounts,
+    version: 3,
+  };
+  const serializedV3 = JSON.stringify(legacyV3);
+  if (serializedJournalFits(serializedV3)) return serializedV3;
 
   if (
     state.projectionRecoveries.length === 0

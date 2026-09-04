@@ -17,12 +17,22 @@ import {
 import { useCustody } from "../custody/custody-context";
 import { useArchivedSessions } from "../data/archived-sessions";
 import { useCommandState, useSubmitCommand } from "../data/commands";
+import {
+  useConsumeDeviceCommandResult,
+  useDeviceCommandState,
+  useSubmitDeviceCommand,
+} from "../data/device-commands";
 import { useDevices, useServerNow, type DeviceView } from "../data/devices";
 import { useDeviceRegistries } from "../data/registry";
 import { useSessionHeads } from "../data/session-heads";
 import { pageSize } from "../env";
 import type { CommandState, RemoteCommandPayload } from "../hra/cloud";
 import { formatRelativeTime, formatUtcDay } from "../model/relative-time";
+import {
+  accountLoginStartCommand,
+  accountLoginStatusCommand,
+  deviceCommandNotice,
+} from "../model/device-commands";
 import {
   approvalModeCommand,
   approvalModeLabels,
@@ -46,6 +56,7 @@ import {
   commandTargetForMachine,
   machineLabelsByDevice,
   shortSessionId,
+  type AccountRowView,
   type ArchivedSessionView,
   type CommandTarget,
   type MachineView,
@@ -329,6 +340,120 @@ function ArchivedSessionRow({
   );
 }
 
+/**
+ * One account, with the browser linking flow behind the machine's local opt-in.
+ *
+ * With the opt-in off the row shows the CLI instruction and nothing else: the
+ * button is absent rather than disabled, because a machine that has not opted in
+ * would refuse the command anyway. With it on, "Link here" relays a provider
+ * login URL that is single use and short lived — the hosted row erases the
+ * ciphertext on the first read, so it opens once and cannot be replayed. Poll
+ * asks the machine what its login is doing; it is one way and returns only a
+ * status and an instruction.
+ */
+function AccountRow({ account }: Readonly<{ account: AccountRowView }>) {
+  const submitDeviceCommand = useSubmitDeviceCommand();
+  const consumeResult = useConsumeDeviceCommandResult();
+  const [commandPublicId, setCommandPublicId] = useState<string | null>(null);
+  const [relay, setRelay] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const command = useDeviceCommandState(commandPublicId);
+  const notice = deviceCommandNotice(command);
+
+  // The relay is exchanged exactly once, as soon as the command settles. A
+  // second tab watching the same command gets nothing, which is the point.
+  useEffect(() => {
+    if (
+      command === null
+      || command.state !== "applied"
+      || !command.resultSingleUse
+      || command.resultConsumed
+      || command.kind !== "account_login_start"
+    ) return;
+    let cancelled = false;
+    void consumeResult(command.publicId)
+      .then((result) => {
+        if (cancelled || result === null) return;
+        if (result.kind === "account_login_start") setRelay(result.loginUrl);
+      })
+      .catch(() => { /* The notice already reports a settled command. */ });
+    return () => { cancelled = true; };
+  }, [command, consumeResult]);
+
+  useEffect(() => {
+    if (command?.state !== "applied" || command.kind !== "account_login_status") return;
+    setStatus("The machine reported its login state. Re-check from the machine if it stays idle.");
+  }, [command?.kind, command?.state]);
+
+  const run = (payload: Parameters<typeof submitDeviceCommand>[0]["payload"]) => {
+    if (busy) return;
+    setBusy(true);
+    setRelay(null);
+    setStatus(null);
+    void submitDeviceCommand({ payload, targetDevicePublicId: account.targetDevicePublicId })
+      .then((publicId) => { setCommandPublicId(publicId); })
+      .catch((failure: unknown) => {
+        setStatus(failure instanceof Error ? failure.message : "The request was not accepted.");
+      })
+      .finally(() => { setBusy(false); });
+  };
+
+  return (
+    <SettingsRow
+      control={(
+        <>
+          <Badge tone="neutral">{account.provider}</Badge>
+          <Badge tone={account.status === "signed_in" ? "accent" : "attention"}>
+            {accountStatusLabels[account.status]}
+          </Badge>
+        </>
+      )}
+      description={account.machineLabel}
+      title={account.label}
+    >
+      {account.accountLinkingAllowed ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            disabled={busy}
+            onClick={() => { run(accountLoginStartCommand(account.publicId)); }}
+            size="small"
+            variant="secondary"
+          >
+            Link here
+          </Button>
+          <Button
+            disabled={busy}
+            onClick={() => { run(accountLoginStatusCommand()); }}
+            size="small"
+            variant="ghost"
+          >
+            Check status
+          </Button>
+        </div>
+      ) : (
+        <CommandHint>{`hra account login ${account.label}`}</CommandHint>
+      )}
+      {relay === null ? null : (
+        <p className="text-xs text-ink-muted">
+          <a className="underline" href={relay} rel="noreferrer noopener" target="_blank">
+            Open the provider login (single use, expires shortly)
+          </a>
+        </p>
+      )}
+      {notice === null ? null : (
+        <p
+          className={notice.tone === "error" ? "text-xs text-danger" : "text-xs text-ink-muted"}
+          role="status"
+        >
+          {notice.text}
+        </p>
+      )}
+      {status === null ? null : <p className="text-xs text-ink-muted">{status}</p>}
+    </SettingsRow>
+  );
+}
+
 function DeviceRow({ device, now }: Readonly<{ device: DeviceView; now: number }>) {
   const seen = device.lastSeenAt === null
     ? "never seen"
@@ -476,22 +601,16 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
           <SettingsCard>
             {accounts.length === 0 ? <EmptyRow>No accounts published yet.</EmptyRow> : null}
             {accounts.map((account) => (
-              <SettingsRow
-                control={(
-                  <>
-                    <Badge tone="neutral">{account.provider}</Badge>
-                    <Badge tone={account.status === "signed_in" ? "accent" : "attention"}>
-                      {accountStatusLabels[account.status]}
-                    </Badge>
-                  </>
-                )}
-                description={account.machineLabel}
-                key={`${account.machineLabel}:${account.publicId}`}
-                title={account.label}
-              />
+              <AccountRow account={account} key={`${account.machineLabel}:${account.publicId}`} />
             ))}
             <SettingsRow
-              description="Linking from the browser arrives later."
+              description="Relaying a login link to this browser is off until a machine opts in."
+              title="Allow linking from the browser"
+            >
+              <CommandHint>hra remote allow account-linking</CommandHint>
+            </SettingsRow>
+            <SettingsRow
+              description="Always available, and the fallback whenever the relay is not."
               title="Link an account from the machine"
             >
               <CommandHint>hra account login &lt;profile&gt;</CommandHint>

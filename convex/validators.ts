@@ -51,6 +51,15 @@ export const commandKind = v.union(
   v.literal("rename_session"),
   v.literal("set_gateway_key"),
 );
+// Device commands are addressed to a device, not to a session, so they carry
+// their own closed union. Nothing here may ever name a session: a command that
+// needs one belongs in `commandKind` above.
+export const deviceCommandKind = v.union(
+  v.literal("session_start"),
+  v.literal("account_login_start"),
+  v.literal("account_login_status"),
+  v.literal("usage_refresh"),
+);
 export const commandState = v.union(
   v.literal("pending"),
   v.literal("prepared"),
@@ -141,6 +150,8 @@ export const maintenanceCategory = v.union(
   v.literal("idempotency_receipts"),
   v.literal("pending_commands"),
   v.literal("terminal_commands"),
+  v.literal("pending_device_commands"),
+  v.literal("terminal_device_commands"),
   v.literal("security_events"),
   v.literal("usage_snapshots"),
   v.literal("account_deletion_receipts"),

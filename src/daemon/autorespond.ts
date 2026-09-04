@@ -10,6 +10,7 @@
  * through the daemon's ordinary resolve path and records evidence.
  */
 
+import { permissionCategoryIsNetworkOrExternal } from "../domain/interactions";
 import type { ApprovalMode, InteractionDisplay, InteractionKind } from "../domain/interactions";
 
 export const AUTORESPOND_CONSECUTIVE_LIMIT = 3;
@@ -35,8 +36,6 @@ export type AutorespondEscalation =
   | "hourly_budget"
   | "daily_budget";
 
-const networkPermissionPattern = /(?:network|internet|http|https|url|fetch|socket|dns|proxy|mcp|remote|web)/iu;
-
 /*
  * Bounded class label for evidence and for the `auto:workspace` gate. Command
  * approvals carry a provider command class; permission approvals are classed
@@ -61,9 +60,14 @@ export function permissionNamesOf(display: InteractionDisplay): string[] {
     : [];
 }
 
+/*
+ * The category test itself lives in `src/domain/interactions.ts` so the remote
+ * decision verifier refuses exactly the categories this gate escalates.
+ */
 export function isNetworkOrExternalPermission(display: Extract<InteractionDisplay, { kind: "permission_approval" }>): boolean {
   if (display.requested.length === 0) return true;
-  return display.requested.some((permission) => networkPermissionPattern.test(permission.name));
+  return display.requested.some((permission) =>
+    permissionCategoryIsNetworkOrExternal(permission.name));
 }
 
 export function decideAutorespond(input: Readonly<{

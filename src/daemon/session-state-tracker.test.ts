@@ -87,4 +87,29 @@ describe("session state tracker", () => {
     expect(tracker.observe("sess_g", { type: "turn_completed", turnId: turn, status: "completed" }))
       .toMatchObject({ state: "working" });
   });
+
+  test("observed subagent activity raises and lowers the open count without double counting", () => {
+    const tracker = new SessionStateTracker(() => 1);
+    const activity = (agentId: string, kind: "started" | "interacted" | "interrupted" | "completed") =>
+      tracker.observe("sess_h", { type: "subagent_activity", turnId: turn, agentId, kind });
+    const settle = (): unknown => {
+      tracker.observe("sess_h", { type: "turn_started", turnId: turn });
+      tracker.observe("sess_h", { type: "assistant_delta", turnId: turn, itemId: "item_1", text: "Fanned out." });
+      return tracker.observe("sess_h", { type: "turn_completed", turnId: turn, status: "completed" });
+    };
+
+    expect(activity("agent_a", "started")).toBeNull();
+    // The same marker item is announced on both its start and its completion.
+    expect(activity("agent_a", "started")).toBeNull();
+    activity("agent_b", "started");
+    activity("agent_a", "interacted");
+    expect(settle()).toMatchObject({ state: "working", reason: expect.stringContaining("subagents") });
+
+    activity("agent_a", "completed");
+    activity("agent_a", "completed");
+    expect(settle()).toMatchObject({ state: "working" });
+
+    activity("agent_b", "interrupted");
+    expect(settle()).toMatchObject({ state: "done" });
+  });
 });

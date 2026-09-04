@@ -17,6 +17,12 @@ import {
   type ProtectedInteractionJson,
 } from "../domain/interactions.ts";
 import { PUBLIC_MCP_FORM_SUMMARY } from "../public-provider-identifier.ts";
+import {
+  containsAbsolutePath,
+  containsUnsafeTerminalScalar,
+  redactAbsolutePaths,
+} from "../domain/text-safety.ts";
+import { redactCompleteSensitiveText } from "../sensitive-text.ts";
 import { CodexError } from "./errors.ts";
 import {
   array,
@@ -132,7 +138,7 @@ export function assertPinnedCodexServerRequestMatrix(): void {
  */
 export const PINNED_CODEX_NOTIFICATION_MATRIX = Object.freeze({
   error: "reduced",
-  "thread/started": "ignored",
+  "thread/started": "reduced",
   "thread/status/changed": "routed",
   "thread/archived": "ignored",
   "thread/deleted": "routed",
@@ -176,6 +182,7 @@ export const PINNED_CODEX_NOTIFICATION_MATRIX = Object.freeze({
   "item/mcpToolCall/progress": "reduced",
   "mcpServer/oauthLogin/completed": "ignored",
   "mcpServer/startupStatus/updated": "ignored",
+  "mcpServer/event/stream/notification": "ignored",
   "account/updated": "routed",
   "account/rateLimits/updated": "routed",
   "app/list/updated": "ignored",
@@ -189,6 +196,8 @@ export const PINNED_CODEX_NOTIFICATION_MATRIX = Object.freeze({
   "thread/compacted": "ignored",
   "model/rerouted": "ignored",
   "model/verification": "ignored",
+  "modelProvider/authRecoveryStarted": "ignored",
+  "modelProvider/authRecoveryCompleted": "ignored",
   "turn/moderationMetadata": "ignored",
   "model/safetyBuffering/updated": "ignored",
   warning: "reduced",
@@ -199,6 +208,9 @@ export const PINNED_CODEX_NOTIFICATION_MATRIX = Object.freeze({
   "fuzzyFileSearch/sessionCompleted": "ignored",
   "thread/realtime/started": "ignored",
   "thread/realtime/itemAdded": "ignored",
+  "thread/realtime/item/started": "ignored",
+  "thread/realtime/item/transcript/delta": "ignored",
+  "thread/realtime/item/completed": "ignored",
   "thread/realtime/transcript/delta": "ignored",
   "thread/realtime/transcript/done": "ignored",
   "thread/realtime/outputAudio/delta": "ignored",
@@ -699,6 +711,22 @@ export type CodexThreadStatus =
 
 export type CodexTurnStatus = "completed" | "interrupted" | "failed" | "inProgress";
 
+/**
+ * `SubAgentActivityKind` in the pinned generated schema. The pinned release
+ * reports subagent lifecycle through a `subAgentActivity` thread item on the
+ * parent thread; its `agentPath` names an agent definition file on disk and is
+ * deliberately never retained, so only the kind and the agent thread id cross
+ * this boundary.
+ */
+export type CodexSubagentActivityKind = "started" | "interacted" | "interrupted" | "completed";
+
+export const CODEX_SUBAGENT_ACTIVITY_KINDS = Object.freeze([
+  "started",
+  "interacted",
+  "interrupted",
+  "completed",
+] as const satisfies readonly CodexSubagentActivityKind[]);
+
 export type CodexThreadItem =
   | {
       readonly type: "userMessage";
@@ -731,6 +759,12 @@ export type CodexThreadItem =
       readonly status: string;
       readonly pluginId: string | null;
       readonly durationMs: number | null;
+    }
+  | {
+      readonly type: "subAgentActivity";
+      readonly id: string;
+      readonly kind: CodexSubagentActivityKind;
+      readonly agentThreadId: string;
     }
   | { readonly type: "unsupported"; readonly id: string; readonly providerType: string };
 
@@ -849,6 +883,28 @@ type CodexFactBody =
       readonly status?: string;
       readonly server?: string;
       readonly tool?: string;
+      /**
+       * Present only for a `subAgentActivity` item. Both the started and the
+       * completed notification of one marker item carry the same activity, so
+       * every consumer of this field must be idempotent per agent thread.
+       */
+      readonly subagent?: {
+        readonly agentThreadId: string;
+        readonly kind: CodexSubagentActivityKind;
+      };
+    }
+  | {
+      /**
+       * A subagent thread the pinned app-server started for `threadId`. The
+       * fact is keyed by the parent thread so it routes to the HRA session
+       * that owns the spawning conversation.
+       */
+      readonly type: "subagentThreadStarted";
+      readonly threadId: string;
+      readonly agentThreadId: string;
+      readonly depth?: number;
+      readonly nickname?: string;
+      readonly role?: string;
     }
   | {
       readonly type: "assistantDelta";
@@ -1682,6 +1738,14 @@ function parseThreadItem(value: unknown, index: number): CodexThreadItem {
       durationMs: nullableNonnegativeNumber(root.durationMs, "mcp durationMs"),
     };
   }
+  if (providerType === "subAgentActivity") {
+    return {
+      type: providerType,
+      id,
+      kind: oneOf(root.kind, "subagent activity kind", CODEX_SUBAGENT_ACTIVITY_KINDS),
+      agentThreadId: identifier(root.agentThreadId, "subagent thread id"),
+    };
+  }
   return { type: "unsupported", id, providerType };
 }
 
@@ -1727,6 +1791,51 @@ const nullableSafeDisplayText = (
 ): string | null => value === null || value === undefined
   ? null
   : safeDisplayText(value, label, maximum);
+
+/** Matches `boundedDetailText(120)` on the hosted `detail` boundary. */
+const SUBAGENT_LABEL_MAX_BYTES = 120;
+const SUBAGENT_MAX_DEPTH = 32;
+
+/*
+ * A subagent nickname or role is provider-authored free text. It is bounded,
+ * stripped of control scalars, cleared of anything path-shaped, and redacted
+ * of secret-shaped runs before it can become a projected label. Anything that
+ * still fails the public checks is dropped rather than repaired.
+ */
+const subagentLabel = (value: unknown, label: string): string | undefined => {
+  if (value === null || value === undefined) return undefined;
+  const bounded = redactAbsolutePaths(
+    safeDisplayText(value, label, SUBAGENT_LABEL_MAX_BYTES),
+  ).trim();
+  const redacted = redactCompleteSensitiveText(bounded).trim();
+  if (
+    redacted.length === 0
+    || canonicalTextEncoder.encode(redacted).byteLength > SUBAGENT_LABEL_MAX_BYTES
+    || containsAbsolutePath(redacted)
+    || containsUnsafeTerminalScalar(redacted)
+  ) return undefined;
+  return redacted;
+};
+
+/** `SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. })`. */
+const subagentSpawnDepth = (value: unknown): number | undefined => {
+  const source = optionalRecord(value);
+  const subAgent = optionalRecord(source?.subAgent);
+  const spawn = optionalRecord(subAgent?.thread_spawn);
+  const depth = spawn?.depth;
+  if (
+    typeof depth !== "number"
+    || !Number.isSafeInteger(depth)
+    || depth < 0
+    || depth > SUBAGENT_MAX_DEPTH
+  ) return undefined;
+  return depth;
+};
+
+const optionalRecord = (value: unknown): UnknownRecord | undefined =>
+  value === null || typeof value !== "object" || Array.isArray(value)
+    ? undefined
+    : value as UnknownRecord;
 
 const canonicalJson = (value: unknown): string => {
   if (value === null) return "null";
@@ -2930,6 +3039,28 @@ export function parseFact(method: string, params: unknown): CodexFact {
       success: boolean(root.success, "login success"),
     };
   }
+  if (method === "thread/started") {
+    // Reduced only for a spawned subagent: the parent thread id routes the
+    // fact to the HRA session that owns the conversation, and the bounded
+    // nickname, role, and depth are the only fields retained. Every other
+    // thread start stays discarded.
+    const thread = record(root.thread, "started thread");
+    const parentThreadId = nullableString(thread.parentThreadId ?? null, "parent thread id", 512);
+    if (parentThreadId === null || parentThreadId.length === 0) {
+      return { type: "notificationIgnored", method: "thread/started" };
+    }
+    const nickname = subagentLabel(thread.agentNickname, "subagent nickname");
+    const role = subagentLabel(thread.agentRole, "subagent role");
+    const depth = subagentSpawnDepth(thread.source);
+    return {
+      type: "subagentThreadStarted",
+      threadId: parentThreadId,
+      agentThreadId: identifier(thread.id, "subagent thread id"),
+      ...(depth === undefined ? {} : { depth }),
+      ...(nickname === undefined ? {} : { nickname }),
+      ...(role === undefined ? {} : { role }),
+    };
+  }
   if (method === "thread/status/changed") {
     return {
       type: "threadStatusChanged",
@@ -2979,6 +3110,12 @@ export function parseFact(method: string, params: unknown): CodexFact {
     const liveAcceptanceCommandDigest = itemKind === "commandExecution"
       ? safeLiveAcceptanceCommandDigest(string(item.command, "command", { max: 1_000_000 }))
       : undefined;
+    const subagent = itemKind === "subAgentActivity"
+      ? {
+          agentThreadId: identifier(item.agentThreadId, "subagent thread id"),
+          kind: oneOf(item.kind, "subagent activity kind", CODEX_SUBAGENT_ACTIVITY_KINDS),
+        }
+      : undefined;
     return {
       type: method === "item/started" ? "itemStarted" : "itemCompleted",
       threadId: identifier(root.threadId, "thread id"),
@@ -2989,6 +3126,7 @@ export function parseFact(method: string, params: unknown): CodexFact {
       ...(status === undefined ? {} : { status }),
       ...(server === undefined ? {} : { server }),
       ...(tool === undefined ? {} : { tool }),
+      ...(subagent === undefined ? {} : { subagent }),
     };
   }
   if (method === "item/agentMessage/delta") {

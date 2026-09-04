@@ -6,6 +6,7 @@ import {
   copyFile,
   link,
   lstat,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -38,14 +39,15 @@ import {
   USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
   StateStore,
 } from "../storage/state-store";
-import { cloudLimits } from "./contracts";
+import { cloudLimits, containsAbsolutePath } from "./contracts";
 import type {
+  CloudCommandExecutionResult,
   CloudDaemonBridge,
   CloudDaemonCycleResult,
   CloudLocalCommandAuthority,
 } from "./daemon-bridge";
 import { BridgedCloudControl, StateBackedCloudDaemonAdapter } from "./daemon-adapters";
-import { parseDeviceRegistryPayload } from "./payloads";
+import { parseDeviceRegistryPayload, type RemoteCommandPayload } from "./payloads";
 import type { CloudRemoteControlPort } from "./local-control";
 
 const privateRootFixture = ["", "Users", "alice", "private"].join("/");
@@ -56,6 +58,7 @@ function sha256(value: string): string {
 }
 
 class FakeCodex implements CodexRuntimePort {
+  readonly provider = "codex" as const;
   projection: CodexSessionProjection = {
     providerThreadId: "thread_0001",
     providerUpdatedAt: 1_000,
@@ -144,6 +147,22 @@ class FakeCodex implements CodexRuntimePort {
 }
 
 const temporaryDirectories: string[] = [];
+
+/**
+ * The whole of the detail an `mcp_elicitation` interaction projects. The
+ * server name, every field name, and every choice stay on the machine: an MCP
+ * form is declared as possibly carrying protected values, so the projection
+ * says only that one exists and where it is answered.
+ */
+const mcpElicitationProjectedDetail = {
+  detailMarkdown: [
+    "- This form may contain protected values.",
+    "- It is completed on the machine running the session.",
+  ].join("\n"),
+  detailVersion: 1,
+  headline: "Codex requests MCP form input",
+  label: "MCP form",
+} as const;
 
 async function fixture(): Promise<Readonly<{
   codex: FakeCodex;
@@ -738,6 +757,7 @@ describe("state-backed cloud daemon adapter", () => {
         revision: 1,
         sequence: 4,
         state: "pending",
+        ...mcpElicitationProjectedDetail,
         summary: "An MCP server requests protected form input",
       });
       const serialized = JSON.stringify(first.events.at(-1));
@@ -770,6 +790,7 @@ describe("state-backed cloud daemon adapter", () => {
         revision: 2,
         sequence: 5,
         state: "expired",
+        ...mcpElicitationProjectedDetail,
         summary: "An MCP server requests protected form input",
       });
       await adapter.listSessions({ limit: 25, signal });
@@ -861,6 +882,7 @@ describe("state-backed cloud daemon adapter", () => {
         revision: 2,
         sequence: 5,
         state: "expired",
+        ...mcpElicitationProjectedDetail,
         summary: "An MCP server requests protected form input",
       }]);
       expect(JSON.stringify(terminal.events)).not.toContain(unobservedId);
@@ -2109,6 +2131,7 @@ describe("state-backed cloud daemon adapter", () => {
         interactionKind: "mcp_elicitation",
         revision: 2,
         state: "expired",
+        ...mcpElicitationProjectedDetail,
         summary: "An MCP server requests protected form input",
       }]);
       const installation = {
@@ -2148,6 +2171,7 @@ describe("state-backed cloud daemon adapter", () => {
         revision: 2,
         sequence: 301,
         state: "expired",
+        ...mcpElicitationProjectedDetail,
         summary: "An MCP server requests protected form input",
       }]);
 
@@ -3261,6 +3285,462 @@ describe("remote decisions at the custodian", () => {
   });
 });
 
+describe("remote interaction detail and the decisions it licenses", () => {
+  const leaseAuthority = { bootGeneration: 1, bootId: "boot_00000001", fence: 1 } as const;
+  let sequence = 0;
+
+  function admitDisplay(
+    value: Awaited<ReturnType<typeof fixture>>,
+    publicId: string,
+    display: Parameters<StateStore["admitInteraction"]>[0]["display"],
+  ): void {
+    sequence += 1;
+    const suffix = String(sequence).padStart(12, "0");
+    // The decision verifier reads the wall clock, so the fixture clock is
+    // advanced to it: an interaction admitted at the fixture's epoch would be
+    // past its deadline before any decision could be verified.
+    value.setNow(Date.now());
+    const session = value.store.requireSession(value.sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    value.store.admitInteraction({
+      authority: {
+        approvalId: null,
+        connectionId: `90000000-0000-4000-8000-${suffix}`,
+        itemId: null,
+        method: "item/commandExecution/requestApproval",
+        processGeneration: profile.processGeneration,
+        profileId: profile.id,
+        requestDigest: "e".repeat(64),
+        requestId: { type: "string", value: `request_${publicId}` },
+        threadId: session.providerThreadId ?? null,
+        turnId: null,
+      },
+      blocking: true,
+      display,
+      kind: display.kind,
+      publicId,
+      sessionId: value.sessionId as `sess_${string}`,
+    });
+  }
+
+  async function harness(
+    value: Awaited<ReturnType<typeof fixture>>,
+  ): Promise<Readonly<{
+    adapter: StateBackedCloudDaemonAdapter;
+    commands: LocalCommand[];
+    projected: (interactionId: string) => Promise<Record<string, unknown> | undefined>;
+    resolve: (
+      payload: Extract<RemoteCommandPayload, { kind: "resolve_interaction" }>,
+    ) => Promise<CloudCommandExecutionResult>;
+  }>> {
+    const commands: LocalCommand[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
+      paths: value.paths,
+      store: value.store,
+    });
+    const signal = new AbortController().signal;
+    const authority = await adapter.resolveCommandAuthority({
+      sessionPublicId: value.sessionId,
+      signal,
+    });
+    let key = 0;
+    return {
+      adapter,
+      commands,
+      projected: async (interactionId) => {
+        await adapter.listSessions({ limit: 25, signal });
+        const read = await adapter.readCompactEvents({
+          afterSequence: 0,
+          limit: 128,
+          sessionPublicId: value.sessionId,
+          signal,
+        });
+        return read.events.find((event) =>
+          event.kind === "interaction_state" && event.interactionId === interactionId) as
+            Record<string, unknown> | undefined;
+      },
+      resolve: async (payload) => {
+        key += 1;
+        return await adapter.execute({
+          authority: authority as CloudLocalCommandAuthority,
+          idempotencyKey: `00000000-0000-7000-8000-0000000005${String(key).padStart(2, "0")}`,
+          leaseAuthority,
+          payload,
+          sessionPublicId: value.sessionId,
+          signal,
+        });
+      },
+    };
+  }
+
+  test("projects a command class and a bounded detail, never the exact command or a local path", async () => {
+    const value = await fixture();
+    const interactionId = "70000000-0000-4000-8000-000000000301";
+    const absoluteFixture = ["", "opt", "private", "checkout"].join("/");
+    admitDisplay(value, interactionId, {
+      availableDecisions: ["once", "decline"],
+      commandClass: "git commit",
+      kind: "command_approval",
+      reason: `Commit the staged work in ${absoluteFixture}`,
+      summary: "Allow git commit",
+      workingDirectory: "src/cloud",
+    });
+    const harnessed = await harness(value);
+    try {
+      const event = await harnessed.projected(interactionId);
+      expect(event).toMatchObject({
+        availableDecisions: ["once", "decline"],
+        commandClass: "git commit",
+        detailVersion: 1,
+        headline: "Allow git commit",
+        label: "Command approval",
+      });
+      const detail = event?.detailMarkdown as string;
+      expect(detail).toContain("- Runs: git commit");
+      expect(detail).toContain("- Directory: src/cloud");
+      const serialized = JSON.stringify(event);
+      expect(serialized).not.toContain("private");
+      expect(containsAbsolutePath(serialized)).toBe(false);
+
+      expect(await harnessed.resolve({
+        decision: "once",
+        interactionId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      expect(harnessed.commands.at(-1)).toMatchObject({
+        kind: "interaction.resolve",
+        resolution: { decision: "once", kind: "approval_decision" },
+      });
+    } finally {
+      harnessed.adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("licenses a workspace permission approval and refuses one the class cannot cover", async () => {
+    const value = await fixture();
+    const workspaceId = "70000000-0000-4000-8000-000000000311";
+    const networkId = "70000000-0000-4000-8000-000000000312";
+    admitDisplay(value, workspaceId, {
+      allowsSessionScope: true,
+      kind: "permission_approval",
+      reason: "Write the generated file",
+      requested: [{ name: "workspace_write" }],
+      summary: "Allow additional workspace permissions",
+    });
+    admitDisplay(value, networkId, {
+      allowsSessionScope: true,
+      kind: "permission_approval",
+      reason: "Reach the package registry",
+      requested: [{ name: "network_outbound" }],
+      summary: "Allow additional permissions",
+    });
+    const harnessed = await harness(value);
+    try {
+      const workspace = await harnessed.projected(workspaceId);
+      expect(workspace).toMatchObject({
+        availableDecisions: ["once", "decline"],
+        commandClass: "permission:workspace",
+      });
+      expect(workspace?.detailMarkdown).toContain("- Requested category: workspace");
+      // The class is projected; the exact requested value never is.
+      expect(JSON.stringify(workspace)).not.toContain("workspace_write");
+
+      const network = await harnessed.projected(networkId);
+      expect(network?.commandClass).toBeUndefined();
+      expect(JSON.stringify(network)).not.toContain("network_outbound");
+      expect(network?.detailMarkdown).toContain("- Requested category: network");
+
+      expect(await harnessed.resolve({
+        decision: "once",
+        interactionId: workspaceId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      expect(harnessed.commands.at(-1)).toMatchObject({
+        kind: "interaction.resolve",
+        resolution: { kind: "permission_grant", permissions: ["workspace_write"], scope: null },
+      });
+
+      // A network category has no re-verifiable class, so neither direction is
+      // decidable from a device.
+      for (const decision of ["once", "decline"] as const) {
+        expect(await harnessed.resolve({
+          decision,
+          interactionId: networkId,
+          kind: "resolve_interaction",
+          revision: 1,
+        })).toEqual({ code: "INTERACTION_PERMISSION_CLASS_UNVERIFIED", state: "failed" });
+      }
+      expect(await harnessed.resolve({
+        decision: "cancel",
+        interactionId: networkId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_PERMISSION_DECISION_UNAVAILABLE", state: "failed" });
+    } finally {
+      harnessed.adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("lists a secret question without an answer path and answers only the plain ones", async () => {
+    const value = await fixture();
+    const interactionId = "70000000-0000-4000-8000-000000000321";
+    admitDisplay(value, interactionId, {
+      blocking: true,
+      kind: "user_input",
+      questions: [
+        {
+          allowsOther: true,
+          header: "Region",
+          id: "region",
+          options: null,
+          question: "Which region should it deploy to?",
+          secret: false,
+        },
+        {
+          allowsOther: true,
+          header: "Registry token",
+          id: "registry_token",
+          options: null,
+          question: "Paste the registry token.",
+          secret: true,
+        },
+      ],
+      summary: "Codex needs user input",
+    });
+    const harnessed = await harness(value);
+    try {
+      const event = await harnessed.projected(interactionId);
+      expect(event?.questions).toEqual([
+        { id: "region", label: "Region", secret: false },
+        { id: "registry_token", label: "Registry token", secret: true },
+      ]);
+      // The projection carries the secret question's identity so the reader
+      // knows what is being asked, and carries nothing that could become its
+      // value: no field contract, no options, no prior answer.
+      expect(event?.detailMarkdown).toContain("- Registry token: answered on the machine");
+      expect(event?.detailMarkdown).not.toContain("Paste the registry token");
+
+      // The local resolve path answers a question set whole, so every way of
+      // answering this one is refused: the protected value alone, the set that
+      // carries it, and the partial set that leaves it out.
+      for (const answers of [
+        { registry_token: { answers: ["a-token"] } },
+        { region: { answers: ["eu"] }, registry_token: { answers: ["a-token"] } },
+        { region: { answers: ["eu"] } },
+      ]) {
+        expect(await harnessed.resolve({
+          answers,
+          interactionId,
+          kind: "resolve_interaction",
+          revision: 1,
+        })).toEqual({ code: "INTERACTION_SECRET_ANSWER_REFUSED", state: "failed" });
+      }
+      expect(harnessed.commands.filter((command) =>
+        command.kind === "interaction.resolve")).toHaveLength(0);
+
+      // A question set with nothing protected in it is answered from here.
+      const plainId = "70000000-0000-4000-8000-000000000322";
+      admitDisplay(value, plainId, {
+        blocking: true,
+        kind: "user_input",
+        questions: [{
+          allowsOther: true,
+          header: "Region",
+          id: "region",
+          options: null,
+          question: "Which region should it deploy to?",
+          secret: false,
+        }],
+        summary: "Codex needs user input",
+      });
+      expect(await harnessed.resolve({
+        answers: { region: { answers: ["eu"] } },
+        interactionId: plainId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toMatchObject({ state: "applied" });
+      expect(harnessed.commands.at(-1)).toMatchObject({
+        kind: "interaction.resolve",
+        resolution: { answers: { region: { answers: ["eu"] } }, kind: "user_answers" },
+      });
+    } finally {
+      harnessed.adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("answers a plain-text MCP form and refuses one whose values are not text", async () => {
+    const value = await fixture();
+    const textId = "70000000-0000-4000-8000-000000000331";
+    const typedId = "70000000-0000-4000-8000-000000000332";
+    admitDisplay(value, textId, {
+      fields: [{
+        format: null,
+        maxLength: 64,
+        minLength: 1,
+        name: "region",
+        required: true,
+        type: "string",
+      }],
+      kind: "mcp_elicitation",
+      mayContainSecrets: true,
+      mode: "form",
+      serverName: "deploy_server",
+      summary: "Review provider input",
+      url: null,
+    });
+    admitDisplay(value, typedId, {
+      fields: [{
+        choices: ["blue", "green"],
+        name: "slot",
+        required: true,
+        type: "single_select",
+      }],
+      kind: "mcp_elicitation",
+      mayContainSecrets: true,
+      mode: "form",
+      serverName: "deploy_server",
+      summary: "Review provider input",
+      url: null,
+    });
+    const harnessed = await harness(value);
+    try {
+      const text = await harnessed.projected(textId);
+      expect(text?.questions).toEqual([{ id: "region", label: "region", secret: false }]);
+      // The server name and every unanswerable field name stay local.
+      expect(JSON.stringify(text)).not.toContain("deploy_server");
+      const typed = await harnessed.projected(typedId);
+      expect(typed?.questions).toBeUndefined();
+      expect(JSON.stringify(typed)).not.toContain("slot");
+
+      expect(await harnessed.resolve({
+        answers: { region: { answers: ["eu"] } },
+        interactionId: textId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toMatchObject({ state: "applied" });
+      expect(harnessed.commands.at(-1)).toMatchObject({
+        kind: "interaction.resolve",
+        resolution: { action: "accept", content: { region: "eu" }, kind: "mcp_submission" },
+      });
+
+      // A field this device could not have been shown is a protected value,
+      // whatever its type, so the secret refusal is the one that fires.
+      expect(await harnessed.resolve({
+        answers: { slot: { answers: ["blue"] } },
+        interactionId: typedId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_SECRET_ANSWER_REFUSED", state: "failed" });
+      expect(await harnessed.resolve({
+        answers: { region: { answers: ["eu"] } },
+        interactionId: typedId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+      expect(await harnessed.resolve({
+        answers: { region: { answers: ["eu", "us"] } },
+        interactionId: textId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+    } finally {
+      harnessed.adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("refuses accepting a file change from a device and preserves every earlier code", async () => {
+    const value = await fixture();
+    const interactionId = "70000000-0000-4000-8000-000000000341";
+    admitDisplay(value, interactionId, {
+      availableDecisions: ["once", "decline"],
+      grantRoot: "src",
+      kind: "file_change_approval",
+      reason: "Write the generated module",
+      summary: "Allow a file change",
+    });
+    const harnessed = await harness(value);
+    try {
+      const event = await harnessed.projected(interactionId);
+      expect(event).toMatchObject({ availableDecisions: ["once", "decline"] });
+      expect(event?.commandClass).toBeUndefined();
+      expect(event?.detailMarkdown).toContain("cannot show the exact affected paths");
+
+      expect(await harnessed.resolve({
+        decision: "once",
+        interactionId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_FILE_CHANGE_ACCEPT_NOT_REMOTE", state: "failed" });
+      expect(await harnessed.resolve({
+        answers: { region: { answers: ["eu"] } },
+        interactionId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ANSWERS_NOT_REMOTE", state: "failed" });
+      expect(await harnessed.resolve({
+        decision: "decline",
+        interactionId,
+        kind: "resolve_interaction",
+        revision: 4,
+      })).toEqual({ code: "INTERACTION_REVISION_STALE", state: "failed" });
+      expect(await harnessed.resolve({
+        decision: "decline",
+        interactionId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      value.store.expireInteraction({ id: interactionId, expectedRevision: 1 });
+      expect(await harnessed.resolve({
+        decision: "decline",
+        interactionId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ALREADY_RESOLVED", state: "failed" });
+    } finally {
+      harnessed.adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("refuses a decision on a question and an answer on an approval", async () => {
+    const value = await fixture();
+    const questionId = "70000000-0000-4000-8000-000000000351";
+    admitDisplay(value, questionId, {
+      blocking: true,
+      kind: "user_input",
+      questions: [{
+        allowsOther: true,
+        header: "Region",
+        id: "region",
+        options: null,
+        question: "Which region?",
+        secret: false,
+      }],
+      summary: "Codex needs user input",
+    });
+    const harnessed = await harness(value);
+    try {
+      expect(await harnessed.resolve({
+        decision: "once",
+        interactionId: questionId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_DECISION_NOT_REMOTE", state: "failed" });
+    } finally {
+      harnessed.adapter.close();
+      value.store.close();
+    }
+  });
+});
+
 describe("settings commands and the device registry", () => {
   const leaseAuthority = { bootGeneration: 1, bootId: "boot_00000001", fence: 1 } as const;
 
@@ -3476,6 +3956,307 @@ describe("settings commands and the device registry", () => {
     } finally {
       adapter.close();
       value.store.close();
+    }
+  });
+});
+
+/*
+ * Device command guards. Every one of them is decided locally, before any
+ * effect: the two `hra remote allow|deny` switches, the requesting device's
+ * day bucket, and the account and project the registry projected. Each refusal
+ * has its own closed code so the browser can name the operator switch.
+ */
+async function deviceCommandFixture() {
+  const value = await fixture();
+  const root = join(value.paths.root, "device-command-project");
+  await mkdir(root, { recursive: true });
+  const project = await value.store.createProject("Control plane", root, true);
+  const account = value.store.listProfiles()[0];
+  if (account === undefined) throw new Error("missing account fixture");
+  const executed: LocalCommand[] = [];
+  const notices: string[] = [];
+  const adapter = new StateBackedCloudDaemonAdapter({
+    codex: value.codex,
+    executeLocal: (command) => {
+      executed.push(command);
+      return Promise.resolve(command.kind === "session.start"
+        ? { session: { id: value.sessionId } }
+        : {});
+    },
+    executeRemote: () => Promise.resolve({}),
+    notifyOperator: (input) => { notices.push(input.title); return Promise.resolve(); },
+    now: () => 1_760_000_000_000,
+    paths: value.paths,
+    store: value.store,
+  });
+  const sessionStart = {
+    accountPublicId: account.id,
+    kind: "session_start" as const,
+    preset: "ultra" as const,
+    projectPublicId: project.id,
+    prompt: "continue the migration",
+    provider: "codex" as const,
+  };
+  return { account, adapter, executed, notices, project, sessionStart, value };
+}
+
+describe("device command execution", () => {
+  test("starts a session then sends its prompt, inheriting the project approval mode", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      world.value.store.setDefaultApprovalMode("manual");
+      world.value.store.setProjectApprovalMode(world.project.id, "auto:workspace");
+      const outcome = await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000001",
+        payload: world.sessionStart,
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      expect(outcome).toMatchObject({
+        code: "APPLIED",
+        result: { kind: "session_start", sessionPublicId: world.value.sessionId },
+        state: "applied",
+      });
+      expect(world.executed.map((command) => command.kind))
+        .toEqual(["session.start", "session.send"]);
+      // One device command, two local effects, two distinct derived keys.
+      const keys = world.executed.map((command) =>
+        (command as { idempotencyKey?: string }).idempotencyKey);
+      expect(new Set(keys).size).toBe(2);
+      expect(world.value.store.readSessionApprovalMode(world.value.sessionId as SessionId))
+        .toEqual({ mode: "auto:workspace", source: "session" });
+      // The desktop notice fires on the first session start from this device.
+      expect(world.notices).toEqual(["HRA: new device started a session"]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("quarantines a send that may or may not have reached the started session", async () => {
+    const value = await fixture();
+    const root = join(value.paths.root, "ambiguous-project");
+    await mkdir(root, { recursive: true });
+    const project = await value.store.createProject("Ambiguous", root, true);
+    const account = value.store.listProfiles()[0];
+    if (account === undefined) throw new Error("missing account fixture");
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeLocal: (command) => command.kind === "session.start"
+        ? Promise.resolve({ session: { id: value.sessionId } })
+        : Promise.reject(new Error("the provider connection dropped")),
+      executeRemote: () => Promise.resolve({}),
+      notifyOperator: () => Promise.resolve(),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const outcome = await adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000002",
+        payload: {
+          accountPublicId: account.id,
+          kind: "session_start",
+          preset: "ultra",
+          projectPublicId: project.id,
+          prompt: "continue",
+          provider: "codex",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      // The session exists, so this is never a clean failure and never carries
+      // a session id a client could treat as a completed start.
+      expect(outcome).toEqual({ code: "LOCAL_SESSION_SEND_INDETERMINATE", state: "ambiguous" });
+      expect(outcome.result).toBeUndefined();
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("the kill switch refuses every device command with its own code", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      world.value.store.setDeviceCommandsAllowed(false);
+      const signal = new AbortController().signal;
+      for (const payload of [
+        world.sessionStart,
+        { kind: "usage_refresh" as const },
+        { kind: "account_login_status" as const },
+      ]) {
+        expect(await world.adapter.executeDeviceCommand({
+          idempotencyKey: "018bcfe5-6800-7000-8000-000000000003",
+          payload,
+          requestingDevicePublicId: "device_browser1",
+          signal,
+        })).toEqual({ code: "DEVICE_COMMANDS_DENIED", state: "failed" });
+      }
+      expect(world.executed).toEqual([]);
+      expect(world.notices).toEqual([]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("account linking needs the local opt-in and refuses a non-relayable URL", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      const signal = new AbortController().signal;
+      const payload = { accountPublicId: world.account.id, kind: "account_login_start" as const };
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000004",
+        payload,
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "ACCOUNT_LINKING_DENIED", state: "failed" });
+
+      world.value.store.setAccountLinkingAllowed(true);
+      // The daemon's login returned a loopback callback, which no other device
+      // can complete: the command fails closed rather than relaying it.
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000005",
+        payload,
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" });
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("relays a single-use https login URL when the machine has opted in", async () => {
+    const value = await fixture();
+    const account = value.store.listProfiles()[0];
+    if (account === undefined) throw new Error("missing account fixture");
+    value.store.setAccountLinkingAllowed(true);
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeLocal: () => Promise.resolve({
+        login: { loginId: "login_1", status: "pending", verificationUrl: "https://auth.example.test/device?code=abc" },
+      }),
+      executeRemote: () => Promise.resolve({}),
+      now: () => 1_760_000_000_000,
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const outcome = await adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000006",
+        payload: { accountPublicId: account.id, kind: "account_login_start" },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      expect(outcome).toMatchObject({ code: "APPLIED", singleUseResult: true, state: "applied" });
+      expect(outcome.result).toEqual({
+        expiresAt: 1_760_000_000_000 + 5 * 60 * 1_000,
+        kind: "account_login_start",
+        loginUrl: "https://auth.example.test/device?code=abc",
+      });
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("reports login status one way, with a CLI instruction and no account", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      world.value.store.setAccountLinkingAllowed(true);
+      const outcome = await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000007",
+        payload: { kind: "account_login_status" },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      expect(outcome).toMatchObject({ code: "APPLIED", state: "applied" });
+      expect(outcome.result).toMatchObject({ kind: "account_login_status", status: "idle" });
+      expect(JSON.stringify(outcome.result)).toContain("hra account login");
+      expect(world.executed).toEqual([]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("refuses addressing the registry does not carry", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      const signal = new AbortController().signal;
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000008",
+        payload: { ...world.sessionStart, accountPublicId: "acct_missing0001" },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "DEVICE_COMMAND_ACCOUNT_UNKNOWN", state: "failed" });
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000009",
+        payload: { ...world.sessionStart, projectPublicId: "proj_missing0001" },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "DEVICE_COMMAND_PROJECT_UNKNOWN", state: "failed" });
+      expect(world.executed).toEqual([]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("caps a device at its daily budget and refreshes usage for signed-in accounts", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      const signal = new AbortController().signal;
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000a",
+        payload: { kind: "usage_refresh" },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toMatchObject({ code: "APPLIED", result: { accountsRefreshed: 1 }, state: "applied" });
+
+      world.value.store.recordDeviceCommandAdmission({
+        dayCount: 100,
+        dayKey: Math.floor(1_760_000_000_000 / (24 * 60 * 60 * 1_000)),
+        devicePublicId: "device_browser1",
+        notifiedFirstSessionStart: false,
+      });
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000b",
+        payload: { kind: "usage_refresh" },
+        requestingDevicePublicId: "device_browser1",
+        signal,
+      })).toEqual({ code: "DEVICE_COMMAND_DAILY_CAP", state: "failed" });
+      // A second device has its own budget.
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000c",
+        payload: { kind: "usage_refresh" },
+        requestingDevicePublicId: "device_browser2",
+        signal,
+      })).toMatchObject({ state: "applied" });
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("projects the two switches into the device registry", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      const signal = new AbortController().signal;
+      const before = await world.adapter.readDeviceRegistry({ signal });
+      expect(parseDeviceRegistryPayload(before)).toMatchObject({
+        accountLinkingAllowed: false,
+        deviceCommandsAllowed: true,
+      });
+      world.value.store.setDeviceCommandsAllowed(false);
+      world.value.store.setAccountLinkingAllowed(true);
+      expect(await world.adapter.readDeviceRegistry({ signal })).toMatchObject({
+        accountLinkingAllowed: true,
+        deviceCommandsAllowed: false,
+      });
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
     }
   });
 });

@@ -14,6 +14,7 @@ import {
   commandKind,
   commandState,
   deviceClass,
+  deviceCommandKind,
   deviceRevocationCategory,
   deviceRevocationState,
   deviceStatus,
@@ -340,6 +341,56 @@ export default defineSchema({
     .index("by_idempotency", [
       "userId",
       "sessionId",
+      "requestingDeviceId",
+      "kind",
+      "idempotencyKey",
+    ])
+    .index("by_user", ["userId"]),
+  // Device commands are addressed to a device, never to a session. There is no
+  // session id, no execution lease, and no per-session FIFO: the fence that
+  // orders them is the target daemon's own boot authority, bound at prepare and
+  // only ever replaced by a strictly greater fence (see convex/deviceCommands.ts).
+  deviceCommands: defineTable({
+    boundAuthority: v.optional(v.object({
+      bootGeneration: v.number(),
+      bootId: v.string(),
+      fence: v.number(),
+    })),
+    createdAt: v.number(),
+    deadline: v.number(),
+    idempotencyKey: v.string(),
+    kind: deviceCommandKind,
+    nonterminal: v.boolean(),
+    payload: encryptedEnvelope,
+    publicId: v.string(),
+    requestDigest: v.string(),
+    requestingDeviceId: v.id("devices"),
+    requesterAcknowledgedAt: v.optional(v.number()),
+    // Set when a settled result is single use (an account-linking relay URL).
+    // `deviceCommands:consumeResult` clears `result` on the first read and
+    // stamps this, so a second read can prove the result is spent rather than
+    // absent.
+    resultConsumedAt: v.optional(v.number()),
+    result: v.optional(encryptedEnvelope),
+    resultCode: v.optional(v.string()),
+    resultDigest: v.optional(v.string()),
+    resultSingleUse: v.optional(v.boolean()),
+    state: commandState,
+    targetDeviceId: v.id("devices"),
+    terminalCleanupAfter: v.optional(v.number()),
+    updatedAt: v.number(),
+    userId: v.id("users"),
+  })
+    .index("by_public_id", ["publicId"])
+    .index("by_target_and_created_at", ["targetDeviceId", "createdAt"])
+    .index("by_target_state_and_created_at", ["targetDeviceId", "state", "createdAt"])
+    .index("by_target_nonterminal_and_created_at", ["targetDeviceId", "nonterminal", "createdAt"])
+    .index("by_requesting_device_and_nonterminal", ["requestingDeviceId", "nonterminal", "createdAt"])
+    .index("by_state_and_deadline", ["state", "deadline"])
+    .index("by_state_and_cleanup_after", ["state", "terminalCleanupAfter"])
+    .index("by_idempotency", [
+      "userId",
+      "targetDeviceId",
       "requestingDeviceId",
       "kind",
       "idempotencyKey",

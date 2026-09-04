@@ -157,7 +157,31 @@ async function terminalizeCommands(
   const requested = requestedCandidates.filter((command) =>
     !targetedIds.has(String(command._id)));
   remaining -= requested.length;
-  const records = [...targeted, ...requested];
+
+  // Device commands live in their own table but drain on exactly the same
+  // rule: a revoked device can neither execute what was addressed to it nor
+  // acknowledge what it asked another device to do.
+  const targetedDevice = remaining === 0
+    ? []
+    : await ctx.db.query("deviceCommands")
+      .withIndex("by_target_nonterminal_and_created_at", (builder) => builder
+        .eq("targetDeviceId", input.deviceId)
+        .eq("nonterminal", true))
+      .take(remaining);
+  remaining -= targetedDevice.length;
+  const requestedDeviceCandidates = remaining === 0
+    ? []
+    : await ctx.db.query("deviceCommands")
+      .withIndex("by_requesting_device_and_nonterminal", (builder) => builder
+        .eq("requestingDeviceId", input.deviceId)
+        .eq("nonterminal", true))
+      .take(remaining);
+  const targetedDeviceIds = new Set(targetedDevice.map((command) => String(command._id)));
+  const requestedDevice = requestedDeviceCandidates.filter((command) =>
+    !targetedDeviceIds.has(String(command._id)));
+  remaining -= requestedDevice.length;
+
+  const records = [...targeted, ...requested, ...targetedDevice, ...requestedDevice];
   const now = Date.now();
   for (const command of records) {
     if (command.state === "pending" || command.state === "prepared") {

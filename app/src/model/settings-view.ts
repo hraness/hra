@@ -71,10 +71,15 @@ export type ScheduledTaskView = Readonly<{
 }>;
 
 export type MachineView = Readonly<{
+  // The two local device-command switches, as this machine last published
+  // them. A registry written before device commands existed carries neither,
+  // which reads as the shipped defaults: commands allowed, linking denied.
+  accountLinkingAllowed: boolean;
   accounts: readonly DeviceRegistryAccount[];
   daemonVersion: string;
   defaultApprovalMode: ApprovalMode;
   defaultPreset: PresetChoice;
+  deviceCommandsAllowed: boolean;
   devicePublicId: string;
   heartbeatAt: number;
   label: string;
@@ -99,10 +104,12 @@ export type MachineViewInput = Readonly<{
 export function toMachineView(input: MachineViewInput): MachineView {
   const { payload } = input;
   return {
+    accountLinkingAllowed: payload.accountLinkingAllowed ?? false,
     accounts: payload.accounts,
     daemonVersion: payload.daemonVersion,
     defaultApprovalMode: payload.defaultApprovalMode,
     defaultPreset: payload.defaultPreset,
+    deviceCommandsAllowed: payload.deviceCommandsAllowed ?? true,
     devicePublicId: input.devicePublicId,
     heartbeatAt: payload.heartbeatAt,
     label: payload.machineLabel,
@@ -240,11 +247,14 @@ export function archivedSessionRows(
 }
 
 export type AccountRowView = Readonly<{
+  /** The machine's local opt-in: `hra remote allow account-linking`. */
+  accountLinkingAllowed: boolean;
   label: string;
   machineLabel: string;
   provider: DeviceRegistryAccount["provider"];
   publicId: string;
   status: DeviceRegistryAccount["status"];
+  targetDevicePublicId: string;
 }>;
 
 export const accountStatusLabels: Readonly<
@@ -258,10 +268,12 @@ export const accountStatusLabels: Readonly<
 
 export function accountRows(machines: readonly MachineView[]): readonly AccountRowView[] {
   return machines.flatMap((machine) => machine.accounts.map((account) => ({
+    accountLinkingAllowed: machine.accountLinkingAllowed,
     label: account.label,
     machineLabel: machine.label,
     provider: account.provider,
     publicId: account.publicId,
     status: account.status,
+    targetDevicePublicId: machine.devicePublicId,
   })));
 }

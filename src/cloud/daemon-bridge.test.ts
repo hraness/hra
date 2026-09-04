@@ -5,12 +5,15 @@ import type {
   AuthorityTuple,
   CommandKind,
   CommandState,
+  DeviceCommandKind,
   EncryptedEnvelope,
 } from "./contracts";
 import {
   type ActiveCloudIdentity,
   type CloudCommandExecutorPort,
   type CloudDaemonIdentityPort,
+  type CloudDeviceCommandExecutionResult,
+  type CloudDeviceCommandExecutorPort,
   type CloudDaemonLocalSourcePort,
   type CloudLocalSessionHead,
   type CloudLocalSessionPage,
@@ -51,9 +54,13 @@ import {
   type CloudPushWakeSubscriber,
 } from "./push-wake";
 import { hmacSha256Hex, sha256Hex } from "./crypto";
+import { deviceCommandRecoveryAdmitted } from "./device-commands";
 import {
   decryptDeviceRegistry,
+  decryptDeviceCommandResult,
+  encryptDeviceCommand,
   encryptRemoteCommand,
+  type DeviceCommandPayload,
   type DeviceRegistryPayload,
   type RemoteCommandPayload,
 } from "./payloads";
@@ -136,6 +143,28 @@ type FakeCommand = {
   updatedAt: number;
 };
 
+function sameAuthorityTuple(left: AuthorityTuple, right: AuthorityTuple): boolean {
+  return left.bootGeneration === right.bootGeneration
+    && left.bootId === right.bootId
+    && left.fence === right.fence;
+}
+
+type FakeDeviceCommand = {
+  boundAuthority?: AuthorityTuple;
+  createdAt: number;
+  deadline: number;
+  kind: DeviceCommandKind;
+  payload: EncryptedEnvelope;
+  publicId: string;
+  requestingDevicePublicId: string;
+  result?: EncryptedEnvelope;
+  resultCode?: string;
+  resultDigest?: string;
+  singleUseResult?: boolean;
+  state: CommandState;
+  updatedAt: number;
+};
+
 class FakeCloud {
   now = fixedNow;
   offline = false;
@@ -170,6 +199,7 @@ class FakeCloud {
   deviceListCalls = 0;
   peerDevices: Array<Readonly<Record<string, unknown>>> = [];
   readonly commands = new Map<string, FakeCommand>();
+  readonly deviceCommands = new Map<string, FakeDeviceCommand>();
   readonly failingCommandGets = new Set<string>();
   readonly failingHeadGets = new Set<string>();
   readonly headGetCalls: string[] = [];
@@ -232,6 +262,30 @@ class FakeCloud {
       requestingDevicePublicId,
       state: "pending",
       targetDevicePublicId: head.executionDevicePublicId,
+      updatedAt: this.now,
+    });
+  }
+
+  async enqueueDeviceCommand(input: Readonly<{
+    kind: DeviceCommandKind;
+    payload: DeviceCommandPayload;
+    publicId: string;
+    requestingDevicePublicId: string;
+  }>): Promise<void> {
+    const envelope = await encryptDeviceCommand(input.payload, key, {
+      entityPublicId: input.publicId,
+      keyVersion: 1,
+      kind: "device_command",
+      userPublicId,
+    });
+    this.deviceCommands.set(input.publicId, {
+      createdAt: this.now,
+      deadline: this.now + 60_000,
+      kind: input.kind,
+      payload: envelope,
+      publicId: input.publicId,
+      requestingDevicePublicId: input.requestingDevicePublicId,
+      state: "pending",
       updatedAt: this.now,
     });
   }
@@ -668,6 +722,62 @@ class FakeCloud {
           command.state = args.state as "applied" | "failed" | "ambiguous";
           return { publicId: command.publicId, replay: false, state: command.state };
         }
+        if (name === "deviceCommands:prepare") {
+          const command = this.requireDeviceCommand(args.commandPublicId);
+          const requested = args.authority as AuthorityTuple;
+          if (
+            (command.state === "pending" || command.state === "prepared")
+            && command.deadline <= this.now
+          ) {
+            command.state = "expired";
+            return { publicId: command.publicId, replay: false, state: "expired" };
+          }
+          if (command.state === "prepared") {
+            const bound = command.boundAuthority;
+            if (bound === undefined) throw new Error("device command bound authority missing");
+            if (sameAuthorityTuple(bound, requested)) {
+              return { publicId: command.publicId, replay: true, state: "prepared" };
+            }
+            if (requested.bootGeneration < bound.bootGeneration) {
+              throw new Error("stale device command authority");
+            }
+            command.boundAuthority = requested;
+            return { publicId: command.publicId, rebound: true, state: "prepared" };
+          }
+          if (command.state !== "pending") throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
+          command.boundAuthority = requested;
+          command.state = "prepared";
+          return { publicId: command.publicId, replay: false, state: "prepared" };
+        }
+        if (name === "deviceCommands:markEffectStarted") {
+          const command = this.requireDeviceCommand(args.commandPublicId);
+          if (command.state === "prepared") command.state = "effect_started";
+          return { publicId: command.publicId, replay: false, state: "effect_started" };
+        }
+        if (name === "deviceCommands:settle") {
+          const command = this.requireDeviceCommand(args.commandPublicId);
+          command.state = args.state as CommandState;
+          command.resultCode = args.resultCode as string;
+          command.resultDigest = args.resultDigest as string;
+          if (args.result !== undefined) command.result = args.result as EncryptedEnvelope;
+          if (args.singleUseResult === true) command.singleUseResult = true;
+          return { publicId: command.publicId, replay: false, state: command.state };
+        }
+        if (name === "deviceCommands:recoverEffectStarted") {
+          const command = this.requireDeviceCommand(args.commandPublicId);
+          const recovery = args.recoveryAuthority as AuthorityTuple;
+          const stale = args.staleAuthority as AuthorityTuple;
+          if (!deviceCommandRecoveryAdmitted({
+            recoveryAuthority: recovery,
+            staleAuthority: stale,
+            state: command.state,
+            terminalState: args.state as "applied" | "failed" | "ambiguous",
+          })) throw new Error("stale device command recovery authority");
+          command.resultCode = args.resultCode as string;
+          command.resultDigest = args.resultDigest as string;
+          command.state = args.state as CommandState;
+          return { publicId: command.publicId, replay: false, state: command.state };
+        }
         throw new Error(`unexpected mutation ${name}`);
       },
       query: async (name, args) => {
@@ -818,9 +928,32 @@ class FakeCloud {
                 publicId,
               };
         }
+        if (name === "deviceCommands:listPendingForTarget") {
+          return [...this.deviceCommands.values()]
+            .filter((command) => command.state === "pending")
+            .map((command) => ({
+              ...(command.boundAuthority === undefined
+                ? {}
+                : { boundAuthority: command.boundAuthority }),
+              createdAt: command.createdAt,
+              deadline: command.deadline,
+              kind: command.kind,
+              payload: command.payload,
+              publicId: command.publicId,
+              requestingDevicePublicId: command.requestingDevicePublicId,
+              state: command.state,
+              updatedAt: command.updatedAt,
+            }));
+        }
         throw new Error(`unexpected query ${name}`);
       },
     };
+  }
+
+  requireDeviceCommand(value: unknown): FakeDeviceCommand {
+    const command = typeof value === "string" ? this.deviceCommands.get(value) : undefined;
+    if (command === undefined) throw new Error("missing device command");
+    return command;
   }
 
   requireHead(value: unknown): FakeHead {
@@ -1462,6 +1595,7 @@ function bridge(input: {
   daemonAuthorityFence?: Readonly<{ assertCurrent(): Promise<void> }>;
   deploymentAuthority?: CloudDeploymentAuthority;
   device: string;
+  deviceExecutor?: CloudDeviceCommandExecutorPort;
   executor?: RecordingExecutor;
   identity?: CloudDaemonIdentityPort;
   journal?: CloudDaemonJournalPort;
@@ -1486,6 +1620,7 @@ function bridge(input: {
       generation: 0,
       scopeCustodySlot: (slot) => slot,
     },
+    ...(input.deviceExecutor === undefined ? {} : { deviceExecutor: input.deviceExecutor }),
     executor: input.executor ?? new RecordingExecutor(),
     identity: input.identity ?? identity(input.device),
     journal: input.journal ?? new MemoryCloudDaemonJournal(),
@@ -1608,11 +1743,12 @@ function saturatedCommandJournal(
   });
   const build = (ciphertextCharacters: number): CloudDaemonJournalState => ({
     commands: terminalCommands,
+    deviceCommands: [],
     pendingUsageAccount: pending(ciphertextCharacters),
     projectionRecoveries: [],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 3,
+    version: 4,
   });
   const maximumBytes = 65_536;
   let lower = 22;
@@ -2448,11 +2584,12 @@ describe("cloud daemon bridge", () => {
     }));
     const status = projectionRecoveryStatusFromJournalState({
       commands: [],
+      deviceCommands: [],
       pendingUsageAccount: null,
       projectionRecoveries: [],
       projectionRecoveryReceipts: receipts,
       usageAccounts: [],
-      version: 3,
+      version: 4,
     });
 
     expect(status.recoveries).toHaveLength(128);
@@ -5029,5 +5166,193 @@ describe("device registry publication", () => {
     expect((await daemon.cycle(signal)).errors).toEqual([]);
     expect(world.writes).toEqual([{ expectedRevision: 7 }]);
     expect(world.rows.get(world.device)?.revision).toBe(8);
+  });
+});
+
+/*
+ * Device commands on the daemon side. The loop mirrors `#processCommands`
+ * exactly, so these cases prove the two things that differ: there is no lease,
+ * and a stale journal entry left at `effect_started` by a previous boot is
+ * closed as ambiguous rather than replayed.
+ */
+class RecordingDeviceExecutor implements CloudDeviceCommandExecutorPort {
+  readonly calls: Array<Readonly<{ idempotencyKey: string; kind: string; requester: string }>> = [];
+  outcome: CloudDeviceCommandExecutionResult = { code: "APPLIED", state: "applied" };
+  throwOnce = false;
+
+  async executeDeviceCommand(input: Readonly<{
+    idempotencyKey: string;
+    payload: DeviceCommandPayload;
+    requestingDevicePublicId: string;
+  }>): Promise<CloudDeviceCommandExecutionResult> {
+    this.calls.push({
+      idempotencyKey: input.idempotencyKey,
+      kind: input.payload.kind,
+      requester: input.requestingDevicePublicId,
+    });
+    if (this.throwOnce) {
+      this.throwOnce = false;
+      throw new Error("the provider connection dropped");
+    }
+    return this.outcome;
+  }
+}
+
+describe("device command execution", () => {
+  const commandPublicId = "018bcfe5-6800-7000-8000-0000000000d1";
+
+  test("claims, executes, and settles a device command with its encrypted result", async () => {
+    const cloud = new FakeCloud();
+    const local = new FakeLocal("session_deviceco", events);
+    const deviceExecutor = new RecordingDeviceExecutor();
+    deviceExecutor.outcome = {
+      code: "APPLIED",
+      result: { accountsRefreshed: 2, kind: "usage_refresh" },
+      state: "applied",
+    };
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    const journal = new MemoryCloudDaemonJournal();
+    const daemon = bridge({ cloud, device: "device_daemon1", deviceExecutor, journal, local });
+    const result = await daemon.cycle(new AbortController().signal);
+
+    expect(result.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([
+      { idempotencyKey: commandPublicId, kind: "usage_refresh", requester: "device_browser1" },
+    ]);
+    const settled = cloud.requireDeviceCommand(commandPublicId);
+    expect(settled).toMatchObject({ resultCode: "APPLIED", state: "applied" });
+    expect(settled.result).toBeDefined();
+    expect(await decryptDeviceCommandResult(settled.result!, key, {
+      entityPublicId: commandPublicId,
+      keyVersion: 1,
+      kind: "device_command_result",
+      userPublicId,
+    })).toEqual({ accountsRefreshed: 2, kind: "usage_refresh" });
+    // Nothing is left behind: the journal entry is removed once it settles.
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("marks a single-use relay result so the hosted row releases it once", async () => {
+    const cloud = new FakeCloud();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    deviceExecutor.outcome = {
+      code: "APPLIED",
+      result: {
+        expiresAt: fixedNow + 60_000,
+        kind: "account_login_start",
+        loginUrl: "https://auth.example.test/device",
+      },
+      singleUseResult: true,
+      state: "applied",
+    };
+    await cloud.enqueueDeviceCommand({
+      kind: "account_login_start",
+      payload: { accountPublicId: "acct_primary0001", kind: "account_login_start" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    const daemon = bridge({ cloud, device: "device_daemon1", deviceExecutor, local: new FakeLocal("session_deviceco", events) });
+    await daemon.cycle(new AbortController().signal);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      singleUseResult: true,
+      state: "applied",
+    });
+  });
+
+  test("quarantines an executor failure after the effect boundary as ambiguous", async () => {
+    const cloud = new FakeCloud();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    deviceExecutor.throwOnce = true;
+    await cloud.enqueueDeviceCommand({
+      kind: "session_start",
+      payload: {
+        accountPublicId: "acct_primary0001",
+        kind: "session_start",
+        preset: "ultra",
+        projectPublicId: "proj_alpha000001",
+        prompt: "continue",
+        provider: "codex",
+      },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    const daemon = bridge({ cloud, device: "device_daemon1", deviceExecutor, local: new FakeLocal("session_deviceco", events) });
+    await daemon.cycle(new AbortController().signal);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      resultCode: "LOCAL_EFFECT_INDETERMINATE",
+      state: "ambiguous",
+    });
+  });
+
+  test("a later boot closes a stale effect_started entry without re-executing it", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    await cloud.enqueueDeviceCommand({
+      kind: "session_start",
+      payload: {
+        accountPublicId: "acct_primary0001",
+        kind: "session_start",
+        preset: "ultra",
+        projectPublicId: "proj_alpha000001",
+        prompt: "continue",
+        provider: "codex",
+      },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    // A previous boot recorded that the start may already have happened.
+    const command = cloud.requireDeviceCommand(commandPublicId);
+    command.state = "effect_started";
+    command.boundAuthority = { bootGeneration: 1, bootId: "boot_00000000", fence: 1 };
+    const observed = await journal.read();
+    await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      deviceCommands: [{
+        authority: { bootGeneration: 1, bootId: "boot_00000000", fence: 1 },
+        commandPublicId,
+        kind: "session_start",
+        payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+        phase: "effect_started",
+        requestingDevicePublicId: "device_browser1",
+      }],
+    });
+
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+    await daemon.cycle(new AbortController().signal);
+
+    // Never re-executed, and closed with the only honest terminal state.
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      resultCode: "LOCAL_EFFECT_RECOVERY_REQUIRED",
+      state: "ambiguous",
+    });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("a daemon without a device executor never reads the device command table", async () => {
+    const cloud = new FakeCloud();
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    const daemon = bridge({ cloud, device: "device_daemon1", local: new FakeLocal("session_deviceco", events) });
+    const result = await daemon.cycle(new AbortController().signal);
+    expect(result.errors).toEqual([]);
+    // The row stays pending and expires on its own deadline.
+    expect(cloud.requireDeviceCommand(commandPublicId).state).toBe("pending");
   });
 });

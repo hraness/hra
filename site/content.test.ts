@@ -100,7 +100,7 @@ describe("public content contract", () => {
     }
     expect(publicContent.badges[2]?.image).toContain("/hraness/hra/ci.yml?branch=main");
     expect(publicContent.badges[4]?.image).toBe("https://img.shields.io/badge/Bun-1.3.14-14151a");
-    expect(publicContent.badges[5]?.image).toBe("https://img.shields.io/badge/runtimes-Codex%200.149.0-0b5fa5");
+    expect(publicContent.badges[5]?.image).toBe("https://img.shields.io/badge/runtimes-Codex%200.153.2-0b5fa5");
     expect(renderSiteHtml()).not.toContain("img.shields.io");
   });
 
@@ -375,7 +375,7 @@ describe("public content contract", () => {
       "hra plugin list <account> [--project <project>] [--refresh]",
       "hra plugin show <account> <plugin> [--project <project>] [--refresh]",
       "Plugin commands are read-only discovery.",
-      "Pinned Codex 0.149.0 has no safely separated install, enablement, and OAuth lifecycle surface",
+      "Pinned Codex 0.153.2 has no safely separated install, enablement, and OAuth lifecycle surface",
       "HRA therefore does not expose plugin install, enable, disable, OAuth, or permission effects.",
       "The pinned tool-suggestion form that can invoke that compound plugin or connector lifecycle is also rejected before admission.",
       "Other standard MCP forms are brokered only when their pinned schema fits HRA's closed primitive-field contract.",

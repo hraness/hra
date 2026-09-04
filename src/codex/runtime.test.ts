@@ -123,12 +123,12 @@ class TrackedProcess implements CodexProcess {
 
 describe("pinned Codex runtime", () => {
   test("resolves only the exact package and contained launcher", async () => {
-    const packageJsonPath = await fakePackage("0.149.0");
+    const packageJsonPath = await fakePackage("0.153.2");
     const runtime = await resolvePinnedCodexRuntime({
       packageJsonPath,
       bunExecutable: process.execPath,
     });
-    expect(runtime.packageVersion).toBe("0.149.0");
+    expect(runtime.packageVersion).toBe("0.153.2");
     expect(runtime.launcherArgv.slice(2)).toEqual([
       "app-server",
       "--listen",
@@ -171,7 +171,7 @@ describe("pinned Codex runtime", () => {
   });
 
   test("forwards explicit shutdown bounds to the client", async () => {
-    const packageJsonPath = await fakePackage("0.149.0");
+    const packageJsonPath = await fakePackage("0.153.2");
     const child = new TrackedProcess();
     const error = await launchPinnedCodexAppServer({
       packageJsonPath,
@@ -190,7 +190,7 @@ describe("pinned Codex runtime", () => {
   });
 
   test("reaps the exact spawned process when client construction fails", async () => {
-    const packageJsonPath = await fakePackage("0.149.0");
+    const packageJsonPath = await fakePackage("0.153.2");
     const child = new TrackedProcess({ ignoreTerm: true });
     const error = await launchPinnedCodexAppServer({
       packageJsonPath,
@@ -210,7 +210,7 @@ describe("pinned Codex runtime", () => {
   });
 
   test("reaps the exact spawned process when initialization fails", async () => {
-    const packageJsonPath = await fakePackage("0.149.0");
+    const packageJsonPath = await fakePackage("0.153.2");
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const child = new TrackedProcess({
       onWrite: (message, target) => {
@@ -244,7 +244,7 @@ describe("pinned Codex runtime", () => {
   });
 
   test("preserves initialization failure when TERM cleanup also fails", async () => {
-    const packageJsonPath = await fakePackage("0.149.0");
+    const packageJsonPath = await fakePackage("0.153.2");
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const termError = new Error("deterministic TERM failure");
     const child = new TrackedProcess({
@@ -283,7 +283,7 @@ describe("pinned Codex runtime", () => {
   });
 
   test("bounds and aggregates a process that cannot be reaped", async () => {
-    const packageJsonPath = await fakePackage("0.149.0");
+    const packageJsonPath = await fakePackage("0.153.2");
     const child = new TrackedProcess({ ignoreTerm: true, ignoreForce: true });
     const error = await launchPinnedCodexAppServer({
       packageJsonPath,

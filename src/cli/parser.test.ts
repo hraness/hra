@@ -138,6 +138,28 @@ describe("CLI parser", () => {
     expect(parseCli(["session", "send", "session", "hello", "from", "the", "CLI"])).toMatchObject({ command: { message: "hello from the CLI" } });
   });
 
+  test("chooses a session provider and its default preset", () => {
+    // Unchanged: no `--provider` means Codex with the existing default preset.
+    expect(parseCli(["session", "start", "work"])).toMatchObject({
+      command: { kind: "session.start", preset: "high", provider: "codex" },
+    });
+    expect(parseCli(["session", "start", "work", "--provider", "claude"])).toMatchObject({
+      command: { kind: "session.start", preset: "fable-max", provider: "claude" },
+    });
+    expect(parseCli(["session", "start", "work", "--provider", "claude", "--preset", "fable-max"]))
+      .toMatchObject({ command: { preset: "fable-max", provider: "claude" } });
+    expect(() => parseCli(["session", "start", "work", "--provider", "gemini"]))
+      .toThrow("Provider must be `codex` or `claude`.");
+    // The preset union is widened; the provider mismatch is refused by the
+    // daemon, not by argument parsing.
+    expect(parseCli(["session", "preset", "s", "fable-max"]))
+      .toMatchObject({ command: { kind: "session.preset", preset: "fable-max" } });
+    expect(parseCli(["remote", "preset", "s", "fable-max"]))
+      .toMatchObject({ command: { kind: "remote.preset", preset: "fable-max" } });
+    expect(() => parseCli(["remote", "preset", "s", "fable"]))
+      .toThrow("Preset must be `low`, `high`, `ultra`, or `fable-max`.");
+  });
+
   test("parses conversation-bound session task reads with exact task IDs", () => {
     const task = `stask_${"a".repeat(32)}`;
     expect(parseCli(["session", "task", "list", "Release work", "--json"]))
@@ -396,6 +418,37 @@ describe("CLI parser", () => {
     expect(() => parseCli(["remote", "command", "not-a-command"])).toThrow(CliUsageError);
     expect(() => parseCli(["remote", "list", "--idempotency-key", idempotencyKey]))
       .toThrow(CliUsageError);
+  });
+
+  test("routes the device command switches to the daemon, not to the cloud", () => {
+    // These are local daemon state. Nothing hosted, and no browser, can set
+    // them, so they parse as ordinary local commands rather than as a remote
+    // invocation that would travel through the cloud transport.
+    expect(parseCli(["remote", "deny", "device-commands"])).toEqual({
+      kind: "command",
+      command: { allowed: false, kind: "remote.policy-set", switch: "device-commands" },
+      json: false,
+    });
+    expect(parseCli(["remote", "allow", "account-linking", "--json"])).toEqual({
+      kind: "command",
+      command: { allowed: true, kind: "remote.policy-set", switch: "account-linking" },
+      json: true,
+    });
+    expect(parseCli(["remote", "policy", "--json"])).toEqual({
+      kind: "command",
+      command: { kind: "remote.policy-status" },
+      json: true,
+    });
+    expect(() => parseCli(["remote", "allow", "everything"])).toThrow(CliUsageError);
+    expect(() => parseCli(["remote", "allow"])).toThrow(CliUsageError);
+    expect(() => parseCli(["remote", "policy", "extra"])).toThrow(CliUsageError);
+    expect(() => parseCli([
+      "remote",
+      "deny",
+      "device-commands",
+      "--idempotency-key",
+      "018bcfe5-6800-7000-8000-000000000001",
+    ])).toThrow(CliUsageError);
   });
 
   test("binds a relative project directory to the invoking CLI cwd", () => {

@@ -1947,6 +1947,7 @@ describe("CLI rendering", () => {
         profileId: accountId,
         title: "Older imported thread",
         state: "idle",
+        provider: "codex",
         preset: "high",
         fastEnabled: false,
         revision: 4,

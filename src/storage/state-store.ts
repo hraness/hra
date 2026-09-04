@@ -41,7 +41,16 @@ import {
   type RootStatusAttentionRecord,
   type SessionLocalObservationSnapshot,
 } from "../domain/observation";
-import { presetSchema, type Preset } from "../domain/presets";
+import {
+  assertPresetSupportedByProvider,
+  presetForProviderTier,
+  presetSchema,
+  presetTiers,
+  presetTierSchema,
+  providerSchema,
+  type Preset,
+  type Provider,
+} from "../domain/presets";
 import {
   effectiveRuntimeProfileSchema,
   type EffectiveRuntimeProfile,
@@ -186,7 +195,10 @@ const sessionRowSchema = z.object({
   provider_thread_id: z.string().nullable(),
   title: z.string(),
   note: z.string(),
-  preset: presetSchema,
+  provider: providerSchema,
+  // Stored as the provider-neutral tier: the column's SQLite CHECK predates
+  // multi-provider presets, so `provider` plus this tier names the preset.
+  preset: presetTierSchema,
   fast_enabled: z.union([z.literal(0), z.literal(1)]),
   state: sessionStateSchema,
   active_turn_id: z.string().nullable(),
@@ -338,6 +350,8 @@ export type SessionRecord = {
   providerThreadId?: string;
   title: string;
   note: string;
+  /** The provider this session is bound to for its whole life. */
+  provider: Provider;
   preset: Preset;
   fastEnabled: boolean;
   state: z.infer<typeof sessionStateSchema>;
@@ -782,7 +796,14 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 31;
+const currentSchemaVersion = 33;
+// A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
+// The ledger keys on it, so the shape is pinned here rather than accepting an
+// arbitrary string from the cloud bridge.
+const deviceCommandDevicePublicIdSchema = z.string().regex(
+  /^[A-Za-z0-9_-]{8,96}$/u,
+  "Device public id must be an opaque cloud identifier.",
+);
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -951,6 +972,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   provider_thread_id TEXT,
   title TEXT NOT NULL CHECK(length(title) <= 320),
   note TEXT NOT NULL DEFAULT '' CHECK(length(CAST(note AS BLOB)) <= 16384),
+  provider TEXT NOT NULL DEFAULT 'codex' CHECK(provider IN ('codex','claude')),
   preset TEXT NOT NULL CHECK(preset IN ('low','high','ultra')),
   fast_enabled INTEGER NOT NULL CHECK(fast_enabled IN (0,1)),
   state TEXT NOT NULL CHECK(state IN ('starting','active','idle','terminal','recovery_required')),
@@ -2291,6 +2313,22 @@ const schemaVersion31ArchiveDefaultPresetColumn =
   "ALTER TABLE daemon_state ADD COLUMN default_preset TEXT NOT NULL DEFAULT 'ultra' "
   + "CHECK(default_preset IN ('low','high','ultra'))";
 
+// Providers (W3). A session binds one provider for its whole life and every
+// pre-existing session is Codex, so the column is additive with a `codex`
+// default and needs no backfill. `preset` keeps its existing CHECK: a preset
+// is stored as this provider plus the provider-neutral tier
+// (`src/domain/presets.ts`), which avoids rebuilding a table that a dozen
+// cascade-deleting children reference.
+const schemaVersion32SessionProviderColumn =
+  "ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex' "
+  + "CHECK(provider IN ('codex','claude'))";
+
+const applySchemaVersion32 = (database: Database): void => {
+  if (!hasTableColumn(database, "sessions", "provider")) {
+    database.exec(schemaVersion32SessionProviderColumn);
+  }
+};
+
 const applySchemaVersion31Archive = (database: Database): void => {
   if (!hasTableColumn(database, "sessions", "archived_at")) {
     database.exec(schemaVersion31ArchiveSessionColumn);
@@ -2302,6 +2340,53 @@ const applySchemaVersion31Archive = (database: Database): void => {
     database.exec(schemaVersion31ArchiveDefaultPresetColumn);
   }
   database.exec(schemaVersion31Archive);
+};
+
+/*
+ * Device commands (W3). Three additive objects, each independently guarded so
+ * a parallel schema-version-32 migration reconciles in either order:
+ *
+ * - two `daemon_state` switches: whether this machine executes device commands
+ *   at all, and whether it will relay a provider login for a browser. The kill
+ *   switch defaults to allowed (the browser is already an enrolled key holder);
+ *   account linking defaults to denied, because relaying a login URL off the
+ *   machine is the one device command that hands a credential path to another
+ *   surface.
+ * - `device_command_ledger`: the per-requesting-device day bucket that enforces
+ *   the daily cap, and the timestamp of the desktop notice shown the first time
+ *   a given device starts a session here.
+ * - `project_approval_modes`: the approval mode a browser-started session in
+ *   that project inherits. Absent means the machine default.
+ */
+const schemaVersion33DeviceCommands = `
+CREATE TABLE IF NOT EXISTS device_command_ledger (
+  device_public_id TEXT PRIMARY KEY,
+  day_key INTEGER NOT NULL CHECK(day_key >= 0),
+  day_count INTEGER NOT NULL CHECK(day_count >= 0),
+  first_session_start_notified_at INTEGER CHECK(first_session_start_notified_at IS NULL OR first_session_start_notified_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_approval_modes (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace','manual')),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+`;
+const schemaVersion33DeviceCommandsAllowedColumn =
+  "ALTER TABLE daemon_state ADD COLUMN device_commands_allowed INTEGER NOT NULL DEFAULT 1 "
+  + "CHECK(device_commands_allowed IN (0,1))";
+const schemaVersion33AccountLinkingAllowedColumn =
+  "ALTER TABLE daemon_state ADD COLUMN account_linking_allowed INTEGER NOT NULL DEFAULT 0 "
+  + "CHECK(account_linking_allowed IN (0,1))";
+
+const applySchemaVersion33DeviceCommands = (database: Database): void => {
+  if (!hasTableColumn(database, "daemon_state", "device_commands_allowed")) {
+    database.exec(schemaVersion33DeviceCommandsAllowedColumn);
+  }
+  if (!hasTableColumn(database, "daemon_state", "account_linking_allowed")) {
+    database.exec(schemaVersion33AccountLinkingAllowedColumn);
+  }
+  database.exec(schemaVersion33DeviceCommands);
 };
 
 const schemaVersion28Objects = [
@@ -3668,8 +3753,23 @@ const migrateWritableDatabase = (
       version = 31;
     }
 
+    if (version < 32) {
+      applySchemaVersion32(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(32, now());
+      database.exec("PRAGMA user_version = 32");
+      version = 32;
+    }
+
+    if (version < 33) {
+      applySchemaVersion33DeviceCommands(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(33, now());
+      database.exec("PRAGMA user_version = 33");
+      version = 33;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
+    applySchemaVersion32(database);
     database.exec(schemaVersion9);
     database.exec(schemaVersion10);
     backfillSchemaVersion9(database, now());
@@ -3705,6 +3805,7 @@ const migrateWritableDatabase = (
     database.exec(schemaVersion30);
     database.exec(schemaVersion31Objects);
     applySchemaVersion31Archive(database);
+    applySchemaVersion33DeviceCommands(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -3748,7 +3849,8 @@ const mapSession = (row: unknown): SessionRecord => {
     ...(parsed.provider_thread_id === null ? {} : { providerThreadId: parsed.provider_thread_id }),
     title: parsed.title,
     note: parsed.note,
-    preset: parsed.preset,
+    provider: parsed.provider,
+    preset: presetForProviderTier(parsed.provider, parsed.preset),
     fastEnabled: parsed.fast_enabled === 1,
     state: parsed.state,
     ...(parsed.active_turn_id === null ? {} : { activeTurnId: parsed.active_turn_id }),
@@ -4563,12 +4665,15 @@ export class StateStore {
     this.#insertSessionEventStream(sessionId, now);
   }
 
-  createSession(input: { profileId: ProfileId; projectId?: ProjectId; title?: string; preset: Preset; fastEnabled: boolean }): SessionRecord {
+  createSession(input: { profileId: ProfileId; projectId?: ProjectId; title?: string; provider?: Provider; preset: Preset; fastEnabled: boolean }): SessionRecord {
     const id = createSessionId();
     const now = this.#now();
     const title = input.title === undefined ? "Untitled session" : titleSchema.parse(input.title);
+    const provider = providerSchema.parse(input.provider ?? "codex");
+    const preset = presetSchema.parse(input.preset);
+    assertPresetSupportedByProvider(provider, preset);
     const create = this.#database.transaction(() => {
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, presetSchema.parse(input.preset), input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, provider, presetTiers[preset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(id, now);
     });
     create.immediate();
@@ -4653,14 +4758,20 @@ export class StateStore {
     write.immediate();
   }
 
-  readDefaultPreset(): Preset {
+  /**
+   * The daemon default is stored as a provider-neutral tier and read back
+   * against the daemon's default provider, so a Claude default and a Codex
+   * default share one column.
+   */
+  readDefaultPreset(provider: Provider = "codex"): Preset {
     const row = this.#database.query("SELECT default_preset FROM daemon_state WHERE singleton=1").get();
-    return z.object({ default_preset: presetSchema }).strict().parse(row).default_preset;
+    const tier = z.object({ default_preset: presetTierSchema }).strict().parse(row).default_preset;
+    return presetForProviderTier(provider, tier);
   }
 
   setDefaultPreset(preset: Preset): void {
     const parsed = presetSchema.parse(preset);
-    const result = this.#database.query("UPDATE daemon_state SET default_preset=? WHERE singleton=1").run(parsed);
+    const result = this.#database.query("UPDATE daemon_state SET default_preset=? WHERE singleton=1").run(presetTiers[parsed]);
     if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
   }
 
@@ -5134,6 +5245,146 @@ export class StateStore {
     write.immediate();
   }
 
+  // --- Device commands: local switches, day ledger, project approval mode ---
+
+  /**
+   * The two local switches a browser can never change. `hra remote deny
+   * device-commands` closes the machine to every device command; account
+   * linking is opt-in because relaying a provider login URL is the one command
+   * that hands a credential path to another surface.
+   */
+  readDeviceCommandPolicy(): Readonly<{
+    accountLinkingAllowed: boolean;
+    deviceCommandsAllowed: boolean;
+  }> {
+    const row = this.#database.query(
+      "SELECT account_linking_allowed, device_commands_allowed FROM daemon_state WHERE singleton=1",
+    ).get();
+    const flag = z.union([z.literal(0), z.literal(1)]);
+    const parsed = z.object({
+      account_linking_allowed: flag,
+      device_commands_allowed: flag,
+    }).strict().parse(row);
+    return {
+      accountLinkingAllowed: parsed.account_linking_allowed === 1,
+      deviceCommandsAllowed: parsed.device_commands_allowed === 1,
+    };
+  }
+
+  setDeviceCommandsAllowed(allowed: boolean): void {
+    const result = this.#database
+      .query("UPDATE daemon_state SET device_commands_allowed=? WHERE singleton=1")
+      .run(allowed ? 1 : 0);
+    if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
+  }
+
+  setAccountLinkingAllowed(allowed: boolean): void {
+    const result = this.#database
+      .query("UPDATE daemon_state SET account_linking_allowed=? WHERE singleton=1")
+      .run(allowed ? 1 : 0);
+    if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
+  }
+
+  readDeviceCommandLedger(devicePublicId: string): Readonly<{
+    dayCount: number;
+    dayKey: number;
+    firstSessionStartNotifiedAt: number | null;
+  }> {
+    const parsedDevice = deviceCommandDevicePublicIdSchema.parse(devicePublicId);
+    const row = this.#database.query(
+      "SELECT day_key, day_count, first_session_start_notified_at FROM device_command_ledger WHERE device_public_id=?",
+    ).get(parsedDevice);
+    if (row === null) return { dayCount: 0, dayKey: 0, firstSessionStartNotifiedAt: null };
+    const parsed = z.object({
+      day_count: z.number().int().nonnegative(),
+      day_key: z.number().int().nonnegative(),
+      first_session_start_notified_at: z.number().int().nonnegative().nullable(),
+    }).strict().parse(row);
+    return {
+      dayCount: parsed.day_count,
+      dayKey: parsed.day_key,
+      firstSessionStartNotifiedAt: parsed.first_session_start_notified_at,
+    };
+  }
+
+  /**
+   * Records one admitted device command against the requesting device's day
+   * bucket. The caller has already decided admission, so this only advances
+   * durable evidence; `notifiedFirstSessionStart` is written once and never
+   * cleared, which is what makes the desktop notice fire exactly once per
+   * device.
+   */
+  recordDeviceCommandAdmission(input: Readonly<{
+    dayCount: number;
+    dayKey: number;
+    devicePublicId: string;
+    notifiedFirstSessionStart: boolean;
+  }>): void {
+    const parsedDevice = deviceCommandDevicePublicIdSchema.parse(input.devicePublicId);
+    const dayKey = z.number().int().nonnegative().parse(input.dayKey);
+    const dayCount = z.number().int().nonnegative().parse(input.dayCount);
+    const now = this.#now();
+    const write = this.#database.transaction(() => {
+      this.#database.query(
+        `INSERT INTO device_command_ledger(
+           device_public_id, day_key, day_count, first_session_start_notified_at, updated_at
+         ) VALUES (?,?,?,?,?)
+         ON CONFLICT(device_public_id) DO UPDATE SET
+           day_key=excluded.day_key,
+           day_count=excluded.day_count,
+           first_session_start_notified_at=COALESCE(
+             device_command_ledger.first_session_start_notified_at,
+             excluded.first_session_start_notified_at),
+           updated_at=excluded.updated_at`,
+      ).run(
+        parsedDevice,
+        dayKey,
+        dayCount,
+        input.notifiedFirstSessionStart ? now : null,
+        now,
+      );
+    });
+    write.immediate();
+  }
+
+  /**
+   * The approval mode a session started in this project inherits. Absent means
+   * the machine default, so a project that has never been configured behaves
+   * exactly as it does today.
+   */
+  readProjectApprovalMode(projectId: string): Readonly<{
+    mode: ApprovalMode;
+    source: "project" | "default";
+  }> {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database
+      .query("SELECT mode FROM project_approval_modes WHERE project_id=?")
+      .get(parsedProjectId);
+    if (row !== null) {
+      return { mode: z.object({ mode: approvalModeSchema }).strict().parse(row).mode, source: "project" };
+    }
+    return { mode: this.readDefaultApprovalMode(), source: "default" };
+  }
+
+  setProjectApprovalMode(projectId: string, mode: ApprovalMode | null): void {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    if (mode === null) {
+      this.#database.query("DELETE FROM project_approval_modes WHERE project_id=?").run(parsedProjectId);
+      return;
+    }
+    const parsed = approvalModeSchema.parse(mode);
+    const write = this.#database.transaction(() => {
+      if (this.#database.query("SELECT 1 FROM projects WHERE id=?").get(parsedProjectId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      this.#database.query(
+        `INSERT INTO project_approval_modes(project_id,mode,updated_at) VALUES (?,?,?)
+         ON CONFLICT(project_id) DO UPDATE SET mode=excluded.mode,updated_at=excluded.updated_at`,
+      ).run(parsedProjectId, parsed, this.#now());
+    });
+    write.immediate();
+  }
+
   readAutorespondBudgets(sessionId: SessionId, now: number = this.#now()): Readonly<{
     consecutive: number;
     lastDay: number;
@@ -5440,10 +5691,12 @@ export class StateStore {
     const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
     const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
     const preset = input.preset === undefined ? current.preset : presetSchema.parse(input.preset);
+    // A preset the session's provider cannot run is refused, never ignored.
+    assertPresetSupportedByProvider(current.provider, preset);
     const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
     const project = input.projectId === undefined ? current.projectId ?? null : input.projectId;
     const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, preset, fast ? 1 : 0, project, now, current.id, current.revision);
+    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], fast ? 1 : 0, project, now, current.id, current.revision);
     if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
     return this.requireSession(current.id);
   }
@@ -6493,6 +6746,7 @@ export class StateStore {
     profileId: ProfileId;
     profileGeneration: number;
     projectId: ProjectId;
+    provider?: Provider;
     preset: Preset;
     fastEnabled: boolean;
     evidence: Extract<MutationEffectEvidence, { kind: "session.start" }>;
@@ -6502,6 +6756,8 @@ export class StateStore {
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const parsedProjectId = projectIdSchema.parse(input.projectId);
     const parsedPreset = presetSchema.parse(input.preset);
+    const parsedProvider = providerSchema.parse(input.provider ?? "codex");
+    assertPresetSupportedByProvider(parsedProvider, parsedPreset);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
     if (evidence.projectId !== parsedProjectId) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
     if (evidence.runtimeProfile !== undefined && (
@@ -6525,7 +6781,7 @@ export class StateStore {
         || authority.process_generation !== parsedGeneration
         || authority.profile_state !== "signed_in"
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedPreset, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedProvider, presetTiers[parsedPreset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
       this.#database.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,?)").run(parsedAttemptId, sessionId, now);
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);

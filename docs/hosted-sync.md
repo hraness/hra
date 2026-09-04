@@ -12,6 +12,8 @@ Browser app project. The web app at `app.hra.sh` is a second Vercel project in t
 
 Live projection. Besides the compact stream of completed turns, the daemon streams the current turn's assistant text (and reasoning summaries only when show-thinking is enabled for the session, default off) to the `detail` stream about once per second in redacted, encrypted batches of at most 8 KiB. Detail chunks carry the `live_tail` retention class: each row expires six hours after it is written, a session keeps at most 200 rows, and the `live_tail_chunks` maintenance category sweeps expired rows behind a detail stream epoch so digest-chain verification of the surviving tail stays valid and both the chunk quota and the per-user `live_chunk` resource counter are released. Raw reasoning is never uploaded.
 
+Interaction detail. The compact `interaction_state` event carries enough for a browser to decide safely and nothing more. Besides the fixed per-kind summary it already carried, it carries a `label`, a bounded `headline`, a bounded redacted `detailMarkdown`, a `commandClass` when the decision is one a device may take, the `availableDecisions` the provider offered reduced to `once` and `decline`, and for questions a `questions` list of `{id, label, secret}`. Every string is bounded, run through the same absolute-path redaction and secret-shape patterns as the rest of the projection, and re-checked by the compact parser before it is written or read; a value that fails drops the whole detail block, which leaves the reader with no buttons rather than with a value it should not see. The projection never carries the exact command text, the exact affected paths or diff of a file change, the exact requested permission values, an absolute path that is not project relative, the MCP server name, an MCP field HRA cannot answer as plain text, or the value of any question marked secret. A secret question is listed by label and marked, so the reader knows what is being asked and the browser offers no input for it; the daemon refuses a remote answer for one outright. `commandClass` is a display value only: before applying any remote decision the daemon recomputes the class from the live interaction record at the bound revision and refuses when it cannot, so a projection that has drifted can never license a decision.
+
 Push wake and sync cadence. Besides its poll timer, the daemon holds one websocket subscription to the pending commands addressed to its own device, presenting the same bearer token from the same custody slot as the HTTP transport and refusing under the same deployment fence. A change to that set wakes the sync cycle immediately, so steering, approvals, and decisions from another device apply in well under a second instead of waiting out the interval. The subscription carries no authority: every command it announces is still claimed, bound to the exact authority generation, and settled by the ordinary cycle under its idempotency key, so a wake that races the timer costs one extra cycle and never a second execution. When the socket fails, one diagnostic is reported through the ordinary cycle diagnostics that `hra sync now` prints, the daemon falls back to polling, and it reconnects with a doubling backoff from one second capped at thirty. The timer itself is adaptive: one second while another device is present in presence or a local session is mid-turn, fifteen seconds otherwise. The device-presence probe is cached for ten seconds so the fast cadence does not list devices every second. `hra sync status` reports the current interval, why it was chosen, and the push-wake state.
 
 Each Convex CLI invocation is bounded in runtime and output and receives only an allowlisted child environment. A timeout reports exit 124 and an output overflow reports exit 1; both are ordinary command failures that the helpers classify without a provider retry. Hosted bootstrap and invitation results retain the protected invite file after capability commit, and attested deploy results retain the final evidence path and its `.intent`. Durable intents and receipts, provider idempotency, and exact reconciliation remain mandatory for every ambiguous Convex result; no local custody claim proves that a remote effect did not occur.
@@ -463,3 +465,109 @@ These constants are hard authority. A stored counter above the constant reads
 as corrupt and fails closed, so never lower a ceiling below what a deployment
 already stores. Read current usage first, and deploy a tier change through the
 attested candidate chain before it can matter.
+
+## Device commands
+
+A session command names a session and is fenced by that session's execution
+lease. A **device command** names a machine and has no session: it is how a
+browser asks a machine to start a session before one exists, to relay a
+provider login, or to refresh usage. It lives in its own hosted table,
+`deviceCommands`, with its own port (`convex/deviceCommands.ts`) and its own
+authority model.
+
+The lifecycle is the one every command already uses (enqueue, acknowledge,
+prepare, effect started, settle, expire) with the same closed state union and
+the same rule that an effect which may have begun is quarantined as
+`ambiguous`, never retried. What differs is the fence. There is no lease, so a
+device command binds the target daemon's own boot authority at `prepare`; only
+a strictly later boot may take over a command that has not started, and a boot
+that finds a command it left at `effect_started` may only close it as
+`ambiguous`. That is what stops a `session_start` that may or may not have run
+from silently starting a second session.
+
+### Kinds
+
+| Kind | Payload | Result |
+| --- | --- | --- |
+| `session_start` | `{accountPublicId, projectPublicId, prompt, preset, provider}` | `{sessionPublicId}` |
+| `account_login_start` | `{accountPublicId}` | `{loginUrl, expiresAt}`, single use |
+| `account_login_status` | none | `{status, instruction}` |
+| `usage_refresh` | none | `{accountsRefreshed}` |
+
+Addressing is by the cloud public ids the device registry already projects
+(`DeviceRegistryPayload.accounts` and `.projects`). A filesystem path is
+refused by the payload parser, so a project root can never reach the hosted
+deployment. `account_login_status` deliberately carries no account: a machine
+relays at most one login at a time, so the poll asks what the machine is doing
+rather than naming an account.
+
+`session_start` runs as start-then-send under one idempotency key. The two
+local effects use keys derived deterministically from the device command's own
+public id, so a replay reaches the same two local mutations. Once the start has
+committed, a failure in the send is settled `ambiguous` and carries no session
+id: the honest instruction is to look at the grid, not to retry.
+
+### Guards
+
+Every guard is local. Nothing hosted and no browser can change one.
+
+| Guard | Refusal code |
+| --- | --- |
+| Per-device kill switch (`hra remote deny device-commands`) | `DEVICE_COMMANDS_DENIED` |
+| Requesting device revoked after enqueue | `REQUESTING_DEVICE_INACTIVE` |
+| Account linking without the local opt-in | `ACCOUNT_LINKING_DENIED` |
+| Account not in the projected registry | `DEVICE_COMMAND_ACCOUNT_UNKNOWN` |
+| Account signed out on the machine | `DEVICE_COMMAND_ACCOUNT_SIGNED_OUT` |
+| Provider does not match the projected account | `DEVICE_COMMAND_PROVIDER_UNSUPPORTED` |
+| Project not in the projected registry | `DEVICE_COMMAND_PROJECT_UNKNOWN` |
+| Per-device daily cap (100 admitted commands) | `DEVICE_COMMAND_DAILY_CAP` |
+| Login URL that cannot be completed on another device | `ACCOUNT_LOGIN_RELAY_UNAVAILABLE` |
+
+The cap is checked last, so a refused or malformed request never consumes the
+day's budget. A browser device can never be a device command target
+(`DEVICE_COMMAND_TARGET_NOT_EXECUTOR`) and can never execute the lifecycle
+(`BROWSER_DEVICE_CANNOT_EXECUTE`).
+
+Two further guards are not refusals. The first `session_start` from each device
+raises a local notice on the machine, written once and never repeated for that
+device; HRA has no desktop notification facility today, so the default notice
+is a daemon diagnostic and the CLI injects a real notifier when one exists. And
+a browser-started session inherits its project's approval mode, applied before
+the prompt is sent, so the first turn is already governed by it.
+
+The relayed login URL is account-key encrypted like every other payload, is
+`https` only with no credentials in its authority, expires five minutes after
+it is issued, and is released by the hosted row exactly once
+(`deviceCommands:consumeResult` erases the ciphertext in the same
+transaction). When the machine's provider login offers a URL that cannot be
+completed elsewhere, the command fails closed and the browser falls back to
+one-way status polling and the CLI instruction.
+
+### Operator switches
+
+```sh
+hra remote policy                      # what this machine currently allows
+hra remote deny device-commands        # stop accepting commands from other devices
+hra remote allow device-commands       # accept them again (the shipped default)
+hra remote allow account-linking       # permit relaying a provider login
+hra remote deny account-linking        # refuse it again (the shipped default)
+```
+
+Both switches are stored in `daemon_state` on the machine and published into
+that machine's encrypted device registry, so the web settings screen shows the
+current state and offers the CLI instruction rather than a button the daemon
+would refuse. Device commands are allowed by default because a browser device
+is already an enrolled key holder; account linking is denied by default because
+relaying a login URL is the one command that hands a credential path to another
+surface.
+
+### Retention and erasure
+
+`deviceCommands` is classified exactly like `sessionCommands`: quota category
+`command`, retention class `command_recovery`, deletion order 10. A pending row
+past its deadline is expired by the `pending_device_commands` maintenance
+category; a terminal row the requester has acknowledged is deleted by
+`terminal_device_commands` after the same 30-day retention. Account deletion
+erases the table with the other command state, and device revocation cancels
+pending rows the revoked device owns while quarantining any that had already
+started.

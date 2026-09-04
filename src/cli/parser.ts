@@ -148,7 +148,7 @@ export type RemoteCliCommand =
       session: string;
     }>
   | Readonly<{ kind: "remote.stop"; session: string }>
-  | Readonly<{ kind: "remote.preset"; preset: "low" | "high" | "ultra"; session: string }>
+  | Readonly<{ kind: "remote.preset"; preset: "low" | "high" | "ultra" | "fable-max"; session: string }>
   | Readonly<{ enabled: boolean; kind: "remote.fast"; session: string }>;
 
 export class CliUsageError extends Error {
@@ -179,7 +179,7 @@ Usage:
   hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
   hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
-  hra remote list|show|command|send|queue|steer|stop|preset|fast
+  hra remote list|show|command|send|queue|steer|stop|resolve|preset|fast|allow|deny|policy
   hra turn inspect
   hra auth login --input-stdin|--input-fd <fd>
   hra auth status|logout
@@ -200,9 +200,10 @@ Mutation safety:
   --idempotency-key <uuid>  Reuse after a lost response; changed reuse fails closed.
 
 Recommended profiles:
-  low     Luna Max
-  high    Sol Max
-  ultra   Sol Ultra
+  low         Luna Max        (codex)
+  high        Sol Max         (codex)
+  ultra       Sol Ultra       (codex)
+  fable-max   Claude Fable    (claude)
 
 Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
 
@@ -296,14 +297,14 @@ Usage:
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
+  hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]
   hra session send|queue|steer <session> <message>
   hra session stop|recover|abandon <session>
   hra session archive|unarchive <session>
   hra session rename <session> <name>
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
-  hra session preset <session> <low|high|ultra>
+  hra session preset <session> <low|high|ultra|fable-max>
   hra session fast <session> <on|off>
   hra session project <session> <project>
   hra session task list <session>
@@ -314,6 +315,7 @@ Usage:
 
 Examples:
   hra session start personal --project jungle --preset high
+  hra session start personal --provider claude --preset fable-max
   hra session watch my-session
   hra session watch my-session --jsonl
   hra session events my-session --wait-ms 30000 --jsonl
@@ -365,12 +367,17 @@ Usage:
   hra remote command <uuidv7>
   hra remote send|queue|steer <cloud-session> <message>
   hra remote stop <cloud-session>
-  hra remote preset <cloud-session> <low|high|ultra>
+  hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <once|decline|cancel>
+  hra remote preset <cloud-session> <low|high|ultra|fable-max>
   hra remote fast <cloud-session> <on|off>
+  hra remote allow|deny <device-commands|account-linking>
+  hra remote policy
 
 Examples:
   hra remote list
   hra remote send synced-session -- "continue the migration"
+  hra remote deny device-commands
+  hra remote allow account-linking
   hra remote command <uuidv7>`,
   turn: `HRA turn
 
@@ -1083,7 +1090,20 @@ const parseSession = (
       finish(cursor);
       return command({ kind: "session.interactions", session, pending, limit, cursor: interactionCursor });
     }
-    case "start": { const project = option(cursor, "--project"); const preset = option(cursor, "--preset") ?? "high"; const fast = flag(cursor, "--fast"); const account = take(cursor, "account"); finish(cursor); return command({ kind: "session.start", account, project, preset, fast }); }
+    case "start": {
+      const project = option(cursor, "--project");
+      const provider = option(cursor, "--provider") ?? "codex";
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      // The provider chooses the default preset, so an unchanged `hra session
+      // start` keeps its exact Codex behaviour.
+      const preset = option(cursor, "--preset") ?? (provider === "claude" ? "fable-max" : "high");
+      const fast = flag(cursor, "--fast");
+      const account = take(cursor, "account");
+      finish(cursor);
+      return command({ kind: "session.start", account, project, provider, preset, fast });
+    }
     case "send": { const session = take(cursor, "session"); return command({ kind: "session.send", session, message: remainder(cursor, "message") }); }
     case "queue": { const session = take(cursor, "session"); return command({ kind: "session.queue", session, message: remainder(cursor, "message") }); }
     case "steer": { const session = take(cursor, "session"); return command({ kind: "session.steer", session, message: remainder(cursor, "message") }); }
@@ -1379,6 +1399,29 @@ const parseInteraction = (cursor: Cursor, json: boolean): ParsedInteraction => {
   throw new CliUsageError("Unknown interaction action. Run `hra interaction --help` for supported actions.");
 };
 
+/**
+ * `hra remote allow|deny <switch>` and `hra remote policy`. These are local
+ * daemon commands, so they are peeled off before the cloud remote parser sees
+ * the cursor; `null` means this is an ordinary remote action.
+ */
+const parseRemotePolicy = (cursor: Cursor): LocalCommand | null => {
+  const action = cursor.values[0];
+  if (action !== "allow" && action !== "deny" && action !== "policy") return null;
+  cursor.values.shift();
+  if (action === "policy") {
+    finish(cursor);
+    return { kind: "remote.policy-status" };
+  }
+  const target = take(cursor, "remote switch");
+  finish(cursor);
+  if (target !== "device-commands" && target !== "account-linking") {
+    throw new CliUsageError(
+      "Unknown remote switch. Use `device-commands` or `account-linking`.",
+    );
+  }
+  return { allowed: action === "allow", kind: "remote.policy-set", switch: target };
+};
+
 const parseRemote = (cursor: Cursor): RemoteCliCommand => {
   const action = take(cursor, "remote action");
   switch (action) {
@@ -1441,8 +1484,8 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
       const session = take(cursor, "session");
       const preset = take(cursor, "preset");
       finish(cursor);
-      if (preset !== "low" && preset !== "high" && preset !== "ultra") {
-        throw new CliUsageError("Preset must be `low`, `high`, or `ultra`.");
+      if (preset !== "low" && preset !== "high" && preset !== "ultra" && preset !== "fable-max") {
+        throw new CliUsageError("Preset must be `low`, `high`, `ultra`, or `fable-max`.");
       }
       return { kind: "remote.preset", session, preset };
     }
@@ -1508,6 +1551,16 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     throw new CliUsageError("Unknown daemon action. Run `hra daemon --help` for supported actions.");
   }
   if (group === "remote") {
+    // The two policy switches are local daemon state, not a hosted command, so
+    // they route to the daemon like `autorespond` rather than through the cloud
+    // remote invocation. Nothing hosted can set them.
+    const policy = parseRemotePolicy(cursor);
+    if (policy !== null) {
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by remote policy commands.");
+      }
+      return { kind: "command", command: policy, json };
+    }
     const remote = parseRemote(cursor);
     if (
       idempotencyKey !== undefined

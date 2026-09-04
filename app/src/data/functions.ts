@@ -26,10 +26,13 @@ const presenceCurrentName = "presence:current" satisfies CloudQuery;
 const listKeyEnvelopesName = "devices:listKeyEnvelopes" satisfies CloudQuery;
 const commandGetName = "commands:get" satisfies CloudQuery;
 const commandListForSessionName = "commands:listForSession" satisfies CloudQuery;
+const deviceCommandGetName = "deviceCommands:get" satisfies CloudQuery;
 
 const registerName = "devices:register" satisfies CloudMutation;
 const beginBindName = "devices:beginBind" satisfies CloudMutation;
 const enqueueName = "commands:enqueue" satisfies CloudMutation;
+const enqueueDeviceCommandName = "deviceCommands:enqueue" satisfies CloudMutation;
+const consumeDeviceCommandResultName = "deviceCommands:consumeResult" satisfies CloudMutation;
 const presenceConnectName = "presence:connect" satisfies CloudMutation;
 const presenceHeartbeatName = "presence:heartbeat" satisfies CloudMutation;
 const presenceDisconnectName = "presence:disconnect" satisfies CloudMutation;
@@ -63,6 +66,16 @@ export type WireEnqueueArgs = Readonly<{
   publicId: string;
   requestDigest: string;
   sessionPublicId: string;
+}>;
+
+export type WireDeviceEnqueueArgs = Readonly<{
+  deadline: number;
+  expectedTargetDevicePublicId: string;
+  idempotencyKey: string;
+  kind: string;
+  payload: WireEncryptedEnvelope;
+  publicId: string;
+  requestDigest: string;
 }>;
 
 export const accountCurrent =
@@ -113,6 +126,9 @@ export const commandListForSession = makeFunctionReference<
   unknown
 >(commandListForSessionName);
 
+export const deviceCommandGet =
+  makeFunctionReference<"query", { commandPublicId: string }, unknown>(deviceCommandGetName);
+
 export const registerDevice =
   makeFunctionReference<"mutation", WireRegisterArgs, unknown>(registerName);
 
@@ -124,6 +140,16 @@ export const beginBind = makeFunctionReference<
 
 export const enqueueCommand =
   makeFunctionReference<"mutation", WireEnqueueArgs, unknown>(enqueueName);
+
+export const enqueueDeviceCommand =
+  makeFunctionReference<"mutation", WireDeviceEnqueueArgs, unknown>(enqueueDeviceCommandName);
+
+/** Exchanges a single-use device command result exactly once. */
+export const consumeDeviceCommandResult = makeFunctionReference<
+  "mutation",
+  { commandPublicId: string },
+  unknown
+>(consumeDeviceCommandResultName);
 
 export const presenceConnect =
   makeFunctionReference<"mutation", WirePresenceArgs, unknown>(presenceConnectName);
