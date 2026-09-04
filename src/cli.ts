@@ -2913,6 +2913,10 @@ export async function runDaemon(
     store = new StateStore(paths);
     const activeStore = store;
     const secretCustody = installation.createSecretCustody();
+    // Prose autorespond stays inert until a gateway key is put into local
+    // secret custody; the responder reads the key per call and never holds it,
+    // and the hosted `set_gateway_key` command writes into the same custody.
+    const gatewayKeys = new CustodyGatewayKeyStore(secretCustody);
     const allowCursorAuthorityInitialization =
       activeStore.canInitializeDaemonCursorAuthority();
     const eventCursors = await resolveSessionEventCursorCodec(secretCustody, {
@@ -3041,6 +3045,10 @@ export async function runDaemon(
             if (current === undefined) throw new Error("The local command service is not ready.");
             return await current.executeRemote(command, expected, { signal: options.signal });
           },
+          gatewayKeyCustody: {
+            hasKey: async () => await gatewayKeys.isConfigured(),
+            setKey: async (key) => { await gatewayKeys.set(key); },
+          },
           paths,
           store: activeStore,
           cloudIdentityNamespace,
@@ -3120,9 +3128,6 @@ export async function runDaemon(
           });
         })()
       : undefined;
-    // Prose autorespond stays inert until a gateway key is put into local
-    // secret custody; the responder reads the key per call and never holds it.
-    const gatewayKeys = new CustodyGatewayKeyStore(secretCustody);
     const activeService = new HraService({
       store: activeStore,
       paths,

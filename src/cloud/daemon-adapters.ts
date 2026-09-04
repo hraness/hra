@@ -21,7 +21,6 @@ import { Database } from "bun:sqlite";
 
 import { readCodexAutomations, type CodexAutomation } from "../codex/automations";
 import { parseAccountUsage, parseRateLimits, type RateLimitSnapshot } from "../codex/protocol";
-import { hasGatewayKey, setGatewayKey } from "../daemon/gateway-key-custody";
 import type { LocalCommand } from "../domain/contracts";
 import type { InteractionRecord } from "../domain/interactions";
 import {
@@ -2145,7 +2144,7 @@ export type CloudGatewayKeyCustody = Readonly<{
 export type StateBackedCloudDaemonAdapterOptions = Readonly<{
   cloudIdentityNamespace?: string | null;
   codex: CodexRuntimePort;
-  /** Local custody for the responder gateway key (default: the state root file custody). */
+  /** Local custody for the responder gateway key (default: none; `set_gateway_key` is refused). */
   gatewayKeyCustody?: CloudGatewayKeyCustody;
   executeRemote: LocalExecuteRemote;
   /** Project reasoning summary deltas to the live stream (default off). */
@@ -2219,9 +2218,12 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
     this.#liveThinking = options.liveThinking ?? false;
     this.#registryNow = options.now ?? Date.now;
     this.#machineLabel = registryLabel(options.machineLabel ?? hostname(), "This machine");
+    // Without an injected custody the adapter reports no key and refuses to
+    // store one: the CLI hands in the daemon's generational secret custody so
+    // the key the hosted command stores is the key the responder reads.
     this.#gatewayKeyCustody = options.gatewayKeyCustody ?? {
-      hasKey: async () => await hasGatewayKey(options.paths),
-      setKey: async (key: string) => { await setGatewayKey(options.paths, key); },
+      hasKey: async () => false,
+      setKey: async () => { throw new Error("Gateway key custody is not available."); },
     };
     this.#readCodexAutomations = options.readCodexAutomations
       ?? (async () => (await readCodexAutomations()).automations);
