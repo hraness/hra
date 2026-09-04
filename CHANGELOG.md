@@ -2,6 +2,15 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## HRA Web v1 wave 2
+
+Unreleased. The browser app foundation.
+
+- `app/` holds a Vite, React 19, Tailwind v4 browser client, gated by `bun run lint`, `bun run typecheck`, `bun test ./app`, and `bun run build:app` inside `bun run check`. It ships as a separate Vercel project on its own origin with the wave 1 Content Security Policy, and a test asserts the built bundle sets no style attribute, references no service worker, calls no `eval`, and names no origin outside the pinned Convex deployment.
+- Authentication tokens live in an in-memory storage adapter rather than `localStorage`, so a closed tab leaves no refresh token behind.
+- A browser enrolls as an ordinary device: non-extractable P-256 signing and wrapping key pairs held in IndexedDB, a displayed key fingerprint to compare before `hra device approve`, and the account key unwrapped into memory only. The key is dropped on a fifteen-minute idle, on `Ctrl+L`, on page hide, and on the first authority refusal from the control plane.
+- The client decrypts the compact history and subscribes to the live `detail` tail, keyed by the detail stream epoch, and submits `send_or_steer` bound to the session's current custodian device.
+
 ## v0.3.0
 
 Conversation-bound scheduled tasks and hosted sign-in mail. Release candidate until the release workflow admits the tag.

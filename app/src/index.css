@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+/*
+ * The Content Security Policy is `style-src 'self'`, so every rule here has to
+ * arrive as this one same-origin stylesheet. Nothing in the app may set a style
+ * attribute or inject a style element, and no font is fetched: `font-src 'self'`
+ * with a system stack keeps the page to one origin.
+ */
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --color-surface: oklch(0.16 0.01 260);
+  --color-surface-raised: oklch(0.21 0.012 260);
+  --color-surface-input: oklch(0.25 0.014 260);
+  --color-line: oklch(0.32 0.015 260);
+  --color-ink: oklch(0.95 0.005 260);
+  --color-ink-muted: oklch(0.72 0.012 260);
+  --color-accent: oklch(0.72 0.14 220);
+  --color-attention: oklch(0.76 0.16 62);
+  --color-danger: oklch(0.68 0.17 25);
+}
+
+@layer base {
+  html {
+    background-color: var(--color-surface);
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-surface);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    margin: 0;
+    min-height: 100dvh;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /* Touch targets stay at 44 CSS pixels on phones. */
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* A card that needs a human is outlined, and glows unless the reader has
+     asked for reduced motion. */
+  .attention-glow {
+    animation: attention-pulse 2.4s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .attention-glow {
+      animation: none;
+    }
+  }
+}
+
+@keyframes attention-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 1px var(--color-attention);
+  }
+
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-attention) 45%, transparent);
+  }
+}

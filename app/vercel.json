@@ -1,0 +1,68 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app",
+  "cleanUrls": false,
+  "framework": null,
+  "installCommand": "true",
+  "outputDirectory": "dist",
+  "trailingSlash": false,
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'none'; script-src 'self'; connect-src https://qualified-hummingbird-537.convex.cloud wss://qualified-hummingbird-537.convex.cloud https://qualified-hummingbird-537.convex.site; style-src 'self'; img-src 'none'; font-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; worker-src 'none'; manifest-src 'none'; frame-ancestors 'none'"
+        },
+        {
+          "key": "Cross-Origin-Opener-Policy",
+          "value": "same-origin"
+        },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(), clipboard-read=(), geolocation=(), microphone=(), payment=(), usb=()"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "no-referrer"
+        },
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        },
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        }
+      ]
+    },
+    {
+      "source": "/",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store"
+        }
+      ]
+    },
+    {
+      "source": "/index.html",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store"
+        }
+      ]
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/((?!assets/).*)",
+      "destination": "/index.html"
+    }
+  ]
+}
