@@ -2,8 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- D4 extracts the provider port; this file is the Claude adapter and loads the pinned runtime.
 import {
+  CLAUDE_PIN,
   ClaudeError,
   ClaudeStreamClient,
+  boundClaudeText,
+  sanitizeClaudeText,
   spawnBunClaudeProcess,
   resolvePinnedClaudeRuntime,
   type ClaudeCanUseTool,
@@ -27,14 +30,43 @@ import {
   effectiveClaudeRuntimeProfileSchema,
   type EffectiveClaudeRuntimeProfile,
 } from "../domain/runtime-profile";
+import type { ClaudeSessionFact } from "./claude-session-facts";
 import type {
   ClaudeRuntimePort,
   ClaudeRuntimeStartReview,
   CodexAccountProjection,
+  CodexProjectedMessage,
   CodexSessionObservation,
   CodexSessionProjection,
+  CodexTurnSummary,
   ProfileAuthority,
 } from "./ports";
+
+/** Bounds on the in-memory transcript one Claude session projects. */
+const PROJECTED_MESSAGE_LIMIT = 256;
+const PROJECTED_TURN_LIMIT = 128;
+const PROJECTED_MESSAGE_BYTES = 16 * 1024;
+const PROJECTED_TITLE_BYTES = 120;
+
+const encoder = new TextEncoder();
+
+/** Sanitizes and bounds one provider string, reporting what it dropped. */
+const projectedText = (value: string): Pick<CodexProjectedMessage, "text" | "omission"> => {
+  const safe = sanitizeClaudeText(value, true);
+  const originalUtf8Bytes = encoder.encode(safe).byteLength;
+  const text = boundClaudeText(safe, PROJECTED_MESSAGE_BYTES);
+  const returnedUtf8Bytes = encoder.encode(text).byteLength;
+  return originalUtf8Bytes === returnedUtf8Bytes
+    ? { text }
+    : {
+        omission: {
+          omittedUtf8Bytes: originalUtf8Bytes - returnedUtf8Bytes,
+          originalUtf8Bytes,
+          returnedUtf8Bytes,
+        },
+        text,
+      };
+};
 
 /** One live Claude session: its process, its client, and its projection. */
 type RunningSession = {
@@ -48,12 +80,23 @@ type RunningSession = {
   activeTurnId: string | undefined;
   title: string;
   updatedAt: number;
+  /**
+   * The bounded local transcript. Claude Code publishes no thread-read
+   * method, so HRA is the only record of what this session said: the
+   * projection every reader sees (`hra session show`, the compact cloud
+   * projection, and the recovery baseline) is assembled here from the same
+   * facts the event stream carries.
+   */
+  readonly messages: CodexProjectedMessage[];
+  readonly turnSummaries: CodexTurnSummary[];
+  /** Raw assistant text per open item id, flushed into `messages` on delta. */
+  readonly assistantItems: Map<string, number>;
+  droppedMessages: number;
+  droppedTurns: number;
+  truncatedMessages: number;
 };
 
-export type ClaudeSessionFact = ClaudeFact & {
-  readonly providerThreadId: string;
-  readonly connectionId: string;
-};
+export type { ClaudeSessionFact } from "./claude-session-facts";
 
 export type ClaudeRuntimeObserver = {
   fact(authority: ProfileAuthority, fact: ClaudeSessionFact): void | Promise<void>;
@@ -227,6 +270,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     });
     const session: RunningSession = {
       activeTurnId: undefined,
+      assistantItems: new Map(),
       authority: input.authority,
       client: new ClaudeStreamClient({
         configDir,
@@ -234,11 +278,16 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
         process,
       }),
       connectionId,
+      droppedMessages: 0,
+      droppedTurns: 0,
+      messages: [],
       profile: pending.review.effectiveRuntimeProfile,
       projectRoot: pending.projectRoot,
       providerThreadId,
       status: "idle",
       title: "Untitled session",
+      truncatedMessages: 0,
+      turnSummaries: [],
       updatedAt: this.#now(),
     };
     this.#sessions.set(providerThreadId, session);
@@ -275,6 +324,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     // boundary it publishes, and it carries no id of its own.
     const turnId = randomUUID();
     await session.client.startTurn({ message: input.message, turnId });
+    this.#appendUserMessage(session, turnId, input.message, input.clientMessageId);
     session.activeTurnId = turnId;
     session.status = "active";
     session.updatedAt = this.#now();
@@ -299,6 +349,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       throw new ClaudeError("INVALID_INPUT", "That Claude turn is no longer active.");
     }
     await session.client.steer(input.message);
+    this.#appendUserMessage(session, input.activeTurnId, input.message, input.clientMessageId);
   }
 
   async interrupt(input: {
@@ -333,6 +384,22 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     signal: AbortSignal;
   }): Promise<CodexSessionProjection> {
     return this.#projection(this.#requireSession(input.authority, input.providerThreadId));
+  }
+
+  /** Widens the runtime-resolution failure into one actionable instruction. */
+  async #admitRuntime(configDir: string): Promise<PinnedClaudeRuntime> {
+    try {
+      return await this.#resolveRuntime({ configDir } satisfies ResolvePinnedClaudeRuntimeOptions);
+    } catch (error: unknown) {
+      const detail = error instanceof ClaudeError ? error.message : "it could not be admitted";
+      throw new ClaudeError(
+        "RUNTIME_MISMATCH",
+        `HRA cannot start a Claude Code session on this machine: ${detail}. `
+        + `Install Claude Code ${CLAUDE_PIN} exactly, put \`claude\` on this daemon's PATH, `
+        + "then sign in inside the account's isolated Claude profile and retry.",
+        { cause: error },
+      );
+    }
   }
 
   async inspectInteractionAuthority(input: {
@@ -398,6 +465,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       throw new ClaudeError("DEADLINE_EXPIRED", "The Claude interaction deadline passed.");
     }
     await session.client.resolveInteraction(requestId, decisionFor(input.kind, input.resolution, request));
+    this.#reportInteractionSettled(session, requestId);
     return { responseWritten: true };
   }
 
@@ -425,7 +493,32 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       kind: "deny",
       message: "HRA did not receive a decision in time",
     });
+    this.#reportInteractionSettled(session, requestId);
     return { responseWritten: true };
+  }
+
+  /**
+   * Claude publishes no resolution notification of its own: one control
+   * response is the whole exchange. The bridge therefore reports the request
+   * as no longer pending, which is the same fact a provider-side cancellation
+   * produces, so the daemon can settle its durable interaction row.
+   *
+   * Codex delivers its equivalent on the notification stream, outside the
+   * resolving call. This one is published the same way: the caller still
+   * holds that interaction's serialization while it awaits the write, so the
+   * fact is handed over after that call returns, never inside it.
+   */
+  #reportInteractionSettled(session: RunningSession, requestId: string): void {
+    const timer = setTimeout(() => {
+      void Promise.resolve(this.#onFact(session.providerThreadId, session.connectionId, {
+        requestId,
+        type: "interactionCanceled",
+      })).catch(() => {
+        // The daemon's own fact path records and escalates its failures; a
+        // settle notice must never reject into the runtime as an unowned task.
+      });
+    }, 0);
+    timer.unref();
   }
 
   async close(): Promise<void> {
@@ -485,7 +578,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       throw new ClaudeError("INVALID_INPUT", "A Claude session requires a project directory.");
     }
     const configDir = this.#configDirFor(input.authority);
-    const runtime = await this.#resolveRuntime({ configDir } satisfies ResolvePinnedClaudeRuntimeOptions);
+    const runtime = await this.#admitRuntime(configDir);
     this.#resolvedRuntime = runtime;
     const profile = effectiveClaudeRuntimeProfileSchema.parse({
       claudeVersion: runtime.version,
@@ -570,8 +663,8 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     return { request: pending.request, requestId, session };
   }
 
-  #projection(session: RunningSession): CodexSessionProjection {
-    return {
+  #projection(session: RunningSession, detail = true): CodexSessionProjection {
+    const base: CodexSessionProjection = {
       providerThreadId: session.providerThreadId,
       providerUpdatedAt: session.updatedAt,
       projectRoot: session.projectRoot,
@@ -579,6 +672,100 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       title: session.title,
       ...(session.activeTurnId === undefined ? {} : { activeTurnId: session.activeTurnId }),
     };
+    if (!detail) return base;
+    return {
+      ...base,
+      messages: [...session.messages],
+      omission: {
+        hasMoreOlderTurns: session.droppedTurns > 0,
+        // Every turn HRA started is proven by its own `user` line and its
+        // `result`, so nothing is ever unread or incomplete here.
+        incompleteTurnIds: [],
+        omittedMessages: session.droppedMessages,
+        returnedTurns: session.turnSummaries.length,
+        truncatedMessages: session.truncatedMessages,
+        turnLimit: PROJECTED_TURN_LIMIT,
+        unreadItemTurnIds: [],
+      },
+      turnSummaries: [...session.turnSummaries],
+    };
+  }
+
+  /** Records one human or steering line, and names the session on its first. */
+  #appendUserMessage(
+    session: RunningSession,
+    turnId: string,
+    message: string,
+    clientMessageId: string,
+  ): void {
+    if (session.messages.length === 0) {
+      session.title = boundClaudeText(
+        sanitizeClaudeText(message),
+        PROJECTED_TITLE_BYTES,
+      ) || "Untitled session";
+    }
+    this.#pushMessage(session, {
+      clientId: clientMessageId,
+      role: "user",
+      turnId,
+      ...projectedText(message),
+    });
+  }
+
+  /** Folds one assistant delta into that item's single projected message. */
+  #appendAssistantDelta(
+    session: RunningSession,
+    turnId: string,
+    itemId: string,
+    text: string,
+  ): void {
+    const index = session.assistantItems.get(itemId);
+    const existing = index === undefined ? undefined : session.messages[index];
+    if (index === undefined || existing === undefined || existing.role !== "assistant") {
+      this.#pushMessage(session, { role: "assistant", turnId, ...projectedText(text) });
+      session.assistantItems.set(itemId, session.messages.length - 1);
+      return;
+    }
+    const projected = projectedText(`${existing.text}${text}`);
+    if (projected.omission !== undefined && existing.omission === undefined) {
+      session.truncatedMessages += 1;
+    }
+    session.messages[index] = { role: "assistant", turnId, ...projected };
+  }
+
+  #pushMessage(session: RunningSession, message: CodexProjectedMessage): void {
+    if (message.omission !== undefined) session.truncatedMessages += 1;
+    session.messages.push(message);
+    while (session.messages.length > PROJECTED_MESSAGE_LIMIT) {
+      session.messages.shift();
+      session.droppedMessages += 1;
+      for (const [itemId, index] of [...session.assistantItems]) {
+        if (index === 0) session.assistantItems.delete(itemId);
+        else session.assistantItems.set(itemId, index - 1);
+      }
+    }
+  }
+
+  #recordTurnSummary(
+    session: RunningSession,
+    summary: Extract<ClaudeFact, { type: "turnSummary" }>,
+  ): void {
+    const completedAt = this.#now();
+    session.turnSummaries.push({
+      actions: [],
+      completedAt,
+      files: [],
+      id: summary.turnId,
+      omittedActions: 0,
+      omittedFiles: 0,
+      runtimeMs: summary.runtimeMs,
+      startedAt: Math.max(0, completedAt - summary.runtimeMs),
+      status: summary.status,
+    });
+    while (session.turnSummaries.length > PROJECTED_TURN_LIMIT) {
+      session.turnSummaries.shift();
+      session.droppedTurns += 1;
+    }
   }
 
   async #onFact(
@@ -588,9 +775,14 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   ): Promise<void> {
     const session = this.#sessions.get(providerThreadId);
     if (session === undefined) return;
+    if (fact.type === "assistantDelta") {
+      this.#appendAssistantDelta(session, fact.turnId, fact.itemId, fact.text);
+    }
+    if (fact.type === "turnSummary") this.#recordTurnSummary(session, fact);
     if (fact.type === "turnCompleted") {
       session.activeTurnId = undefined;
       session.status = "idle";
+      session.assistantItems.clear();
     }
     if (fact.type === "providerError" && fact.terminal) session.status = "terminal";
     session.updatedAt = this.#now();

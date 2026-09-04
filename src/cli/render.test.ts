@@ -62,6 +62,51 @@ const data = {
 };
 
 describe("CLI rendering", () => {
+  test("renders a Claude session's reviewed runtime profile, not the Codex one", () => {
+    const shown = capture();
+    renderSuccess(
+      { detail: true, kind: "session.show", session: "claude-session" },
+      {
+        effectiveRuntimeProfile: {
+          claudeVersion: "2.1.260",
+          inputFormat: "stream-json",
+          isolatedConfigDir: true,
+          model: "claude-fable-5-1",
+          observedAt: 2_000,
+          outputFormat: "stream-json",
+          permissionMode: "default",
+          preset: "fable-max",
+          processGeneration: 3,
+          profileId: "acct_00000000000000000000000000000000",
+          reasoningEffort: "max",
+        },
+        projection: {
+          messages: [{ role: "user", text: "hello", turnId: "turn-1" }],
+          projectRoot: "/workspace/project",
+          providerThreadId: "thread-claude",
+          status: "idle",
+          title: "Claude work",
+          turnSummaries: [],
+        },
+        session: { id: "sess-claude", state: "idle", title: "Claude work" },
+      },
+      false,
+      shown.output,
+    );
+    const rendered = shown.stdout.join("");
+    expect(rendered).toContain("provider: Claude Code 2.1.260");
+    expect(rendered).toContain("preset: fable-max");
+    expect(rendered).toContain("model: claude-fable-5-1");
+    expect(rendered).toContain("permission mode: default");
+    expect(rendered).toContain("isolated profile: enabled");
+    expect(rendered).toContain("stream: stream-json in, stream-json out");
+    // No Codex-only row is invented for a provider that has none of them.
+    expect(rendered).not.toContain("service tier");
+    expect(rendered).not.toContain("Fast:");
+    expect(rendered).not.toContain("plugin capability");
+    expect(rendered).not.toContain("enabled apps");
+  });
+
   test("renders bounded local root status with closed recovery commands", () => {
     const status = {
       version: 1 as const,

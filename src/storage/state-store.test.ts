@@ -29,6 +29,10 @@ import {
 import { utf8Bytes } from "../domain/values";
 import { canTransitionQueue, queueStateSchema, type QueueState } from "../domain/transitions";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
+import {
+  effectiveClaudeRuntimeProfileSchema,
+  effectiveRuntimeProfileSchema,
+} from "../domain/runtime-profile";
 import { initializeProfilePaths, initializeStatePaths, resolveStatePaths } from "./paths";
 import {
   USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
@@ -1154,6 +1158,171 @@ describe("StateStore", () => {
     expect(store.recoverEffectStartedMutations()).toEqual({ recovered: [attempt.id], unresolved: [] });
     expect(store.requireSession(session.id)).toMatchObject({ state: "recovery_required" });
     expect(store.requireSession(session.id).providerThreadId).toBeUndefined();
+  });
+
+  test("carries either provider's reviewed runtime profile through one session-start evidence row", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(store, "Both providers", "both-providers@example.com");
+    const projectRoot = join(home, "both-providers-project");
+    await mkdir(projectRoot);
+    const project = await store.createProject("Both providers project", projectRoot, true);
+    const codexProfile = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-5.6-sol",
+      observedAt: 2_000,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+    // The Claude document has none of the Codex fields and is stored exactly
+    // as the Claude port reviewed it.
+    const claudeProfile = {
+      claudeVersion: "2.1.260",
+      inputFormat: "stream-json" as const,
+      isolatedConfigDir: true as const,
+      model: "claude-fable-5-1",
+      observedAt: 2_100,
+      outputFormat: "stream-json" as const,
+      permissionMode: "default" as const,
+      preset: "fable-max" as const,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      reasoningEffort: "max" as const,
+    };
+
+    const start = (
+      idempotencyKey: string,
+      provider: "codex" | "claude",
+      preset: "high" | "fable-max",
+      runtimeProfile: typeof codexProfile | typeof claudeProfile,
+    ) => {
+      const attempt = store.prepareMutation({
+        authorityGeneration: profile.processGeneration,
+        authorityId: profile.id,
+        idempotencyKey,
+        kind: "session.start",
+        request: { fast: false, preset, projectId: project.id },
+      });
+      const session = store.beginSessionStartEffect({
+        attemptId: attempt.id,
+        evidence: {
+          clientMessageId: null,
+          kind: "session.start",
+          messageDigest: null,
+          projectId: project.id,
+          runtimeProfile,
+        },
+        fastEnabled: false,
+        preset,
+        profileGeneration: profile.processGeneration,
+        profileId: profile.id,
+        projectId: project.id,
+        provider,
+      });
+      store.completeSessionStartEffect({
+        attemptId: attempt.id,
+        expectedSessionRevision: session.revision,
+        providerThreadId: `thread-${provider}`,
+        receipt: { effectiveRuntimeProfile: runtimeProfile, sessionId: session.id },
+        runtimeProfile,
+        sessionId: session.id,
+        state: "idle",
+      });
+      return { attempt, session };
+    };
+
+    const codex = start("00000000-0000-4000-8000-0000000006a0", "codex", "high", codexProfile);
+    const claude = start("00000000-0000-4000-8000-0000000006a1", "claude", "fable-max", claudeProfile);
+
+    expect(store.requireSession(codex.session.id)).toMatchObject({ preset: "high", provider: "codex" });
+    expect(store.requireSession(claude.session.id))
+      .toMatchObject({ preset: "fable-max", provider: "claude" });
+    expect(store.latestSessionRuntimeProfile(codex.session.id))
+      .toMatchObject({ profile: codexProfile, sourceKind: "session_start" });
+    expect(store.latestSessionRuntimeProfile(claude.session.id))
+      .toMatchObject({ profile: claudeProfile, sourceKind: "session_start" });
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006a1")).toMatchObject({
+      evidence: { evidence: { kind: "session.start", runtimeProfile: claudeProfile } },
+      result: { effectiveRuntimeProfile: claudeProfile },
+      state: "applied",
+    });
+
+    // A Codex row is stored byte for byte as it was before the widening.
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const rows = inspector.query(
+        "SELECT session_id,profile_json FROM session_runtime_profiles ORDER BY session_id",
+      ).all() as { profile_json: string; session_id: string }[];
+      const stored = new Map(rows.map((row) => [row.session_id, row.profile_json]));
+      // The widened union re-serialises a Codex document byte for byte as the
+      // Codex-only schema always did, so every row written before Claude
+      // existed still round-trips and still digests the same.
+      expect(stored.get(codex.session.id))
+        .toBe(JSON.stringify(effectiveRuntimeProfileSchema.parse(codexProfile)));
+      expect(stored.get(claude.session.id))
+        .toBe(JSON.stringify(effectiveClaudeRuntimeProfileSchema.parse(claudeProfile)));
+    } finally {
+      inspector.close(false);
+    }
+
+    // A store holding both providers' evidence opens again with no migration.
+    const reopened = new StateStore(store.paths);
+    stores.push(reopened);
+    expect(reopened.latestSessionRuntimeProfile(codex.session.id))
+      .toMatchObject({ profile: codexProfile });
+    expect(reopened.latestSessionRuntimeProfile(claude.session.id))
+      .toMatchObject({ profile: claudeProfile });
+  });
+
+  test("refuses a session-start evidence row whose profile names another provider", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(store, "Mismatch", "mismatch@example.com");
+    const projectRoot = join(home, "mismatch-project");
+    await mkdir(projectRoot);
+    const project = await store.createProject("Mismatch project", projectRoot, true);
+    const attempt = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006a2",
+      kind: "session.start",
+      request: { fast: false, preset: "fable-max", projectId: project.id },
+    });
+    expect(() => store.beginSessionStartEffect({
+      attemptId: attempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        projectId: project.id,
+        runtimeProfile: {
+          claudeVersion: "2.1.260",
+          inputFormat: "stream-json",
+          isolatedConfigDir: true,
+          model: "claude-fable-5-1",
+          observedAt: 2_100,
+          outputFormat: "stream-json",
+          permissionMode: "default",
+          preset: "fable-max",
+          processGeneration: profile.processGeneration,
+          profileId: profile.id,
+          reasoningEffort: "max",
+        },
+      },
+      fastEnabled: true,
+      preset: "fable-max",
+      profileGeneration: profile.processGeneration,
+      profileId: profile.id,
+      projectId: project.id,
+      provider: "claude",
+    })).toThrow("MUTATION_EFFECT_RUNTIME_PROFILE_MISMATCH");
   });
 
   test("appends an immutable resolution with stale-CAS rejection and releases only the exact authority", async () => {

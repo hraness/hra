@@ -6,12 +6,12 @@
 - `src/hra/` re-exports the browser-safe repository modules the app is allowed to reach.
 - `src/auth/` holds the Convex client, the in-memory token storage adapter, and the one-time-code sign-in screen.
 - `src/custody/` holds device key generation, IndexedDB key storage, the enrollment flow, the account-key unlock context, idle lock, and presence.
-- `src/data/` holds the wire parsers, the session heads and one head, the compact history walk, the subscribed compact and detail stream tails, the session metadata cache, the session and device command hooks, and the device, device registry, and archived session hooks.
-- `src/model/` holds the framework-free session model reducer, the transcript derivation, the grid and interaction view models, the settings and device command view models and builders, and time formatting.
+- `src/data/` holds the wire parsers, the session heads and one head, the compact history walk, the subscribed compact and detail stream tails, the session metadata cache, the session and device command hooks, the device, device registry, and archived session hooks, and the manual grid arrangement bound to this browser.
+- `src/model/` holds the framework-free session model reducer, the transcript derivation, the grid and interaction view models, the manual card-order reducer, the session scheduled-task selection, the settings and device command view models and builders, and time formatting.
 - `src/markdown/` holds the sanitiser and the markdown renderer.
 - `src/routing/` holds the hash route model and the router hook.
 - `src/components/ui/` holds the interface primitives as owned source.
-- `src/components/` holds the icons, the state indicator, the streaming tail, the session card, the transcript, and the interaction panel.
+- `src/components/` holds the icons, the state indicator, the streaming tail, the session card, the subagent chips, the scheduled-tasks badge, the transcript, and the interaction panel.
 - `src/screens/` holds the grid, session, and settings screens.
 
 # Guidelines
@@ -23,6 +23,8 @@
 - Offer a remote decision only where the daemon will accept one. `src/model/session-view.ts` holds that table with the verification rule behind each entry.
 - Never register a service worker, load an analytics script, or reference an origin outside the pinned Convex deployment.
 - Never persist plaintext projection text, an authentication token, or an unwrapped account key. Tokens live in the in-memory storage adapter and the account key lives in the custody context only.
+- Keep local storage to the one key `app/src/data/card-order.ts` owns, holding a bounded list of opaque session public ids for the reader's own grid arrangement. `app/src/auth/no-persistent-storage.test.ts` allowlists that module by name; a second entry needs the same argument, and nothing else in the app may name `localStorage`, `sessionStorage`, or `document.cookie`.
+- Show a schedule; never offer to change one. The scheduled-task badge and the settings list read the projected device registries and expose no create, edit, or delete anywhere.
 - Persist only non-extractable `CryptoKey` objects, and only in IndexedDB. A private key must never be exportable.
 - Drop the account key on idle, on `Ctrl+L`, and on the first authority error from Convex.
 - A browser device is never the first device on an account and never approves another device.

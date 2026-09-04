@@ -77,6 +77,28 @@ export function StopIcon(): ReactNode {
   );
 }
 
+export function DragHandleIcon(): ReactNode {
+  return (
+    <Glyph>
+      <circle cx="9" cy="6" r="1" />
+      <circle cx="15" cy="6" r="1" />
+      <circle cx="9" cy="12" r="1" />
+      <circle cx="15" cy="12" r="1" />
+      <circle cx="9" cy="18" r="1" />
+      <circle cx="15" cy="18" r="1" />
+    </Glyph>
+  );
+}
+
+export function ScheduleIcon(): ReactNode {
+  return (
+    <Glyph>
+      <circle cx="12" cy="12" r="8" />
+      <path d="M12 7.5V12l3 2" />
+    </Glyph>
+  );
+}
+
 export function ChevronIcon({ open }: Readonly<{ open: boolean }>): ReactNode {
   return (
     <Glyph>

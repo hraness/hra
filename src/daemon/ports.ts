@@ -195,6 +195,12 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
   readonly provider: "claude";
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
   pinnedVersion(): string;
+  /**
+   * The exact durable authority one pending Claude control request binds.
+   * Codex publishes its own request authority on the notification; Claude's
+   * control request carries only an id, so the daemon asks the port for it.
+   */
+  interactionAuthority(providerThreadId: string, requestId: string): ProviderInteractionAuthority;
 }
 
 export interface CodexRuntimePort extends SessionRuntimePort<EffectiveRuntimeProfile> {
@@ -322,17 +328,39 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
 }
 
 /**
+ * A provider runtime this machine cannot run at all. It is distinct from a
+ * transient provider fault: the daemon reports its message verbatim so the
+ * operator is told exactly what to install.
+ */
+export class ProviderRuntimeUnavailableError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ProviderRuntimeUnavailableError";
+  }
+}
+
+/**
  * The default Claude seam on a machine with no admitted `claude` binary. A
  * session that names the Claude provider is refused with one clear message
  * instead of silently falling back to another provider.
  */
 export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
   readonly provider = "claude" as const;
+  readonly #pinnedVersion: string;
+
+  /** `pinnedVersion` is the exact `CLAUDE_PIN` this build admits. */
+  constructor(pinnedVersion: string) {
+    this.#pinnedVersion = pinnedVersion;
+  }
+
   #unavailable(): never {
-    throw new Error(
-      "The Claude Code runtime is unavailable on this machine. Install the pinned `claude` release, then sign in inside the account's isolated profile.",
+    throw new ProviderRuntimeUnavailableError(
+      `This daemon has no Claude Code runtime. Install Claude Code ${this.#pinnedVersion} exactly, `
+      + "put `claude` on this daemon's PATH, restart the daemon with `hra daemon restart`, then sign in "
+      + "inside the account's isolated Claude profile.",
     );
   }
+  interactionAuthority(): ProviderInteractionAuthority { return this.#unavailable(); }
   pinnedVersion(): string { return this.#unavailable(); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }

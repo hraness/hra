@@ -8,6 +8,10 @@ import {
   CloudProjectionRecoveryAdmissionError,
   KeyRotationRequiredError,
 } from "../domain/cloud-outcomes";
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- the daemon maps this provider's closed failure codes onto command outcomes; only the error class and the pinned version cross the boundary.
+import { ClaudeError } from "../claude/errors";
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- `claude/pin.ts` is the zero-import pin module; the daemon names the exact release an operator must install.
+import { CLAUDE_PIN } from "../claude/pin";
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- D4 extracts the provider port; until then the daemon composes the pinned Codex runtime directly.
 import {
   CodexError,
@@ -33,6 +37,7 @@ import {
   type InteractionRecord,
   type InteractionIntendedTerminalState,
   type InteractionResolution,
+  type ProviderInteractionAuthority,
   type PublicInteraction,
 } from "../domain/interactions";
 import {
@@ -45,8 +50,12 @@ import {
 import {
   isPresetSupportedByProvider,
   PresetProviderMismatchError,
+  type Provider,
 } from "../domain/presets";
-import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
+import {
+  reviewedRuntimeProfileSchema,
+  type ReviewedRuntimeProfile,
+} from "../domain/runtime-profile";
 import {
   SESSION_CONVERSATION_AUTOMATION_CAPABILITY,
   summarizeSessionTask,
@@ -127,6 +136,9 @@ import type { HraFactsMemoryLifecyclePort } from "./facts-memory-lifecycle";
 import { commandFailureBrand } from "./local-transport";
 import {
   CodexSessionObservationError,
+  ProviderRuntimeUnavailableError,
+  UnavailableClaudeRuntime,
+  type ClaudeRuntimePort,
   type CloudControlPort,
   type CodexAccountProjection,
   type CodexLoginOutcome,
@@ -135,8 +147,13 @@ import {
   type CodexSessionProjection,
   type DesktopSwitchPort,
   type ProfileAuthority,
-  type RuntimeStartReview,
+  type RuntimeStartReviewOf,
+  type SessionRuntimePort,
 } from "./ports";
+import {
+  ClaudeSessionFactTranslator,
+  type ClaudeSessionFact,
+} from "./claude-session-facts";
 import {
   SessionEventCursorCodec,
   SessionEventCursorError,
@@ -270,6 +287,59 @@ const cloudProjectionRecoveryAction = (
 ): string => root.unavailability === "disabled"
   ? `${cloudReenableAction(root)} first. After restart, ${action}`
   : `${action.slice(0, 1).toUpperCase()}${action.slice(1)}`;
+
+/**
+ * The closed failure code either provider's adapter raised. The daemon's
+ * interaction lane reasons about provider outcomes (invalid input, expired
+ * deadline, unproven effect) rather than about which provider produced them.
+ */
+const providerFailure = (error: unknown): CodexError | ClaudeError | null =>
+  error instanceof CodexError || error instanceof ClaudeError ? error : null;
+
+const providerFailureCode = (error: unknown): string | null => providerFailure(error)?.code ?? null;
+
+/** The provider's own bounded, credential-free message, or a neutral one. */
+const providerFailureMessage = (error: unknown): string =>
+  providerFailure(error)?.message ?? "The provider refused the operation.";
+
+const claudeCommandFailure = (error: ClaudeError): CommandFailure => {
+  switch (error.code) {
+    case "AUTHORITY_STALE":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "The exact Claude Code process authority changed before the operation finished. Inspect daemon status before starting a fresh attempt.",
+        { reason: "claude_authority_stale", nextCommand: "hra daemon status --json" },
+      );
+    case "DEADLINE_EXPIRED":
+      return new CommandFailure(
+        "CONFLICT",
+        "The Claude Code interaction deadline expired before HRA could apply the response. Refresh pending interactions instead of replaying the expired response.",
+        { reason: "claude_interaction_deadline_expired", nextCommand: "hra interaction list --pending --json" },
+      );
+    case "INVALID_INPUT":
+    case "PRESET_UNSUPPORTED":
+    case "UNSUPPORTED_CAPABILITY":
+      return new CommandFailure("INVALID_INPUT", error.message, { reason: "claude_unsupported" });
+    case "NOT_AUTHENTICATED":
+      return new CommandFailure(
+        "INTERACTION_REQUIRED",
+        `Claude Code ${CLAUDE_PIN} is installed but this account's isolated Claude profile is not signed in. Sign in inside that profile, then retry.`,
+        { reason: "claude_not_authenticated" },
+      );
+    case "CONFIG_DIR_MISMATCH":
+    case "RUNTIME_MISMATCH":
+      return new CommandFailure("UNAVAILABLE", error.message, { reason: "claude_runtime_unavailable" });
+    case "PROCESS_EXITED":
+    case "PROTOCOL_ERROR":
+    case "PROTOCOL_LIMIT":
+    case "TIMEOUT":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        `The pinned Claude Code ${CLAUDE_PIN} runtime connection ended before the operation finished. Start a fresh attempt.`,
+        { reason: "claude_runtime_fault" },
+      );
+  }
+};
 
 const codexCommandFailure = (error: CodexError): CommandFailure => {
   switch (error.code) {
@@ -485,13 +555,13 @@ const loginCancelReceiptSchema = z.object({
 const sessionStartReceiptSchema = z.object({
   sessionId: sessionIdSchema,
   sourceId: z.string().min(1).max(200).optional(),
-  effectiveRuntimeProfile: effectiveRuntimeProfileSchema.optional(),
+  effectiveRuntimeProfile: reviewedRuntimeProfileSchema.optional(),
 }).strict();
 const turnStartReceiptSchema = z.object({
   turnId: z.string().min(1).max(200),
   status: z.enum(["completed", "interrupted", "failed", "inProgress"]).optional(),
   sourceId: z.string().min(1).max(200).optional(),
-  effectiveRuntimeProfile: effectiveRuntimeProfileSchema.optional(),
+  effectiveRuntimeProfile: reviewedRuntimeProfileSchema.optional(),
 }).strict();
 const steeredReceiptSchema = z.object({ steered: z.literal(true), activeTurnId: z.string().min(1).max(200) }).strict();
 const stoppedReceiptSchema = z.discriminatedUnion("stopped", [
@@ -615,6 +685,7 @@ const restoreLoginReceipt = (value: unknown): LoginOutcome => {
 export const BACKGROUND_DIAGNOSTIC_CODES = [
   "account_fact_apply_failed",
   "autorespond_failed",
+  "claude_fact_untranslatable",
   "prose_autorespond_failed",
   "queue_dispatch_failed",
   "queue_pre_effect_retry_failed",
@@ -655,6 +726,8 @@ export class HraService {
   readonly #store: StateStore;
   readonly #paths: StatePaths;
   readonly #codex: CodexRuntimePort;
+  readonly #claude: ClaudeRuntimePort;
+  readonly #claudeFacts: ClaudeSessionFactTranslator;
   readonly #desktop: DesktopSwitchPort | undefined;
   readonly #cloud: CloudControlPort;
   readonly #daemonAuthority: Pick<DaemonAuthorityFence, "assertCurrent" | "close">;
@@ -706,6 +779,8 @@ export class HraService {
     store: StateStore;
     paths: StatePaths;
     codex: CodexRuntimePort;
+    /** Omitted on a machine with no admitted `claude` binary. */
+    claude?: ClaudeRuntimePort;
     cloud: CloudControlPort;
     daemonAuthority: Pick<DaemonAuthorityFence, "assertCurrent" | "close">;
     desktop?: DesktopSwitchPort;
@@ -724,6 +799,12 @@ export class HraService {
     this.#store = input.store;
     this.#paths = input.paths;
     this.#codex = input.codex;
+    this.#claude = input.claude ?? new UnavailableClaudeRuntime(CLAUDE_PIN);
+    this.#claudeFacts = new ClaudeSessionFactTranslator({
+      authorityFor: (providerThreadId, requestId) =>
+        this.#claude.interactionAuthority(providerThreadId, requestId),
+      now: () => this.#now(),
+    });
     this.#cloud = input.cloud;
     this.#daemonAuthority = input.daemonAuthority;
     this.#eventCursors = input.eventCursors
@@ -1342,6 +1423,14 @@ export class HraService {
         throw new CommandFailure("CONFLICT", "The session event cursor is ahead of the current stream.");
       }
       if (error instanceof CodexError) throw codexCommandFailure(error);
+      if (error instanceof ClaudeError) throw claudeCommandFailure(error);
+      // A provider this machine cannot run at all is reported verbatim: the
+      // message names the exact release the operator has to install.
+      if (error instanceof ProviderRuntimeUnavailableError) {
+        throw new CommandFailure("UNAVAILABLE", error.message, {
+          reason: "provider_runtime_unavailable",
+        });
+      }
       if (error instanceof Error && /unavailable|not configured/iu.test(error.message)) {
         throw new CommandFailure("UNAVAILABLE", "A required local or provider capability is unavailable.");
       }
@@ -1829,10 +1918,11 @@ export class HraService {
     signal: AbortSignal,
   ): Promise<void> {
     const profile = this.#store.requireProfileById(current.authority.profileId);
+    const runtime = this.#runtimeForInteraction(current);
     let responseDigest: string;
     try {
       await this.#daemonAuthority.assertCurrent();
-      const validated = await this.#codex.validateInteractionTimeout({
+      const validated = await runtime.validateInteractionTimeout({
         authority: authorityFor(this.#paths, profile),
         provider: current.authority,
         signal,
@@ -1842,7 +1932,7 @@ export class HraService {
       if (signal.aborted) return;
       const latest = this.#store.requireInteraction(current.publicId);
       if (latest.state !== "pending" || latest.revision !== current.revision) return;
-      const terminal = error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+      const terminal = providerFailureCode(error) === "INDETERMINATE_EFFECT"
         ? this.#store.markInteractionResolutionUnknown({
             id: latest.publicId,
             expectedRevision: latest.revision,
@@ -1872,7 +1962,7 @@ export class HraService {
     }
     try {
       await this.#daemonAuthority.assertCurrent();
-      await this.#codex.timeoutInteraction({
+      await runtime.timeoutInteraction({
         authority: authorityFor(this.#paths, profile),
         provider: prepared.authority,
         signal,
@@ -1881,7 +1971,7 @@ export class HraService {
       if (signal.aborted) return;
       const latest = this.#store.requireInteraction(prepared.publicId);
       if (latest.state !== "response_prepared" || latest.revision !== prepared.revision) return;
-      const terminal = error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+      const terminal = providerFailureCode(error) === "INDETERMINATE_EFFECT"
         ? this.#store.markInteractionResolutionUnknown({
             id: latest.publicId,
             expectedRevision: latest.revision,
@@ -1932,6 +2022,70 @@ export class HraService {
     } finally {
       finish();
     }
+  }
+
+  /**
+   * One Claude bridge fact, reduced to the daemon's neutral vocabulary and
+   * then applied through exactly the same path a Codex fact takes. Everything
+   * downstream (transcript events, durable interactions, turn boundaries, the
+   * session-state classifier, the compact projection, the live uploader) is
+   * therefore provider-agnostic by construction.
+   */
+  async observeClaudeFact(authority: ProfileAuthority, fact: ClaudeSessionFact): Promise<void> {
+    let translated: readonly CodexFact[];
+    try {
+      translated = this.#claudeFacts.translate(fact);
+    } catch (error: unknown) {
+      // A control request whose authority the runtime can no longer prove is
+      // a dropped fact, never a fault on a live session.
+      this.recordBackgroundDiagnostic("claude_fact_untranslatable", error);
+      return;
+    }
+    for (const neutral of translated) await this.observeCodexFact(authority, neutral);
+  }
+
+  /** The port that runs one provider's sessions, turns, and interactions. */
+  #sessionRuntime(provider: Provider): SessionRuntimePort<ReviewedRuntimeProfile> {
+    return provider === "claude" ? this.#claude : this.#codex;
+  }
+
+  #runtimeForSession(
+    session: Readonly<{ provider: Provider }>,
+  ): SessionRuntimePort<ReviewedRuntimeProfile> {
+    return this.#sessionRuntime(session.provider);
+  }
+
+  /**
+   * The port that owns a brokered interaction. The session it belongs to is
+   * the authority; an interaction with no session (a provider-level request)
+   * is attributed by the durable method name its authority recorded.
+   */
+  #runtimeForInteraction(
+    record: Readonly<{
+      sessionId: SessionRecord["id"] | null;
+      authority: ProviderInteractionAuthority;
+    }>,
+  ): SessionRuntimePort<ReviewedRuntimeProfile> {
+    if (record.sessionId !== null) {
+      try {
+        return this.#runtimeForSession(this.#store.requireSession(record.sessionId));
+      } catch {
+        // Fall through to the durable method name below.
+      }
+    }
+    return this.#sessionRuntime(
+      record.authority.method.startsWith("claude/") ? "claude" : "codex",
+    );
+  }
+
+  /** Refuses a Codex-only capability on a session bound to another provider. */
+  #requireCodexSession(session: Readonly<{ provider: Provider }>, capability: string): void {
+    if (session.provider === "codex") return;
+    throw new CommandFailure(
+      "INVALID_INPUT",
+      `The ${session.provider} provider does not support ${capability}. `
+      + "It is available on Codex sessions only.",
+    );
   }
 
   async handleConversationAutomationToolCall(
@@ -3103,7 +3257,10 @@ export class HraService {
       if (this.#sessionTaskPumpTask !== undefined) {
         await this.#sessionTaskPumpTask.catch(() => undefined);
       }
-      await this.#codex.close();
+      const closed = await Promise.allSettled([this.#codex.close(), this.#claude.close()]);
+      for (const outcome of closed) {
+        if (outcome.status === "rejected") runtimeError ??= outcome.reason;
+      }
     } catch (error: unknown) {
       runtimeError = error;
     }
@@ -4732,7 +4889,7 @@ export class HraService {
     const authority = authorityFor(this.#paths, profile);
     let observation: CodexSessionObservation;
     try {
-      observation = await this.#fencedEffect(async () => await this.#codex.observeSession({
+      observation = await this.#fencedEffect(async () => await this.#runtimeForSession(session).observeSession({
         authority,
         providerThreadId,
         signal,
@@ -5772,7 +5929,7 @@ export class HraService {
       let authority: Awaited<ReturnType<CodexRuntimePort["inspectInteractionAuthority"]>>;
       try {
         await this.#daemonAuthority.assertCurrent();
-        authority = await this.#codex.inspectInteractionAuthority({
+        authority = await this.#runtimeForInteraction(current).inspectInteractionAuthority({
           authority: authorityFor(this.#paths, profile),
           provider: current.authority,
           kind: current.kind,
@@ -5780,8 +5937,8 @@ export class HraService {
         });
         await this.#daemonAuthority.assertCurrent();
       } catch (error: unknown) {
-        if (error instanceof CodexError && error.code === "UNSUPPORTED_CAPABILITY") {
-          throw new CommandFailure("INVALID_INPUT", error.message);
+        if (providerFailureCode(error) === "UNSUPPORTED_CAPABILITY") {
+          throw new CommandFailure("INVALID_INPUT", providerFailureMessage(error));
         }
         throw new CommandFailure(
           "CONFLICT",
@@ -5853,10 +6010,11 @@ export class HraService {
       }
       this.#assertResolutionMatches(current, command.resolution);
       const profile = this.#store.requireProfileById(current.authority.profileId);
+      const runtime = this.#runtimeForInteraction(current);
       let responseDigest: string;
       try {
         await this.#daemonAuthority.assertCurrent();
-        const validated = await this.#codex.validateInteractionResolution({
+        const validated = await runtime.validateInteractionResolution({
           authority: authorityFor(this.#paths, profile),
           provider: current.authority,
           kind: current.kind,
@@ -5868,10 +6026,10 @@ export class HraService {
         if (this.#now() >= current.deadlineAt) {
           await this.#rejectManualResolutionAtDeadline(current);
         }
-        if (error instanceof CodexError && error.code === "INVALID_INPUT") {
-          throw new CommandFailure("INVALID_INPUT", error.message);
+        if (providerFailureCode(error) === "INVALID_INPUT") {
+          throw new CommandFailure("INVALID_INPUT", providerFailureMessage(error));
         }
-        const terminal = error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+        const terminal = providerFailureCode(error) === "INDETERMINATE_EFFECT"
           ? this.#store.markInteractionResolutionUnknown({
               id: current.publicId,
               expectedRevision: current.revision,
@@ -5881,7 +6039,7 @@ export class HraService {
               expectedRevision: current.revision,
             });
         this.#appendInteractionState(terminal);
-        if (error instanceof CodexError && error.code === "INDETERMINATE_EFFECT") {
+        if (providerFailureCode(error) === "INDETERMINATE_EFFECT") {
           throw new CommandFailure(
             "RECOVERY_REQUIRED",
             "The interaction response may already have reached Codex; its resolution is unknown.",
@@ -5921,7 +6079,7 @@ export class HraService {
         if (this.#now() >= prepared.deadlineAt) {
           await this.#rejectPreparedManualResolutionAtDeadline(prepared);
         }
-        await this.#codex.resolveInteraction({
+        await runtime.resolveInteraction({
           authority: authorityFor(this.#paths, profile),
           provider: prepared.authority,
           kind: prepared.kind,
@@ -5931,10 +6089,10 @@ export class HraService {
         });
       } catch (error: unknown) {
         if (error instanceof CommandFailure) throw error;
-        if (error instanceof CodexError && error.code === "DEADLINE_EXPIRED") {
+        if (providerFailureCode(error) === "DEADLINE_EXPIRED") {
           await this.#rejectPreparedManualResolutionAtDeadline(prepared);
         }
-        const terminal = error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+        const terminal = providerFailureCode(error) === "INDETERMINATE_EFFECT"
           ? this.#store.markInteractionResolutionUnknown({
               id: prepared.publicId,
               expectedRevision: prepared.revision,
@@ -5945,15 +6103,15 @@ export class HraService {
               expectedRevision: prepared.revision,
             });
         this.#appendInteractionState(terminal);
-        if (error instanceof CodexError && error.code === "INDETERMINATE_EFFECT") {
+        if (providerFailureCode(error) === "INDETERMINATE_EFFECT") {
           throw new CommandFailure(
             "RECOVERY_REQUIRED",
             "The interaction response may have reached Codex; its resolution is unknown.",
             { interaction: this.#publicInteraction(terminal) },
           );
         }
-        if (error instanceof CodexError && error.code === "INVALID_INPUT") {
-          throw new CommandFailure("INVALID_INPUT", error.message);
+        if (providerFailureCode(error) === "INVALID_INPUT") {
+          throw new CommandFailure("INVALID_INPUT", providerFailureMessage(error));
         }
         throw new CommandFailure(
           "CONFLICT",
@@ -6004,11 +6162,12 @@ export class HraService {
       || prepared.intendedTerminalState === "expired"
     ) throw new Error("INTERACTION_MANUAL_RESPONSE_NOT_PREPARED");
     const profile = this.#store.requireProfileById(prepared.authority.profileId);
+    const runtime = this.#runtimeForInteraction(prepared);
     const signal = this.#interactionDeadlineAbort.signal;
     let timeoutResponseDigest: string;
     try {
       await this.#daemonAuthority.assertCurrent();
-      const validated = await this.#codex.validateInteractionTimeout({
+      const validated = await runtime.validateInteractionTimeout({
         authority: authorityFor(this.#paths, profile),
         provider: prepared.authority,
         signal,
@@ -6028,7 +6187,7 @@ export class HraService {
       if (terminal !== latest) this.#appendInteractionState(terminal);
       throw new CommandFailure(
         "RECOVERY_REQUIRED",
-        error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+        providerFailureCode(error) === "INDETERMINATE_EFFECT"
           ? "The interaction response may already have reached Codex; its resolution is unknown."
           : "The expired interaction could not be closed on its exact provider connection.",
         { interaction: this.#publicInteraction(terminal) },
@@ -6053,7 +6212,7 @@ export class HraService {
     }
     try {
       await this.#daemonAuthority.assertCurrent();
-      await this.#codex.timeoutInteraction({
+      await runtime.timeoutInteraction({
         authority: authorityFor(this.#paths, profile),
         provider: timeoutPrepared.authority,
         signal,
@@ -6063,7 +6222,7 @@ export class HraService {
       const terminal = latest.state === "response_prepared"
         && latest.revision === timeoutPrepared.revision
         && latest.responseDigest === timeoutResponseDigest
-        ? error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+        ? providerFailureCode(error) === "INDETERMINATE_EFFECT"
           ? this.#store.markInteractionResolutionUnknown({
               id: latest.publicId,
               expectedRevision: latest.revision,
@@ -6076,10 +6235,10 @@ export class HraService {
         : latest;
       if (terminal !== latest) this.#appendInteractionState(terminal);
       throw new CommandFailure(
-        error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+        providerFailureCode(error) === "INDETERMINATE_EFFECT"
           ? "RECOVERY_REQUIRED"
           : "CONFLICT",
-        error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+        providerFailureCode(error) === "INDETERMINATE_EFFECT"
           ? "The provider timeout response may have reached Codex; its resolution is unknown."
           : "The expired interaction could not be closed on its exact provider connection.",
         { interaction: this.#publicInteraction(terminal) },
@@ -6272,7 +6431,7 @@ export class HraService {
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettled(session.id);
     await this.#daemonAuthority.assertCurrent();
-    const projection = await this.#fencedEffect(async () => await this.#codex.readSession({ authority: authorityFor(this.#paths, profile), providerThreadId, detail, signal }));
+    const projection = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: authorityFor(this.#paths, profile), providerThreadId, detail, signal }));
     if (projectionRecoveryUnsettled || this.#projectionRecoveriesInFlight.has(session.id)) {
       const runtimeProfile = this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null;
       const coherentSession = this.#store.requireSession(session.id);
@@ -6315,22 +6474,18 @@ export class HraService {
         new PresetProviderMismatchError(provider, command.preset).message,
       );
     }
-    if (provider !== this.#codex.provider) {
-      // W3-C: the Claude port exists (`ClaudeRuntimePort`,
-      // `src/daemon/claude-runtime-adapter.ts`) but the daemon's durable
-      // session-start evidence still carries only the Codex runtime profile,
-      // so a Claude session is refused with one clear message rather than
-      // silently started on the other provider.
-      throw new CommandFailure(
-        "INTERACTION_REQUIRED",
-        `This daemon cannot start a ${provider} session yet. Start it with \`--provider codex\`, or run the Claude provider once the daemon's Claude runtime is enabled.`,
-      );
-    }
+    // The session binds this provider's port for its whole life: the durable
+    // session-start evidence carries whichever provider's reviewed profile the
+    // port proves, and every later turn, steer, stop, and interaction on this
+    // session is routed back to the same port by `sessions.provider`.
+    const runtime = this.#sessionRuntime(provider);
     const key = command.idempotencyKey ?? randomUUID();
     let localSessionId: SessionRecord["id"] | undefined;
     let clientMessageId: string | undefined;
-    let review: RuntimeStartReview | undefined;
-    let startedProjection: (CodexSessionProjection & { effectiveRuntimeProfile: z.infer<typeof effectiveRuntimeProfileSchema> }) | undefined;
+    let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
+    let startedProjection:
+      | (CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile })
+      | undefined;
     const outcome = await this.#effect<z.infer<typeof sessionStartReceiptSchema>>({
       kind: "session.start",
       authorityId: profile.id,
@@ -6341,7 +6496,7 @@ export class HraService {
         clientMessageId = attemptId;
         review = await this.#fencedEffect(async () => {
           const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
-          return await this.#codex.reviewSessionStart({
+          return await runtime.reviewSessionStart({
             authority: authorityFor(this.#paths, profile),
             projectRoot,
             preset: command.preset,
@@ -6375,7 +6530,7 @@ export class HraService {
         try {
           startedProjection = await this.#fencedEffect(async () => {
             const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
-            return await this.#codex.startSession({
+            return await runtime.startSession({
               authority: authorityFor(this.#paths, profile),
               projectRoot,
               review: runtimeReview,
@@ -6460,10 +6615,10 @@ export class HraService {
     if (actor === "human") this.#store.resetAutorespondCounter(session.id);
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
-    let review: RuntimeStartReview | undefined;
+    let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
     let dispatchSessionRevision: number | undefined;
     let dispatchFactEpoch: number | undefined;
-    let startedResult: { turnId: string; status: "completed" | "interrupted" | "failed" | "inProgress"; effectiveRuntimeProfile: z.infer<typeof effectiveRuntimeProfileSchema> } | undefined;
+    let startedResult: { turnId: string; status: "completed" | "interrupted" | "failed" | "inProgress"; effectiveRuntimeProfile: ReviewedRuntimeProfile } | undefined;
     const result = await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message }, idempotencyKey: key, effect: async (attemptId) => {
       if (baseline === undefined || review === undefined) throw new Error("Session send lost its exact pre-effect provider baseline or runtime review.");
       const runtimeReview = review;
@@ -6472,7 +6627,7 @@ export class HraService {
         const projectRoot = project === undefined
           ? undefined
           : await this.#requireUsableProjectRoot(project.rootPath);
-        return await this.#codex.startTurn({
+        return await this.#runtimeForSession(session).startTurn({
           authority: authorityFor(this.#paths, profile),
           providerThreadId: session.providerThreadId,
           ...(projectRoot === undefined ? {} : { projectRoot }),
@@ -6490,7 +6645,7 @@ export class HraService {
         const projectRoot = project === undefined
           ? undefined
           : await this.#requireUsableProjectRoot(project.rootPath);
-        return await this.#codex.reviewTurnStart({
+        return await this.#runtimeForSession(session).reviewTurnStart({
           authority: authorityFor(this.#paths, profile),
           providerThreadId: session.providerThreadId,
           ...(projectRoot === undefined ? {} : { projectRoot }),
@@ -6558,7 +6713,7 @@ export class HraService {
     const result = await this.#effect({ kind: "session.steer", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message }, idempotencyKey: key, effect: async (attemptId) => {
       if (activeTurnId === undefined) throw new CommandFailure("CONFLICT", "The session has no active turn to steer.");
       const turnId = activeTurnId;
-      await this.#fencedEffect(async () => await this.#codex.steer({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, message, clientMessageId: attemptId, signal }));
+      await this.#fencedEffect(async () => await this.#runtimeForSession(session).steer({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, message, clientMessageId: attemptId, signal }));
       return { steered: true as const, activeTurnId: turnId };
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
@@ -6704,7 +6859,7 @@ export class HraService {
     const result = await this.#effect({ kind: "session.stop", authorityId: session.id, authorityGeneration: profile.processGeneration, request: {}, idempotencyKey: key, effect: async () => {
       if (activeTurnId === null) return { stopped: false as const, activeTurnId: null };
       const turnId = activeTurnId;
-      await this.#fencedEffect(async () => await this.#codex.interrupt({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, signal }));
+      await this.#fencedEffect(async () => await this.#runtimeForSession(session).interrupt({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, signal }));
       return { stopped: true as const, activeTurnId: turnId };
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
@@ -6734,6 +6889,7 @@ export class HraService {
 
   async #rename(selector: string, name: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
+    this.#requireCodexSession(session, "renaming a provider thread");
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
     const key = idempotencyKey ?? randomUUID();
@@ -6991,7 +7147,7 @@ export class HraService {
   }
 
   async #readExactSessionProjection(session: BoundSessionRecord, profile: ProfileRecord, detail: boolean, signal: AbortSignal): Promise<CodexSessionProjection> {
-    const projection = await this.#fencedEffect(async () => await this.#codex.readSession({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, detail, signal }));
+    const projection = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, detail, signal }));
     if (projection.providerThreadId !== session.providerThreadId) {
       throw new CommandFailure("RECOVERY_REQUIRED", "Codex returned a projection for a different provider thread.");
     }
@@ -7008,6 +7164,7 @@ export class HraService {
 
   async #inspectTurn(sessionSelector: string, turnId: string, signal: AbortSignal): Promise<unknown> {
     const session = this.#requireBoundSession(sessionSelector);
+    this.#requireCodexSession(session, "protected turn inspection");
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
     this.#requireLiveProviderObservation(
@@ -7158,7 +7315,7 @@ export class HraService {
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) return;
       const review = await this.#fencedEffect(async () => {
         const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
-        return await this.#codex.reviewTurnStart({
+        return await this.#runtimeForSession(session).reviewTurnStart({
           authority,
           providerThreadId: boundSession.providerThreadId,
           projectRoot,
@@ -7188,7 +7345,7 @@ export class HraService {
       const dispatchFactEpoch = this.#snapshotSessionFactEpoch(session.id);
       const result = await this.#fencedEffect(async () => {
         const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
-        return await this.#codex.startTurn({
+        return await this.#runtimeForSession(session).startTurn({
           authority,
           providerThreadId: boundSession.providerThreadId,
           projectRoot,

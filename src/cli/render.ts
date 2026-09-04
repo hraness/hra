@@ -258,6 +258,24 @@ const renderTurnSummary = (value: unknown): string | null => {
 const renderEffectiveRuntimeProfile = (value: unknown): readonly string[] => {
   const profile = object(value);
   if (profile === null) return [];
+  // The two providers review different documents. Claude Code owns its own
+  // permission engine, so its profile names the pinned CLI version, the
+  // interactive permission mode, and the isolated runtime home instead of the
+  // Codex approval, review, and app capabilities.
+  if (typeof profile.claudeVersion === "string") {
+    return [
+      "Runtime",
+      `  account: ${line(profile.profileId)} generation ${line(profile.processGeneration)}`,
+      `  provider: Claude Code ${line(profile.claudeVersion)}`,
+      `  preset: ${line(profile.preset)}`,
+      `  model: ${line(profile.model)}`,
+      `  reasoning effort: ${line(profile.reasoningEffort)}`,
+      `  permission mode: ${line(profile.permissionMode)}`,
+      `  isolated profile: ${profile.isolatedConfigDir === true ? "enabled" : "unavailable"}`,
+      `  stream: ${line(profile.inputFormat)} in, ${line(profile.outputFormat)} out`,
+      `  observed at: ${line(profile.observedAt)}`,
+    ];
+  }
   const apps = Array.isArray(profile.enabledApps)
     ? profile.enabledApps.map(object).filter((app): app is Record<string, unknown> => app !== null)
     : [];

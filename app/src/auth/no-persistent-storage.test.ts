@@ -29,16 +29,33 @@ async function sourceFiles(root: string): Promise<readonly string[]> {
   return found.sort();
 }
 
+/**
+ * The one module allowed to name `localStorage`, and what it is allowed to keep
+ * there: a bounded list of opaque session public ids that is the reader's own
+ * grid arrangement. No projection text, no session name, no authentication
+ * token, and no key material — those stay in memory and in the non-extractable
+ * IndexedDB key store. A second entry here needs the same argument.
+ */
+const localStorageUsers = ["data/card-order.ts"];
+
 describe("browser storage discipline", () => {
-  test("no module reaches localStorage, sessionStorage, or document.cookie", async () => {
+  test("only the grid arrangement reaches localStorage, and nothing reaches sessionStorage or document.cookie", async () => {
     const offenders: string[] = [];
+    const users: string[] = [];
     for (const path of await sourceFiles(appSource)) {
       const text = stripComments(await readFile(path, "utf8"));
-      if (/\blocalStorage\b|\bsessionStorage\b|document\.cookie/u.test(text)) {
+      if (/\bsessionStorage\b|document\.cookie/u.test(text)) {
         offenders.push(relative(appSource, path));
-      }
+      } else if (/\blocalStorage\b/u.test(text)) users.push(relative(appSource, path));
     }
     expect(offenders).toEqual([]);
+    expect(users).toEqual(localStorageUsers);
+  });
+
+  test("the stored arrangement is bounded and holds ids only", async () => {
+    const text = await readFile(join(appSource, "model", "card-order.ts"), "utf8");
+    expect(text).toContain("export const maximumOrderedCards = 200");
+    expect(text).toContain("normaliseCardOrder");
   });
 
   test("the only persistent store is IndexedDB, and only for device key pairs", async () => {

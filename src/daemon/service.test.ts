@@ -14,6 +14,7 @@ import {
   type CodexPluginCatalog,
 } from "../codex";
 import { parseFact } from "../codex/protocol";
+import { CLAUDE_PIN } from "../claude/pin";
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import { AccountKeyLossPreconditionError } from "../cloud/local-control";
 import {
@@ -1155,15 +1156,17 @@ describe("HraService", () => {
       fast: false,
     }, { signal })).rejects.toThrow("does not support the `ultra` model preset");
 
-    // The Claude runtime is not wired into this daemon's durable session-start
-    // evidence yet, so the coherent pair is refused with one clear message.
+    // The coherent pair is admitted, but this fixture composes no Claude
+    // runtime, so the refusal names the exact pinned release to install.
     await expect(service.execute({
       kind: "session.start",
       account: added.account.id,
       provider: "claude",
       preset: "fable-max",
       fast: false,
-    }, { signal })).rejects.toThrow("cannot start a claude session yet");
+    }, { signal })).rejects.toThrow(
+      `This daemon has no Claude Code runtime. Install Claude Code ${CLAUDE_PIN} exactly`,
+    );
 
     // Every existing Codex path is unchanged.
     const started = await service.execute({
