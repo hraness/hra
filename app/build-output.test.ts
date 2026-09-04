@@ -31,6 +31,9 @@ const reviewedVendorOrigins = new Set([
   "https://happy-otter-123.convex.cloud",
   // The React error decoder link.
   "https://react.dev",
+  // Changelog and repository links inside react-markdown and
+  // hast-util-to-jsx-runtime error messages.
+  "https://github.com",
 ]);
 
 const pinnedConvexOrigins = new Set([
@@ -98,9 +101,19 @@ describe("built shell", () => {
 });
 
 describe("bundle invariants", () => {
+  /*
+   * `style-src 'self'` blocks a style attribute, and a violation is invisible
+   * until a browser drops the rule, so the built text is the fixture. The
+   * lookbehind excludes an assignment to a `style` member on an object, which
+   * is how a vendored renderer builds a React props record: that is a property
+   * write inside library code, not an attribute this app emits, and the
+   * component overrides in `app/src/markdown/markdown.tsx` drop the prop before
+   * it can reach an element. Anything that reads as an attribute, in the shell
+   * or in a bundle, still fails here.
+   */
   test("no output sets a style attribute", () => {
     for (const artifact of artifacts) {
-      const offenders = [...artifact.text.matchAll(/\bstyle\s*=/gu)];
+      const offenders = [...artifact.text.matchAll(/(?<![.\w$])style\s*=/gu)];
       expect({ file: artifact.name, offenders: offenders.length }).toEqual({
         file: artifact.name,
         offenders: 0,

@@ -10,6 +10,7 @@ import {
   type ReactNode,
 } from "react";
 
+import { clearCompactHistoryCache } from "../data/compact-history";
 import {
   accountCurrent,
   currentRegistration,
@@ -21,6 +22,7 @@ import {
   presenceHeartbeat,
   registerDevice,
 } from "../data/functions";
+import { clearSessionMetadataCache } from "../data/session-metadata";
 import {
   parseAccountContext,
   parseBindChallenge,
@@ -172,6 +174,11 @@ export function CustodyProvider({ children }: Readonly<{ children: ReactNode }>)
     wipeBytes(current?.key);
     unlockedRef.current = null;
     setUnlocked(null);
+    // Decrypted projection text lives in tab-local caches so a card does not
+    // re-decrypt on every render. Dropping the key without dropping them would
+    // leave plaintext readable behind the lock screen.
+    clearCompactHistoryCache();
+    clearSessionMetadataCache();
   }, [disconnectPresence]);
 
   const reportAuthorityFailure = useCallback((failure: unknown) => {

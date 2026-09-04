@@ -10,6 +10,7 @@
 export {
   canonicalDevicePublicKeyJson,
   decodeBase64Url,
+  decryptBytes,
   deviceBindMessage,
   encodeBase64Url,
   encryptBytes,
@@ -27,8 +28,10 @@ export {
 
 export {
   cloudLimits,
+  COMMAND_KINDS,
   hasExactKeys,
   isBase64Url,
+  isCommandKind,
   isFiniteTimestamp,
   isOpaqueIdentifier,
   isRecord,
@@ -53,8 +56,10 @@ export {
   sessionChunkAad,
   type CompactInteractionKind,
   type CompactInteractionState,
+  type CompactMessageActor,
   type CompactSessionEvent,
   type DetailSessionEvent,
+  type GitAction,
   type ModelPreset,
   type SessionChunkAuthority,
   type SessionStateValue,
@@ -62,9 +67,17 @@ export {
 
 export {
   cloudPayloadAad,
+  decryptDeviceRegistry,
   decryptSessionMetadata,
+  deviceRegistryLimits,
   encryptRemoteCommand,
+  parseDeviceRegistryPayload,
+  parseRemoteCommandPayload,
   type CloudPayloadAuthority,
+  type DeviceRegistryAccount,
+  type DeviceRegistryPayload,
+  type DeviceRegistryProject,
+  type DeviceRegistryScheduledTask,
   type RemoteCommandPayload,
   type SessionMetadataPayload,
 } from "../../../src/cloud/payloads";

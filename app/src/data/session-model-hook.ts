@@ -1,77 +1,81 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 
-import { useCustody } from "../custody/custody-context";
-import { decryptSessionMetadata } from "../hra/cloud";
 import {
   initialSessionModel,
   sessionModelReducer,
   type SessionModel,
 } from "../model/session-model";
-import { createCancellation } from "../lib/cancellation";
+import { mergeCompactEvents } from "../model/transcript";
+import type { CompactSessionEvent } from "../hra/cloud";
 import { useCompactHistory } from "./compact-history";
+import { useCompactTail } from "./compact-tail";
 import { useLiveTail } from "./live-tail";
+import { useSessionMetadata, type SessionMetadata } from "./session-metadata";
 import type { SessionHead } from "./wire";
 
-/** The encrypted head metadata, decrypted for the session name. */
-export function useSessionName(head: SessionHead | null): string | null {
-  const custody = useCustody();
-  const unlocked = custody.state === "unlocked" ? custody : null;
-  const key = unlocked?.key ?? null;
-  const userPublicId = unlocked?.identity.userPublicId ?? null;
-  const report = custody.reportAuthorityFailure;
-  const [name, setName] = useState<string | null>(null);
-  const envelope = head?.metadata ?? null;
-  const publicId = head?.publicId ?? null;
-
-  useEffect(() => {
-    if (envelope === null || key === null || userPublicId === null || publicId === null) {
-      setName(null);
-      return;
-    }
-    const run = createCancellation();
-    void decryptSessionMetadata(envelope, key, {
-      entityPublicId: publicId,
-      keyVersion: envelope.keyVersion,
-      kind: "session_metadata",
-      userPublicId,
-    })
-      .then((payload) => { if (run.live()) setName(payload.name); })
-      .catch((failure: unknown) => {
-        report(failure);
-        if (run.live()) setName(null);
-      });
-    return () => { run.cancel(); };
-  }, [envelope, key, publicId, report, userPublicId]);
-
-  return name;
-}
+/**
+ * How much of the compact stream a caller needs.
+ *
+ * - `none`: the live tail only. Nothing on screen needs a prompt or an
+ *   interaction, so nothing is decrypted beyond the current turn.
+ * - `tail`: the subscribed last few compact chunks. A grid card learns its last
+ *   prompt and its pending interactions at a bounded cost.
+ * - `full`: the whole history walk plus the subscribed tail, which is what an
+ *   open transcript needs: everything that happened, and everything that
+ *   happens while it stays open.
+ */
+export type SessionHistoryMode = "none" | "tail" | "full";
 
 export type SessionModelView = Readonly<{
+  /** The compact events behind `model`, in sequence order, for the transcript. */
+  compactEvents: readonly CompactSessionEvent[];
   historyLoading: boolean;
+  /**
+   * The detail stream folded on its own. `model.streamingText` is whatever the
+   * two streams last wrote; this one is only what the live tail has seen, which
+   * is how the transcript tells an in-flight turn from a closed one.
+   */
+  liveModel: SessionModel;
+  /** The decrypted head metadata: the name, the note, and the archived flag. */
+  metadata: SessionMetadata;
   model: SessionModel;
 }>;
 
 /**
- * The rendered session model: the live tail always, the compact history only
- * for the session the reader has open. A card in a long list therefore costs one
- * live subscription rather than a full history walk.
+ * The rendered session model.
+ *
+ * The live tail is always subscribed; the compact stream is read at the depth
+ * the caller asked for. A card in a long list therefore costs two subscriptions
+ * rather than a full history walk per session.
  */
 export function useSessionModel(
   head: SessionHead | null,
-  options: Readonly<{ includeHistory: boolean }>,
+  options: Readonly<{ history: SessionHistoryMode }>,
 ): SessionModelView {
   const publicId = head?.publicId ?? null;
-  const history = useCompactHistory(options.includeHistory ? publicId : null);
+  const history = useCompactHistory(options.history === "full" ? publicId : null);
+  const compactTail = useCompactTail(options.history === "none" ? null : publicId);
   const tail = useLiveTail(publicId);
-  const name = useSessionName(head);
+  const metadata = useSessionMetadata(head);
+  const name = metadata.name;
+
+  const compactEvents = useMemo(
+    () => mergeCompactEvents(history.events, compactTail.events),
+    [compactTail.events, history.events],
+  );
+
+  const liveModel = useMemo(
+    () => sessionModelReducer(initialSessionModel(), { events: tail.events, type: "detail" }),
+    [tail.events],
+  );
 
   const model = useMemo(() => {
     let next = initialSessionModel();
-    next = sessionModelReducer(next, { events: history.events, type: "compact" });
+    next = sessionModelReducer(next, { events: compactEvents, type: "compact" });
     next = sessionModelReducer(next, { events: tail.events, type: "detail" });
     next = sessionModelReducer(next, { name, type: "metadata" });
     return next;
-  }, [history.events, name, tail.events]);
+  }, [compactEvents, name, tail.events]);
 
-  return { historyLoading: history.loading, model };
+  return { compactEvents, historyLoading: history.loading, liveModel, metadata, model };
 }

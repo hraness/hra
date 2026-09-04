@@ -1,7 +1,7 @@
-import { usePaginatedQuery } from "convex/react";
+import { usePaginatedQuery, useQuery } from "convex/react";
 import { useMemo } from "react";
 
-import { listHeadsPage } from "./functions";
+import { getHead, listHeadsPage } from "./functions";
 import { parseSessionHead, type SessionHead } from "./wire";
 
 export type SessionHeadsPage = Readonly<{
@@ -29,4 +29,20 @@ export function useSessionHeads(initialNumItems = 24): SessionHeadsPage {
     loadMore: page.loadMore,
     status: page.status,
   };
+}
+
+/**
+ * One session head, subscribed.
+ *
+ * The session screen is reachable by link, so it cannot assume the paginated
+ * list has already loaded the session it was asked to open. Convex deduplicates
+ * identical subscriptions, so this shares the socket with the tails that read
+ * the same head for their stream epochs.
+ */
+export function useSessionHead(sessionPublicId: string | null): SessionHead | null {
+  const value = useQuery(
+    getHead,
+    sessionPublicId === null ? "skip" : { publicId: sessionPublicId },
+  );
+  return useMemo(() => value === undefined ? null : parseSessionHead(value), [value]);
 }
