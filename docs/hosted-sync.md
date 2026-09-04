@@ -490,7 +490,7 @@ from silently starting a second session.
 | Kind | Payload | Result |
 | --- | --- | --- |
 | `session_start` | `{accountPublicId, projectPublicId, prompt, preset, provider}` | `{sessionPublicId}` |
-| `account_login_start` | `{accountPublicId}` | `{loginUrl, expiresAt}`, single use |
+| `account_login_start` | `{accountPublicId}` | `{loginUrl, userCode, expiresAt}`, single use |
 | `account_login_status` | none | `{status, instruction}` |
 | `usage_refresh` | none | `{accountsRefreshed}` |
 
@@ -521,7 +521,7 @@ Every guard is local. Nothing hosted and no browser can change one.
 | Provider does not match the projected account | `DEVICE_COMMAND_PROVIDER_UNSUPPORTED` |
 | Project not in the projected registry | `DEVICE_COMMAND_PROJECT_UNKNOWN` |
 | Per-device daily cap (100 admitted commands) | `DEVICE_COMMAND_DAILY_CAP` |
-| Login URL that cannot be completed on another device | `ACCOUNT_LOGIN_RELAY_UNAVAILABLE` |
+| Incomplete or non-relayable login handoff | `ACCOUNT_LOGIN_RELAY_UNAVAILABLE` |
 
 The cap is checked last, so a refused or malformed request never consumes the
 day's budget. A browser device can never be a device command target
@@ -535,13 +535,39 @@ is a daemon diagnostic and the CLI injects a real notifier when one exists. And
 a browser-started session inherits its project's approval mode, applied before
 the prompt is sent, so the first turn is already governed by it.
 
-The relayed login URL is account-key encrypted like every other payload, is
-`https` only with no credentials in its authority, expires five minutes after
-it is issued, and is released by the hosted row exactly once
-(`deviceCommands:consumeResult` erases the ciphertext in the same
-transaction). When the machine's provider login offers a URL that cannot be
-completed elsewhere, the command fails closed and the browser falls back to
-one-way status polling and the CLI instruction.
+For Codex, `account_login_start` always dispatches the local `account.login`
+command in device-code mode. The web lane never requests browser mode. A
+browser-mode loopback callback cannot be completed on another device, so HRA
+does not relay it.
+
+The pending Codex response must carry both the verification URL and its
+separate one-time user code. The URL is bounded and must be an HTTPS URL with
+a hostname, no username or password, and an exact round trip through URL
+parsing. The user code must match the closed device-code grammar. A missing or
+malformed value fails closed with
+`ACCOUNT_LOGIN_RELAY_UNAVAILABLE`.
+
+HRA encrypts the URL and user code together under the account key in one
+result. The hosted deployment stores only that ciphertext. The result expires
+five minutes after issue and `deviceCommands:consumeResult` releases it only
+to the requesting browser, exactly once, while erasing the ciphertext in the
+same transaction. Settings displays the code before the link, offers a copy
+control with manual selection as the fallback, and clears the handoff at its
+expiry or when a later login start or status check supersedes it.
+
+Both local gates still apply: device commands must be enabled and the machine
+must have `hra remote allow account-linking` set. Settings offers the flow only
+for an account in that machine's encrypted registry after the registry reports
+the opt-in. The daemon rechecks the requesting device, account public id, local
+switches, and daily cap before starting the provider effect.
+
+Roll out this exact result shape in order: deploy the updated web parser and UI
+first, then update the machine daemon. Refresh a stale Settings tab before
+starting a login. The new web app rejects an older URL-only result and asks for
+a machine update; an old tab can consume a new single-use result without being
+able to render it, so refresh and retry. This behavior is covered by focused
+parser, adapter, bridge, Convex, and UI tests. It has not yet been accepted
+against production or in a live two-device Codex login.
 
 ### Operator switches
 
@@ -558,8 +584,8 @@ that machine's encrypted device registry, so the web settings screen shows the
 current state and offers the CLI instruction rather than a button the daemon
 would refuse. Device commands are allowed by default because a browser device
 is already an enrolled key holder; account linking is denied by default because
-relaying a login URL is the one command that hands a credential path to another
-surface.
+relaying a login handoff is the one command that hands a provider authorization
+path to another surface.
 
 ### Retention and erasure
 
