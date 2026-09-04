@@ -41,7 +41,16 @@ import {
   type RootStatusAttentionRecord,
   type SessionLocalObservationSnapshot,
 } from "../domain/observation";
-import { presetSchema, type Preset } from "../domain/presets";
+import {
+  assertPresetSupportedByProvider,
+  presetForProviderTier,
+  presetSchema,
+  presetTiers,
+  presetTierSchema,
+  providerSchema,
+  type Preset,
+  type Provider,
+} from "../domain/presets";
 import {
   effectiveRuntimeProfileSchema,
   type EffectiveRuntimeProfile,
@@ -186,7 +195,10 @@ const sessionRowSchema = z.object({
   provider_thread_id: z.string().nullable(),
   title: z.string(),
   note: z.string(),
-  preset: presetSchema,
+  provider: providerSchema,
+  // Stored as the provider-neutral tier: the column's SQLite CHECK predates
+  // multi-provider presets, so `provider` plus this tier names the preset.
+  preset: presetTierSchema,
   fast_enabled: z.union([z.literal(0), z.literal(1)]),
   state: sessionStateSchema,
   active_turn_id: z.string().nullable(),
@@ -338,6 +350,8 @@ export type SessionRecord = {
   providerThreadId?: string;
   title: string;
   note: string;
+  /** The provider this session is bound to for its whole life. */
+  provider: Provider;
   preset: Preset;
   fastEnabled: boolean;
   state: z.infer<typeof sessionStateSchema>;
@@ -782,7 +796,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 31;
+const currentSchemaVersion = 32;
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -951,6 +965,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   provider_thread_id TEXT,
   title TEXT NOT NULL CHECK(length(title) <= 320),
   note TEXT NOT NULL DEFAULT '' CHECK(length(CAST(note AS BLOB)) <= 16384),
+  provider TEXT NOT NULL DEFAULT 'codex' CHECK(provider IN ('codex','claude')),
   preset TEXT NOT NULL CHECK(preset IN ('low','high','ultra')),
   fast_enabled INTEGER NOT NULL CHECK(fast_enabled IN (0,1)),
   state TEXT NOT NULL CHECK(state IN ('starting','active','idle','terminal','recovery_required')),
@@ -2290,6 +2305,22 @@ const schemaVersion31ArchiveShowThinkingColumn =
 const schemaVersion31ArchiveDefaultPresetColumn =
   "ALTER TABLE daemon_state ADD COLUMN default_preset TEXT NOT NULL DEFAULT 'ultra' "
   + "CHECK(default_preset IN ('low','high','ultra'))";
+
+// Providers (W3). A session binds one provider for its whole life and every
+// pre-existing session is Codex, so the column is additive with a `codex`
+// default and needs no backfill. `preset` keeps its existing CHECK: a preset
+// is stored as this provider plus the provider-neutral tier
+// (`src/domain/presets.ts`), which avoids rebuilding a table that a dozen
+// cascade-deleting children reference.
+const schemaVersion32SessionProviderColumn =
+  "ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex' "
+  + "CHECK(provider IN ('codex','claude'))";
+
+const applySchemaVersion32 = (database: Database): void => {
+  if (!hasTableColumn(database, "sessions", "provider")) {
+    database.exec(schemaVersion32SessionProviderColumn);
+  }
+};
 
 const applySchemaVersion31Archive = (database: Database): void => {
   if (!hasTableColumn(database, "sessions", "archived_at")) {
@@ -3668,8 +3699,16 @@ const migrateWritableDatabase = (
       version = 31;
     }
 
+    if (version < 32) {
+      applySchemaVersion32(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(32, now());
+      database.exec("PRAGMA user_version = 32");
+      version = 32;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
+    applySchemaVersion32(database);
     database.exec(schemaVersion9);
     database.exec(schemaVersion10);
     backfillSchemaVersion9(database, now());
@@ -3748,7 +3787,8 @@ const mapSession = (row: unknown): SessionRecord => {
     ...(parsed.provider_thread_id === null ? {} : { providerThreadId: parsed.provider_thread_id }),
     title: parsed.title,
     note: parsed.note,
-    preset: parsed.preset,
+    provider: parsed.provider,
+    preset: presetForProviderTier(parsed.provider, parsed.preset),
     fastEnabled: parsed.fast_enabled === 1,
     state: parsed.state,
     ...(parsed.active_turn_id === null ? {} : { activeTurnId: parsed.active_turn_id }),
@@ -4563,12 +4603,15 @@ export class StateStore {
     this.#insertSessionEventStream(sessionId, now);
   }
 
-  createSession(input: { profileId: ProfileId; projectId?: ProjectId; title?: string; preset: Preset; fastEnabled: boolean }): SessionRecord {
+  createSession(input: { profileId: ProfileId; projectId?: ProjectId; title?: string; provider?: Provider; preset: Preset; fastEnabled: boolean }): SessionRecord {
     const id = createSessionId();
     const now = this.#now();
     const title = input.title === undefined ? "Untitled session" : titleSchema.parse(input.title);
+    const provider = providerSchema.parse(input.provider ?? "codex");
+    const preset = presetSchema.parse(input.preset);
+    assertPresetSupportedByProvider(provider, preset);
     const create = this.#database.transaction(() => {
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, presetSchema.parse(input.preset), input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, provider, presetTiers[preset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(id, now);
     });
     create.immediate();
@@ -4653,14 +4696,20 @@ export class StateStore {
     write.immediate();
   }
 
-  readDefaultPreset(): Preset {
+  /**
+   * The daemon default is stored as a provider-neutral tier and read back
+   * against the daemon's default provider, so a Claude default and a Codex
+   * default share one column.
+   */
+  readDefaultPreset(provider: Provider = "codex"): Preset {
     const row = this.#database.query("SELECT default_preset FROM daemon_state WHERE singleton=1").get();
-    return z.object({ default_preset: presetSchema }).strict().parse(row).default_preset;
+    const tier = z.object({ default_preset: presetTierSchema }).strict().parse(row).default_preset;
+    return presetForProviderTier(provider, tier);
   }
 
   setDefaultPreset(preset: Preset): void {
     const parsed = presetSchema.parse(preset);
-    const result = this.#database.query("UPDATE daemon_state SET default_preset=? WHERE singleton=1").run(parsed);
+    const result = this.#database.query("UPDATE daemon_state SET default_preset=? WHERE singleton=1").run(presetTiers[parsed]);
     if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
   }
 
@@ -5440,10 +5489,12 @@ export class StateStore {
     const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
     const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
     const preset = input.preset === undefined ? current.preset : presetSchema.parse(input.preset);
+    // A preset the session's provider cannot run is refused, never ignored.
+    assertPresetSupportedByProvider(current.provider, preset);
     const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
     const project = input.projectId === undefined ? current.projectId ?? null : input.projectId;
     const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, preset, fast ? 1 : 0, project, now, current.id, current.revision);
+    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], fast ? 1 : 0, project, now, current.id, current.revision);
     if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
     return this.requireSession(current.id);
   }
@@ -6493,6 +6544,7 @@ export class StateStore {
     profileId: ProfileId;
     profileGeneration: number;
     projectId: ProjectId;
+    provider?: Provider;
     preset: Preset;
     fastEnabled: boolean;
     evidence: Extract<MutationEffectEvidence, { kind: "session.start" }>;
@@ -6502,6 +6554,8 @@ export class StateStore {
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const parsedProjectId = projectIdSchema.parse(input.projectId);
     const parsedPreset = presetSchema.parse(input.preset);
+    const parsedProvider = providerSchema.parse(input.provider ?? "codex");
+    assertPresetSupportedByProvider(parsedProvider, parsedPreset);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
     if (evidence.projectId !== parsedProjectId) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
     if (evidence.runtimeProfile !== undefined && (
@@ -6525,7 +6579,7 @@ export class StateStore {
         || authority.process_generation !== parsedGeneration
         || authority.profile_state !== "signed_in"
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedPreset, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedProvider, presetTiers[parsedPreset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
       this.#database.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,?)").run(parsedAttemptId, sessionId, now);
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);

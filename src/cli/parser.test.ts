@@ -138,6 +138,28 @@ describe("CLI parser", () => {
     expect(parseCli(["session", "send", "session", "hello", "from", "the", "CLI"])).toMatchObject({ command: { message: "hello from the CLI" } });
   });
 
+  test("chooses a session provider and its default preset", () => {
+    // Unchanged: no `--provider` means Codex with the existing default preset.
+    expect(parseCli(["session", "start", "work"])).toMatchObject({
+      command: { kind: "session.start", preset: "high", provider: "codex" },
+    });
+    expect(parseCli(["session", "start", "work", "--provider", "claude"])).toMatchObject({
+      command: { kind: "session.start", preset: "fable-max", provider: "claude" },
+    });
+    expect(parseCli(["session", "start", "work", "--provider", "claude", "--preset", "fable-max"]))
+      .toMatchObject({ command: { preset: "fable-max", provider: "claude" } });
+    expect(() => parseCli(["session", "start", "work", "--provider", "gemini"]))
+      .toThrow("Provider must be `codex` or `claude`.");
+    // The preset union is widened; the provider mismatch is refused by the
+    // daemon, not by argument parsing.
+    expect(parseCli(["session", "preset", "s", "fable-max"]))
+      .toMatchObject({ command: { kind: "session.preset", preset: "fable-max" } });
+    expect(parseCli(["remote", "preset", "s", "fable-max"]))
+      .toMatchObject({ command: { kind: "remote.preset", preset: "fable-max" } });
+    expect(() => parseCli(["remote", "preset", "s", "fable"]))
+      .toThrow("Preset must be `low`, `high`, `ultra`, or `fable-max`.");
+  });
+
   test("parses conversation-bound session task reads with exact task IDs", () => {
     const task = `stask_${"a".repeat(32)}`;
     expect(parseCli(["session", "task", "list", "Release work", "--json"]))

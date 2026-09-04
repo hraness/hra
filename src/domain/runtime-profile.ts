@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { presetRequirements, presetSchema } from "./presets";
+import { presetProviders, presetRequirements, presetSchema } from "./presets";
 import { profileIdSchema, unixMillisecondsSchema } from "./values";
 
 const binaryCompare = (left: string, right: string): number =>
@@ -40,6 +40,9 @@ export const effectiveRuntimeProfileSchema = z.object({
   pluginCapability: z.literal(true),
   enabledApps: z.array(effectiveRuntimeAppSchema).max(100),
 }).strict().superRefine((value, context) => {
+  if (presetProviders[value.preset] !== "codex") {
+    context.addIssue({ code: "custom", message: "A Codex runtime profile cannot carry another provider's model preset." });
+  }
   const requirement = presetRequirements[value.preset];
   if (value.model !== requirement.model || value.reasoningEffort !== requirement.effort) {
     context.addIssue({ code: "custom", message: "The effective model and reasoning effort must match the exact HRA preset." });
@@ -57,3 +60,31 @@ export const effectiveRuntimeProfileSchema = z.object({
 
 export type EffectiveRuntimeApp = z.infer<typeof effectiveRuntimeAppSchema>;
 export type EffectiveRuntimeProfile = z.infer<typeof effectiveRuntimeProfileSchema>;
+
+/**
+ * The reviewed profile HRA proves before it lets the pinned Claude Code
+ * runtime start a session or a turn. Claude Code owns its own permission
+ * engine, so the profile pins the interactive permission mode (every tool use
+ * reaches HRA as a `can_use_tool` control request), the exact pinned CLI
+ * version, and the fact that the runtime home is an isolated
+ * `CLAUDE_CONFIG_DIR` rather than the user's own configuration.
+ */
+export const effectiveClaudeRuntimeProfileSchema = z.object({
+  profileId: profileIdSchema,
+  processGeneration: z.number().int().nonnegative(),
+  observedAt: unixMillisecondsSchema,
+  preset: z.literal("fable-max"),
+  model: z.string().trim().min(1).max(200),
+  reasoningEffort: z.literal("max"),
+  claudeVersion: z.string().regex(/^\d{1,5}\.\d{1,5}\.\d{1,5}$/u),
+  permissionMode: z.literal("default"),
+  isolatedConfigDir: z.literal(true),
+  outputFormat: z.literal("stream-json"),
+  inputFormat: z.literal("stream-json"),
+}).strict().superRefine((value, context) => {
+  if (value.model !== presetRequirements[value.preset].model) {
+    context.addIssue({ code: "custom", message: "The effective model must match the exact HRA preset." });
+  }
+});
+
+export type EffectiveClaudeRuntimeProfile = z.infer<typeof effectiveClaudeRuntimeProfileSchema>;

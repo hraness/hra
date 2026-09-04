@@ -10,7 +10,18 @@ import {
 } from "./contracts";
 import { decryptBytes, encryptBytes } from "./crypto";
 
-export type ModelPreset = "low" | "high" | "ultra";
+/**
+ * The wire model preset. `fable-max` (W3) is the Claude Fable preset; adding
+ * it widens the compact projection format, so a reader older than this build
+ * rejects a chunk whose `turn_summary.model` names it. The parser tolerates
+ * unknown *keys* (see `maximumUnknownKeySlack`), never unknown enum values.
+ */
+export type ModelPreset = "low" | "high" | "ultra" | "fable-max";
+
+const modelPresets = new Set<ModelPreset>(["low", "high", "ultra", "fable-max"]);
+
+export const isModelPreset = (value: unknown): value is ModelPreset =>
+  typeof value === "string" && modelPresets.has(value as ModelPreset);
 
 export type GitAction = Readonly<{
   commit?: string;
@@ -520,10 +531,7 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
     ])
     || ((value.fast === undefined) !== (value.model === undefined))
     || (value.fast !== undefined && typeof value.fast !== "boolean")
-    || (value.model !== undefined
-      && value.model !== "low"
-      && value.model !== "high"
-      && value.model !== "ultra")
+    || (value.model !== undefined && !isModelPreset(value.model))
     || !isSafeNonNegativeInteger(value.runtimeMs)
     || value.runtimeMs > 7 * 24 * 60 * 60 * 1_000
     || !isSafePositiveInteger(value.sequence)
@@ -542,9 +550,7 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
     filesTouched: value.filesTouched,
     gitActions: gitActions as GitAction[],
     kind: value.kind,
-    ...(value.model === "low" || value.model === "high" || value.model === "ultra"
-      ? { model: value.model }
-      : {}),
+    ...(isModelPreset(value.model) ? { model: value.model } : {}),
     runtimeMs: value.runtimeMs,
     sequence: value.sequence,
     turnId: value.turnId,

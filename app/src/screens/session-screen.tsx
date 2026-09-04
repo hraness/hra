@@ -22,6 +22,7 @@ const presetOptions: readonly (readonly [ModelPreset, string])[] = [
   ["low", "Sol Low"],
   ["high", "Sol High"],
   ["ultra", "Sol Ultra"],
+  ["fable-max", "Claude Fable Max"],
 ];
 
 const approvalOptions: readonly (readonly [ApprovalMode, string])[] = [

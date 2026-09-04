@@ -17,6 +17,7 @@ describe("domain laws", () => {
       low: { model: "gpt-5.6-luna", effort: "max" },
       high: { model: "gpt-5.6-sol", effort: "max" },
       ultra: { model: "gpt-5.6-sol", effort: "ultra" },
+      "fable-max": { model: "claude-fable-5-1", effort: "max" },
     });
   });
 

@@ -1,6 +1,6 @@
 # Claude provider notes
 
-Status: design and probe notes for plan item D3 in `kb/plans/hra-v2.md`. No Claude runtime ships yet.
+Status: the notes below are the W1 spike that the W3-C adapter was built from. The adapter now exists in `src/claude/` (pin, runtime discovery, process, protocol, delta assembler, client) with `src/daemon/claude-runtime-adapter.ts` implementing `ClaudeRuntimePort`. Every mapped shape below is covered by a fixture-driven test in `src/claude/`; nothing shells out to `claude` in tests. The daemon does not yet start a Claude session end to end: its durable session-start evidence still carries only the Codex runtime profile, so `hra session start --provider claude` records the provider and is then refused with one clear message.
 
 ## Shape
 

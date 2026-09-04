@@ -167,6 +167,7 @@ export class LiveBatcher {
       case "session_status":
       case "item_started":
       case "item_completed":
+      case "subagent_activity":
       case "tool_progress":
       case "file_change":
       case "plan_updated":

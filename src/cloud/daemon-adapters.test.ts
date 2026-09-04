@@ -57,6 +57,7 @@ function sha256(value: string): string {
 }
 
 class FakeCodex implements CodexRuntimePort {
+  readonly provider = "codex" as const;
   projection: CodexSessionProjection = {
     providerThreadId: "thread_0001",
     providerUpdatedAt: 1_000,

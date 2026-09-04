@@ -59,6 +59,14 @@ describe("closed encrypted payloads", () => {
     expect(await decryptUsageProjection(envelope, key, authority)).toEqual(projection);
   });
 
+  test("admits the fable-max preset in model and default-preset commands", () => {
+    expect(parseRemoteCommandPayload({ kind: "set_model", preset: "fable-max" }))
+      .toEqual({ kind: "set_model", preset: "fable-max" });
+    expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "fable-max" }))
+      .toEqual({ kind: "set_default_preset", preset: "fable-max" });
+    expect(parseRemoteCommandPayload({ kind: "set_model", preset: "fable" })).toBeNull();
+  });
+
   test("rejects generic RPC and provider method smuggling", () => {
     const absoluteSecretPath = ["", "Users", "name", ".ssh"].join("/");
     expect(parseRemoteCommandPayload({ kind: "rpc", method: "danger" })).toBeNull();

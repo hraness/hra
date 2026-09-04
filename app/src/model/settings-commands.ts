@@ -17,7 +17,7 @@
 import type { RemoteCommandPayload } from "../hra/cloud";
 
 export type ApprovalMode = "auto:all" | "auto:workspace" | "manual";
-export type PresetChoice = "low" | "high" | "ultra";
+export type PresetChoice = "low" | "high" | "ultra" | "fable-max";
 
 /** The scope every machine-level control on this screen uses. */
 export const defaultSettingScope = "default" as const;
@@ -38,9 +38,11 @@ export const presetChoices: readonly PresetChoice[] = Object.freeze([
   "low",
   "high",
   "ultra",
+  "fable-max",
 ] as const);
 
 export const presetLabels: Readonly<Record<PresetChoice, string>> = Object.freeze({
+  "fable-max": "Fable Max",
   high: "High",
   low: "Low",
   ultra: "Ultra",
