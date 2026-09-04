@@ -3,6 +3,18 @@ import { v } from "convex/values";
 export const authAttemptKind = v.union(v.literal("send"), v.literal("verify"));
 export const authSubjectStatus = v.union(v.literal("active"), v.literal("disabled"));
 export const authAdmissionState = v.union(v.literal("open"), v.literal("frozen"));
+// Break-glass admission (`authAdmissionState`) gates every authenticated path.
+// New-identity admission is the separate, narrower control that decides whether
+// a first `authSubjects` row may be created without an invitation. An absent
+// stored value always means `invite_only`.
+export const newIdentityAdmissionState = v.union(
+  v.literal("invite_only"),
+  v.literal("open"),
+);
+// Only open admission is recorded on the subject. An invited subject keeps its
+// `admissionInviteId` instead, and an absent marker never means "no invite
+// required".
+export const authSubjectAdmittedBy = v.literal("open");
 export const challengeDeliveryState = v.union(
   v.literal("reserved"),
   v.literal("accepted"),

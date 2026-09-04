@@ -224,7 +224,10 @@ custody exits 75.
 The record exposes only the release-attestation binding state, whether all six
 HRA-managed environment *names* are present and which of those static names
 are missing, a capped count of occupied bootstrap tables plus a closed
-bootstrap classification, and the safe admission generation/state. It never
+bootstrap classification, and the safe admission generation, state, and
+new-identity admission value. A deployment that predates the new-identity
+control reports no value, which the operator reads as `invite_only` exactly as
+the authority does. It never
 emits environment values, unrelated environment names, invitation material,
 quota totals, user counts, or database rows. `CONVEX_SITE_URL` is
 Convex-owned runtime configuration, not an HRA-managed protected value, so it
@@ -376,3 +379,85 @@ bun run hosted:invites -- revoke \
 Status and revoke accept only the public ID, never the bearer capability. Revoke reads and validates identity-invite status before mutation. Every operation performs authenticated numeric target readback before and after its bounded Convex call, requires the exact HRA team, project, production deployment, generated name, and URL, and refuses retired HRA v0 project ID `2680173` and deployment ID `4677913`. Provider stdout and stderr are suppressed; failures return only a static refusal code.
 
 If issuance is refused after protected custody commits, do not repeat `issue` with a new path. Reconcile the exact default deployment, then use `recover` with the preserved file. Keep the file until a strict result returns its deterministic public ID or the deployment is formally quarantined.
+
+## Operate open sign-up
+
+Two independent controls live on the single `serviceControl` row.
+`authAdmissions` is the break-glass: `frozen` refuses every authenticated
+path, including verification and device pairing for existing members, so it
+locks out the whole service and is never the way to close sign-up.
+`newIdentityAdmissions` is the narrow control: `invite_only` (the default, and
+the meaning of an absent stored value) or `open`. It is read in exactly one
+place, where a first `authSubjects` row would be inserted without an
+invitation. Everything else is unchanged: a frozen deployment still refuses an
+open sign-up before writing any row, identity invitations keep working while
+sign-up is open, and a subject admitted without an invitation carries
+`admittedBy: "open"` so no later step ever treats a missing invitation as
+permission.
+
+Both controls share one generation fence and one mutation identity, so a
+change to either advances `authAdmissionGeneration` and an exact replay stays
+recognisable. Read the current generation first:
+
+```sh
+bun run hosted:admission -- status \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud
+```
+
+Open sign-up with the exact generation that status returned, a fresh UUIDv7,
+and the explicit acknowledgement:
+
+```sh
+bun run hosted:admission -- new-identities \
+  --new-identities open \
+  --expected-generation <GENERATION> \
+  --mutation-id <FRESH_UUIDV7> \
+  --acknowledge-open-signup \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud
+```
+
+Close it again with `--new-identities invite_only` and no acknowledgement.
+The acknowledgement is required exactly for the `open` direction, as
+`--acknowledge-resume` is for resuming admissions. The operator proves the
+exact default target before and after every provider call, refuses a request
+whose expected generation is stale, refuses a change the deployment already
+has, and reconciles a lost response through durable state instead of replaying
+blind. Deploy the authority change through the attested candidate chain before
+opening admissions; opening sign-up against a deployment that still runs the
+invite-only authority does nothing.
+
+Abuse controls apply to every path, invited or open. One address may receive 3
+codes per 15 minutes and 5 per 24 hours, and at most 10 for its lifetime while
+it has never verified. The service admits 200 sends per hour, 1,000 per day,
+and 200 newly admitted identities per rolling 24 hours, counted on the service
+control row. Verification attempts keep their own limits: 100 per hour service
+wide and 10 per 15 minutes per address. One verified email owns exactly one
+identity: a second subject can never be verified onto the same address or the
+same user. Budget a paid Resend plan before opening sign-up; the free tier
+delivers 100 messages per day, well under the send ceiling.
+
+## Beta free tier and service ceilings
+
+One identity gets 200 MiB of server-visible logical bytes, 50,000 session
+chunks, 20,000 live-tail chunks, 10,000 session heads, 16 devices, 32 Codex
+accounts, 256 nonterminal remote commands, and 100,000 usage snapshots per
+account. The deployment ceiling is 5,000 identities, 100 GiB, and 25 M
+records. The identity count is deliberately oversubscribed against the byte
+ceiling: 5,000 tiers of 200 MiB would be 1,000 GiB, so the service byte
+ceiling is the real hard stop and must be raised before the service approaches
+it. Worst-case usage telemetry for one Codex account before any row becomes
+cleanup-eligible is 16,888,144 logical bytes, under a tenth of the tier; the
+tier holds twelve such accounts at once.
+
+These constants are hard authority. A stored counter above the constant reads
+as corrupt and fails closed, so never lower a ceiling below what a deployment
+already stores. Read current usage first, and deploy a tier change through the
+attested candidate chain before it can matter.

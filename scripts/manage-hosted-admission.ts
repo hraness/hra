@@ -32,8 +32,13 @@ const convexCli = resolve(import.meta.dir, "..", "node_modules", "convex", "bin"
 const repositoryRoot = resolve(import.meta.dir, "..");
 const providerOutputMaximumBytes = 64 * 1024;
 
+// A deployment that predates the new-identity control reports no value. Absent
+// means invite_only there exactly as it does in the authority itself.
+const newIdentityAdmissions = z.union([z.literal("invite_only"), z.literal("open")]);
+
 const statusSchema = z.object({
   generation: z.number().refine(isSafeNonNegativeInteger),
+  newIdentityAdmissions: newIdentityAdmissions.optional(),
   state: z.union([z.literal("open"), z.literal("frozen")]),
   updatedAt: z.number().finite().nonnegative(),
 }).strict();
@@ -43,14 +48,33 @@ const transitionSchema = statusSchema.extend({
   replay: z.boolean(),
 }).strict();
 
-type AdmissionStatus = z.infer<typeof statusSchema>;
-type AdmissionAction =
-  | Readonly<{ kind: "status" }>
-  | Readonly<{
-      expectedGeneration: number;
-      kind: "freeze" | "resume";
-      mutationId: string;
-    }>;
+type NewIdentityAdmissions = z.infer<typeof newIdentityAdmissions>;
+type AdmissionStatus = Readonly<{
+  generation: number;
+  newIdentityAdmissions: NewIdentityAdmissions;
+  state: "frozen" | "open";
+  updatedAt: number;
+}>;
+type AdmissionTransition = Readonly<{
+  expectedGeneration: number;
+  kind: "freeze" | "new-identities" | "resume";
+  mutationId: string;
+  newIdentities?: NewIdentityAdmissions;
+}>;
+type AdmissionAction = Readonly<{ kind: "status" }> | AdmissionTransition;
+type DesiredControl = Readonly<{
+  newIdentityAdmissions: NewIdentityAdmissions;
+  state: "frozen" | "open";
+}>;
+
+const readStatus = (
+  parsed: z.infer<typeof statusSchema>,
+): AdmissionStatus => ({
+  generation: parsed.generation,
+  newIdentityAdmissions: parsed.newIdentityAdmissions ?? "invite_only",
+  state: parsed.state,
+  updatedAt: parsed.updatedAt,
+});
 
 type AdmissionArguments = Readonly<{
   action: AdmissionAction;
@@ -101,12 +125,14 @@ export function parseAdmissionArguments(arguments_: readonly string[]): Admissio
     if (values.length !== 0) throw new AdmissionOperatorError("usage_invalid");
     return { action: { kind: "status" }, target: targetArguments.target };
   }
-  if (action !== "freeze" && action !== "resume") {
+  if (action !== "freeze" && action !== "new-identities" && action !== "resume") {
     throw new AdmissionOperatorError("usage_invalid");
   }
   const expected = takeOption(values, "--expected-generation");
   const mutationId = takeOption(values, "--mutation-id");
+  const newIdentities = takeOption(values, "--new-identities");
   const acknowledgedResume = takeFlag(values, "--acknowledge-resume");
+  const acknowledgedOpenSignup = takeFlag(values, "--acknowledge-open-signup");
   if (
     values.length !== 0
     || expected === undefined
@@ -115,12 +141,18 @@ export function parseAdmissionArguments(arguments_: readonly string[]): Admissio
     || mutationId === undefined
     || !isUuidV7(mutationId)
     || (action === "resume") !== acknowledgedResume
+    || (newIdentities !== undefined
+      && newIdentities !== "invite_only"
+      && newIdentities !== "open")
+    || (action === "new-identities") !== (newIdentities !== undefined)
+    || (newIdentities === "open") !== acknowledgedOpenSignup
   ) throw new AdmissionOperatorError("usage_invalid");
   return {
     action: {
       expectedGeneration: Number(expected),
       kind: action,
       mutationId,
+      ...(newIdentities === undefined ? {} : { newIdentities }),
     },
     target: targetArguments.target,
   };
@@ -148,14 +180,20 @@ const statusArguments = (deployment: string): readonly string[] => [
 
 const transitionArguments = (
   deployment: string,
-  action: Extract<AdmissionAction, { kind: "freeze" | "resume" }>,
+  action: AdmissionTransition,
+  desired: DesiredControl,
 ): readonly string[] => [
   "run",
   "admissionControl:transition",
   JSON.stringify({
     expectedGeneration: action.expectedGeneration,
     mutationId: action.mutationId,
-    state: action.kind === "freeze" ? "frozen" : "open",
+    // Only an explicit `--new-identities` sends the field, so freeze and resume
+    // stay exactly the request they were before this control existed.
+    ...(action.newIdentities === undefined
+      ? {}
+      : { newIdentityAdmissions: action.newIdentities }),
+    state: desired.state,
   }),
   "--deployment",
   deployment,
@@ -217,35 +255,47 @@ export async function manageHostedAdmission(options: AdmissionOptions): Promise<
   if (beforeResult.exitCode !== 0) {
     throw new AdmissionOperatorError("provider_result_invalid");
   }
-  const before = parseProviderJson(beforeResult.stdout, statusSchema);
+  const before = readStatus(parseProviderJson(beforeResult.stdout, statusSchema));
   if (options.action.kind === "status") {
     return before;
   }
 
-  const desired = options.action.kind === "freeze" ? "frozen" : "open";
-  const expectedBefore = before.generation === options.action.expectedGeneration;
-  const possibleLostResponse = before.generation === options.action.expectedGeneration + 1
-    && before.state === desired;
+  const action = options.action;
+  const desired: DesiredControl = {
+    newIdentityAdmissions: action.newIdentities ?? before.newIdentityAdmissions,
+    state: action.kind === "freeze"
+      ? "frozen"
+      : action.kind === "resume"
+        ? "open"
+        : before.state,
+  };
+  const matchesDesired = (observed: AdmissionStatus): boolean =>
+    observed.state === desired.state
+    && observed.newIdentityAdmissions === desired.newIdentityAdmissions;
+  const expectedBefore = before.generation === action.expectedGeneration;
+  const possibleLostResponse = before.generation === action.expectedGeneration + 1
+    && matchesDesired(before);
   if (
     (!expectedBefore && !possibleLostResponse)
-    || (expectedBefore && before.state === desired)
+    || (expectedBefore && matchesDesired(before))
   ) {
     throw new AdmissionOperatorError("transition_refused");
   }
 
   const changedResult = await invokeWithPostflight(
-    transitionArguments(target.deploymentName, options.action),
+    transitionArguments(target.deploymentName, action, desired),
     "hosted-admission-transition",
   );
   if (changedResult.exitCode !== 0) {
     throw new AdmissionOperatorError("transition_refused");
   }
-  const changed = parseProviderJson(changedResult.stdout, transitionSchema);
-  const expectedGeneration = options.action.expectedGeneration + 1;
+  const parsedChange = parseProviderJson(changedResult.stdout, transitionSchema);
+  const changed = readStatus(parsedChange);
+  const expectedGeneration = action.expectedGeneration + 1;
   if (
-    changed.state !== desired
+    !matchesDesired(changed)
     || changed.generation !== expectedGeneration
-    || (possibleLostResponse && !changed.replay)
+    || (possibleLostResponse && !parsedChange.replay)
   ) throw new AdmissionOperatorError("transition_refused");
 
   const afterResult = await invokeWithPostflight(
@@ -255,8 +305,8 @@ export async function manageHostedAdmission(options: AdmissionOptions): Promise<
   if (afterResult.exitCode !== 0) {
     throw new AdmissionOperatorError("provider_result_invalid");
   }
-  const after = parseProviderJson(afterResult.stdout, statusSchema);
-  if (after.state !== desired || after.generation !== expectedGeneration) {
+  const after = readStatus(parseProviderJson(afterResult.stdout, statusSchema));
+  if (!matchesDesired(after) || after.generation !== expectedGeneration) {
     throw new AdmissionOperatorError("transition_refused");
   }
   return after;
@@ -283,6 +333,7 @@ export async function executeHostedAdmission(options: ExecuteAdmissionOptions): 
     });
     options.stdout.write(`${JSON.stringify({
       generation: status.generation,
+      newIdentityAdmissions: status.newIdentityAdmissions,
       state: status.state,
       version: 1,
     })}\n`);
