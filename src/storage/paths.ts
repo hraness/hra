@@ -77,11 +77,19 @@ export async function initializeStatePaths(paths: StatePaths): Promise<void> {
   await ensurePrivateDirectory(paths.runtime);
 }
 
-export function profilePaths(paths: StatePaths, profileId: ProfileId): { root: string; codexHome: string; desktopUserData: string } {
+export function profilePaths(paths: StatePaths, profileId: ProfileId): {
+  root: string;
+  codexHome: string;
+  claudeConfigDir: string;
+  desktopUserData: string;
+} {
   const root = join(paths.profiles, profileId);
   return {
     root,
     codexHome: join(root, "codex-home"),
+    // The isolated `CLAUDE_CONFIG_DIR` is the entire Claude Code
+    // authentication boundary for this account. HRA never reads inside it.
+    claudeConfigDir: join(root, "claude-config"),
     desktopUserData: join(root, "desktop-user-data"),
   };
 }
@@ -90,6 +98,7 @@ export async function initializeProfilePaths(paths: StatePaths, profileId: Profi
   const owned = profilePaths(paths, profileId);
   await ensurePrivateDirectory(owned.root);
   await ensurePrivateDirectory(owned.codexHome);
+  await ensurePrivateDirectory(owned.claudeConfigDir);
   await ensurePrivateDirectory(owned.desktopUserData);
   return owned;
 }

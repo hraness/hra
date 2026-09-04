@@ -1,6 +1,6 @@
 # Claude provider notes
 
-Status: the notes below are the W1 spike that the W3-C adapter was built from. The adapter now exists in `src/claude/` (pin, runtime discovery, process, protocol, delta assembler, client) with `src/daemon/claude-runtime-adapter.ts` implementing `ClaudeRuntimePort`. Every mapped shape below is covered by a fixture-driven test in `src/claude/`; nothing shells out to `claude` in tests. The daemon does not yet start a Claude session end to end: its durable session-start evidence still carries only the Codex runtime profile, so `hra session start --provider claude` records the provider and is then refused with one clear message.
+Status: the notes below are the W1 spike that the W3-C adapter was built from. The adapter now exists in `src/claude/` (pin, runtime discovery, process, protocol, delta assembler, client) with `src/daemon/claude-runtime-adapter.ts` implementing `ClaudeRuntimePort`. Every mapped shape below is covered by a fixture-driven test in `src/claude/`; nothing shells out to `claude` in tests. The daemon now starts a Claude session end to end: the durable session-start and turn evidence carries either provider's reviewed profile, and the daemon routes every session effect to the port its session's provider binds. Claude account sign-in, provider-side session listing, and resume are still absent, so a Claude session lives only as long as the daemon that started it.
 
 ## Shape
 

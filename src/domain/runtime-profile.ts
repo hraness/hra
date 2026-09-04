@@ -1,6 +1,11 @@
 import { z } from "zod";
 
-import { presetProviders, presetRequirements, presetSchema } from "./presets";
+import {
+  presetProviders,
+  presetRequirements,
+  presetSchema,
+  type Provider,
+} from "./presets";
 import { profileIdSchema, unixMillisecondsSchema } from "./values";
 
 const binaryCompare = (left: string, right: string): number =>
@@ -88,3 +93,34 @@ export const effectiveClaudeRuntimeProfileSchema = z.object({
 });
 
 export type EffectiveClaudeRuntimeProfile = z.infer<typeof effectiveClaudeRuntimeProfileSchema>;
+
+/**
+ * The reviewed runtime profile one session-start, turn-start, or queue-start
+ * effect proved, for either provider.
+ *
+ * The two provider documents are stored exactly as their provider reviewed
+ * them rather than inside a `{provider, profile}` wrapper: both are `.strict()`
+ * objects with disjoint required keys (`approvalPolicy`/`permissionProfile`
+ * against `claudeVersion`/`permissionMode`), so exactly one member can ever
+ * match, and every Codex row and receipt written before Claude existed still
+ * parses and re-serialises byte for byte. `session_runtime_profiles` and
+ * `session_turn_runtime_profiles` already carry the three columns both
+ * documents share (`profile_id`, `process_generation`, `observed_at`), so the
+ * widening needs no new column and no schema version.
+ */
+export const reviewedRuntimeProfileSchema = z.union([
+  effectiveRuntimeProfileSchema,
+  effectiveClaudeRuntimeProfileSchema,
+]);
+
+export type ReviewedRuntimeProfile = EffectiveRuntimeProfile | EffectiveClaudeRuntimeProfile;
+
+/** The provider a reviewed profile belongs to, read from its exact preset. */
+export const reviewedRuntimeProfileProvider = (
+  profile: ReviewedRuntimeProfile,
+): Provider => presetProviders[profile.preset];
+
+/** True only for the Codex document, which is the one that carries fast mode. */
+export const isCodexRuntimeProfile = (
+  profile: ReviewedRuntimeProfile,
+): profile is EffectiveRuntimeProfile => reviewedRuntimeProfileProvider(profile) === "codex";

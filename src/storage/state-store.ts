@@ -52,8 +52,10 @@ import {
   type Provider,
 } from "../domain/presets";
 import {
-  effectiveRuntimeProfileSchema,
-  type EffectiveRuntimeProfile,
+  isCodexRuntimeProfile,
+  reviewedRuntimeProfileProvider,
+  reviewedRuntimeProfileSchema,
+  type ReviewedRuntimeProfile,
 } from "../domain/runtime-profile";
 import {
   ACCOUNT_USAGE_HISTORY_PAGE_LIMIT,
@@ -369,7 +371,7 @@ export type SessionRuntimeProfileRecord = {
   revision: number;
   sourceKind: z.infer<typeof runtimeProfileSourceKindSchema>;
   sourceId: string;
-  profile: EffectiveRuntimeProfile;
+  profile: ReviewedRuntimeProfile;
   recordedAt: number;
 };
 
@@ -630,11 +632,11 @@ export type SessionProviderBaseline = {
 };
 
 export type MutationEffectEvidence =
-  | { kind: "session.send"; providerThreadId: string; baseline: SessionProviderBaseline; clientMessageId: string; messageDigest: string; runtimeProfile?: EffectiveRuntimeProfile }
+  | { kind: "session.send"; providerThreadId: string; baseline: SessionProviderBaseline; clientMessageId: string; messageDigest: string; runtimeProfile?: ReviewedRuntimeProfile }
   | { kind: "session.steer"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null; clientMessageId: string; messageDigest: string }
   | { kind: "session.stop"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null }
   | { kind: "session.rename"; providerThreadId: string; baseline: SessionProviderBaseline; requestedName: string }
-  | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: EffectiveRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
+  | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: ReviewedRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
   | { kind: "account.login"; method: "browser" | "device_code" }
   | { kind: "account.logout"; baselineSignedIn: boolean }
   | { kind: "account.login-cancel"; loginId: string };
@@ -662,7 +664,7 @@ export type QueueEffectEvidence = {
   baseline: SessionProviderBaseline;
   clientMessageId: string;
   messageDigest: string;
-  runtimeProfile: EffectiveRuntimeProfile;
+  runtimeProfile: ReviewedRuntimeProfile;
 };
 
 export type QueueEffectEvidenceRecord = {
@@ -721,11 +723,11 @@ const providerBaselineSchema = z.object({
   activeTurnId: z.string().min(1).max(200).nullable(),
 }).strict();
 const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("session.send"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema, runtimeProfile: effectiveRuntimeProfileSchema.optional() }).strict(),
+  z.object({ kind: z.literal("session.send"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema, runtimeProfile: reviewedRuntimeProfileSchema.optional() }).strict(),
   z.object({ kind: z.literal("session.steer"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable(), clientMessageId: z.string().min(1).max(512), messageDigest: sha256Schema }).strict(),
   z.object({ kind: z.literal("session.stop"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable() }).strict(),
   z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
-  z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: effectiveRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
+  z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: reviewedRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
   z.object({ kind: z.literal("account.login"), method: z.enum(["browser", "device_code"]) }).strict(),
   z.object({ kind: z.literal("account.logout"), baselineSignedIn: z.boolean() }).strict(),
   z.object({ kind: z.literal("account.login-cancel"), loginId: providerLoginIdSchema }).strict(),
@@ -739,7 +741,7 @@ const queueEffectEvidenceSchema = z.object({
   baseline: providerBaselineSchema,
   clientMessageId: z.string().min(1).max(512),
   messageDigest: sha256Schema,
-  runtimeProfile: effectiveRuntimeProfileSchema,
+  runtimeProfile: reviewedRuntimeProfileSchema,
 }).strict();
 const mutationResolutionKindSchema = z.enum(["proven_applied", "provider_state_reconciled", "abandoned"]);
 const desktopRecoveryResolutionSchema = z.enum(["resolved_applied", "resolved_not_applied"]);
@@ -3007,7 +3009,7 @@ const backfillExactTurnRuntimeProfiles = (database: Database, now: number): void
       turn_id: z.string().min(1).max(200).nullable(),
     }).parse(row);
     if (parsed.turn_id === null || parsed.source_kind === "session_start") continue;
-    const profile = effectiveRuntimeProfileSchema.parse(JSON.parse(parsed.profile_json) as unknown);
+    const profile = reviewedRuntimeProfileSchema.parse(JSON.parse(parsed.profile_json) as unknown);
     if (
       profile.profileId !== parsed.profile_id
       || profile.processGeneration !== parsed.process_generation
@@ -3970,7 +3972,7 @@ const parseStoredSessionEvent = (
 
 const mapSessionRuntimeProfile = (row: unknown): SessionRuntimeProfileRecord => {
   const parsed = sessionRuntimeProfileRowSchema.parse(row);
-  const profile = effectiveRuntimeProfileSchema.parse(JSON.parse(parsed.profile_json) as unknown);
+  const profile = reviewedRuntimeProfileSchema.parse(JSON.parse(parsed.profile_json) as unknown);
   if (
     profile.profileId !== parsed.profile_id
     || profile.processGeneration !== parsed.process_generation
@@ -3987,14 +3989,14 @@ const mapSessionRuntimeProfile = (row: unknown): SessionRuntimeProfileRecord => 
 };
 
 const mapSessionTurnRuntimeProfile = (row: unknown): Readonly<{
-  profile: EffectiveRuntimeProfile;
+  profile: ReviewedRuntimeProfile;
   sessionId: SessionId;
   sourceId: string;
   sourceKind: "turn_start" | "queue_start";
   turnId: string;
 }> => {
   const parsed = sessionTurnRuntimeProfileRowSchema.parse(row);
-  const profile = effectiveRuntimeProfileSchema.parse(JSON.parse(parsed.profile_json) as unknown);
+  const profile = reviewedRuntimeProfileSchema.parse(JSON.parse(parsed.profile_json) as unknown);
   if (
     profile.profileId !== parsed.profile_id
     || profile.processGeneration !== parsed.process_generation
@@ -4880,7 +4882,7 @@ export class StateStore {
     sessionId: SessionId;
     sourceKind: z.infer<typeof runtimeProfileSourceKindSchema>;
     sourceId: string;
-    profile: EffectiveRuntimeProfile;
+    profile: ReviewedRuntimeProfile;
   }): SessionRuntimeProfileRecord {
     let record: SessionRuntimeProfileRecord | undefined;
     const transaction = this.#database.transaction(() => {
@@ -4895,11 +4897,11 @@ export class StateStore {
     sessionId: SessionId;
     sourceKind: z.infer<typeof runtimeProfileSourceKindSchema>;
     sourceId: string;
-    profile: EffectiveRuntimeProfile;
+    profile: ReviewedRuntimeProfile;
   }, now: number): SessionRuntimeProfileRecord {
     const sourceKind = runtimeProfileSourceKindSchema.parse(input.sourceKind);
     const sourceId = z.string().min(1).max(200).parse(input.sourceId);
-    const profile = effectiveRuntimeProfileSchema.parse(input.profile);
+    const profile = reviewedRuntimeProfileSchema.parse(input.profile);
     const profileJson = JSON.stringify(profile);
     const existing = this.#database.query(
       "SELECT * FROM session_runtime_profiles WHERE source_kind=? AND source_id=?",
@@ -4944,8 +4946,8 @@ export class StateStore {
     sourceKind: "turn_start" | "queue_start";
     sourceId: string;
     turnId: string;
-    profile: EffectiveRuntimeProfile;
-  }, now: number): EffectiveRuntimeProfile {
+    profile: ReviewedRuntimeProfile;
+  }, now: number): ReviewedRuntimeProfile {
     const turnId = z.string().min(1).max(200).parse(input.turnId);
     const profileRecord = this.#insertSessionRuntimeProfile(input, now);
     const profileJson = JSON.stringify(profileRecord.profile);
@@ -4986,7 +4988,7 @@ export class StateStore {
     return mapSessionTurnRuntimeProfile(inserted).profile;
   }
 
-  runtimeProfileForTurn(sessionId: SessionId, turnId: string): EffectiveRuntimeProfile | null {
+  runtimeProfileForTurn(sessionId: SessionId, turnId: string): ReviewedRuntimeProfile | null {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const parsedTurnId = z.string().min(1).max(200).parse(turnId);
     const row = this.#database.query(
@@ -5021,12 +5023,12 @@ export class StateStore {
     state: "active" | "idle" | "terminal";
     activeTurnId?: string;
     providerUpdatedAt?: number;
-    runtimeProfile: EffectiveRuntimeProfile;
+    runtimeProfile: ReviewedRuntimeProfile;
     receipt: unknown;
   }): void {
     const attemptId = attemptIdSchema.parse(input.attemptId);
     const sessionId = sessionIdSchema.parse(input.sessionId);
-    const profile = effectiveRuntimeProfileSchema.parse(input.runtimeProfile);
+    const profile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
     const receiptJson = JSON.stringify(input.receipt);
     const now = this.#now();
     const transaction = this.#database.transaction(() => {
@@ -5081,12 +5083,12 @@ export class StateStore {
     applyResponseState: boolean;
     turnId: string;
     turnStatus: "completed" | "interrupted" | "failed" | "inProgress";
-    runtimeProfile: EffectiveRuntimeProfile;
+    runtimeProfile: ReviewedRuntimeProfile;
     receipt: unknown;
   }): void {
     const attemptId = attemptIdSchema.parse(input.attemptId);
     const sessionId = sessionIdSchema.parse(input.sessionId);
-    const profile = effectiveRuntimeProfileSchema.parse(input.runtimeProfile);
+    const profile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
     const now = this.#now();
     const transaction = this.#database.transaction(() => {
       const row = z.object({ authority_id: sessionIdSchema, evidence_json: z.string() }).strict().parse(
@@ -6206,13 +6208,13 @@ export class StateStore {
     applyResponseState: boolean;
     turnId: string;
     turnStatus: "completed" | "interrupted" | "failed" | "inProgress";
-    runtimeProfile: EffectiveRuntimeProfile;
+    runtimeProfile: ReviewedRuntimeProfile;
     receipt: unknown;
   }): void {
     completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const queueId = queueIdSchema.parse(input.queueId);
     const evidenceDigest = sha256Schema.parse(input.expectedEvidenceDigest);
-    const profile = effectiveRuntimeProfileSchema.parse(input.runtimeProfile);
+    const profile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
     const now = this.#now();
     const complete = this.#database.transaction(() => {
       const row = z.object({ session_id: sessionIdSchema, state: z.literal("dispatching"), evidence_json: z.string(), evidence_digest: sha256Schema }).strict().parse(
@@ -6764,7 +6766,12 @@ export class StateStore {
       evidence.runtimeProfile.profileId !== parsedProfileId
       || evidence.runtimeProfile.processGeneration !== parsedGeneration
       || evidence.runtimeProfile.preset !== parsedPreset
-      || evidence.runtimeProfile.fast !== input.fastEnabled
+      // Fast mode is a Codex capability. The Claude document has no `fast`
+      // field at all, so the coherent value for a Claude session is `false`.
+      || (isCodexRuntimeProfile(evidence.runtimeProfile)
+        ? evidence.runtimeProfile.fast !== input.fastEnabled
+        : input.fastEnabled)
+      || reviewedRuntimeProfileProvider(evidence.runtimeProfile) !== parsedProvider
     )) throw new Error("MUTATION_EFFECT_RUNTIME_PROFILE_MISMATCH");
     const canonical = JSON.stringify(evidence);
     const digest = createHash("sha256").update(canonical).digest("hex");

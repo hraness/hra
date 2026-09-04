@@ -3,7 +3,7 @@
 import { dlopen } from "bun:ffi";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
-import { readSync, type Stats } from "node:fs";
+import { mkdirSync, readSync, type Stats } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isatty } from "node:tty";
@@ -133,9 +133,10 @@ import {
   waitForDaemonReady,
   type DaemonIdentity,
 } from "./daemon/daemon-startup";
+import { PinnedClaudeRuntimeManager } from "./daemon/claude-runtime-adapter";
 import { PinnedCodexRuntimeManager } from "./daemon/codex-runtime-adapter";
 import { HraFactsMemoryLifecycle } from "./daemon/facts-memory-lifecycle";
-import { UnavailableCloudControl, type CloudControlPort, type CodexRuntimePort, type CompactProjectionRecoveryBlocker } from "./daemon/ports";
+import { UnavailableCloudControl, type ClaudeRuntimePort, type CloudControlPort, type CodexRuntimePort, type CompactProjectionRecoveryBlocker } from "./daemon/ports";
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { CommandFailure, HraService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
@@ -146,7 +147,12 @@ import {
   createProductionInstallation,
   type HraInstallation,
 } from "./installation";
-import { initializeStatePaths, resolveStatePaths, type StatePaths } from "./storage/paths";
+import {
+  initializeStatePaths,
+  profilePaths,
+  resolveStatePaths,
+  type StatePaths,
+} from "./storage/paths";
 import { FactsMemoryControlStore } from "./storage/facts-memory-control";
 import { LocalFactsMemoryBroker } from "./storage/local-facts-memory-broker";
 import { resolveUsableCanonicalProjectDirectory } from "./storage/project-directory";
@@ -2977,6 +2983,7 @@ export async function runDaemon(
   let store: StateStore | undefined;
   let factsMemoryControl: FactsMemoryControlStore | undefined;
   let codex: PinnedCodexRuntimeManager | undefined;
+  let claude: PinnedClaudeRuntimeManager | undefined;
   let service: HraService | undefined;
   let server: LocalDaemonServer | undefined;
   let cloudAdapter: StateBackedCloudDaemonAdapter | undefined;
@@ -3083,6 +3090,30 @@ export async function runDaemon(
         fact: async (authority, fact) => { await serviceReference.current?.observeCodexFact(authority, fact); },
       },
     });
+    // The Claude seam is composed unconditionally: it locates and admits the
+    // pinned `claude` binary only when a session actually names the provider,
+    // so a machine without it pays nothing and is refused with one exact,
+    // actionable message at `session start --provider claude`.
+    claude = new PinnedClaudeRuntimeManager({
+      configDirFor: (authority) => {
+        const dir = profilePaths(paths, authority.id).claudeConfigDir;
+        mkdirSync(dir, { mode: 0o700, recursive: true });
+        return dir;
+      },
+      isCurrent: (authority) => {
+        try {
+          const profile = activeStore.requireProfile(authority.id);
+          return profile.processGeneration === authority.generation && profile.state !== "removed";
+        } catch {
+          return false;
+        }
+      },
+      observer: {
+        fact: async (authority, fact) => {
+          await serviceReference.current?.observeClaudeFact(authority, fact);
+        },
+      },
+    });
     const cloudEnvironment = installation.cloudEnvironment;
     const cloudStartup = await resolveDaemonCloudStartup({
       environment: cloudEnvironment,
@@ -3147,7 +3178,26 @@ export async function runDaemon(
             };
           },
         }) as CodexRuntimePort;
+        // The same authority fence around the Claude seam: cloud projection
+        // reads a Claude session through its own port.
+        const cloudClaude = new Proxy(claude, {
+          get(target, property) {
+            const value = Reflect.get(target, property, target) as unknown;
+            if (typeof value !== "function") return value;
+            if (property === "close" || property === "interactionAuthority"
+              || property === "pinnedVersion") {
+              return (...args: unknown[]): unknown => Reflect.apply(value, target, args) as unknown;
+            }
+            return async (...args: unknown[]) => {
+              await activeDaemonAuthority.assertCurrent();
+              const result = await Reflect.apply(value, target, args) as unknown;
+              await activeDaemonAuthority.assertCurrent();
+              return result;
+            };
+          },
+        }) as ClaudeRuntimePort;
         candidateAdapter = new StateBackedCloudDaemonAdapter({
+          claude: cloudClaude,
           codex: cloudCodex,
           // Device commands run ordinary local commands, so they go through the
           // same admitted service path a person's CLI uses, with the same
@@ -3250,6 +3300,7 @@ export async function runDaemon(
       store: activeStore,
       paths,
       codex,
+      claude,
       cloud,
       daemonAuthority: activeDaemonAuthority,
       daemonGeneration: generation,
