@@ -1537,7 +1537,9 @@ function parsePendingRemoteCommand(value: string): PendingRemoteCommand {
       && decoded.kind !== "steer"
       && decoded.kind !== "stop"
       && decoded.kind !== "set_model"
-      && decoded.kind !== "set_fast")
+      && decoded.kind !== "set_fast"
+      && decoded.kind !== "resolve_interaction"
+      && decoded.kind !== "send_or_steer")
     || !isDigest(decoded.payloadDigest)
     || !isDigest(decoded.requestDigest)
     || (decoded.version === 2
@@ -1908,6 +1910,8 @@ function parseRemoteCommandKind(value: unknown): RemoteCommandPayload["kind"] | 
     || value === "stop"
     || value === "set_model"
     || value === "set_fast"
+    || value === "resolve_interaction"
+    || value === "send_or_steer"
     ? value
     : null;
 }

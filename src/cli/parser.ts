@@ -123,7 +123,14 @@ export type RemoteCliCommand =
   | Readonly<{ kind: "remote.list"; limit: number }>
   | Readonly<{ kind: "remote.show"; session: string }>
   | Readonly<{ commandPublicId: string; kind: "remote.command" }>
-  | Readonly<{ kind: "remote.send" | "remote.queue" | "remote.steer"; message: string; session: string }>
+  | Readonly<{ kind: "remote.send" | "remote.queue" | "remote.steer"; message: string; orSteer?: boolean; session: string }>
+  | Readonly<{
+      decision: "once" | "decline" | "cancel";
+      interaction: string;
+      kind: "remote.resolve";
+      revision: number;
+      session: string;
+    }>
   | Readonly<{ kind: "remote.stop"; session: string }>
   | Readonly<{ kind: "remote.preset"; preset: "low" | "high" | "ultra"; session: string }>
   | Readonly<{ enabled: boolean; kind: "remote.fast"; session: string }>;
@@ -1233,10 +1240,31 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
     case "send":
     case "queue":
     case "steer": {
+      const orSteer = action === "send" && flag(cursor, "--or-steer");
       const session = take(cursor, "session");
       const message = remainder(cursor, "message");
       if (message.length > 64_000) throw new CliUsageError("Remote message is too long.");
-      return { kind: `remote.${action}`, session, message };
+      return orSteer
+        ? { kind: "remote.send", session, message, orSteer: true }
+        : { kind: `remote.${action}`, session, message };
+    }
+    case "resolve": {
+      const interaction = option(cursor, "--interaction");
+      const revisionValue = option(cursor, "--revision");
+      const decision = option(cursor, "--decision");
+      const session = take(cursor, "session");
+      finish(cursor);
+      if (interaction === undefined || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(interaction)) {
+        throw new CliUsageError("Remote resolve requires --interaction <uuid>.");
+      }
+      const revision = Number(revisionValue);
+      if (revisionValue === undefined || !/^[1-9]\d{0,15}$/u.test(revisionValue) || !Number.isSafeInteger(revision)) {
+        throw new CliUsageError("Remote resolve requires --revision <positive integer>.");
+      }
+      if (decision !== "once" && decision !== "decline" && decision !== "cancel") {
+        throw new CliUsageError("Remote resolve requires --decision once|decline|cancel.");
+      }
+      return { decision, interaction, kind: "remote.resolve", revision, session };
     }
     case "stop": {
       const session = take(cursor, "session");

@@ -1206,3 +1206,37 @@ describe("CLI help", () => {
     expect(leaves).toBeGreaterThan(60);
   });
 });
+
+describe("remote decisions and send-or-steer parsing", () => {
+  test("parses remote resolve and refuses session scope", () => {
+    expect(parseCli([
+      "remote", "resolve", "sess_a",
+      "--interaction", "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b",
+      "--revision", "2",
+      "--decision", "once",
+    ])).toMatchObject({
+      command: {
+        decision: "once",
+        interaction: "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b",
+        kind: "remote.resolve",
+        revision: 2,
+        session: "sess_a",
+      },
+    });
+    expect(() => parseCli(["remote", "resolve", "sess_a", "--interaction", "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b", "--revision", "2", "--decision", "session"]))
+      .toThrow("once|decline|cancel");
+    expect(() => parseCli(["remote", "resolve", "sess_a", "--interaction", "nope", "--revision", "2", "--decision", "once"]))
+      .toThrow("--interaction");
+    expect(() => parseCli(["remote", "resolve", "sess_a", "--interaction", "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b", "--revision", "0", "--decision", "once"]))
+      .toThrow("--revision");
+  });
+
+  test("parses remote send --or-steer", () => {
+    expect(parseCli(["remote", "send", "--or-steer", "sess_a", "keep", "going"])).toMatchObject({
+      command: { kind: "remote.send", message: "keep going", orSteer: true, session: "sess_a" },
+    });
+    expect(parseCli(["remote", "send", "sess_a", "plain"])).toMatchObject({
+      command: { kind: "remote.send", message: "plain", session: "sess_a" },
+    });
+  });
+});

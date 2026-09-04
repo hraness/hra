@@ -537,6 +537,7 @@ type RemoteSessionCommand = Extract<LocalCommand, { kind:
   | "session.rename"
   | "session.preset"
   | "session.fast"
+  | "interaction.resolve"
 }>;
 const restoreLoginReceipt = (value: unknown): LoginOutcome => {
   const parsed = loginReceiptSchema.parse(value);
@@ -1174,7 +1175,7 @@ export class HraService {
       })
       .strict()
       .parse(expectedAuthority);
-    if (command.session !== expected.sessionId) {
+    if (command.kind !== "interaction.resolve" && command.session !== expected.sessionId) {
       throw new CommandFailure("CONFLICT", "The remote command selector does not match its exact session authority.");
     }
     return await this.#serializeSessionAuthority({ id: expected.sessionId, profileId: expected.profileId }, async () => {
@@ -1209,6 +1210,16 @@ export class HraService {
             sessionId: session.id,
           }),
         };
+        case "interaction.resolve": {
+          // A remote decision must name an interaction of this exact session;
+          // the ordinary resolve path then enforces revision, state, deadline,
+          // and provider-offered decisions.
+          const interaction = this.#store.requireInteraction(command.interaction);
+          if (interaction.sessionId !== session.id) {
+            throw new CommandFailure("CONFLICT", "The remote decision names an interaction of another session.");
+          }
+          return await this.#resolveInteraction(command, { signal: context.signal });
+        }
       }
     });
   }

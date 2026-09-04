@@ -2998,3 +2998,48 @@ describe("bridged cloud control", () => {
     expect(deviceSignals).toEqual([deviceSignal, deviceSignal]);
   });
 });
+
+describe("remote decisions at the custodian", () => {
+  test("send_or_steer sends when no turn is active and remote decisions are verified before dispatch", async () => {
+    const value = await fixture();
+    const commands: LocalCommand[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const authority = await adapter.resolveCommandAuthority({ sessionPublicId: value.sessionId, signal });
+      expect(authority).not.toBeNull();
+      expect(await adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-000000000021",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "send_or_steer", message: "Keep going" },
+        sessionPublicId: value.sessionId,
+        signal,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      expect(commands.at(-1)).toMatchObject({ kind: "session.send", message: "Keep going" });
+
+      expect(await adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-000000000022",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: {
+          decision: "once",
+          interactionId: "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b",
+          kind: "resolve_interaction",
+          revision: 1,
+        },
+        sessionPublicId: value.sessionId,
+        signal,
+      })).toEqual({ code: "INTERACTION_NOT_FOUND", state: "failed" });
+      expect(commands.filter((command) => command.kind === "interaction.resolve")).toHaveLength(0);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+});

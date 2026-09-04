@@ -14,11 +14,58 @@ import {
   type UsageProjection,
 } from "./usage";
 
+// Interaction identifiers are provider-brokered UUIDs (see
+// `src/domain/interactions.ts`, `z.string().uuid()`) that are not necessarily
+// UUIDv7, so this checks the generic RFC 4122 shape rather than reusing the
+// stricter `isUuidV7` idempotency-key check.
+const uuidPattern =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
+
+function isInteractionId(value: unknown): value is string {
+  return typeof value === "string" && uuidPattern.test(value);
+}
+
+function isRemoteInteractionAnswerMap(
+  value: unknown,
+): value is Readonly<Record<string, Readonly<{ answers: readonly string[] }>>> {
+  if (!isRecord(value)) return false;
+  const entries = Object.entries(value);
+  if (entries.length < 1 || entries.length > 20) return false;
+  return entries.every(([questionId, answer]) =>
+    questionId.length >= 1
+    && questionId.length <= 512
+    && isRecord(answer)
+    && hasExactKeys(answer, ["answers"])
+    && Array.isArray(answer.answers)
+    && answer.answers.length <= 20
+    && answer.answers.every((entry) =>
+      typeof entry === "string"
+      && entry.length <= 16_384
+      && !containsAbsolutePath(entry)
+      && !containsUnsafeTerminalScalar(entry, true)));
+}
+
+export type ResolveInteractionDecisionPayload = Readonly<{
+  decision: "once" | "decline" | "cancel";
+  interactionId: string;
+  kind: "resolve_interaction";
+  revision: number;
+}>;
+
+export type ResolveInteractionAnswersPayload = Readonly<{
+  answers: Readonly<Record<string, Readonly<{ answers: readonly string[] }>>>;
+  interactionId: string;
+  kind: "resolve_interaction";
+  revision: number;
+}>;
+
 export type RemoteCommandPayload =
-  | Readonly<{ kind: "send" | "queue" | "steer"; message: string }>
+  | Readonly<{ kind: "send" | "queue" | "steer" | "send_or_steer"; message: string }>
   | Readonly<{ kind: "stop" }>
   | Readonly<{ kind: "set_model"; preset: "low" | "high" | "ultra" }>
-  | Readonly<{ enabled: boolean; kind: "set_fast" }>;
+  | Readonly<{ enabled: boolean; kind: "set_fast" }>
+  | ResolveInteractionDecisionPayload
+  | ResolveInteractionAnswersPayload;
 
 export type SessionMetadataPayload = Readonly<{
   name: string | null;
@@ -35,7 +82,8 @@ export type CloudPayloadAuthority = Readonly<{
 export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload | null {
   if (!isRecord(value)) return null;
   if (
-    (value.kind === "send" || value.kind === "queue" || value.kind === "steer")
+    (value.kind === "send" || value.kind === "queue" || value.kind === "steer"
+      || value.kind === "send_or_steer")
     && hasExactKeys(value, ["kind", "message"])
     && typeof value.message === "string"
     && value.message.length >= 1
@@ -54,6 +102,35 @@ export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload 
     && hasExactKeys(value, ["enabled", "kind"])
     && typeof value.enabled === "boolean"
   ) return { enabled: value.enabled, kind: value.kind };
+  if (
+    value.kind === "resolve_interaction"
+    && isInteractionId(value.interactionId)
+    && Number.isSafeInteger(value.revision)
+    && (value.revision as number) > 0
+  ) {
+    if (
+      hasExactKeys(value, ["decision", "interactionId", "kind", "revision"])
+      && (value.decision === "once" || value.decision === "decline" || value.decision === "cancel")
+    ) {
+      return {
+        decision: value.decision,
+        interactionId: value.interactionId,
+        kind: value.kind,
+        revision: value.revision as number,
+      };
+    }
+    if (
+      hasExactKeys(value, ["answers", "interactionId", "kind", "revision"])
+      && isRemoteInteractionAnswerMap(value.answers)
+    ) {
+      return {
+        answers: value.answers,
+        interactionId: value.interactionId,
+        kind: value.kind,
+        revision: value.revision as number,
+      };
+    }
+  }
   return null;
 }
 
