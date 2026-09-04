@@ -43,7 +43,7 @@ describe("public content contract", () => {
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init --yes",
       installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.2.1/hraness-hra-0.2.1.tgz",
+        "https://github.com/hraness/hra/releases/download/v0.3.0/hraness-hra-0.3.0.tgz",
       ),
       links: {
         github: "https://github.com/hraness/hra",
@@ -217,33 +217,29 @@ describe("public content contract", () => {
     }
   });
 
-  test("marks the local release, website, and invite-only hosted sync live", () => {
-    expect(publicReleaseState).toBe("live");
+  test("marks the local release ready while the website and invite-only hosted sync stay live", () => {
+    expect(publicReleaseState).toBe("release-ready");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "live",
+      betaTag: "release-ready",
       githubRepository: "live",
       hostedSync: "live",
       website: "live",
     });
+    expect(renderReadmeMarkdown()).toContain("The local CLI v0.3.0 is release-ready for macOS and Linux");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Immutable local CLI release; hosted sync live as an invite-only beta");
-      expect(surface).toContain("is live from the immutable");
-      expect(surface).toContain("npm exposes the same provenance-bearing bytes as latest");
-      expect(surface).toContain("public CLI is immutable and admitted");
-      expect(surface).not.toContain("release tag is release-ready");
-      expect(surface).toContain("optional hosted sync is live as an invite-only beta");
+      expect(surface).toContain("Immutable local CLI release candidate; hosted sync live as an invite-only beta");
+      expect(surface).toContain("works once GitHub exposes the immutable");
+      expect(surface).toContain("public CLI stays immutable once admitted");
       expect(surface).not.toContain("beta-not-yet-live");
       expect(surface).not.toContain("not yet live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("are installable through the exact command above");
-      expect(surface).not.toContain("once its GitHub Release exists");
-      expect(surface).not.toContain("works once GitHub exposes the immutable");
+      expect(surface).toContain("become installable through the exact command above once its GitHub Release exists");
       expect(surface).not.toContain("install command becomes usable");
       expect(surface).not.toContain("Beta not yet live");
-      expect(surface).not.toContain("No published `v0.2.1` tag currently exposes these commands");
+      expect(surface).not.toContain("No published `v0.3.0` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Install the live v0.2.1 beta");
-    expect(renderLlmsText()).not.toContain("Install after the v0.2.1 beta tag is live");
+    expect(renderLlmsText()).toContain("Install after the v0.3.0 beta tag is live");
+    expect(renderLlmsText()).not.toContain("Install the live v0.3.0 beta");
   });
 
   test("publishes protected cloud auth and the exact device-pairing path", () => {
@@ -536,7 +532,7 @@ describe("public content contract", () => {
     expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("| bun -e '");
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.2.1/hraness-hra-0.2.1.tgz",
+      "-- https://github.com/hraness/hra/releases/download/v0.3.0/hraness-hra-0.3.0.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");
@@ -551,7 +547,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra-install-safe");
       expect(surface).toContain("fresh random private staging root");
       expect(surface).toContain("GitHub repository ID 1343008607");
-      expect(surface).toContain("published immutable v0.2.1 release");
+      expect(surface).toContain("published immutable v0.3.0 release");
       expect(surface).toContain("immutable release metadata");
       expect(surface).toContain("verified in-memory snapshot");
       expect(surface).toContain("bounded package-file manifest");
@@ -569,7 +565,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
       expect(surface).toContain("Do not install a moving branch");
-      expect(surface).toContain("verified repair installation of v0.2.1");
+      expect(surface).toContain("verified repair installation of v0.3.0");
       expect(surface).toContain("replace the tagged preflight and release archive references together");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
@@ -599,6 +595,17 @@ describe("public content contract", () => {
       "equivalent compatibility spelling",
       "hra session interactions <session-id> --pending --json",
       "Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form.",
+      "Scheduled work in the same conversation",
+      "hra session task create <session-id> --name daily-review --every-minutes 1440",
+      "hra session task list <session-id>",
+      "hra session task show <session-id> <task-id>",
+      "hra session task edit <session-id> <task-id> --revision <revision> --pause",
+      "hra session task edit <session-id> <task-id> --revision <revision> --resume",
+      "hra session task delete <session-id> <task-id> --revision <revision>",
+      "A task cannot independently retarget its account, project, model, or execution environment",
+      "later explicit changes to the session apply to future runs",
+      "Missed intervals coalesce into one queued turn",
+      "HRA never creates a replacement conversation or writes Codex's private automation registry",
     ];
 
     expect(markdown).toContain("## First session");

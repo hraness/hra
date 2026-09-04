@@ -2,6 +2,16 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## v0.3.0
+
+Conversation-bound scheduled tasks and hosted sign-in mail. Release candidate until the release workflow admits the tag.
+
+- `hra session task` creates, inspects, edits, pauses, resumes, and deletes recurring interval tasks. Tasks carry durable revisions and replay receipts, accept intervals from 15 minutes through 7 days, and are capped at 32 per conversation.
+- New HRA-created Codex conversations expose `hra.automation_update`. The tool is bound to the exact provider thread and profile generation, and cannot retarget a session, project, model, or environment. Existing conversations remain manageable through the CLI without being retrofitted.
+- Due tasks enter the durable session queue transactionally. Missed intervals coalesce, and restart, collision, generation, and concurrency fences prevent duplicate dispatch.
+- Scheduled prompts stay local and are omitted from cloud projections. Existing approval, question, permission, MCP, and plugin flows retain their established boundaries.
+- Hosted sign-in verification email now uses the production HRA sender and pinned authentication subdomain.
+
 ## v0.2.1
 
 Patch release for the hosted beta. Admitted 2026-09-03 as immutable GitHub Release `v0.2.1` and npm `latest`.

@@ -191,16 +191,16 @@ export const siteDocumentPaths: readonly string[] = [
   "/privacy/",
 ];
 
-export const publicReleaseState: "live" | "release-ready" | "staged" = "live";
+export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.2.1/hraness-hra-0.2.1.tgz",
+  "https://github.com/hraness/hra/releases/download/v0.3.0/hraness-hra-0.3.0.tgz",
 );
 
 const productName = "HRA";
 const tagline = "Control plane for coding-agent subscriptions";
 const providerRoadmap = "Codex today, Claude next.";
-const releaseVersion = "0.2.1";
+const releaseVersion = "0.3.0";
 
 /** Toolchain and runtime pins come from `package.json`, so badges cannot drift from the manifest. */
 export const publicPins = {
@@ -253,7 +253,7 @@ export const publicContent: PublicContent = {
   releaseVersion,
   thesis: `${productName} runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.`,
   description: `${tagline}: run several accounts side by side, keep their sessions alive in a local daemon, and drive them from a shell or JSON. ${providerRoadmap}`,
-  statusLine: `Status: public beta. The local CLI v${releaseVersion} is live for macOS and Linux; hosted sync is live as an invite-only beta.`,
+  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready for macOS and Linux; hosted sync is live as an invite-only beta.`,
   badges,
   maintainer: {
     name: "Hraness",
@@ -270,7 +270,7 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-    betaTag: "live",
+    betaTag: "release-ready",
     githubRepository: "live",
     hostedSync: "live",
     website: "live",
@@ -280,7 +280,7 @@ export const publicContent: PublicContent = {
     eyebrow: tagline,
     heading: "Keep every Codex account and live session in one durable CLI.",
     summary: "Give each account its own Codex home, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.",
-    boundary: "macOS and Linux CLI · macOS desktop switching · local v0.2.1 live · hosted sync live (invite-only beta)",
+    boundary: "macOS and Linux CLI · macOS desktop switching · local v0.3.0 release-ready · hosted sync live (invite-only beta)",
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
@@ -338,11 +338,11 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: "Immutable local CLI release; hosted sync live as an invite-only beta",
+      label: "Immutable local CLI release candidate; hosted sync live as an invite-only beta",
       content: [
-        text("The exact install command below is live from the immutable "),
-        code("v0.2.1"),
-        text(" GitHub Release and its verified archive. npm exposes the same provenance-bearing bytes as latest. The public CLI is immutable and admitted; optional hosted sync is live as an invite-only beta."),
+        text("The exact install command below works once GitHub exposes the immutable "),
+        code("v0.3.0"),
+        text(" GitHub Release and its verified archive. The website and optional hosted sync are live; the public CLI stays immutable once admitted."),
       ],
     },
     paragraph(
@@ -381,10 +381,10 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("The single install command streams the exact v0.2.1 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.2.1 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
+          text("The single install command streams the exact v0.3.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.3.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
         ),
         paragraph(
-          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.2.1. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
+          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.3.0. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
         ),
         {
           kind: "commands",
@@ -549,6 +549,23 @@ export const publicContent: PublicContent = {
         paragraph(
           text("If the event stream reports a blocking interaction, read its exact ID and revision, inspect the live authority through the protected path, and resolve only the interaction kind you received. Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form. The protected interaction commands and input documents are defined below."),
         ),
+        { kind: "subheading", text: "Scheduled work in the same conversation" },
+        paragraph(
+          text("Attach a recurring whole-minute interval to an existing session with "),
+          code("hra session task"),
+          text(". Each run returns to that exact conversation. A task cannot independently retarget its account, project, model, or execution environment; later explicit changes to the session apply to future runs. Missed intervals coalesce into one queued turn. Use the returned task ID and revision for later edits or deletion; HRA never creates a replacement conversation or writes Codex's private automation registry."),
+        ),
+        {
+          kind: "commands",
+          commands: [
+            "hra session task create <session-id> --name daily-review --every-minutes 1440 -- \"Review the release queue.\"",
+            "hra session task list <session-id>",
+            "hra session task show <session-id> <task-id>",
+            "hra session task edit <session-id> <task-id> --revision <revision> --pause",
+            "hra session task edit <session-id> <task-id> --revision <revision> --resume",
+            "hra session task delete <session-id> <task-id> --revision <revision>",
+          ],
+        },
       ],
     },
     {
@@ -560,8 +577,8 @@ export const publicContent: PublicContent = {
           label: "Local release boundary",
           content: [
             text("These commands are part of the immutable "),
-            code("v0.2.1"),
-            text(" local CLI release and are installable through the exact command above. Hosted sync is not required for this local protocol."),
+            code("v0.3.0"),
+            text(" local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol."),
           ],
         },
         paragraph(
@@ -1075,6 +1092,11 @@ export const publicContent: PublicContent = {
             "hra session preset <session> <low|high|ultra>",
             "hra session fast <session> <on|off>",
             "hra session project <session> <project>",
+            "hra session task list <session>",
+            "hra session task show <session> <task-id>",
+            "hra session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>",
+            "hra session task edit <session> <task-id> --revision <n> [--name <name>] [--every-minutes <15..10080>] [--pause|--resume] [--idempotency-key <uuid>] [-- <replacement-prompt>]",
+            "hra session task delete <session> <task-id> --revision <n> [--idempotency-key <uuid>]",
             "hra work protocol [--operation <kind>|--type <name>|--topic <topic>]",
             "hra work apply --input-stdin|--input-fd <fd>",
             "hra work snapshot <work> [--actor <session>]",
@@ -1254,7 +1276,7 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     content.thesis,
     content.statusLine,
     "",
-    `Install the live v0.2.1 beta: ${content.installCommand}`,
+    `Install after the v0.3.0 beta tag is live: ${content.installCommand}`,
     `Initialize: ${content.initCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
     "",
