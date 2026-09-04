@@ -3,9 +3,9 @@ import type { ReactNode } from "react";
 /**
  * Icons as inline SVG.
  *
- * `img-src 'none'` and `default-src 'none'` leave no way to fetch an icon file,
- * and a sprite sheet would be another request the policy refuses, so every glyph
- * is drawn here as owned source. They inherit `currentColor` and size from the
+ * `img-src data: blob:` names no remote origin and `default-src 'none'` leaves
+ * no way to fetch an icon file, and a sprite sheet would be another request the
+ * policy refuses, so every glyph is drawn here as owned source. They inherit `currentColor` and size from the
  * class the caller passes, and they carry no title: each one lives inside a
  * control that already has an accessible name.
  */
@@ -103,6 +103,23 @@ export function ChevronIcon({ open }: Readonly<{ open: boolean }>): ReactNode {
   return (
     <Glyph>
       <path d={open ? "M6 15l6-6 6 6" : "M9 6l6 6-6 6"} />
+    </Glyph>
+  );
+}
+
+export function AttachIcon(): ReactNode {
+  return (
+    <Glyph>
+      <path d="M20 11.5 12.3 19a4.5 4.5 0 0 1-6.4-6.4l7.8-7.8a3 3 0 0 1 4.3 4.3l-7.8 7.8a1.5 1.5 0 0 1-2.2-2.2l7.2-7.2" />
+    </Glyph>
+  );
+}
+
+export function CloseIcon(): ReactNode {
+  return (
+    <Glyph>
+      <path d="M6 6l12 12" />
+      <path d="M18 6 6 18" />
     </Glyph>
   );
 }

@@ -8,13 +8,16 @@ import {
   type ReactNode,
 } from "react";
 
-import { SettingsIcon } from "../components/icons";
+import { ComposerAttachmentChips } from "../components/attachment-chips";
+import { AttachIcon, SettingsIcon } from "../components/icons";
 import { SessionCard } from "../components/session-card";
 import { ChoiceGroup } from "../components/settings-list";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { useCardOrder } from "../data/card-order";
 import { useSubmitCommand } from "../data/commands";
+import { useComposerAttachments } from "../data/composer-attachments";
+import { holdSentAttachment } from "../data/sent-attachments";
 import { useDeviceCommandState, useSubmitDeviceCommand } from "../data/device-commands";
 import { useDeviceRegistries } from "../data/registry";
 import { useSessionHeads } from "../data/session-heads";
@@ -28,6 +31,11 @@ import {
   sessionStartTargets,
   type PresetChoice,
 } from "../model/device-commands";
+import {
+  attachmentAcceptAttribute,
+  attachmentSendSupported,
+  buildSendPayload,
+} from "../model/attachments";
 import {
   orderSessionCards,
   resolveComposerTarget,
@@ -75,6 +83,12 @@ function cardUnderPointer(clientX: number, clientY: number): string | null {
  * as it has since W2. With nothing selected it starts a real session on a
  * machine through the `session_start` device command, addressed by the account
  * and project public ids the device registry projects — never by a path.
+ *
+ * Attachments belong to the steer mode only, and the paste, the drop, and the
+ * picker are wired up only there. A start is a device command carrying a prompt,
+ * with no field for a file and no session yet to hold one, so a reader who
+ * attaches something while starting is told to open the session and attach it
+ * there rather than having it dropped in silence.
  */
 export function GridScreen({
   onSelect,
@@ -98,6 +112,8 @@ export function GridScreen({
   const [targetKey, setTargetKey] = useState<string | null>(null);
   const [projectPublicId, setProjectPublicId] = useState<string | null>(null);
   const [preset, setPreset] = useState<PresetChoice>(defaultSessionStartPreset);
+  const attach = useComposerAttachments();
+  const pickerRef = useRef<HTMLInputElement>(null);
 
   const startCommand = useDeviceCommandState(startCommandId);
   const startNotice = deviceCommandNotice(startCommand);
@@ -173,6 +189,7 @@ export function GridScreen({
 
   const canSubmit = message.trim().length > 0
     && !sending
+    && !attach.busy
     && (starting
       ? startTarget !== null && project !== null
       : steerTarget !== null && headById.get(steerTarget.publicId) !== undefined);
@@ -181,6 +198,21 @@ export function GridScreen({
     event.preventDefault();
     const text = message.trim();
     if (!canSubmit) return;
+    // A new session is a device command carrying a prompt and nothing else, so
+    // there is nowhere for an attachment to ride. Say so rather than dropping
+    // it silently: the reader can open the session and attach there.
+    if (starting && attach.attachments.length > 0) {
+      setNotice("A new session starts with text only. Open it, then attach files there.");
+      return;
+    }
+    if (attach.sendRefusal !== null) {
+      setNotice(attach.sendRefusal);
+      return;
+    }
+    if (attach.attachments.length > 0 && !attachmentSendSupported()) {
+      setNotice("This build does not carry attachments to the machine yet.");
+      return;
+    }
     setSending(true);
     setNotice(null);
     const run = starting && startTarget !== null && project !== null
@@ -200,12 +232,22 @@ export function GridScreen({
       : (() => {
           const head = steerTarget === null ? undefined : headById.get(steerTarget.publicId);
           if (head === undefined) return Promise.resolve();
+          const attachments = attach.attachments;
           return submit({
             executionDevicePublicId: head.executionDevicePublicId,
-            payload: { kind: "send_or_steer", message: text },
+            payload: buildSendPayload({ attachments, message: text }),
             sessionPublicId: head.publicId,
           }).then(() => {
+            for (const item of attachments) {
+              if (item.kind !== "image") continue;
+              holdSentAttachment({
+                bytes: item.bytes,
+                digest: item.digest,
+                mediaType: item.mediaType,
+              });
+            }
             setMessage("");
+            attach.clear();
             setNotice(`Sent to ${steerTarget?.title ?? "the session"}.`);
           });
         })();
@@ -330,11 +372,39 @@ export function GridScreen({
           >
             <SettingsIcon />
           </Button>
-          <form className="flex flex-1 items-center gap-2" onSubmit={send}>
+          <form
+            className="flex flex-1 items-center gap-2"
+            onDragLeave={attach.onDragLeave}
+            onDragOver={starting ? undefined : attach.onDragOver}
+            onDrop={starting ? undefined : attach.onDrop}
+            onSubmit={send}
+          >
+            <input
+              accept={attachmentAcceptAttribute}
+              aria-hidden="true"
+              className="hidden"
+              multiple
+              onChange={attach.onPick}
+              ref={pickerRef}
+              tabIndex={-1}
+              type="file"
+            />
+            {starting ? null : (
+              <Button
+                aria-label="Attach a file"
+                disabled={steerTarget === null}
+                onClick={() => { pickerRef.current?.click(); }}
+                size="icon"
+                variant="ghost"
+              >
+                <AttachIcon />
+              </Button>
+            )}
             <Input
               aria-label="Start a new session"
               disabled={starting ? startTarget === null : steerTarget === null}
               onChange={(event) => { setMessage(event.target.value); }}
+              onPaste={starting ? undefined : attach.onPaste}
               placeholder="Start a new session"
               value={message}
             />
@@ -400,6 +470,10 @@ export function GridScreen({
         {notice === null ? null : (
           <p className="text-xs text-ink-muted" role="status">{notice}</p>
         )}
+        {attach.notice === null ? null : (
+          <p className="text-xs text-danger" role="status">{attach.notice}</p>
+        )}
+        <ComposerAttachmentChips attachments={attach.attachments} onRemove={attach.remove} />
       </header>
 
       <main className="flex-1 px-[max(1rem,env(safe-area-inset-left))] py-4 pb-[calc(1rem+env(safe-area-inset-bottom))]">
