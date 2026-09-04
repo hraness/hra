@@ -3117,8 +3117,13 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
   acknowledgeNoAccountKeyHolders(signal: AbortSignal): Promise<unknown> {
     return this.#control.acknowledgeNoAccountKeyHolders(signal);
   }
-  approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
-    return this.#control.approveDevice(device, idempotencyKey, signal);
+  approveDevice(
+    device: string,
+    idempotencyKey: string,
+    fingerprint: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    return this.#control.approveDevice(device, idempotencyKey, fingerprint, signal);
   }
   revokeDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
     return this.#control.revokeDevice(device, idempotencyKey, signal);

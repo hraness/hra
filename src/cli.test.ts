@@ -2598,6 +2598,8 @@ describe("CLI entry point", () => {
       "device",
       "approve",
       "device_pending",
+      "--fingerprint",
+      "0000-1111-2222-3333-4444-5555-6666-7777",
       "--json",
     ], captured.output, {
       callDaemon: (command) => {
@@ -2621,7 +2623,11 @@ describe("CLI entry point", () => {
       },
     });
     expect(rendered.error.details.nextCommand)
-      .toBe(`hra device approve device_pending --idempotency-key ${generatedKey} --json`);
+      .toBe(
+        "hra device approve device_pending"
+        + " --fingerprint 0000-1111-2222-3333-4444-5555-6666-7777"
+        + ` --idempotency-key ${generatedKey} --json`,
+      );
   });
 
   test("keeps rejected projection recovery as an immutable receipt with one status action", async () => {

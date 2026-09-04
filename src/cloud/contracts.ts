@@ -87,9 +87,13 @@ export type AccountKeyStatus =
 
 export type CloudDeviceListLabelSource = "encrypted" | "fallback";
 
+export type CloudDeviceClass = "daemon" | "browser";
+
 export type CloudDeviceListEntry = Readonly<{
   activatedAt?: number;
   current: boolean;
+  deviceClass: CloudDeviceClass;
+  fingerprint: string;
   keyVersion: number;
   label: string;
   labelSource: CloudDeviceListLabelSource;
@@ -108,6 +112,13 @@ export type CloudDeviceList = Readonly<{
 const base64UrlPattern = /^[A-Za-z0-9_-]+$/u;
 const digestPattern = /^[0-9a-f]{64}$/u;
 const opaqueIdentifierPattern = /^[A-Za-z0-9_-]{8,96}$/u;
+const deviceKeyFingerprintPattern = /^[0-9a-f]{4}(?:-[0-9a-f]{4}){7}$/u;
+
+// Eight lower-case hex groups of four, hyphen separated: the rendered form of
+// `deviceKeyFingerprint`, kept here so parsers never import the crypto module.
+export function isDeviceKeyFingerprint(value: unknown): value is string {
+  return typeof value === "string" && deviceKeyFingerprintPattern.test(value);
+}
 
 export function isSafePositiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && typeof value === "number" && value > 0;
@@ -145,6 +156,8 @@ export function parseCloudDeviceList(value: unknown): CloudDeviceList | null {
     if (!isRecord(candidate)) return null;
     const required = [
       "current",
+      "deviceClass",
+      "fingerprint",
       "keyVersion",
       "label",
       "labelSource",
@@ -158,6 +171,8 @@ export function parseCloudDeviceList(value: unknown): CloudDeviceList | null {
     if (
       !hasExactKeys(candidate, keys)
       || typeof candidate.current !== "boolean"
+      || (candidate.deviceClass !== "daemon" && candidate.deviceClass !== "browser")
+      || !isDeviceKeyFingerprint(candidate.fingerprint)
       || !isSafePositiveInteger(candidate.keyVersion)
       || typeof candidate.label !== "string"
       || candidate.label.length < 1
@@ -187,6 +202,8 @@ export function parseCloudDeviceList(value: unknown): CloudDeviceList | null {
         ? { activatedAt: candidate.activatedAt }
         : {}),
       current: candidate.current,
+      deviceClass: candidate.deviceClass,
+      fingerprint: candidate.fingerprint,
       keyVersion: candidate.keyVersion,
       label: candidate.label,
       labelSource: candidate.labelSource,

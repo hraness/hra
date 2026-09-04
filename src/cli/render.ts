@@ -1513,6 +1513,8 @@ const renderDeviceList = (data: unknown): string => {
     `Device ${String(index + 1)}${device.current ? " (current)" : ""}`,
     `  Label: ${terminalSafeDeviceLabel(device.label)}${device.labelSource === "fallback" ? " [fallback]" : ""}`,
     `  ID: ${device.publicId}`,
+    `  Class: ${device.deviceClass}`,
+    `  Fingerprint: ${device.fingerprint}`,
     `  Status: ${device.status}`,
     `  Presence: ${device.online
       ? "online"

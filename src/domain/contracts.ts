@@ -47,6 +47,10 @@ const requiredUuidV7IdempotencyKeySchema = z.string().regex(
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
   "Idempotency key must be a UUIDv7.",
 );
+const deviceKeyFingerprintSchema = z.string().regex(
+  /^[0-9a-f]{4}(?:-[0-9a-f]{4}){7}$/u,
+  "Device fingerprint must be eight lower-case hex groups of four separated by hyphens.",
+);
 const projectPathSchema = z.string().min(1).max(4096).refine(
   (value) => isAbsolute(value) && normalize(value) === value,
   "Project path must be absolute and normalized.",
@@ -318,7 +322,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     acknowledgeNoKeyHolders: z.literal(true),
     kind: z.literal("device.key-loss"),
   }).strict(),
-  z.object({ kind: z.literal("device.approve"), device: selectorSchema, idempotencyKey: requiredUuidV7IdempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("device.approve"), device: selectorSchema, fingerprint: deviceKeyFingerprintSchema, idempotencyKey: requiredUuidV7IdempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("device.revoke"), device: selectorSchema, idempotencyKey: requiredUuidV7IdempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("sync.status") }).strict(),
   z.object({ kind: z.literal("sync.now") }).strict(),

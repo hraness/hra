@@ -15,6 +15,7 @@ import {
 } from "../src/cloud/usage";
 import {
   rejectAuthority,
+  requireDaemonDevice,
   requireDeviceAuthority,
 } from "./authority";
 import {
@@ -88,7 +89,7 @@ export const upsertAccount = mutation({
     sourceGeneration: v.number(),
   },
   handler: async (ctx, args): Promise<AccountSummary> => {
-    const authority = await requireDeviceAuthority(ctx);
+    const authority = await requireDaemonDevice(ctx);
     if (
       !isOpaqueIdentifier(args.publicId)
       || !isDigest(args.matchKey)
@@ -306,7 +307,7 @@ export const upsertSnapshot = mutation({
     sourceRevision: v.number(),
   },
   handler: async (ctx, args) => {
-    const authority = await requireDeviceAuthority(ctx);
+    const authority = await requireDaemonDevice(ctx);
     const now = Date.now();
     if (
       !isOpaqueIdentifier(args.accountPublicId)

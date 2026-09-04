@@ -33,7 +33,12 @@ describe("domain laws", () => {
     const capability = "a".repeat(43);
     const requestId = "00000000-0000-4000-8000-000000000001";
     const idempotencyKey = "018bcfe5-6800-7000-8000-000000000001";
-    const command = { device: "device_target", idempotencyKey, kind: "device.approve" };
+    const command = {
+      device: "device_target",
+      fingerprint: "0000-1111-2222-3333-4444-5555-6666-7777",
+      idempotencyKey,
+      kind: "device.approve",
+    };
 
     expect(localCommandSchema.safeParse(command).success).toBe(true);
     expect(commandEnvelopeSchema.safeParse({
@@ -46,7 +51,7 @@ describe("domain laws", () => {
     expect(commandEnvelopeSchema.safeParse({ capability, command, requestId, version: 1 }).success)
       .toBe(false);
     for (const invalidCommand of [
-      { device: "device_target", kind: "device.approve" },
+      { device: "device_target", fingerprint: "0000-1111-2222-3333-4444-5555-6666-7777", kind: "device.approve" },
       {
         device: "device_target",
         idempotencyKey: "00000000-0000-4000-8000-000000000001",

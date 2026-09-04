@@ -714,13 +714,13 @@ export const publicContent: PublicContent = {
           text("After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority."),
         ),
         paragraph(
-          text("On an already active machine, list devices and approve the pending device by its exact ID or unique prefix:"),
+          text("On an already active machine, list devices and approve the pending device by its exact ID or unique prefix. The listing shows each device's class, daemon or browser, and the fingerprint of its two public keys. Approval requires that exact fingerprint, so the machine you approve is the one whose fingerprint you read:"),
         ),
         {
           kind: "commands",
           commands: [
             "hra device list",
-            "hra device approve <pending-device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
+            "hra device approve <pending-device-id-or-prefix> --fingerprint <value> [--idempotency-key <current-uuidv7>]",
           ],
         },
         paragraph(
@@ -1086,7 +1086,8 @@ export const publicContent: PublicContent = {
             "hra auth delete --acknowledge-erasure",
             "hra device list|pair",
             "hra device key-loss --acknowledge-no-key-holders",
-            "hra device approve|revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
+            "hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <current-uuidv7>]",
+            "hra device revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
             "hra account add <label>",
             "hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]",
             "hra account login-cancel <profile>",

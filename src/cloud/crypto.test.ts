@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  canonicalDevicePublicKeyJson,
   decryptBytes,
+  deviceKeyFingerprint,
   encodeBase64Url,
   encryptBytes,
   exportDevicePrivateKey,
@@ -109,6 +111,32 @@ describe("cloud cryptography", () => {
     const rotated = await encryptBytes(plaintext, key, 2, aad, budget);
     expect(rotated.keyVersion).toBe(2);
     expect(budget.observe(await gcmMessageBudgetKey(key, 2))).toBe(1);
+  });
+
+  test("renders one stable device key fingerprint from both public keys", async () => {
+    const signing = { crv: "P-256", kty: "EC", x: "A".repeat(43), y: "B".repeat(43) } as const;
+    const wrapping = { crv: "P-256", kty: "EC", x: "C".repeat(43), y: "D".repeat(43) } as const;
+    const expected = "8144-52ea-9db6-227b-786f-8c8c-eec0-6435";
+    expect(await deviceKeyFingerprint(signing, wrapping)).toBe(expected);
+    // Key order and JSON member order never change the rendered value.
+    expect(await deviceKeyFingerprint(
+      JSON.stringify({ kty: "EC", y: "B".repeat(43), crv: "P-256", x: "A".repeat(43) }),
+      canonicalDevicePublicKeyJson(wrapping),
+    )).toBe(expected);
+    expect(await deviceKeyFingerprint(wrapping, signing)).not.toBe(expected);
+    expect(expected).toMatch(/^[0-9a-f]{4}(?:-[0-9a-f]{4}){7}$/u);
+
+    const generated = await generateDeviceSigningKeyPair();
+    const wrappingPair = await generateDeviceWrappingKeyPair();
+    const exported = await deviceKeyFingerprint(
+      await exportDevicePublicKey(generated.publicKey),
+      await exportDevicePublicKey(wrappingPair.publicKey),
+    );
+    expect(exported).toMatch(/^[0-9a-f]{4}(?:-[0-9a-f]{4}){7}$/u);
+    await expectPromiseToReject(
+      deviceKeyFingerprint("not-a-key", canonicalDevicePublicKeyJson(wrapping)),
+      "Unsupported device public key",
+    );
   });
 
   test("counts every encryption in the process-wide budget and bounds tracked keys", async () => {

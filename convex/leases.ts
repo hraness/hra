@@ -15,6 +15,7 @@ import {
 } from "../src/cloud/leases";
 import {
   rejectAuthority,
+  requireDaemonDevice,
   requireDeviceAuthority,
   requireOwnedSession,
 } from "./authority";
@@ -77,7 +78,7 @@ export const acquire = mutation({
     sessionPublicId: v.string(),
   },
   handler: async (ctx, args) => {
-    const authority = await requireDeviceAuthority(ctx);
+    const authority = await requireDaemonDevice(ctx);
     if (
       !isOpaqueIdentifier(args.bootId)
       || !isOpaqueIdentifier(args.sessionPublicId)
@@ -160,7 +161,7 @@ export const heartbeat = mutation({
     sessionPublicId: v.string(),
   },
   handler: async (ctx, args) => {
-    const current = await requireDeviceAuthority(ctx);
+    const current = await requireDaemonDevice(ctx);
     if (
       !isOpaqueIdentifier(args.sessionPublicId)
       || !isDigest(args.fingerprint)

@@ -12,6 +12,7 @@ import {
 } from "../src/cloud/contracts";
 import {
   rejectAuthority,
+  requireDaemonDevice,
   requireDeviceAuthority,
 } from "./authority";
 import {
@@ -219,7 +220,7 @@ export const create = mutation({
     requestDigest: v.string(),
   },
   handler: async (ctx, args): Promise<SessionSummary> => {
-    const authority = await requireDeviceAuthority(ctx);
+    const authority = await requireDaemonDevice(ctx);
     if (
       !isOpaqueIdentifier(args.publicId)
       || (args.metadata !== undefined
@@ -524,7 +525,7 @@ export const beginCompactEpoch = mutation({
     sessionPublicId: v.string(),
   },
   handler: async (ctx, args) => {
-    const current = await requireDeviceAuthority(ctx);
+    const current = await requireDaemonDevice(ctx);
     if (
       !isUuidV7(args.epochPublicId)
       || !isSafeNonNegativeInteger(args.expectedCompactStreamEpoch)
@@ -734,7 +735,7 @@ export const appendChunk = mutation({
     stream: syncStream,
   },
   handler: async (ctx, args) => {
-    const current = await requireDeviceAuthority(ctx);
+    const current = await requireDaemonDevice(ctx);
     if (
       !isOpaqueIdentifier(args.sessionPublicId)
       || !isSafeNonNegativeInteger(args.expectedHeadSequence)
@@ -858,7 +859,7 @@ export const updateMetadata = mutation({
     sessionPublicId: v.string(),
   },
   handler: async (ctx, args): Promise<SessionSummary> => {
-    const authority = await requireDeviceAuthority(ctx);
+    const authority = await requireDaemonDevice(ctx);
     if (
       !isOpaqueIdentifier(args.sessionPublicId)
       || !isSafeNonNegativeInteger(args.expectedRevision)
@@ -926,7 +927,7 @@ export const updateState = mutation({
     state: v.union(v.literal("active"), v.literal("idle"), v.literal("terminal")),
   },
   handler: async (ctx, args) => {
-    const current = await requireDeviceAuthority(ctx);
+    const current = await requireDaemonDevice(ctx);
     if (!isOpaqueIdentifier(args.sessionPublicId)) rejectAuthority();
     const sessions = await ctx.db
       .query("sessionHeads")
