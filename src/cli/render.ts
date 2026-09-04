@@ -1099,7 +1099,8 @@ const renderSessionList = (
     : `${localHeader.join("\n")}\n\n${tableListing}`;
   const nextCursor = opaqueCursor(root?.nextCursor);
   if (nextCursor === undefined || !accountId.success) return listing;
-  return `${listing}\n\nContinue: hra session list --account ${accountId.data} --limit ${String(command.limit)} --cursor ${nextCursor}`;
+  const archived = command.archived ? " --archived" : "";
+  return `${listing}\n\nContinue: hra session list --account ${accountId.data}${archived} --limit ${String(command.limit)} --cursor ${nextCursor}`;
 };
 
 const renderSessionTaskList = (data: unknown): string => {
@@ -1513,6 +1514,8 @@ const renderDeviceList = (data: unknown): string => {
     `Device ${String(index + 1)}${device.current ? " (current)" : ""}`,
     `  Label: ${terminalSafeDeviceLabel(device.label)}${device.labelSource === "fallback" ? " [fallback]" : ""}`,
     `  ID: ${device.publicId}`,
+    `  Class: ${device.deviceClass}`,
+    `  Fingerprint: ${device.fingerprint}`,
     `  Status: ${device.status}`,
     `  Presence: ${device.online
       ? "online"
@@ -1985,6 +1988,19 @@ const renderProjectionStatus = (root: Record<string, unknown>): string[] => {
   return rows;
 };
 
+const renderSyncCadence = (root: Record<string, unknown>): string[] => {
+  const cadence = object(root.syncCadence);
+  if (cadence === null) return [];
+  const intervalMs = cadence.intervalMs;
+  if (typeof intervalMs !== "number" || !Number.isSafeInteger(intervalMs) || intervalMs < 0) {
+    return [];
+  }
+  const seconds = Math.round(intervalMs / 100) / 10;
+  const wake = object(cadence.pushWake);
+  const wakeState = wake === null ? "unavailable" : humanState(wake.state);
+  return [`Sync cadence: every ${String(seconds)}s (${humanState(cadence.reason)}), push wake ${wakeState}`];
+};
+
 const projectionRecoveryIsUnsettled = (root: Record<string, unknown>): boolean => {
   const recovery = object(root.projectionRecovery);
   if (!Array.isArray(recovery?.recoveries)) return false;
@@ -2131,6 +2147,7 @@ const renderSyncStatus = (data: unknown): string => {
   if (deletion !== null) rows.push(...renderDeletion(deletion));
   if (Object.hasOwn(root, "lastSync")) rows.push(renderLastSync(root.lastSync));
   rows.push(...renderProjectionStatus(root));
+  rows.push(...renderSyncCadence(root));
   if (typeof root.diagnostic === "string") rows.push(`Detail: ${safeDiagnostic(root.diagnostic)}`);
   const projectionNext = projectionRecoveryUnsettled
     ? projectionRecoveryCommand ?? "hra doctor"
@@ -2256,11 +2273,14 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     const report = value as {
       budgets?: { consecutive: number; lastDay: number; lastHour: number };
       counts?: { accepted: number; refused: number };
+      gateway?: unknown;
       mode?: unknown;
       recent?: unknown[];
       source?: unknown;
     };
     const rows = [`Approval mode: ${line(report.mode)} (${line(report.source)})`];
+    // Only the configured/not-configured fact is ever shown for the key.
+    if (report.gateway !== undefined) rows.push(`Gateway: ${line(report.gateway)}`);
     if (report.counts !== undefined) {
       rows.push(`Autoresponses: ${String(report.counts.accepted)} accepted, ${String(report.counts.refused)} escalated`);
     }
@@ -2268,9 +2288,15 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       rows.push(`Budgets: ${String(report.budgets.consecutive)} consecutive, ${String(report.budgets.lastHour)} this hour, ${String(report.budgets.lastDay)} today`);
     }
     if (Array.isArray(report.recent) && report.recent.length > 0) {
-      rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "kind", "approvalClass", "decision", "outcome", "sessionId"]));
+      rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "path", "kind", "rule", "decision", "outcome", "model", "sessionId"]));
     }
     output.writeStdout(`${rows.join("\n")}\n`);
+  } else if (command.kind === "autorespond.gateway-set") {
+    output.writeStdout("Autorespond gateway key configured.\n");
+  } else if (command.kind === "autorespond.gateway-clear") {
+    output.writeStdout(value.cleared === true
+      ? "Autorespond gateway key cleared.\n"
+      : "No autorespond gateway key was configured.\n");
   } else if (command.kind === "session.events") {
     const page = sessionEventPage(data);
     output.writeStdout(`${page === null ? "Event page data is unavailable." : renderSessionEventPageHuman(page)}\n`);

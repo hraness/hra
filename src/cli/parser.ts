@@ -121,7 +121,19 @@ export type CliInvocation =
   | WorkEventFollowCliInvocation
   | InteractionRequiredInvocation
   | ProjectionRecoveryCliInvocation
+  | GatewayKeySetCliInvocation
   | { kind: "command"; command: LocalCommand; json: boolean };
+
+/*
+ * `hra autorespond gateway set` never accepts the key as an argument. The
+ * parser only names the descriptor to read; the value is read once, sent to
+ * the daemon, and never rendered.
+ */
+export type GatewayKeySetCliInvocation = Readonly<{
+  input: ProtectedInputSource;
+  json: boolean;
+  kind: "autorespond.gateway-set";
+}>;
 
 export type RemoteCliCommand =
   | Readonly<{ kind: "remote.list"; limit: number }>
@@ -164,7 +176,7 @@ Usage:
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session rename|recover|abandon|note|preset|fast|project
+  hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
   hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
   hra remote list|show|command|send|queue|steer|stop|preset|fast
@@ -274,17 +286,20 @@ Examples:
 Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
 Usage:
-  hra session list [--account <profile>] [--limit <1..100>] [--cursor <cursor>]
+  hra session list [--account <profile>] [--archived] [--limit <1..100>] [--cursor <cursor>]
   hra session show <session> [--detail]
   hra session status <session> [--json]
   hra session state <session> [--json]
   hra autorespond on|workspace|off|default|status [--session <session>] [--json]
+  hra autorespond gateway set [--from-fd <fd>] [--json]
+  hra autorespond gateway clear [--json]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
   hra session send|queue|steer <session> <message>
   hra session stop|recover|abandon <session>
+  hra session archive|unarchive <session>
   hra session rename <session> <name>
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
@@ -380,12 +395,13 @@ Usage:
   hra device list
   hra device pair
   hra device key-loss --acknowledge-no-key-holders
-  hra device approve|revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]
+  hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <uuidv7>] [--json]
+  hra device revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]
 
 Examples:
   hra device pair
   hra device key-loss --acknowledge-no-key-holders
-  hra device approve <pending-device-prefix>`,
+  hra device approve <pending-device-prefix> --fingerprint <value>`,
   sync: `HRA sync
 
 Usage:
@@ -520,6 +536,8 @@ const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
 const literal = (value: string): string => `${literalPrefix}${value}`;
 const decode = (value: string): string => value.startsWith(literalPrefix) ? value.slice(literalPrefix.length) : value;
 const isOption = (value: string): boolean => !value.startsWith(literalPrefix) && value.startsWith("--");
+
+const deviceKeyFingerprintPattern = /^[0-9a-f]{4}(?:-[0-9a-f]{4}){7}$/u;
 
 const isCurrentUuidV7 = (value: string, now = Date.now()): boolean => {
   if (!isUuidV7(value) || !Number.isSafeInteger(now) || now < 0) return false;
@@ -706,6 +724,7 @@ export const deviceMutationReplayCommand = (
 ): string => [
   `hra device ${command.kind === "device.approve" ? "approve" : "revoke"}`,
   shellArgument(command.device),
+  ...(command.kind === "device.approve" ? ["--fingerprint", command.fingerprint] : []),
   "--idempotency-key",
   command.idempotencyKey,
   ...(json ? ["--json"] : []),
@@ -1004,10 +1023,11 @@ const parseSession = (
   switch (action) {
     case "list": {
       const account = option(cursor, "--account");
+      const archived = flag(cursor, "--archived");
       const limit = boundedDecimal(option(cursor, "--limit"), "session limit", 1, 100, 50);
       const sessionCursor = option(cursor, "--cursor");
       finish(cursor);
-      return command({ kind: "session.list", account, limit, cursor: sessionCursor });
+      return command({ kind: "session.list", account, archived, limit, cursor: sessionCursor });
     }
     case "show": { const detail = flag(cursor, "--detail"); const session = take(cursor, "session"); finish(cursor); return { kind: "session.show", session, detail }; }
     case "status": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.status", session }; }
@@ -1069,6 +1089,8 @@ const parseSession = (
     case "steer": { const session = take(cursor, "session"); return command({ kind: "session.steer", session, message: remainder(cursor, "message") }); }
     case "stop": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.stop", session }; }
     case "rename": { const session = take(cursor, "session"); return command({ kind: "session.rename", session, name: remainder(cursor, "name") }); }
+    case "archive": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.archive", session, archived: true }; }
+    case "unarchive": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.archive", session, archived: false }; }
     case "recover": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.recover", session }; }
     case "abandon": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.abandon", session }; }
     case "note": return parseSessionNote(cursor);
@@ -1505,6 +1527,31 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   }
   if (group === "autorespond") {
     const action = take(cursor, "autorespond action");
+    if (action === "gateway") {
+      const gatewayAction = take(cursor, "autorespond gateway action");
+      const descriptor = option(cursor, "--from-fd");
+      finish(cursor);
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by autorespond.");
+      }
+      if (gatewayAction === "clear") {
+        if (descriptor !== undefined) {
+          throw new CliUsageError("--from-fd is not supported by `autorespond gateway clear`.");
+        }
+        return { kind: "command", command: { kind: "autorespond.gateway-clear" }, json };
+      }
+      if (gatewayAction !== "set") {
+        throw new CliUsageError("Unknown autorespond gateway action. Use `set` or `clear`.");
+      }
+      if (descriptor === undefined) {
+        return { input: { kind: "stdin" }, json, kind: "autorespond.gateway-set" };
+      }
+      const fd = boundedDecimal(descriptor, "gateway key file descriptor", 0, 1_048_575);
+      if (fd === 1 || fd === 2) {
+        throw new CliUsageError("The gateway key cannot be read from stdout or stderr.");
+      }
+      return { input: { fd, kind: "fd" }, json, kind: "autorespond.gateway-set" };
+    }
     const session = option(cursor, "--session");
     finish(cursor);
     if (idempotencyKey !== undefined) throw new CliUsageError("--idempotency-key is not supported by autorespond.");
@@ -1521,7 +1568,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
             ? null
             : undefined;
     if (mode === undefined) {
-      throw new CliUsageError("Unknown autorespond action. Use `on`, `workspace`, `off`, `default`, or `status`.");
+      throw new CliUsageError("Unknown autorespond action. Use `on`, `workspace`, `off`, `default`, `status`, or `gateway`.");
     }
     if (mode === null && session === undefined) {
       throw new CliUsageError("`autorespond default` clears a session override; pass --session <session>.");
@@ -1639,12 +1686,23 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       };
     } else if (action === "approve" || action === "revoke") {
       const device = take(cursor, "device");
+      // Approval binds to the key fingerprint the operator was shown, so an
+      // enrolling device cannot substitute another key pair behind its ID.
+      const fingerprint = action === "approve" ? option(cursor, "--fingerprint") : undefined;
       finish(cursor);
+      if (action === "approve" && fingerprint === undefined) {
+        throw new CliUsageError("Device approval requires --fingerprint <value> from hra device list.");
+      }
+      if (fingerprint !== undefined && !deviceKeyFingerprintPattern.test(fingerprint)) {
+        throw new CliUsageError("Device approval --fingerprint must be eight lower-case hex groups of four separated by hyphens.");
+      }
       const deviceMutationKey = idempotencyKey ?? createCloudUuidV7();
       if (!isCurrentUuidV7(deviceMutationKey)) {
         throw new CliUsageError("Device mutation --idempotency-key must be a current UUIDv7.");
       }
-      parsed = { device, idempotencyKey: deviceMutationKey, kind: `device.${action}` };
+      parsed = action === "approve" && fingerprint !== undefined
+        ? { device, fingerprint, idempotencyKey: deviceMutationKey, kind: "device.approve" }
+        : { device, idempotencyKey: deviceMutationKey, kind: "device.revoke" };
     } else {
       throw new CliUsageError("Unknown device action. Run `hra device --help` for supported actions.");
     }

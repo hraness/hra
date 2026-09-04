@@ -87,7 +87,14 @@ import {
   PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES,
 } from "./domain/interactions";
 import { sessionStatusSchema } from "./domain/observation";
-import { profileIdSchema, selectByIdOrLabel, sessionIdSchema } from "./domain/values";
+import {
+  GATEWAY_KEY_MAX_BYTES,
+  GATEWAY_KEY_MIN_BYTES,
+  gatewayKeySchema,
+  profileIdSchema,
+  selectByIdOrLabel,
+  sessionIdSchema,
+} from "./domain/values";
 import {
   WORK_PROTOCOL_REQUEST_MAX_BYTES,
   WORK_PROTOCOL,
@@ -143,6 +150,8 @@ import { initializeStatePaths, resolveStatePaths, type StatePaths } from "./stor
 import { FactsMemoryControlStore } from "./storage/facts-memory-control";
 import { LocalFactsMemoryBroker } from "./storage/local-facts-memory-broker";
 import { resolveUsableCanonicalProjectDirectory } from "./storage/project-directory";
+import { CustodyGatewayKeyStore } from "./storage/gateway-key-custody";
+import { AiGatewayProseResponder } from "./daemon/prose-responder";
 import type { GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
 import { WorkCapabilityCodec } from "./storage/work-capability";
@@ -1528,9 +1537,15 @@ class DiagnosedUnavailableCloudControl extends UnavailableCloudControl {
   override deleteAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   override listDevices(): Promise<never> { return Promise.reject(this.#unavailable()); }
   override pairDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  override approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<never> {
+  override approveDevice(
+    device: string,
+    idempotencyKey: string,
+    fingerprint: string,
+    signal: AbortSignal,
+  ): Promise<never> {
     void device;
     void idempotencyKey;
+    void fingerprint;
     void signal;
     return Promise.reject(this.#unavailable());
   }
@@ -2898,6 +2913,10 @@ export async function runDaemon(
     store = new StateStore(paths);
     const activeStore = store;
     const secretCustody = installation.createSecretCustody();
+    // Prose autorespond stays inert until a gateway key is put into local
+    // secret custody; the responder reads the key per call and never holds it,
+    // and the hosted `set_gateway_key` command writes into the same custody.
+    const gatewayKeys = new CustodyGatewayKeyStore(secretCustody);
     const allowCursorAuthorityInitialization =
       activeStore.canInitializeDaemonCursorAuthority();
     const eventCursors = await resolveSessionEventCursorCodec(secretCustody, {
@@ -3026,6 +3045,10 @@ export async function runDaemon(
             if (current === undefined) throw new Error("The local command service is not ready.");
             return await current.executeRemote(command, expected, { signal: options.signal });
           },
+          gatewayKeyCustody: {
+            hasKey: async () => await gatewayKeys.isConfigured(),
+            setKey: async (key) => { await gatewayKeys.set(key); },
+          },
           paths,
           store: activeStore,
           cloudIdentityNamespace,
@@ -3049,12 +3072,13 @@ export async function runDaemon(
           );
         }
         const cloudBridge = candidateBridge;
+        const candidateLifecycle = createCloudDaemonLifecycle({ bridge: cloudBridge });
         const candidateCloud = new BridgedCloudControl(
           localCloudControl,
           cloudBridge,
           candidateAdapter,
+          candidateLifecycle,
         );
-        const candidateLifecycle = createCloudDaemonLifecycle({ bridge: cloudBridge });
         cloudAdapter = candidateAdapter;
         cloud = candidateCloud;
         cloudLifecycle = candidateLifecycle;
@@ -3115,6 +3139,10 @@ export async function runDaemon(
       usageHistoryCursors,
       workCapabilities,
       factsMemory,
+      gatewayKeys,
+      proseResponder: new AiGatewayProseResponder({
+        readKey: async () => await gatewayKeys.read(),
+      }),
       ...(desktop === undefined ? {} : { desktop }),
       requestStop,
     });
@@ -3351,6 +3379,70 @@ const readInvocationProtectedDocument = async (
   return await withProtectedTerminalLifecycle(async (signal) =>
     await readProtectedDocument(source, output, signal, maximumBytes));
 };
+
+/*
+ * The AI Gateway key is one line, not a JSON document, so it has its own
+ * bounded reader. It is read from a descriptor the caller redirected (or typed
+ * with echo off), handed to the daemon once, and zeroed here; it is never an
+ * argument, never echoed, and never part of any rendered result.
+ */
+const gatewayKeyMaximumBytes = 1_024;
+
+const readGatewayKeyValue = async (
+  source: ProtectedInputSource,
+  output: Output,
+  input: CliMainInput,
+): Promise<string> => {
+  const fd = protectedInputDescriptor(source);
+  const terminal = (input.isTerminalDescriptor ?? isatty)(fd);
+  let bytes: Buffer;
+  if (terminal) {
+    if (fd !== 0) {
+      throw new CliUsageError("A typed gateway key is supported only through stdin.");
+    }
+    if (!input.interactive || !process.stderr.isTTY) {
+      throw new CliUsageError(
+        "Typing the gateway key requires an interactive stdin and a visible terminal on stderr. Redirect it from a non-terminal stdin or file descriptor instead.",
+      );
+    }
+    bytes = await withProtectedTerminalLifecycle(async (signal) =>
+      await readHiddenProtectedLine(output, signal));
+  } else {
+    try {
+      bytes = readBoundedDescriptor(fd, gatewayKeyMaximumBytes);
+    } catch (error: unknown) {
+      if (error instanceof CliUsageError) throw error;
+      throw new CliUsageError("The gateway key could not be read from the selected descriptor.");
+    }
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
+  } catch {
+    throw new CliUsageError("The gateway key must be valid UTF-8 text.");
+  } finally {
+    bytes.fill(0);
+  }
+};
+
+async function executeGatewayKeySet(
+  invocation: Extract<CliInvocation, { kind: "autorespond.gateway-set" }>,
+  output: Output,
+  input: CliMainInput,
+): Promise<number> {
+  const key = await readGatewayKeyValue(invocation.input, output, input);
+  const parsed = gatewayKeySchema.safeParse(key);
+  if (!parsed.success) {
+    throw new CliUsageError(
+      "The gateway key must be one line of printable ASCII between "
+      + `${String(GATEWAY_KEY_MIN_BYTES)} and ${String(GATEWAY_KEY_MAX_BYTES)} characters.`,
+    );
+  }
+  const command = { key: parsed.data, kind: "autorespond.gateway-set" } as const;
+  const response = await commandCaller(input)(command);
+  if (!response.ok) return renderFailure(response.error, invocation.json, output);
+  renderSuccess(command, response.data, invocation.json, output);
+  return 0;
+}
 
 async function executeProtectedInteraction(
   invocation: Extract<CliInvocation, { kind: "interaction.resolve-protected" }>,
@@ -4819,6 +4911,9 @@ async function executeInvocation(
   }
   if (invocation.kind === "auth.login-protected") {
     return await executeProtectedAuthLogin(invocation, output, input);
+  }
+  if (invocation.kind === "autorespond.gateway-set") {
+    return await executeGatewayKeySet(invocation, output, input);
   }
   if (invocation.kind === "work.apply-input") {
     return await executeWorkApply(invocation, output, input);

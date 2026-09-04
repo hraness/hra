@@ -64,8 +64,11 @@ const bootstrapReadSchema = z.object({
   ) context.addIssue({ code: "custom", message: "bootstrap_status_incoherent" });
 });
 
+// A deployment that predates the new-identity control reports no value, which
+// means invite_only exactly as an absent stored value does.
 const admissionSchema = z.object({
   generation: z.number().int().min(0).safe(),
+  newIdentityAdmissions: z.enum(["invite_only", "open"]).optional(),
   state: z.enum(["frozen", "open"]),
   updatedAt: z.number().finite().nonnegative(),
 }).strict();
@@ -98,7 +101,11 @@ type ReleaseAttestationState = Readonly<{ state: "current" | "other" | "unbound"
 export type HostedStatusResult = Readonly<{
   admission: Readonly<
     | { state: "inconsistent" | "uninitialized" }
-    | { generation: number; state: "frozen" | "open" }
+    | {
+        generation: number;
+        newIdentityAdmissions: "invite_only" | "open";
+        state: "frozen" | "open";
+      }
   >;
   bootstrap: Readonly<{
     occupiedTableCount: number;
@@ -353,6 +360,7 @@ export async function readHostedStatus(options: HostedStatusOptions): Promise<Ho
     );
     admission = {
       generation: parsedAdmission.generation,
+      newIdentityAdmissions: parsedAdmission.newIdentityAdmissions ?? "invite_only",
       state: parsedAdmission.state,
     };
   } else {

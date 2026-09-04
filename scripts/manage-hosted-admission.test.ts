@@ -73,6 +73,138 @@ describe("hosted auth admission operator", () => {
     ])).toMatchObject({ action: { expectedGeneration: 1, kind: "resume", mutationId } });
   });
 
+  test("parses new-identity admission changes and requires the open acknowledgement", () => {
+    expect(parseAdmissionArguments([
+      "new-identities",
+      "--new-identities", "invite_only",
+      "--expected-generation", "2",
+      "--mutation-id", mutationId,
+      ...targetArguments,
+    ])).toEqual({
+      action: {
+        expectedGeneration: 2,
+        kind: "new-identities",
+        mutationId,
+        newIdentities: "invite_only",
+      },
+      target,
+    });
+    expect(parseAdmissionArguments([
+      "new-identities",
+      "--new-identities", "open",
+      "--expected-generation", "2",
+      "--mutation-id", mutationId,
+      "--acknowledge-open-signup",
+      ...targetArguments,
+    ])).toMatchObject({ action: { kind: "new-identities", newIdentities: "open" } });
+
+    for (const invalid of [
+      // Opening sign-up without the explicit acknowledgement.
+      ["new-identities", "--new-identities", "open", "--expected-generation", "2", "--mutation-id", mutationId],
+      // An acknowledgement without the open value.
+      ["new-identities", "--new-identities", "invite_only", "--expected-generation", "2", "--mutation-id", mutationId, "--acknowledge-open-signup"],
+      // A value outside the closed union.
+      ["new-identities", "--new-identities", "sometimes", "--expected-generation", "2", "--mutation-id", mutationId],
+      // The action without its required value.
+      ["new-identities", "--expected-generation", "2", "--mutation-id", mutationId],
+      // The value on an action that does not take it.
+      ["freeze", "--new-identities", "invite_only", "--expected-generation", "2", "--mutation-id", mutationId],
+    ]) {
+      expect(() => parseAdmissionArguments([...invalid, ...targetArguments]))
+        .toThrow("usage_invalid");
+    }
+  });
+
+  test("changes only new-identity admission under the shared generation fence", async () => {
+    const requests: CommandRequest[] = [];
+    const results = [
+      { exitCode: 0, stderr: "", stdout: '{"generation":2,"state":"open","updatedAt":1}' },
+      { exitCode: 0, stderr: "", stdout: '{"changed":true,"generation":3,"newIdentityAdmissions":"open","replay":false,"state":"open","updatedAt":2}' },
+      { exitCode: 0, stderr: "", stdout: '{"generation":3,"newIdentityAdmissions":"open","state":"open","updatedAt":2}' },
+    ];
+    const runner: CommandRunner = async (request) => {
+      requests.push(request);
+      return results.shift()!;
+    };
+    expect(await manageHostedAdmission({
+      action: {
+        expectedGeneration: 2,
+        kind: "new-identities",
+        mutationId,
+        newIdentities: "open",
+      },
+      runner,
+      target,
+      verifyTarget: async () => undefined,
+    })).toEqual({
+      generation: 3,
+      newIdentityAdmissions: "open",
+      state: "open",
+      updatedAt: 2,
+    });
+    expect(requests[1]?.arguments).toContain(JSON.stringify({
+      expectedGeneration: 2,
+      mutationId,
+      newIdentityAdmissions: "open",
+      state: "open",
+    }));
+  });
+
+  test("refuses a new-identity change that the deployment already has", async () => {
+    await expect(manageHostedAdmission({
+      action: {
+        expectedGeneration: 2,
+        kind: "new-identities",
+        mutationId,
+        newIdentities: "open",
+      },
+      runner: async () => ({
+        exitCode: 0,
+        stderr: "",
+        stdout: '{"generation":2,"newIdentityAdmissions":"open","state":"open","updatedAt":1}',
+      }),
+      target,
+      verifyTarget: async () => undefined,
+    })).rejects.toThrow("transition_refused");
+  });
+
+  test("refuses a transition whose readback keeps the previous new-identity value", async () => {
+    const results = [
+      { exitCode: 0, stderr: "", stdout: '{"generation":2,"state":"open","updatedAt":1}' },
+      { exitCode: 0, stderr: "", stdout: '{"changed":true,"generation":3,"newIdentityAdmissions":"invite_only","replay":false,"state":"open","updatedAt":2}' },
+    ];
+    await expect(manageHostedAdmission({
+      action: {
+        expectedGeneration: 2,
+        kind: "new-identities",
+        mutationId,
+        newIdentities: "open",
+      },
+      runner: async () => results.shift()!,
+      target,
+      verifyTarget: async () => undefined,
+    })).rejects.toThrow("transition_refused");
+  });
+
+  test("replays a lost new-identity response from durable state", async () => {
+    const results = [
+      { exitCode: 0, stderr: "", stdout: '{"generation":3,"newIdentityAdmissions":"open","state":"open","updatedAt":2}' },
+      { exitCode: 0, stderr: "", stdout: '{"changed":true,"generation":3,"newIdentityAdmissions":"open","replay":true,"state":"open","updatedAt":2}' },
+      { exitCode: 0, stderr: "", stdout: '{"generation":3,"newIdentityAdmissions":"open","state":"open","updatedAt":2}' },
+    ];
+    expect(await manageHostedAdmission({
+      action: {
+        expectedGeneration: 2,
+        kind: "new-identities",
+        mutationId,
+        newIdentities: "open",
+      },
+      runner: async () => results.shift()!,
+      target,
+      verifyTarget: async () => undefined,
+    })).toMatchObject({ generation: 3, newIdentityAdmissions: "open" });
+  });
+
   test("freezes with exact target checks and strict postflight", async () => {
     const requests: CommandRequest[] = [];
     const results = [
@@ -199,7 +331,9 @@ describe("hosted auth admission operator", () => {
       stdout: outputWriter(stdout),
       verifyTarget: async () => undefined,
     })).toBe(0);
-    expect(stdout).toEqual(['{"generation":4,"state":"frozen","version":1}\n']);
+    expect(stdout).toEqual([
+      '{"generation":4,"newIdentityAdmissions":"invite_only","state":"frozen","version":1}\n',
+    ]);
     expect(stderr).toEqual([]);
 
     stdout.length = 0;

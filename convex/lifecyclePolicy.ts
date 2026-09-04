@@ -54,6 +54,7 @@ export const HOSTED_TABLE_LIFECYCLE = {
   deviceKeyEnvelopes: { owner: "user", quota: "custody", retention: "active", deletionOrder: 60, disposition: "erase" },
   recoveryEnvelopes: { owner: "user", quota: "custody", retention: "active", deletionOrder: 60, disposition: "erase" },
   devicePresence: { owner: "user", quota: "device", retention: "lease_expiry", deletionOrder: 60, disposition: "erase" },
+  deviceRegistries: { owner: "user", quota: "custody", retention: "active", deletionOrder: 60, disposition: "erase" },
   sessionHeads: { owner: "user", quota: "session", retention: "encrypted_history", deletionOrder: 30, disposition: "erase" },
   sessionChunks: { owner: "user", quota: "chunk", retention: "encrypted_history", deletionOrder: 20, disposition: "erase" },
   sessionStreamEpochs: { owner: "user", quota: "chunk", retention: "encrypted_history", deletionOrder: 20, disposition: "erase" },

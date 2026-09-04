@@ -15,7 +15,12 @@ const status = makeFunctionReference<"query", Record<string, never>, unknown>(
 );
 const transition = makeFunctionReference<
   "mutation",
-  { expectedGeneration: number; mutationId: string; state: "frozen" | "open" },
+  {
+    expectedGeneration: number;
+    mutationId: string;
+    newIdentityAdmissions?: "invite_only" | "open";
+    state: "frozen" | "open";
+  },
   unknown
 >("admissionControl:transition");
 const recordInvite = makeFunctionReference<
@@ -36,6 +41,7 @@ const reserveEmail = makeFunctionReference<
 
 const freezeId = "018bcfe5-6800-7000-8000-000000000901";
 const resumeId = "018bcfe5-6800-7000-8000-000000000902";
+const openSignupId = "018bcfe5-6800-7000-8000-000000000905";
 const digest = "a".repeat(64);
 
 describe("hosted authentication admission control", () => {
@@ -124,6 +130,93 @@ describe("hosted authentication admission control", () => {
       attempts: await ctx.db.query("authEmailAttemptEvents").collect(),
       invites: await ctx.db.query("authInvites").collect(),
     }))).toEqual({ attempts: [], invites: [] });
+  });
+
+  test("new-identity admission defaults to invite_only under the same fence", async () => {
+    expect(await runtime.query(status, {})).toMatchObject({
+      generation: 0,
+      newIdentityAdmissions: "invite_only",
+      state: "open",
+    });
+    await expect(runtime.mutation(transition, {
+      expectedGeneration: 0,
+      mutationId: openSignupId,
+      newIdentityAdmissions: "invite_only",
+      state: "open",
+    })).rejects.toThrow("AUTH_ADMISSION_AUTHORITY_STALE");
+
+    expect(await runtime.mutation(transition, {
+      expectedGeneration: 0,
+      mutationId: openSignupId,
+      newIdentityAdmissions: "open",
+      state: "open",
+    })).toMatchObject({
+      changed: true,
+      generation: 1,
+      newIdentityAdmissions: "open",
+      replay: false,
+      state: "open",
+    });
+    expect(await runtime.mutation(transition, {
+      expectedGeneration: 0,
+      mutationId: openSignupId,
+      newIdentityAdmissions: "open",
+      state: "open",
+    })).toMatchObject({ generation: 1, newIdentityAdmissions: "open", replay: true });
+    await expect(runtime.mutation(transition, {
+      expectedGeneration: 0,
+      mutationId: openSignupId,
+      newIdentityAdmissions: "invite_only",
+      state: "open",
+    })).rejects.toThrow("AUTH_ADMISSION_AUTHORITY_STALE");
+
+    expect(await runtime.mutation(transition, {
+      expectedGeneration: 1,
+      mutationId: freezeId,
+      state: "frozen",
+    })).toMatchObject({
+      generation: 2,
+      newIdentityAdmissions: "open",
+      state: "frozen",
+    });
+    expect(await runtime.query(status, {})).toMatchObject({
+      generation: 2,
+      newIdentityAdmissions: "open",
+      state: "frozen",
+    });
+  });
+
+  test("a half-written or nonsense new-identity window fails closed", async () => {
+    const patchControl = async (
+      instance: ReturnType<typeof convexTest>,
+      patch: Readonly<Record<string, unknown>>,
+    ) => {
+      await instance.run(async (ctx) => {
+        const row = await ctx.db.query("serviceControl").unique() as unknown as
+          | Readonly<{ _id: string }>
+          | null;
+        if (row === null) throw new Error("missing fixture authority");
+        await ctx.db.patch(row._id as never, patch as never);
+      });
+    };
+    await patchControl(runtime, { newIdentityWindowCount: 1 });
+    await expect(runtime.query(status, {}))
+      .rejects.toThrow("AUTH_ADMISSION_AUTHORITY_CORRUPT");
+
+    const startWithoutCount = convexTest(schema, modules);
+    await startWithoutCount.mutation(genesis, {});
+    await patchControl(startWithoutCount, { newIdentityWindowStartedAt: Date.now() });
+    await expect(startWithoutCount.query(status, {}))
+      .rejects.toThrow("AUTH_ADMISSION_AUTHORITY_CORRUPT");
+
+    const negativeWindow = convexTest(schema, modules);
+    await negativeWindow.mutation(genesis, {});
+    await patchControl(negativeWindow, {
+      newIdentityWindowCount: -1,
+      newIdentityWindowStartedAt: Date.now(),
+    });
+    await expect(negativeWindow.query(status, {}))
+      .rejects.toThrow("AUTH_ADMISSION_AUTHORITY_CORRUPT");
   });
 
   test("missing, duplicate, or corrupt control authority fails closed", async () => {

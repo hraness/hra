@@ -191,6 +191,7 @@ const sessionRowSchema = z.object({
   state: sessionStateSchema,
   active_turn_id: z.string().nullable(),
   provider_updated_at: z.number().nonnegative().nullable(),
+  archived_at: unixMillisecondsSchema.nullable(),
   revision: z.number().int().positive(),
   created_at: unixMillisecondsSchema,
   updated_at: unixMillisecondsSchema,
@@ -272,15 +273,43 @@ export const sessionStateRowSchema = z.object({
 }).strict();
 
 export type SessionStateRow = z.infer<typeof sessionStateRowSchema>;
+/*
+ * Autorespond evidence covers both paths. `protocol` rows answer a provider
+ * approval and carry its interaction id; `prose` rows answer an assistant
+ * message and carry the classifier rule and the responder model instead. The
+ * outcome vocabulary is closed apart from the bounded `gate_failed:<reason>`
+ * family, which names exactly which positive-gate clause refused the turn.
+ */
+export const autorespondEvidenceOutcomeSchema = z.union([
+  z.enum(["accepted", "refused", "sent", "verbatim_mismatch", "responder_failed"]),
+  z.string().regex(/^gate_failed:[a-z_]{1,48}$/u),
+]);
+
+export type AutorespondEvidenceOutcome = z.infer<typeof autorespondEvidenceOutcomeSchema>;
+export type AutorespondEvidencePath = "protocol" | "prose";
+export type AutorespondEvidenceKind =
+  | "command_approval"
+  | "file_change_approval"
+  | "permission_approval"
+  | "prose_approval";
+
 const autorespondEvidenceRowSchema = z.object({
   id: z.number().int(),
   session_id: z.string(),
-  interaction_id: z.string().uuid(),
-  kind: z.enum(["command_approval", "file_change_approval", "permission_approval"]),
+  path: z.enum(["protocol", "prose"]),
+  interaction_id: z.string().uuid().nullable(),
+  kind: z.enum([
+    "command_approval",
+    "file_change_approval",
+    "permission_approval",
+    "prose_approval",
+  ]),
   class: z.string().max(256),
+  rule: z.string().max(64).nullable(),
+  model: z.string().max(128).nullable(),
   decision: z.string().max(64),
   mode: z.enum(["auto:all", "auto:workspace", "manual"]),
-  outcome: z.enum(["accepted", "refused"]),
+  outcome: autorespondEvidenceOutcomeSchema,
   latency_ms: z.number().int().nonnegative(),
   subagent: z.number().int(),
   occurred_at: z.number().int().nonnegative(),
@@ -289,12 +318,15 @@ const autorespondEvidenceRowSchema = z.object({
 export type AutorespondEvidenceRow = Readonly<{
   approvalClass: string;
   decision: string;
-  interactionId: string;
-  kind: "command_approval" | "file_change_approval" | "permission_approval";
+  interactionId: string | null;
+  kind: AutorespondEvidenceKind;
   latencyMs: number;
   mode: "auto:all" | "auto:workspace" | "manual";
+  model: string | null;
   occurredAt: number;
-  outcome: "accepted" | "refused";
+  outcome: AutorespondEvidenceOutcome;
+  path: AutorespondEvidencePath;
+  rule: string | null;
   sessionId: string;
   subagent: boolean;
 }>;
@@ -311,6 +343,8 @@ export type SessionRecord = {
   state: z.infer<typeof sessionStateSchema>;
   activeTurnId?: string;
   providerUpdatedAt?: number;
+  /** Set when the session was archived out of the default listing (W2 settings). */
+  archivedAt?: number;
   revision: number;
   createdAt: number;
   updatedAt: number;
@@ -748,7 +782,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 30;
+const currentSchemaVersion = 31;
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -2185,6 +2219,91 @@ const schemaVersion30ResolvedByColumn =
 /** Per-session evidence rows kept for `hra autorespond status`; oldest rows past this cap are pruned on insert. */
 export const AUTORESPOND_EVIDENCE_PER_SESSION_CAP = 500;
 
+// Prose autorespond (W2). The evidence table gains a path discriminator, the
+// classifier rule, and the responder model, and its interaction id becomes
+// optional because a prose approval has no provider interaction. SQLite cannot
+// relax a CHECK in place, so v31 rebuilds the table and copies the v30 rows
+// forward as `protocol` evidence. The message-source table records which
+// dispatched turns HRA authored, so the compact projection can mark their
+// `user_message` events with `actor: "autorespond"`.
+const schemaVersion31 = `
+CREATE TABLE IF NOT EXISTS autorespond_evidence_next (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  path TEXT NOT NULL CHECK(path IN ('protocol','prose')),
+  interaction_id TEXT CHECK(interaction_id IS NULL OR length(interaction_id) = 36),
+  kind TEXT NOT NULL CHECK(kind IN ('command_approval','file_change_approval','permission_approval','prose_approval')),
+  class TEXT NOT NULL CHECK(length(class) BETWEEN 1 AND 256),
+  rule TEXT CHECK(rule IS NULL OR length(rule) BETWEEN 1 AND 64),
+  model TEXT CHECK(model IS NULL OR length(model) BETWEEN 1 AND 128),
+  decision TEXT NOT NULL CHECK(length(decision) BETWEEN 1 AND 64),
+  mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace','manual')),
+  outcome TEXT NOT NULL CHECK(
+    outcome IN ('accepted','refused','sent','verbatim_mismatch','responder_failed')
+    OR outcome GLOB 'gate_failed:[a-z_]*'
+  ),
+  latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
+  subagent INTEGER NOT NULL CHECK(subagent IN (0,1)),
+  occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0),
+  CHECK((path = 'protocol') = (interaction_id IS NOT NULL)),
+  CHECK((path = 'prose') = (kind = 'prose_approval'))
+) STRICT;
+INSERT INTO autorespond_evidence_next(
+  id,session_id,path,interaction_id,kind,class,rule,model,decision,mode,outcome,latency_ms,subagent,occurred_at)
+SELECT id,session_id,'protocol',interaction_id,kind,class,NULL,NULL,decision,mode,outcome,latency_ms,subagent,occurred_at
+FROM autorespond_evidence;
+DROP TABLE autorespond_evidence;
+ALTER TABLE autorespond_evidence_next RENAME TO autorespond_evidence;
+`;
+const schemaVersion31Objects = `
+CREATE INDEX IF NOT EXISTS autorespond_evidence_session ON autorespond_evidence(session_id, occurred_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS autorespond_evidence_recent ON autorespond_evidence(occurred_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS autorespond_message_sources (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL CHECK(length(source_id) BETWEEN 1 AND 200),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  PRIMARY KEY (session_id, source_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS autorespond_message_sources_recent ON autorespond_message_sources(session_id, created_at DESC);
+`;
+/** Per-session autorespond-authored message sources kept for projection labelling. */
+export const AUTORESPOND_MESSAGE_SOURCE_PER_SESSION_CAP = 500;
+// Session archive and the settings projection's daemon-level defaults (W2
+// settings). Every object here is additive and independently guarded, so a
+// second schema-version-31 migration authored in parallel can be reconciled
+// by applying both constants in either order; nothing below rewrites a row
+// that another migration owns.
+const schemaVersion31Archive = `
+CREATE TABLE IF NOT EXISTS session_show_thinking (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+CREATE INDEX IF NOT EXISTS sessions_archived ON sessions(archived_at, updated_at DESC, id);
+`;
+const schemaVersion31ArchiveSessionColumn =
+  "ALTER TABLE sessions ADD COLUMN archived_at INTEGER "
+  + "CHECK(archived_at IS NULL OR archived_at >= 0)";
+const schemaVersion31ArchiveShowThinkingColumn =
+  "ALTER TABLE daemon_state ADD COLUMN default_show_thinking INTEGER NOT NULL DEFAULT 0 "
+  + "CHECK(default_show_thinking IN (0,1))";
+const schemaVersion31ArchiveDefaultPresetColumn =
+  "ALTER TABLE daemon_state ADD COLUMN default_preset TEXT NOT NULL DEFAULT 'ultra' "
+  + "CHECK(default_preset IN ('low','high','ultra'))";
+
+const applySchemaVersion31Archive = (database: Database): void => {
+  if (!hasTableColumn(database, "sessions", "archived_at")) {
+    database.exec(schemaVersion31ArchiveSessionColumn);
+  }
+  if (!hasTableColumn(database, "daemon_state", "default_show_thinking")) {
+    database.exec(schemaVersion31ArchiveShowThinkingColumn);
+  }
+  if (!hasTableColumn(database, "daemon_state", "default_preset")) {
+    database.exec(schemaVersion31ArchiveDefaultPresetColumn);
+  }
+  database.exec(schemaVersion31Archive);
+};
+
 const schemaVersion28Objects = [
   {
     name: "account_rate_limit_reset_policies",
@@ -3538,6 +3657,17 @@ const migrateWritableDatabase = (
       version = 30;
     }
 
+    if (version < 31) {
+      if (!hasTableColumn(database, "autorespond_evidence", "path")) {
+        database.exec(schemaVersion31);
+      }
+      database.exec(schemaVersion31Objects);
+      applySchemaVersion31Archive(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(31, now());
+      database.exec("PRAGMA user_version = 31");
+      version = 31;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -3573,6 +3703,8 @@ const migrateWritableDatabase = (
     database.exec(SESSION_TASK_SCHEMA_SQL);
     assertSessionTaskSchema(database);
     database.exec(schemaVersion30);
+    database.exec(schemaVersion31Objects);
+    applySchemaVersion31Archive(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -3621,6 +3753,7 @@ const mapSession = (row: unknown): SessionRecord => {
     state: parsed.state,
     ...(parsed.active_turn_id === null ? {} : { activeTurnId: parsed.active_turn_id }),
     ...(parsed.provider_updated_at === null ? {} : { providerUpdatedAt: parsed.provider_updated_at }),
+    ...(parsed.archived_at === null ? {} : { archivedAt: parsed.archived_at }),
     revision: parsed.revision,
     createdAt: parsed.created_at,
     updatedAt: parsed.updated_at,
@@ -4442,17 +4575,99 @@ export class StateStore {
     return this.requireSession(id);
   }
 
-  listSessions(limit = 50, profileId?: ProfileId): readonly SessionRecord[] {
+  /**
+   * Archived sessions are excluded unless `includeArchived` is set: archive is
+   * a listing filter, never a deletion, so every other read path still sees
+   * the session and its history.
+   */
+  listSessions(limit = 50, profileId?: ProfileId, includeArchived = false): readonly SessionRecord[] {
     const bounded = Math.max(1, Math.min(100, Math.trunc(limit)));
+    const archiveClause = includeArchived ? "" : " AND archived_at IS NULL";
     const rows = profileId === undefined
-      ? this.#database.query("SELECT * FROM sessions ORDER BY updated_at DESC,id LIMIT ?").all(bounded)
-      : this.#database.query("SELECT * FROM sessions WHERE profile_id=? ORDER BY updated_at DESC,id LIMIT ?").all(profileId, bounded);
+      ? this.#database.query(
+        `SELECT * FROM sessions WHERE 1=1${archiveClause} ORDER BY updated_at DESC,id LIMIT ?`,
+      ).all(bounded)
+      : this.#database.query(
+        `SELECT * FROM sessions WHERE profile_id=?${archiveClause} ORDER BY updated_at DESC,id LIMIT ?`,
+      ).all(profileId, bounded);
     return rows.map(mapSession);
+  }
+
+  /**
+   * Archive or unarchive a session. The row's `revision` is left alone: this
+   * is local presentation state, not provider-observable session authority,
+   * so it must not invalidate an in-flight optimistic session update.
+   */
+  setSessionArchived(sessionId: SessionId, archived: boolean): SessionRecord {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const now = this.#now();
+    const write = this.#database.transaction(() => {
+      const result = this.#database.query(
+        "UPDATE sessions SET archived_at=? WHERE id=?",
+      ).run(archived ? now : null, parsedSessionId);
+      if (result.changes !== 1) throw new SelectionError("NOT_FOUND");
+    });
+    write.immediate();
+    return this.requireSession(parsedSessionId);
+  }
+
+  // --- Settings projection: show thinking and the daemon default preset ----
+
+  readDefaultShowThinking(): boolean {
+    const row = this.#database.query("SELECT default_show_thinking FROM daemon_state WHERE singleton=1").get();
+    return z.object({ default_show_thinking: z.union([z.literal(0), z.literal(1)]) })
+      .strict().parse(row).default_show_thinking === 1;
+  }
+
+  setDefaultShowThinking(enabled: boolean): void {
+    const result = this.#database.query("UPDATE daemon_state SET default_show_thinking=? WHERE singleton=1")
+      .run(enabled ? 1 : 0);
+    if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
+  }
+
+  readSessionShowThinking(sessionId: SessionId): Readonly<{ enabled: boolean; source: "session" | "default" }> {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const row = this.#database.query("SELECT enabled FROM session_show_thinking WHERE session_id=?").get(parsedSessionId);
+    if (row !== null) {
+      const parsed = z.object({ enabled: z.union([z.literal(0), z.literal(1)]) }).strict().parse(row);
+      return { enabled: parsed.enabled === 1, source: "session" };
+    }
+    return { enabled: this.readDefaultShowThinking(), source: "default" };
+  }
+
+  setSessionShowThinking(sessionId: SessionId, enabled: boolean | null): void {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    if (enabled === null) {
+      this.#database.query("DELETE FROM session_show_thinking WHERE session_id=?").run(parsedSessionId);
+      return;
+    }
+    const write = this.#database.transaction(() => {
+      if (this.#database.query("SELECT 1 FROM sessions WHERE id=?").get(parsedSessionId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      this.#database.query(
+        `INSERT INTO session_show_thinking(session_id,enabled,updated_at) VALUES (?,?,?)
+         ON CONFLICT(session_id) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at`,
+      ).run(parsedSessionId, enabled ? 1 : 0, this.#now());
+    });
+    write.immediate();
+  }
+
+  readDefaultPreset(): Preset {
+    const row = this.#database.query("SELECT default_preset FROM daemon_state WHERE singleton=1").get();
+    return z.object({ default_preset: presetSchema }).strict().parse(row).default_preset;
+  }
+
+  setDefaultPreset(preset: Preset): void {
+    const parsed = presetSchema.parse(preset);
+    const result = this.#database.query("UPDATE daemon_state SET default_preset=? WHERE singleton=1").run(parsed);
+    if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
   }
 
   listLocalSessionPage(input: Readonly<{
     profileId: ProfileId;
     after: Readonly<{ createdAt: number; sessionId: SessionId }> | null;
+    includeArchived?: boolean;
     limit: number;
   }>): Readonly<{
     sessions: readonly SessionRecord[];
@@ -4466,16 +4681,17 @@ export class StateStore {
           createdAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER).parse(input.after.createdAt),
           sessionId: sessionIdSchema.parse(input.after.sessionId),
         };
+    const archiveClause = input.includeArchived === true ? "" : " AND archived_at IS NULL";
     const rows = (after === null
       ? this.#database.query(
         `SELECT * FROM sessions
-         WHERE profile_id=?
+         WHERE profile_id=?${archiveClause}
          ORDER BY created_at DESC,id ASC
          LIMIT ?`,
       ).all(profileId, limit + 1)
       : this.#database.query(
         `SELECT * FROM sessions
-         WHERE profile_id=?
+         WHERE profile_id=?${archiveClause}
            AND (created_at < ? OR (created_at = ? AND id > ?))
          ORDER BY created_at DESC,id ASC
          LIMIT ?`,
@@ -4489,6 +4705,17 @@ export class StateStore {
         ? { createdAt: last.createdAt, sessionId: last.id }
         : null,
     };
+  }
+
+  /*
+   * True while any non-terminal session is mid-turn. This is a cadence hint
+   * for the cloud sync loop, so it reads one indexless existence row and
+   * never projects session content.
+   */
+  hasSessionWithActiveTurn(): boolean {
+    return this.#database.query(
+      "SELECT 1 AS present FROM sessions WHERE active_turn_id IS NOT NULL AND state='active' LIMIT 1",
+    ).get() !== null;
   }
 
   listCloudSessionPage(input: Readonly<{
@@ -4920,8 +5147,11 @@ export class StateStore {
       ? 0
       : z.object({ consecutive_count: z.number().int().nonnegative() }).strict().parse(counter).consecutive_count;
     const count = (since: number): number => {
+      // Both paths spend the same per-session budget: a protocol approval that
+      // was accepted and a prose approval that was actually sent.
       const row = this.#database.query(
-        "SELECT COUNT(*) AS total FROM autorespond_evidence WHERE session_id=? AND outcome='accepted' AND occurred_at>=?",
+        `SELECT COUNT(*) AS total FROM autorespond_evidence
+         WHERE session_id=? AND outcome IN ('accepted','sent') AND occurred_at>=?`,
       ).get(parsedSessionId, since);
       return z.object({ total: z.number().int().nonnegative() }).strict().parse(row).total;
     };
@@ -4994,20 +5224,84 @@ export class StateStore {
     sessionId: SessionId;
     subagent: boolean;
   }): void {
+    this.#insertAutorespondEvidence({
+      approvalClass: input.approvalClass,
+      decision: input.decision,
+      interactionId: z.string().uuid().parse(input.interactionId),
+      kind: input.kind,
+      latencyMs: input.latencyMs,
+      mode: input.mode,
+      model: null,
+      outcome: input.outcome,
+      path: "protocol",
+      rule: null,
+      sessionId: input.sessionId,
+      subagent: input.subagent,
+    });
+  }
+
+  /*
+   * Prose-path evidence. Every attempt writes one row, including a refusal by
+   * the positive gate, so `hra autorespond status` shows exactly why a turn was
+   * left to the human. No message text, literal, or key ever enters this row.
+   */
+  recordProseAutorespondEvidence(input: {
+    decision: string;
+    latencyMs: number;
+    mode: ApprovalMode;
+    model: string | null;
+    outcome: AutorespondEvidenceOutcome;
+    rule: string;
+    sessionId: SessionId;
+  }): void {
+    this.#insertAutorespondEvidence({
+      approvalClass: "prose_approval",
+      decision: input.decision,
+      interactionId: null,
+      kind: "prose_approval",
+      latencyMs: input.latencyMs,
+      mode: input.mode,
+      model: input.model,
+      outcome: input.outcome,
+      path: "prose",
+      rule: input.rule,
+      sessionId: input.sessionId,
+      subagent: false,
+    });
+  }
+
+  #insertAutorespondEvidence(input: {
+    approvalClass: string;
+    decision: string;
+    interactionId: string | null;
+    kind: AutorespondEvidenceKind;
+    latencyMs: number;
+    mode: ApprovalMode;
+    model: string | null;
+    outcome: AutorespondEvidenceOutcome;
+    path: AutorespondEvidencePath;
+    rule: string | null;
+    sessionId: SessionId;
+    subagent: boolean;
+  }): void {
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
+    const outcome = autorespondEvidenceOutcomeSchema.parse(input.outcome);
     const now = this.#now();
     const write = this.#database.transaction(() => {
       this.#database.query(
-        `INSERT INTO autorespond_evidence(session_id,interaction_id,kind,class,decision,mode,outcome,latency_ms,subagent,occurred_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO autorespond_evidence(session_id,path,interaction_id,kind,class,rule,model,decision,mode,outcome,latency_ms,subagent,occurred_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         parsedSessionId,
-        z.string().uuid().parse(input.interactionId),
+        input.path,
+        input.interactionId,
         input.kind,
         input.approvalClass.slice(0, 256),
+        input.rule === null ? null : input.rule.slice(0, 64),
+        input.model === null ? null : input.model.slice(0, 128),
         input.decision.slice(0, 64),
         approvalModeSchema.parse(input.mode),
-        input.outcome,
+        outcome,
         Math.max(0, Math.floor(input.latencyMs)),
         input.subagent ? 1 : 0,
         now,
@@ -5018,6 +5312,37 @@ export class StateStore {
       ).run(parsedSessionId, parsedSessionId, AUTORESPOND_EVIDENCE_PER_SESSION_CAP);
     });
     write.immediate();
+  }
+
+  /*
+   * Records that HRA, not the human, authored the turn dispatched under this
+   * client message id. The compact projection reads it back to label the
+   * `user_message` event with `actor: "autorespond"`.
+   */
+  recordAutorespondMessageSource(sessionId: SessionId, sourceId: string): void {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedSourceId = z.string().min(1).max(200).parse(sourceId);
+    const now = this.#now();
+    const write = this.#database.transaction(() => {
+      this.#database.query(
+        `INSERT INTO autorespond_message_sources(session_id,source_id,created_at) VALUES (?,?,?)
+         ON CONFLICT(session_id,source_id) DO NOTHING`,
+      ).run(parsedSessionId, parsedSourceId, now);
+      this.#database.query(
+        `DELETE FROM autorespond_message_sources WHERE session_id=? AND source_id NOT IN (
+           SELECT source_id FROM autorespond_message_sources WHERE session_id=?
+           ORDER BY created_at DESC, source_id DESC LIMIT ?)`,
+      ).run(parsedSessionId, parsedSessionId, AUTORESPOND_MESSAGE_SOURCE_PER_SESSION_CAP);
+    });
+    write.immediate();
+  }
+
+  isAutorespondMessageSource(sessionId: SessionId, sourceId: string): boolean {
+    const parsedSourceId = z.string().min(1).max(200).safeParse(sourceId);
+    if (!parsedSourceId.success) return false;
+    return this.#database.query(
+      "SELECT 1 FROM autorespond_message_sources WHERE session_id=? AND source_id=?",
+    ).get(sessionIdSchema.parse(sessionId), parsedSourceId.data) !== null;
   }
 
   listAutorespondEvidence(input: { sessionId?: SessionId; limit?: number } = {}): readonly AutorespondEvidenceRow[] {
@@ -5038,14 +5363,22 @@ export class StateStore {
         kind: parsed.kind,
         latencyMs: parsed.latency_ms,
         mode: parsed.mode,
+        model: parsed.model,
         occurredAt: parsed.occurred_at,
         outcome: parsed.outcome,
+        path: parsed.path,
+        rule: parsed.rule,
         sessionId: parsed.session_id,
         subagent: parsed.subagent === 1,
       };
     });
   }
 
+  /*
+   * `accepted` counts the autoresponses that actually reached the provider on
+   * either path; `refused` counts every other recorded attempt, including the
+   * bounded `gate_failed:<reason>` family.
+   */
   countAutorespondEvidence(input: { sessionId?: SessionId } = {}): Readonly<{ accepted: number; refused: number }> {
     const rows = input.sessionId === undefined
       ? this.#database.query("SELECT outcome, COUNT(*) AS total FROM autorespond_evidence GROUP BY outcome").all()
@@ -5054,8 +5387,15 @@ export class StateStore {
         ).all(sessionIdSchema.parse(input.sessionId));
     const counts = { accepted: 0, refused: 0 };
     for (const row of rows) {
-      const parsed = z.object({ outcome: z.enum(["accepted", "refused"]), total: z.number().int().nonnegative() }).strict().parse(row);
-      counts[parsed.outcome] = parsed.total;
+      const parsed = z.object({
+        outcome: autorespondEvidenceOutcomeSchema,
+        total: z.number().int().nonnegative(),
+      }).strict().parse(row);
+      if (parsed.outcome === "accepted" || parsed.outcome === "sent") {
+        counts.accepted += parsed.total;
+      } else {
+        counts.refused += parsed.total;
+      }
     }
     return counts;
   }

@@ -102,6 +102,51 @@ export function decideAutorespond(input: Readonly<{
   return { action: "accept", decision: "once", approvalClass };
 }
 
+/*
+ * Prose path (W2). A prose approval has no provider interaction, so the
+ * decision is the positive gate plus the same budgets as the protocol path:
+ * at most one autoresponse per turn, a consecutive counter that only a
+ * human-authored send resets, and the hourly and daily caps. The gate itself
+ * (cues, message length, gateway key, pending interactions) is evaluated by
+ * the daemon, which owns the classifier report and the store.
+ */
+export type ProseAutorespondGateFailure =
+  | "consecutive_limit"
+  | "daily_budget"
+  | "denylist_cue"
+  | "gateway_key_missing"
+  | "hourly_budget"
+  | "human_action_cue"
+  | "manual_mode"
+  | "message_too_long"
+  | "not_an_approval_cue"
+  | "pending_interaction"
+  | "verbatim_literal_missing";
+
+export const PROSE_AUTORESPOND_MAX_MESSAGE_CHARACTERS = 4_000;
+
+export type ProseAutorespondDecision =
+  | Readonly<{ action: "send" }>
+  | Readonly<{ action: "escalate"; code: ProseAutorespondGateFailure }>;
+
+/** Budget half of the prose gate; the daemon applies the cue and custody half. */
+export function decideProseAutorespond(input: Readonly<{
+  budgets: AutorespondBudgets;
+  mode: ApprovalMode;
+}>): ProseAutorespondDecision {
+  if (input.mode === "manual") return { action: "escalate", code: "manual_mode" };
+  if (input.budgets.consecutive >= AUTORESPOND_CONSECUTIVE_LIMIT) {
+    return { action: "escalate", code: "consecutive_limit" };
+  }
+  if (input.budgets.lastHour >= AUTORESPOND_HOURLY_BUDGET) {
+    return { action: "escalate", code: "hourly_budget" };
+  }
+  if (input.budgets.lastDay >= AUTORESPOND_DAILY_BUDGET) {
+    return { action: "escalate", code: "daily_budget" };
+  }
+  return { action: "send" };
+}
+
 export type AutorespondEvidenceInput = Readonly<{
   approvalClass: string;
   decision: string;

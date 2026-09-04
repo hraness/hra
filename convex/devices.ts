@@ -8,6 +8,7 @@ import {
   isBase64Url,
   isDigest,
   isOpaqueIdentifier,
+  isSafeNonNegativeInteger,
   isSafePositiveInteger,
   parseEncryptedEnvelope,
   parseWrappedKeyEnvelope,
@@ -17,9 +18,12 @@ import {
   verifyDeviceBind,
 } from "../src/cloud/crypto";
 import {
+  deviceClassOf,
   rejectAuthority,
   requireAuthAuthority,
+  requireDaemonDevice,
   requireDeviceAuthority,
+  type DeviceClass,
 } from "./authority";
 import { requireAuthAdmissionsOpen } from "./admissionControl";
 import {
@@ -40,11 +44,12 @@ import {
   type MutationCtx,
 } from "./server";
 import { presenceForDevice } from "./presence";
-import { encryptedEnvelope, wrappedKeyEnvelope } from "./validators";
+import { deviceClass, encryptedEnvelope, wrappedKeyEnvelope } from "./validators";
 
 const bindChallengeLifetimeMs = 5 * 60 * 1_000;
 
 type DeviceSummary = Readonly<{
+  deviceClass: DeviceClass;
   publicId: string;
   revision: number;
   status: "pending" | "active" | "revoked";
@@ -93,6 +98,8 @@ async function bindRegistrationToAuthSession(
   await ctx.db.insert("deviceSessions", sessionDocument);
 }
 
+// A receipt stored before browser enrollment carries no class, so an absent
+// field decodes as `daemon` exactly as an absent device-row field does.
 function parseDeviceSummary(value: unknown): DeviceSummary | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Readonly<Record<string, unknown>>;
@@ -100,8 +107,12 @@ function parseDeviceSummary(value: unknown): DeviceSummary | null {
     !isOpaqueIdentifier(record.publicId)
     || !isSafePositiveInteger(record.revision)
     || (record.status !== "pending" && record.status !== "active" && record.status !== "revoked")
+    || (record.deviceClass !== undefined
+      && record.deviceClass !== "daemon"
+      && record.deviceClass !== "browser")
   ) return null;
   return {
+    deviceClass: record.deviceClass ?? "daemon",
     publicId: record.publicId,
     revision: record.revision,
     status: record.status,
@@ -109,19 +120,27 @@ function parseDeviceSummary(value: unknown): DeviceSummary | null {
 }
 
 function summarizeDevice(device: Readonly<{
+  deviceClass?: DeviceClass;
   publicId: string;
   revision: number;
   status: "pending" | "active" | "revoked";
 }>): DeviceSummary {
-  return { publicId: device.publicId, revision: device.revision, status: device.status };
+  return {
+    deviceClass: deviceClassOf(device),
+    publicId: device.publicId,
+    revision: device.revision,
+    status: device.status,
+  };
 }
 
 function publicDevice(device: Readonly<{
   activatedAt?: number;
+  deviceClass?: DeviceClass;
   encryptedLabel: Parameters<typeof parseEncryptedEnvelope>[0];
   keyVersion: number;
   publicId: string;
   revision: number;
+  signingPublicKey: string;
   status: "pending" | "active" | "revoked";
   updatedAt: number;
   userId: string;
@@ -129,12 +148,14 @@ function publicDevice(device: Readonly<{
 }>, presence: Awaited<ReturnType<typeof presenceForDevice>>, now: number) {
   return {
     ...(device.activatedAt === undefined ? {} : { activatedAt: device.activatedAt }),
+    deviceClass: deviceClassOf(device),
     encryptedLabel: device.encryptedLabel,
     keyVersion: device.keyVersion,
     lastSeenAt: presence?.observedAt ?? null,
     online: device.status !== "revoked" && presence !== null && presence.presenceUntil > now,
     publicId: device.publicId,
     revision: device.revision,
+    signingPublicKey: device.signingPublicKey,
     status: device.status,
     userPublicId: device.userId,
     wrappingPublicKey: device.wrappingPublicKey,
@@ -144,6 +165,7 @@ function publicDevice(device: Readonly<{
 export const register = mutation({
   args: {
     bootstrapKeyEnvelope: v.optional(wrappedKeyEnvelope),
+    deviceClass: v.optional(deviceClass),
     encryptedLabel: encryptedEnvelope,
     idempotencyKey: v.string(),
     keyVersion: v.number(),
@@ -154,6 +176,7 @@ export const register = mutation({
   },
   handler: async (ctx, args): Promise<DeviceSummary> => {
     const auth = await requireAuthAuthority(ctx);
+    const requestedClass: DeviceClass = args.deviceClass ?? "daemon";
     if (
       !isOpaqueIdentifier(args.publicId)
       || !isSafePositiveInteger(args.keyVersion)
@@ -194,6 +217,8 @@ export const register = mutation({
         matches.length !== 1
         || device === undefined
         || device.publicId !== parsed.publicId
+        || deviceClassOf(device) !== parsed.deviceClass
+        || deviceClassOf(device) !== requestedClass
         || device.keyVersion !== args.keyVersion
         || device.registrationIdempotencyKey !== args.idempotencyKey
         || device.registrationRequestDigest !== args.requestDigest
@@ -224,6 +249,11 @@ export const register = mutation({
         builder.eq("userId", auth.userId).eq("status", "active"))
       .take(1);
     const status = active.length === 0 ? "active" as const : "pending" as const;
+    // A browser device is never the first device and never generates the
+    // account key: enrollment requires an existing active daemon device.
+    if (requestedClass === "browser" && active.length === 0) {
+      throw new Error("BROWSER_DEVICE_REQUIRES_ACTIVE_DEVICE");
+    }
     if ((status === "active") !== (args.bootstrapKeyEnvelope !== undefined)) {
       rejectAuthority();
     }
@@ -233,6 +263,7 @@ export const register = mutation({
       authEpoch: auth.subject.authEpoch,
       createdAt: now,
       credentialGeneration: 1,
+      deviceClass: requestedClass,
       encryptedLabel: args.encryptedLabel,
       keyVersion: args.keyVersion,
       publicId: args.publicId,
@@ -272,7 +303,12 @@ export const register = mutation({
     } as const;
     await reserveQuotaForInsert(ctx, auth.userId, "security", securityDocument);
     await ctx.db.insert("securityEvents", securityDocument);
-    const response = { publicId: args.publicId, revision: 1, status };
+    const response = {
+      deviceClass: requestedClass,
+      publicId: args.publicId,
+      revision: 1,
+      status,
+    };
     await storeIdempotencyReceipt(ctx, scope, {
       idempotencyKey: args.idempotencyKey,
       requestDigest: args.requestDigest,
@@ -288,6 +324,7 @@ export const register = mutation({
 export const recoverRegistration = mutation({
   args: {
     bootstrapKeyEnvelope: v.optional(wrappedKeyEnvelope),
+    deviceClass: v.optional(deviceClass),
     encryptedLabel: encryptedEnvelope,
     idempotencyKey: v.string(),
     keyVersion: v.number(),
@@ -324,6 +361,7 @@ export const recoverRegistration = mutation({
       || device === undefined
       || device.registrationIdempotencyKey !== args.idempotencyKey
       || device.registrationRequestDigest !== args.requestDigest
+      || deviceClassOf(device) !== (args.deviceClass ?? "daemon")
       || device.keyVersion !== args.keyVersion
       || JSON.stringify(device.registrationBootstrapKeyEnvelope)
         !== JSON.stringify(args.bootstrapKeyEnvelope)
@@ -427,7 +465,7 @@ export const approve = mutation({
     targetPublicId: v.string(),
   },
   handler: async (ctx, args): Promise<DeviceSummary> => {
-    const authority = await requireDeviceAuthority(ctx);
+    const authority = await requireDaemonDevice(ctx, "administer");
     if (
       !isOpaqueIdentifier(args.targetPublicId)
       || !isSafePositiveInteger(args.expectedRevision)
@@ -496,6 +534,7 @@ export const approve = mutation({
     await reserveQuotaForInsert(ctx, authority.userId, "security", securityDocument);
     await ctx.db.insert("securityEvents", securityDocument);
     const response = {
+      deviceClass: deviceClassOf(target),
       publicId: target.publicId,
       revision: target.revision + 1,
       status: "active" as const,
@@ -726,7 +765,7 @@ export const revoke = mutation({
     targetPublicId: v.string(),
   },
   handler: async (ctx, args): Promise<DeviceSummary> => {
-    const authority = await requireDeviceAuthority(ctx);
+    const authority = await requireDaemonDevice(ctx, "administer");
     if (!isOpaqueIdentifier(args.targetPublicId) || !isSafePositiveInteger(args.expectedRevision)) {
       rejectAuthority();
     }
@@ -837,6 +876,7 @@ export const revoke = mutation({
     await reserveQuotaForInsert(ctx, authority.userId, "security", securityDocument);
     await ctx.db.insert("securityEvents", securityDocument);
     const response = {
+      deviceClass: deviceClassOf(target),
       publicId: target.publicId,
       revision: target.revision + 1,
       status: "revoked" as const,
@@ -863,5 +903,115 @@ export const listKeyEnvelopes = query({
       createdAt: entry.createdAt,
       envelope: entry.envelope,
     }));
+  },
+});
+
+function publicRegistry(registry: Readonly<{
+  devicePublicId: string;
+  envelope: Parameters<typeof parseEncryptedEnvelope>[0];
+  keyVersion: number;
+  revision: number;
+  updatedAt: number;
+}>) {
+  return {
+    devicePublicId: registry.devicePublicId,
+    envelope: registry.envelope,
+    keyVersion: registry.keyVersion,
+    revision: registry.revision,
+    updatedAt: registry.updatedAt,
+  };
+}
+
+// A device writes only its own registry row: the calling device's identity is
+// the row key, so no target-device argument exists and no device can overwrite
+// another device's projection. Reads stay user-scoped so a second device can
+// resolve what the rest of the account has published.
+export const updateRegistry = mutation({
+  args: {
+    envelope: encryptedEnvelope,
+    expectedRevision: v.number(),
+    keyVersion: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const authority = await requireDeviceAuthority(ctx);
+    if (
+      parseEncryptedEnvelope(args.envelope, cloudLimits.registryCiphertextCharacters) === null
+      || !isSafePositiveInteger(args.keyVersion)
+      || args.keyVersion !== args.envelope.keyVersion
+      || !isSafeNonNegativeInteger(args.expectedRevision)
+    ) rejectAuthority();
+    const matches = await ctx.db
+      .query("deviceRegistries")
+      .withIndex("by_device", (builder) => builder.eq("deviceId", authority.deviceId))
+      .take(2);
+    if (matches.length > 1) rejectAuthority();
+    const existing = matches[0];
+    const now = Date.now();
+    if (existing === undefined) {
+      if (args.expectedRevision !== 0) throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
+      const document = {
+        createdAt: now,
+        deviceId: authority.deviceId,
+        devicePublicId: authority.device.publicId,
+        envelope: args.envelope,
+        keyVersion: args.keyVersion,
+        revision: 1,
+        updatedAt: now,
+        userId: authority.userId,
+      } as const;
+      await reserveQuotaForInsert(ctx, authority.userId, "custody", document);
+      await ctx.db.insert("deviceRegistries", document);
+      return {
+        devicePublicId: document.devicePublicId,
+        revision: document.revision,
+        updatedAt: document.updatedAt,
+      };
+    }
+    if (existing.revision !== args.expectedRevision) {
+      throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
+    }
+    const patch = {
+      envelope: args.envelope,
+      keyVersion: args.keyVersion,
+      revision: existing.revision + 1,
+      updatedAt: now,
+    } as const;
+    await adjustQuotaForPatch(ctx, authority.userId, "custody", existing, patch);
+    await ctx.db.patch(existing._id, patch);
+    return {
+      devicePublicId: existing.devicePublicId,
+      revision: patch.revision,
+      updatedAt: patch.updatedAt,
+    };
+  },
+});
+
+export const getRegistry = query({
+  args: { devicePublicId: v.string() },
+  handler: async (ctx, args) => {
+    const authority = await requireDeviceAuthority(ctx);
+    if (!isOpaqueIdentifier(args.devicePublicId)) rejectAuthority();
+    const matches = await ctx.db
+      .query("deviceRegistries")
+      .withIndex("by_user_and_device_public_id", (builder) => builder
+        .eq("userId", authority.userId)
+        .eq("devicePublicId", args.devicePublicId))
+      .take(2);
+    if (matches.length > 1) rejectAuthority();
+    const registry = matches[0];
+    if (registry === undefined) return null;
+    return publicRegistry(registry);
+  },
+});
+
+export const listRegistries = query({
+  args: {},
+  handler: async (ctx) => {
+    const authority = await requireDeviceAuthority(ctx);
+    const registries = await ctx.db
+      .query("deviceRegistries")
+      .withIndex("by_user", (builder) => builder.eq("userId", authority.userId))
+      .take(cloudLimits.pageSize);
+    return registries.map((registry) => publicRegistry(registry));
   },
 });

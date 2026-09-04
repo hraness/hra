@@ -210,11 +210,11 @@ The CLI stores HRA's revocable device credential, workspace encryption key, and 
 
 After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority.
 
-On an already active machine, list devices and approve the pending device by its exact ID or unique prefix:
+On an already active machine, list devices and approve the pending device by its exact ID or unique prefix. The listing shows each device's class, daemon or browser, and the fingerprint of its two public keys. Approval requires that exact fingerprint, so the machine you approve is the one whose fingerprint you read:
 
 ```text
 hra device list
-hra device approve <pending-device-id-or-prefix> [--idempotency-key <current-uuidv7>]
+hra device approve <pending-device-id-or-prefix> --fingerprint <value> [--idempotency-key <current-uuidv7>]
 ```
 
 After approval, run `hra device pair` on the new machine to retrieve and unwrap its encryption-key envelope. Use `hra device revoke <device-id-or-prefix>` from a different active machine to revoke a device.
@@ -408,7 +408,8 @@ hra auth status|logout
 hra auth delete --acknowledge-erasure
 hra device list|pair
 hra device key-loss --acknowledge-no-key-holders
-hra device approve|revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]
+hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <current-uuidv7>]
+hra device revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]
 hra account add <label>
 hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
 hra account login-cancel <profile>
@@ -424,7 +425,7 @@ hra plugin show <account> <plugin> [--project <project>] [--refresh]
 hra project add --path <directory> [--name <name>]
 hra project list
 hra project use <project>
-hra session list [--account <profile>] [--limit <1-100>] [--cursor <cursor>]
+hra session list [--account <profile>] [--archived] [--limit <1-100>] [--cursor <cursor>]
 hra session show <session> [--detail]
 hra session status <session> [--json]
 hra session watch <session> [--cursor <cursor>] [--jsonl]
@@ -435,6 +436,7 @@ hra session send|queue|steer <session> <message>
 hra session stop <session>
 hra session rename <session> <name>
 hra session recover|abandon <session>
+hra session archive|unarchive <session>
 hra session note get|edit|clear <session>
 hra session note set <session> <note>
 hra session state <session>

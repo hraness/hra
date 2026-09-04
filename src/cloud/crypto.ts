@@ -2,6 +2,7 @@ import { KeyRotationRequiredError } from "../domain/cloud-outcomes";
 export { KeyRotationRequiredError } from "../domain/cloud-outcomes";
 import {
   isBase64Url,
+  isDeviceKeyFingerprint,
   isRecord,
   type EncryptedEnvelope,
   type WrappedKeyEnvelope,
@@ -247,6 +248,40 @@ export function parseDevicePrivateKeyJson(value: unknown): DevicePrivateKey | nu
 
 export function canonicalDevicePublicKeyJson(value: DevicePublicKey): string {
   return JSON.stringify({ crv: value.crv, kty: value.kty, x: value.x, y: value.y });
+}
+
+const deviceKeyFingerprintGroups = 8;
+const deviceKeyFingerprintGroupCharacters = 4;
+
+// A short, human-comparable digest of both device public keys. The browser tab
+// displays it at enrollment and the approving device is given the same value on
+// the command line, so an approval binds to the exact key pair it was shown.
+export async function deviceKeyFingerprint(
+  signingPublicKey: DevicePublicKey | string,
+  wrappingPublicKey: DevicePublicKey | string,
+): Promise<string> {
+  const signing = typeof signingPublicKey === "string"
+    ? parseDevicePublicKeyJson(signingPublicKey)
+    : parseDevicePublicKey(signingPublicKey);
+  const wrapping = typeof wrappingPublicKey === "string"
+    ? parseDevicePublicKeyJson(wrappingPublicKey)
+    : parseDevicePublicKey(wrappingPublicKey);
+  if (signing === null || wrapping === null) {
+    throw new Error("Unsupported device public key.");
+  }
+  const digest = await sha256Hex(
+    `${canonicalDevicePublicKeyJson(signing)}\n${canonicalDevicePublicKeyJson(wrapping)}`,
+  );
+  const groups: string[] = [];
+  for (let group = 0; group < deviceKeyFingerprintGroups; group += 1) {
+    const start = group * deviceKeyFingerprintGroupCharacters;
+    groups.push(digest.slice(start, start + deviceKeyFingerprintGroupCharacters));
+  }
+  const fingerprint = groups.join("-");
+  if (!isDeviceKeyFingerprint(fingerprint)) {
+    throw new Error("Device key fingerprint is invalid.");
+  }
+  return fingerprint;
 }
 
 export async function exportDevicePublicKey(key: CryptoKey): Promise<string> {

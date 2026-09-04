@@ -43,8 +43,20 @@ import {
   type CloudSecretCustodyPort,
 } from "./local-control";
 import { PollingCloudDaemonLifecycle } from "./daemon-lifecycle";
+import {
+  createCloudPushWake,
+  pendingCommandFingerprint,
+  pushWakeBackoffMs,
+  type CloudPushWakePort,
+  type CloudPushWakeSubscriber,
+} from "./push-wake";
 import { hmacSha256Hex, sha256Hex } from "./crypto";
-import { encryptRemoteCommand, type RemoteCommandPayload } from "./payloads";
+import {
+  decryptDeviceRegistry,
+  encryptRemoteCommand,
+  type DeviceRegistryPayload,
+  type RemoteCommandPayload,
+} from "./payloads";
 import { encryptCompactEvents, type CompactSessionEvent } from "./projection";
 
 const fixedNow = 1_900_000_000_000;
@@ -155,6 +167,8 @@ class FakeCloud {
     name: "presence:connect" | "presence:disconnect" | "presence:heartbeat";
   }>> = [];
   sessionHeadListCalls = 0;
+  deviceListCalls = 0;
+  peerDevices: Array<Readonly<Record<string, unknown>>> = [];
   readonly commands = new Map<string, FakeCommand>();
   readonly failingCommandGets = new Set<string>();
   readonly failingHeadGets = new Set<string>();
@@ -767,6 +781,17 @@ class FakeCloud {
                   : { requestingDevicePublicId: command.requestingDevicePublicId }),
                 targetDevicePublicId: command.targetDevicePublicId,
               };
+        }
+        if (name === "devices:list") {
+          this.deviceListCalls += 1;
+          return [
+            {
+              online: this.presences.get(devicePublicId) !== undefined,
+              publicId: devicePublicId,
+              status: "active",
+            },
+            ...this.peerDevices,
+          ];
         }
         if (name === "devices:get") {
           const publicId = args.publicId as string;
@@ -1443,6 +1468,7 @@ function bridge(input: {
   local: CloudDaemonLocalSourcePort;
   now?: () => number;
   optionalSyncBudgetMs?: number;
+  pushWake?: CloudPushWakePort;
   randomConnectionUuid?: () => string;
   sessionSyncCursor?: CloudSessionSyncCursorPort;
   transport?: CloudTransport;
@@ -1469,6 +1495,7 @@ function bridge(input: {
     ...(input.optionalSyncBudgetMs === undefined
       ? {}
       : { optionalSyncBudgetMs: input.optionalSyncBudgetMs }),
+    ...(input.pushWake === undefined ? {} : { pushWake: input.pushWake }),
     randomConnectionUuid: input.randomConnectionUuid
       ?? (() => connectionUuid(connectionUuidSequence += 1)),
     randomUuid: () => uuidV7(uuidSequence++, input.cloud.now),
@@ -4515,6 +4542,37 @@ describe("cloud daemon bridge", () => {
     expect(executor.calls).toEqual([]);
   });
 
+  test("a close that lands during a cycle ends the wake-gated wait at once", async () => {
+    const manual = manualPushWake();
+    let closing: Promise<void> | undefined;
+    const bridge = {
+      async close() { await manual.wake.close(); },
+      async cycle() {
+        // The daemon shuts down while this cycle is still running, so the
+        // abort precedes the wait; the loop must not sleep the full interval.
+        closing ??= lifecycle.close();
+        return {
+          commandsApplied: 0,
+          commandsUnsettled: 0,
+          errors: [],
+          online: true,
+          remoteSessions: [],
+          sessionsUploaded: 0,
+          usageUploaded: 0,
+        };
+      },
+      async pullRemoteSessions() { return []; },
+      pushWake() { return manual.wake; },
+    };
+    const lifecycle = new PollingCloudDaemonLifecycle({ bridge, intervalMs: 15_000 });
+    const startedAt = Date.now();
+    lifecycle.start();
+    await until(() => closing !== undefined, "the cycle to request shutdown");
+    await closing;
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(manual.wake.status().state).toBe("closed");
+  });
+
   test("close aborts and joins the polling lifecycle", async () => {
     let calls = 0;
     let closeCalls = 0;
@@ -4542,5 +4600,434 @@ describe("cloud daemon bridge", () => {
     await lifecycle.join();
     expect(calls).toBeGreaterThanOrEqual(1);
     expect(closeCalls).toBe(1);
+  });
+});
+
+type ManualPushWake = Readonly<{
+  deliver: (value: unknown) => void;
+  wake: CloudPushWakePort;
+}>;
+
+function manualPushWake(): ManualPushWake {
+  let handlers: Parameters<CloudPushWakeSubscriber>[0] | null = null;
+  const wake = createCloudPushWake({
+    subscribe: (next) => {
+      handlers = next;
+      return { close: async () => { handlers = null; } };
+    },
+  });
+  return {
+    deliver: (value: unknown) => { handlers?.onResult(value); },
+    wake,
+  };
+}
+
+function pendingRows(...commandPublicIds: readonly string[]): readonly unknown[] {
+  return commandPublicIds.map((publicId, index) => ({
+    publicId,
+    sessionPublicId: "session_pushwake",
+    state: "pending",
+    updatedAt: fixedNow + index,
+  }));
+}
+
+async function until(
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${description}.`);
+    await Bun.sleep(1);
+  }
+}
+
+describe("cloud daemon push wake and adaptive cadence", () => {
+  test("executes a pending command within 100ms of the subscription change", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const sessionPublicId = "session_pushwake1";
+    const manual = manualPushWake();
+    const adapter = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      local: new FakeLocal(sessionPublicId, events),
+      pushWake: manual.wake,
+    });
+    let cycles = 0;
+    // A very long timer proves the wake, not the poll interval, ran the command.
+    const lifecycle = new PollingCloudDaemonLifecycle({
+      bridge: adapter,
+      intervalMs: 60_000,
+      onCycle: () => { cycles += 1; },
+    });
+    manual.deliver(pendingRows());
+    lifecycle.start();
+    try {
+      await until(() => cycles >= 1 && cloud.heads.has(sessionPublicId), "the first cycle");
+      await Bun.sleep(20);
+      expect(executor.calls).toEqual([]);
+
+      const commandPublicId = uuidV7(9_001);
+      await cloud.enqueue(
+        "device_22222222",
+        sessionPublicId,
+        commandPublicId,
+        { kind: "send", message: "steer from the phone" },
+      );
+      const wokeAt = performance.now();
+      manual.deliver(pendingRows(commandPublicId));
+      await until(() => executor.calls.length > 0, "the woken command execution", 5_000);
+      const latencyMs = performance.now() - wokeAt;
+      console.log(`push wake to command execution: ${latencyMs.toFixed(1)}ms`);
+      expect(latencyMs).toBeLessThan(100);
+      expect(executor.calls).toEqual([{ idempotencyKey: commandPublicId, sessionPublicId }]);
+      expect(manual.wake.status()).toMatchObject({ state: "listening", wakes: 1 });
+    } finally {
+      await lifecycle.close();
+    }
+  }, 20_000);
+
+  test("a wake latched during a cycle and the poll timer execute each command once", async () => {
+    const cloud = new FakeCloud();
+    const executor = new RecordingExecutor();
+    const sessionPublicId = "session_pushwake2";
+    const manual = manualPushWake();
+    const adapter = bridge({
+      cloud,
+      device: "device_11111111",
+      executor,
+      local: new FakeLocal(sessionPublicId, events),
+      pushWake: manual.wake,
+    });
+    let cycles = 0;
+    const lifecycle = new PollingCloudDaemonLifecycle({
+      bridge: adapter,
+      intervalMs: 1_000,
+      onCycle: () => { cycles += 1; },
+    });
+    manual.deliver(pendingRows());
+    lifecycle.start();
+    try {
+      await until(() => cycles >= 1 && cloud.heads.has(sessionPublicId), "the first cycle");
+      const first = uuidV7(9_101);
+      const second = uuidV7(9_102);
+      await cloud.enqueue("device_22222222", sessionPublicId, first, { kind: "stop" });
+      await cloud.enqueue(
+        "device_22222222",
+        sessionPublicId,
+        second,
+        { kind: "set_model", preset: "ultra" },
+      );
+      // The wake fires again from inside the very cycle that claims these
+      // commands, so the next sleep returns immediately while the one-second
+      // timer is also due. Neither may produce a second execution.
+      cloud.afterPendingScan = () => { manual.deliver(pendingRows(first, second)); };
+      manual.deliver(pendingRows(first));
+      await until(
+        () => cloud.requireCommand(first).state === "applied"
+          && cloud.requireCommand(second).state === "applied",
+        "both commands to settle",
+      );
+      const settledCycles = cycles;
+      await until(() => cycles >= settledCycles + 3, "three further cycles");
+      expect(executor.calls.filter((call) => call.idempotencyKey === first)).toHaveLength(1);
+      expect(executor.calls.filter((call) => call.idempotencyKey === second)).toHaveLength(1);
+      expect(executor.calls).toHaveLength(2);
+    } finally {
+      await lifecycle.close();
+    }
+  }, 30_000);
+
+  test("reports the cadence hint from peer presence and local turn activity", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_cadence1";
+    const local = new FakeLocal(sessionPublicId, events) as FakeLocal & {
+      hasActiveTurn?: () => boolean;
+    };
+    const adapter = bridge({ cloud, device: "device_11111111", local });
+    const signal = new AbortController().signal;
+
+    const idle = await adapter.cycle(signal);
+    expect(idle.errors).toEqual([]);
+    expect(idle.activity).toEqual({ localTurnActive: false, peerDevicePresent: false });
+    expect(cloud.deviceListCalls).toBe(1);
+
+    // The probe is cached, so a peer that appears inside the window is not
+    // observed until the cache expires.
+    cloud.peerDevices = [{ online: true, publicId: "device_22222222", status: "active" }];
+    expect((await adapter.cycle(signal)).activity)
+      .toEqual({ localTurnActive: false, peerDevicePresent: false });
+    expect(cloud.deviceListCalls).toBe(1);
+
+    cloud.now += 11_000;
+    expect((await adapter.cycle(signal)).activity)
+      .toEqual({ localTurnActive: false, peerDevicePresent: true });
+
+    // A revoked or offline peer, and this daemon's own row, never count.
+    cloud.peerDevices = [
+      { online: false, publicId: "device_22222222", status: "active" },
+      { online: true, publicId: "device_33333333", status: "revoked" },
+    ];
+    cloud.now += 11_000;
+    expect((await adapter.cycle(signal)).activity)
+      .toEqual({ localTurnActive: false, peerDevicePresent: false });
+
+    // A declared device class is believed when the summary carries one.
+    cloud.peerDevices = [
+      { deviceClass: "daemon", online: true, publicId: "device_44444444", status: "active" },
+    ];
+    cloud.now += 11_000;
+    expect((await adapter.cycle(signal)).activity)
+      .toEqual({ localTurnActive: false, peerDevicePresent: false });
+    cloud.peerDevices = [
+      { deviceClass: "browser", online: true, publicId: "device_55555555", status: "active" },
+    ];
+    cloud.now += 11_000;
+    local.hasActiveTurn = () => true;
+    expect((await adapter.cycle(signal)).activity)
+      .toEqual({ localTurnActive: true, peerDevicePresent: true });
+  }, 20_000);
+
+  test("keeps the last cadence hint when the device probe fails", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_cadence2";
+    const upstream = cloud.connect("device_11111111");
+    let failDeviceList = false;
+    const adapter = bridge({
+      cloud,
+      device: "device_11111111",
+      local: new FakeLocal(sessionPublicId, events),
+      transport: {
+        ...upstream,
+        query: async (name, args) => {
+          if (name === "devices:list" && failDeviceList) {
+            throw new Error("device list unavailable");
+          }
+          return await upstream.query(name, args);
+        },
+      },
+    });
+    const signal = new AbortController().signal;
+    cloud.peerDevices = [{ online: true, publicId: "device_22222222", status: "active" }];
+    expect((await adapter.cycle(signal)).activity?.peerDevicePresent).toBe(true);
+
+    failDeviceList = true;
+    cloud.now += 11_000;
+    const degraded = await adapter.cycle(signal);
+    expect(degraded.activity).toEqual({ localTurnActive: false, peerDevicePresent: true });
+    expect(degraded.errors).toEqual([]);
+  }, 20_000);
+
+  test("moves between the fast and idle intervals and publishes them in status", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_cadence3";
+    const manual = manualPushWake();
+    const adapter = bridge({
+      cloud,
+      device: "device_11111111",
+      local: new FakeLocal(sessionPublicId, events),
+      pushWake: manual.wake,
+    });
+    let cycles = 0;
+    const lifecycle = new PollingCloudDaemonLifecycle({
+      bridge: adapter,
+      intervalMs: 15_000,
+      onCycle: () => { cycles += 1; },
+    });
+    expect(lifecycle.syncCadence()).toMatchObject({
+      intervalMs: 15_000,
+      mode: "idle",
+      reason: "idle",
+    });
+    manual.deliver(pendingRows());
+    lifecycle.start();
+    try {
+      await until(() => cycles >= 1, "the first cycle");
+      expect(lifecycle.syncCadence()).toMatchObject({
+        intervalMs: 15_000,
+        mode: "idle",
+        reason: "idle",
+      });
+      expect(lifecycle.syncCadence().pushWake).toMatchObject({ state: "listening" });
+
+      cloud.peerDevices = [{ online: true, publicId: "device_22222222", status: "active" }];
+      cloud.now += 11_000;
+      const before = cycles;
+      manual.deliver(pendingRows(uuidV7(9_201)));
+      await until(() => cycles > before, "a woken cycle");
+      expect(lifecycle.syncCadence()).toMatchObject({
+        intervalMs: 1_000,
+        mode: "active",
+        reason: "browser_device_present",
+      });
+    } finally {
+      await lifecycle.close();
+    }
+  }, 20_000);
+
+  test("reports one push-wake diagnostic through the cycle result and closes the socket", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_pushwake3";
+    let closes = 0;
+    const captured: { handlers: Parameters<CloudPushWakeSubscriber>[0] | null } = {
+      handlers: null,
+    };
+    const wake = createCloudPushWake({
+      subscribe: (next) => {
+        captured.handlers = next;
+        return { close: async () => { closes += 1; } };
+      },
+    });
+    const adapter = bridge({
+      cloud,
+      device: "device_11111111",
+      local: new FakeLocal(sessionPublicId, events),
+      pushWake: wake,
+    });
+    const signal = new AbortController().signal;
+    expect((await adapter.cycle(signal)).errors).toEqual([]);
+    captured.handlers?.onError(new Error("push subscription refused"));
+    const reported = await adapter.cycle(signal);
+    expect(reported.errors).toEqual(["push wake: push subscription refused"]);
+    expect((await adapter.cycle(signal)).errors).toEqual([]);
+    expect(adapter.pushWake()).toBe(wake);
+    await adapter.close();
+    expect(wake.status().state).toBe("closed");
+    expect(closes).toBeGreaterThanOrEqual(1);
+    expect(pushWakeBackoffMs(1)).toBe(1_000);
+    expect(pendingCommandFingerprint([])).toBe("0|");
+  }, 20_000);
+});
+
+describe("device registry publication", () => {
+  const registry = {
+    accounts: [],
+    daemonVersion: "0.3.0",
+    defaultApprovalMode: "auto:all",
+    defaultPreset: "ultra",
+    heartbeatAt: 0,
+    machineLabel: "Studio",
+    projects: [],
+    proseAutorespondConfigured: false,
+    scheduledTasks: [],
+    showThinkingDefault: false,
+    version: 1,
+  } as const;
+
+  function registryWorld(readDeviceRegistry: () => Promise<DeviceRegistryPayload>) {
+    const cloud = new FakeCloud();
+    const device = "device_registry_1";
+    const inner = cloud.connect(device);
+    const rows = new Map<string, Readonly<{ envelope: EncryptedEnvelope; keyVersion: number; revision: number }>>();
+    const writes: Array<Readonly<{ expectedRevision: number }>> = [];
+    const local: CloudDaemonLocalSourcePort = Object.assign(new EmptyLocal(), { readDeviceRegistry });
+    const transport: CloudTransport = {
+      action: (name, args) => inner.action(name, args),
+      mutation: async (name, args) => {
+        if (name !== "devices:updateRegistry") return await inner.mutation(name, args);
+        const expectedRevision = args.expectedRevision as number;
+        writes.push({ expectedRevision });
+        const current = rows.get(device);
+        if ((current?.revision ?? 0) !== expectedRevision) {
+          throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
+        }
+        const revision = expectedRevision + 1;
+        rows.set(device, {
+          envelope: args.envelope as unknown as EncryptedEnvelope,
+          keyVersion: args.keyVersion as number,
+          revision,
+        });
+        return { devicePublicId: device, revision, updatedAt: cloud.now };
+      },
+      query: async (name, args) => {
+        if (name !== "devices:getRegistry") return await inner.query(name, args);
+        const row = rows.get(args.devicePublicId as string);
+        return row === undefined ? null : { devicePublicId: device, ...row, updatedAt: cloud.now };
+      },
+    };
+    return { cloud, device, local, rows, transport, writes };
+  }
+
+  test("publishes on start, republishes on change, and otherwise heartbeats at most once a minute", async () => {
+    let projection: DeviceRegistryPayload = { ...registry, heartbeatAt: 1_000 };
+    const world = registryWorld(() => Promise.resolve(projection));
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      local: world.local,
+      now: () => world.cloud.now,
+      transport: world.transport,
+    });
+    const signal = new AbortController().signal;
+
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }]);
+    const stored = world.rows.get(world.device);
+    expect(stored?.revision).toBe(1);
+    expect(await decryptDeviceRegistry(
+      stored?.envelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "device_registry",
+        userPublicId,
+      },
+    )).toEqual(projection);
+
+    // Unchanged inputs inside the heartbeat window write nothing.
+    projection = { ...projection, heartbeatAt: projection.heartbeatAt + 1_000 };
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toHaveLength(1);
+
+    // A changed input republishes immediately under the returned revision.
+    projection = { ...projection, showThinkingDefault: true };
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }, { expectedRevision: 1 }]);
+    expect(world.rows.get(world.device)?.revision).toBe(2);
+
+    // With inputs unchanged, the heartbeat republishes after the interval.
+    world.cloud.now += 60_000;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toHaveLength(3);
+    expect(world.rows.get(world.device)?.revision).toBe(3);
+  });
+
+  test("reports a registry failure without stopping the cycle and recovers the server revision", async () => {
+    let failures = 1;
+    const world = registryWorld(() => {
+      if (failures > 0) {
+        failures -= 1;
+        return Promise.reject(new Error("local registry unavailable"));
+      }
+      return Promise.resolve({ ...registry, heartbeatAt: 1_000 });
+    });
+    // A row written by an earlier daemon process: this process knows no
+    // revision and must read the server's rather than assuming zero.
+    world.rows.set(world.device, {
+      envelope: { algorithm: "A256GCM", ciphertext: "AAAA", keyVersion: 1, nonce: "BBBB" },
+      keyVersion: 1,
+      revision: 7,
+    });
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      local: world.local,
+      now: () => world.cloud.now,
+      transport: world.transport,
+    });
+    const signal = new AbortController().signal;
+
+    const failed = await daemon.cycle(signal);
+    expect(failed.online).toBe(true);
+    expect(failed.errors).toEqual(["device registry: local registry unavailable"]);
+    expect(world.writes).toEqual([]);
+
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toEqual([{ expectedRevision: 7 }]);
+    expect(world.rows.get(world.device)?.revision).toBe(8);
   });
 });

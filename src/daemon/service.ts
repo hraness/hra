@@ -153,7 +153,25 @@ import {
   type SessionEventWrite,
 } from "./streaming-redaction";
 import { SessionStateTracker } from "./session-state-tracker";
-import { decideAutorespond, permissionNamesOf } from "./autorespond";
+import {
+  decideAutorespond,
+  decideProseAutorespond,
+  permissionNamesOf,
+  PROSE_AUTORESPOND_MAX_MESSAGE_CHARACTERS,
+  type ProseAutorespondGateFailure,
+} from "./autorespond";
+import {
+  PROSE_APPROVAL_REPLY,
+  type ProseResponder,
+} from "./prose-responder";
+import type { GatewayKeyPort } from "../storage/gateway-key-custody";
+import {
+  DENYLIST_CUES,
+  HUMAN_ACTION_CUES,
+  prepareAssistantText,
+  STRONG_HUMAN_ACTION_CUES,
+  type SessionStateClassification,
+} from "../domain/session-state";
 
 export class CommandFailure extends Error {
   readonly [commandFailureBrand] = true as const;
@@ -593,6 +611,7 @@ const restoreLoginReceipt = (value: unknown): LoginOutcome => {
 export const BACKGROUND_DIAGNOSTIC_CODES = [
   "account_fact_apply_failed",
   "autorespond_failed",
+  "prose_autorespond_failed",
   "queue_dispatch_failed",
   "queue_pre_effect_retry_failed",
   "recovery_observation_failed",
@@ -644,6 +663,10 @@ export class HraService {
   readonly #eventRedactor: SessionEventStreamRedactor;
   readonly #sessionTasks: SessionTaskStore;
   readonly #sessionStateTracker = new SessionStateTracker(() => this.#now());
+  readonly #gatewayKeys: GatewayKeyPort | undefined;
+  readonly #proseResponder: ProseResponder | undefined;
+  /** Last turn per session that already spent its one prose autoresponse. */
+  readonly #proseAutorespondedTurns = new Map<string, string>();
   readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
   readonly #daemonGeneration: number;
   readonly #now: () => number;
@@ -686,6 +709,8 @@ export class HraService {
     usageHistoryCursors?: UsageHistoryCursorCodec;
     eventWaiters?: SessionEventWaiters;
     factsMemory?: HraFactsMemoryLifecyclePort;
+    gatewayKeys?: GatewayKeyPort;
+    proseResponder?: ProseResponder;
     workWaiters?: WorkEventWaiters;
     workCapabilities?: WorkCapabilityCodec;
     daemonGeneration?: number;
@@ -710,6 +735,8 @@ export class HraService {
       ?? new UsageHistoryCursorCodec(UsageHistoryCursorCodec.generateKey());
     this.#eventWaiters = input.eventWaiters ?? new SessionEventWaiters();
     this.#sessionTasks = this.#store.createSessionTaskStore();
+    this.#gatewayKeys = input.gatewayKeys;
+    this.#proseResponder = input.proseResponder;
     this.#factsMemory = input.factsMemory;
     this.#daemonGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.daemonGeneration ?? 0);
@@ -836,12 +863,23 @@ export class HraService {
         case "project.list": return { projects: this.#store.listProjects() };
         case "project.add": return { project: await this.#addProject(command.label, command.path) };
         case "project.use": return { project: this.#store.setDefaultProject(this.#store.requireProject(command.project).id) };
+        case "session.archive": {
+          const session = this.#store.requireSession(command.session);
+          const archived = this.#store.setSessionArchived(session.id, command.archived);
+          return {
+            version: 1,
+            session: archived.id,
+            archived: archived.archivedAt !== undefined,
+            archivedAt: archived.archivedAt ?? null,
+          };
+        }
         case "session.list": {
           if (command.account === undefined) {
             return await this.#listSessions(
               undefined,
               command.limit,
               command.cursor,
+              command.archived,
               context.signal,
             );
           }
@@ -850,6 +888,7 @@ export class HraService {
             profile.id,
             command.limit,
             command.cursor,
+            command.archived,
             context.signal,
           ));
         }
@@ -886,10 +925,22 @@ export class HraService {
             ...(session === null ? {} : { session: session.id }),
             mode: mode.mode,
             source: mode.source,
+            // Status carries only whether a key exists, never any part of it.
+            gateway: await this.#gatewayConfigured() ? "configured" : "not configured",
             counts: this.#store.countAutorespondEvidence(session === null ? {} : { sessionId: session.id }),
             ...(session === null ? {} : { budgets: this.#store.readAutorespondBudgets(session.id) }),
             recent: this.#store.listAutorespondEvidence({ ...(session === null ? {} : { sessionId: session.id }), limit: 20 }),
           };
+        }
+        case "autorespond.gateway-set": {
+          const custody = this.#requireGatewayKeys();
+          await custody.set(command.key);
+          return { version: 1, gateway: "configured" };
+        }
+        case "autorespond.gateway-clear": {
+          const custody = this.#requireGatewayKeys();
+          const cleared = await custody.clear();
+          return { version: 1, cleared, gateway: "not configured" };
         }
         case "autorespond.set": {
           if (command.session === undefined) {
@@ -1078,7 +1129,7 @@ export class HraService {
         case "device.pair": return await this.#fencedEffect(async () => await this.#cloud.pairDevice(context.signal));
         case "device.key-loss": return await this.#fencedEffect(async () =>
           await this.#cloud.acknowledgeNoAccountKeyHolders(context.signal));
-        case "device.approve": return await this.#fencedEffect(async () => await this.#cloud.approveDevice(command.device, command.idempotencyKey, context.signal));
+        case "device.approve": return await this.#fencedEffect(async () => await this.#cloud.approveDevice(command.device, command.idempotencyKey, command.fingerprint, context.signal));
         case "device.revoke": return await this.#fencedEffect(async () => await this.#cloud.revokeDevice(command.device, command.idempotencyKey, context.signal));
         case "sync.status": return await this.#fencedEffect(async () => await this.#cloud.status(context.signal));
         case "sync.now": return await this.#fencedEffect(async () => await this.#cloud.sync(context.signal));
@@ -2406,6 +2457,219 @@ export class HraService {
     }
   }
 
+  #requireGatewayKeys(): GatewayKeyPort {
+    if (this.#gatewayKeys === undefined) {
+      throw new CommandFailure(
+        "UNAVAILABLE",
+        "Local secret custody for the autorespond gateway key is unavailable in this daemon.",
+      );
+    }
+    return this.#gatewayKeys;
+  }
+
+  async #gatewayConfigured(): Promise<boolean> {
+    try {
+      return await this.#gatewayKeys?.isConfigured() ?? false;
+    } catch {
+      return false;
+    }
+  }
+
+  /*
+   * Prose autorespond (W2). A completed turn that classified as
+   * `needs_approval` through the lexical approval cue — never through a pending
+   * provider interaction — may be answered on the human's behalf. Everything
+   * below is a refusal path except the last one, and every path leaves one
+   * evidence row.
+   */
+  #scheduleProseAutorespond(
+    sessionId: SessionRecord["id"],
+    turnId: string,
+    classification: SessionStateClassification,
+  ): void {
+    if (this.#proseResponder === undefined) return;
+    if (classification.state !== "needs_approval") return;
+    // At most one autoresponse per turn, even if the state is re-emitted.
+    if (this.#proseAutorespondedTurns.get(sessionId) === turnId) return;
+    this.#proseAutorespondedTurns.set(sessionId, turnId);
+    const tracked = this.#autorespondProse(sessionId, classification).then(
+      () => undefined,
+      (error: unknown) => {
+        if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+        else this.recordBackgroundDiagnostic("prose_autorespond_failed", error);
+      },
+    );
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  async #autorespondProse(
+    sessionId: SessionRecord["id"],
+    classification: SessionStateClassification,
+  ): Promise<void> {
+    const responder = this.#proseResponder;
+    if (responder === undefined) return;
+    const startedAt = this.#now();
+    const { mode } = this.#store.readSessionApprovalMode(sessionId);
+    const rule = classification.matchedRule;
+    const finalText = this.#sessionStateTracker.finalAssistantText(sessionId);
+    const refuse = (code: ProseAutorespondGateFailure): void => {
+      this.#store.recordProseAutorespondEvidence({
+        decision: "refuse",
+        latencyMs: this.#now() - startedAt,
+        mode,
+        model: null,
+        outcome: `gate_failed:${code}`,
+        rule,
+        sessionId,
+      });
+    };
+
+    // The positive gate. Each clause must hold before a model is consulted.
+    if (rule !== "approval_cue") return refuse("not_an_approval_cue");
+    if (this.#store.listInteractions({ sessionId, pendingOnly: true, limit: 1 }).length > 0) {
+      return refuse("pending_interaction");
+    }
+    const prepared = prepareAssistantText(finalText);
+    // The classifier reads cues over the stripped text and, for the full
+    // human-action list, only over the tail. The gate is stricter on purpose:
+    // it scans the whole raw message, fenced code and blockquotes included, so
+    // a quoted login step or a destructive command inside a code block still
+    // hands the turn back to the human.
+    if (
+      STRONG_HUMAN_ACTION_CUES.some((cue) => cue.test(finalText))
+      || HUMAN_ACTION_CUES.some((cue) => cue.test(finalText))
+    ) return refuse("human_action_cue");
+    if (DENYLIST_CUES.some((cue) => cue.test(finalText))) return refuse("denylist_cue");
+    if (finalText.length >= PROSE_AUTORESPOND_MAX_MESSAGE_CHARACTERS) {
+      return refuse("message_too_long");
+    }
+    if (!await this.#gatewayConfigured()) return refuse("gateway_key_missing");
+    const verbatimLiteral = classification.verbatimRequired
+      ? classification.verbatimLiteral
+      : undefined;
+    if (classification.verbatimRequired && verbatimLiteral === undefined) {
+      return refuse("verbatim_literal_missing");
+    }
+    const budgets = this.#store.readAutorespondBudgets(sessionId, startedAt);
+    const decision = decideProseAutorespond({ budgets, mode });
+    if (decision.action === "escalate") return refuse(decision.code);
+
+    const durable = this.#store.readSessionState(sessionId);
+    let result: Awaited<ReturnType<ProseResponder["respond"]>>;
+    try {
+      result = await responder.respond(
+        {
+          assistantTail: prepared.tail,
+          report: {
+            version: 1,
+            session: sessionId,
+            state: durable?.state ?? classification.state,
+            attention: durable?.attention ?? classification.attention,
+            reason: durable?.reason ?? classification.reason,
+            verbatimRequired: classification.verbatimRequired,
+            lastActivityAt: durable?.lastActivityAt ?? null,
+            revision: durable?.revision ?? 0,
+          },
+          ...(verbatimLiteral === undefined ? {} : { verbatimLiteral }),
+        },
+        this.#backgroundAbort.signal,
+      );
+    } catch {
+      this.#store.recordProseAutorespondEvidence({
+        decision: "refuse",
+        latencyMs: this.#now() - startedAt,
+        mode,
+        model: null,
+        outcome: "responder_failed",
+        rule,
+        sessionId,
+      });
+      return;
+    }
+
+    /*
+     * The responder is never trusted with free text. A verbatim ask must come
+     * back byte-exact from the assistant's own message; every other approval is
+     * answered with the one fixed sentence, whatever the model produced.
+     */
+    let reply = PROSE_APPROVAL_REPLY;
+    if (verbatimLiteral !== undefined) {
+      if (!finalText.includes(result.reply)) {
+        this.#store.recordProseAutorespondEvidence({
+          decision: "refuse",
+          latencyMs: this.#now() - startedAt,
+          mode,
+          model: result.model,
+          outcome: "verbatim_mismatch",
+          rule,
+          sessionId,
+        });
+        this.#escalateSessionState(sessionId, "autorespond_verbatim_mismatch");
+        return;
+      }
+      reply = result.reply;
+    }
+
+    let outcome: "sent" | "responder_failed" = "sent";
+    try {
+      const session = this.#store.requireSession(sessionId);
+      await this.#serializeSessionAuthority(session, async () =>
+        this.#send(session.id, reply, undefined, this.#backgroundAbort.signal, undefined, "autorespond"));
+      this.#store.bumpAutorespondCounter(sessionId);
+    } catch (error: unknown) {
+      outcome = "responder_failed";
+      if (!(error instanceof CommandFailure) && !(error instanceof SelectionError)) throw error;
+    } finally {
+      this.#store.recordProseAutorespondEvidence({
+        decision: outcome === "sent" ? "send" : "refuse",
+        latencyMs: this.#now() - startedAt,
+        mode,
+        model: result.model,
+        outcome,
+        rule,
+        sessionId,
+      });
+    }
+  }
+
+  /*
+   * Emit one further `session_state` revision after an autorespond outcome
+   * that hands the turn back to the human. A later revision always wins, so
+   * the browser and the CLI converge on the escalation.
+   */
+  #escalateSessionState(sessionId: SessionRecord["id"], reason: string): void {
+    try {
+      const body = this.#sessionStateTracker.escalate(sessionId, {
+        attention: true,
+        reason,
+        state: "needs_answer",
+      });
+      const snapshot = this.#sessionStateTracker.snapshot(sessionId);
+      if (snapshot === null) return;
+      this.#store.upsertSessionState({
+        sessionId,
+        state: snapshot.state,
+        attention: snapshot.attention,
+        reason: snapshot.reason,
+        verbatimRequired: snapshot.verbatimRequired,
+        verbatimLiteral: snapshot.verbatimLiteral,
+        lastActivityAt: snapshot.lastActivityAt,
+        revision: snapshot.revision,
+      });
+      const session = this.#store.requireSession(sessionId);
+      const profile = this.#store.requireProfile(session.profileId);
+      this.#appendSessionEvent(
+        authorityFor(this.#paths, profile),
+        sessionId,
+        this.#sessionProviderConnections.get(sessionId) ?? null,
+        body,
+      );
+    } catch (error: unknown) {
+      this.recordBackgroundDiagnostic("session_state_tracking_failed", error);
+    }
+  }
+
   #appendSessionEvent(
     authority: ProfileAuthority,
     sessionId: SessionRecord["id"],
@@ -2478,6 +2742,18 @@ export class HraService {
       });
       this.#store.appendPublicSessionEvent({ ...write, body });
       this.#eventWaiters.notify(write.sessionId);
+      // A prose approval is only ever answered for a turn that just ended and
+      // left no pending provider interaction behind.
+      if (
+        body.state === "needs_approval"
+        && write.body.type === "turn_completed"
+        && pending === undefined
+      ) {
+        const classification = this.#sessionStateTracker.classification(write.sessionId);
+        if (classification !== null) {
+          this.#scheduleProseAutorespond(write.sessionId, write.body.turnId, classification);
+        }
+      }
     } catch (error: unknown) {
       this.recordBackgroundDiagnostic("session_state_tracking_failed", error);
     }
@@ -5800,6 +6076,7 @@ export class HraService {
     account: string | undefined,
     limit: number,
     cursor: string | undefined,
+    includeArchived: boolean,
     signal: AbortSignal,
   ): Promise<unknown> {
     if (account === undefined) {
@@ -5811,7 +6088,7 @@ export class HraService {
       }
       return {
         accountId: null,
-        sessions: this.#store.listSessions(limit),
+        sessions: this.#store.listSessions(limit, undefined, includeArchived),
         nextCursor: null,
       };
     }
@@ -5833,6 +6110,7 @@ export class HraService {
               createdAt: decodedCursor.afterCreatedAt,
               sessionId: decodedCursor.afterSessionId,
             },
+        includeArchived,
         limit,
       });
       const nextCursor = page.nextPosition === null
@@ -5877,7 +6155,7 @@ export class HraService {
       }
       return {
         accountId: profile.id,
-        sessions: this.#store.listSessions(limit, profile.id),
+        sessions: this.#store.listSessions(limit, profile.id, includeArchived),
         nextCursor: null,
         recovery: {
           diagnostic: "Provider reconciliation is paused while compact-projection recovery preserves exact local authority.",
@@ -5925,7 +6203,13 @@ export class HraService {
       sessions.push(session);
       await this.#reconcileCommittedSessionFactsMemory(session);
     }
-    return { accountId: profile.id, sessions, nextCursor };
+    return {
+      accountId: profile.id,
+      // Archive is a listing filter over locally known sessions: the
+      // provider has no archive concept, so its page is filtered here.
+      sessions: includeArchived ? sessions : sessions.filter((session) => session.archivedAt === undefined),
+      nextCursor,
+    };
   }
 
   async #showSession(selector: string, detail: boolean, signal: AbortSignal): Promise<unknown> {
@@ -6094,6 +6378,7 @@ export class HraService {
     idempotencyKey: string | undefined,
     signal: AbortSignal,
     beforeEffect?: (attemptId: MutationAttemptRecord["id"]) => void,
+    actor: "human" | "autorespond" = "human",
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
@@ -6105,7 +6390,7 @@ export class HraService {
     );
     // A human-authored message is the only thing that resets the consecutive
     // autorespond counter for a session.
-    this.#store.resetAutorespondCounter(session.id);
+    if (actor === "human") this.#store.resetAutorespondCounter(session.id);
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let review: RuntimeStartReview | undefined;
@@ -6149,6 +6434,11 @@ export class HraService {
       });
       // Work authorization and nested begin are one synchronous fence boundary.
       beforeEffect?.(attemptId);
+      // The compact projection reads this back to mark the resulting
+      // `user_message` with `actor: "autorespond"`.
+      if (actor === "autorespond") {
+        this.#store.recordAutorespondMessageSource(session.id, attemptId);
+      }
       this.#store.beginSessionMutationEffect({
         attemptId,
         sessionId: session.id,

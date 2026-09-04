@@ -87,13 +87,22 @@ describe("hosted preflight status operator", () => {
   test("reports an accepted deployment with open admission as live", async () => {
     for (const scenario of [
       {
-        admission: '{"generation":2,"state":"open","updatedAt":1}',
-        expected: { admission: { generation: 2, state: "open" }, nextAction: "operate_hosted_sync", status: "live" },
+        admission: '{"generation":2,"newIdentityAdmissions":"open","state":"open","updatedAt":1}',
+        expected: {
+          admission: { generation: 2, newIdentityAdmissions: "open", state: "open" },
+          nextAction: "operate_hosted_sync",
+          status: "live",
+        },
         exitCode: 0,
       },
       {
+        // A deployment that predates the control reports no value: invite_only.
         admission: '{"generation":1,"state":"frozen","updatedAt":1}',
-        expected: { admission: { generation: 1, state: "frozen" }, nextAction: "resume_admissions", status: "preflight_incomplete" },
+        expected: {
+          admission: { generation: 1, newIdentityAdmissions: "invite_only", state: "frozen" },
+          nextAction: "resume_admissions",
+          status: "preflight_incomplete",
+        },
         exitCode: 1,
       },
     ] as const) {
@@ -175,7 +184,11 @@ describe("hosted preflight status operator", () => {
     });
 
     expect(status).toEqual({
-      admission: { generation: 0, state: "open" },
+      admission: {
+        generation: 0,
+        newIdentityAdmissions: "invite_only",
+        state: "open",
+      },
       bootstrap: { occupiedTableCount: 3, state: "ready" },
       environment: { requiredNamesPresent: true, missingRequiredNames: [] },
       nextAction: "run_live_acceptance",

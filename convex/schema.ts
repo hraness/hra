@@ -8,10 +8,12 @@ import {
   accountDeletionState,
   authAdmissionState,
   authAttemptKind,
+  authSubjectAdmittedBy,
   authSubjectStatus,
   challengeDeliveryState,
   commandKind,
   commandState,
+  deviceClass,
   deviceRevocationCategory,
   deviceRevocationState,
   deviceStatus,
@@ -19,6 +21,7 @@ import {
   invitePurpose,
   inviteState,
   maintenanceCategory,
+  newIdentityAdmissionState,
   quotaCategory,
   quotaAccountResource,
   quotaEnforcement,
@@ -40,10 +43,14 @@ export default defineSchema({
     .index("sessionId", ["sessionId"]),
   authSubjects: defineTable({
     admissionInviteId: v.optional(v.id("authInvites")),
+    admittedBy: v.optional(authSubjectAdmittedBy),
     authEpoch: v.number(),
     createdAt: v.number(),
     emailDigest: v.string(),
     status: authSubjectStatus,
+    // Lifetime count of code sends for an address that has never verified. It
+    // stops here and is never reset while the subject stays unverified.
+    unverifiedSendCount: v.optional(v.number()),
     updatedAt: v.number(),
     userId: v.optional(v.id("users")),
     verifiedAt: v.optional(v.number()),
@@ -102,6 +109,7 @@ export default defineSchema({
     authEpoch: v.number(),
     createdAt: v.number(),
     credentialGeneration: v.optional(v.number()),
+    deviceClass: v.optional(deviceClass),
     encryptedLabel: encryptedEnvelope,
     keyVersion: v.number(),
     publicId: v.string(),
@@ -174,6 +182,19 @@ export default defineSchema({
   })
     .index("by_device", ["deviceId"])
     .index("by_presence_until", ["presenceUntil"])
+    .index("by_user", ["userId"]),
+  deviceRegistries: defineTable({
+    createdAt: v.number(),
+    deviceId: v.id("devices"),
+    devicePublicId: v.string(),
+    envelope: encryptedEnvelope,
+    keyVersion: v.number(),
+    revision: v.number(),
+    updatedAt: v.number(),
+    userId: v.id("users"),
+  })
+    .index("by_device", ["deviceId"])
+    .index("by_user_and_device_public_id", ["userId", "devicePublicId"])
     .index("by_user", ["userId"]),
   sessionHeads: defineTable({
     compactHasRecoveryGap: v.optional(v.boolean()),
@@ -473,6 +494,11 @@ export default defineSchema({
     bootstrapInvitePublicId: v.optional(v.string()),
     key: v.literal("global"),
     lastMutationId: v.optional(v.string()),
+    // Absent means invite_only. The rolling window counts identities admitted
+    // in the last 24 hours through either the invite or the open path.
+    newIdentityAdmissions: v.optional(newIdentityAdmissionState),
+    newIdentityWindowCount: v.optional(v.number()),
+    newIdentityWindowStartedAt: v.optional(v.number()),
     updatedAt: v.number(),
   }).index("by_key", ["key"]),
   storageResourceUsageByUser: defineTable({

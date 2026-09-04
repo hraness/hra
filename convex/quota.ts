@@ -57,13 +57,24 @@ type QuotaLimit = Readonly<{ logicalBytes: number; records: number }>;
  * UTF-8 bytes and includes the deterministic `_id` and `_creationTime`
  * overhead for documents that have not been inserted yet.
  */
+/**
+ * Open-beta free tier. One identity gets 200 MiB of server-visible logical
+ * bytes. The record ceiling is deliberately far above what those bytes can
+ * hold, so bytes are the binding limit and no row-count cliff appears first.
+ */
 export const USER_TOTAL_QUOTA = {
-  logicalBytes: 2 * 1_024 * 1_024 * 1_024,
+  logicalBytes: 200 * 1_024 * 1_024,
   records: 4_000_000,
 } as const satisfies QuotaLimit;
 
+/**
+ * The identity ceiling is deliberately oversubscribed against the byte
+ * ceiling: 5,000 free-tier identities could claim 1,000 GiB but the service
+ * stops at 100 GiB, which is the real hard stop. Raise the byte ceiling before
+ * the service approaches it, not the identity count.
+ */
 export const SERVICE_TOTAL_QUOTA = {
-  identities: 500,
+  identities: 5_000,
   logicalBytes: 100 * 1_024 * 1_024 * 1_024,
   records: 25_000_000,
 } as const;
@@ -86,7 +97,7 @@ export const USER_RESOURCE_QUOTAS = {
   device: 16,
   codex_account: 32,
   session_head: 10_000,
-  session_chunk: 250_000,
+  session_chunk: 50_000,
   nonterminal_command: 256,
   // The live (detail-stream) tail is a bounded sub-quota of session_chunk:
   // every detail chunk also charges session_chunk, so live_chunk can never
@@ -848,6 +859,7 @@ export const QUOTA_GENESIS_CHARGED_TABLES = [
   "deviceKeyEnvelopes",
   "recoveryEnvelopes",
   "devicePresence",
+  "deviceRegistries",
   "sessionHeads",
   "sessionChunks",
   "sessionStreamEpochs",
@@ -892,6 +904,7 @@ async function requireGenesisEmpty(ctx: MutationCtx): Promise<void> {
     hasAny(ctx.db.query("deviceKeyEnvelopes").take(1)),
     hasAny(ctx.db.query("recoveryEnvelopes").take(1)),
     hasAny(ctx.db.query("devicePresence").take(1)),
+    hasAny(ctx.db.query("deviceRegistries").take(1)),
     hasAny(ctx.db.query("sessionHeads").take(1)),
     hasAny(ctx.db.query("sessionChunks").take(1)),
     hasAny(ctx.db.query("sessionStreamEpochs").take(1)),
@@ -1247,6 +1260,7 @@ export const hostedBootstrapStatus = internalQuery({
       deviceKeyEnvelopes,
       recoveryEnvelopes,
       devicePresence,
+      deviceRegistries,
       sessionHeads,
       sessionChunks,
       sessionStreamEpochs,
@@ -1284,6 +1298,7 @@ export const hostedBootstrapStatus = internalQuery({
       ctx.db.query("deviceKeyEnvelopes").take(2),
       ctx.db.query("recoveryEnvelopes").take(2),
       ctx.db.query("devicePresence").take(2),
+      ctx.db.query("deviceRegistries").take(2),
       ctx.db.query("sessionHeads").take(2),
       ctx.db.query("sessionChunks").take(2),
       ctx.db.query("sessionStreamEpochs").take(2),
@@ -1322,6 +1337,7 @@ export const hostedBootstrapStatus = internalQuery({
       deviceKeyEnvelopes,
       recoveryEnvelopes,
       devicePresence,
+      deviceRegistries,
       sessionHeads,
       sessionChunks,
       sessionStreamEpochs,

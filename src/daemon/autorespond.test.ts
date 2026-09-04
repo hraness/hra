@@ -8,7 +8,9 @@ import {
   AUTORESPOND_DAILY_BUDGET,
   AUTORESPOND_HOURLY_BUDGET,
   decideAutorespond,
+  decideProseAutorespond,
   permissionNamesOf,
+  PROSE_AUTORESPOND_MAX_MESSAGE_CHARACTERS,
 } from "./autorespond";
 
 const quiet = { consecutive: 0, lastDay: 0, lastHour: 0 };
@@ -106,5 +108,35 @@ describe("autorespond policy", () => {
     expect(approvalClassOf(network)).toBe("permission:network");
     expect(permissionNamesOf(network)).toEqual(["network"]);
     expect(permissionNamesOf(command)).toEqual([]);
+  });
+});
+
+describe("decideProseAutorespond", () => {
+  test("sends under either auto mode when every budget is quiet", () => {
+    expect(decideProseAutorespond({ budgets: quiet, mode: "auto:all" }))
+      .toEqual({ action: "send" });
+    expect(decideProseAutorespond({ budgets: quiet, mode: "auto:workspace" }))
+      .toEqual({ action: "send" });
+  });
+
+  test("escalates under manual mode and on each spent budget", () => {
+    expect(decideProseAutorespond({ budgets: quiet, mode: "manual" }))
+      .toEqual({ action: "escalate", code: "manual_mode" });
+    expect(decideProseAutorespond({
+      budgets: { ...quiet, consecutive: AUTORESPOND_CONSECUTIVE_LIMIT },
+      mode: "auto:all",
+    })).toEqual({ action: "escalate", code: "consecutive_limit" });
+    expect(decideProseAutorespond({
+      budgets: { ...quiet, lastHour: AUTORESPOND_HOURLY_BUDGET },
+      mode: "auto:all",
+    })).toEqual({ action: "escalate", code: "hourly_budget" });
+    expect(decideProseAutorespond({
+      budgets: { ...quiet, lastDay: AUTORESPOND_DAILY_BUDGET },
+      mode: "auto:all",
+    })).toEqual({ action: "escalate", code: "daily_budget" });
+  });
+
+  test("bounds the message length the daemon will consider", () => {
+    expect(PROSE_AUTORESPOND_MAX_MESSAGE_CHARACTERS).toBe(4_000);
   });
 });

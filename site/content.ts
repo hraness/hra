@@ -72,6 +72,8 @@ export interface SocialCard {
   readonly width: number;
 }
 
+export type HostedSignup = "invite_only" | "open";
+
 export interface PublicContent {
   /** README trust-signal badges, rendered on one line under the H1. */
   readonly badges: readonly Badge[];
@@ -83,6 +85,8 @@ export interface PublicContent {
   readonly initCommand: string;
   readonly introduction: readonly ContentBlock[];
   readonly hero: HeroContent;
+  /** Whether hosted sign-up needs an invitation. Drives every beta claim. */
+  readonly hostedSignup: HostedSignup;
   readonly links: {
     readonly contributing: string;
     readonly documentation: string;
@@ -123,6 +127,33 @@ const list = (...items: readonly (readonly InlineContent[])[]): ContentBlock => 
   kind: "list",
   items,
 });
+
+/**
+ * The one place the public beta claim is decided. It must match the deployed
+ * `serviceControl.newIdentityAdmissions` value: say "invite-only beta" while
+ * the authority refuses an uninvited identity, and "open beta" only once it
+ * admits one. Every surface below derives its wording from this constant.
+ */
+const hostedSignup: HostedSignup = "invite_only";
+
+/** The exact public wording for each hosted sign-up state. */
+export const hostedSignupCopy = (signup: HostedSignup): Readonly<{
+  admissionClaim: string;
+  betaLabel: string;
+}> => signup === "open"
+  ? {
+      admissionClaim: "Anyone can create an identity with an email address and a one-time code; an invitation is optional.",
+      betaLabel: "open beta",
+    }
+  : {
+      admissionClaim: "The first identity and device were admitted on the production deployment on 2026-09-03; new identities need an invitation from an existing member.",
+      betaLabel: "invite-only beta",
+    };
+
+const {
+  admissionClaim: hostedAdmissionClaim,
+  betaLabel: hostedBetaLabel,
+} = hostedSignupCopy(hostedSignup);
 
 const links = {
   contributing: "https://github.com/hraness/hra/blob/main/CONTRIBUTING.md",
@@ -181,7 +212,7 @@ const privacyBlocks: readonly ContentBlock[] = [
     kind: "notice",
     label: "Hosted sync status",
     content: [
-      text("The hosted sync endpoint is live as an invite-only beta. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. The first identity and device were admitted on the production deployment on 2026-09-03; new identities need an invitation from an existing member."),
+      text(`The hosted sync endpoint is live as an ${hostedBetaLabel}. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. ${hostedAdmissionClaim}`),
     ],
   },
 ];
@@ -253,7 +284,7 @@ export const publicContent: PublicContent = {
   releaseVersion,
   thesis: `${productName} runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.`,
   description: `${tagline}: run several accounts side by side, keep their sessions alive in a local daemon, and drive them from a shell or JSON. ${providerRoadmap}`,
-  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready for macOS and Linux; hosted sync is live as an invite-only beta.`,
+  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready for macOS and Linux; hosted sync is live as an ${hostedBetaLabel}.`,
   badges,
   maintainer: {
     name: "Hraness",
@@ -275,12 +306,13 @@ export const publicContent: PublicContent = {
     hostedSync: "live",
     website: "live",
   },
+  hostedSignup,
   links,
   hero: {
     eyebrow: tagline,
     heading: "Keep every Codex account and live session in one durable CLI.",
     summary: "Give each account its own Codex home, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.",
-    boundary: "macOS and Linux CLI · macOS desktop switching · local v0.3.0 release-ready · hosted sync live (invite-only beta)",
+    boundary: `macOS and Linux CLI · macOS desktop switching · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
@@ -338,7 +370,7 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: "Immutable local CLI release candidate; hosted sync live as an invite-only beta",
+      label: `Immutable local CLI release candidate; hosted sync live as an ${hostedBetaLabel}`,
       content: [
         text("The exact install command below works once GitHub exposes the immutable "),
         code("v0.3.0"),
@@ -674,7 +706,7 @@ export const publicContent: PublicContent = {
       heading: "Cloud sign-in and device pairing",
       blocks: [
         paragraph(
-          text("The hosted endpoint is live as an invite-only beta. An unset "),
+          text(`The hosted endpoint is live as an ${hostedBetaLabel}. An unset `),
           code("HRA_CONVEX_URL"),
           text(" selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. After deliberately disabling a bound state root, "),
           code("hra sync status"),
@@ -714,13 +746,13 @@ export const publicContent: PublicContent = {
           text("After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority."),
         ),
         paragraph(
-          text("On an already active machine, list devices and approve the pending device by its exact ID or unique prefix:"),
+          text("On an already active machine, list devices and approve the pending device by its exact ID or unique prefix. The listing shows each device's class, daemon or browser, and the fingerprint of its two public keys. Approval requires that exact fingerprint, so the machine you approve is the one whose fingerprint you read:"),
         ),
         {
           kind: "commands",
           commands: [
             "hra device list",
-            "hra device approve <pending-device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
+            "hra device approve <pending-device-id-or-prefix> --fingerprint <value> [--idempotency-key <current-uuidv7>]",
           ],
         },
         paragraph(
@@ -1086,7 +1118,8 @@ export const publicContent: PublicContent = {
             "hra auth delete --acknowledge-erasure",
             "hra device list|pair",
             "hra device key-loss --acknowledge-no-key-holders",
-            "hra device approve|revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
+            "hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <current-uuidv7>]",
+            "hra device revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
             "hra account add <label>",
             "hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]",
             "hra account login-cancel <profile>",
@@ -1102,7 +1135,7 @@ export const publicContent: PublicContent = {
             "hra project add --path <directory> [--name <name>]",
             "hra project list",
             "hra project use <project>",
-            "hra session list [--account <profile>] [--limit <1-100>] [--cursor <cursor>]",
+            "hra session list [--account <profile>] [--archived] [--limit <1-100>] [--cursor <cursor>]",
             "hra session show <session> [--detail]",
             "hra session status <session> [--json]",
             "hra session watch <session> [--cursor <cursor>] [--jsonl]",
@@ -1113,6 +1146,7 @@ export const publicContent: PublicContent = {
             "hra session stop <session>",
             "hra session rename <session> <name>",
             "hra session recover|abandon <session>",
+            "hra session archive|unarchive <session>",
             "hra session note get|edit|clear <session>",
             "hra session note set <session> <note>",
             "hra session state <session>",
@@ -1291,7 +1325,7 @@ export const renderPrivacyMarkdown = (content: PublicContent = publicContent): s
 
   return [
     "# Privacy",
-    "This policy describes the HRA beta data boundary. The hosted sync service is live as an invite-only beta. Besides completed turns, the daemon streams the current turn's assistant text to the hosted service in encrypted, redacted batches that expire within six hours; reasoning summaries are included only when you enable show-thinking for a session, and raw reasoning is never uploaded.",
+    `This policy describes the HRA beta data boundary. The hosted sync service is live as an ${hostedBetaLabel}. Besides completed turns, the daemon streams the current turn's assistant text to the hosted service in encrypted, redacted batches that expire within six hours; reasoning summaries are included only when you enable show-thinking for a session, and raw reasoning is never uploaded.`,
     renderMarkdownBlocks(privacy.blocks, 2),
     `Report a suspected boundary violation through [private vulnerability reporting](${content.links.privateSecurityReport}).`,
   ].join("\n\n") + "\n";

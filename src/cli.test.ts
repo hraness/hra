@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { closeSync, openSync } from "node:fs";
 import { PassThrough } from "node:stream";
 
 import {
@@ -2185,6 +2186,71 @@ describe("CLI entry point", () => {
     expect(JSON.stringify(captured.read())).not.toContain(secretAnswer);
   });
 
+  test("reads the gateway key from a descriptor and keeps it off argv and output", async () => {
+    // Twenty-four printable characters, assembled rather than written.
+    const key = ["gw", "k".repeat(22)].join("");
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-gateway-key-")));
+    try {
+      const file = join(home, "key");
+      await writeFile(file, `${key}\n`, { mode: 0o600 });
+      const descriptor = openSync(file, "r");
+      try {
+        const captured = capture();
+        const commands: LocalCommand[] = [];
+        const argv = ["autorespond", "gateway", "set", "--from-fd", String(descriptor), "--json"];
+        expect(argv.join(" ")).not.toContain(key);
+        expect(await main(argv, captured.output, {
+          callDaemon: (command) => {
+            commands.push(command);
+            return Promise.resolve({
+              data: { gateway: "configured", version: 1 },
+              ok: true,
+              requestId: "018bcfe5-6800-7000-8000-00000000077a",
+              version: 1,
+            });
+          },
+          isTerminalDescriptor: () => false,
+        })).toBe(0);
+        expect(commands).toEqual([{ key, kind: "autorespond.gateway-set" }]);
+        expect(JSON.stringify(captured.read())).not.toContain(key);
+        expect(captured.read().stdout).toContain("autorespond.gateway-set");
+      } finally {
+        closeSync(descriptor);
+      }
+    } finally {
+      await rm(home, { force: true, recursive: true });
+    }
+  });
+
+  test("refuses a gateway key that is not one printable line", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-gateway-key-bad-")));
+    try {
+      const file = join(home, "key");
+      await writeFile(file, "short\n", { mode: 0o600 });
+      const descriptor = openSync(file, "r");
+      try {
+        const captured = capture();
+        let daemonCalls = 0;
+        expect(await main(
+          ["autorespond", "gateway", "set", "--from-fd", String(descriptor), "--json"],
+          captured.output,
+          {
+            callDaemon: () => {
+              daemonCalls += 1;
+              throw new Error("Daemon must not be called.");
+            },
+            isTerminalDescriptor: () => false,
+          },
+        )).not.toBe(0);
+        expect(daemonCalls).toBe(0);
+      } finally {
+        closeSync(descriptor);
+      }
+    } finally {
+      await rm(home, { force: true, recursive: true });
+    }
+  });
+
   test("keeps identity invites and verification codes off argv and output", async () => {
     const captured = capture();
     const commands: LocalCommand[] = [];
@@ -2598,6 +2664,8 @@ describe("CLI entry point", () => {
       "device",
       "approve",
       "device_pending",
+      "--fingerprint",
+      "0000-1111-2222-3333-4444-5555-6666-7777",
       "--json",
     ], captured.output, {
       callDaemon: (command) => {
@@ -2621,7 +2689,11 @@ describe("CLI entry point", () => {
       },
     });
     expect(rendered.error.details.nextCommand)
-      .toBe(`hra device approve device_pending --idempotency-key ${generatedKey} --json`);
+      .toBe(
+        "hra device approve device_pending"
+        + " --fingerprint 0000-1111-2222-3333-4444-5555-6666-7777"
+        + ` --idempotency-key ${generatedKey} --json`,
+      );
   });
 
   test("keeps rejected projection recovery as an immutable receipt with one status action", async () => {

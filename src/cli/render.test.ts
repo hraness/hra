@@ -278,6 +278,8 @@ describe("CLI rendering", () => {
         {
           activatedAt: 1_700_000_000_000,
           current: true,
+          deviceClass: "daemon",
+          fingerprint: "0f1e-2d3c-4b5a-6978-8796-a5b4-c3d2-e1f0",
           keyVersion: 1,
           label: unsafeLabel,
           labelSource: "encrypted",
@@ -289,6 +291,8 @@ describe("CLI rendering", () => {
         },
         {
           current: false,
+          deviceClass: "browser",
+          fingerprint: "1111-2222-3333-4444-5555-6666-7777-8888",
           keyVersion: 1,
           label: "Pending device PPPPPPPP",
           labelSource: "fallback",
@@ -301,6 +305,8 @@ describe("CLI rendering", () => {
         {
           activatedAt: 1_699_999_000_000,
           current: false,
+          deviceClass: "daemon",
+          fingerprint: "9999-aaaa-bbbb-cccc-dddd-eeee-ffff-0000",
           keyVersion: 1,
           label: "Revoked device RRRRRRRR",
           labelSource: "fallback",
@@ -321,6 +327,9 @@ describe("CLI rendering", () => {
     expect(rendered).toContain("  Status:");
     expect(rendered).toContain("  Presence:");
     expect(rendered).toContain("  ID:");
+    expect(rendered).toContain("  Class: daemon");
+    expect(rendered).toContain("  Class: browser");
+    expect(rendered).toContain("  Fingerprint: 1111-2222-3333-4444-5555-6666-7777-8888");
     expect(rendered).toContain("Desk\\u{001b}[31m\\u{000a}Line");
     expect(rendered).not.toContain("\u001b");
     expect(rendered).not.toContain(unsafeLabel);
@@ -394,6 +403,8 @@ describe("CLI rendering", () => {
         currentDevicePublicId: publicId,
         devices: [{
           current: true,
+          deviceClass: "daemon",
+          fingerprint: "0f1e-2d3c-4b5a-6978-8796-a5b4-c3d2-e1f0",
           keyVersion: 1,
           label,
           labelSource: "encrypted",
@@ -431,6 +442,8 @@ describe("CLI rendering", () => {
       const publicId = `device_${String(index).padStart(8, "0")}`;
       return {
         current: index === 0,
+        deviceClass: "daemon" as const,
+        fingerprint: "0f1e-2d3c-4b5a-6978-8796-a5b4-c3d2-e1f0",
         keyVersion: 1,
         label: "\u200d".repeat(160),
         labelSource: "fallback" as const,
@@ -1944,7 +1957,7 @@ describe("CLI rendering", () => {
     };
     const human = capture();
     renderSuccess(
-      { kind: "session.list", account: "mutable-label", limit: 37, cursor: "earlier" },
+      { kind: "session.list", account: "mutable-label", archived: false, limit: 37, cursor: "earlier" },
       listing,
       false,
       human.output,
@@ -1963,7 +1976,7 @@ describe("CLI rendering", () => {
 
     const json = capture();
     renderSuccess(
-      { kind: "session.list", account: "mutable-label", limit: 37 },
+      { kind: "session.list", account: "mutable-label", archived: false, limit: 37 },
       listing,
       true,
       json.output,
@@ -1980,7 +1993,7 @@ describe("CLI rendering", () => {
     const privateSentinel = "PRIVATE-PROVIDER-THREAD-SENTINEL";
     const stripped = capture();
     renderSuccess(
-      { kind: "session.list", account: accountId, limit: 37 },
+      { kind: "session.list", account: accountId, archived: false, limit: 37 },
       {
         ...listing,
         sessions: listing.sessions.map((session) => ({
@@ -2016,7 +2029,7 @@ describe("CLI rendering", () => {
     ]) {
       const mismatched = capture();
       expect(() => renderSuccess(
-        { kind: "session.list", account: accountId, limit: 37 },
+        { kind: "session.list", account: accountId, archived: false, limit: 37 },
         response,
         true,
         mismatched.output,
@@ -2026,7 +2039,7 @@ describe("CLI rendering", () => {
 
     const malformed = capture();
     expect(() => renderSuccess(
-      { kind: "session.list", account: "mutable-label", limit: 37 },
+      { kind: "session.list", account: "mutable-label", archived: false, limit: 37 },
       { ...listing, nextCursor: "provider-cursor-must-not-render" },
       false,
       malformed.output,
@@ -2036,7 +2049,7 @@ describe("CLI rendering", () => {
 
     const unsafeMetadata = capture();
     expect(() => renderSuccess(
-      { kind: "session.list", account: "mutable-label", limit: 37 },
+      { kind: "session.list", account: "mutable-label", archived: false, limit: 37 },
       {
         ...listing,
         listing: {

@@ -3,6 +3,18 @@ import { v } from "convex/values";
 export const authAttemptKind = v.union(v.literal("send"), v.literal("verify"));
 export const authSubjectStatus = v.union(v.literal("active"), v.literal("disabled"));
 export const authAdmissionState = v.union(v.literal("open"), v.literal("frozen"));
+// Break-glass admission (`authAdmissionState`) gates every authenticated path.
+// New-identity admission is the separate, narrower control that decides whether
+// a first `authSubjects` row may be created without an invitation. An absent
+// stored value always means `invite_only`.
+export const newIdentityAdmissionState = v.union(
+  v.literal("invite_only"),
+  v.literal("open"),
+);
+// Only open admission is recorded on the subject. An invited subject keeps its
+// `admissionInviteId` instead, and an absent marker never means "no invite
+// required".
+export const authSubjectAdmittedBy = v.literal("open");
 export const challengeDeliveryState = v.union(
   v.literal("reserved"),
   v.literal("accepted"),
@@ -13,6 +25,9 @@ export const deviceStatus = v.union(
   v.literal("active"),
   v.literal("revoked"),
 );
+// A device row written before browser enrollment carries no class. An absent
+// field therefore means `daemon`, and `deviceClassOf` is the only reader.
+export const deviceClass = v.union(v.literal("daemon"), v.literal("browser"));
 export const sessionStatus = v.union(
   v.literal("active"),
   v.literal("idle"),
@@ -29,6 +44,12 @@ export const commandKind = v.union(
   v.literal("set_fast"),
   v.literal("resolve_interaction"),
   v.literal("send_or_steer"),
+  v.literal("set_approval_mode"),
+  v.literal("set_show_thinking"),
+  v.literal("set_default_preset"),
+  v.literal("archive_session"),
+  v.literal("rename_session"),
+  v.literal("set_gateway_key"),
 );
 export const commandState = v.union(
   v.literal("pending"),

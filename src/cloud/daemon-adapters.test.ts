@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import type { LocalCommand } from "../domain/contracts";
+import type { SessionId } from "../domain/values";
 import {
   createStoredAccountUsageSnapshot,
   storedAccountUsageSnapshotSchema,
@@ -44,6 +45,7 @@ import type {
   CloudLocalCommandAuthority,
 } from "./daemon-bridge";
 import { BridgedCloudControl, StateBackedCloudDaemonAdapter } from "./daemon-adapters";
+import { parseDeviceRegistryPayload } from "./payloads";
 import type { CloudRemoteControlPort } from "./local-control";
 
 const privateRootFixture = ["", "Users", "alice", "private"].join("/");
@@ -3118,10 +3120,10 @@ describe("bridged cloud control", () => {
         calls.push("key-loss");
         return Promise.resolve({ localOnly: true });
       },
-      approveDevice: (device, idempotencyKey, signal) => {
+      approveDevice: (device, idempotencyKey, fingerprint, signal) => {
         expect(signal.aborted).toBe(false);
         deviceSignals.push(signal);
-        calls.push(`approve:${device}:${idempotencyKey}`);
+        calls.push(`approve:${device}:${idempotencyKey}:${fingerprint}`);
         return Promise.resolve({ approved: true });
       },
       revokeDevice: (device, idempotencyKey, signal) => {
@@ -3193,16 +3195,21 @@ describe("bridged cloud control", () => {
     calls.length = 0;
     const deviceSignal = new AbortController().signal;
     const approvalKey = "018bcfe5-6800-7000-8000-000000000031";
+    const approvalFingerprint = "0000-1111-2222-3333-4444-5555-6666-7777";
     const revocationKey = "018bcfe5-6800-7000-8000-000000000032";
     expect(await combined.acknowledgeNoAccountKeyHolders(deviceSignal))
       .toEqual({ localOnly: true });
-    expect(await combined.approveDevice("device_pending", approvalKey, deviceSignal))
-      .toEqual({ approved: true });
+    expect(await combined.approveDevice(
+      "device_pending",
+      approvalKey,
+      approvalFingerprint,
+      deviceSignal,
+    )).toEqual({ approved: true });
     expect(await combined.revokeDevice("device_active", revocationKey, deviceSignal))
       .toEqual({ revoked: true });
     expect(calls).toEqual([
       "key-loss",
-      `approve:device_pending:${approvalKey}`,
+      `approve:device_pending:${approvalKey}:${approvalFingerprint}`,
       `revoke:device_active:${revocationKey}`,
     ]);
     expect(deviceSignals).toEqual([deviceSignal, deviceSignal]);
@@ -3247,6 +3254,225 @@ describe("remote decisions at the custodian", () => {
         signal,
       })).toEqual({ code: "INTERACTION_NOT_FOUND", state: "failed" });
       expect(commands.filter((command) => command.kind === "interaction.resolve")).toHaveLength(0);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+});
+
+describe("settings commands and the device registry", () => {
+  const leaseAuthority = { bootGeneration: 1, bootId: "boot_00000001", fence: 1 } as const;
+
+  test("applies every settings command locally and never reaches the provider", async () => {
+    const value = await fixture();
+    const commands: LocalCommand[] = [];
+    const gatewayKeys: string[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
+      gatewayKeyCustody: {
+        hasKey: () => Promise.resolve(gatewayKeys.length > 0),
+        setKey: (key) => { gatewayKeys.push(key); return Promise.resolve(); },
+      },
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const authority = await adapter.resolveCommandAuthority({ sessionPublicId: value.sessionId, signal });
+      expect(authority).not.toBeNull();
+      let sequence = 30;
+      const execute = async (
+        payload: Parameters<typeof adapter.execute>[0]["payload"],
+      ): Promise<unknown> => {
+        sequence += 1;
+        return await adapter.execute({
+          authority: authority as CloudLocalCommandAuthority,
+          idempotencyKey: `00000000-0000-7000-8000-0000000000${String(sequence)}`,
+          leaseAuthority,
+          payload,
+          sessionPublicId: value.sessionId,
+          signal,
+        });
+      };
+
+      expect(await execute({ kind: "set_approval_mode", mode: "manual", scope: "session" }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(value.store.readSessionApprovalMode(value.sessionId as SessionId))
+        .toEqual({ mode: "manual", source: "session" });
+      expect(await execute({ kind: "set_approval_mode", mode: "auto:workspace", scope: "default" }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(value.store.readDefaultApprovalMode()).toBe("auto:workspace");
+
+      expect(await execute({ kind: "set_show_thinking", enabled: true, scope: "session" }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(value.store.readSessionShowThinking(value.sessionId as SessionId))
+        .toEqual({ enabled: true, source: "session" });
+      expect(await execute({ kind: "set_show_thinking", enabled: true, scope: "default" }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(value.store.readDefaultShowThinking()).toBe(true);
+
+      expect(await execute({ kind: "set_default_preset", preset: "low" }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(value.store.readDefaultPreset()).toBe("low");
+
+      expect(await execute({ kind: "archive_session", archived: true }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(value.store.requireSession(value.sessionId).archivedAt).toBeGreaterThan(0);
+      expect(value.store.listSessions(50).map((session) => session.id)).not.toContain(value.sessionId);
+      expect(value.store.listSessions(50, undefined, true).map((session) => session.id))
+        .toContain(value.sessionId);
+      expect(await execute({ kind: "archive_session", archived: false }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(value.store.requireSession(value.sessionId).archivedAt).toBeUndefined();
+
+      const gatewayKey = ["gw", "k".repeat(24)].join("-");
+      expect(await execute({ kind: "set_gateway_key", key: gatewayKey }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(gatewayKeys).toEqual([gatewayKey]);
+
+      // No settings command touches the provider.
+      expect(commands).toEqual([]);
+
+      // Renaming is provider-observable and stays on the execution path; a
+      // cleared name resets the session to the default title.
+      expect(await execute({ kind: "rename_session", name: "Renamed remotely" }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(commands.at(-1)).toMatchObject({ kind: "session.rename", name: "Renamed remotely" });
+      expect(await execute({ kind: "rename_session", name: null }))
+        .toEqual({ code: "APPLIED", state: "applied" });
+      expect(commands.at(-1)).toMatchObject({ kind: "session.rename", name: "Untitled session" });
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("live projection honours the stored show-thinking setting", async () => {
+    const value = await fixture();
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      expect((await adapter.readLiveEvents({
+        afterLocalSequence: null,
+        limit: 10,
+        sessionPublicId: value.sessionId,
+        signal,
+      })).includeThinking).toBe(false);
+      value.store.setSessionShowThinking(value.sessionId as SessionId, true);
+      expect((await adapter.readLiveEvents({
+        afterLocalSequence: null,
+        limit: 10,
+        sessionPublicId: value.sessionId,
+        signal,
+      })).includeThinking).toBe(true);
+      value.store.setSessionShowThinking(value.sessionId as SessionId, null);
+      value.store.setDefaultShowThinking(true);
+      expect((await adapter.readLiveEvents({
+        afterLocalSequence: null,
+        limit: 10,
+        sessionPublicId: value.sessionId,
+        signal,
+      })).includeThinking).toBe(true);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("projects labels only, merges Codex automations, and marks archived sessions", async () => {
+    const value = await fixture();
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      gatewayKeyCustody: { hasKey: () => Promise.resolve(true), setKey: () => Promise.resolve() },
+      machineLabel: "Studio",
+      paths: value.paths,
+      readCodexAutomations: () => Promise.resolve([
+        {
+          cadence: "FREQ=WEEKLY;BYDAY=MO",
+          id: "upload-usage",
+          kind: "heartbeat",
+          label: "Upload usage",
+          status: "active" as const,
+          targetThreadId: "thread_0001",
+          updatedAt: 1_000,
+        },
+        {
+          cadence: "FREQ=HOURLY;INTERVAL=6",
+          id: "unknown-thread",
+          kind: "heartbeat",
+          label: "Other machine automation",
+          status: "paused" as const,
+          targetThreadId: "thread_9999",
+          updatedAt: 1_000,
+        },
+      ]),
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const registry = await adapter.readDeviceRegistry({ signal });
+      expect(parseDeviceRegistryPayload(registry)).toEqual(registry);
+      expect(registry).toMatchObject({
+        defaultApprovalMode: "auto:all",
+        defaultPreset: "ultra",
+        machineLabel: "Studio",
+        proseAutorespondConfigured: true,
+        showThinkingDefault: false,
+        version: 1,
+      });
+      // The fixture account and session labels embed a private path; the
+      // projection replaces them rather than leaking a filesystem location.
+      expect(JSON.stringify(registry)).not.toContain(privateRootFixture);
+      expect(registry.accounts).toEqual([
+        expect.objectContaining({ provider: "codex", publicId: expect.any(String), status: "signed_in" }),
+      ]);
+      expect(registry.scheduledTasks).toEqual([
+        expect.objectContaining({
+          cadence: "FREQ=WEEKLY;BYDAY=MO",
+          id: "upload-usage",
+          kind: "codex_automation",
+          label: "Upload usage",
+          nextRunAt: null,
+          sessionPublicId: value.sessionId,
+        }),
+        expect.objectContaining({
+          id: "unknown-thread",
+          kind: "codex_automation",
+          sessionPublicId: null,
+        }),
+      ]);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("uploads the archived flag in session metadata only while archived", async () => {
+    const value = await fixture();
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const before = await adapter.listSessions({ limit: 10, signal });
+      expect(before.sessions.at(0)?.metadata.archived).toBeUndefined();
+      value.store.setSessionArchived(value.sessionId as SessionId, true);
+      const archived = await adapter.listSessions({ limit: 10, signal });
+      expect(archived.sessions.at(0)?.metadata.archived).toBe(true);
+      value.store.setSessionArchived(value.sessionId as SessionId, false);
+      const restored = await adapter.listSessions({ limit: 10, signal });
+      expect(restored.sessions.at(0)?.metadata.archived).toBeUndefined();
     } finally {
       adapter.close();
       value.store.close();

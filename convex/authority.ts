@@ -64,6 +64,32 @@ export async function requireDeviceAuthority(ctx: ReadCtx) {
   return { ...auth, binding, device, deviceId: device._id };
 }
 
+export type DeviceClass = "daemon" | "browser";
+
+// Every device row written before browser enrollment carries no class. Absence
+// is `daemon`, so legacy rows keep full daemon authority without a migration.
+export function deviceClassOf(
+  device: Readonly<{ deviceClass?: DeviceClass }>,
+): DeviceClass {
+  return device.deviceClass ?? "daemon";
+}
+
+// A browser device is a key holder for the projection only. It may read, report
+// presence, and enqueue commands; it may never administer devices and never
+// perform a write the daemon owns as execution custodian.
+export async function requireDaemonDevice(
+  ctx: ReadCtx,
+  duty: "administer" | "execute" = "execute",
+) {
+  const authority = await requireDeviceAuthority(ctx);
+  if (deviceClassOf(authority.device) !== "daemon") {
+    throw new Error(duty === "administer"
+      ? "BROWSER_DEVICE_CANNOT_ADMINISTER"
+      : "BROWSER_DEVICE_CANNOT_EXECUTE");
+  }
+  return authority;
+}
+
 export async function requireRegisteredDeviceAuthority(ctx: ReadCtx) {
   const auth = await requireAuthAuthority(ctx);
   const bindings = await ctx.db

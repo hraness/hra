@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import {
   hasExactKeys,
+  isCommandKind,
   isDigest,
   isOpaqueIdentifier,
   isRecord,
@@ -864,16 +865,7 @@ export class CloudDaemonJournalRecoveryBlocker {
 }
 
 function parseCommandKind(value: unknown): CommandKind | null {
-  return value === "send"
-    || value === "queue"
-    || value === "steer"
-    || value === "stop"
-    || value === "set_model"
-    || value === "set_fast"
-    || value === "resolve_interaction"
-    || value === "send_or_steer"
-    ? value
-    : null;
+  return isCommandKind(value) ? value : null;
 }
 
 function parseCommand(value: unknown): CloudCommandJournalEntry {

@@ -19,6 +19,7 @@ import {
 } from "../src/cloud/commands";
 import {
   rejectAuthority,
+  requireDaemonDevice,
   requireDeviceAuthority,
 } from "./authority";
 import { validateIdempotencyInput } from "./idempotency";
@@ -204,7 +205,13 @@ function publicCommand(command: Readonly<{
     | "set_model"
     | "set_fast"
     | "resolve_interaction"
-    | "send_or_steer";
+    | "send_or_steer"
+    | "set_approval_mode"
+    | "set_show_thinking"
+    | "set_default_preset"
+    | "archive_session"
+    | "rename_session"
+    | "set_gateway_key";
   payload: Parameters<typeof parseEncryptedEnvelope>[0];
   publicId: string;
   result?: Parameters<typeof parseEncryptedEnvelope>[0];
@@ -423,7 +430,7 @@ async function requireCommandExecutionAuthority(
   commandPublicId: string,
   authorityTupleValue: AuthorityTuple,
 ) {
-  const authority = await requireDeviceAuthority(ctx);
+  const authority = await requireDaemonDevice(ctx);
   if (!isUuidV7(commandPublicId)) rejectAuthority();
   const command = await commandByPublicId(ctx, commandPublicId);
   if (

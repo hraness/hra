@@ -11,6 +11,7 @@ import {
 } from "../src/install-preflight";
 import packageJson from "../package.json";
 import {
+  hostedSignupCopy,
   publicContent,
   publicPins,
   publicReleaseState,
@@ -242,6 +243,32 @@ describe("public content contract", () => {
     expect(renderLlmsText()).not.toContain("Install the live v0.3.0 beta");
   });
 
+  test("states one hosted sign-up claim everywhere and switches it in one place", () => {
+    expect(publicContent.hostedSignup).toBe("invite_only");
+    for (const surface of [
+      renderReadmeMarkdown(),
+      renderSiteHtml(),
+      renderPrivacyMarkdown(),
+    ]) {
+      expect(surface).not.toContain("open beta");
+    }
+    expect(renderReadmeMarkdown()).toContain(
+      "new identities need an invitation from an existing member",
+    );
+    expect(renderPrivacyMarkdown()).toContain(
+      "The hosted sync service is live as an invite-only beta",
+    );
+    // The open-beta wording is one constant away, and nothing else changes.
+    expect(hostedSignupCopy(publicContent.hostedSignup)).toEqual({
+      admissionClaim: "The first identity and device were admitted on the production deployment on 2026-09-03; new identities need an invitation from an existing member.",
+      betaLabel: "invite-only beta",
+    });
+    expect(hostedSignupCopy("open")).toEqual({
+      admissionClaim: "Anyone can create an identity with an email address and a one-time code; an invitation is optional.",
+      betaLabel: "open beta",
+    });
+  });
+
   test("publishes protected cloud auth and the exact device-pairing path", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
@@ -277,7 +304,8 @@ describe("public content contract", () => {
       expect(surface).not.toContain("auth login --code");
     }
     expect(markdown).toContain(
-      "hra device approve <pending-device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
+      "hra device approve <pending-device-id-or-prefix> --fingerprint <value>"
+      + " [--idempotency-key <current-uuidv7>]",
     );
     expect(html).toContain("hra device approve &lt;pending-device-id-or-prefix&gt;");
     for (const claim of [

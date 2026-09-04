@@ -5,6 +5,7 @@ import fc from "fast-check";
 import {
   CliUsageError,
   completeProtectedAuthLogin,
+  deviceMutationReplayCommand,
   completeProtectedInteraction,
   helpGroupNames,
   parseCli,
@@ -325,6 +326,7 @@ describe("CLI parser", () => {
       command: {
         kind: "session.list",
         account: "mutable-label",
+        archived: false,
         limit: 37,
         cursor,
       },
@@ -334,6 +336,22 @@ describe("CLI parser", () => {
       .toThrow(CliUsageError);
     expect(() => parseCli(["session", "list", "--limit", "1.5"]))
       .toThrow("session limit must be an integer from 1 to 100");
+  });
+
+  test("parses session archive, unarchive, and the archived listing filter", () => {
+    expect(parseCli(["session", "archive", "sess-1"]))
+      .toEqual({ kind: "command", command: { kind: "session.archive", session: "sess-1", archived: true }, json: false });
+    expect(parseCli(["session", "unarchive", "sess-1"]))
+      .toEqual({ kind: "command", command: { kind: "session.archive", session: "sess-1", archived: false }, json: false });
+    expect(parseCli(["session", "list", "--archived"]))
+      .toEqual({ kind: "command", command: { kind: "session.list", archived: true, limit: 50 }, json: false });
+    expect(parseCli(["session", "list"]))
+      .toMatchObject({ command: { archived: false } });
+    for (const argv of [
+      ["session", "archive"],
+      ["session", "archive", "sess-1", "extra"],
+      ["session", "unarchive"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
   });
 
   test("maps cloud session reads and the closed remote command set", () => {
@@ -594,7 +612,13 @@ describe("CLI parser", () => {
   });
 
   test("generates and preserves one current UUIDv7 for each device mutation", () => {
-    const generated = parseCli(["device", "approve", "device_target"]);
+    const generated = parseCli([
+      "device",
+      "approve",
+      "device_target",
+      "--fingerprint",
+      "0000-1111-2222-3333-4444-5555-6666-7777",
+    ]);
     if (generated.kind !== "command" || generated.command.kind !== "device.approve") {
       throw new Error("Expected a device approval command.");
     }
@@ -617,9 +641,39 @@ describe("CLI parser", () => {
       "device",
       "approve",
       "device_target",
+      "--fingerprint",
+      "0000-1111-2222-3333-4444-5555-6666-7777",
       "--idempotency-key",
       "00000000-0000-4000-8000-000000000001",
     ])).toThrow("current UUIDv7");
+  });
+
+  test("binds device approval to a displayed key fingerprint", () => {
+    const fingerprint = "8144-52ea-9db6-227b-786f-8c8c-eec0-6435";
+    const approval = parseCli(["device", "approve", "device_target", "--fingerprint", fingerprint]);
+    if (approval.kind !== "command" || approval.command.kind !== "device.approve") {
+      throw new Error("Expected a device approval command.");
+    }
+    expect(approval.command.fingerprint).toBe(fingerprint);
+    expect(deviceMutationReplayCommand(approval.command, true)).toBe(
+      "hra device approve device_target"
+      + ` --fingerprint ${fingerprint}`
+      + ` --idempotency-key ${approval.command.idempotencyKey} --json`,
+    );
+
+    expect(() => parseCli(["device", "approve", "device_target"]))
+      .toThrow("requires --fingerprint");
+    expect(() => parseCli(["device", "approve", "device_target", "--fingerprint", "nope"]))
+      .toThrow("eight lower-case hex groups");
+    expect(() => parseCli([
+      "device",
+      "approve",
+      "device_target",
+      "--fingerprint",
+      fingerprint.toUpperCase(),
+    ])).toThrow("eight lower-case hex groups");
+    expect(() => parseCli(["device", "revoke", "device_target", "--fingerprint", fingerprint]))
+      .toThrow();
   });
 
   test("parses only the exact local account-key loss acknowledgement", () => {
@@ -1433,5 +1487,30 @@ describe("autorespond parsing", () => {
     });
     expect(() => parseCli(["autorespond", "default"])).toThrow("--session");
     expect(() => parseCli(["autorespond", "maybe"])).toThrow("Unknown autorespond action");
+  });
+
+  test("reads the gateway key from a descriptor and never from an argument", () => {
+    expect(parseCli(["autorespond", "gateway", "set"])).toEqual({
+      input: { kind: "stdin" },
+      json: false,
+      kind: "autorespond.gateway-set",
+    });
+    expect(parseCli(["autorespond", "gateway", "set", "--from-fd", "3", "--json"])).toEqual({
+      input: { fd: 3, kind: "fd" },
+      json: true,
+      kind: "autorespond.gateway-set",
+    });
+    expect(parseCli(["autorespond", "gateway", "clear"])).toEqual({
+      command: { kind: "autorespond.gateway-clear" },
+      json: false,
+      kind: "command",
+    });
+    // The key is never accepted positionally, on stdout, or on stderr.
+    expect(() => parseCli(["autorespond", "gateway", "set", ["gw", "k".repeat(22)].join("")]))
+      .toThrow();
+    expect(() => parseCli(["autorespond", "gateway", "set", "--from-fd", "1"])).toThrow("stdout");
+    expect(() => parseCli(["autorespond", "gateway", "set", "--from-fd", "2"])).toThrow("stderr");
+    expect(() => parseCli(["autorespond", "gateway", "clear", "--from-fd", "3"])).toThrow("--from-fd");
+    expect(() => parseCli(["autorespond", "gateway", "rotate"])).toThrow("Unknown autorespond gateway action");
   });
 });

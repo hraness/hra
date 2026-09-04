@@ -25,6 +25,8 @@ import {
   containsAbsolutePath,
   hasExactKeys,
   isBase64Url,
+  isDeviceKeyFingerprint,
+  isCommandKind,
   isDigest,
   isFiniteTimestamp,
   isOpaqueIdentifier,
@@ -37,6 +39,7 @@ import {
   parseEncryptedEnvelope,
   parseWrappedKeyEnvelope,
   type AccountKeyStatus,
+  type CloudDeviceClass,
   type CloudDeviceList,
   type CloudDeviceListEntry,
   type CommandState,
@@ -46,6 +49,7 @@ import {
 import {
   decodeBase64Url,
   decryptBytes,
+  deviceKeyFingerprint,
   encodeBase64Url,
   encryptBytes,
   exportDevicePrivateKey,
@@ -604,12 +608,14 @@ type AccountOperationAuthority = Readonly<{
 
 type DeviceRecord = Readonly<{
   activatedAt?: number;
+  deviceClass: CloudDeviceClass;
   encryptedLabel: EncryptedEnvelope;
   keyVersion: number;
   lastSeenAt: number | null;
   online: boolean;
   publicId: string;
   revision: number;
+  signingPublicKey: string;
   status: DeviceStatus;
   userPublicId: string;
   wrappingPublicKey: string;
@@ -1532,14 +1538,7 @@ function parsePendingRemoteCommand(value: string): PendingRemoteCommand {
     || !isFiniteTimestamp(decoded.deadline)
     || envelope === null
     || !isUuidV7(decoded.idempotencyKey)
-    || (decoded.kind !== "send"
-      && decoded.kind !== "queue"
-      && decoded.kind !== "steer"
-      && decoded.kind !== "stop"
-      && decoded.kind !== "set_model"
-      && decoded.kind !== "set_fast"
-      && decoded.kind !== "resolve_interaction"
-      && decoded.kind !== "send_or_steer")
+    || !isCommandKind(decoded.kind)
     || !isDigest(decoded.payloadDigest)
     || !isDigest(decoded.requestDigest)
     || (decoded.version === 2
@@ -1665,14 +1664,24 @@ function publicAccountDevice(device: AccountContext["device"]): null | Readonly<
   };
 }
 
+// The summary carries the device class for the browser app. A daemon acts on
+// its own registration and mutations, so it validates the field and keeps the
+// durable local mutation receipt in its existing three-field shape.
 function parseDeviceSummary(value: unknown): Readonly<{
   publicId: string;
   revision: number;
   status: DeviceStatus;
 }> {
+  const required = ["publicId", "revision", "status"];
   if (
     !isRecord(value)
-    || !hasExactKeys(value, ["publicId", "revision", "status"])
+    || !hasExactKeys(
+      value,
+      value.deviceClass === undefined ? required : [...required, "deviceClass"],
+    )
+    || (value.deviceClass !== undefined
+      && value.deviceClass !== "daemon"
+      && value.deviceClass !== "browser")
     || !isOpaqueIdentifier(value.publicId)
     || !isSafePositiveInteger(value.revision)
     || (value.status !== "pending" && value.status !== "active" && value.status !== "revoked")
@@ -1683,12 +1692,14 @@ function parseDeviceSummary(value: unknown): Readonly<{
 function parseDeviceRecord(value: unknown): DeviceRecord {
   if (!isRecord(value)) throw new Error("Cloud device response is invalid.");
   const required = [
+    "deviceClass",
     "encryptedLabel",
     "keyVersion",
     "lastSeenAt",
     "online",
     "publicId",
     "revision",
+    "signingPublicKey",
     "status",
     "userPublicId",
     "wrappingPublicKey",
@@ -1698,6 +1709,7 @@ function parseDeviceRecord(value: unknown): DeviceRecord {
   if (
     !hasExactKeys(value, keys)
     || encryptedLabel === null
+    || (value.deviceClass !== "daemon" && value.deviceClass !== "browser")
     || !isSafePositiveInteger(value.keyVersion)
     || (value.lastSeenAt !== null && !isFiniteTimestamp(value.lastSeenAt))
     || typeof value.online !== "boolean"
@@ -1707,18 +1719,22 @@ function parseDeviceRecord(value: unknown): DeviceRecord {
     || (value.status !== "pending" && value.status !== "active" && value.status !== "revoked")
     || (value.status === "revoked" && value.online)
     || !isOpaqueIdentifier(value.userPublicId)
+    || typeof value.signingPublicKey !== "string"
+    || parseDevicePublicKeyJson(value.signingPublicKey) === null
     || typeof value.wrappingPublicKey !== "string"
     || parseDevicePublicKeyJson(value.wrappingPublicKey) === null
     || (value.activatedAt !== undefined && !isFiniteTimestamp(value.activatedAt))
   ) throw new Error("Cloud device response is invalid.");
   return {
     ...(typeof value.activatedAt === "number" ? { activatedAt: value.activatedAt } : {}),
+    deviceClass: value.deviceClass,
     encryptedLabel,
     keyVersion: value.keyVersion,
     lastSeenAt: value.lastSeenAt,
     online: value.online,
     publicId: value.publicId,
     revision: value.revision,
+    signingPublicKey: value.signingPublicKey,
     status: value.status,
     userPublicId: value.userPublicId,
     wrappingPublicKey: value.wrappingPublicKey,
@@ -1904,16 +1920,7 @@ function parseCommandState(value: unknown): CommandState | null {
 }
 
 function parseRemoteCommandKind(value: unknown): RemoteCommandPayload["kind"] | null {
-  return value === "send"
-    || value === "queue"
-    || value === "steer"
-    || value === "stop"
-    || value === "set_model"
-    || value === "set_fast"
-    || value === "resolve_interaction"
-    || value === "send_or_steer"
-    ? value
-    : null;
+  return isCommandKind(value) ? value : null;
 }
 
 function parseRemoteCommandReceipt(value: unknown): Readonly<{
@@ -3036,6 +3043,11 @@ export class LocalCloudControl implements CloudControlPort {
         publicDevices.push({
           ...(device.activatedAt === undefined ? {} : { activatedAt: device.activatedAt }),
           current,
+          deviceClass: device.deviceClass,
+          fingerprint: await deviceKeyFingerprint(
+            device.signingPublicKey,
+            device.wrappingPublicKey,
+          ),
           keyVersion: device.keyVersion,
           label: decryptedLabel ?? fallbackDeviceLabel(device, current),
           labelSource: decryptedLabel === null ? "fallback" : "encrypted",
@@ -3084,15 +3096,22 @@ export class LocalCloudControl implements CloudControlPort {
     }
   }
 
+  // Approval always binds to the fingerprint the operator was shown, so an
+  // enrolling browser tab cannot substitute another key pair behind the
+  // opaque public ID.
   async approveDevice(
     selector: string,
     idempotencyKey: string,
+    fingerprint: string,
     signal: AbortSignal,
   ): Promise<unknown> {
     if (!isUuidV7(idempotencyKey)) {
       throw new Error("Cloud device mutation idempotency key is invalid.");
     }
-    return await this.#mutateDevice("approve", selector, idempotencyKey, signal);
+    if (!isDeviceKeyFingerprint(fingerprint)) {
+      throw new Error("Cloud device fingerprint is invalid.");
+    }
+    return await this.#mutateDevice("approve", selector, idempotencyKey, signal, fingerprint);
   }
 
   async revokeDevice(
@@ -3103,7 +3122,7 @@ export class LocalCloudControl implements CloudControlPort {
     if (!isUuidV7(idempotencyKey)) {
       throw new Error("Cloud device mutation idempotency key is invalid.");
     }
-    return await this.#mutateDevice("revoke", selector, idempotencyKey, signal);
+    return await this.#mutateDevice("revoke", selector, idempotencyKey, signal, null);
   }
 
   async #mutateDevice(
@@ -3111,6 +3130,7 @@ export class LocalCloudControl implements CloudControlPort {
     selector: string,
     idempotencyKey: string,
     signal: AbortSignal,
+    expectedFingerprint: string | null,
   ): Promise<unknown> {
     return await this.#exclusive(async () => {
       abortBeforeEffect(signal);
@@ -3120,6 +3140,13 @@ export class LocalCloudControl implements CloudControlPort {
         throw new Error(kind === "approve"
           ? "The current cloud device is already active."
           : "The current cloud device cannot revoke itself.");
+      }
+      if (expectedFingerprint !== null) {
+        const observed = await deviceKeyFingerprint(
+          target.signingPublicKey,
+          target.wrappingPublicKey,
+        );
+        if (observed !== expectedFingerprint) throw new Error("DEVICE_FINGERPRINT_MISMATCH");
       }
 
       const custody = await this.#readDeviceMutationCustody(account.userPublicId);

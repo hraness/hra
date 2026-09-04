@@ -14,14 +14,21 @@ import {
   renameSync,
   unlinkSync,
 } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { Database } from "bun:sqlite";
 
+import { readCodexAutomations, type CodexAutomation } from "../codex/automations";
 import { parseAccountUsage, parseRateLimits, type RateLimitSnapshot } from "../codex/protocol";
 import type { LocalCommand } from "../domain/contracts";
 import type { InteractionRecord } from "../domain/interactions";
-import type { RemoteCommandPayload } from "./payloads";
+import {
+  deviceRegistryLimits,
+  type DeviceRegistryPayload,
+  type DeviceRegistryScheduledTask,
+  type RemoteCommandPayload,
+} from "./payloads";
 import { providerUsagePayload } from "../domain/usage-metrics";
 import type { SessionEvent } from "../domain/session-events";
 import { queueIdSchema, sessionIdSchema } from "../domain/values";
@@ -32,6 +39,7 @@ import type {
   ProfileAuthority,
 } from "../daemon/ports";
 import { profilePaths, type StatePaths } from "../storage/paths";
+import { HRA_VERSION } from "../version";
 import type {
   InteractionListPosition,
   ProfileRecord,
@@ -61,6 +69,7 @@ import type {
   CloudLocalSessionPage,
   CloudLocalUsageSnapshot,
 } from "./daemon-bridge";
+import type { CloudSyncCadenceStatus } from "./daemon-lifecycle";
 import type {
   CloudRemoteCommandReceipt,
   CloudRemoteCommandStatus,
@@ -72,6 +81,7 @@ import type {
 import {
   isProjectRelativePath,
   parseCompactSessionEvents,
+  type CompactMessageActor,
   type CompactSessionEvent,
   type GitAction,
 } from "./projection";
@@ -96,6 +106,11 @@ type ProviderRemoteLocalCommand = Extract<LocalCommand, Readonly<{
   kind: "session.send" | "session.queue" | "session.steer" | "session.stop" | "session.rename" | "session.preset" | "session.fast" | "interaction.resolve";
 }>>;
 
+/** Remote command kinds that only change local daemon settings. */
+type SettingCommandPayload = Extract<RemoteCommandPayload, Readonly<{
+  kind: "set_approval_mode" | "set_show_thinking" | "set_default_preset" | "archive_session" | "set_gateway_key";
+}>>;
+
 type LocalExecuteRemote = (
   command: ProviderRemoteLocalCommand,
   expected: Readonly<{
@@ -108,7 +123,12 @@ type LocalExecuteRemote = (
 ) => Promise<unknown>;
 
 type CompactSessionEventBody =
-  | Readonly<{ kind: "user_message" | "assistant_message"; text: string; turnId: string }>
+  | Readonly<{
+      actor?: CompactMessageActor;
+      kind: "user_message" | "assistant_message";
+      text: string;
+      turnId: string;
+    }>
   | Readonly<{
       blocking: boolean;
       interactionId: string;
@@ -557,9 +577,31 @@ function boundedNote(value: string): string | null {
   return boundedUtf8Text(boundedText(value, 8_000), 10_000);
 }
 
+const defaultSessionTitle = "Untitled session";
+
 function boundedName(value: string): string {
   const name = boundedText(value, 160).trim();
-  return name.length === 0 ? "Untitled session" : name;
+  return name.length === 0 ? defaultSessionTitle : name;
+}
+
+/**
+ * Registry labels are display text. A value that carries an absolute path or
+ * a control scalar is replaced by the fallback rather than redacted in place:
+ * the settings projection shows names, never anything derived from the
+ * filesystem, and `parseDeviceRegistryPayload` refuses the rest.
+ */
+function registryLabel(
+  value: string,
+  fallback: string,
+  maximum: number = deviceRegistryLimits.labelCharacters,
+): string {
+  const label = boundedText(value, maximum).trim();
+  if (
+    label.length === 0
+    || containsAbsolutePath(label)
+    || containsUnsafeTerminalScalar(label)
+  ) return fallback;
+  return label;
 }
 
 function compactInteractionSummary(kind: InteractionRecord["kind"]): string {
@@ -674,6 +716,9 @@ function parseStoredEvents(value: string): readonly CompactSessionEvent[] {
 function compactSessionEventBody(event: CompactSessionEvent): CompactSessionEventBody {
   if (event.kind === "user_message" || event.kind === "assistant_message") {
     return {
+      ...(event.kind === "user_message" && event.actor !== undefined
+        ? { actor: event.actor }
+        : {}),
       kind: event.kind,
       text: event.text,
       turnId: event.turnId,
@@ -1962,7 +2007,13 @@ function completedProjectionTurns(
     const text = scheduledTaskSource
       ? scheduledTaskPromptProjectionMarker
       : boundedText(message.text, 64_000);
+    // A user message HRA authored on the human's behalf is labelled so the web
+    // grid can tell an autoresponse from something the human actually typed.
+    const autorespondAuthored = message.role === "user"
+      && message.clientId !== undefined
+      && store.isAutorespondMessageSource(session.id, message.clientId);
     messages.push({
+      ...(autorespondAuthored ? { actor: "autorespond" as const } : {}),
       kind: message.role === "user" ? "user_message" : "assistant_message",
       text,
       turnId: message.turnId,
@@ -2080,14 +2131,30 @@ function orderedProjectionInteractions(
       || left.publicId.localeCompare(right.publicId));
 }
 
+/**
+ * Local custody for the responder gateway key. Injected so the adapter never
+ * needs a real state directory in a test, and so the prose-autorespond work
+ * package can hand in its own custody without changing this file.
+ */
+export type CloudGatewayKeyCustody = Readonly<{
+  hasKey(): Promise<boolean>;
+  setKey(key: string): Promise<void>;
+}>;
+
 export type StateBackedCloudDaemonAdapterOptions = Readonly<{
   cloudIdentityNamespace?: string | null;
   codex: CodexRuntimePort;
+  /** Local custody for the responder gateway key (default: none; `set_gateway_key` is refused). */
+  gatewayKeyCustody?: CloudGatewayKeyCustody;
   executeRemote: LocalExecuteRemote;
   /** Project reasoning summary deltas to the live stream (default off). */
   liveThinking?: boolean;
+  /** Display name for this machine in the device registry (default: the host name). */
+  machineLabel?: string;
   now?: () => number;
   paths: StatePaths;
+  /** Read-only Codex Desktop automations source for the scheduled-task registry. */
+  readCodexAutomations?: () => Promise<readonly CodexAutomation[]>;
   store: StateStore;
 }>;
 
@@ -2142,9 +2209,24 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
   readonly #projectionRecoveryErrors = new Set<string>();
   readonly #store: StateStore;
   readonly #liveThinking: boolean;
+  readonly #gatewayKeyCustody: CloudGatewayKeyCustody;
+  readonly #machineLabel: string;
+  readonly #readCodexAutomations: () => Promise<readonly CodexAutomation[]>;
+  readonly #registryNow: () => number;
 
   constructor(options: StateBackedCloudDaemonAdapterOptions) {
     this.#liveThinking = options.liveThinking ?? false;
+    this.#registryNow = options.now ?? Date.now;
+    this.#machineLabel = registryLabel(options.machineLabel ?? hostname(), "This machine");
+    // Without an injected custody the adapter reports no key and refuses to
+    // store one: the CLI hands in the daemon's generational secret custody so
+    // the key the hosted command stores is the key the responder reads.
+    this.#gatewayKeyCustody = options.gatewayKeyCustody ?? {
+      hasKey: async () => false,
+      setKey: async () => { throw new Error("Gateway key custody is not available."); },
+    };
+    this.#readCodexAutomations = options.readCodexAutomations
+      ?? (async () => (await readCodexAutomations()).automations);
     if (
       options.cloudIdentityNamespace !== undefined
       && options.cloudIdentityNamespace !== null
@@ -2614,6 +2696,10 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
     return { profile, session: session as SessionRecord & { providerThreadId: string } };
   }
 
+  hasActiveTurn(): boolean {
+    return this.#store.hasSessionWithActiveTurn();
+  }
+
   async listSessions(input: Readonly<{
     afterPublicId?: string | null;
     limit: number;
@@ -2708,7 +2794,14 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
       if (!includeHead) continue;
       heads.push({
         createdAt: session.createdAt,
-        metadata: { name: boundedName(session.title), note: boundedNote(session.note) },
+        metadata: {
+          // Additive: the key appears only for an archived session, so an
+          // unarchived session's metadata keeps its pre-archive bytes and
+          // does not force a metadata update on every existing session.
+          ...(session.archivedAt === undefined ? {} : { archived: true }),
+          name: boundedName(session.title),
+          note: boundedNote(session.note),
+        },
         publicId: session.id,
         state,
         updatedAt: session.updatedAt,
@@ -2791,14 +2884,98 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
         || event.body.type === "assistant_delta"
         || event.body.type === "reasoning_summary_delta"
         || event.body.type === "session_state");
+      // The stored per-session setting (falling back to the daemon default)
+      // decides; the constructor flag is a startup override that can only
+      // turn summaries on, never force them off for a session that asked.
+      const stored = this.#store.readSessionShowThinking(sessionIdSchema.parse(input.sessionPublicId));
       return Promise.resolve({
         events,
-        includeThinking: this.#liveThinking,
+        includeThinking: this.#liveThinking || stored.enabled,
         observedThroughSequence: page.observedThroughSequence,
       });
     } catch (error: unknown) {
       return Promise.reject(error instanceof Error ? error : new Error("Local live projection failed."));
     }
+  }
+
+  /**
+   * The device settings projection: machine, daemon defaults, accounts,
+   * projects, and scheduled tasks, as labels only. Codex Desktop automations
+   * are read from disk read-only; a malformed automation is skipped rather
+   * than failing the whole registry, and a Codex thread that is not one of
+   * this daemon's sessions projects a null session id.
+   */
+  async readDeviceRegistry(input: Readonly<{ signal: AbortSignal }>): Promise<DeviceRegistryPayload> {
+    if (input.signal.aborted) throw input.signal.reason;
+    const sessions = this.#store.listSessions(100, undefined, true);
+    const sessionByProviderThread = new Map<string, string>();
+    for (const session of sessions) {
+      if (session.providerThreadId !== undefined) {
+        sessionByProviderThread.set(session.providerThreadId, session.id);
+      }
+    }
+    const accounts = this.#store.listProfiles()
+      .flatMap((profile) => profile.state === "removed"
+        ? []
+        : [{
+            label: registryLabel(profile.label, "Account"),
+            provider: "codex" as const,
+            publicId: profile.id,
+            status: profile.state,
+          }])
+      .slice(0, deviceRegistryLimits.accounts);
+    const projects = this.#store.listProjects()
+      .slice(0, deviceRegistryLimits.projects)
+      .map((project) => ({
+        label: registryLabel(project.label, "Project"),
+        publicId: project.id,
+      }));
+    const scheduledTasks: DeviceRegistryScheduledTask[] = this.#store.createSessionTaskStore()
+      .listAll(deviceRegistryLimits.scheduledTasks)
+      .map((task) => ({
+        cadence: `every ${task.schedule.minutes} minutes`,
+        id: task.id,
+        kind: "hra_conversation" as const,
+        label: registryLabel(task.name, "Scheduled task"),
+        nextRunAt: task.nextDueAt,
+        sessionPublicId: task.sessionId,
+      }));
+    let automations: readonly CodexAutomation[] = [];
+    try {
+      automations = await this.#readCodexAutomations();
+    } catch {
+      // A Codex Desktop that is absent, unreadable, or mid-write must not
+      // block the rest of the settings projection.
+      automations = [];
+    }
+    throwIfAborted(input.signal);
+    for (const automation of automations) {
+      if (scheduledTasks.length >= deviceRegistryLimits.scheduledTasks) break;
+      const sessionPublicId = automation.targetThreadId === null
+        ? null
+        : sessionByProviderThread.get(automation.targetThreadId) ?? null;
+      scheduledTasks.push({
+        cadence: registryLabel(automation.cadence, "unknown", deviceRegistryLimits.cadenceCharacters),
+        id: registryLabel(automation.id, "automation", deviceRegistryLimits.scheduledTaskIdCharacters),
+        kind: "codex_automation",
+        label: registryLabel(automation.label, "Codex automation"),
+        nextRunAt: null,
+        sessionPublicId,
+      });
+    }
+    return {
+      accounts,
+      daemonVersion: registryLabel(HRA_VERSION, "unknown", deviceRegistryLimits.versionCharacters),
+      defaultApprovalMode: this.#store.readDefaultApprovalMode(),
+      defaultPreset: this.#store.readDefaultPreset(),
+      heartbeatAt: this.#registryNow(),
+      machineLabel: this.#machineLabel,
+      projects,
+      proseAutorespondConfigured: await this.#gatewayKeyCustody.hasKey(),
+      scheduledTasks,
+      showThinkingDefault: this.#store.readDefaultShowThinking(),
+      version: 1,
+    };
   }
 
   recordCompactUploadIntent(input: CompactUploadCheckpoint): Promise<void> {
@@ -2949,6 +3126,15 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
 
       let command: ProviderRemoteLocalCommand;
       switch (input.payload.kind) {
+          // Settings commands change local daemon state only: they never
+          // reach the provider, so they settle without an execution round
+          // trip. They still run in the ordinary command lane.
+          case "set_approval_mode":
+          case "set_show_thinking":
+          case "set_default_preset":
+          case "archive_session":
+          case "set_gateway_key":
+            return await this.#applySettingCommand(session.id, input.payload);
           case "send":
             command = { kind: "session.send", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey };
             break;
@@ -2973,6 +3159,17 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
             command = session.activeTurnId === undefined
               ? { kind: "session.send", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey }
               : { kind: "session.steer", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey };
+            break;
+          case "rename_session":
+            // A cleared name is the default title, not an empty one: the
+            // provider has no "no title" state, so `null` resets the session
+            // to the same title a fresh session starts with.
+            command = {
+              kind: "session.rename",
+              session: session.id,
+              name: input.payload.name ?? defaultSessionTitle,
+              idempotencyKey: input.idempotencyKey,
+            };
             break;
           case "resolve_interaction": {
             const verified = verifyRemoteInteraction(this.#store, session.id, input.payload, Date.now());
@@ -2999,6 +3196,40 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
         return { code: `LOCAL_${code}`.slice(0, 64), state: "ambiguous" };
       }
       return { code: `LOCAL_${code.replace(/[^A-Z0-9_]/gu, "_")}`.slice(0, 64), state: "failed" };
+    }
+  }
+
+  /**
+   * Apply a settings command against local state. `rename_session` is
+   * deliberately not here: renaming is observable to the provider, so it
+   * stays on the ordinary provider execution path.
+   *
+   * The gateway key is written straight into local secret custody. Nothing
+   * about its value is returned, journalled, or logged; the caller only ever
+   * learns that a key was set.
+   */
+  async #applySettingCommand(
+    sessionId: SessionRecord["id"],
+    payload: SettingCommandPayload,
+  ): Promise<CloudCommandExecutionResult> {
+    switch (payload.kind) {
+      case "set_approval_mode":
+        if (payload.scope === "default") this.#store.setDefaultApprovalMode(payload.mode);
+        else this.#store.setSessionApprovalMode(sessionId, payload.mode);
+        return { code: "APPLIED", state: "applied" };
+      case "set_show_thinking":
+        if (payload.scope === "default") this.#store.setDefaultShowThinking(payload.enabled);
+        else this.#store.setSessionShowThinking(sessionId, payload.enabled);
+        return { code: "APPLIED", state: "applied" };
+      case "set_default_preset":
+        this.#store.setDefaultPreset(payload.preset);
+        return { code: "APPLIED", state: "applied" };
+      case "archive_session":
+        this.#store.setSessionArchived(sessionId, payload.archived);
+        return { code: "APPLIED", state: "applied" };
+      case "set_gateway_key":
+        await this.#gatewayKeyCustody.setKey(payload.key);
+        return { code: "APPLIED", state: "applied" };
     }
   }
 }
@@ -3059,35 +3290,42 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
   readonly #bridge: CloudDaemonBridge;
   readonly #control: CloudControlPort & CloudRemoteControlPort;
   readonly #projectionStatus: (() => CloudProjectionCacheStatus) | undefined;
+  readonly #syncCadence: (() => CloudSyncCadenceStatus) | undefined;
 
   constructor(
     control: CloudControlPort & CloudRemoteControlPort,
     bridge: CloudDaemonBridge,
     projectionDiagnostics?: Readonly<{ projectionCacheStatus(): CloudProjectionCacheStatus }>,
+    cadenceDiagnostics?: Readonly<{ syncCadence(): CloudSyncCadenceStatus }>,
   ) {
     this.#control = control;
     this.#bridge = bridge;
     this.#projectionStatus = projectionDiagnostics === undefined
       ? undefined
       : () => projectionDiagnostics.projectionCacheStatus();
+    this.#syncCadence = cadenceDiagnostics === undefined
+      ? undefined
+      : () => cadenceDiagnostics.syncCadence();
   }
 
   async status(signal: AbortSignal): Promise<unknown> {
     const status = await this.#control.status(signal);
     const projectionCache = this.#projectionStatus?.();
     const projectionRecovery = await this.#bridge.projectionRecoveryStatus?.();
-    if (projectionCache === undefined && projectionRecovery === undefined) return status;
+    const syncCadence = this.#syncCadence?.();
+    if (
+      projectionCache === undefined
+      && projectionRecovery === undefined
+      && syncCadence === undefined
+    ) return status;
+    const additions = {
+      ...(projectionCache === undefined ? {} : { projectionCache }),
+      ...(projectionRecovery === undefined ? {} : { projectionRecovery }),
+      ...(syncCadence === undefined ? {} : { syncCadence }),
+    };
     return isRecord(status)
-      ? {
-          ...status,
-          ...(projectionCache === undefined ? {} : { projectionCache }),
-          ...(projectionRecovery === undefined ? {} : { projectionRecovery }),
-        }
-      : {
-          control: status,
-          ...(projectionCache === undefined ? {} : { projectionCache }),
-          ...(projectionRecovery === undefined ? {} : { projectionRecovery }),
-        };
+      ? { ...status, ...additions }
+      : { control: status, ...additions };
   }
   async auth(input: { email: string; code?: string; invite?: string; signal: AbortSignal }): Promise<unknown> {
     if (input.code !== undefined) {
@@ -3117,8 +3355,13 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
   acknowledgeNoAccountKeyHolders(signal: AbortSignal): Promise<unknown> {
     return this.#control.acknowledgeNoAccountKeyHolders(signal);
   }
-  approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
-    return this.#control.approveDevice(device, idempotencyKey, signal);
+  approveDevice(
+    device: string,
+    idempotencyKey: string,
+    fingerprint: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    return this.#control.approveDevice(device, idempotencyKey, fingerprint, signal);
   }
   revokeDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
     return this.#control.revokeDevice(device, idempotencyKey, signal);
