@@ -16,8 +16,8 @@
   },
   "src/cli.ts": {
     "mode0600": 2,
-    "mode0700": 3,
-    "assertCurrent": 3,
+    "mode0700": 4,
+    "assertCurrent": 5,
     "redactCompleteSensitiveText": 1
   },
   "src/cloud/daemon-adapters.ts": {

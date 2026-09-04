@@ -28,6 +28,7 @@ import {
   storedAccountUsageSnapshotSchema,
 } from "../domain/usage-metrics";
 import type {
+  ClaudeRuntimePort,
   CodexAccountProjection,
   CodexRuntimePort,
   CodexSessionProjection,
@@ -393,7 +394,159 @@ afterEach(async () => {
   }
 });
 
+/**
+ * A Claude seam that answers only what cloud projection asks of it. The
+ * adapter must reach it, not the Codex port, for a session whose provider is
+ * `claude`.
+ */
+class FakeClaude implements ClaudeRuntimePort {
+  readonly provider = "claude" as const;
+  readSessionCalls = 0;
+  projection: CodexSessionProjection = {
+    messages: [
+      { role: "user", text: "Summarise the diff", turnId: "turn_claude_1" },
+      { role: "assistant", text: "Two files changed", turnId: "turn_claude_1" },
+    ],
+    providerThreadId: "thread_claude_0001",
+    providerUpdatedAt: 1_000,
+    status: "idle",
+    title: "Claude title",
+    turnSummaries: [{
+      actions: [],
+      files: ["src/index.ts"],
+      id: "turn_claude_1",
+      omittedActions: 0,
+      omittedFiles: 0,
+      runtimeMs: 2_374,
+      status: "completed",
+    }],
+  };
+
+  async readSession(): Promise<CodexSessionProjection> {
+    this.readSessionCalls += 1;
+    return this.projection;
+  }
+  #unused(): never { throw new Error("unused"); }
+  pinnedVersion(): string { return this.#unused(); }
+  interactionAuthority(): never { return this.#unused(); }
+  readAccount(): Promise<CodexAccountProjection> { return Promise.reject(this.#unused()); }
+  reviewSessionStart(): Promise<never> { return Promise.reject(this.#unused()); }
+  startSession(): Promise<never> { return Promise.reject(this.#unused()); }
+  observeSession(): ReturnType<ClaudeRuntimePort["observeSession"]> { return Promise.reject(this.#unused()); }
+  reviewTurnStart(): Promise<never> { return Promise.reject(this.#unused()); }
+  startTurn(): Promise<never> { return Promise.reject(this.#unused()); }
+  steer(): Promise<void> { return Promise.reject(this.#unused()); }
+  interrupt(): Promise<void> { return Promise.reject(this.#unused()); }
+  inspectInteractionAuthority(): ReturnType<ClaudeRuntimePort["inspectInteractionAuthority"]> { return Promise.reject(this.#unused()); }
+  validateInteractionResolution(): Promise<{ responseDigest: string }> { return Promise.reject(this.#unused()); }
+  resolveInteraction(): Promise<{ responseWritten: true }> { return Promise.reject(this.#unused()); }
+  validateInteractionTimeout(): Promise<{ responseDigest: string }> { return Promise.reject(this.#unused()); }
+  timeoutInteraction(): Promise<{ responseWritten: true }> { return Promise.reject(this.#unused()); }
+  async close(): Promise<void> {}
+}
+
 describe("state-backed cloud daemon adapter", () => {
+  test("projects a Claude session through its own port exactly like a Codex one", async () => {
+    const value = await fixture();
+    const profile = value.store.requireProfileById(
+      value.store.requireSession(value.sessionId).profileId,
+    );
+    const starting = value.store.createSession({
+      fastEnabled: false,
+      preset: "fable-max",
+      profileId: profile.id,
+      provider: "claude",
+      title: "Claude work",
+    });
+    const bound = value.store.bindSession({
+      expectedRevision: starting.revision,
+      providerThreadId: "thread_claude_0001",
+      sessionId: starting.id,
+      state: "idle",
+      providerUpdatedAt: 1_000,
+    });
+    // Bind the turn's reviewed Claude profile the way a dispatched queue entry
+    // does, so the compact turn summary can name its model.
+    const claudeProfile = {
+      claudeVersion: "2.1.260",
+      inputFormat: "stream-json" as const,
+      isolatedConfigDir: true as const,
+      model: "claude-fable-5-1",
+      observedAt: 2_100,
+      outputFormat: "stream-json" as const,
+      permissionMode: "default" as const,
+      preset: "fable-max" as const,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      reasoningEffort: "max" as const,
+    };
+    const queued = value.store.enqueue(bound.id, "Summarise the diff");
+    const evidence = value.store.beginQueueEffect({
+      evidence: {
+        baseline: { activeTurnId: null, providerUpdatedAt: 1_000, status: "idle" },
+        clientMessageId: queued.id,
+        kind: "queue.dispatch",
+        messageDigest: sha256("Summarise the diff"),
+        profileGeneration: profile.processGeneration,
+        providerThreadId: "thread_claude_0001",
+        queueId: queued.id,
+        runtimeProfile: claudeProfile,
+        sessionId: bound.id,
+      },
+      profileGeneration: profile.processGeneration,
+      queueId: queued.id,
+      sessionId: bound.id,
+    });
+    value.store.completeQueueEffect({
+      applyResponseState: false,
+      expectedEvidenceDigest: evidence.digest,
+      expectedSessionRevision: bound.revision,
+      queueId: queued.id,
+      receipt: { turnId: "turn_claude_1" },
+      runtimeProfile: claudeProfile,
+      turnId: "turn_claude_1",
+      turnStatus: "completed",
+    });
+
+    const claude = new FakeClaude();
+    const adapter = new StateBackedCloudDaemonAdapter({
+      claude,
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      expect(claude.readSessionCalls).toBe(1);
+      const events = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: bound.id,
+        signal,
+      });
+      expect(events.complete).toBe(true);
+      expect(events.events.map((event) => event.kind)).toEqual([
+        "user_message",
+        "assistant_message",
+        "turn_summary",
+      ]);
+      // The compact format pairs `model` and `fast`; the Claude document has
+      // no fast mode, so the pair stays coherent with an explicit `false`.
+      expect(events.events[2]).toMatchObject({
+        fast: false,
+        filesTouched: ["src/index.ts"],
+        kind: "turn_summary",
+        model: "fable-max",
+        runtimeMs: 2_374,
+      });
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
   test("persists bounded compact sequences and projects polled usage without exporting local paths", async () => {
     const value = await fixture();
     const commands: LocalCommand[] = [];

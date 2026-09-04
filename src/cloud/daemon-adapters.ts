@@ -41,10 +41,12 @@ import {
   type DeviceRegistryScheduledTask,
   type RemoteCommandPayload,
 } from "./payloads";
+import { isCodexRuntimeProfile } from "../domain/runtime-profile";
 import { providerUsagePayload } from "../domain/usage-metrics";
 import type { SessionEvent } from "../domain/session-events";
 import { queueIdSchema, sessionIdSchema } from "../domain/values";
 import type {
+  ClaudeRuntimePort,
   CodexRuntimePort,
   CodexSessionProjection,
   CloudControlPort,
@@ -2256,7 +2258,11 @@ function completedProjectionTurns(
     const filesTouched = [...new Set(summary.files.filter(isProjectRelativePath))].slice(0, 128);
     const bodies = [...(messagesByTurn.get(summary.id) ?? [])];
     bodies.push({
-      ...(runtimeProfile === null ? {} : { fast: runtimeProfile.fast }),
+      // `fast` and `model` travel together in the compact format, and only the
+      // Codex document carries fast mode; a Claude turn is never fast.
+      ...(runtimeProfile === null
+        ? {}
+        : { fast: isCodexRuntimeProfile(runtimeProfile) && runtimeProfile.fast }),
       filesTouched,
       gitActions: gitActions(summary.actions),
       kind: "turn_summary",
@@ -2356,6 +2362,12 @@ export type CloudGatewayKeyCustody = Readonly<{
 export type StateBackedCloudDaemonAdapterOptions = Readonly<{
   cloudIdentityNamespace?: string | null;
   codex: CodexRuntimePort;
+  /**
+   * The Claude seam, when this daemon composes one. Cloud projection reads a
+   * session through the port its own provider binds, so a Claude session
+   * projects exactly like a Codex one.
+   */
+  claude?: ClaudeRuntimePort;
   /** Local custody for the responder gateway key (default: none; `set_gateway_key` is refused). */
   gatewayKeyCustody?: CloudGatewayKeyCustody;
   executeRemote: LocalExecuteRemote;
@@ -2420,6 +2432,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   readonly #cacheFileName: string;
   #cacheStatus: CloudProjectionCacheStatus;
   readonly #codex: CodexRuntimePort;
+  readonly #claude: ClaudeRuntimePort | undefined;
   readonly #executeRemote: LocalExecuteRemote;
   readonly #executeLocal: LocalExecuteCommand;
   readonly #notifyOperator: (input: Readonly<{ body: string; title: string }>) => Promise<void>;
@@ -2477,6 +2490,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       this.#cacheStatus = projectionCacheFailure(error);
     }
     this.#codex = options.codex;
+    this.#claude = options.claude;
     this.#executeRemote = options.executeRemote;
     // Without an injected local executor no device command can reach the
     // provider, so the adapter refuses every one of them rather than pretending
@@ -2491,6 +2505,18 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     this.#notifyOperator = options.notifyOperator ?? (() => Promise.resolve());
     this.#paths = options.paths;
     this.#store = options.store;
+  }
+
+  /** The provider port that owns one session's live projection reads. */
+  #sessionRuntime(session: SessionRecord): {
+    readSession: CodexRuntimePort["readSession"];
+  } {
+    if (session.provider !== "claude") return this.#codex;
+    const claude = this.#claude;
+    if (claude === undefined) {
+      throw new Error("This daemon composes no Claude Code runtime for that session.");
+    }
+    return claude;
   }
 
   close(): void {
@@ -2556,7 +2582,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         || entry.state === "dispatching"
         || entry.state === "ambiguous")
     ) throw new Error("Cloud projection recovery requires settled local session effects.");
-    const projection = await this.#codex.readSession({
+    const projection = await this.#sessionRuntime(session).readSession({
       authority: authorityFor(this.#paths, profile.id, profile.processGeneration),
       providerThreadId: session.providerThreadId,
       detail: false,
@@ -2971,7 +2997,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         } else {
           let projectionError: Error | undefined;
           try {
-            const projection = await this.#codex.readSession({
+            const projection = await this.#sessionRuntime(session).readSession({
               authority: authorityFor(this.#paths, profile.id, profile.processGeneration),
               providerThreadId: session.providerThreadId,
               detail: false,
@@ -2979,7 +3005,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
             });
             throwIfAborted(input.signal);
             if (projection.providerThreadId !== session.providerThreadId) {
-              throw new Error("The Codex runtime returned a session under different authority.");
+              throw new Error("The provider runtime returned a session under different authority.");
             }
             for (const turn of completedProjectionTurns(this.#store, session, projection)) {
               cache.ingestTurn(session.id, turn.baseline.turnId, turn.bodies);
