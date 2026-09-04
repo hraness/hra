@@ -181,6 +181,20 @@ describe("hosted quota authority", () => {
     })).toBe(86);
   });
 
+  test("pins the open-beta free tier and its deliberate oversubscription", () => {
+    expect(USER_TOTAL_QUOTA.logicalBytes).toBe(200 * 1_024 * 1_024);
+    expect(USER_RESOURCE_QUOTAS.session_chunk).toBe(50_000);
+    expect(USER_RESOURCE_QUOTAS.live_chunk).toBe(20_000);
+    expect(USER_RESOURCE_QUOTAS.live_chunk)
+      .toBeLessThan(USER_RESOURCE_QUOTAS.session_chunk);
+    expect(SERVICE_TOTAL_QUOTA.identities).toBe(5_000);
+    // The service byte ceiling, not the identity count, is the real hard stop.
+    expect(SERVICE_TOTAL_QUOTA.logicalBytes)
+      .toBeLessThan(SERVICE_TOTAL_QUOTA.identities * USER_TOTAL_QUOTA.logicalBytes);
+    // Bytes bind before records for one identity at any plausible row size.
+    expect(USER_TOTAL_QUOTA.logicalBytes / USER_TOTAL_QUOTA.records).toBeLessThan(64);
+  });
+
   test("accepts exact aggregate and resource boundaries and rejects the next unit", () => {
     const categoryLimit = CATEGORY_QUOTAS.device;
     const exact = nextQuotaSnapshot({
@@ -258,13 +272,22 @@ describe("hosted quota authority", () => {
     };
     const maximumLogicalBytes = logicalDocumentBytes(maximumUsageDocument);
     expect(maximumLogicalBytes).toBe(11_599);
+    // The open-beta free tier makes this statement per Codex account. One
+    // account's worst-case telemetry before any row becomes cleanup-eligible
+    // stays under a tenth of the tier, and the tier holds twelve such accounts
+    // at once. Running more accounts than that at the absolute worst-case
+    // envelope needs a raised tier, not a looser conservative bound.
+    const conservativeAccountUsageBytes = conservativeAccountRecords
+      * maximumLogicalBytes;
     const conservativeUserRecords = conservativeAccountRecords
       * USER_RESOURCE_QUOTAS.codex_account;
-    const conservativeUserUsageBytes = conservativeUserRecords * maximumLogicalBytes;
     expect(conservativeUserRecords).toBe(46_592);
-    expect(conservativeUserUsageBytes).toBe(540_420_608);
-    expect(conservativeUserUsageBytes * 10).toBeLessThan(USER_TOTAL_QUOTA.logicalBytes * 3);
-    expect(conservativeUserUsageBytes).toBeLessThan(CATEGORY_QUOTAS.usage.logicalBytes);
+    expect(conservativeUserRecords).toBeLessThan(CATEGORY_QUOTAS.usage.records);
+    expect(conservativeAccountUsageBytes).toBe(16_888_144);
+    expect(conservativeAccountUsageBytes * 10)
+      .toBeLessThan(USER_TOTAL_QUOTA.logicalBytes);
+    expect(Math.floor(USER_TOTAL_QUOTA.logicalBytes / conservativeAccountUsageBytes))
+      .toBe(12);
 
     const minimumByteBoundSamples = Math.floor(
       USAGE_LOCAL_RETAIN_BYTES / USAGE_LOCAL_SNAPSHOT_MAX_BYTES,
@@ -460,7 +483,7 @@ describe("hosted quota authority", () => {
       .collect())).toHaveLength(USER_RESOURCE_QUOTAS.device);
   });
 
-  test("session chunk resource accepts the exact 250,000th row atomically", async () => {
+  test("session chunk resource accepts the exact 50,000th row atomically", async () => {
     const world = await quotaWorld();
     const sessionId = await world.testRuntime.run(async (ctx) => {
       const document = {
