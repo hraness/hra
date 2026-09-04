@@ -2297,6 +2297,18 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "path", "kind", "rule", "decision", "outcome", "model", "sessionId"]));
     }
     output.writeStdout(`${rows.join("\n")}\n`);
+  } else if (
+    command.kind === "remote.policy-set"
+    || command.kind === "remote.policy-status"
+  ) {
+    const policy = value as {
+      accountLinkingAllowed?: unknown;
+      deviceCommandsAllowed?: unknown;
+    };
+    output.writeStdout([
+      `Device commands: ${policy.deviceCommandsAllowed === true ? "allowed" : "denied"}`,
+      `Account linking: ${policy.accountLinkingAllowed === true ? "allowed" : "denied"}`,
+    ].join("\n").concat("\n"));
   } else if (command.kind === "autorespond.gateway-set") {
     output.writeStdout("Autorespond gateway key configured.\n");
   } else if (command.kind === "autorespond.gateway-clear") {

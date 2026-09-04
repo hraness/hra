@@ -80,7 +80,7 @@ const capture = () => {
 const downgradeStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("DELETE FROM migrations WHERE version=32; PRAGMA user_version=31");
+    database.exec("DELETE FROM migrations WHERE version=33; PRAGMA user_version=32");
   } finally {
     database.close(false);
   }
@@ -4693,7 +4693,7 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (31 to 32); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (32 to 33); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
@@ -4754,7 +4754,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (31 to 32). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (32 to 33). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });

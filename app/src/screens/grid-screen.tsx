@@ -1,14 +1,24 @@
-import { useCallback, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 
 import { SettingsIcon } from "../components/icons";
 import { SessionCard } from "../components/session-card";
+import { ChoiceGroup } from "../components/settings-list";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { useSubmitCommand } from "../data/commands";
+import { useDeviceCommandState, useSubmitDeviceCommand } from "../data/device-commands";
+import { useDeviceRegistries } from "../data/registry";
 import { useSessionHeads } from "../data/session-heads";
 import { useCustody } from "../custody/custody-context";
 import { navigate } from "../routing/router";
 import { sessionRoute, settingsRoute } from "../routing/route";
+import {
+  defaultSessionStartPreset,
+  deviceCommandNotice,
+  sessionStartCommand,
+  sessionStartTargets,
+  type PresetChoice,
+} from "../model/device-commands";
 import {
   orderSessionCards,
   resolveComposerTarget,
@@ -24,6 +34,12 @@ function sameSummary(left: SessionCardSummary, right: SessionCardSummary): boole
     && left.title === right.title;
 }
 
+const presetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[] = [
+  { label: "Sol Low", value: "low" },
+  { label: "Sol High", value: "high" },
+  { label: "Sol Ultra", value: "ultra" },
+];
+
 /**
  * The grid.
  *
@@ -31,6 +47,11 @@ function sameSummary(left: SessionCardSummary, right: SessionCardSummary): boole
  * decides the order, and the cards themselves stay mounted across a reorder
  * because they are keyed by session id: a card that floats to the front keeps
  * its subscription and its scroll position rather than remounting.
+ *
+ * The composer has two modes. With a session selected it steers that session,
+ * as it has since W2. With nothing selected it starts a real session on a
+ * machine through the `session_start` device command, addressed by the account
+ * and project public ids the device registry projects — never by a path.
  */
 export function GridScreen({
   onSelect,
@@ -42,11 +63,20 @@ export function GridScreen({
   const custody = useCustody();
   const { heads, isLoading, loadMore, status } = useSessionHeads();
   const submit = useSubmitCommand();
+  const submitDeviceCommand = useSubmitDeviceCommand();
+  const registries = useDeviceRegistries();
 
   const [summaries, setSummaries] = useState<Readonly<Record<string, SessionCardSummary>>>({});
   const [message, setMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [startCommandId, setStartCommandId] = useState<string | null>(null);
+  const [targetKey, setTargetKey] = useState<string | null>(null);
+  const [projectPublicId, setProjectPublicId] = useState<string | null>(null);
+  const [preset, setPreset] = useState<PresetChoice>(defaultSessionStartPreset);
+
+  const startCommand = useDeviceCommandState(startCommandId);
+  const startNotice = deviceCommandNotice(startCommand);
 
   const reportSummary = useCallback((summary: SessionCardSummary) => {
     setSummaries((current) => {
@@ -74,32 +104,85 @@ export function GridScreen({
   );
 
   const ordered = useMemo(() => orderSessionCards(known), [known]);
-  const target = useMemo(
-    () => resolveComposerTarget(ordered, selectedSessionId),
+  const steerTarget = useMemo(
+    () => selectedSessionId === null
+      ? null
+      : resolveComposerTarget(ordered, selectedSessionId),
     [ordered, selectedSessionId],
   );
+  const starting = selectedSessionId === null;
+
+  const targets = useMemo(() => sessionStartTargets(registries.machines), [registries.machines]);
+  const startTarget = useMemo(
+    () => targets.find((entry) =>
+      `${entry.targetDevicePublicId}:${entry.accountPublicId}` === targetKey)
+      ?? targets[0]
+      ?? null,
+    [targetKey, targets],
+  );
+  // The picker follows the registry: an account or project that disappears
+  // between renders is replaced rather than left addressing something gone.
+  const project = useMemo(
+    () => startTarget?.projects.find((entry) => entry.publicId === projectPublicId)
+      ?? startTarget?.projects[0]
+      ?? null,
+    [projectPublicId, startTarget],
+  );
+
+  // Once the started session shows up in the grid, the command notice has done
+  // its job and the composer goes quiet again.
+  useEffect(() => {
+    if (startCommand?.state === "applied" && heads.length > 0) {
+      const timer = setTimeout(() => { setStartCommandId(null); }, 15_000);
+      return () => { clearTimeout(timer); };
+    }
+    return undefined;
+  }, [heads.length, startCommand?.state]);
 
   const open = useCallback((sessionPublicId: string) => {
     onSelect(sessionPublicId);
     navigate(sessionRoute(sessionPublicId));
   }, [onSelect]);
 
+  const canSubmit = message.trim().length > 0
+    && !sending
+    && (starting
+      ? startTarget !== null && project !== null
+      : steerTarget !== null && headById.get(steerTarget.publicId) !== undefined);
+
   const send = (event: { preventDefault: () => void }) => {
     event.preventDefault();
     const text = message.trim();
-    const head = target === null ? undefined : headById.get(target.publicId);
-    if (head === undefined || text.length === 0 || sending) return;
+    if (!canSubmit) return;
     setSending(true);
     setNotice(null);
-    void submit({
-      executionDevicePublicId: head.executionDevicePublicId,
-      payload: { kind: "send_or_steer", message: text },
-      sessionPublicId: head.publicId,
-    })
-      .then(() => {
-        setMessage("");
-        setNotice(`Sent to ${target?.title ?? "the session"}.`);
-      })
+    const run = starting && startTarget !== null && project !== null
+      ? submitDeviceCommand({
+          payload: sessionStartCommand({
+            accountPublicId: startTarget.accountPublicId,
+            preset,
+            projectPublicId: project.publicId,
+            prompt: text,
+            provider: startTarget.provider,
+          }),
+          targetDevicePublicId: startTarget.targetDevicePublicId,
+        }).then((commandPublicId) => {
+          setStartCommandId(commandPublicId);
+          setMessage("");
+        })
+      : (() => {
+          const head = steerTarget === null ? undefined : headById.get(steerTarget.publicId);
+          if (head === undefined) return Promise.resolve();
+          return submit({
+            executionDevicePublicId: head.executionDevicePublicId,
+            payload: { kind: "send_or_steer", message: text },
+            sessionPublicId: head.publicId,
+          }).then(() => {
+            setMessage("");
+            setNotice(`Sent to ${steerTarget?.title ?? "the session"}.`);
+          });
+        })();
+    void run
       .catch((failure: unknown) => {
         setNotice(failure instanceof Error ? failure.message : "The command was not accepted.");
       })
@@ -112,8 +195,16 @@ export function GridScreen({
   // A head whose card has not reported yet is still rendered, otherwise nothing
   // would ever mount to report.
   const reported = new Set(known.map((summary) => summary.publicId));
-  const pending = heads.filter((head) => !reported.has(head.publicId));
-  const rendered = [...visible, ...pending];
+  const pendingHeads = heads.filter((head) => !reported.has(head.publicId));
+  const rendered = [...visible, ...pendingHeads];
+
+  const hint = starting
+    ? startTarget === null || project === null
+      ? "No machine here can start a session yet. Sign an account in on a machine, add a project, and leave `hra remote allow device-commands` set."
+      : `Starts on ${startTarget.machineLabel}${startTarget.machineOnline ? "" : " (offline; it will run when the machine wakes)"}.`
+    : steerTarget === null
+      ? "Nothing to send to yet."
+      : `Steers ${steerTarget.title}. Clear the selection to start a new session.`;
 
   return (
     <div className="mx-auto flex min-h-dvh w-full max-w-6xl flex-col pt-[env(safe-area-inset-top)]">
@@ -135,22 +226,70 @@ export function GridScreen({
           <form className="flex flex-1 items-center gap-2" onSubmit={send}>
             <Input
               aria-label="Start a new session"
-              disabled={target === null}
+              disabled={starting ? startTarget === null : steerTarget === null}
               onChange={(event) => { setMessage(event.target.value); }}
               placeholder="Start a new session"
               value={message}
             />
-            <Button disabled={target === null || sending || message.trim().length === 0} type="submit">
-              Send
+            <Button disabled={!canSubmit} type="submit">
+              {starting ? "Start" : "Send"}
             </Button>
           </form>
           <Button onClick={custody.lock} size="small" variant="ghost">Lock</Button>
         </div>
-        <p className="text-xs text-ink-muted">
-          {target === null
-            ? "Nothing to send to yet."
-            : `Starting a new session from the web arrives with device commands. For now this steers ${target.title}.`}
-        </p>
+        {starting && startTarget !== null ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-1 text-xs text-ink-muted">
+              <span>Account</span>
+              <select
+                className="min-h-11 rounded-md border border-line bg-surface-input px-2 text-sm text-ink"
+                onChange={(event) => {
+                  setTargetKey(event.target.value);
+                  setProjectPublicId(null);
+                }}
+                value={`${startTarget.targetDevicePublicId}:${startTarget.accountPublicId}`}
+              >
+                {targets.map((entry) => (
+                  <option
+                    key={`${entry.targetDevicePublicId}:${entry.accountPublicId}`}
+                    value={`${entry.targetDevicePublicId}:${entry.accountPublicId}`}
+                  >
+                    {`${entry.accountLabel} — ${entry.machineLabel}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1 text-xs text-ink-muted">
+              <span>Project</span>
+              <select
+                className="min-h-11 rounded-md border border-line bg-surface-input px-2 text-sm text-ink"
+                onChange={(event) => { setProjectPublicId(event.target.value); }}
+                value={project?.publicId ?? ""}
+              >
+                {startTarget.projects.map((entry) => (
+                  <option key={entry.publicId} value={entry.publicId}>{entry.label}</option>
+                ))}
+              </select>
+            </label>
+            <ChoiceGroup
+              label="Model"
+              onSelect={setPreset}
+              options={presetOptions}
+              value={preset}
+            />
+          </div>
+        ) : null}
+        <p className="text-xs text-ink-muted">{hint}</p>
+        {startNotice === null ? null : (
+          <p
+            className={startNotice.tone === "error"
+              ? "text-xs text-danger"
+              : "text-xs text-ink-muted"}
+            role="status"
+          >
+            {startNotice.text}
+          </p>
+        )}
         {notice === null ? null : (
           <p className="text-xs text-ink-muted" role="status">{notice}</p>
         )}
@@ -162,7 +301,7 @@ export function GridScreen({
         ) : null}
         {!isLoading && heads.length === 0 ? (
           <p className="text-sm text-ink-muted">
-            No sessions yet. Start one from a machine with hra installed.
+            No sessions yet. Type a prompt above to start one on a machine.
           </p>
         ) : null}
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(20rem,1fr))]">

@@ -733,6 +733,45 @@ describe("bounded cloud retention", () => {
       } as const;
       await reserveQuotaForInsert(ctx, userId, "command", terminalCommand);
       await ctx.db.insert("sessionCommands", terminalCommand);
+      // Device commands sweep on their own two categories, so the rotation
+      // fixture carries one row for each of them as well.
+      const deviceCommandBase = {
+        createdAt: now - 8 * 24 * 60 * 60 * 1_000,
+        deadline: now - 1,
+        kind: "usage_refresh" as const,
+        payload: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "D".repeat(32),
+          keyVersion: 1,
+          nonce: "D".repeat(16),
+        },
+        requestDigest: "9".repeat(64),
+        requestingDeviceId: deviceId,
+        targetDeviceId: deviceId,
+        userId,
+      };
+      const pendingDeviceCommand = {
+        ...deviceCommandBase,
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000108",
+        nonterminal: true,
+        publicId: "018bcfe5-6800-7000-8000-000000000109",
+        state: "pending",
+        updatedAt: now - 1,
+      } as const;
+      await reserveNonterminalCommandQuotaForInsert(ctx, userId, pendingDeviceCommand);
+      await ctx.db.insert("deviceCommands", pendingDeviceCommand);
+      const terminalDeviceCommand = {
+        ...deviceCommandBase,
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000010a",
+        nonterminal: false,
+        publicId: "018bcfe5-6800-7000-8000-00000000010b",
+        requesterAcknowledgedAt: now - 100_000,
+        state: "applied",
+        terminalCleanupAfter: now - 1,
+        updatedAt: now - 100_000,
+      } as const;
+      await reserveQuotaForInsert(ctx, userId, "command", terminalDeviceCommand);
+      await ctx.db.insert("deviceCommands", terminalDeviceCommand);
       const securityEvent = {
         createdAt: now - 91 * 24 * 60 * 60 * 1_000,
         entityId: "fair",
@@ -812,14 +851,16 @@ describe("bounded cloud retention", () => {
       devicePresence: 1,
       deviceRevocationJobs: 1,
       expiredPendingCommands: 1,
+      expiredPendingDeviceCommands: 1,
       idempotencyReceipts: 1,
       liveTailChunks: 0,
       otpChallenges: 1,
       securityEvents: 1,
       terminalCommands: 1,
+      terminalDeviceCommands: 1,
       usageSnapshots: 1,
-      processed: 13,
-      visitedCategories: 14,
+      processed: 15,
+      visitedCategories: 16,
     });
     expect(await runtime.run(async (ctx) => {
       const service = await ctx.db.query("storageUsageService")
@@ -854,10 +895,13 @@ describe("bounded cloud retention", () => {
       maintenanceStates: 1,
       service: {
         identities: 1,
-        records: 7,
+        // The expired pending device command is still a stored row: expiry
+        // terminalizes it, and the terminal sweep deletes it only after the
+        // requester has acknowledged and the retention window has passed.
+        records: 8,
         serviceLogicalBytes: 0,
         serviceRecords: 0,
-        userRecords: 7,
+        userRecords: 8,
       },
       userResources: [
         { records: 1, resource: "codex_account" },

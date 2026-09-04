@@ -796,7 +796,14 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 32;
+const currentSchemaVersion = 33;
+// A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
+// The ledger keys on it, so the shape is pinned here rather than accepting an
+// arbitrary string from the cloud bridge.
+const deviceCommandDevicePublicIdSchema = z.string().regex(
+  /^[A-Za-z0-9_-]{8,96}$/u,
+  "Device public id must be an opaque cloud identifier.",
+);
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -2335,6 +2342,53 @@ const applySchemaVersion31Archive = (database: Database): void => {
   database.exec(schemaVersion31Archive);
 };
 
+/*
+ * Device commands (W3). Three additive objects, each independently guarded so
+ * a parallel schema-version-32 migration reconciles in either order:
+ *
+ * - two `daemon_state` switches: whether this machine executes device commands
+ *   at all, and whether it will relay a provider login for a browser. The kill
+ *   switch defaults to allowed (the browser is already an enrolled key holder);
+ *   account linking defaults to denied, because relaying a login URL off the
+ *   machine is the one device command that hands a credential path to another
+ *   surface.
+ * - `device_command_ledger`: the per-requesting-device day bucket that enforces
+ *   the daily cap, and the timestamp of the desktop notice shown the first time
+ *   a given device starts a session here.
+ * - `project_approval_modes`: the approval mode a browser-started session in
+ *   that project inherits. Absent means the machine default.
+ */
+const schemaVersion33DeviceCommands = `
+CREATE TABLE IF NOT EXISTS device_command_ledger (
+  device_public_id TEXT PRIMARY KEY,
+  day_key INTEGER NOT NULL CHECK(day_key >= 0),
+  day_count INTEGER NOT NULL CHECK(day_count >= 0),
+  first_session_start_notified_at INTEGER CHECK(first_session_start_notified_at IS NULL OR first_session_start_notified_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_approval_modes (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace','manual')),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+`;
+const schemaVersion33DeviceCommandsAllowedColumn =
+  "ALTER TABLE daemon_state ADD COLUMN device_commands_allowed INTEGER NOT NULL DEFAULT 1 "
+  + "CHECK(device_commands_allowed IN (0,1))";
+const schemaVersion33AccountLinkingAllowedColumn =
+  "ALTER TABLE daemon_state ADD COLUMN account_linking_allowed INTEGER NOT NULL DEFAULT 0 "
+  + "CHECK(account_linking_allowed IN (0,1))";
+
+const applySchemaVersion33DeviceCommands = (database: Database): void => {
+  if (!hasTableColumn(database, "daemon_state", "device_commands_allowed")) {
+    database.exec(schemaVersion33DeviceCommandsAllowedColumn);
+  }
+  if (!hasTableColumn(database, "daemon_state", "account_linking_allowed")) {
+    database.exec(schemaVersion33AccountLinkingAllowedColumn);
+  }
+  database.exec(schemaVersion33DeviceCommands);
+};
+
 const schemaVersion28Objects = [
   {
     name: "account_rate_limit_reset_policies",
@@ -3706,6 +3760,13 @@ const migrateWritableDatabase = (
       version = 32;
     }
 
+    if (version < 33) {
+      applySchemaVersion33DeviceCommands(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(33, now());
+      database.exec("PRAGMA user_version = 33");
+      version = 33;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -3744,6 +3805,7 @@ const migrateWritableDatabase = (
     database.exec(schemaVersion30);
     database.exec(schemaVersion31Objects);
     applySchemaVersion31Archive(database);
+    applySchemaVersion33DeviceCommands(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -5179,6 +5241,146 @@ export class StateStore {
         `INSERT INTO session_approval_modes(session_id,mode,updated_at) VALUES (?,?,?)
          ON CONFLICT(session_id) DO UPDATE SET mode=excluded.mode,updated_at=excluded.updated_at`,
       ).run(parsedSessionId, parsed, this.#now());
+    });
+    write.immediate();
+  }
+
+  // --- Device commands: local switches, day ledger, project approval mode ---
+
+  /**
+   * The two local switches a browser can never change. `hra remote deny
+   * device-commands` closes the machine to every device command; account
+   * linking is opt-in because relaying a provider login URL is the one command
+   * that hands a credential path to another surface.
+   */
+  readDeviceCommandPolicy(): Readonly<{
+    accountLinkingAllowed: boolean;
+    deviceCommandsAllowed: boolean;
+  }> {
+    const row = this.#database.query(
+      "SELECT account_linking_allowed, device_commands_allowed FROM daemon_state WHERE singleton=1",
+    ).get();
+    const flag = z.union([z.literal(0), z.literal(1)]);
+    const parsed = z.object({
+      account_linking_allowed: flag,
+      device_commands_allowed: flag,
+    }).strict().parse(row);
+    return {
+      accountLinkingAllowed: parsed.account_linking_allowed === 1,
+      deviceCommandsAllowed: parsed.device_commands_allowed === 1,
+    };
+  }
+
+  setDeviceCommandsAllowed(allowed: boolean): void {
+    const result = this.#database
+      .query("UPDATE daemon_state SET device_commands_allowed=? WHERE singleton=1")
+      .run(allowed ? 1 : 0);
+    if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
+  }
+
+  setAccountLinkingAllowed(allowed: boolean): void {
+    const result = this.#database
+      .query("UPDATE daemon_state SET account_linking_allowed=? WHERE singleton=1")
+      .run(allowed ? 1 : 0);
+    if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
+  }
+
+  readDeviceCommandLedger(devicePublicId: string): Readonly<{
+    dayCount: number;
+    dayKey: number;
+    firstSessionStartNotifiedAt: number | null;
+  }> {
+    const parsedDevice = deviceCommandDevicePublicIdSchema.parse(devicePublicId);
+    const row = this.#database.query(
+      "SELECT day_key, day_count, first_session_start_notified_at FROM device_command_ledger WHERE device_public_id=?",
+    ).get(parsedDevice);
+    if (row === null) return { dayCount: 0, dayKey: 0, firstSessionStartNotifiedAt: null };
+    const parsed = z.object({
+      day_count: z.number().int().nonnegative(),
+      day_key: z.number().int().nonnegative(),
+      first_session_start_notified_at: z.number().int().nonnegative().nullable(),
+    }).strict().parse(row);
+    return {
+      dayCount: parsed.day_count,
+      dayKey: parsed.day_key,
+      firstSessionStartNotifiedAt: parsed.first_session_start_notified_at,
+    };
+  }
+
+  /**
+   * Records one admitted device command against the requesting device's day
+   * bucket. The caller has already decided admission, so this only advances
+   * durable evidence; `notifiedFirstSessionStart` is written once and never
+   * cleared, which is what makes the desktop notice fire exactly once per
+   * device.
+   */
+  recordDeviceCommandAdmission(input: Readonly<{
+    dayCount: number;
+    dayKey: number;
+    devicePublicId: string;
+    notifiedFirstSessionStart: boolean;
+  }>): void {
+    const parsedDevice = deviceCommandDevicePublicIdSchema.parse(input.devicePublicId);
+    const dayKey = z.number().int().nonnegative().parse(input.dayKey);
+    const dayCount = z.number().int().nonnegative().parse(input.dayCount);
+    const now = this.#now();
+    const write = this.#database.transaction(() => {
+      this.#database.query(
+        `INSERT INTO device_command_ledger(
+           device_public_id, day_key, day_count, first_session_start_notified_at, updated_at
+         ) VALUES (?,?,?,?,?)
+         ON CONFLICT(device_public_id) DO UPDATE SET
+           day_key=excluded.day_key,
+           day_count=excluded.day_count,
+           first_session_start_notified_at=COALESCE(
+             device_command_ledger.first_session_start_notified_at,
+             excluded.first_session_start_notified_at),
+           updated_at=excluded.updated_at`,
+      ).run(
+        parsedDevice,
+        dayKey,
+        dayCount,
+        input.notifiedFirstSessionStart ? now : null,
+        now,
+      );
+    });
+    write.immediate();
+  }
+
+  /**
+   * The approval mode a session started in this project inherits. Absent means
+   * the machine default, so a project that has never been configured behaves
+   * exactly as it does today.
+   */
+  readProjectApprovalMode(projectId: string): Readonly<{
+    mode: ApprovalMode;
+    source: "project" | "default";
+  }> {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    const row = this.#database
+      .query("SELECT mode FROM project_approval_modes WHERE project_id=?")
+      .get(parsedProjectId);
+    if (row !== null) {
+      return { mode: z.object({ mode: approvalModeSchema }).strict().parse(row).mode, source: "project" };
+    }
+    return { mode: this.readDefaultApprovalMode(), source: "default" };
+  }
+
+  setProjectApprovalMode(projectId: string, mode: ApprovalMode | null): void {
+    const parsedProjectId = projectIdSchema.parse(projectId);
+    if (mode === null) {
+      this.#database.query("DELETE FROM project_approval_modes WHERE project_id=?").run(parsedProjectId);
+      return;
+    }
+    const parsed = approvalModeSchema.parse(mode);
+    const write = this.#database.transaction(() => {
+      if (this.#database.query("SELECT 1 FROM projects WHERE id=?").get(parsedProjectId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      this.#database.query(
+        `INSERT INTO project_approval_modes(project_id,mode,updated_at) VALUES (?,?,?)
+         ON CONFLICT(project_id) DO UPDATE SET mode=excluded.mode,updated_at=excluded.updated_at`,
+      ).run(parsedProjectId, parsed, this.#now());
     });
     write.immediate();
   }

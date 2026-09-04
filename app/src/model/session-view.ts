@@ -95,13 +95,13 @@ export function isIdleSession(state: SessionStateValue): boolean {
 }
 
 /**
- * Where the grid composer sends.
+ * Where the grid composer steers.
  *
- * Starting a new session is a device command and arrives with W3, so until then
- * the wide input steers an existing one: the selected session when it is idle,
- * otherwise the session with the most recent activity. `summaries` is expected
- * in the grid's own display order, which already puts the freshest first inside
- * each group, so the fallback re-sorts by activity rather than trusting it.
+ * With no session selected the composer starts a new one through the
+ * `session_start` device command instead; this resolves the target only for the
+ * steering half. `summaries` is expected in the grid's own display order, which
+ * already puts the freshest first inside each group, so the fallback re-sorts
+ * by activity rather than trusting it.
  */
 export function resolveComposerTarget(
   summaries: readonly SessionCardSummary[],

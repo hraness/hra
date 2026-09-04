@@ -6,6 +6,7 @@
 import {
   cloudLimits,
   isCommandKind,
+  isDeviceCommandKind,
   isFiniteTimestamp,
   isOpaqueIdentifier,
   isRecord,
@@ -17,6 +18,7 @@ import {
   type AuthorityTuple,
   type CommandKind,
   type CommandState,
+  type DeviceCommandKind,
   type EncryptedEnvelope,
   type SyncStream,
   type WrappedKeyEnvelope,
@@ -318,6 +320,58 @@ export function parseCommandRecord(value: unknown): CommandRecord | null {
     publicId: value.publicId,
     resultCode: typeof value.resultCode === "string" ? value.resultCode : null,
     sessionPublicId: value.sessionPublicId,
+    state: value.state as CommandState,
+    updatedAt: value.updatedAt,
+  };
+}
+
+/**
+ * A device command as the requesting browser sees it. There is no session, and
+ * a single-use result is never returned by an ordinary read: the row reports
+ * only that one exists and whether it has already been spent.
+ */
+export type DeviceCommandRecord = Readonly<{
+  createdAt: number;
+  deadline: number;
+  kind: DeviceCommandKind;
+  publicId: string;
+  result: EncryptedEnvelope | null;
+  resultCode: string | null;
+  resultConsumed: boolean;
+  resultSingleUse: boolean;
+  state: CommandState;
+  updatedAt: number;
+}>;
+
+export function parseDeviceCommandRecord(value: unknown): DeviceCommandRecord | null {
+  if (
+    !isRecord(value)
+    || !isFiniteTimestamp(value.createdAt)
+    || !isFiniteTimestamp(value.deadline)
+    || !isDeviceCommandKind(value.kind)
+    || !isUuidV7(value.publicId)
+    || typeof value.state !== "string"
+    || !commandStates.has(value.state as CommandState)
+    || !isFiniteTimestamp(value.updatedAt)
+    || (value.resultCode !== undefined
+      && (typeof value.resultCode !== "string"
+        || value.resultCode.length > cloudLimits.resultCodeCharacters))
+    || (value.resultSingleUse !== undefined && value.resultSingleUse !== true)
+    || (value.resultConsumed !== undefined && typeof value.resultConsumed !== "boolean")
+  ) return null;
+  const result = value.result === undefined
+    ? null
+    : parseEncryptedEnvelope(value.result, cloudLimits.metadataCiphertextCharacters);
+  if (value.result !== undefined && result === null) return null;
+  return {
+    createdAt: value.createdAt,
+    deadline: value.deadline,
+    kind: value.kind,
+    publicId: value.publicId,
+    result,
+    resultCode: typeof value.resultCode === "string" ? value.resultCode : null,
+    resultConsumed: value.resultConsumed === true,
+    resultSingleUse: value.resultSingleUse === true,
     state: value.state as CommandState,
     updatedAt: value.updatedAt,
   };

@@ -12,6 +12,7 @@ import {
   containsUnsafeTerminalScalar,
   hasExactKeys,
   isCommandKind,
+  isDeviceCommandKind,
   isDigest,
   isFiniteTimestamp,
   isOpaqueIdentifier,
@@ -24,6 +25,7 @@ import {
   type AuthorityTuple,
   type CommandKind,
   type CommandState,
+  type DeviceCommandKind,
   type EncryptedEnvelope,
 } from "./contracts";
 import {
@@ -39,6 +41,7 @@ import {
   type CloudCommandJournalEntry,
   type CloudDaemonJournalPort,
   type CloudDaemonJournalState,
+  type CloudDeviceCommandJournalEntry,
   type CloudProjectionRecoveryAppliedResponse,
   type CloudProjectionRecoveryBaselineInteraction,
   type CloudProjectionRecoveryJournalEntry,
@@ -48,6 +51,7 @@ import {
   type CloudUsageAccountCursor,
   type PendingCloudUsageAccount,
   addCloudCommandJournalEntry,
+  addCloudDeviceCommandJournalEntry,
   addCloudProjectionRecovery,
   advanceCloudSessionRemoteCursor,
   assertCloudDaemonJournalFutureCapacity,
@@ -63,18 +67,24 @@ import {
   parseCloudProjectionRecoveryEntry,
   providerDeletionProjectionRecoveryCode,
   pruneExpiredCloudProjectionRecoveryReceipts,
+  removeCloudDeviceCommandJournalEntry,
   supersedeCloudProjectionRecoveryForProviderDeletion,
   terminalizeUnreservedPreparedCloudCommands,
   transitionCloudCommandJournalEntry,
+  transitionCloudDeviceCommandJournalEntry,
   transitionCloudProjectionRecovery,
 } from "./daemon-journal";
 import {
+  decryptDeviceCommand,
   decryptRemoteCommand,
   decryptSessionMetadata,
+  encryptDeviceCommandResult,
   encryptDeviceRegistry,
   encryptSessionMetadata,
   encryptUsageProjection,
   parseSessionMetadataPayload,
+  type DeviceCommandPayload,
+  type DeviceCommandResultPayload,
   type DeviceRegistryPayload,
   type RemoteCommandPayload,
   type SessionMetadataPayload,
@@ -119,6 +129,9 @@ const maximumChunksPerRemoteSession = 8;
 const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumCommandsPerCycle = 32;
 const maximumJournalRecoveriesPerCycle = 4;
+// Device commands are foreground requests. A small per-cycle budget keeps a
+// burst from crowding out session steering, and the daily cap bounds the rest.
+const maximumDeviceCommandsPerCycle = 8;
 const maximumUsageAccounts = 32;
 const maximumUsageSnapshotsPerCycle = 32;
 const maximumIdempotencyLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
@@ -351,6 +364,33 @@ export type CloudCommandExecutionResult = Readonly<{
   state: "applied" | "failed" | "ambiguous";
 }>;
 
+export type CloudDeviceCommandExecutionResult = Readonly<{
+  code: string;
+  /** Settled back to the requester, account-key encrypted, when present. */
+  result?: DeviceCommandResultPayload;
+  /**
+   * Marks the result readable exactly once. Only the account-linking relay sets
+   * it; the hosted row erases the ciphertext on the requester's first read.
+   */
+  singleUseResult?: boolean;
+  state: "applied" | "failed" | "ambiguous";
+}>;
+
+/**
+ * Executes one device command. Unlike `CloudCommandExecutorPort` this carries
+ * no session and no lease: the device itself is the authority, so the port only
+ * needs the requesting device's identity (for the per-device guards) and the
+ * command's own idempotency key.
+ */
+export interface CloudDeviceCommandExecutorPort {
+  executeDeviceCommand(input: Readonly<{
+    idempotencyKey: string;
+    payload: DeviceCommandPayload;
+    requestingDevicePublicId: string;
+    signal: AbortSignal;
+  }>): Promise<CloudDeviceCommandExecutionResult>;
+}
+
 export interface CloudCommandExecutorPort {
   execute(input: Readonly<{
     authority: CloudLocalCommandAuthority;
@@ -561,6 +601,8 @@ export type LocalCloudDaemonBridgeOptions = Readonly<{
   daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
   deploymentAuthority: CloudDeploymentAuthority;
+  /** Device-command executor (default: none; every device command is refused). */
+  deviceExecutor?: CloudDeviceCommandExecutorPort;
   executor: CloudCommandExecutorPort;
   identity: CloudDaemonIdentityPort;
   journal: CloudDaemonJournalPort;
@@ -581,6 +623,8 @@ export type LocalCloudDaemonBridgeEnvironmentOptions = Readonly<{
   deploymentUrl?: string;
   deploymentAuthority?: CloudDeploymentAuthority;
   environment?: Readonly<Record<string, string | undefined>>;
+  /** Device-command executor (default: none; every device command is refused). */
+  deviceExecutor?: CloudDeviceCommandExecutorPort;
   executor: CloudCommandExecutorPort;
   journal?: CloudDaemonJournalPort;
   leaseDurationMs?: number;
@@ -1322,6 +1366,73 @@ function parseCloudCommand(value: unknown): CloudCommand {
   };
 }
 
+type CloudDeviceCommand = Readonly<{
+  boundAuthority?: AuthorityTuple;
+  createdAt: number;
+  deadline: number;
+  kind: DeviceCommandKind;
+  payload: EncryptedEnvelope;
+  publicId: string;
+  requestingDevicePublicId: string;
+  state: CommandState;
+}>;
+
+function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[] {
+  if (!Array.isArray(value) || value.length > cloudLimits.pageSize) {
+    throw new Error("Cloud device command response is invalid.");
+  }
+  const commands = value.map((entry): CloudDeviceCommand => {
+    if (!isRecord(entry)) throw new Error("Cloud device command response is invalid.");
+    const optional = [
+      "boundAuthority",
+      "result",
+      "resultCode",
+      "resultConsumed",
+      "resultSingleUse",
+    ].filter((key) => Object.hasOwn(entry, key));
+    const boundAuthority = entry.boundAuthority === undefined
+      ? undefined
+      : parseAuthorityTuple(entry.boundAuthority);
+    const payload = parseEncryptedEnvelope(entry.payload);
+    const state = parseCommandState(entry.state);
+    if (
+      !hasExactKeys(entry, [
+        ...optional,
+        "createdAt",
+        "deadline",
+        "kind",
+        "payload",
+        "publicId",
+        "requestingDevicePublicId",
+        "state",
+        "updatedAt",
+      ])
+      || (entry.boundAuthority !== undefined && boundAuthority === null)
+      || !isFiniteTimestamp(entry.createdAt)
+      || !isFiniteTimestamp(entry.deadline)
+      || !isDeviceCommandKind(entry.kind)
+      || payload === null
+      || !isUuidV7(entry.publicId)
+      || !isOpaqueIdentifier(entry.requestingDevicePublicId)
+      || state === null
+    ) throw new Error("Cloud device command response is invalid.");
+    return {
+      ...(boundAuthority === undefined || boundAuthority === null ? {} : { boundAuthority }),
+      createdAt: entry.createdAt,
+      deadline: entry.deadline,
+      kind: entry.kind,
+      payload,
+      publicId: entry.publicId,
+      requestingDevicePublicId: entry.requestingDevicePublicId,
+      state,
+    };
+  });
+  if (new Set(commands.map((command) => command.publicId)).size !== commands.length) {
+    throw new Error("Cloud device command response is invalid.");
+  }
+  return commands;
+}
+
 function parseCloudCommandMetadata(value: unknown): CloudCommandMetadata {
   if (!isRecord(value)) throw new Error("Cloud command metadata is invalid.");
   const optional = ["boundAuthority", "result", "resultCode"]
@@ -1878,6 +1989,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   readonly #daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
   readonly #deploymentAuthority: CloudDeploymentAuthority;
   readonly #executor: CloudCommandExecutorPort;
+  readonly #deviceExecutor: CloudDeviceCommandExecutorPort | null;
   readonly #identity: CloudDaemonIdentityPort;
   readonly #journal: CloudDaemonJournalPort;
   readonly #leaseDurationMs: number;
@@ -1919,6 +2031,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     this.#daemonAuthorityFence = options.daemonAuthorityFence;
     this.#deploymentAuthority = options.deploymentAuthority;
     this.#executor = options.executor;
+    this.#deviceExecutor = options.deviceExecutor ?? null;
     this.#identity = options.identity;
     this.#journal = options.journal;
     this.#leaseDurationMs = leaseDurationMs;
@@ -2017,6 +2130,12 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         );
         result.commandsApplied = commandResult.applied;
         result.commandsUnsettled = commandResult.unsettled;
+        const deviceCommandResult = await this.#processDeviceCommands(
+          identity,
+          signal,
+          result.errors,
+        );
+        result.commandsApplied += deviceCommandResult.applied;
         const previousOptional = this.#optionalTask;
         if (previousOptional !== null) {
           if (previousOptional.state.outcome === null) {
@@ -3733,6 +3852,218 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     return uploaded;
   }
 
+  /*
+   * Device commands. One bounded pass per cycle, mirroring `#processCommands`
+   * exactly: claim the pending row, journal `prepared` before the server call,
+   * flip the journal to `effect_started` before the effect, execute, settle.
+   *
+   * The two differences are the whole point of the separate table. There is no
+   * lease, so the fence is this daemon's own boot authority; and there is no
+   * session FIFO, so nothing queues behind a prepared head.
+   *
+   * Recovery is deliberately one-way. A journal entry left at `effect_started`
+   * by a previous boot describes a `session_start` that may or may not have
+   * created a session. It is closed as `ambiguous` and never re-executed, which
+   * is what stops a start that may have happened from silently starting twice.
+   */
+  async #processDeviceCommands(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+    errors: string[],
+  ): Promise<Readonly<{ applied: number }>> {
+    const executor = this.#deviceExecutor;
+    // A daemon built without a device-command executor never reads the device
+    // command table at all. Rows addressed to it stay pending and expire on
+    // their own deadline rather than being claimed by something that cannot
+    // run them.
+    if (executor === null) return { applied: 0 };
+    let applied = 0;
+    const journalState = (await this.#journal.read()).state;
+    await this.#assertDaemonCurrent(signal);
+
+    // Close every stale entry first, so a crashed effect is quarantined before
+    // this boot claims anything new.
+    for (const entry of journalState.deviceCommands.slice(0, maximumDeviceCommandsPerCycle)) {
+      abortBeforeEffect(signal);
+      try {
+        if (entry.phase === "terminal") {
+          await this.#settleDeviceCommand(entry);
+          await this.#mutateJournal((state) =>
+            removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+          continue;
+        }
+        if (sameAuthority(entry.authority, this.#deviceCommandAuthority())) continue;
+        await this.#quarantineDeviceCommand(entry);
+      } catch (error: unknown) {
+        errors.push(`device command ${entry.commandPublicId}: ${normalizeError(error)}`);
+      }
+    }
+
+    const pending = parseCloudDeviceCommands(
+      await this.#transport.query("deviceCommands:listPendingForTarget", {
+        limit: maximumDeviceCommandsPerCycle,
+      }),
+    );
+    await this.#assertDaemonCurrent(signal);
+    for (const command of pending) {
+      abortBeforeEffect(signal);
+      try {
+        const authority = this.#deviceCommandAuthority();
+        const payloadDigest = await sha256Hex(JSON.stringify(command.payload));
+        const prepared: CloudDeviceCommandJournalEntry = {
+          authority,
+          commandPublicId: command.publicId,
+          kind: command.kind,
+          payloadDigest,
+          phase: "prepared",
+          requestingDevicePublicId: command.requestingDevicePublicId,
+        };
+        await this.#mutateJournal((state) =>
+          addCloudDeviceCommandJournalEntry(state, prepared));
+        const claim = await this.#mutation("deviceCommands:prepare", {
+          authority,
+          commandPublicId: command.publicId,
+          localPhase: "prepared_no_effect",
+        });
+        if (
+          !isRecord(claim)
+          || claim.publicId !== command.publicId
+          || (claim.state !== "prepared" && claim.state !== "expired")
+        ) throw new Error("Cloud device command prepare response is invalid.");
+        if (claim.state === "expired") {
+          await this.#mutateJournal((state) =>
+            removeCloudDeviceCommandJournalEntry(state, command.publicId));
+          continue;
+        }
+        const started: CloudDeviceCommandJournalEntry = { ...prepared, phase: "effect_started" };
+        await this.#mutateJournal((state) =>
+          transitionCloudDeviceCommandJournalEntry(state, started));
+        const begin = await this.#mutation("deviceCommands:markEffectStarted", {
+          authority,
+          commandPublicId: command.publicId,
+        });
+        if (
+          !isRecord(begin)
+          || begin.publicId !== command.publicId
+          || (begin.state !== "effect_started" && begin.state !== "expired")
+        ) throw new Error("Cloud device command effect-start response is invalid.");
+        if (begin.state === "expired") {
+          await this.#mutateJournal((state) =>
+            removeCloudDeviceCommandJournalEntry(state, command.publicId));
+          continue;
+        }
+        let outcome: CloudDeviceCommandExecutionResult;
+        try {
+          const payload = await decryptDeviceCommand(command.payload, identity.accountKey, {
+            entityPublicId: command.publicId,
+            keyVersion: command.payload.keyVersion,
+            kind: "device_command",
+            userPublicId: identity.userPublicId,
+          });
+          if (payload.kind !== command.kind) {
+            throw new Error("Cloud device command kind is inconsistent.");
+          }
+          await this.#assertDaemonCurrent(signal);
+          outcome = await executor.executeDeviceCommand({
+            idempotencyKey: command.publicId,
+            payload,
+            requestingDevicePublicId: command.requestingDevicePublicId,
+            signal,
+          });
+          if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(outcome.code)) {
+            throw new Error("Local device command executor returned an invalid result.");
+          }
+        } catch {
+          outcome = { code: "LOCAL_EFFECT_INDETERMINATE", state: "ambiguous" };
+        }
+        const resultDigest = await sha256Hex(JSON.stringify({
+          code: outcome.code,
+          result: outcome.result ?? null,
+          state: outcome.state,
+        }));
+        const terminal: CloudDeviceCommandJournalEntry = {
+          ...started,
+          phase: "terminal",
+          resultCode: outcome.code,
+          resultDigest,
+          terminalState: outcome.state,
+        };
+        await this.#mutateJournal((state) =>
+          transitionCloudDeviceCommandJournalEntry(state, terminal));
+        await this.#settleDeviceCommand(terminal, identity, outcome);
+        await this.#mutateJournal((state) =>
+          removeCloudDeviceCommandJournalEntry(state, command.publicId));
+        if (outcome.state === "applied") applied += 1;
+      } catch (error: unknown) {
+        errors.push(`device command ${command.publicId}: ${normalizeError(error)}`);
+        break;
+      }
+    }
+    return { applied };
+  }
+
+  #deviceCommandAuthority(): AuthorityTuple {
+    return {
+      bootGeneration: this.#daemonAuthority.bootGeneration,
+      bootId: this.#daemonAuthority.bootId,
+      // A device command has no lease, so the boot generation and id are the
+      // whole fence. Fence 1 keeps the tuple shape valid for the shared
+      // authority validator without inventing a second counter.
+      fence: 1,
+    };
+  }
+
+  async #settleDeviceCommand(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }>,
+    identity?: ActiveCloudIdentity,
+    outcome?: CloudDeviceCommandExecutionResult,
+  ): Promise<void> {
+    const encrypted = identity === undefined || outcome?.result === undefined
+      ? undefined
+      : await encryptDeviceCommandResult(outcome.result, identity.accountKey, {
+          entityPublicId: entry.commandPublicId,
+          keyVersion: identity.keyVersion,
+          kind: "device_command_result",
+          userPublicId: identity.userPublicId,
+        });
+    await this.#mutation("deviceCommands:settle", {
+      authority: entry.authority,
+      commandPublicId: entry.commandPublicId,
+      ...(encrypted === undefined ? {} : { result: encrypted }),
+      resultCode: entry.resultCode,
+      resultDigest: entry.resultDigest,
+      ...(outcome?.singleUseResult === true ? { singleUseResult: true } : {}),
+      state: entry.terminalState,
+    });
+  }
+
+  async #quarantineDeviceCommand(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+  ): Promise<void> {
+    // `prepared` never began an effect, so it is honestly a failure. An
+    // `effect_started` entry may have created a session; the only truthful
+    // terminal state a later boot can publish is `ambiguous`.
+    const terminalState = entry.phase === "prepared" ? "failed" as const : "ambiguous" as const;
+    const resultCode = entry.phase === "prepared"
+      ? "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT"
+      : "LOCAL_EFFECT_RECOVERY_REQUIRED";
+    const resultDigest = await sha256Hex(JSON.stringify({
+      code: resultCode,
+      result: null,
+      state: terminalState,
+    }));
+    await this.#mutation("deviceCommands:recoverEffectStarted", {
+      commandPublicId: entry.commandPublicId,
+      recoveryAuthority: this.#deviceCommandAuthority(),
+      resultCode,
+      resultDigest,
+      staleAuthority: entry.authority,
+      state: terminalState,
+    });
+    await this.#mutateJournal((state) =>
+      removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+  }
+
   async #processCommands(
     identity: ActiveCloudIdentity,
     heads: Map<string, CloudSessionHead>,
@@ -4735,6 +5066,9 @@ export async function createLocalCloudDaemonBridgeFromEnvironment(
       daemonAuthority: options.daemonAuthority,
       daemonAuthorityFence: options.daemonAuthorityFence,
       deploymentAuthority,
+      ...(options.deviceExecutor === undefined
+        ? {}
+        : { deviceExecutor: options.deviceExecutor }),
       executor: options.executor,
       identity,
       journal: options.journal ?? new CustodyCloudDaemonJournal(fencedCustody),

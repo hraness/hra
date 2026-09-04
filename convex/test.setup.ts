@@ -7,6 +7,7 @@ export const modules = {
   "./admissionControl.ts": async () => await import("./admissionControl"),
   "./commands.ts": async () => await import("./commands"),
   "./devices.ts": async () => await import("./devices"),
+  "./deviceCommands.ts": async () => await import("./deviceCommands"),
   "./deviceRevocation.ts": async () => await import("./deviceRevocation"),
   "./leases.ts": async () => await import("./leases"),
   "./maintenance.ts": async () => await import("./maintenance"),

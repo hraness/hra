@@ -850,6 +850,27 @@ const renderJson = (command: LocalCommand, data: unknown): string => {
 };
 
 describe("HraService", () => {
+  test("sets the two device-command switches locally and reports them", async () => {
+    const value = await fixture();
+    expect(await value.service.execute({ kind: "remote.policy-status" }, { signal })).toEqual({
+      accountLinkingAllowed: false,
+      deviceCommandsAllowed: true,
+      version: 1,
+    });
+    expect(await value.service.execute(
+      { allowed: false, kind: "remote.policy-set", switch: "device-commands" },
+      { signal },
+    )).toEqual({ accountLinkingAllowed: false, deviceCommandsAllowed: false, version: 1 });
+    expect(await value.service.execute(
+      { allowed: true, kind: "remote.policy-set", switch: "account-linking" },
+      { signal },
+    )).toEqual({ accountLinkingAllowed: true, deviceCommandsAllowed: false, version: 1 });
+    expect(value.store.readDeviceCommandPolicy()).toEqual({
+      accountLinkingAllowed: true,
+      deviceCommandsAllowed: false,
+    });
+  });
+
   test("forwards one caller UUIDv7 through lost device responses and exact replays", async () => {
     for (const kind of ["approve", "revoke"] as const) {
       const cloud = new FakeCloud();
@@ -2856,10 +2877,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 32 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }]);
     } finally {
       inspector.close(false);
     }

@@ -179,7 +179,7 @@ Usage:
   hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
   hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
-  hra remote list|show|command|send|queue|steer|stop|preset|fast
+  hra remote list|show|command|send|queue|steer|stop|resolve|preset|fast|allow|deny|policy
   hra turn inspect
   hra auth login --input-stdin|--input-fd <fd>
   hra auth status|logout
@@ -367,12 +367,17 @@ Usage:
   hra remote command <uuidv7>
   hra remote send|queue|steer <cloud-session> <message>
   hra remote stop <cloud-session>
+  hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <once|decline|cancel>
   hra remote preset <cloud-session> <low|high|ultra|fable-max>
   hra remote fast <cloud-session> <on|off>
+  hra remote allow|deny <device-commands|account-linking>
+  hra remote policy
 
 Examples:
   hra remote list
   hra remote send synced-session -- "continue the migration"
+  hra remote deny device-commands
+  hra remote allow account-linking
   hra remote command <uuidv7>`,
   turn: `HRA turn
 
@@ -1394,6 +1399,29 @@ const parseInteraction = (cursor: Cursor, json: boolean): ParsedInteraction => {
   throw new CliUsageError("Unknown interaction action. Run `hra interaction --help` for supported actions.");
 };
 
+/**
+ * `hra remote allow|deny <switch>` and `hra remote policy`. These are local
+ * daemon commands, so they are peeled off before the cloud remote parser sees
+ * the cursor; `null` means this is an ordinary remote action.
+ */
+const parseRemotePolicy = (cursor: Cursor): LocalCommand | null => {
+  const action = cursor.values[0];
+  if (action !== "allow" && action !== "deny" && action !== "policy") return null;
+  cursor.values.shift();
+  if (action === "policy") {
+    finish(cursor);
+    return { kind: "remote.policy-status" };
+  }
+  const target = take(cursor, "remote switch");
+  finish(cursor);
+  if (target !== "device-commands" && target !== "account-linking") {
+    throw new CliUsageError(
+      "Unknown remote switch. Use `device-commands` or `account-linking`.",
+    );
+  }
+  return { allowed: action === "allow", kind: "remote.policy-set", switch: target };
+};
+
 const parseRemote = (cursor: Cursor): RemoteCliCommand => {
   const action = take(cursor, "remote action");
   switch (action) {
@@ -1523,6 +1551,16 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     throw new CliUsageError("Unknown daemon action. Run `hra daemon --help` for supported actions.");
   }
   if (group === "remote") {
+    // The two policy switches are local daemon state, not a hosted command, so
+    // they route to the daemon like `autorespond` rather than through the cloud
+    // remote invocation. Nothing hosted can set them.
+    const policy = parseRemotePolicy(cursor);
+    if (policy !== null) {
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by remote policy commands.");
+      }
+      return { kind: "command", command: policy, json };
+    }
     const remote = parseRemote(cursor);
     if (
       idempotencyKey !== undefined

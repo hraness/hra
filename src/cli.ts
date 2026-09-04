@@ -3149,6 +3149,14 @@ export async function runDaemon(
         }) as CodexRuntimePort;
         candidateAdapter = new StateBackedCloudDaemonAdapter({
           codex: cloudCodex,
+          // Device commands run ordinary local commands, so they go through the
+          // same admitted service path a person's CLI uses, with the same
+          // idempotency, quarantine, and authority checks.
+          executeLocal: async (command, options) => {
+            const current = serviceReference.current;
+            if (current === undefined) throw new Error("The local command service is not ready.");
+            return await current.execute(command, { signal: options.signal });
+          },
           executeRemote: async (command, expected, options) => {
             const current = serviceReference.current;
             if (current === undefined) throw new Error("The local command service is not ready.");
@@ -3167,6 +3175,7 @@ export async function runDaemon(
           daemonAuthorityFence: activeDaemonAuthority,
           deploymentAuthority: cloudDeploymentAuthority,
           environment: cloudEnvironment,
+          deviceExecutor: candidateAdapter,
           executor: candidateAdapter,
           lifetimeSignal: cloudRequestController.signal,
           local: candidateAdapter,

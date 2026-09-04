@@ -33,6 +33,8 @@ const maintenanceCategories = [
   "idempotency_receipts",
   "pending_commands",
   "terminal_commands",
+  "pending_device_commands",
+  "terminal_device_commands",
   "security_events",
   "usage_snapshots",
   "account_deletion_receipts",
@@ -63,11 +65,13 @@ type CleanupCounts = {
   devicePresence: number;
   deviceRevocationJobs: number;
   expiredPendingCommands: number;
+  expiredPendingDeviceCommands: number;
   idempotencyReceipts: number;
   liveTailChunks: number;
   otpChallenges: number;
   securityEvents: number;
   terminalCommands: number;
+  terminalDeviceCommands: number;
   usageSnapshots: number;
 };
 
@@ -82,6 +86,8 @@ const countField = {
   idempotency_receipts: "idempotencyReceipts",
   pending_commands: "expiredPendingCommands",
   terminal_commands: "terminalCommands",
+  pending_device_commands: "expiredPendingDeviceCommands",
+  terminal_device_commands: "terminalDeviceCommands",
   security_events: "securityEvents",
   usage_snapshots: "usageSnapshots",
   account_deletion_receipts: "accountDeletionReceipts",
@@ -302,6 +308,53 @@ async function deleteTerminalCommands(ctx: MutationCtx, now: number, limit: numb
   return limit - remaining;
 }
 
+/*
+ * Device commands share the session-command lifecycle, so they share its two
+ * sweeps: a pending row past its deadline expires, and a terminal row the
+ * requester has acknowledged is deleted after the same retention. They get
+ * their own maintenance categories rather than being folded into the session
+ * sweeps so one table's backlog can never starve the other's.
+ */
+async function expirePendingDeviceCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
+  const records = await ctx.db.query("deviceCommands")
+    .withIndex("by_state_and_deadline", (builder) => builder
+      .eq("state", "pending")
+      .lt("deadline", now))
+    .take(limit);
+  for (const record of records) {
+    const commandPatch = {
+      nonterminal: false,
+      state: "expired" as const,
+      ...(record.requesterAcknowledgedAt === undefined
+        ? {}
+        : { terminalCleanupAfter: now + cloudRetentionMs.terminalCommand }),
+      updatedAt: now,
+    };
+    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
+    await ctx.db.patch(record._id, commandPatch);
+  }
+  return records.length;
+}
+
+async function deleteTerminalDeviceCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
+  let remaining = limit;
+  for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
+    if (remaining === 0) break;
+    const records = await ctx.db.query("deviceCommands")
+      .withIndex("by_state_and_cleanup_after", (builder) => builder
+        .eq("state", state)
+        .gt("terminalCleanupAfter", 0)
+        .lt("terminalCleanupAfter", now))
+      .take(remaining);
+    for (const record of records) {
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+    }
+    remaining -= records.length;
+  }
+  return limit - remaining;
+}
+
 async function deleteExpiredSecurityEvents(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   const records = await ctx.db.query("securityEvents")
     .withIndex("by_created_at", (builder) => builder
@@ -466,6 +519,8 @@ const handlers = {
   idempotency_receipts: deleteExpiredIdempotency,
   pending_commands: expirePendingCommands,
   terminal_commands: deleteTerminalCommands,
+  pending_device_commands: expirePendingDeviceCommands,
+  terminal_device_commands: deleteTerminalDeviceCommands,
   security_events: deleteExpiredSecurityEvents,
   usage_snapshots: deleteExpiredUsage,
   account_deletion_receipts: deleteExpiredAccountReceipts,
@@ -484,11 +539,13 @@ const emptyCounts = (): CleanupCounts => ({
   devicePresence: 0,
   deviceRevocationJobs: 0,
   expiredPendingCommands: 0,
+  expiredPendingDeviceCommands: 0,
   idempotencyReceipts: 0,
   liveTailChunks: 0,
   otpChallenges: 0,
   securityEvents: 0,
   terminalCommands: 0,
+  terminalDeviceCommands: 0,
   usageSnapshots: 0,
 });
 

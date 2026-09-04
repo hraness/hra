@@ -2,12 +2,20 @@ import { describe, expect, test } from "bun:test";
 
 import { randomKeyBytes } from "./crypto";
 import {
+  decryptDeviceCommand,
+  decryptDeviceCommandResult,
   decryptDeviceRegistry,
   decryptUsageProjection,
   decryptRemoteCommand,
+  deviceCommandLimits,
+  encryptDeviceCommand,
+  encryptDeviceCommandResult,
   encryptDeviceRegistry,
   encryptUsageProjection,
   encryptRemoteCommand,
+  isRelayedLoginUrl,
+  parseDeviceCommandPayload,
+  parseDeviceCommandResultPayload,
   parseDeviceRegistryPayload,
   parseRemoteCommandPayload,
   parseSessionMetadataPayload,
@@ -198,8 +206,8 @@ describe("session metadata archive", () => {
   });
 });
 
-describe("device registry payloads", () => {
-  const registry = {
+function registryFixture() {
+  return {
     accounts: [{ label: "Work", provider: "codex", publicId: "acct_00000000000000000000000000000001", status: "signed_in" }],
     daemonVersion: "0.3.0",
     defaultApprovalMode: "auto:all",
@@ -229,6 +237,10 @@ describe("device registry payloads", () => {
     showThinkingDefault: false,
     version: 1,
   } as const;
+}
+
+describe("device registry payloads", () => {
+  const registry = registryFixture();
   const authority = {
     entityPublicId: "device_12345678",
     keyVersion: 2,
@@ -303,6 +315,136 @@ describe("device registry payloads", () => {
     expect(parseDeviceRegistryPayload({
       ...registry,
       projects: Array.from({ length: 201 }, () => registry.projects[0]),
+    })).toBeNull();
+  });
+});
+
+describe("device command payloads", () => {
+  const sessionStart = {
+    accountPublicId: "account_primary",
+    kind: "session_start",
+    preset: "ultra",
+    projectPublicId: "project_alpha",
+    prompt: "continue the migration",
+    provider: "codex",
+  } as const;
+
+  test("accepts each kind in its exact shape", () => {
+    expect(parseDeviceCommandPayload(sessionStart)).toEqual(sessionStart);
+    expect(parseDeviceCommandPayload({
+      accountPublicId: "account_primary",
+      kind: "account_login_start",
+    })).toEqual({ accountPublicId: "account_primary", kind: "account_login_start" });
+    expect(parseDeviceCommandPayload({ kind: "account_login_status" }))
+      .toEqual({ kind: "account_login_status" });
+    expect(parseDeviceCommandPayload({ kind: "usage_refresh" }))
+      .toEqual({ kind: "usage_refresh" });
+  });
+
+  test("refuses an extra key, a wrong scalar, and a session command kind", () => {
+    expect(parseDeviceCommandPayload({ ...sessionStart, extra: 1 })).toBeNull();
+    expect(parseDeviceCommandPayload({ ...sessionStart, preset: "fable-max" })).toBeNull();
+    expect(parseDeviceCommandPayload({ ...sessionStart, provider: "gemini" })).toBeNull();
+    expect(parseDeviceCommandPayload({ kind: "send_or_steer", message: "hello" })).toBeNull();
+    expect(parseDeviceCommandPayload({ kind: "account_login_status", accountPublicId: "a" }))
+      .toBeNull();
+  });
+
+  test("never accepts a filesystem path as addressing or as a prompt", () => {
+    expect(parseDeviceCommandPayload({ ...sessionStart, projectPublicId: "/srv/app" })).toBeNull();
+    expect(parseDeviceCommandPayload({ ...sessionStart, projectPublicId: "~/app" })).toBeNull();
+    expect(parseDeviceCommandPayload({ ...sessionStart, prompt: "open /etc/passwd" })).toBeNull();
+  });
+
+  test("bounds the prompt", () => {
+    expect(parseDeviceCommandPayload({ ...sessionStart, prompt: "" })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      prompt: "x".repeat(deviceCommandLimits.promptCharacters),
+    })).not.toBeNull();
+    expect(parseDeviceCommandPayload({
+      ...sessionStart,
+      prompt: "x".repeat(deviceCommandLimits.promptCharacters + 1),
+    })).toBeNull();
+  });
+
+  test("a relayed login URL is https, credential free, and bounded", () => {
+    expect(isRelayedLoginUrl("https://auth.example.test/device?code=abc")).toBe(true);
+    expect(isRelayedLoginUrl("http://localhost:1455/callback")).toBe(false);
+    expect(isRelayedLoginUrl("https://user:pass@auth.example.test/")).toBe(false);
+    expect(isRelayedLoginUrl("javascript:alert(1)")).toBe(false);
+    expect(isRelayedLoginUrl(
+      `https://auth.example.test/${"a".repeat(deviceCommandLimits.loginUrlCharacters)}`,
+    )).toBe(false);
+  });
+
+  test("result payloads carry only what their kind promises", () => {
+    expect(parseDeviceCommandResultPayload({
+      kind: "session_start",
+      sessionPublicId: "sess_0000000000000001",
+    })).toEqual({ kind: "session_start", sessionPublicId: "sess_0000000000000001" });
+    expect(parseDeviceCommandResultPayload({
+      expiresAt: 1,
+      kind: "account_login_start",
+      loginUrl: "https://auth.example.test/device",
+    })).not.toBeNull();
+    expect(parseDeviceCommandResultPayload({
+      expiresAt: 1,
+      kind: "account_login_start",
+      loginUrl: "http://auth.example.test/device",
+    })).toBeNull();
+    expect(parseDeviceCommandResultPayload({
+      instruction: "No login is in progress.",
+      kind: "account_login_status",
+      status: "idle",
+    })).not.toBeNull();
+    expect(parseDeviceCommandResultPayload({
+      instruction: "No login is in progress.",
+      kind: "account_login_status",
+      status: "unknown",
+    })).toBeNull();
+    expect(parseDeviceCommandResultPayload({ accountsRefreshed: 0, kind: "usage_refresh" }))
+      .toEqual({ accountsRefreshed: 0, kind: "usage_refresh" });
+    expect(parseDeviceCommandResultPayload({ accountsRefreshed: -1, kind: "usage_refresh" }))
+      .toBeNull();
+  });
+
+  test("round-trips a device command and its result under their own authorities", async () => {
+    const key = randomKeyBytes();
+    const commandAuthority = {
+      entityPublicId: "018bcfe5-6800-7000-8000-000000000001",
+      keyVersion: 1,
+      kind: "device_command",
+      userPublicId: "user_0000000000000001",
+    } as const;
+    const resultAuthority = { ...commandAuthority, kind: "device_command_result" } as const;
+    const envelope = await encryptDeviceCommand(sessionStart, key, commandAuthority);
+    expect(await decryptDeviceCommand(envelope, key, commandAuthority)).toEqual(sessionStart);
+    // The two authorities are separate: a command envelope never decrypts as a
+    // result, so a relayed login URL cannot be produced by replaying a request.
+    await expectPromiseToReject(decryptDeviceCommandResult(envelope, key, resultAuthority));
+    const result = { accountsRefreshed: 2, kind: "usage_refresh" } as const;
+    const resultEnvelope = await encryptDeviceCommandResult(result, key, resultAuthority);
+    expect(await decryptDeviceCommandResult(resultEnvelope, key, resultAuthority)).toEqual(result);
+  });
+
+  test("the registry switches are additive and default conservatively", () => {
+    const base = parseDeviceRegistryPayload(registryFixture());
+    expect(base).not.toBeNull();
+    expect(base?.accountLinkingAllowed).toBeUndefined();
+    expect(base?.deviceCommandsAllowed).toBeUndefined();
+    const withSwitches = parseDeviceRegistryPayload({
+      ...registryFixture(),
+      accountLinkingAllowed: true,
+      deviceCommandsAllowed: false,
+    });
+    expect(withSwitches).toMatchObject({
+      accountLinkingAllowed: true,
+      deviceCommandsAllowed: false,
+    });
+    expect(parseDeviceRegistryPayload({
+      ...registryFixture(),
+      deviceCommandsAllowed: "yes",
     })).toBeNull();
   });
 });

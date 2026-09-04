@@ -957,6 +957,16 @@ export class HraService {
           const effective = this.#store.readSessionApprovalMode(session.id);
           return { version: 1, session: session.id, mode: effective.mode, source: effective.source };
         }
+        case "remote.policy-set": {
+          if (command.switch === "device-commands") {
+            this.#store.setDeviceCommandsAllowed(command.allowed);
+          } else {
+            this.#store.setAccountLinkingAllowed(command.allowed);
+          }
+          return { version: 1, ...this.#store.readDeviceCommandPolicy() };
+        }
+        case "remote.policy-status":
+          return { version: 1, ...this.#store.readDeviceCommandPolicy() };
         case "session.events": return await this.#sessionEvents(command, context.signal);
         case "session.interactions": {
           const session = this.#store.requireSession(command.session);
