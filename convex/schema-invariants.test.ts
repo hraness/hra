@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 
 import schema from "./schema";
-import { HOSTED_TABLE_LIFECYCLE } from "./lifecyclePolicy";
-import { QUOTA_GENESIS_CHARGED_TABLES } from "./quota";
+import { DETAIL_CHUNK_RETENTION, HOSTED_TABLE_LIFECYCLE } from "./lifecyclePolicy";
+import { QUOTA_GENESIS_CHARGED_TABLES, USER_QUOTA_RESOURCES, USER_RESOURCE_QUOTAS } from "./quota";
 
 describe("hosted schema invariants", () => {
   test("every schema table has exactly one lifecycle, quota, retention, and erasure classification", () => {
@@ -31,6 +31,14 @@ describe("hosted schema invariants", () => {
   test("immutable compact history is erased only through whole-account deletion", () => {
     expect(HOSTED_TABLE_LIFECYCLE.sessionChunks).toMatchObject({ retention: "encrypted_history", disposition: "erase" });
     expect(HOSTED_TABLE_LIFECYCLE.sessionStreamEpochs).toMatchObject({ retention: "encrypted_history", disposition: "erase" });
+  });
+
+  test("live_tail is a distinct retention class from the table-wide compact history bulk class", () => {
+    expect(DETAIL_CHUNK_RETENTION).toBe("live_tail");
+    expect(DETAIL_CHUNK_RETENTION).not.toBe(HOSTED_TABLE_LIFECYCLE.sessionChunks.retention);
+    expect(USER_QUOTA_RESOURCES).toContain("live_chunk");
+    expect(USER_RESOURCE_QUOTAS.live_chunk).toBe(20_000);
+    expect(USER_RESOURCE_QUOTAS.live_chunk).toBeLessThan(USER_RESOURCE_QUOTAS.session_chunk);
   });
 
   test("hard quota genesis proves every charged table empty", () => {
