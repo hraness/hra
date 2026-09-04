@@ -8,9 +8,9 @@ import {
 export { HRA_INSTALL_ARCHIVE_URL, HRA_INSTALL_BUN_VERSION };
 
 export const HRA_INSTALL_PREFLIGHT_SOURCE_URL =
-  "https://raw.githubusercontent.com/hraness/hra/v0.2.1/src/install-preflight-runtime.ts";
+  "https://raw.githubusercontent.com/hraness/hra/v0.3.0/src/install-preflight-runtime.ts";
 export const HRA_INSTALL_PREFLIGHT_SOURCE_SHA256 =
-  "5bed09f57b0709963c515e134e7792fcac8736f624de9a02326b182e2bfd3412";
+  "880673a6cd3ebfbce6ac36172d4ee34f707fd2fb34783244714edca870055344";
 export const HRA_INSTALL_PREFLIGHT_SUCCESS = HRA_INSTALL_SUCCESS;
 export const HRA_INSTALL_PREFLIGHT_LOADER = [
   "const[a,h]=process.argv.slice(1);",

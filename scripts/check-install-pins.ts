@@ -6,7 +6,7 @@
 //
 //   bun ./scripts/check-install-pins.ts             working-tree check
 //   bun ./scripts/check-install-pins.ts --update    re-pin CLI and normalizer digests
-//   bun ./scripts/check-install-pins.ts --release-tag v0.2.1
+//   bun ./scripts/check-install-pins.ts --release-tag v0.3.0
 //                                                    working-tree check plus the public-command proof
 
 import { createHash } from "node:crypto";
