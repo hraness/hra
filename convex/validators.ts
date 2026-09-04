@@ -27,6 +27,8 @@ export const commandKind = v.union(
   v.literal("stop"),
   v.literal("set_model"),
   v.literal("set_fast"),
+  v.literal("resolve_interaction"),
+  v.literal("send_or_steer"),
 );
 export const commandState = v.union(
   v.literal("pending"),

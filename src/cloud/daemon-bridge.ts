@@ -560,6 +560,10 @@ type CloudCommand = Readonly<{
   kind: CommandKind;
   payload: EncryptedEnvelope;
   publicId: string;
+  // Populated only by `commands:get` (the exact per-command lookup used
+  // before a prepared command's effect starts). Metadata pages never carry
+  // it; nothing in the fair-scheduling scan needs it before that point.
+  requestingDevicePublicId?: string;
   sessionPublicId: string;
   state: CommandState;
 }>;
@@ -1142,13 +1146,15 @@ function parseCommandKind(value: unknown): CommandKind | null {
     || value === "stop"
     || value === "set_model"
     || value === "set_fast"
+    || value === "resolve_interaction"
+    || value === "send_or_steer"
     ? value
     : null;
 }
 
 function parseCloudCommand(value: unknown): CloudCommand {
   if (!isRecord(value)) throw new Error("Cloud command response is invalid.");
-  const optional = ["boundAuthority", "result", "resultCode"]
+  const optional = ["boundAuthority", "requestingDevicePublicId", "result", "resultCode"]
     .filter((key) => Object.hasOwn(value, key));
   if (!hasExactKeys(value, [
     ...optional,
@@ -1174,6 +1180,7 @@ function parseCloudCommand(value: unknown): CloudCommand {
     || kind === null
     || payload === null
     || !isUuidV7(value.publicId)
+    || (value.requestingDevicePublicId !== undefined && !isOpaqueIdentifier(value.requestingDevicePublicId))
     || !isOpaqueIdentifier(value.sessionPublicId)
     || state === null
     || (value.result !== undefined && parseEncryptedEnvelope(value.result) === null)
@@ -1188,6 +1195,9 @@ function parseCloudCommand(value: unknown): CloudCommand {
     kind,
     payload,
     publicId: value.publicId,
+    ...(typeof value.requestingDevicePublicId === "string"
+      ? { requestingDevicePublicId: value.requestingDevicePublicId }
+      : {}),
     sessionPublicId: value.sessionPublicId,
     state,
   };
@@ -3386,17 +3396,21 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
 
     // The server index is authoritative for equal-millisecond insertion order.
     // Choose only the oldest unsettled command per session, then order those
-    // heads by deadline. A prepared/effect-started head blocks its successors.
+    // heads by deadline. A prepared/effect-started head blocks its successors,
+    // except `resolve_interaction`, which gets its own per-session scheduling
+    // lane so a decision is never stuck behind a long-prepared `send` head.
     const alreadyJournaled = new Set(journalAtStart.map((entry) => entry.commandPublicId));
     const sessionHeads: Array<Readonly<{ command: CloudCommandMetadata; ordinal: number }>> = [];
-    const selectedSessionIds = new Set<string>();
+    const selectedLaneKeys = new Set<string>();
     for (const [ordinal, command] of nonterminal.entries()) {
-      if (selectedSessionIds.has(command.sessionPublicId)) continue;
-      selectedSessionIds.add(command.sessionPublicId);
+      const decisionLane = command.kind === "resolve_interaction";
+      const laneKey = `${command.sessionPublicId} ${decisionLane ? "decision" : "default"}`;
+      if (selectedLaneKeys.has(laneKey)) continue;
+      selectedLaneKeys.add(laneKey);
       if (
         command.state !== "pending"
         || alreadyJournaled.has(command.publicId)
-        || initiallyBlockedSessionIds.has(command.sessionPublicId)
+        || (!decisionLane && initiallyBlockedSessionIds.has(command.sessionPublicId))
       ) continue;
       sessionHeads.push({ command, ordinal });
     }

@@ -2499,7 +2499,15 @@ function remotePayload(command: RemoteCliCommand): RemoteCommandPayload | null {
     case "remote.list":
     case "remote.show":
     case "remote.command": return null;
-    case "remote.send": return { kind: "send", message: command.message };
+    case "remote.send": return command.orSteer === true
+      ? { kind: "send_or_steer", message: command.message }
+      : { kind: "send", message: command.message };
+    case "remote.resolve": return {
+      decision: command.decision,
+      interactionId: command.interaction,
+      kind: "resolve_interaction",
+      revision: command.revision,
+    };
     case "remote.queue": return { kind: "queue", message: command.message };
     case "remote.steer": return { kind: "steer", message: command.message };
     case "remote.stop": return { kind: "stop" };
@@ -2648,7 +2656,7 @@ export function renderRemoteSuccess(
         if (!interactionGuidanceAvailable) {
           rows.push("  Interaction action guidance is suppressed while remote recovery settles.");
         } else if (event.state === "pending") {
-          rows.push("  Resolve on the execution device. Remote interaction responses are not enabled.");
+          rows.push(`  Decide remotely with \`hra remote resolve <session> --interaction ${event.interactionId} --revision ${String(event.revision)} --decision once|decline|cancel\`, or resolve on the execution device.`);
         } else if (event.state === "response_prepared") {
           rows.push("  A response is durably prepared on the execution device. Do not submit another response.");
         } else if (event.state === "response_written") {

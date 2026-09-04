@@ -54,7 +54,9 @@ export type CommandKind =
   | "steer"
   | "stop"
   | "set_model"
-  | "set_fast";
+  | "set_fast"
+  | "resolve_interaction"
+  | "send_or_steer";
 
 export type CommandState =
   | "pending"

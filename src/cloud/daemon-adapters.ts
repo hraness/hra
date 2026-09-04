@@ -21,6 +21,7 @@ import { Database } from "bun:sqlite";
 import { parseAccountUsage, parseRateLimits, type RateLimitSnapshot } from "../codex/protocol";
 import type { LocalCommand } from "../domain/contracts";
 import type { InteractionRecord } from "../domain/interactions";
+import type { RemoteCommandPayload } from "./payloads";
 import { providerUsagePayload } from "../domain/usage-metrics";
 import { sessionIdSchema } from "../domain/values";
 import type {
@@ -90,7 +91,7 @@ const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumProjectionRecoveryStatusSessions = 20;
 
 type ProviderRemoteLocalCommand = Extract<LocalCommand, Readonly<{
-  kind: "session.send" | "session.queue" | "session.steer" | "session.stop" | "session.rename" | "session.preset" | "session.fast";
+  kind: "session.send" | "session.queue" | "session.steer" | "session.stop" | "session.rename" | "session.preset" | "session.fast" | "interaction.resolve";
 }>>;
 
 type LocalExecuteRemote = (
@@ -2911,6 +2912,24 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
           case "set_fast":
             command = { kind: "session.fast", session: session.id, enabled: input.payload.enabled, idempotencyKey: input.idempotencyKey };
             break;
+          case "send_or_steer":
+            // Resolved at execution time: the requester's view of "turn
+            // active" is stale by design, so the custodian decides.
+            command = session.activeTurnId === undefined
+              ? { kind: "session.send", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey }
+              : { kind: "session.steer", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey };
+            break;
+          case "resolve_interaction": {
+            const verified = verifyRemoteInteraction(this.#store, session.id, input.payload, Date.now());
+            if (verified.kind === "refused") return { code: verified.code, state: "failed" };
+            command = {
+              kind: "interaction.resolve",
+              interaction: input.payload.interactionId,
+              expectedRevision: input.payload.revision,
+              resolution: verified.resolution,
+            };
+            break;
+          }
       }
       await this.#executeRemote(command, {
         processGeneration: profile.processGeneration,
@@ -2927,6 +2946,58 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
       return { code: `LOCAL_${code.replace(/[^A-Z0-9_]/gu, "_")}`.slice(0, 64), state: "failed" };
     }
   }
+}
+
+type RemoteInteractionVerification =
+  | Readonly<{ kind: "refused"; code: string }>
+  | Readonly<{ kind: "verified"; resolution: Extract<LocalCommand, { kind: "interaction.resolve" }>["resolution"] }>;
+
+/*
+ * Remote decisions are verified against the local interaction record before
+ * the ordinary resolve path runs: the interaction must exist, belong to the
+ * command's session, still be pending at the requested revision, be inside
+ * its deadline, and the decision must be one the provider offered. Session
+ * scope is never accepted remotely, and questions marked secret are refused.
+ */
+function verifyRemoteInteraction(
+  store: StateStore,
+  sessionId: SessionRecord["id"],
+  payload: Extract<RemoteCommandPayload, { kind: "resolve_interaction" }>,
+  now: number,
+): RemoteInteractionVerification {
+  let interaction: InteractionRecord;
+  try {
+    interaction = store.requireInteraction(payload.interactionId);
+  } catch {
+    return { kind: "refused", code: "INTERACTION_NOT_FOUND" };
+  }
+  if (interaction.sessionId !== sessionId) return { kind: "refused", code: "INTERACTION_SESSION_MISMATCH" };
+  if (interaction.state !== "pending") return { kind: "refused", code: "INTERACTION_ALREADY_RESOLVED" };
+  if (interaction.revision !== payload.revision) return { kind: "refused", code: "INTERACTION_REVISION_STALE" };
+  if (now >= interaction.deadlineAt) return { kind: "refused", code: "INTERACTION_EXPIRED" };
+  if ("decision" in payload) {
+    const display = interaction.display;
+    if (display.kind !== "command_approval" && display.kind !== "file_change_approval") {
+      return { kind: "refused", code: "INTERACTION_DECISION_NOT_REMOTE" };
+    }
+    if (!display.availableDecisions.includes(payload.decision)) {
+      return { kind: "refused", code: "INTERACTION_DECISION_UNAVAILABLE" };
+    }
+    return { kind: "verified", resolution: { kind: "approval_decision", decision: payload.decision } };
+  }
+  if (interaction.display.kind !== "user_input") {
+    return { kind: "refused", code: "INTERACTION_ANSWERS_NOT_REMOTE" };
+  }
+  const secretQuestions = new Set(
+    interaction.display.questions.filter((question) => question.secret).map((question) => question.id),
+  );
+  for (const questionId of Object.keys(payload.answers)) {
+    if (secretQuestions.has(questionId)) return { kind: "refused", code: "INTERACTION_SECRET_ANSWER_REFUSED" };
+  }
+  const answers = Object.fromEntries(
+    Object.entries(payload.answers).map(([questionId, answer]) => [questionId, { answers: [...answer.answers] }]),
+  );
+  return { kind: "verified", resolution: { kind: "user_answers", answers } };
 }
 
 export class BridgedCloudControl implements CloudControlPort, CloudRemoteControlPort {
