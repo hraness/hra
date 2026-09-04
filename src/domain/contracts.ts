@@ -27,6 +27,7 @@ import {
 } from "./work";
 import { workProtocolQuerySchema } from "./work-protocol";
 import {
+  gatewayKeySchema,
   labelSchema,
   messageSchema,
   noteSchema,
@@ -284,6 +285,14 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     session: selectorSchema.optional(),
     mode: z.enum(["auto:all", "auto:workspace", "manual"]).nullable(),
   }).strict(),
+  // The gateway key reaches the daemon only through this command, only from a
+  // descriptor the caller redirected, and never from argv. Command kinds are
+  // the only part of a command that any renderer or log ever reproduces.
+  z.object({
+    kind: z.literal("autorespond.gateway-set"),
+    key: gatewayKeySchema,
+  }).strict(),
+  z.object({ kind: z.literal("autorespond.gateway-clear") }).strict(),
   z.object({
     kind: z.literal("interaction.list"),
     session: selectorSchema.optional(),

@@ -2256,11 +2256,14 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     const report = value as {
       budgets?: { consecutive: number; lastDay: number; lastHour: number };
       counts?: { accepted: number; refused: number };
+      gateway?: unknown;
       mode?: unknown;
       recent?: unknown[];
       source?: unknown;
     };
     const rows = [`Approval mode: ${line(report.mode)} (${line(report.source)})`];
+    // Only the configured/not-configured fact is ever shown for the key.
+    if (report.gateway !== undefined) rows.push(`Gateway: ${line(report.gateway)}`);
     if (report.counts !== undefined) {
       rows.push(`Autoresponses: ${String(report.counts.accepted)} accepted, ${String(report.counts.refused)} escalated`);
     }
@@ -2268,9 +2271,15 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       rows.push(`Budgets: ${String(report.budgets.consecutive)} consecutive, ${String(report.budgets.lastHour)} this hour, ${String(report.budgets.lastDay)} today`);
     }
     if (Array.isArray(report.recent) && report.recent.length > 0) {
-      rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "kind", "approvalClass", "decision", "outcome", "sessionId"]));
+      rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "path", "kind", "rule", "decision", "outcome", "model", "sessionId"]));
     }
     output.writeStdout(`${rows.join("\n")}\n`);
+  } else if (command.kind === "autorespond.gateway-set") {
+    output.writeStdout("Autorespond gateway key configured.\n");
+  } else if (command.kind === "autorespond.gateway-clear") {
+    output.writeStdout(value.cleared === true
+      ? "Autorespond gateway key cleared.\n"
+      : "No autorespond gateway key was configured.\n");
   } else if (command.kind === "session.events") {
     const page = sessionEventPage(data);
     output.writeStdout(`${page === null ? "Event page data is unavailable." : renderSessionEventPageHuman(page)}\n`);

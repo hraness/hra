@@ -42,6 +42,7 @@ type TurnAccumulator = {
 
 type SessionTracking = {
   active: TurnAccumulator | null;
+  lastClassification: SessionStateClassification | null;
   lastFinalText: string;
   lastTurnStatus: "completed" | "interrupted" | "failed";
   openSubagents: number;
@@ -61,6 +62,20 @@ export class SessionStateTracker {
 
   snapshot(sessionId: string): SessionStateSnapshot | null {
     return this.#sessions.get(sessionId)?.snapshot ?? null;
+  }
+
+  /*
+   * The full classification behind the latest emitted snapshot. The prose
+   * autoresponder needs the matched rule and the verbatim literal, neither of
+   * which belongs on the wire event.
+   */
+  classification(sessionId: string): SessionStateClassification | null {
+    return this.#sessions.get(sessionId)?.lastClassification ?? null;
+  }
+
+  /** The accumulated text of the last completed turn, bounded by the tracker. */
+  finalAssistantText(sessionId: string): string {
+    return this.#sessions.get(sessionId)?.lastFinalText ?? "";
   }
 
   forget(sessionId: string): void {
@@ -145,6 +160,50 @@ export class SessionStateTracker {
     }
   }
 
+  /*
+   * Force one further revision without reclassifying. The daemon uses this
+   * when an autorespond outcome, not new provider text, changes who must act:
+   * a verbatim mismatch escalates the turn to the human.
+   */
+  escalate(
+    sessionId: string,
+    input: Readonly<{
+      attention: boolean;
+      reason: string;
+      state: SessionStateClassification["state"];
+    }>,
+  ): Extract<SessionEventBody, { type: "session_state" }> {
+    const tracking = this.#tracking(sessionId);
+    const classification: SessionStateClassification = {
+      state: input.state,
+      attention: input.attention,
+      reason: input.reason,
+      verbatimRequired: false,
+      matchedRule: tracking.lastClassification?.matchedRule ?? "approval_cue",
+    };
+    tracking.revision += 1;
+    const snapshot: SessionStateSnapshot = {
+      state: classification.state,
+      attention: classification.attention,
+      reason: classification.reason.slice(0, REASON_MAX_CHARACTERS),
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+      lastActivityAt: this.#now(),
+      revision: tracking.revision,
+    };
+    tracking.lastClassification = classification;
+    tracking.snapshot = snapshot;
+    return {
+      type: "session_state",
+      state: snapshot.state,
+      attention: snapshot.attention,
+      reason: snapshot.reason,
+      verbatimRequired: false,
+      lastActivityAt: snapshot.lastActivityAt,
+      revision: snapshot.revision,
+    };
+  }
+
   setOpenSubagents(sessionId: string, count: number): void {
     this.#tracking(sessionId).openSubagents = Math.max(0, Math.floor(count));
   }
@@ -154,6 +213,7 @@ export class SessionStateTracker {
     if (tracking === undefined) {
       tracking = {
         active: null,
+        lastClassification: null,
         lastFinalText: "",
         lastTurnStatus: "completed",
         openSubagents: 0,
@@ -210,6 +270,7 @@ export class SessionStateTracker {
       lastActivityAt: this.#now(),
       revision: tracking.revision,
     };
+    tracking.lastClassification = classification;
     tracking.snapshot = snapshot;
     void sessionId;
     return {

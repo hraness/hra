@@ -121,7 +121,19 @@ export type CliInvocation =
   | WorkEventFollowCliInvocation
   | InteractionRequiredInvocation
   | ProjectionRecoveryCliInvocation
+  | GatewayKeySetCliInvocation
   | { kind: "command"; command: LocalCommand; json: boolean };
+
+/*
+ * `hra autorespond gateway set` never accepts the key as an argument. The
+ * parser only names the descriptor to read; the value is read once, sent to
+ * the daemon, and never rendered.
+ */
+export type GatewayKeySetCliInvocation = Readonly<{
+  input: ProtectedInputSource;
+  json: boolean;
+  kind: "autorespond.gateway-set";
+}>;
 
 export type RemoteCliCommand =
   | Readonly<{ kind: "remote.list"; limit: number }>
@@ -279,6 +291,8 @@ Usage:
   hra session status <session> [--json]
   hra session state <session> [--json]
   hra autorespond on|workspace|off|default|status [--session <session>] [--json]
+  hra autorespond gateway set [--from-fd <fd>] [--json]
+  hra autorespond gateway clear [--json]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
@@ -1505,6 +1519,31 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   }
   if (group === "autorespond") {
     const action = take(cursor, "autorespond action");
+    if (action === "gateway") {
+      const gatewayAction = take(cursor, "autorespond gateway action");
+      const descriptor = option(cursor, "--from-fd");
+      finish(cursor);
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by autorespond.");
+      }
+      if (gatewayAction === "clear") {
+        if (descriptor !== undefined) {
+          throw new CliUsageError("--from-fd is not supported by `autorespond gateway clear`.");
+        }
+        return { kind: "command", command: { kind: "autorespond.gateway-clear" }, json };
+      }
+      if (gatewayAction !== "set") {
+        throw new CliUsageError("Unknown autorespond gateway action. Use `set` or `clear`.");
+      }
+      if (descriptor === undefined) {
+        return { input: { kind: "stdin" }, json, kind: "autorespond.gateway-set" };
+      }
+      const fd = boundedDecimal(descriptor, "gateway key file descriptor", 0, 1_048_575);
+      if (fd === 1 || fd === 2) {
+        throw new CliUsageError("The gateway key cannot be read from stdout or stderr.");
+      }
+      return { input: { fd, kind: "fd" }, json, kind: "autorespond.gateway-set" };
+    }
     const session = option(cursor, "--session");
     finish(cursor);
     if (idempotencyKey !== undefined) throw new CliUsageError("--idempotency-key is not supported by autorespond.");
@@ -1521,7 +1560,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
             ? null
             : undefined;
     if (mode === undefined) {
-      throw new CliUsageError("Unknown autorespond action. Use `on`, `workspace`, `off`, `default`, or `status`.");
+      throw new CliUsageError("Unknown autorespond action. Use `on`, `workspace`, `off`, `default`, `status`, or `gateway`.");
     }
     if (mode === null && session === undefined) {
       throw new CliUsageError("`autorespond default` clears a session override; pass --session <session>.");
