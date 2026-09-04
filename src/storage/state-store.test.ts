@@ -2510,6 +2510,28 @@ describe("StateStore", () => {
     expect(store.requireSession(queueSession.id)).toMatchObject({ state: "idle", fastEnabled: true });
   });
 
+  test("reports whether any session is mid-turn as a cloud cadence hint", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Cadence authority", "cadence@example.com");
+    expect(store.hasSessionWithActiveTurn()).toBe(false);
+    const created = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    expect(store.hasSessionWithActiveTurn()).toBe(false);
+    const bound = store.bindSession({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      providerThreadId: "thread-cadence",
+      state: "active",
+      activeTurnId: "turn-cadence",
+    });
+    expect(store.hasSessionWithActiveTurn()).toBe(true);
+    store.reconcileSessionFromProvider({
+      sessionId: bound.id,
+      state: "idle",
+      activeTurnId: null,
+    });
+    expect(store.hasSessionWithActiveTurn()).toBe(false);
+  });
+
   test("appends ordered bounded session events and reads an atomic snapshot cursor", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Event authority", "events@example.com");

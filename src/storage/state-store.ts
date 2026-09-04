@@ -4491,6 +4491,17 @@ export class StateStore {
     };
   }
 
+  /*
+   * True while any non-terminal session is mid-turn. This is a cadence hint
+   * for the cloud sync loop, so it reads one indexless existence row and
+   * never projects session content.
+   */
+  hasSessionWithActiveTurn(): boolean {
+    return this.#database.query(
+      "SELECT 1 AS present FROM sessions WHERE active_turn_id IS NOT NULL AND state='active' LIMIT 1",
+    ).get() !== null;
+  }
+
   listCloudSessionPage(input: Readonly<{
     afterId: string | null;
     limit: number;

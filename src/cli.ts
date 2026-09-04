@@ -3049,12 +3049,13 @@ export async function runDaemon(
           );
         }
         const cloudBridge = candidateBridge;
+        const candidateLifecycle = createCloudDaemonLifecycle({ bridge: cloudBridge });
         const candidateCloud = new BridgedCloudControl(
           localCloudControl,
           cloudBridge,
           candidateAdapter,
+          candidateLifecycle,
         );
-        const candidateLifecycle = createCloudDaemonLifecycle({ bridge: cloudBridge });
         cloudAdapter = candidateAdapter;
         cloud = candidateCloud;
         cloudLifecycle = candidateLifecycle;

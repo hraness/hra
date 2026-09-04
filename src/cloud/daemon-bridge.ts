@@ -85,6 +85,11 @@ import {
   parseCompactSessionEvents,
   type CompactSessionEvent,
 } from "./projection";
+import {
+  createCloudPushWake,
+  createConvexPushWakeSubscriber,
+  type CloudPushWakePort,
+} from "./push-wake";
 import { parseUsageProjection, type UsageProjection } from "./usage";
 import {
   deploymentFencedCloudTransport,
@@ -120,6 +125,7 @@ const defaultLeaseDurationMs = 60_000;
 const defaultOptionalSyncBudgetMs = 10_000;
 const minimumPresenceCycleTtlMs = 15_000;
 const maximumPresenceTtlMs = 120_000;
+const peerPresenceRefreshMs = 10_000;
 const authLogoutCustodySlot = "cloud-auth-logout";
 const unreservedPreparedCommandResultCode = "LOCAL_JOURNAL_CAPACITY_BEFORE_EFFECT";
 
@@ -212,6 +218,11 @@ export interface CloudDaemonLocalSourcePort {
     idempotencyKey: string;
     sessionPublicId: string;
   }>): Promise<void>;
+  /*
+   * Cadence hint only: true while any local session is mid-turn. It is read
+   * once per cycle, so it must be cheap and must never throw a cycle down.
+   */
+  hasActiveTurn?(): boolean | Promise<boolean>;
   isSessionTerminal?(sessionPublicId: string): boolean | Promise<boolean>;
   listSessions(input: Readonly<{
     afterPublicId: string | null;
@@ -350,7 +361,18 @@ export type RemoteCloudSession = Readonly<{
   updatedAt: number;
 }>;
 
+/*
+ * The cadence hint the lifecycle uses to pick its poll interval. Both fields
+ * are best effort: a failed probe keeps the previous observation rather than
+ * failing a cycle, because nothing but the sleep length depends on them.
+ */
+export type CloudDaemonActivity = Readonly<{
+  localTurnActive: boolean;
+  peerDevicePresent: boolean;
+}>;
+
 export type CloudDaemonCycleResult = Readonly<{
+  activity?: CloudDaemonActivity;
   commandsApplied: number;
   commandsUnsettled: number;
   errors: readonly string[];
@@ -478,6 +500,12 @@ export interface CloudDaemonBridge {
   cycle(signal: AbortSignal): Promise<CloudDaemonCycleResult>;
   /** Uploads coalesced live text for sessions this daemon executes; safe to call every second. */
   liveTick?(signal: AbortSignal): Promise<CloudLiveTickResult>;
+  /**
+   * The hosted push-wake subscription, when this bridge opened one. The
+   * lifecycle waits on it beside its adaptive timer; the bridge owns its
+   * lifetime and drains its diagnostics into each cycle result.
+   */
+  pushWake?(): CloudPushWakePort | null;
   projectionRecoveryStatus?(): Promise<CloudProjectionRecoveryStatus>;
   isCompactProjectionRecoveryUnsettledForProfile?(profileId: string): Promise<boolean>;
   isCompactProjectionRecoveryUnsettled?(sessionPublicId: string): Promise<boolean>;
@@ -513,6 +541,7 @@ export type LocalCloudDaemonBridgeOptions = Readonly<{
   local: CloudDaemonLocalSourcePort;
   now?: () => number;
   optionalSyncBudgetMs?: number;
+  pushWake?: CloudPushWakePort;
   randomConnectionUuid?: () => string;
   randomUuid?: () => string;
   sessionSyncCursor: CloudSessionSyncCursorPort;
@@ -531,6 +560,8 @@ export type LocalCloudDaemonBridgeEnvironmentOptions = Readonly<{
   lifetimeSignal?: AbortSignal;
   local: CloudDaemonLocalSourcePort;
   now?: () => number;
+  /** Pass `null` to run without a push-wake subscription (polling only). */
+  pushWake?: CloudPushWakePort | null;
   randomConnectionUuid?: () => string;
   randomUuid?: () => string;
   registration?: CloudDeviceRegistrationPort;
@@ -910,6 +941,24 @@ export class CustodyCloudDaemonIdentity implements CloudDaemonIdentityPort {
       status: "active",
     };
   }
+}
+
+/*
+ * Reads the cadence hint out of a device summary page. Only the three fields
+ * the hint needs are inspected, and an unparseable row is ignored rather than
+ * rejected: a malformed summary must not decide the poll interval by throwing.
+ */
+export function hasPresentPeerDevice(value: unknown, devicePublicId: string): boolean {
+  if (!Array.isArray(value)) return false;
+  for (const entry of value as readonly unknown[]) {
+    if (!isRecord(entry)) continue;
+    if (entry.online !== true) continue;
+    if (entry.status !== "active") continue;
+    if (typeof entry.publicId !== "string" || entry.publicId === devicePublicId) continue;
+    if (typeof entry.deviceClass === "string" && entry.deviceClass !== "browser") continue;
+    return true;
+  }
+  return false;
 }
 
 function parseSessionHead(value: unknown): CloudSessionHead {
@@ -1818,6 +1867,8 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   readonly #local: CloudDaemonLocalSourcePort;
   readonly #now: () => number;
   readonly #optionalSyncBudgetMs: number;
+  readonly #pushWake: CloudPushWakePort | null;
+  #peerPresence: Readonly<{ observedAt: number; present: boolean }> | null = null;
   readonly #randomConnectionUuid: () => string;
   readonly #randomUuid: () => string;
   readonly #sessionSyncCursor: CloudSessionSyncCursorPort;
@@ -1855,6 +1906,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     this.#local = options.local;
     this.#now = options.now ?? Date.now;
     this.#optionalSyncBudgetMs = optionalSyncBudgetMs;
+    this.#pushWake = options.pushWake ?? null;
     this.#randomConnectionUuid = options.randomConnectionUuid ?? (() => crypto.randomUUID());
     this.#randomUuid = options.randomUuid ?? (() => uuidV7(this.#now()));
     this.#sessionSyncCursor = options.sessionSyncCursor;
@@ -1864,9 +1916,14 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     );
   }
 
+  pushWake(): CloudPushWakePort | null {
+    return this.#pushWake;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    await this.#pushWake?.close().catch(() => undefined);
     await this.#tail.catch(() => undefined);
     const optional = this.#optionalTask;
     if (optional !== null) {
@@ -1887,6 +1944,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     if (this.#closed) throw new Error("The cloud daemon bridge is closed.");
     return await this.#exclusive(async () => {
       const result = {
+        activity: { localTurnActive: false, peerDevicePresent: false } as CloudDaemonActivity,
         commandsApplied: 0,
         commandsUnsettled: 0,
         errors: [] as string[],
@@ -1899,8 +1957,13 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         await this.#assertDaemonCurrent(signal);
         const registeredIdentity = await this.#requireRegisteredIdentity(signal);
         await this.#maintainPresence(registeredIdentity, signal);
+        result.activity = { ...result.activity, localTurnActive: await this.#localTurnActive() };
         if (registeredIdentity.status === "pending") return result;
         const identity = registeredIdentity.activeIdentity;
+        result.activity = {
+          ...result.activity,
+          peerDevicePresent: await this.#peerDevicePresent(identity, signal),
+        };
         await this.#assertDaemonCurrent(signal);
         const heads = parseSessionHeadPage(await this.#transport.query(
           "sessions:listHeadsPage",
@@ -2120,9 +2183,47 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         result.errors.push(normalizeError(error));
         result.commandsUnsettled = (await this.#journal.read().catch(() => null))
           ?.state.commands.length ?? result.commandsUnsettled;
+      } finally {
+        // Push wake runs outside the cycle, so its diagnostics reach the
+        // operator through the same background path as every other cycle
+        // error rather than through a second reporting channel.
+        result.errors.push(...(this.#pushWake?.takeDiagnostics() ?? []));
       }
       return result;
     });
+  }
+
+  /*
+   * A device other than this daemon that is currently present is treated as a
+   * browser-class device until device summaries carry an explicit class. The
+   * probe is cached because the fast cadence would otherwise list devices
+   * every second, and a stale hint only changes how long the loop sleeps.
+   */
+  async #peerDevicePresent(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const now = this.#now();
+    const cached = this.#peerPresence;
+    if (cached !== null && now - cached.observedAt < peerPresenceRefreshMs) return cached.present;
+    try {
+      const devices = await this.#transport.query("devices:list", {});
+      abortBeforeEffect(signal);
+      const present = hasPresentPeerDevice(devices, identity.devicePublicId);
+      this.#peerPresence = { observedAt: now, present };
+      return present;
+    } catch (error: unknown) {
+      if (signal.aborted) throw error;
+      return cached?.present ?? false;
+    }
+  }
+
+  async #localTurnActive(): Promise<boolean> {
+    try {
+      return await this.#local.hasActiveTurn?.() ?? false;
+    } catch {
+      return false;
+    }
   }
 
   async projectionRecoveryStatus(): Promise<CloudProjectionRecoveryStatus> {
@@ -4480,17 +4581,18 @@ export async function createLocalCloudDaemonBridgeFromEnvironment(
     identityCustody,
     deploymentAuthority,
   );
+  const accessToken = async (): Promise<string | null> => {
+    await deploymentAuthority.assertCurrent();
+    const token = (await readCustodyAuth(fencedCustody))?.token ?? null;
+    await deploymentAuthority.assertCurrent();
+    return token;
+  };
   let transport: CloudTransport;
   if (options.transport !== undefined) {
     transport = deploymentFencedCloudTransport(options.transport, deploymentAuthority);
   } else {
     const rawTransport = createConvexCloudTransport({
-      accessToken: async () => {
-        await deploymentAuthority.assertCurrent();
-        const token = (await readCustodyAuth(fencedCustody))?.token ?? null;
-        await deploymentAuthority.assertCurrent();
-        return token;
-      },
+      accessToken,
       deploymentUrl,
       ...(options.lifetimeSignal === undefined
         ? {}
@@ -4498,6 +4600,27 @@ export async function createLocalCloudDaemonBridgeFromEnvironment(
     });
     transport = deploymentFencedCloudTransport(rawTransport, deploymentAuthority);
   }
+  /*
+   * The push-wake socket presents the same custody token as the HTTP
+   * transport and reads it through the same deployment fence, so a deployment
+   * or identity change refuses the socket exactly as it refuses a request.
+   * An injected transport (tests, in-memory harnesses) opens no socket.
+   */
+  const pushWake = options.pushWake === undefined
+    ? options.transport === undefined
+      ? createCloudPushWake({
+        ...(options.lifetimeSignal === undefined
+          ? {}
+          : { lifetimeSignal: options.lifetimeSignal }),
+        ...(options.now === undefined ? {} : { now: options.now }),
+        subscribe: createConvexPushWakeSubscriber({
+          accessToken,
+          deploymentUrl,
+          ...(options.now === undefined ? {} : { now: options.now }),
+        }),
+      })
+      : null
+    : options.pushWake;
   const registration = options.registration ?? new LocalCloudControl({
     deploymentAuthority,
     deploymentUrl,
@@ -4514,24 +4637,33 @@ export async function createLocalCloudDaemonBridgeFromEnvironment(
     registration,
     transport,
   });
-  return new LocalCloudDaemonBridge({
-    daemonAuthority: options.daemonAuthority,
-    daemonAuthorityFence: options.daemonAuthorityFence,
-    deploymentAuthority,
-    executor: options.executor,
-    identity,
-    journal: options.journal ?? new CustodyCloudDaemonJournal(fencedCustody),
-    ...(options.leaseDurationMs === undefined
-      ? {}
-      : { leaseDurationMs: options.leaseDurationMs }),
-    local: options.local,
-    ...(options.now === undefined ? {} : { now: options.now }),
-    ...(options.randomConnectionUuid === undefined
-      ? {}
-      : { randomConnectionUuid: options.randomConnectionUuid }),
-    ...(options.randomUuid === undefined ? {} : { randomUuid: options.randomUuid }),
-    sessionSyncCursor: options.sessionSyncCursor
-      ?? new CustodyCloudSessionSyncCursor(fencedCustody),
-    transport,
-  });
+  try {
+    return new LocalCloudDaemonBridge({
+      daemonAuthority: options.daemonAuthority,
+      daemonAuthorityFence: options.daemonAuthorityFence,
+      deploymentAuthority,
+      executor: options.executor,
+      identity,
+      journal: options.journal ?? new CustodyCloudDaemonJournal(fencedCustody),
+      ...(options.leaseDurationMs === undefined
+        ? {}
+        : { leaseDurationMs: options.leaseDurationMs }),
+      local: options.local,
+      ...(options.now === undefined ? {} : { now: options.now }),
+      ...(pushWake === null ? {} : { pushWake }),
+      ...(options.randomConnectionUuid === undefined
+        ? {}
+        : { randomConnectionUuid: options.randomConnectionUuid }),
+      ...(options.randomUuid === undefined ? {} : { randomUuid: options.randomUuid }),
+      sessionSyncCursor: options.sessionSyncCursor
+        ?? new CustodyCloudSessionSyncCursor(fencedCustody),
+      transport,
+    });
+  } catch (error: unknown) {
+    // An owned socket must never outlive a bridge that failed to construct.
+    if (pushWake !== null && options.pushWake === undefined) {
+      void pushWake.close().catch(() => undefined);
+    }
+    throw error;
+  }
 }

@@ -61,6 +61,7 @@ import type {
   CloudLocalSessionPage,
   CloudLocalUsageSnapshot,
 } from "./daemon-bridge";
+import type { CloudSyncCadenceStatus } from "./daemon-lifecycle";
 import type {
   CloudRemoteCommandReceipt,
   CloudRemoteCommandStatus,
@@ -2614,6 +2615,10 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
     return { profile, session: session as SessionRecord & { providerThreadId: string } };
   }
 
+  hasActiveTurn(): boolean {
+    return this.#store.hasSessionWithActiveTurn();
+  }
+
   async listSessions(input: Readonly<{
     afterPublicId?: string | null;
     limit: number;
@@ -3059,35 +3064,42 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
   readonly #bridge: CloudDaemonBridge;
   readonly #control: CloudControlPort & CloudRemoteControlPort;
   readonly #projectionStatus: (() => CloudProjectionCacheStatus) | undefined;
+  readonly #syncCadence: (() => CloudSyncCadenceStatus) | undefined;
 
   constructor(
     control: CloudControlPort & CloudRemoteControlPort,
     bridge: CloudDaemonBridge,
     projectionDiagnostics?: Readonly<{ projectionCacheStatus(): CloudProjectionCacheStatus }>,
+    cadenceDiagnostics?: Readonly<{ syncCadence(): CloudSyncCadenceStatus }>,
   ) {
     this.#control = control;
     this.#bridge = bridge;
     this.#projectionStatus = projectionDiagnostics === undefined
       ? undefined
       : () => projectionDiagnostics.projectionCacheStatus();
+    this.#syncCadence = cadenceDiagnostics === undefined
+      ? undefined
+      : () => cadenceDiagnostics.syncCadence();
   }
 
   async status(signal: AbortSignal): Promise<unknown> {
     const status = await this.#control.status(signal);
     const projectionCache = this.#projectionStatus?.();
     const projectionRecovery = await this.#bridge.projectionRecoveryStatus?.();
-    if (projectionCache === undefined && projectionRecovery === undefined) return status;
+    const syncCadence = this.#syncCadence?.();
+    if (
+      projectionCache === undefined
+      && projectionRecovery === undefined
+      && syncCadence === undefined
+    ) return status;
+    const additions = {
+      ...(projectionCache === undefined ? {} : { projectionCache }),
+      ...(projectionRecovery === undefined ? {} : { projectionRecovery }),
+      ...(syncCadence === undefined ? {} : { syncCadence }),
+    };
     return isRecord(status)
-      ? {
-          ...status,
-          ...(projectionCache === undefined ? {} : { projectionCache }),
-          ...(projectionRecovery === undefined ? {} : { projectionRecovery }),
-        }
-      : {
-          control: status,
-          ...(projectionCache === undefined ? {} : { projectionCache }),
-          ...(projectionRecovery === undefined ? {} : { projectionRecovery }),
-        };
+      ? { ...status, ...additions }
+      : { control: status, ...additions };
   }
   async auth(input: { email: string; code?: string; invite?: string; signal: AbortSignal }): Promise<unknown> {
     if (input.code !== undefined) {

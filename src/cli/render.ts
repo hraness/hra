@@ -1985,6 +1985,19 @@ const renderProjectionStatus = (root: Record<string, unknown>): string[] => {
   return rows;
 };
 
+const renderSyncCadence = (root: Record<string, unknown>): string[] => {
+  const cadence = object(root.syncCadence);
+  if (cadence === null) return [];
+  const intervalMs = cadence.intervalMs;
+  if (typeof intervalMs !== "number" || !Number.isSafeInteger(intervalMs) || intervalMs < 0) {
+    return [];
+  }
+  const seconds = Math.round(intervalMs / 100) / 10;
+  const wake = object(cadence.pushWake);
+  const wakeState = wake === null ? "unavailable" : humanState(wake.state);
+  return [`Sync cadence: every ${String(seconds)}s (${humanState(cadence.reason)}), push wake ${wakeState}`];
+};
+
 const projectionRecoveryIsUnsettled = (root: Record<string, unknown>): boolean => {
   const recovery = object(root.projectionRecovery);
   if (!Array.isArray(recovery?.recoveries)) return false;
@@ -2131,6 +2144,7 @@ const renderSyncStatus = (data: unknown): string => {
   if (deletion !== null) rows.push(...renderDeletion(deletion));
   if (Object.hasOwn(root, "lastSync")) rows.push(renderLastSync(root.lastSync));
   rows.push(...renderProjectionStatus(root));
+  rows.push(...renderSyncCadence(root));
   if (typeof root.diagnostic === "string") rows.push(`Detail: ${safeDiagnostic(root.diagnostic)}`);
   const projectionNext = projectionRecoveryUnsettled
     ? projectionRecoveryCommand ?? "hra doctor"
