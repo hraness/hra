@@ -814,6 +814,12 @@ export const publicContent: PublicContent = {
           text(" returns status version 2. HRA produces one typed provider-observation result, attempting a Codex app-server read only when the current local state makes one applicable, then reads the session, event cut, interactions, and queue from one local SQLite transaction. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret."),
         ),
         paragraph(
+          code("hra session state <session> --json"),
+          text(" returns the daemon's latest classification of who must act next: working, needs approval, needs an answer, needs a human action, done, done with followups, done with caveats, or aborted, with an attention flag, a short reason, and a monotonic revision. The daemon classifies the final assistant text of every completed turn with ordered lexical rules in which human-action cues beat approval cues, so a login or a code from email never reads as consent, and it reclassifies when a provider interaction is requested or resolved. The same classification is appended to the session event stream as a "),
+          code("session_state"),
+          text(" event."),
+        ),
+        paragraph(
           text("For snapshot-to-stream continuity, start selected-session monitoring at the atomic status cursor. "),
           code("hra session watch <session> [--cursor <cursor>]"),
           text(" renders a bounded human stream by default; add "),
@@ -825,6 +831,7 @@ export const publicContent: PublicContent = {
           commands: [
             "hra",
             "hra session status <session> --json",
+            "hra session state <session> --json",
             "hra session watch <session> --cursor <cursor>",
             "hra session watch <session> --cursor <cursor> --jsonl",
             "hra session events <session> --cursor <cursor> --limit <1-200> --wait-ms <0-30000> --json",
