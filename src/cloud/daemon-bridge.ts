@@ -2907,6 +2907,14 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     return { complete: local.complete, uploaded: true };
   }
 
+  async #requestingDeviceActive(requestingDevicePublicId: string | undefined): Promise<boolean> {
+    if (requestingDevicePublicId === undefined) return false;
+    const device = await this.#transport.query("devices:get", { publicId: requestingDevicePublicId });
+    return isRecord(device)
+      && device.publicId === requestingDevicePublicId
+      && device.status === "active";
+  }
+
   async #ensureLease(
     sessionPublicId: string,
     identity: ActiveCloudIdentity,
@@ -3767,14 +3775,21 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       );
       if (payload.kind !== command.kind) throw new Error("Cloud command kind is inconsistent.");
       await this.#assertDaemonCurrent(signal);
-      outcome = await this.#executor.execute({
-        authority: localAuthority,
-        idempotencyKey: command.publicId,
-        leaseAuthority: authority,
-        payload,
-        sessionPublicId,
-        signal,
-      });
+      // A remote decision is honoured only while the device that requested it
+      // is still active; a device revoked after enqueue cannot approve.
+      const requesterActive = payload.kind === "resolve_interaction"
+        ? await this.#requestingDeviceActive(command.requestingDevicePublicId)
+        : true;
+      outcome = requesterActive
+        ? await this.#executor.execute({
+            authority: localAuthority,
+            idempotencyKey: command.publicId,
+            leaseAuthority: authority,
+            payload,
+            sessionPublicId,
+            signal,
+          })
+        : { code: "REQUESTING_DEVICE_INACTIVE", state: "failed" };
       if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(outcome.code)) {
         throw new Error("Local cloud command executor returned an invalid result.");
       }
