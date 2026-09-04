@@ -2119,39 +2119,77 @@ const initializationRequired = (
   { nextCommand: "hra init --yes" },
 );
 
-async function requireInitializedDaemonState(
-  paths: StatePaths,
-  operation: "daemon" | "local_status" = "daemon",
-): Promise<void> {
-  try {
-    await lstat(paths.database);
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      throw initializationRequired(operation);
-    }
-    throw new CommandFailure(
-      "RECOVERY_REQUIRED",
-      operation === "daemon"
-        ? "HRA could not prove that local state is initialized. Inspect it before starting the daemon."
-        : "HRA could not prove that local state is initialized. Inspect it before reading local status.",
-      { nextCommand: "hra doctor --offline" },
-    );
+const unprovenLocalState = (operation: "daemon" | "local_status"): CommandFailure =>
+  new CommandFailure(
+    "RECOVERY_REQUIRED",
+    operation === "daemon"
+      ? "HRA could not prove that local state is initialized. Inspect it before starting the daemon."
+      : "HRA could not prove that local state is initialized. Inspect it before reading local status.",
+    { nextCommand: "hra doctor --offline" },
+  );
+
+// A store opened read-only reports a schema difference instead of migrating it.
+// Both directions are exact and diagnosable, so the CLI classifies them here
+// rather than folding them into one opaque recovery boundary.
+type StateSchemaMismatch = Readonly<{
+  kind: "migration_required" | "newer";
+  found: number;
+  expected: number;
+}>;
+
+const stateSchemaMismatch = (error: unknown): StateSchemaMismatch | null => {
+  if (!(error instanceof Error)) return null;
+  const pending = /^STATE_SCHEMA_MIGRATION_REQUIRED:(\d+):(\d+)$/u.exec(error.message);
+  if (pending !== null) {
+    return { kind: "migration_required", found: Number(pending[1]), expected: Number(pending[2]) };
   }
+  const newer = /^STATE_SCHEMA_NEWER:(\d+):(\d+)$/u.exec(error.message);
+  if (newer !== null) {
+    return { kind: "newer", found: Number(newer[1]), expected: Number(newer[2]) };
+  }
+  return null;
+};
+
+// The leading `STATE_...` token of a local state error. It names the failure
+// without exposing a path, a stack, or any row content.
+const stateErrorShortCode = (error: unknown): string | null => {
+  if (!(error instanceof Error)) return null;
+  const match = /^(STATE_[A-Z0-9_]+)(?::|$)/u.exec(error.message);
+  return match === null ? null : match[1] ?? null;
+};
+
+const stateSchemaNewerFailure = (mismatch: StateSchemaMismatch): CommandFailure =>
+  new CommandFailure(
+    "RECOVERY_REQUIRED",
+    `This HRA build is older than the local state schema (${mismatch.found} vs ${mismatch.expected}); install the newer HRA.`,
+  );
+
+const stateSchemaMigrationPending = (mismatch: StateSchemaMismatch): CommandFailure =>
+  new CommandFailure(
+    "RECOVERY_REQUIRED",
+    `The local state schema needs a migration (${mismatch.found} to ${mismatch.expected}); start the daemon to migrate it.`,
+    { nextCommand: "hra daemon start" },
+  );
+
+// One read-only initialization proof. A schema difference is returned as data so
+// the daemon path can migrate once and prove the state again; every other
+// failure stays the opaque recovery boundary.
+function proveInitializedStateOnce(
+  paths: StatePaths,
+  operation: "daemon" | "local_status",
+): StateSchemaMismatch | null {
   let store: StateStore | undefined;
   let inspectionFailure: CommandFailure | undefined;
+  let mismatch: StateSchemaMismatch | null = null;
   try {
     store = new StateStore(paths, { readonly: true });
     if (store.listProjects().length === 0) throw initializationRequired(operation);
   } catch (error: unknown) {
-    inspectionFailure = error instanceof CommandFailure
-      ? error
-      : new CommandFailure(
-          "RECOVERY_REQUIRED",
-          operation === "daemon"
-            ? "HRA could not prove that local state is initialized. Inspect it before starting the daemon."
-            : "HRA could not prove that local state is initialized. Inspect it before reading local status.",
-          { nextCommand: "hra doctor --offline" },
-        );
+    if (error instanceof CommandFailure) inspectionFailure = error;
+    else {
+      mismatch = stateSchemaMismatch(error);
+      if (mismatch === null) inspectionFailure = unprovenLocalState(operation);
+    }
   }
   try {
     store?.close();
@@ -2165,6 +2203,60 @@ async function requireInitializedDaemonState(
     );
   }
   if (inspectionFailure !== undefined) throw inspectionFailure;
+  return mismatch;
+}
+
+// A writable open is the only place the store migrates itself, under its own
+// locking and scrub rules. Nothing else in the product performs one, so an
+// install that meets a newer schema version would otherwise deadlock here.
+function migrateLocalStateSchema(paths: StatePaths): void {
+  let store: StateStore | undefined;
+  try {
+    store = new StateStore(paths);
+  } catch (error: unknown) {
+    const mismatch = stateSchemaMismatch(error);
+    if (mismatch !== null && mismatch.kind === "newer") throw stateSchemaNewerFailure(mismatch);
+    throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      "HRA could not migrate local state to the schema this build requires. Inspect it before starting the daemon.",
+      { nextCommand: "hra doctor --offline" },
+    );
+  }
+  try {
+    store.close();
+  } catch {
+    throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      "HRA could not close its local state migration safely. Inspect local state before starting the daemon.",
+      { nextCommand: "hra doctor --offline" },
+    );
+  }
+}
+
+async function requireInitializedDaemonState(
+  paths: StatePaths,
+  operation: "daemon" | "local_status" = "daemon",
+): Promise<void> {
+  try {
+    await lstat(paths.database);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw initializationRequired(operation);
+    }
+    throw unprovenLocalState(operation);
+  }
+  const mismatch = proveInitializedStateOnce(paths, operation);
+  if (mismatch === null) return;
+  if (mismatch.kind === "newer") throw stateSchemaNewerFailure(mismatch);
+  // Only the daemon path migrates. A status read is a pure observation and must
+  // never take the writer's authority over local state.
+  if (operation !== "daemon") throw stateSchemaMigrationPending(mismatch);
+  migrateLocalStateSchema(paths);
+  const remaining = proveInitializedStateOnce(paths, operation);
+  if (remaining === null) return;
+  throw remaining.kind === "newer"
+    ? stateSchemaNewerFailure(remaining)
+    : stateSchemaMigrationPending(remaining);
 }
 
 async function callWithAutostart(
@@ -2257,6 +2349,23 @@ export async function initialize(
   }
 }
 
+// A pending or newer state schema is an exact, actionable condition. Reporting
+// it as the opaque line hid the one upgrade failure an operator can fix, so the
+// doctor names both versions there and appends the short `STATE_...` code of
+// any other named local state failure. It never prints a path or a stack.
+const localDatabaseProblem = (error: unknown): string => {
+  const mismatch = stateSchemaMismatch(error);
+  if (mismatch !== null) {
+    return mismatch.kind === "migration_required"
+      ? `The local state schema needs a migration (${mismatch.found} to ${mismatch.expected}). Run \`hra daemon start\` to migrate it.`
+      : `This HRA build is older than the local state schema (${mismatch.found} vs ${mismatch.expected}). Install the newer HRA.`;
+  }
+  const code = stateErrorShortCode(error);
+  return code === null
+    ? "The local database check failed without exposing its runtime diagnostic."
+    : `The local database check failed without exposing its runtime diagnostic (${code}).`;
+};
+
 async function offlineDoctor(
   json: boolean,
   output: Output,
@@ -2338,7 +2447,7 @@ async function offlineDoctor(
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         database = "invalid";
-        problems.push("The local database check failed without exposing its runtime diagnostic.");
+        problems.push(localDatabaseProblem(error));
       }
     }
   }
@@ -2355,9 +2464,9 @@ async function offlineDoctor(
       } finally {
         store.close();
       }
-    } catch {
+    } catch (error: unknown) {
       database = "invalid";
-      problems.push("The local database check failed without exposing its runtime diagnostic.");
+      problems.push(localDatabaseProblem(error));
     }
   }
   if (database === "ready") {

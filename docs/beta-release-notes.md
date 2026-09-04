@@ -35,5 +35,6 @@ The local CLI is public. Hosted sync remains an invite-only beta: this release d
 - The browser client is in the repository and is not yet hosted. This release exposes it through no public address.
 - Plugin and connector discovery is read-only. HRA does not install, enable, authorize, or open OAuth flows.
 - Desktop account switching is macOS-only in this release.
+- Upgrading over an older install migrates the local state schema on the first `hra daemon start`. Until that runs, `hra status` and `hra doctor --offline` report the pending migration and name both schema versions.
 
 Read the [v0.4.0 README](https://github.com/hraness/hra/tree/v0.4.0#readme), [privacy notice](https://github.com/hraness/hra/blob/v0.4.0/PRIVACY.md), and [security policy](https://github.com/hraness/hra/blob/v0.4.0/SECURITY.md) before installation or use. Report defects through [GitHub issues](https://github.com/hraness/hra/issues) and security concerns through the private process in the security policy.

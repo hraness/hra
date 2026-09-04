@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -70,6 +71,57 @@ const capture = () => {
   return {
     output: { writeStdout: (value: string) => { stdout += value; }, writeStderr: (value: string) => { stderr += value; } },
     read: () => ({ stdout, stderr }),
+  };
+};
+
+// An install written by an older HRA build: the newest migration row is gone and
+// `user_version` still names the schema that build stamped. The migration code
+// still supports 30, so a writable open must carry it forward to 31.
+const downgradeStateSchema = (databasePath: string): void => {
+  const database = new Database(databasePath, { create: false, strict: true });
+  try {
+    database.exec("DELETE FROM migrations WHERE version=31; PRAGMA user_version=30");
+  } finally {
+    database.close(false);
+  }
+};
+
+// An install written by a newer HRA build than this one. No migration exists for
+// it, so every entry point must refuse instead of guessing.
+const advanceStateSchema = (databasePath: string): void => {
+  const database = new Database(databasePath, { create: false, strict: true });
+  try {
+    database.exec("PRAGMA user_version=32");
+  } finally {
+    database.close(false);
+  }
+};
+
+const stateSchemaVersion = (databasePath: string): number => {
+  const database = new Database(databasePath, { create: false, strict: true });
+  try {
+    return (database.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+  } finally {
+    database.close(false);
+  }
+};
+
+const upgradeFixture = async (
+  name: string,
+): Promise<Readonly<{ installation: ReturnType<typeof createAcceptanceInstallation>; runRoot: string }>> => {
+  const runId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd4d";
+  const runRoot = await realpath(await mkdtemp(join(tmpdir(), `hra-live-acceptance-${runId}-`)));
+  return {
+    installation: createAcceptanceInstallation({
+      device: "a",
+      documentsDirectory: join(runRoot, `project-a-${name}`),
+      expectedHomeDirectory: process.env.HOME ?? "/missing-home",
+      rootDirectory: join(runRoot, `device-a-${name}`),
+      runId,
+      type: "hra-live-acceptance-device",
+      version: 1,
+    }),
+    runRoot,
   };
 };
 
@@ -4588,6 +4640,155 @@ describe("CLI entry point", () => {
       expect(daemonStarts).toBe(1);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("daemon start migrates local state left at an older schema version", async () => {
+    const { installation, runRoot } = await upgradeFixture("daemon-start-migrate");
+    let daemonStarts = 0;
+    const input = {
+      installation,
+      startDaemon: async () => {
+        daemonStarts += 1;
+        return readyDaemonStatus();
+      },
+    };
+    try {
+      const initialized = capture();
+      expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
+      downgradeStateSchema(installation.paths.database);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(30);
+
+      const started = capture();
+      expect(await main(["daemon", "start", "--json"], started.output, input)).toBe(0);
+      expect(JSON.parse(started.read().stdout)).toEqual({
+        command: "daemon.status",
+        data: readyDaemonStatus(),
+        ok: true,
+        version: 1,
+      });
+      expect(started.read().stderr).toBe("");
+      expect(daemonStarts).toBe(1);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(31);
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("local status refuses a pending schema migration and names the daemon", async () => {
+    const { installation, runRoot } = await upgradeFixture("status-pending-migration");
+    const input = {
+      installation,
+      startDaemon: () => { throw new Error("Local status must not start the daemon."); },
+      callDaemon: () => { throw new Error("Local status must not call the daemon."); },
+    };
+    try {
+      const initialized = capture();
+      expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
+      downgradeStateSchema(installation.paths.database);
+
+      const captured = capture();
+      expect(await main(["status", "--json"], captured.output, input)).toBe(7);
+      expect(JSON.parse(captured.read().stdout)).toEqual({
+        error: {
+          code: "RECOVERY_REQUIRED",
+          details: { nextCommand: "hra daemon start" },
+          message: "The local state schema needs a migration (30 to 31); start the daemon to migrate it.",
+        },
+        ok: false,
+        version: 1,
+      });
+      expect(captured.read().stderr).toBe("");
+      expect(stateSchemaVersion(installation.paths.database)).toBe(30);
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("daemon start refuses local state written by a newer HRA build", async () => {
+    const { installation, runRoot } = await upgradeFixture("daemon-start-newer");
+    let daemonStarts = 0;
+    const input = {
+      installation,
+      startDaemon: async () => {
+        daemonStarts += 1;
+        return readyDaemonStatus();
+      },
+    };
+    try {
+      const initialized = capture();
+      expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
+      advanceStateSchema(installation.paths.database);
+
+      const captured = capture();
+      expect(await main(["daemon", "start", "--json"], captured.output, input)).toBe(7);
+      expect(JSON.parse(captured.read().stdout)).toEqual({
+        error: {
+          code: "RECOVERY_REQUIRED",
+          message: "This HRA build is older than the local state schema (32 vs 31); install the newer HRA.",
+        },
+        ok: false,
+        version: 1,
+      });
+      expect(captured.read().stderr).toBe("");
+      expect(daemonStarts).toBe(0);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(32);
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor names a pending schema migration instead of an opaque diagnostic", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-schema-pending-")));
+    try {
+      const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
+      await initializeStatePaths(statePaths);
+      const store = new StateStore(statePaths);
+      store.close();
+      downgradeStateSchema(statePaths.database);
+      const captured = capture();
+      expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(1);
+      const rendered = JSON.parse(captured.read().stdout) as unknown;
+      expect(rendered).toMatchObject({
+        ok: false,
+        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        data: {
+          healthy: false,
+          problems: ["The local state schema needs a migration (30 to 31). Run `hra daemon start` to migrate it."],
+          state: { database: "invalid", initialized: false },
+        },
+      });
+      expect(JSON.stringify(rendered)).not.toContain(temporary);
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor names local state written by a newer HRA build", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-schema-newer-")));
+    try {
+      const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
+      await initializeStatePaths(statePaths);
+      const store = new StateStore(statePaths);
+      store.close();
+      advanceStateSchema(statePaths.database);
+      const captured = capture();
+      expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(1);
+      const rendered = JSON.parse(captured.read().stdout) as unknown;
+      expect(rendered).toMatchObject({
+        ok: false,
+        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        data: {
+          healthy: false,
+          problems: ["This HRA build is older than the local state schema (32 vs 31). Install the newer HRA."],
+          state: { database: "invalid", initialized: false },
+        },
+      });
+      expect(JSON.stringify(rendered)).not.toContain(temporary);
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
     }
   });
 
