@@ -76,7 +76,7 @@ const capture = () => {
 
 // An install written by an older HRA build: the newest migration row is gone and
 // `user_version` still names the schema that build stamped. The migration code
-// still supports 31, so a writable open must carry it forward to 32.
+// still supports 32, so a writable open must carry it forward to 33.
 const downgradeStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
@@ -91,7 +91,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=33");
+    database.exec("PRAGMA user_version=34");
   } finally {
     database.close(false);
   }
@@ -4657,7 +4657,7 @@ describe("CLI entry point", () => {
       const initialized = capture();
       expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
       downgradeStateSchema(installation.paths.database);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(31);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(32);
 
       const started = capture();
       expect(await main(["daemon", "start", "--json"], started.output, input)).toBe(0);
@@ -4669,7 +4669,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(32);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(33);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -4699,7 +4699,7 @@ describe("CLI entry point", () => {
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
-      expect(stateSchemaVersion(installation.paths.database)).toBe(31);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(32);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -4725,14 +4725,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (33 vs 32); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (34 vs 33); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(33);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(34);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -4781,7 +4781,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (33 vs 32). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (34 vs 33). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });
