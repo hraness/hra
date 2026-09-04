@@ -6,8 +6,8 @@
 - `src/hra/` re-exports the browser-safe repository modules the app is allowed to reach.
 - `src/auth/` holds the Convex client, the in-memory token storage adapter, and the one-time-code sign-in screen.
 - `src/custody/` holds device key generation, IndexedDB key storage, the enrollment flow, the account-key unlock context, idle lock, and presence.
-- `src/data/` holds the wire parsers and the session heads, compact history, live tail, and command hooks.
-- `src/model/` holds the framework-free session model reducer.
+- `src/data/` holds the wire parsers and the session heads, compact history, live tail, command, device, device registry, and archived session hooks.
+- `src/model/` holds the framework-free session model reducer and the settings view models, command builders, and time formatting.
 - `src/components/ui/` holds the interface primitives as owned source.
 - `src/screens/` holds the rendered screens.
 

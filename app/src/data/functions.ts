@@ -20,6 +20,9 @@ const getHeadName = "sessions:getHead" satisfies CloudQuery;
 const getChunksName = "sessions:getChunks" satisfies CloudQuery;
 const getLatestChunksName = "sessions:getLatestChunks" satisfies CloudQuery;
 const currentRegistrationName = "devices:currentRegistration" satisfies CloudQuery;
+const listDevicesName = "devices:list" satisfies CloudQuery;
+const listRegistriesName = "devices:listRegistries" satisfies CloudQuery;
+const presenceCurrentName = "presence:current" satisfies CloudQuery;
 const listKeyEnvelopesName = "devices:listKeyEnvelopes" satisfies CloudQuery;
 const commandGetName = "commands:get" satisfies CloudQuery;
 const commandListForSessionName = "commands:listForSession" satisfies CloudQuery;
@@ -88,6 +91,15 @@ export const getLatestChunks = makeFunctionReference<
 
 export const currentRegistration =
   makeFunctionReference<"query", Record<string, never>, unknown>(currentRegistrationName);
+
+export const listDevices =
+  makeFunctionReference<"query", Record<string, never>, unknown>(listDevicesName);
+
+export const listRegistries =
+  makeFunctionReference<"query", Record<string, never>, unknown>(listRegistriesName);
+
+export const presenceCurrent =
+  makeFunctionReference<"query", Record<string, never>, unknown>(presenceCurrentName);
 
 export const listKeyEnvelopes =
   makeFunctionReference<"query", Record<string, never>, unknown>(listKeyEnvelopesName);

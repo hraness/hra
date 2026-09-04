@@ -12,6 +12,9 @@ import type { SessionHead } from "../data/wire";
 import { streamingTailLines } from "../env";
 import type { SessionStateValue } from "../hra/cloud";
 import { streamingTail } from "../model/session-model";
+// R2-B temporary bridge: drop this import with the block marked below once the
+// hash router owns `#/settings`.
+import { SettingsScreen } from "./settings-screen";
 
 const stateTone: Readonly<Record<SessionStateValue, BadgeTone>> = {
   aborted: "danger",
@@ -89,6 +92,10 @@ export function SessionsScreen() {
   const [message, setMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  // ---- R2-B temporary settings bridge, delete this block on router landing ----
+  const [showSettings, setShowSettings] = useState(false);
+  if (showSettings) return <SettingsScreen onBack={() => { setShowSettings(false); }} />;
+  // ---- end R2-B temporary settings bridge ----
 
   const selected = heads.find((head) => head.publicId === selectedId)
     ?? heads[0]
@@ -119,7 +126,13 @@ export function SessionsScreen() {
     <div className="mx-auto flex min-h-dvh w-full max-w-3xl flex-col pt-[env(safe-area-inset-top)]">
       <header className="flex items-center justify-between gap-2 border-b border-line px-4 py-3">
         <h1 className="text-sm font-semibold">Sessions</h1>
-        <Button onClick={custody.lock} size="small" variant="ghost">Lock</Button>
+        <span className="flex items-center gap-2">
+          {/* R2-B temporary settings bridge, delete with the block above. */}
+          <Button onClick={() => { setShowSettings(true); }} size="small" variant="ghost">
+            Settings
+          </Button>
+          <Button onClick={custody.lock} size="small" variant="ghost">Lock</Button>
+        </span>
       </header>
 
       <main className="flex flex-1 flex-col gap-3 p-4">
