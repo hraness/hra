@@ -862,6 +862,7 @@ describe("bounded cloud retention", () => {
       userResources: [
         { records: 1, resource: "codex_account" },
         { records: 1, resource: "device" },
+        { records: 0, resource: "live_chunk" },
         { records: 0, resource: "nonterminal_command" },
         { records: 0, resource: "session_chunk" },
         { records: 1, resource: "session_head" },
