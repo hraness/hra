@@ -27,6 +27,8 @@ import {
   type InteractionIntendedTerminalState,
   type InteractionKind,
   type InteractionRecord,
+  type ApprovalMode,
+  approvalModeSchema,
   type ProviderInteractionAuthority,
 } from "../domain/interactions";
 import {
@@ -241,6 +243,33 @@ export type ProjectRecord = {
   createdAt: number;
   updatedAt: number;
 };
+
+const autorespondEvidenceRowSchema = z.object({
+  id: z.number().int(),
+  session_id: z.string(),
+  interaction_id: z.string().uuid(),
+  kind: z.enum(["command_approval", "file_change_approval", "permission_approval"]),
+  class: z.string().max(256),
+  decision: z.string().max(64),
+  mode: z.enum(["auto:all", "auto:workspace", "manual"]),
+  outcome: z.enum(["accepted", "refused"]),
+  latency_ms: z.number().int().nonnegative(),
+  subagent: z.number().int(),
+  occurred_at: z.number().int().nonnegative(),
+}).strict();
+
+export type AutorespondEvidenceRow = Readonly<{
+  approvalClass: string;
+  decision: string;
+  interactionId: string;
+  kind: "command_approval" | "file_change_approval" | "permission_approval";
+  latencyMs: number;
+  mode: "auto:all" | "auto:workspace" | "manual";
+  occurredAt: number;
+  outcome: "accepted" | "refused";
+  sessionId: string;
+  subagent: boolean;
+}>;
 
 export type SessionRecord = {
   id: SessionId;
@@ -691,7 +720,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 28;
+const currentSchemaVersion = 29;
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -2077,6 +2106,46 @@ WHEN NOT EXISTS (
 BEGIN SELECT RAISE(ABORT, 'account rate-limit reset rebind authority is invalid'); END;
 `;
 
+// Approval mode, autorespond evidence, and the consecutive-autorespond
+// counter (W1 autorespond). Kept as auxiliary side tables rather than columns
+// on `sessions`, matching the existing convention for per-session runtime
+// state (e.g. session_runtime_profiles).
+const schemaVersion29 = `
+CREATE TABLE IF NOT EXISTS session_approval_modes (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace','manual')),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS session_autorespond_counters (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  consecutive_count INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_count >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS autorespond_evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  interaction_id TEXT NOT NULL CHECK(length(interaction_id) = 36),
+  kind TEXT NOT NULL CHECK(kind IN ('command_approval','file_change_approval','permission_approval')),
+  class TEXT NOT NULL CHECK(length(class) BETWEEN 1 AND 256),
+  decision TEXT NOT NULL CHECK(length(decision) BETWEEN 1 AND 64),
+  mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace','manual')),
+  outcome TEXT NOT NULL CHECK(outcome IN ('accepted','refused')),
+  latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
+  subagent INTEGER NOT NULL CHECK(subagent IN (0,1)),
+  occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0)
+) STRICT;
+CREATE INDEX IF NOT EXISTS autorespond_evidence_session ON autorespond_evidence(session_id, occurred_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS autorespond_evidence_recent ON autorespond_evidence(occurred_at DESC, id DESC);
+`;
+const schemaVersion29DefaultApprovalModeColumn =
+  "ALTER TABLE daemon_state ADD COLUMN default_approval_mode TEXT NOT NULL DEFAULT 'auto:all' "
+  + "CHECK(default_approval_mode IN ('auto:all','auto:workspace','manual'))";
+const schemaVersion29ResolvedByColumn =
+  "ALTER TABLE provider_interactions ADD COLUMN resolved_by TEXT "
+  + "CHECK(resolved_by IS NULL OR resolved_by = 'autorespond')";
+/** Per-session evidence rows kept for `hra autorespond status`; oldest rows past this cap are pruned on insert. */
+export const AUTORESPOND_EVIDENCE_PER_SESSION_CAP = 500;
+
 const schemaVersion28Objects = [
   {
     name: "account_rate_limit_reset_policies",
@@ -3409,6 +3478,19 @@ const migrateWritableDatabase = (
       version = 28;
     }
 
+    if (version < 29) {
+      database.exec(schemaVersion29);
+      if (!hasTableColumn(database, "daemon_state", "default_approval_mode")) {
+        database.exec(schemaVersion29DefaultApprovalModeColumn);
+      }
+      if (!hasTableColumn(database, "provider_interactions", "resolved_by")) {
+        database.exec(schemaVersion29ResolvedByColumn);
+      }
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(29, now());
+      database.exec("PRAGMA user_version = 29");
+      version = 29;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -3441,6 +3523,7 @@ const migrateWritableDatabase = (
     ensureUsagePollFailureAccountFingerprint(database);
     database.exec(schemaVersion28);
     assertAccountRateLimitResetPolicies(database);
+    database.exec(schemaVersion29);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -3536,6 +3619,7 @@ const interactionRowSchema = z.object({
   response_digest: sha256Schema.nullable(),
   response_expected_revision: z.number().int().positive().nullable(),
   intended_terminal_state: interactionIntendedTerminalStateSchema.nullable(),
+  resolved_by: z.enum(["autorespond"]).nullable(),
   requested_at: unixMillisecondsSchema,
   deadline_at: unixMillisecondsSchema,
   updated_at: unixMillisecondsSchema,
@@ -3574,6 +3658,7 @@ const mapInteraction = (row: unknown): InteractionRecord => {
     display,
     responseDigest: parsed.response_digest,
     intendedTerminalState: parsed.intended_terminal_state,
+    resolvedBy: parsed.resolved_by,
     requestedAt: parsed.requested_at,
     deadlineAt: parsed.deadline_at,
     updatedAt: parsed.updated_at,
@@ -4623,6 +4708,177 @@ export class StateStore {
     const result = this.#database.query("UPDATE sessions SET project_id=COALESCE(project_id,?),title=?,state=?,active_turn_id=?,provider_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=? AND (provider_updated_at IS NULL OR provider_updated_at < ?)").run(input.projectId ?? null, titleSchema.parse(input.title), input.state, input.activeTurnId ?? null, input.providerUpdatedAt, now, current.id, current.revision, input.providerUpdatedAt);
     if (result.changes !== 1) throw new Error("Session changed while importing the provider projection.");
     return this.requireSession(current.id);
+  }
+
+  // --- Autorespond: approval modes, counters, evidence ----------------------
+
+  readDefaultApprovalMode(): ApprovalMode {
+    const row = this.#database.query("SELECT default_approval_mode FROM daemon_state WHERE singleton=1").get();
+    const parsed = z.object({ default_approval_mode: approvalModeSchema }).strict().parse(row);
+    return parsed.default_approval_mode;
+  }
+
+  setDefaultApprovalMode(mode: ApprovalMode): void {
+    const parsed = approvalModeSchema.parse(mode);
+    const result = this.#database.query("UPDATE daemon_state SET default_approval_mode=? WHERE singleton=1").run(parsed);
+    if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
+  }
+
+  readSessionApprovalMode(sessionId: SessionId): Readonly<{ mode: ApprovalMode; source: "session" | "default" }> {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const row = this.#database.query("SELECT mode FROM session_approval_modes WHERE session_id=?").get(parsedSessionId);
+    if (row !== null) {
+      return { mode: z.object({ mode: approvalModeSchema }).strict().parse(row).mode, source: "session" };
+    }
+    return { mode: this.readDefaultApprovalMode(), source: "default" };
+  }
+
+  setSessionApprovalMode(sessionId: SessionId, mode: ApprovalMode | null): void {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    if (mode === null) {
+      this.#database.query("DELETE FROM session_approval_modes WHERE session_id=?").run(parsedSessionId);
+      return;
+    }
+    const parsed = approvalModeSchema.parse(mode);
+    const write = this.#database.transaction(() => {
+      if (this.#database.query("SELECT 1 FROM sessions WHERE id=?").get(parsedSessionId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      this.#database.query(
+        `INSERT INTO session_approval_modes(session_id,mode,updated_at) VALUES (?,?,?)
+         ON CONFLICT(session_id) DO UPDATE SET mode=excluded.mode,updated_at=excluded.updated_at`,
+      ).run(parsedSessionId, parsed, this.#now());
+    });
+    write.immediate();
+  }
+
+  readAutorespondBudgets(sessionId: SessionId, now: number = this.#now()): Readonly<{
+    consecutive: number;
+    lastDay: number;
+    lastHour: number;
+  }> {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const counter = this.#database.query(
+      "SELECT consecutive_count FROM session_autorespond_counters WHERE session_id=?",
+    ).get(parsedSessionId);
+    const consecutive = counter === null
+      ? 0
+      : z.object({ consecutive_count: z.number().int().nonnegative() }).strict().parse(counter).consecutive_count;
+    const count = (since: number): number => {
+      const row = this.#database.query(
+        "SELECT COUNT(*) AS total FROM autorespond_evidence WHERE session_id=? AND outcome='accepted' AND occurred_at>=?",
+      ).get(parsedSessionId, since);
+      return z.object({ total: z.number().int().nonnegative() }).strict().parse(row).total;
+    };
+    return {
+      consecutive,
+      lastDay: count(now - 24 * 60 * 60 * 1_000),
+      lastHour: count(now - 60 * 60 * 1_000),
+    };
+  }
+
+  bumpAutorespondCounter(sessionId: SessionId): number {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const now = this.#now();
+    const write = this.#database.transaction(() => {
+      this.#database.query(
+        `INSERT INTO session_autorespond_counters(session_id,consecutive_count,updated_at) VALUES (?,1,?)
+         ON CONFLICT(session_id) DO UPDATE SET consecutive_count=consecutive_count+1,updated_at=excluded.updated_at`,
+      ).run(parsedSessionId, now);
+      const row = this.#database.query(
+        "SELECT consecutive_count FROM session_autorespond_counters WHERE session_id=?",
+      ).get(parsedSessionId);
+      return z.object({ consecutive_count: z.number().int().nonnegative() }).strict().parse(row).consecutive_count;
+    });
+    return write.immediate();
+  }
+
+  resetAutorespondCounter(sessionId: SessionId): void {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    this.#database.query(
+      "UPDATE session_autorespond_counters SET consecutive_count=0,updated_at=? WHERE session_id=?",
+    ).run(this.#now(), parsedSessionId);
+  }
+
+  recordAutorespondEvidence(input: {
+    approvalClass: string;
+    decision: string;
+    interactionId: string;
+    kind: "command_approval" | "file_change_approval" | "permission_approval";
+    latencyMs: number;
+    mode: ApprovalMode;
+    outcome: "accepted" | "refused";
+    sessionId: SessionId;
+    subagent: boolean;
+  }): void {
+    const parsedSessionId = sessionIdSchema.parse(input.sessionId);
+    const now = this.#now();
+    const write = this.#database.transaction(() => {
+      this.#database.query(
+        `INSERT INTO autorespond_evidence(session_id,interaction_id,kind,class,decision,mode,outcome,latency_ms,subagent,occurred_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        parsedSessionId,
+        z.string().uuid().parse(input.interactionId),
+        input.kind,
+        input.approvalClass.slice(0, 256),
+        input.decision.slice(0, 64),
+        approvalModeSchema.parse(input.mode),
+        input.outcome,
+        Math.max(0, Math.floor(input.latencyMs)),
+        input.subagent ? 1 : 0,
+        now,
+      );
+      this.#database.query(
+        `DELETE FROM autorespond_evidence WHERE session_id=? AND id NOT IN (
+           SELECT id FROM autorespond_evidence WHERE session_id=? ORDER BY occurred_at DESC, id DESC LIMIT ?)`,
+      ).run(parsedSessionId, parsedSessionId, AUTORESPOND_EVIDENCE_PER_SESSION_CAP);
+    });
+    write.immediate();
+  }
+
+  listAutorespondEvidence(input: { sessionId?: SessionId; limit?: number } = {}): readonly AutorespondEvidenceRow[] {
+    const limit = z.number().int().min(1).max(200).parse(input.limit ?? 20);
+    const rows = input.sessionId === undefined
+      ? this.#database.query(
+          "SELECT * FROM autorespond_evidence ORDER BY occurred_at DESC, id DESC LIMIT ?",
+        ).all(limit)
+      : this.#database.query(
+          "SELECT * FROM autorespond_evidence WHERE session_id=? ORDER BY occurred_at DESC, id DESC LIMIT ?",
+        ).all(sessionIdSchema.parse(input.sessionId), limit);
+    return rows.map((row) => {
+      const parsed = autorespondEvidenceRowSchema.parse(row);
+      return {
+        approvalClass: parsed.class,
+        decision: parsed.decision,
+        interactionId: parsed.interaction_id,
+        kind: parsed.kind,
+        latencyMs: parsed.latency_ms,
+        mode: parsed.mode,
+        occurredAt: parsed.occurred_at,
+        outcome: parsed.outcome,
+        sessionId: parsed.session_id,
+        subagent: parsed.subagent === 1,
+      };
+    });
+  }
+
+  countAutorespondEvidence(input: { sessionId?: SessionId } = {}): Readonly<{ accepted: number; refused: number }> {
+    const rows = input.sessionId === undefined
+      ? this.#database.query("SELECT outcome, COUNT(*) AS total FROM autorespond_evidence GROUP BY outcome").all()
+      : this.#database.query(
+          "SELECT outcome, COUNT(*) AS total FROM autorespond_evidence WHERE session_id=? GROUP BY outcome",
+        ).all(sessionIdSchema.parse(input.sessionId));
+    const counts = { accepted: 0, refused: 0 };
+    for (const row of rows) {
+      const parsed = z.object({ outcome: z.enum(["accepted", "refused"]), total: z.number().int().nonnegative() }).strict().parse(row);
+      counts[parsed.outcome] = parsed.total;
+    }
+    return counts;
+  }
+
+  markInteractionResolvedBy(publicId: string, resolvedBy: "autorespond"): void {
+    this.#database.query("UPDATE provider_interactions SET resolved_by=? WHERE public_id=?").run(resolvedBy, z.string().uuid().parse(publicId));
   }
 
   bindSession(input: { sessionId: SessionId; expectedRevision: number; providerThreadId: string; state: "active" | "idle"; activeTurnId?: string; providerUpdatedAt?: number }): SessionRecord {

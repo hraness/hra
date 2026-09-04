@@ -264,6 +264,7 @@ Usage:
   hra session list [--account <profile>] [--limit <1..100>] [--cursor <cursor>]
   hra session show <session> [--detail]
   hra session status <session> [--json]
+  hra autorespond on|workspace|off|default|status [--session <session>] [--json]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
@@ -1328,6 +1329,31 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       ...(mutates && idempotencyKey !== undefined ? { idempotencyKey } : {}),
       json,
     };
+  }
+  if (group === "autorespond") {
+    const action = take(cursor, "autorespond action");
+    const session = option(cursor, "--session");
+    finish(cursor);
+    if (idempotencyKey !== undefined) throw new CliUsageError("--idempotency-key is not supported by autorespond.");
+    if (action === "status") {
+      return { kind: "command", command: { kind: "autorespond.status", ...(session === undefined ? {} : { session }) }, json };
+    }
+    const mode = action === "on"
+      ? "auto:all"
+      : action === "workspace"
+        ? "auto:workspace"
+        : action === "off"
+          ? "manual"
+          : action === "default"
+            ? null
+            : undefined;
+    if (mode === undefined) {
+      throw new CliUsageError("Unknown autorespond action. Use `on`, `workspace`, `off`, `default`, or `status`.");
+    }
+    if (mode === null && session === undefined) {
+      throw new CliUsageError("`autorespond default` clears a session override; pass --session <session>.");
+    }
+    return { kind: "command", command: { kind: "autorespond.set", mode, ...(session === undefined ? {} : { session }) }, json };
   }
   let parsed: LocalCommand;
   if (group === "account") {
