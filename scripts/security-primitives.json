@@ -48,6 +48,9 @@
   "src/codex/protocol.ts": {
     "redactCompleteSensitiveText": 1
   },
+  "src/daemon/attachment-ingest.ts": {
+    "O_NOFOLLOW": 1
+  },
   "src/daemon/claude-runtime-adapter.ts": {
     "assertCurrent": 4
   },
@@ -99,6 +102,10 @@
   "src/public-provider-identifier.ts": {
     "redactCompleteSensitiveText": 1
   },
+  "src/storage/attachment-store.ts": {
+    "O_NOFOLLOW": 2,
+    "mode0600": 2
+  },
   "src/storage/facts-memory-control.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
@@ -131,7 +138,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 75,
+    "immediateTransaction": 76,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 2

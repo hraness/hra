@@ -33,6 +33,7 @@ import { mutation, query, type MutationCtx } from "./server";
 import {
   authorityTuple,
   commandKind,
+  commandPayloadCiphertextCharacters,
   encryptedEnvelope,
 } from "./validators";
 
@@ -101,7 +102,7 @@ export const enqueue = mutation({
       || !isOpaqueIdentifier(args.expectedTargetDevicePublicId)
       || !isOpaqueIdentifier(args.sessionPublicId)
       || !isDigest(args.requestDigest)
-      || parseEncryptedEnvelope(args.payload) === null
+      || parseEncryptedEnvelope(args.payload, commandPayloadCiphertextCharacters) === null
       || !Number.isFinite(args.deadline)
       || args.deadline > now + maximumCommandLifetimeMs
     ) rejectAuthority();

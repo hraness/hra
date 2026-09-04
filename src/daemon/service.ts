@@ -97,6 +97,7 @@ import {
   type WorkPoll,
   type WorkPreparedEffect,
 } from "../domain/work";
+import { resolveMessageAttachments } from "./attachments";
 import { describeWorkProtocol } from "../domain/work-protocol";
 import { workPreparedEffectMessage } from "../domain/work-message";
 import {
@@ -105,6 +106,15 @@ import {
   sessionIdSchema,
   sessionTaskIdSchema,
 } from "../domain/values";
+import {
+  attachmentReferenceOf,
+  type AttachmentReference,
+  type PreparedAttachment,
+} from "../domain/attachments";
+import {
+  ATTACHMENT_BLOB_SWEEP_GRACE_MS,
+  AttachmentBlobStore,
+} from "../storage/attachment-store";
 import { initializeProfilePaths, profilePaths, type StatePaths } from "../storage/paths";
 import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
 import { WorkCapabilityCodec } from "../storage/work-capability";
@@ -120,6 +130,7 @@ import {
   type ProfileRecord,
   type SessionRecord,
   type StateStore,
+  type StoredMessageAttachment,
 } from "../storage/state-store";
 import {
   WorkStoreError,
@@ -684,6 +695,7 @@ const restoreLoginReceipt = (value: unknown): LoginOutcome => {
 /** Background tasks that swallow their own rejection record one of these closed codes. */
 export const BACKGROUND_DIAGNOSTIC_CODES = [
   "account_fact_apply_failed",
+  "attachment_sweep_failed",
   "autorespond_failed",
   "claude_fact_untranslatable",
   "prose_autorespond_failed",
@@ -725,6 +737,7 @@ const SESSION_FACT_EPOCH_LIMIT = 4_096;
 export class HraService {
   readonly #store: StateStore;
   readonly #paths: StatePaths;
+  #attachmentBlobs: AttachmentBlobStore | undefined;
   readonly #codex: CodexRuntimePort;
   readonly #claude: ClaudeRuntimePort;
   readonly #claudeFacts: ClaudeSessionFactTranslator;
@@ -1059,9 +1072,9 @@ export class HraService {
           });
         }
         case "session.start": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#startSession({ ...command, account: profile.id }, context.signal)); }
-        case "session.send": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#send(session.id, command.message, command.idempotencyKey, context.signal)); }
-        case "session.queue": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#queue(session.id, command.message, command.idempotencyKey)); }
-        case "session.steer": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#steer(session.id, command.message, command.idempotencyKey, context.signal)); }
+        case "session.send": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#send(session.id, command.message, command.idempotencyKey, context.signal, undefined, "human", command.attachments ?? [])); }
+        case "session.queue": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#queue(session.id, command.message, command.idempotencyKey, undefined, command.attachments ?? [])); }
+        case "session.steer": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#steer(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? [])); }
         case "session.stop": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#stop(session.id, command.idempotencyKey, context.signal)); }
         case "session.rename": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#rename(session.id, command.name, command.idempotencyKey, context.signal)); }
         case "session.recover": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#resolveSessionRecovery(session.id, "recover", context.signal)); }
@@ -1499,9 +1512,9 @@ export class HraService {
       }
       this.#assertSignedIn(profile);
       switch (command.kind) {
-        case "session.send": return await this.#send(session.id, command.message, command.idempotencyKey, context.signal);
-        case "session.queue": return await this.#queue(session.id, command.message, command.idempotencyKey);
-        case "session.steer": return await this.#steer(session.id, command.message, command.idempotencyKey, context.signal);
+        case "session.send": return await this.#send(session.id, command.message, command.idempotencyKey, context.signal, undefined, "human", command.attachments ?? []);
+        case "session.queue": return await this.#queue(session.id, command.message, command.idempotencyKey, undefined, command.attachments ?? []);
+        case "session.steer": return await this.#steer(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? []);
         case "session.stop": return await this.#stop(session.id, command.idempotencyKey, context.signal);
         case "session.rename": return await this.#rename(session.id, command.name, command.idempotencyKey, context.signal);
         case "session.preset": return {
@@ -6417,6 +6430,27 @@ export class HraService {
     };
   }
 
+  /*
+   * Adds each user message`s attachment manifest to a provider projection.
+   * The manifest names the file, its declared media type, its length, and its
+   * digest; the bytes stay in local custody and never enter a projection, a
+   * rendered result, or a log.
+   */
+  #withAttachmentManifests(
+    sessionId: SessionRecord["id"],
+    projection: CodexSessionProjection,
+  ): CodexSessionProjection {
+    const messages = projection.messages;
+    if (messages === undefined || messages.length === 0) return projection;
+    const enriched = messages.map((message) => {
+      if (message.role !== "user" || message.clientId === undefined) return message;
+      const manifest = this.#store.messageAttachmentManifest(sessionId, message.clientId);
+      return manifest.length === 0 ? message : { ...message, attachments: manifest };
+    });
+    const changed = enriched.some((message, index) => message !== messages[index]);
+    return changed ? { ...projection, messages: enriched } : projection;
+  }
+
   async #showSession(selector: string, detail: boolean, signal: AbortSignal): Promise<unknown> {
     const session = this.#store.requireSession(selector);
     if (session.providerThreadId === undefined) return { session, effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null };
@@ -6431,7 +6465,8 @@ export class HraService {
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettled(session.id);
     await this.#daemonAuthority.assertCurrent();
-    const projection = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: authorityFor(this.#paths, profile), providerThreadId, detail, signal }));
+    const observed = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: authorityFor(this.#paths, profile), providerThreadId, detail, signal }));
+    const projection = this.#withAttachmentManifests(session.id, observed);
     if (projectionRecoveryUnsettled || this.#projectionRecoveriesInFlight.has(session.id)) {
       const runtimeProfile = this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null;
       const coherentSession = this.#store.requireSession(session.id);
@@ -6594,6 +6629,58 @@ export class HraService {
     };
   }
 
+  /*
+   * Local attachment custody for one message.
+   *
+   * The command carries digests, never paths and never bytes. This reads the
+   * bytes back from the content-addressed store, re-proves each digest, and
+   * re-runs the same admission the ingest path ran. An attachment that is not
+   * in custody on this machine, or whose bytes no longer match what its
+   * reference claims, refuses the whole command before any provider effect.
+   */
+  #blobs(): AttachmentBlobStore {
+    this.#attachmentBlobs ??= AttachmentBlobStore.forStatePaths(this.#paths);
+    return this.#attachmentBlobs;
+  }
+
+  /*
+   * Bounded attachment custody maintenance. It runs only after a message that
+   * actually carried attachments, so a text-only daemon never pays for it.
+   *
+   * First it drops accounting rows that no message references any more — a
+   * session was deleted, or the per-session manifest cap pruned the oldest
+   * source — and removes their blobs. Then it removes blob files that local
+   * custody does not account for at all, which is how a blob written for a
+   * command that never reached the daemon is reclaimed. Blobs younger than
+   * the grace window are never touched, so an in-flight command is safe.
+   */
+  async #sweepAttachmentCustody(active: boolean): Promise<void> {
+    if (!active) return;
+    try {
+      const blobs = this.#blobs();
+      for (const row of this.#store.listUnreferencedAttachments(64)) {
+        await blobs.remove(row.digest, row.canonicalMediaType);
+        this.#store.forgetAttachment(row.digest);
+      }
+      await blobs.sweepUnaccounted(
+        this.#store.accountedAttachmentDigests(),
+        ATTACHMENT_BLOB_SWEEP_GRACE_MS,
+        Date.now(),
+      );
+    } catch (error: unknown) {
+      this.recordBackgroundDiagnostic("attachment_sweep_failed", error);
+    }
+  }
+
+  async #prepareAttachments(
+    references: readonly AttachmentReference[],
+  ): Promise<Readonly<{ stored: readonly StoredMessageAttachment[]; values: readonly PreparedAttachment[] }>> {
+    if (references.length === 0) return { stored: [], values: [] };
+    const resolved = await resolveMessageAttachments(this.#blobs(), references);
+    if (resolved.kind === "refused") throw new CommandFailure("INVALID_INPUT", resolved.message);
+    return { stored: resolved.stored, values: resolved.values };
+  }
+
   async #send(
     selector: string,
     message: string,
@@ -6601,8 +6688,10 @@ export class HraService {
     signal: AbortSignal,
     beforeEffect?: (attemptId: MutationAttemptRecord["id"]) => void,
     actor: "human" | "autorespond" = "human",
+    attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
+    const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
@@ -6619,7 +6708,7 @@ export class HraService {
     let dispatchSessionRevision: number | undefined;
     let dispatchFactEpoch: number | undefined;
     let startedResult: { turnId: string; status: "completed" | "interrupted" | "failed" | "inProgress"; effectiveRuntimeProfile: ReviewedRuntimeProfile } | undefined;
-    const result = await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message }, idempotencyKey: key, effect: async (attemptId) => {
+    const result = await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, effect: async (attemptId) => {
       if (baseline === undefined || review === undefined) throw new Error("Session send lost its exact pre-effect provider baseline or runtime review.");
       const runtimeReview = review;
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
@@ -6633,6 +6722,7 @@ export class HraService {
           ...(projectRoot === undefined ? {} : { projectRoot }),
           review: runtimeReview,
           message,
+          ...(attachments.values.length === 0 ? {} : { attachments: attachments.values }),
           clientMessageId: attemptId,
           signal,
         });
@@ -6674,6 +6764,13 @@ export class HraService {
           runtimeProfile: review.effectiveRuntimeProfile,
         },
       });
+      if (attachments.stored.length > 0) {
+        this.#store.recordMessageAttachments({
+          attachments: attachments.stored,
+          sessionId: session.id,
+          sourceId: attemptId,
+        });
+      }
       dispatchSessionRevision = this.#store.requireSession(session.id).revision;
       dispatchFactEpoch = this.#snapshotSessionFactEpoch(session.id);
     }, receipt: (value) => turnStartReceiptSchema.parse(value), restore: (value) => turnStartReceiptSchema.parse(value), commit: (attemptId, _value, receipt) => {
@@ -6689,9 +6786,18 @@ export class HraService {
         receipt,
       });
     }, onAmbiguous: () => this.#quarantineSession(session.id) });
+    await this.#sweepAttachmentCustody(attachments.values.length > 0);
     const reconciled = this.#store.requireSession(session.id);
     if (reconciled.state === "idle") this.#scheduleQueueDispatch(reconciled);
-    return { session: reconciled, turnId: result.turnId, effectiveRuntimeProfile: result.effectiveRuntimeProfile ?? null, idempotencyKey: key };
+    return {
+      session: reconciled,
+      turnId: result.turnId,
+      effectiveRuntimeProfile: result.effectiveRuntimeProfile ?? null,
+      ...(attachments.values.length === 0
+        ? {}
+        : { attachments: attachments.values.map(attachmentReferenceOf) }),
+      idempotencyKey: key,
+    };
   }
 
   async #steer(
@@ -6700,8 +6806,10 @@ export class HraService {
     idempotencyKey: string | undefined,
     signal: AbortSignal,
     beforeEffect?: (attemptId: MutationAttemptRecord["id"]) => void,
+    attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
+    const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
     this.#requireLiveProviderObservation(
@@ -6710,10 +6818,10 @@ export class HraService {
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let activeTurnId: string | undefined;
-    const result = await this.#effect({ kind: "session.steer", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message }, idempotencyKey: key, effect: async (attemptId) => {
+    const result = await this.#effect({ kind: "session.steer", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, effect: async (attemptId) => {
       if (activeTurnId === undefined) throw new CommandFailure("CONFLICT", "The session has no active turn to steer.");
       const turnId = activeTurnId;
-      await this.#fencedEffect(async () => await this.#runtimeForSession(session).steer({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, message, clientMessageId: attemptId, signal }));
+      await this.#fencedEffect(async () => await this.#runtimeForSession(session).steer({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, message, ...(attachments.values.length === 0 ? {} : { attachments: attachments.values }), clientMessageId: attemptId, signal }));
       return { steered: true as const, activeTurnId: turnId };
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
@@ -6733,8 +6841,23 @@ export class HraService {
           messageDigest: digestText(message),
         },
       });
+      if (attachments.stored.length > 0) {
+        this.#store.recordMessageAttachments({
+          attachments: attachments.stored,
+          sessionId: session.id,
+          sourceId: attemptId,
+        });
+      }
     }, receipt: (value) => steeredReceiptSchema.parse(value), restore: (value) => steeredReceiptSchema.parse(value), onAmbiguous: () => this.#quarantineSession(session.id) });
-    return { steered: true, turnId: result.activeTurnId, idempotencyKey: key };
+    await this.#sweepAttachmentCustody(attachments.values.length > 0);
+    return {
+      steered: true,
+      turnId: result.activeTurnId,
+      ...(attachments.values.length === 0
+        ? {}
+        : { attachments: attachments.values.map(attachmentReferenceOf) }),
+      idempotencyKey: key,
+    };
   }
 
   async #queue(
@@ -6742,19 +6865,37 @@ export class HraService {
     message: string,
     idempotencyKey: string | undefined,
     beforeEffect?: () => void,
+    attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
+    // Custody is proved before anything durable exists, so a queue entry never
+    // outlives the attachments it references.
+    const attachments = await this.#prepareAttachments(attachmentReferences);
     const key = idempotencyKey ?? randomUUID();
     // Work authorization and durable enqueue are one synchronous fence boundary.
     beforeEffect?.();
     const queued = this.#store.enqueueIdempotent({ sessionId: session.id, profileGeneration: profile.processGeneration, message, idempotencyKey: key });
+    if (attachments.stored.length > 0) {
+      this.#store.recordMessageAttachments({
+        attachments: attachments.stored,
+        sessionId: session.id,
+        sourceId: queued.id,
+      });
+    }
+    await this.#sweepAttachmentCustody(attachments.values.length > 0);
     const observed = this.#store.requireSession(session.id);
     if (queued.state === "pending" && observed.state === "idle") {
       this.#scheduleQueueDispatch(observed);
     }
-    return { queued, idempotencyKey: key };
+    return {
+      queued,
+      ...(attachments.values.length === 0
+        ? {}
+        : { attachments: attachments.values.map(attachmentReferenceOf) }),
+      idempotencyKey: key,
+    };
   }
 
   #scheduleQueueDispatch(session: SessionRecord): void {
@@ -7324,6 +7465,11 @@ export class HraService {
           signal,
         });
       });
+      // The queued manifest is durable; its bytes are re-proved here, at
+      // dispatch, exactly as they were at enqueue.
+      const queuedAttachments = await this.#prepareAttachments(
+        this.#store.messageAttachmentManifest(session.id, queued.id),
+      );
       evidence = this.#store.beginQueueEffect({
         queueId: queued.id,
         sessionId: session.id,
@@ -7351,6 +7497,9 @@ export class HraService {
           projectRoot,
           review,
           message: queued.message,
+          ...(queuedAttachments.values.length === 0
+            ? {}
+            : { attachments: queuedAttachments.values }),
           clientMessageId: queued.id,
           signal,
         });

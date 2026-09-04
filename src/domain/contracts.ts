@@ -2,6 +2,7 @@ import { isAbsolute, normalize } from "node:path";
 
 import { z } from "zod";
 
+import { attachmentReferenceListSchema } from "./attachment-schemas";
 import { presetSchema, providerSchema } from "./presets";
 import { interactionResolutionSchema } from "./interactions";
 import {
@@ -220,9 +221,13 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
   z.object({ kind: z.literal("session.start"), account: selectorSchema, project: selectorSchema.optional(), provider: providerSchema.optional(), preset: presetSchema, fast: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
-  z.object({ kind: z.literal("session.send"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
-  z.object({ kind: z.literal("session.queue"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
-  z.object({ kind: z.literal("session.steer"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
+  // `attachments` is optional and absent by default, so a message with no
+  // attachment serializes exactly as it did before attachments existed. The
+  // references name digests in local custody; no path ever crosses this
+  // boundary.
+  z.object({ kind: z.literal("session.send"), session: selectorSchema, message: messageSchema, attachments: attachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.queue"), session: selectorSchema, message: messageSchema, attachments: attachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.steer"), session: selectorSchema, message: messageSchema, attachments: attachmentReferenceListSchema.optional(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.stop"), session: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.rename"), session: selectorSchema, name: titleSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.archive"), session: selectorSchema, archived: z.boolean() }).strict(),

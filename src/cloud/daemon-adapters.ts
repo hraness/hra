@@ -52,6 +52,11 @@ import type {
   CloudControlPort,
   ProfileAuthority,
 } from "../daemon/ports";
+import {
+  isAttachmentImageMediaType,
+  type AttachmentReference,
+} from "../domain/attachments";
+import { AttachmentBlobStore } from "../storage/attachment-store";
 import { profilePaths, type StatePaths } from "../storage/paths";
 import { HRA_VERSION } from "../version";
 import type {
@@ -106,6 +111,7 @@ import {
   parseCompactSessionEvents,
   type CompactInteractionDecision,
   type CompactInteractionQuestion,
+  type CompactAttachment,
   type CompactMessageActor,
   type CompactSessionEvent,
   type GitAction,
@@ -161,6 +167,7 @@ type LocalExecuteRemote = (
 type CompactSessionEventBody =
   | Readonly<{
       actor?: CompactMessageActor;
+      attachments?: readonly CompactAttachment[];
       kind: "user_message" | "assistant_message";
       text: string;
       turnId: string;
@@ -534,6 +541,63 @@ function recoveryQuarantinePath(
   idempotencyKey: string,
 ): string {
   return join(root, `${cacheFileName}.quarantine-${idempotencyKey}`);
+}
+
+/*
+ * Turning a hosted attachment manifest into local custody.
+ *
+ * An entry that carries `data` is admitted exactly the way the CLI admits a
+ * file: the base64 is decoded, the bytes are sniffed against the declared
+ * media type, and the store re-derives the digest. A hosted claim about the
+ * digest is checked, never trusted. An entry with no `data` must already be
+ * in custody on this machine, which is how a browser re-sends a file the
+ * custodian already holds without paying for the bytes twice.
+ */
+export type RemoteAttachmentMaterialization =
+  | Readonly<{ kind: "materialized"; values: readonly AttachmentReference[] }>
+  | Readonly<{ code: string; kind: "refused" }>;
+
+export async function materializeRemoteAttachments(
+  blobs: AttachmentBlobStore,
+  payload: RemoteCommandPayload,
+): Promise<RemoteAttachmentMaterialization> {
+  if (!("attachments" in payload)) return { kind: "materialized", values: [] };
+  const values: AttachmentReference[] = [];
+  for (const attachment of payload.attachments) {
+    const canonical = isAttachmentImageMediaType(attachment.mediaType)
+      ? attachment.mediaType
+      : "text/plain";
+    if (attachment.data === undefined) {
+      if (!await blobs.has(attachment.digest, canonical)) {
+        return { code: "ATTACHMENT_MISSING", kind: "refused" };
+      }
+      values.push({
+        byteLength: attachment.byteLength,
+        digest: attachment.digest,
+        mediaType: attachment.mediaType,
+        name: attachment.name,
+      });
+      continue;
+    }
+    const bytes = new Uint8Array(Buffer.from(attachment.data, "base64"));
+    if (bytes.byteLength !== attachment.byteLength) {
+      return { code: "ATTACHMENT_LENGTH_MISMATCH", kind: "refused" };
+    }
+    const stored = await blobs.put(attachment.mediaType, bytes);
+    if (stored.kind === "refused") {
+      return { code: `ATTACHMENT_${stored.reason}`, kind: "refused" };
+    }
+    if (stored.value.digest !== attachment.digest) {
+      return { code: "ATTACHMENT_DIGEST_MISMATCH", kind: "refused" };
+    }
+    values.push({
+      byteLength: stored.value.byteLength,
+      digest: stored.value.digest,
+      mediaType: attachment.mediaType,
+      name: attachment.name,
+    });
+  }
+  return { kind: "materialized", values };
 }
 
 function authorityFor(paths: StatePaths, profileId: Parameters<typeof profilePaths>[1], generation: number): ProfileAuthority {
@@ -924,9 +988,15 @@ function parseStoredEvents(value: string): readonly CompactSessionEvent[] {
 
 function compactSessionEventBody(event: CompactSessionEvent): CompactSessionEventBody {
   if (event.kind === "user_message" || event.kind === "assistant_message") {
+    // Both optional keys are spread in place, so an event that carries
+    // neither digests byte for byte as it did before either existed and a
+    // cache written by an older build still verifies.
     return {
       ...(event.kind === "user_message" && event.actor !== undefined
         ? { actor: event.actor }
+        : {}),
+      ...(event.kind === "user_message" && event.attachments !== undefined
+        ? { attachments: event.attachments }
         : {}),
       kind: event.kind,
       text: event.text,
@@ -2226,8 +2296,15 @@ function completedProjectionTurns(
     const autorespondAuthored = message.role === "user"
       && message.clientId !== undefined
       && store.isAutorespondMessageSource(session.id, message.clientId);
+    // The manifest is local custody, keyed by the client message id the turn
+    // was dispatched under. It names each file and its size; the bytes never
+    // leave this machine.
+    const manifest = message.role === "user" && message.clientId !== undefined
+      ? store.messageAttachmentManifest(session.id, message.clientId)
+      : [];
     messages.push({
       ...(autorespondAuthored ? { actor: "autorespond" as const } : {}),
+      ...(manifest.length === 0 ? {} : { attachments: manifest }),
       kind: message.role === "user" ? "user_message" : "assistant_message",
       text,
       turnId: message.turnId,
@@ -2437,6 +2514,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   readonly #executeLocal: LocalExecuteCommand;
   readonly #notifyOperator: (input: Readonly<{ body: string; title: string }>) => Promise<void>;
   readonly #paths: StatePaths;
+  readonly #attachmentBlobStore: AttachmentBlobStore;
   readonly #projectionErrors = new Map<string, Error>();
   readonly #projectionRecoveryErrors = new Set<string>();
   readonly #store: StateStore;
@@ -2505,6 +2583,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     this.#notifyOperator = options.notifyOperator ?? (() => Promise.resolve());
     this.#paths = options.paths;
     this.#store = options.store;
+    this.#attachmentBlobStore = AttachmentBlobStore.forStatePaths(options.paths);
   }
 
   /** The provider port that owns one session's live projection reads. */
@@ -3385,6 +3464,20 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         || profile.state !== "signed_in"
       ) return { code: "LOCAL_AUTHORITY_CHANGED", state: "failed" };
 
+      // Hosted attachments are materialized into the same local
+      // content-addressed custody the CLI writes, before any provider effect.
+      // The command that follows carries digests only.
+      const materialized = await materializeRemoteAttachments(
+        this.#attachmentBlobs(),
+        input.payload,
+      );
+      if (materialized.kind === "refused") {
+        return { code: materialized.code, state: "failed" };
+      }
+      const attached = materialized.values.length === 0
+        ? {}
+        : { attachments: [...materialized.values] };
+
       let command: ProviderRemoteLocalCommand;
       switch (input.payload.kind) {
           // Settings commands change local daemon state only: they never
@@ -3397,13 +3490,13 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
           case "set_gateway_key":
             return await this.#applySettingCommand(session.id, input.payload);
           case "send":
-            command = { kind: "session.send", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey };
+            command = { kind: "session.send", session: session.id, message: input.payload.message, ...attached, idempotencyKey: input.idempotencyKey };
             break;
           case "queue":
-            command = { kind: "session.queue", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey };
+            command = { kind: "session.queue", session: session.id, message: input.payload.message, ...attached, idempotencyKey: input.idempotencyKey };
             break;
           case "steer":
-            command = { kind: "session.steer", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey };
+            command = { kind: "session.steer", session: session.id, message: input.payload.message, ...attached, idempotencyKey: input.idempotencyKey };
             break;
           case "stop":
             command = { kind: "session.stop", session: session.id, idempotencyKey: input.idempotencyKey };
@@ -3418,8 +3511,8 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
             // Resolved at execution time: the requester's view of "turn
             // active" is stale by design, so the custodian decides.
             command = session.activeTurnId === undefined
-              ? { kind: "session.send", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey }
-              : { kind: "session.steer", session: session.id, message: input.payload.message, idempotencyKey: input.idempotencyKey };
+              ? { kind: "session.send", session: session.id, message: input.payload.message, ...attached, idempotencyKey: input.idempotencyKey }
+              : { kind: "session.steer", session: session.id, message: input.payload.message, ...attached, idempotencyKey: input.idempotencyKey };
             break;
           case "rename_session":
             // A cleared name is the default title, not an empty one: the
@@ -3469,6 +3562,10 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
    * about its value is returned, journalled, or logged; the caller only ever
    * learns that a key was set.
    */
+  #attachmentBlobs(): AttachmentBlobStore {
+    return this.#attachmentBlobStore;
+  }
+
   async #applySettingCommand(
     sessionId: SessionRecord["id"],
     payload: SettingCommandPayload,

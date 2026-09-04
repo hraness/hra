@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 
 import { CODEX_PIN } from "../codex/pin";
+import { ATTACHMENT_MAX_COUNT } from "../domain/attachments";
 import type { LocalCommand } from "../domain/contracts";
 import { localCommandSchema } from "../domain/contracts";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
@@ -67,6 +68,21 @@ export type ProtectedAuthLoginCliInvocation = Readonly<{
   kind: "auth.login-protected";
 }>;
 
+/**
+ * `hra session send|queue|steer --attach <path>`. The parser hands back the
+ * exact command plus the paths it was given; the composition entry reads,
+ * sniffs, bounds, and stores each file, then reissues the command with the
+ * resulting digest references.
+ */
+export type SessionAttachmentCliInvocation = Readonly<{
+  attach: readonly string[];
+  command: Extract<LocalCommand, {
+    kind: "session.send" | "session.queue" | "session.steer";
+  }>;
+  json: boolean;
+  kind: "session.attach";
+}>;
+
 export type SessionEventFollowCliInvocation = Readonly<{
   command: Extract<LocalCommand, { kind: "session.events" }>;
   jsonl: true;
@@ -115,6 +131,7 @@ export type CliInvocation =
   | ProtectedInteractionCliInvocation
   | ProtectedInteractionInspectCliInvocation
   | AccountLoginCliInvocation
+  | SessionAttachmentCliInvocation
   | SessionEventFollowCliInvocation
   | SessionEventWatchCliInvocation
   | WorkApplyCliInvocation
@@ -298,7 +315,7 @@ Usage:
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]
-  hra session send|queue|steer <session> <message>
+  hra session send|queue|steer <session> [--attach <path>]... <message>
   hra session stop|recover|abandon <session>
   hra session archive|unarchive <session>
   hra session rename <session> <name>
@@ -320,6 +337,7 @@ Examples:
   hra session watch my-session --jsonl
   hra session events my-session --wait-ms 30000 --jsonl
   hra session send my-session -- "run --help exactly"
+  hra session send my-session --attach diagram.png --attach notes.md "what changed here?"
   hra session task create my-session --name daily-review --every-minutes 1440 -- "review the release queue"`,
   work: `HRA work
 
@@ -589,6 +607,29 @@ const option = (cursor: Cursor, name: string): string | undefined => {
   if (value === undefined || isOption(value)) throw new CliUsageError(`Missing value for ${name}.`);
   cursor.values.splice(index, 2);
   return decode(value);
+};
+
+/*
+ * A repeatable option. Every occurrence is consumed before the positional
+ * words are read, so `--attach` may appear anywhere ahead of the message and
+ * the message itself still reaches `remainder` unchanged. A literal word after
+ * `--` carries the literal prefix and can never be mistaken for the option.
+ */
+const repeatedOption = (cursor: Cursor, name: string, limit: number): readonly string[] => {
+  const values: string[] = [];
+  for (;;) {
+    const index = cursor.values.indexOf(name);
+    if (index < 0) return values;
+    const value = cursor.values[index + 1];
+    if (value === undefined || isOption(value)) {
+      throw new CliUsageError(`Missing value for ${name}.`);
+    }
+    if (values.length >= limit) {
+      throw new CliUsageError(`At most ${String(limit)} ${name} values are accepted.`);
+    }
+    cursor.values.splice(index, 2);
+    values.push(decode(value));
+  }
 };
 
 const boundedDecimal = (
@@ -1025,7 +1066,11 @@ const parseSession = (
   cursor: Cursor,
   jsonl: boolean,
   idempotencyKey: string | undefined,
-): LocalCommand | SessionEventFollowCliInvocation | SessionEventWatchCliInvocation => {
+):
+  | LocalCommand
+  | SessionEventFollowCliInvocation
+  | SessionEventWatchCliInvocation
+  | Omit<SessionAttachmentCliInvocation, "json"> => {
   const action = take(cursor, "session action");
   switch (action) {
     case "list": {
@@ -1104,9 +1149,26 @@ const parseSession = (
       finish(cursor);
       return command({ kind: "session.start", account, project, provider, preset, fast });
     }
-    case "send": { const session = take(cursor, "session"); return command({ kind: "session.send", session, message: remainder(cursor, "message") }); }
-    case "queue": { const session = take(cursor, "session"); return command({ kind: "session.queue", session, message: remainder(cursor, "message") }); }
-    case "steer": { const session = take(cursor, "session"); return command({ kind: "session.steer", session, message: remainder(cursor, "message") }); }
+    case "send":
+    case "queue":
+    case "steer": {
+      // Attachment paths are read, sniffed, bounded, and written into local
+      // content-addressed custody by the CLI composition entry. The parser
+      // never opens a file and never puts a path into a command.
+      const attach = repeatedOption(cursor, "--attach", ATTACHMENT_MAX_COUNT);
+      const session = take(cursor, "session");
+      const kind = action === "send"
+        ? "session.send" as const
+        : action === "queue" ? "session.queue" as const : "session.steer" as const;
+      const parsed = command({ kind, session, message: remainder(cursor, "message") });
+      if (attach.length === 0) return parsed;
+      if (
+        parsed.kind !== "session.send"
+        && parsed.kind !== "session.queue"
+        && parsed.kind !== "session.steer"
+      ) throw new CliUsageError("Session message command is invalid.");
+      return { attach, command: parsed, kind: "session.attach" };
+    }
     case "stop": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.stop", session }; }
     case "rename": { const session = take(cursor, "session"); return command({ kind: "session.rename", session, name: remainder(cursor, "name") }); }
     case "archive": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.archive", session, archived: true }; }
@@ -1629,6 +1691,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     return { kind: "command", command: { kind: "autorespond.set", mode, ...(session === undefined ? {} : { session }) }, json };
   }
   let parsed: LocalCommand;
+  let sessionAttach: readonly string[] = [];
   if (group === "account") {
     const account = parseAccount(cursor, idempotencyKey, json);
     if (account.kind === "account.login-handoff") return account;
@@ -1659,7 +1722,12 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     if (jsonl) {
       throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
     }
-    parsed = sessionCommand;
+    if (sessionCommand.kind === "session.attach") {
+      sessionAttach = sessionCommand.attach;
+      parsed = sessionCommand.command;
+    } else {
+      parsed = sessionCommand;
+    }
   }
   else if (group === "work") {
     if (idempotencyKey !== undefined) {
@@ -1828,6 +1896,14 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       ? parsed.idempotencyKey
       : randomUUID();
     parsed = command({ ...parsed, idempotencyKey: idempotencyKey ?? generated });
+  }
+  if (sessionAttach.length > 0) {
+    if (
+      parsed.kind !== "session.send"
+      && parsed.kind !== "session.queue"
+      && parsed.kind !== "session.steer"
+    ) throw new CliUsageError("Only session send, queue, and steer accept --attach.");
+    return { attach: sessionAttach, command: parsed, json, kind: "session.attach" };
   }
   return { kind: "command", command: parsed, json };
 }
