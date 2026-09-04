@@ -2,14 +2,29 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
-## HRA Web v1 wave 2
+## v0.4.0
 
-Unreleased. The browser app foundation.
+HRA Web v1 waves 1 and 2: live session projection, session state, autorespond, remote decisions, and the browser client. Release candidate until the release workflow admits the tag.
+
+Daemon and CLI:
+
+- The daemon streams the running turn to the hosted `detail` stream: turn starts, coalesced assistant deltas, reasoning summary deltas only where show-thinking is enabled for that session, subagent activity, and session state. Batches flush at one second or 8 KiB and again when the turn completes, and redaction carries a 256-byte window across batches so a secret split across two batches is still seen whole.
+- A lexical classifier decides who must act next and how a turn ended. Human-action cues are evaluated before approval cues, so a login prompt or a code from email never reads as consent. `hra session state` reads the persisted result.
+- Autorespond accepts freshly admitted command, file-change, and permission approvals at once scope through the ordinary resolve path. `hra autorespond on|workspace|off|default|status` sets `auto:all` (the default), `auto:workspace`, or `manual` per session or daemon-wide. Every attempt leaves an evidence row, and a consecutive counter that only a human message resets, plus hourly and daily budgets, escalate rather than continue.
+- A turn that ends asking for approval in prose, with no protocol interaction to resolve, can be answered through a gateway key held in the daemon's generational secret custody. `hra autorespond gateway set|clear` manages it and status reports only whether it is configured. A verbatim ask sends a byte-exact substring of the message or escalates; every other admitted case sends one fixed sentence.
+- `hra remote resolve` and `hra remote send --or-steer` carry a decision from another enrolled device. The custodian verifies that the interaction exists, belongs to the session, is pending at the requested revision, is inside its deadline, and offers that decision; it refuses secret answers and session-scope grants, and honours decisions only from active requesting devices.
+- The daemon wakes its sync cycle from a websocket subscription to its pending commands instead of waiting for the next poll, and the poll cadence adapts: one second while a peer device is present or a local turn is running, fifteen seconds idle. `hra sync status` reports it.
+- Devices carry a class, `daemon` or `browser`, and a key fingerprint over both canonical public keys. Device listings show the fingerprint and `hra device approve --fingerprint` requires it. A browser device is refused as a first device, refused administration, and refused every daemon-owned write.
+- Each device publishes an encrypted registry projection: machine label, daemon version, daemon defaults, accounts and projects by label, scheduled tasks as read-only rows, and whether prose autorespond is configured. Hosted command kinds now also set the approval mode, show-thinking, and default preset, archive or rename a session, and set the gateway key.
+- `hra session archive` and `hra session unarchive` move a finished session out of the default listing, which `--archived` still shows. Store schema version 31 migrates additively.
+
+Browser client:
 
 - `app/` holds a Vite, React 19, Tailwind v4 browser client, gated by `bun run lint`, `bun run typecheck`, `bun test ./app`, and `bun run build:app` inside `bun run check`. It ships as a separate Vercel project on its own origin with the wave 1 Content Security Policy, and a test asserts the built bundle sets no style attribute, references no service worker, calls no `eval`, and names no origin outside the pinned Convex deployment.
 - Authentication tokens live in an in-memory storage adapter rather than `localStorage`, so a closed tab leaves no refresh token behind.
 - A browser enrolls as an ordinary device: non-extractable P-256 signing and wrapping key pairs held in IndexedDB, a displayed key fingerprint to compare before `hra device approve`, and the account key unwrapped into memory only. The key is dropped on a fifteen-minute idle, on `Ctrl+L`, on page hide, and on the first authority refusal from the control plane.
 - The client decrypts the compact history and subscribes to the live `detail` tail, keyed by the detail stream epoch, and submits `send_or_steer` bound to the session's current custodian device.
+- A session grid, a session view with sanitised streaming markdown and an interaction panel, and a settings screen for machines, defaults, archived sessions, scheduled tasks, accounts, and devices. Hosted sign-up stays invite-only in this release.
 
 ## v0.3.0
 

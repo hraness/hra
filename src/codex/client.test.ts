@@ -988,7 +988,7 @@ describe("CodexAppServerClient", () => {
   test("accepts the pinned desktop user agent and rejects protocol version drift", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const pinned = createClient({
-      process: successfulFake(codexHome, "Codex Desktop/0.149.0 (Mac OS 26.5; arm64) dumb (hra; 0.3.0)"),
+      process: successfulFake(codexHome, "Codex Desktop/0.149.0 (Mac OS 26.5; arm64) dumb (hra; 0.4.0)"),
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: codexHome,
       isAuthorityCurrent: () => true,
