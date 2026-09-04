@@ -12,9 +12,9 @@ const invocation = "https://github.com/hraness/hra/actions/runs/123/attempts/2";
 const repositorySubject = [
   "repo:hraness",
   "307125679/hra",
-  "1343008607:ref:refs/tags/v0.4.0",
+  "1343008607:ref:refs/tags/v0.4.1",
 ].join("@");
-const policy = releaseSignerIdentity("v0.4.0", sha, invocation);
+const policy = releaseSignerIdentity("v0.4.1", sha, invocation);
 const decodeDerUtf8String = (value) => {
   const bytes = Buffer.from(value);
   assert.equal(bytes[0], 0x0c);
@@ -23,7 +23,7 @@ const decodeDerUtf8String = (value) => {
 };
 assert.equal(
   policy.options.certificateIdentityURI,
-  "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.4\\.0$",
+  "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.4\\.1$",
 );
 assert.equal(policy.options.certificateOIDs["1.3.6.1.4.1.57264.1.2"], "push");
 assert.equal(policy.options.certificateOIDs["1.3.6.1.4.1.57264.1.5"], "hraness/hra");
@@ -40,9 +40,9 @@ assert.deepEqual(
 );
 assert.throws(() => canonicalAsciiDerUtf8String("a".repeat(128)));
 assert.throws(() => releaseSignerIdentity(
-  "v0.4.0",
+  "v0.4.1",
   sha,
   "https://github.com/hraness/other/actions/runs/123/attempts/2",
 ));
-assert.throws(() => releaseSignerIdentity("v0.4.0", "b".repeat(39), invocation));
+assert.throws(() => releaseSignerIdentity("v0.4.1", "b".repeat(39), invocation));
 process.stdout.write("node enforced exact npm provenance signer policy\n");

@@ -1,4 +1,4 @@
-# HRA v0.4.0 local CLI beta
+# HRA v0.4.1 local CLI beta
 
 HRA is a persistent Codex CLI for isolated accounts and live local session control. Optional hosted encrypted sync is live as an invite-only beta since 2026-09-03.
 
@@ -7,13 +7,13 @@ HRA is a persistent Codex CLI for isolated accounts and live local session contr
 Install the immutable beta tag with Bun 1.3.14:
 
 ```sh
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.4.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.4.0/hraness-hra-0.4.0.tgz 3e008db0520395a0d19d307f7c84ea0ce34fbc97745ce38d089341a068dc0873)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.4.1/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.4.1/hraness-hra-0.4.1.tgz b6e914d74d53483db01e1867880b93bc594ce7e162667312a188134d587e4126)" = hra-install-safe
 hra --version
 hra doctor --offline
 hra init --yes
 ```
 
-The single command verifies the SHA-256 of the exact tagged installer runtime before executing it. The installer then requires GitHub repository ID `1343008607`, a published immutable `v0.4.0` release, and one uploaded archive whose size and SHA-256 match GitHub's immutable metadata. It privately downloads the archive and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the archive-bound completion receipt. Local and official archives use separate full-digest version namespaces. HRA also verifies the complete staged tree, package identity, zero-lifecycle manifest, reviewed normalizer, CLI SHA-256, protected descriptors, links, ownership, permissions, and ACLs before atomically publishing only the `$BUN_INSTALL/bin/hra` symlink. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging, and interruption recovery removes or completes only a proven private stage. Existing `trustedDependencies` remain unchanged.
+The single command verifies the SHA-256 of the exact tagged installer runtime before executing it. The installer then requires GitHub repository ID `1343008607`, a published immutable `v0.4.1` release, and one uploaded archive whose size and SHA-256 match GitHub's immutable metadata. It privately downloads the archive and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the archive-bound completion receipt. Local and official archives use separate full-digest version namespaces. HRA also verifies the complete staged tree, package identity, zero-lifecycle manifest, reviewed normalizer, CLI SHA-256, protected descriptors, links, ownership, permissions, and ACLs before atomically publishing only the `$BUN_INSTALL/bin/hra` symlink. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging, and interruption recovery removes or completes only a proven private stage. Existing `trustedDependencies` remain unchanged.
 
 The local CLI is public. Hosted sync remains an invite-only beta: this release does not grant enrollment or invitation authority.
 
@@ -28,6 +28,12 @@ The local CLI is public. Hosted sync remains an invite-only beta: this release d
 - Each device publishes an encrypted registry projection of its machine label, daemon version, defaults, accounts and projects by label, scheduled tasks, and whether prose autorespond is configured, so an enrolled device can read and change those defaults. `hra session archive` and `hra session unarchive` move a finished session out of the default listing, which `--archived` still shows.
 - Everything from `v0.3.0`: isolated Codex account profiles with historical usage, persistent local sessions with bounded event streaming and typed interaction handoff, conversation-bound scheduled tasks, agent-safe JSON and JSONL output, reversible macOS ChatGPT account switching, hosted invite-only sync, and one checksummed npm tarball published as the same bytes on npm and the immutable GitHub Release with `SHA256SUMS`.
 
+## Fixed in v0.4.1
+
+- Installing a newer build over an existing install no longer deadlocks the daemon. `hra daemon start` and `hra daemon run` migrate an older local state schema once, under the store's own locking and scrub rules, and then repeat the read-only initialization proof; before this, the read-only proof refused the schema difference and reported the opaque `RECOVERY_REQUIRED` line with no product path that could migrate.
+- A status read never migrates. It names both schema versions and gives `hra daemon start` as its next command, and a store written by a newer build stays a clear refusal that asks for the newer HRA.
+- `hra doctor --offline` names a pending migration and a newer on-disk schema as their own conditions instead of the opaque local-database line, and appends the short state code of any other named local state failure. It still prints no path and no stack.
+
 ## Known limits
 
 - Hosted sync, identity enrollment, device pairing, and remote commands are live as an invite-only beta; new identities need an invitation from an existing member.
@@ -35,6 +41,6 @@ The local CLI is public. Hosted sync remains an invite-only beta: this release d
 - The browser client is in the repository and is not yet hosted. This release exposes it through no public address.
 - Plugin and connector discovery is read-only. HRA does not install, enable, authorize, or open OAuth flows.
 - Desktop account switching is macOS-only in this release.
-- Upgrading over an older install migrates the local state schema on the first `hra daemon start`. Until that runs, `hra status` and `hra doctor --offline` report the pending migration and name both schema versions.
+- Upgrading over an older install leaves the local state schema pending until the first `hra daemon start`. Until that runs, `hra status` and `hra doctor --offline` report the pending migration and name both schema versions rather than migrating.
 
-Read the [v0.4.0 README](https://github.com/hraness/hra/tree/v0.4.0#readme), [privacy notice](https://github.com/hraness/hra/blob/v0.4.0/PRIVACY.md), and [security policy](https://github.com/hraness/hra/blob/v0.4.0/SECURITY.md) before installation or use. Report defects through [GitHub issues](https://github.com/hraness/hra/issues) and security concerns through the private process in the security policy.
+Read the [v0.4.1 README](https://github.com/hraness/hra/tree/v0.4.1#readme), [privacy notice](https://github.com/hraness/hra/blob/v0.4.1/PRIVACY.md), and [security policy](https://github.com/hraness/hra/blob/v0.4.1/SECURITY.md) before installation or use. Report defects through [GitHub issues](https://github.com/hraness/hra/issues) and security concerns through the private process in the security policy.
