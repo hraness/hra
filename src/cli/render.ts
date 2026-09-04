@@ -419,6 +419,7 @@ const renderSingleEvent = (event: SessionEvent): string => {
     case "warning": return `Warning ${line(body.code)}: ${line(body.message)}`;
     case "error": return `Error ${line(body.code)}${body.terminal ? " (terminal)" : ""}: ${line(body.message)}`;
     case "protocol_incompatible": return `Protocol notice: unsupported ${line(body.method)} (${line(body.payloadDigest)})`;
+    case "session_state": return `Session state: ${line(body.state)}${body.attention ? ", needs attention" : ""}, revision ${String(body.revision)}: ${line(body.reason)}`;
   }
 };
 

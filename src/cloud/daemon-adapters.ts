@@ -22,6 +22,7 @@ import { parseAccountUsage, parseRateLimits, type RateLimitSnapshot } from "../c
 import type { LocalCommand } from "../domain/contracts";
 import type { InteractionRecord } from "../domain/interactions";
 import { providerUsagePayload } from "../domain/usage-metrics";
+import type { SessionEvent } from "../domain/session-events";
 import { sessionIdSchema } from "../domain/values";
 import type {
   CodexRuntimePort,
@@ -2070,6 +2071,8 @@ export type StateBackedCloudDaemonAdapterOptions = Readonly<{
   cloudIdentityNamespace?: string | null;
   codex: CodexRuntimePort;
   executeRemote: LocalExecuteRemote;
+  /** Project reasoning summary deltas to the live stream (default off). */
+  liveThinking?: boolean;
   now?: () => number;
   paths: StatePaths;
   store: StateStore;
@@ -2125,8 +2128,10 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
   readonly #projectionErrors = new Map<string, Error>();
   readonly #projectionRecoveryErrors = new Set<string>();
   readonly #store: StateStore;
+  readonly #liveThinking: boolean;
 
   constructor(options: StateBackedCloudDaemonAdapterOptions) {
+    this.#liveThinking = options.liveThinking ?? false;
     if (
       options.cloudIdentityNamespace !== undefined
       && options.cloudIdentityNamespace !== null
@@ -2742,6 +2747,44 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
         this.#projectionRecoveryErrors.add(input.sessionPublicId);
       }
       return Promise.reject(error);
+    }
+  }
+
+  /*
+   * Live projection source: the session's public event ledger after a local
+   * sequence, narrowed to the kinds the live batcher renders. The session
+   * public id is the local session id.
+   */
+  readLiveEvents(input: Readonly<{
+    afterLocalSequence: number | null;
+    limit: number;
+    sessionPublicId: string;
+    signal: AbortSignal;
+  }>): Promise<Readonly<{
+    events: readonly SessionEvent[];
+    includeThinking: boolean;
+    observedThroughSequence: number;
+  }>> {
+    if (input.signal.aborted) return Promise.reject(input.signal.reason);
+    try {
+      const page = this.#store.listSessionEvents({
+        sessionId: sessionIdSchema.parse(input.sessionPublicId),
+        afterSequence: input.afterLocalSequence,
+        limit: input.limit,
+      });
+      const events = page.events.filter((event) =>
+        event.body.type === "turn_started"
+        || event.body.type === "turn_completed"
+        || event.body.type === "assistant_delta"
+        || event.body.type === "reasoning_summary_delta"
+        || event.body.type === "session_state");
+      return Promise.resolve({
+        events,
+        includeThinking: this.#liveThinking,
+        observedThroughSequence: page.observedThroughSequence,
+      });
+    } catch (error: unknown) {
+      return Promise.reject(error instanceof Error ? error : new Error("Local live projection failed."));
     }
   }
 

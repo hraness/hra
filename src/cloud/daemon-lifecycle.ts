@@ -6,6 +6,7 @@ import type {
 export type CloudDaemonLifecycleOptions = Readonly<{
   bridge: CloudDaemonBridge;
   intervalMs?: number;
+  liveIntervalMs?: number;
   onCycle?: (result: CloudDaemonCycleResult) => void;
 }>;
 
@@ -35,6 +36,7 @@ export class PollingCloudDaemonLifecycle implements CloudDaemonLifecycle {
   readonly #bridge: CloudDaemonBridge;
   readonly #controller = new AbortController();
   readonly #intervalMs: number;
+  readonly #liveIntervalMs: number;
   readonly #onCycle: ((result: CloudDaemonCycleResult) => void) | undefined;
   #run: Promise<void> | null = null;
 
@@ -43,8 +45,13 @@ export class PollingCloudDaemonLifecycle implements CloudDaemonLifecycle {
     if (!Number.isSafeInteger(intervalMs) || intervalMs < 1_000 || intervalMs > 60_000) {
       throw new Error("Cloud daemon polling interval is invalid.");
     }
+    const liveIntervalMs = options.liveIntervalMs ?? 1_000;
+    if (!Number.isSafeInteger(liveIntervalMs) || liveIntervalMs < 250 || liveIntervalMs > 10_000) {
+      throw new Error("Cloud daemon live interval is invalid.");
+    }
     this.#bridge = options.bridge;
     this.#intervalMs = intervalMs;
+    this.#liveIntervalMs = liveIntervalMs;
     this.#onCycle = options.onCycle;
   }
 
@@ -67,10 +74,35 @@ export class PollingCloudDaemonLifecycle implements CloudDaemonLifecycle {
   }
 
   async #loop(): Promise<void> {
+    const live = this.#liveLoop();
+    try {
+      while (!this.#controller.signal.aborted) {
+        const result = await this.#bridge.cycle(this.#controller.signal);
+        this.#onCycle?.(result);
+        await abortableDelay(this.#intervalMs, this.#controller.signal);
+      }
+    } finally {
+      await live;
+    }
+  }
+
+  /*
+   * The live projection ticks on its own short cadence so streaming text
+   * reaches the hosted detail stream within about a second while the full
+   * sync cycle keeps its longer interval. A bridge without liveTick runs no
+   * live loop at all.
+   */
+  async #liveLoop(): Promise<void> {
+    const tick = this.#bridge.liveTick?.bind(this.#bridge);
+    if (tick === undefined) return;
     while (!this.#controller.signal.aborted) {
-      const result = await this.#bridge.cycle(this.#controller.signal);
-      this.#onCycle?.(result);
-      await abortableDelay(this.#intervalMs, this.#controller.signal);
+      try {
+        await tick(this.#controller.signal);
+      } catch {
+        // Live upload failures are reported by the bridge through the next
+        // cycle result; the loop itself never dies on them.
+      }
+      await abortableDelay(this.#liveIntervalMs, this.#controller.signal);
     }
   }
 }

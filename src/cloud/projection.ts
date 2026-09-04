@@ -2,7 +2,6 @@ import {
   cloudLimits,
   containsAbsolutePath,
   containsUnsafeTerminalScalar,
-  hasExactKeys,
   isOpaqueIdentifier,
   isRecord,
   isSafeNonNegativeInteger,
@@ -47,8 +46,16 @@ export type CompactInteractionEvent = Readonly<{
   summary: string;
 }>;
 
+export type CompactMessageActor = "human" | "autorespond";
+
 export type CompactSessionEvent =
-  | Readonly<{ kind: "user_message"; sequence: number; text: string; turnId: string }>
+  | Readonly<{
+      actor?: CompactMessageActor;
+      kind: "user_message";
+      sequence: number;
+      text: string;
+      turnId: string;
+    }>
   | Readonly<{ kind: "assistant_message"; sequence: number; text: string; turnId: string }>
   | CompactInteractionEvent
   | Readonly<{
@@ -98,7 +105,28 @@ const compactInteractionStates = new Set<CompactInteractionState>([
 const forbiddenDetailKeyPattern =
   /^(?:approval_secret|credential|env|environment|provider_token|raw_reasoning|tool_arguments|tool_output)$/iu;
 const forbiddenSecretValuePattern =
-  /(?:-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\b(?:sk|re)_[A-Za-z0-9_-]{8,}|\bBearer\s+[A-Za-z0-9._~-]{8,})/u;
+  /(?:-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\b(?:sk|re)_[A-Za-z0-9_-]{8,}|\bsk-ant-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9_-]{8,}|\bAKIA[A-Z0-9]{12,}|\bBearer\s+[A-Za-z0-9._~-]{8,})/u;
+
+// A wire event body carries only its required fields plus a small, named set
+// of optional fields for its kind. Any other key is a forward-compatible
+// addition from a later revision: it is accepted and silently ignored rather
+// than rejected, so an older parser keeps working against a newer writer.
+// The event's own `kind`/`type` literal is still matched exactly, so an
+// unrecognized event kind is always rejected.
+const maximumUnknownKeySlack = 12;
+
+function hasRequiredKeys(
+  value: Readonly<Record<string, unknown>>,
+  required: readonly string[],
+): boolean {
+  try {
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > required.length + maximumUnknownKeySlack) return false;
+    return required.every((key) => Object.hasOwn(value, key));
+  } catch {
+    return false;
+  }
+}
 
 export function isProjectRelativePath(value: unknown): value is string {
   if (
@@ -154,7 +182,7 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
   if (!isRecord(value)) return null;
   if (
     (value.kind === "user_message" || value.kind === "assistant_message")
-    && hasExactKeys(value, ["kind", "sequence", "text", "turnId"])
+    && hasRequiredKeys(value, ["kind", "sequence", "text", "turnId"])
     && isSafePositiveInteger(value.sequence)
     && typeof value.text === "string"
     && value.text.length <= 64_000
@@ -162,8 +190,23 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
     && !containsUnsafeTerminalScalar(value.text, true)
     && !forbiddenSecretValuePattern.test(value.text)
     && isOpaqueIdentifier(value.turnId)
+    && (value.kind !== "user_message"
+      || value.actor === undefined
+      || value.actor === "human"
+      || value.actor === "autorespond")
   ) {
+    if (value.kind === "assistant_message") {
+      return {
+        kind: value.kind,
+        sequence: value.sequence,
+        text: value.text,
+        turnId: value.turnId,
+      };
+    }
+    const actor: CompactMessageActor | undefined =
+      value.actor === "human" || value.actor === "autorespond" ? value.actor : undefined;
     return {
+      ...(actor === undefined ? {} : { actor }),
       kind: value.kind,
       sequence: value.sequence,
       text: value.text,
@@ -172,7 +215,7 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
   }
   if (
     value.kind === "interaction_state"
-    && hasExactKeys(value, [
+    && hasRequiredKeys(value, [
       "blocking",
       "interactionId",
       "interactionKind",
@@ -210,15 +253,13 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
   }
   if (
     value.kind !== "turn_summary"
-    || !hasExactKeys(value, [
+    || !hasRequiredKeys(value, [
       "filesTouched",
       "gitActions",
       "kind",
       "runtimeMs",
       "sequence",
       "turnId",
-      ...(value.fast === undefined ? [] : ["fast"]),
-      ...(value.model === undefined ? [] : ["model"]),
     ])
     || ((value.fast === undefined) !== (value.model === undefined))
     || (value.fast !== undefined && typeof value.fast !== "boolean")
@@ -330,6 +371,209 @@ export async function decryptCompactEvents(
   const decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as unknown;
   const parsed = parseCompactSessionEvents(decoded);
   if (parsed === null) throw new Error("Invalid compact projection chunk.");
+  return parsed;
+}
+
+// --- Live projection (detail stream) -------------------------------------
+//
+// The `detail` stream carries a small, closed set of live wire events in
+// addition to the generic redacted-JSON rows already accepted by
+// `detailProjectionIsSafe`. These are the only detail events the live
+// uploader (src/cloud/live-uploader.ts) produces and the only ones a reader
+// needs to special-case for rendering; any other detail payload still goes
+// through the generic safety check below.
+
+export type SessionStateValue =
+  | "working"
+  | "needs_approval"
+  | "needs_answer"
+  | "needs_action"
+  | "done"
+  | "done_followups"
+  | "done_caveats"
+  | "aborted";
+
+export type DetailSubagentActivityKind = "started" | "interacted" | "interrupted" | "completed";
+
+export type DetailSessionEvent =
+  | Readonly<{ at: number; sequence: number; turnId: string; type: "turn_started" }>
+  | Readonly<{ sequence: number; text: string; turnId: string; type: "assistant_delta" }>
+  | Readonly<{ sequence: number; text: string; turnId: string; type: "reasoning_summary_delta" }>
+  | Readonly<{
+      agentId: string;
+      depth?: number;
+      kind: DetailSubagentActivityKind;
+      nickname?: string;
+      role?: string;
+      sequence: number;
+      turnId: string;
+      type: "subagent_activity";
+    }>
+  | Readonly<{
+      attention: boolean;
+      lastActivityAt: number;
+      reason: string;
+      revision: number;
+      sequence: number;
+      state: SessionStateValue;
+      type: "session_state";
+      verbatimRequired: boolean;
+    }>;
+
+const sessionStateValues = new Set<SessionStateValue>([
+  "working",
+  "needs_approval",
+  "needs_answer",
+  "needs_action",
+  "done",
+  "done_followups",
+  "done_caveats",
+  "aborted",
+]);
+
+const subagentActivityKinds = new Set<DetailSubagentActivityKind>([
+  "started",
+  "interacted",
+  "interrupted",
+  "completed",
+]);
+
+const boundedDetailText = (maximum: number) => (value: unknown): value is string =>
+  typeof value === "string"
+  && value.length <= maximum
+  && !containsAbsolutePath(value)
+  && !containsUnsafeTerminalScalar(value, true)
+  && !forbiddenSecretValuePattern.test(value);
+
+export function parseDetailSessionEvent(value: unknown): DetailSessionEvent | null {
+  if (!isRecord(value)) return null;
+  if (
+    value.type === "turn_started"
+    && hasRequiredKeys(value, ["at", "sequence", "turnId", "type"])
+    && isSafeNonNegativeInteger(value.at)
+    && isSafePositiveInteger(value.sequence)
+    && isOpaqueIdentifier(value.turnId)
+  ) {
+    return { at: value.at, sequence: value.sequence, turnId: value.turnId, type: value.type };
+  }
+  if (
+    (value.type === "assistant_delta" || value.type === "reasoning_summary_delta")
+    && hasRequiredKeys(value, ["sequence", "text", "turnId", "type"])
+    && isSafePositiveInteger(value.sequence)
+    && boundedDetailText(32_768)(value.text)
+    && isOpaqueIdentifier(value.turnId)
+  ) {
+    return { sequence: value.sequence, text: value.text, turnId: value.turnId, type: value.type };
+  }
+  if (
+    value.type === "subagent_activity"
+    && hasRequiredKeys(value, ["agentId", "kind", "sequence", "turnId", "type"])
+    && isOpaqueIdentifier(value.agentId)
+    && typeof value.kind === "string"
+    && subagentActivityKinds.has(value.kind as DetailSubagentActivityKind)
+    && isSafePositiveInteger(value.sequence)
+    && isOpaqueIdentifier(value.turnId)
+    && (value.nickname === undefined || boundedDetailText(120)(value.nickname))
+    && (value.role === undefined || boundedDetailText(120)(value.role))
+    && (value.depth === undefined
+      || (isSafeNonNegativeInteger(value.depth) && value.depth <= 32))
+  ) {
+    return {
+      agentId: value.agentId,
+      ...(value.depth === undefined ? {} : { depth: value.depth }),
+      kind: value.kind as DetailSubagentActivityKind,
+      ...(value.nickname === undefined ? {} : { nickname: value.nickname }),
+      ...(value.role === undefined ? {} : { role: value.role }),
+      sequence: value.sequence,
+      turnId: value.turnId,
+      type: value.type,
+    };
+  }
+  if (
+    value.type === "session_state"
+    && hasRequiredKeys(value, [
+      "attention",
+      "lastActivityAt",
+      "reason",
+      "revision",
+      "sequence",
+      "state",
+      "type",
+      "verbatimRequired",
+    ])
+    && typeof value.attention === "boolean"
+    && isSafeNonNegativeInteger(value.lastActivityAt)
+    && boundedDetailText(256)(value.reason)
+    && isSafePositiveInteger(value.revision)
+    && isSafePositiveInteger(value.sequence)
+    && typeof value.state === "string"
+    && sessionStateValues.has(value.state as SessionStateValue)
+    && typeof value.verbatimRequired === "boolean"
+  ) {
+    return {
+      attention: value.attention,
+      lastActivityAt: value.lastActivityAt,
+      reason: value.reason,
+      revision: value.revision,
+      sequence: value.sequence,
+      state: value.state as SessionStateValue,
+      type: value.type,
+      verbatimRequired: value.verbatimRequired,
+    };
+  }
+  return null;
+}
+
+export function parseDetailSessionEvents(value: unknown): readonly DetailSessionEvent[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 256) return null;
+  const parsed = value.map(parseDetailSessionEvent);
+  if (parsed.some((event) => event === null)) return null;
+  const events = parsed as DetailSessionEvent[];
+  for (let index = 1; index < events.length; index += 1) {
+    const previous = events[index - 1];
+    const current = events[index];
+    if (current?.sequence !== (previous?.sequence ?? -1) + 1) {
+      return null;
+    }
+  }
+  return events;
+}
+
+export async function encryptDetailEvents(
+  events: readonly DetailSessionEvent[],
+  accountKey: Uint8Array,
+  authority: SessionChunkAuthority,
+) {
+  const parsed = parseDetailSessionEvents(events);
+  if (
+    parsed === null
+    || parsed[0]?.sequence !== authority.firstSequence
+    || parsed.at(-1)?.sequence !== authority.lastSequence
+  ) throw new Error("Invalid detail projection chunk.");
+  const plaintext = new TextEncoder().encode(JSON.stringify(parsed));
+  if (plaintext.byteLength > cloudLimits.detailChunkBytes) {
+    throw new Error("Detail projection chunk is too large.");
+  }
+  return await encryptBytes(
+    plaintext,
+    accountKey,
+    authority.keyVersion,
+    sessionChunkAad(authority),
+  );
+}
+
+export async function decryptDetailEvents(
+  envelope: Parameters<typeof decryptBytes>[0],
+  accountKey: Uint8Array,
+  authority: SessionChunkAuthority,
+): Promise<readonly DetailSessionEvent[]> {
+  const plaintext = await decryptBytes(envelope, accountKey, sessionChunkAad(authority));
+  if (plaintext.byteLength > cloudLimits.detailChunkBytes) {
+    throw new Error("Detail projection chunk is too large.");
+  }
+  const decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as unknown;
+  const parsed = parseDetailSessionEvents(decoded);
+  if (parsed === null) throw new Error("Invalid detail projection chunk.");
   return parsed;
 }
 

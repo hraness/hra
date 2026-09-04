@@ -242,6 +242,24 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     method: boundedText(512),
     payloadDigest: digestSchema,
   }).strict(),
+  z.object({
+    type: z.literal("session_state"),
+    state: z.enum([
+      "working",
+      "needs_approval",
+      "needs_answer",
+      "needs_action",
+      "done",
+      "done_followups",
+      "done_caveats",
+      "aborted",
+    ]),
+    attention: z.boolean(),
+    reason: boundedText(256),
+    verbatimRequired: z.boolean(),
+    lastActivityAt: unixMillisecondsSchema,
+    revision: z.number().int().positive(),
+  }).strict(),
 ]);
 
 export type SessionEventBody = z.infer<typeof sessionEventBodySchema>;

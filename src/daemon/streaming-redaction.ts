@@ -287,6 +287,10 @@ const sanitizeCompleteBody = (
     case "gap":
     case "interaction_state":
       return body;
+    case "session_state": return {
+      ...body,
+      reason: safe(body.reason),
+    };
   }
 };
 
