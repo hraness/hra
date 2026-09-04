@@ -2,7 +2,7 @@
 
 - Migrations create the local SQLite authority.
 - Repositories implement narrow semantic reads and CAS transitions.
-- Secret custody stores HRA device credentials and encryption keys.
+- Secret custody stores HRA device credentials, encryption keys, and the autorespond gateway key.
 - State paths select platform roots, profile directories, and isolated facts-memory session roots.
 
 # Guidelines

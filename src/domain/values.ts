@@ -47,6 +47,22 @@ export const createSessionTaskId = (): SessionTaskId => sessionTaskIdSchema.pars
 export const createQueueId = (): QueueId => queueIdSchema.parse(createId("queue"));
 export const createAttemptId = (): AttemptId => attemptIdSchema.parse(createId("attempt"));
 
+/** Upper bound on an accepted AI Gateway key, in UTF-8 bytes. */
+export const GATEWAY_KEY_MAX_BYTES = 512;
+/** Lower bound on an accepted AI Gateway key, in UTF-8 bytes. */
+export const GATEWAY_KEY_MIN_BYTES = 16;
+
+/*
+ * A gateway key is one line of printable, non-whitespace ASCII. Anything else
+ * is a paste accident (a JSON document, a shell prompt, a wrapped export line)
+ * and is refused before it reaches custody. The value itself never appears in
+ * argv, a log, an event, an evidence row, or a rendered command result.
+ */
+export const gatewayKeySchema = z.string()
+  .min(GATEWAY_KEY_MIN_BYTES)
+  .max(GATEWAY_KEY_MAX_BYTES)
+  .regex(/^[!-~]+$/u, "The gateway key must be one line of printable ASCII.");
+
 export const unixMillisecondsSchema = z.number().int().nonnegative().finite();
 export const positiveRevisionSchema = z.number().int().positive().finite();
 

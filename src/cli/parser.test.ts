@@ -1471,4 +1471,29 @@ describe("autorespond parsing", () => {
     expect(() => parseCli(["autorespond", "default"])).toThrow("--session");
     expect(() => parseCli(["autorespond", "maybe"])).toThrow("Unknown autorespond action");
   });
+
+  test("reads the gateway key from a descriptor and never from an argument", () => {
+    expect(parseCli(["autorespond", "gateway", "set"])).toEqual({
+      input: { kind: "stdin" },
+      json: false,
+      kind: "autorespond.gateway-set",
+    });
+    expect(parseCli(["autorespond", "gateway", "set", "--from-fd", "3", "--json"])).toEqual({
+      input: { fd: 3, kind: "fd" },
+      json: true,
+      kind: "autorespond.gateway-set",
+    });
+    expect(parseCli(["autorespond", "gateway", "clear"])).toEqual({
+      command: { kind: "autorespond.gateway-clear" },
+      json: false,
+      kind: "command",
+    });
+    // The key is never accepted positionally, on stdout, or on stderr.
+    expect(() => parseCli(["autorespond", "gateway", "set", ["gw", "k".repeat(22)].join("")]))
+      .toThrow();
+    expect(() => parseCli(["autorespond", "gateway", "set", "--from-fd", "1"])).toThrow("stdout");
+    expect(() => parseCli(["autorespond", "gateway", "set", "--from-fd", "2"])).toThrow("stderr");
+    expect(() => parseCli(["autorespond", "gateway", "clear", "--from-fd", "3"])).toThrow("--from-fd");
+    expect(() => parseCli(["autorespond", "gateway", "rotate"])).toThrow("Unknown autorespond gateway action");
+  });
 });

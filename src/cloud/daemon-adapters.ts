@@ -73,6 +73,7 @@ import type {
 import {
   isProjectRelativePath,
   parseCompactSessionEvents,
+  type CompactMessageActor,
   type CompactSessionEvent,
   type GitAction,
 } from "./projection";
@@ -109,7 +110,12 @@ type LocalExecuteRemote = (
 ) => Promise<unknown>;
 
 type CompactSessionEventBody =
-  | Readonly<{ kind: "user_message" | "assistant_message"; text: string; turnId: string }>
+  | Readonly<{
+      actor?: CompactMessageActor;
+      kind: "user_message" | "assistant_message";
+      text: string;
+      turnId: string;
+    }>
   | Readonly<{
       blocking: boolean;
       interactionId: string;
@@ -675,6 +681,9 @@ function parseStoredEvents(value: string): readonly CompactSessionEvent[] {
 function compactSessionEventBody(event: CompactSessionEvent): CompactSessionEventBody {
   if (event.kind === "user_message" || event.kind === "assistant_message") {
     return {
+      ...(event.kind === "user_message" && event.actor !== undefined
+        ? { actor: event.actor }
+        : {}),
       kind: event.kind,
       text: event.text,
       turnId: event.turnId,
@@ -1963,7 +1972,13 @@ function completedProjectionTurns(
     const text = scheduledTaskSource
       ? scheduledTaskPromptProjectionMarker
       : boundedText(message.text, 64_000);
+    // A user message HRA authored on the human's behalf is labelled so the web
+    // grid can tell an autoresponse from something the human actually typed.
+    const autorespondAuthored = message.role === "user"
+      && message.clientId !== undefined
+      && store.isAutorespondMessageSource(session.id, message.clientId);
     messages.push({
+      ...(autorespondAuthored ? { actor: "autorespond" as const } : {}),
       kind: message.role === "user" ? "user_message" : "assistant_message",
       text,
       turnId: message.turnId,

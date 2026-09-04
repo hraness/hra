@@ -72,3 +72,73 @@ describe("autorespond store", () => {
     expect(store.listAutorespondEvidence({ limit: 5 })).toHaveLength(3);
   });
 });
+
+describe("prose autorespond evidence", () => {
+  test("records prose rows with the rule, the model, and a bounded gate outcome", async () => {
+    const { store, sessionId, clock } = await fixture();
+    store.recordProseAutorespondEvidence({
+      decision: "send",
+      latencyMs: 41,
+      mode: "auto:all",
+      model: "openai/gpt-5-nano",
+      outcome: "sent",
+      rule: "approval_cue",
+      sessionId,
+    });
+    clock.now += 1_000;
+    store.recordProseAutorespondEvidence({
+      decision: "refuse",
+      latencyMs: 3,
+      mode: "auto:all",
+      model: null,
+      outcome: "gate_failed:human_action_cue",
+      rule: "approval_cue",
+      sessionId,
+    });
+
+    const rows = store.listAutorespondEvidence({ sessionId, limit: 10 });
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      decision: "refuse",
+      interactionId: null,
+      kind: "prose_approval",
+      model: null,
+      outcome: "gate_failed:human_action_cue",
+      path: "prose",
+      rule: "approval_cue",
+    });
+    expect(rows[1]).toMatchObject({
+      kind: "prose_approval",
+      model: "openai/gpt-5-nano",
+      outcome: "sent",
+      path: "prose",
+    });
+    // A sent prose reply spends the same per-session budget as a protocol accept.
+    expect(store.readAutorespondBudgets(sessionId)).toMatchObject({ lastDay: 1, lastHour: 1 });
+    expect(store.countAutorespondEvidence({ sessionId })).toEqual({ accepted: 1, refused: 1 });
+  });
+
+  test("refuses an outcome outside the closed vocabulary", async () => {
+    const { store, sessionId } = await fixture();
+    expect(() => store.recordProseAutorespondEvidence({
+      decision: "send",
+      latencyMs: 1,
+      mode: "auto:all",
+      model: null,
+      outcome: "gate_failed:NOT ALLOWED" as never,
+      rule: "approval_cue",
+      sessionId,
+    })).toThrow();
+    expect(store.listAutorespondEvidence({ sessionId })).toHaveLength(0);
+  });
+
+  test("labels autorespond-authored message sources per session", async () => {
+    const { store, sessionId } = await fixture();
+    expect(store.isAutorespondMessageSource(sessionId, "attempt_one")).toBe(false);
+    store.recordAutorespondMessageSource(sessionId, "attempt_one");
+    store.recordAutorespondMessageSource(sessionId, "attempt_one");
+    expect(store.isAutorespondMessageSource(sessionId, "attempt_one")).toBe(true);
+    expect(store.isAutorespondMessageSource(sessionId, "attempt_two")).toBe(false);
+    expect(store.isAutorespondMessageSource(sessionId, "")).toBe(false);
+  });
+});

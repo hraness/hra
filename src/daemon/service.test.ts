@@ -46,7 +46,16 @@ import {
   storedAccountUsageSnapshotSchema,
 } from "../domain/usage-metrics";
 import { initializeStatePaths, profilePaths, resolveStatePaths } from "../storage/paths";
+import {
+  InMemoryGatewayKeyStore,
+  type GatewayKeyPort,
+} from "../storage/gateway-key-custody";
 import { StateStore } from "../storage/state-store";
+import {
+  DeterministicProseResponder,
+  PROSE_APPROVAL_REPLY,
+  type ProseResponder,
+} from "./prose-responder";
 import { DaemonAuthoritySafetyError } from "./daemon-lock";
 import type {
   HraFactsMemoryLifecyclePort,
@@ -670,6 +679,10 @@ async function fixture(
   requestStop: () => void = () => undefined,
   now: () => number = Date.now,
   factsMemory?: HraFactsMemoryLifecyclePort,
+  autorespond: Readonly<{
+    gatewayKeys?: GatewayKeyPort;
+    proseResponder?: ProseResponder;
+  }> = {},
 ): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
   serviceRoots.push(home);
@@ -685,7 +698,7 @@ async function fixture(
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), now, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
 }
 
 async function createIdleSession(
@@ -2730,10 +2743,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 30 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 31 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }]);
     } finally {
       inspector.close(false);
     }
@@ -10533,5 +10546,373 @@ describe("HraService autorespond", () => {
     expect(value.codex.resolvedInteractions).toHaveLength(0);
     expect(value.store.requireInteraction(interaction.publicId).state).toBe("pending");
     expect(value.store.listAutorespondEvidence({ sessionId })).toHaveLength(0);
+  });
+});
+
+describe("HraService prose autorespond", () => {
+  // Twenty-four printable characters, built rather than written, so no
+  // credential-shaped literal enters the repository.
+  const testGatewayKey = ["gw", "k".repeat(22)].join("");
+  const filler = `${"Progress notes continue here without any cue that changes the classification. ".repeat(12)}\n\n`;
+
+  const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
+    const startedAt = Date.now();
+    while (!predicate()) {
+      if (Date.now() - startedAt > timeoutMs) throw new Error("Timed out waiting for prose autorespond.");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+
+  const proseFixture = async (options: Readonly<{
+    gatewayKeys?: GatewayKeyPort;
+    responder?: ProseResponder;
+  }> = {}) => {
+    const responder = options.responder ?? new DeterministicProseResponder();
+    const gatewayKeys = options.gatewayKeys ?? new InMemoryGatewayKeyStore(testGatewayKey);
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, undefined, {
+      gatewayKeys,
+      proseResponder: responder,
+    });
+    return { ...value, gatewayKeys, responder };
+  };
+
+  const completeTurn = async (
+    value: Awaited<ReturnType<typeof proseFixture>>,
+    sessionId: `sess_${string}`,
+    turnId: string,
+    text: string,
+  ): Promise<void> => {
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    const threadId = session.providerThreadId;
+    if (threadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    await value.service.observeCodexFact(authority, {
+      type: "turnStarted",
+      threadId,
+      turn: { id: turnId, items: [], status: "inProgress", startedAt: 1, completedAt: null, durationMs: null },
+    });
+    await value.service.observeCodexFact(authority, {
+      type: "itemStarted",
+      threadId,
+      turnId,
+      itemId: `${turnId}-agent`,
+      itemKind: "agentMessage",
+    });
+    await value.service.observeCodexFact(authority, {
+      type: "assistantDelta",
+      threadId,
+      turnId,
+      itemId: `${turnId}-agent`,
+      text,
+    });
+    await value.service.observeCodexFact(authority, {
+      type: "itemCompleted",
+      threadId,
+      turnId,
+      itemId: `${turnId}-agent`,
+      itemKind: "agentMessage",
+      status: "completed",
+    });
+    await value.service.observeCodexFact(authority, {
+      type: "turnCompleted",
+      threadId,
+      turn: { id: turnId, items: [], status: "completed", startedAt: 1, completedAt: 2, durationMs: 1 },
+    });
+  };
+
+  const proseEvidence = (
+    value: Awaited<ReturnType<typeof proseFixture>>,
+    sessionId: `sess_${string}`,
+  ) => value.store.listAutorespondEvidence({ sessionId, limit: 50 })
+    .filter((row) => row.path === "prose");
+
+  const lastUserMessage = (
+    value: Awaited<ReturnType<typeof proseFixture>>,
+  ): Readonly<{ clientId?: string; text: string }> | undefined =>
+    [...(value.codex.readProjection.messages ?? [])]
+      .reverse()
+      .find((message) => message.role === "user");
+
+  const lastSessionStateBody = (
+    value: Awaited<ReturnType<typeof proseFixture>>,
+    sessionId: `sess_${string}`,
+  ) => {
+    const bodies = value.store
+      .listSessionEvents({ sessionId, afterSequence: null, limit: 200 })
+      .events
+      .map((event) => event.body)
+      .filter((body) => body.type === "session_state");
+    return bodies.at(-1);
+  };
+
+  test("sends the fixed approval reply, marks the source, and records sent evidence", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose accept");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+
+    await completeTurn(value, sessionId, "turn-prose-1", "The refactor is staged. Should I proceed?");
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      decision: "send",
+      kind: "prose_approval",
+      mode: "auto:all",
+      outcome: "sent",
+      path: "prose",
+      rule: "approval_cue",
+    });
+    expect(proseEvidence(value, sessionId)[0]?.model).toBe("openai/gpt-5-nano");
+    expect(value.codex.calls.filter((call) => call === "send").length).toBe(sends + 1);
+    expect(lastUserMessage(value)?.text).toBe(PROSE_APPROVAL_REPLY);
+    expect(value.responder).toBeInstanceOf(DeterministicProseResponder);
+    // The autoresponse spends budget and never resets the consecutive counter.
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
+    expect(value.store.readAutorespondBudgets(sessionId).lastHour).toBe(1);
+  });
+
+  test("marks the dispatched autoresponse as an autorespond message source", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose source");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+
+    await completeTurn(value, sessionId, "turn-prose-source", "Ready to apply. Should I proceed?");
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+
+    const clientId = lastUserMessage(value)?.clientId;
+    expect(clientId).toBeDefined();
+    expect(value.store.isAutorespondMessageSource(sessionId, clientId as string)).toBe(true);
+    expect(value.store.isAutorespondMessageSource(sessionId, "attempt_not_ours")).toBe(false);
+  });
+
+  test("sends a verbatim literal only when it is a byte-exact substring", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose verbatim");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+
+    await completeTurn(
+      value,
+      sessionId,
+      "turn-prose-verbatim",
+      'The migration is staged. Please reply with "APPROVE MIGRATION" to continue.',
+    );
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({ outcome: "sent" });
+    expect(lastUserMessage(value)?.text).toBe("APPROVE MIGRATION");
+  });
+
+  test("escalates to needs_answer when the responder's verbatim reply does not match", async () => {
+    const value = await proseFixture({
+      responder: new DeterministicProseResponder({ reply: () => "TOTALLY DIFFERENT STRING" }),
+    });
+    const { sessionId } = await createIdleSession(value, "Prose mismatch");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+
+    await completeTurn(
+      value,
+      sessionId,
+      "turn-prose-mismatch",
+      'The migration is staged. Please reply with "APPROVE MIGRATION" to continue.',
+    );
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      decision: "refuse",
+      outcome: "verbatim_mismatch",
+    });
+    expect(value.codex.calls.filter((call) => call === "send").length).toBe(sends);
+    const durable = value.store.readSessionState(sessionId);
+    expect(durable).toMatchObject({
+      attention: true,
+      reason: "autorespond_verbatim_mismatch",
+      state: "needs_answer",
+    });
+    const latest = lastSessionStateBody(value, sessionId);
+    expect(latest).toMatchObject({
+      attention: true,
+      reason: "autorespond_verbatim_mismatch",
+      state: "needs_answer",
+    });
+    expect(durable?.revision).toBe(latest?.revision);
+  });
+
+  test("records responder_failed and sends nothing when the responder call fails", async () => {
+    const value = await proseFixture({
+      responder: new DeterministicProseResponder({ failure: "gateway unavailable" }),
+    });
+    const { sessionId } = await createIdleSession(value, "Prose responder failure");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const sends = value.codex.calls.filter((call) => call === "send").length;
+
+    await completeTurn(value, sessionId, "turn-prose-failure", "Ready to apply. Should I proceed?");
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      model: null,
+      outcome: "responder_failed",
+    });
+    expect(value.codex.calls.filter((call) => call === "send").length).toBe(sends);
+  });
+
+  test("refuses when no gateway key is configured", async () => {
+    const value = await proseFixture({ gatewayKeys: new InMemoryGatewayKeyStore() });
+    const { sessionId } = await createIdleSession(value, "Prose no key");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+
+    await completeTurn(value, sessionId, "turn-prose-nokey", "Ready to apply. Should I proceed?");
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      outcome: "gate_failed:gateway_key_missing",
+    });
+    expect((value.responder as DeterministicProseResponder).calls).toHaveLength(0);
+  });
+
+  test("refuses under manual approval mode", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose manual");
+    value.store.setSessionApprovalMode(sessionId, "manual");
+
+    await completeTurn(value, sessionId, "turn-prose-manual", "Ready to apply. Should I proceed?");
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      mode: "manual",
+      outcome: "gate_failed:manual_mode",
+    });
+  });
+
+  test("refuses a human-action cue that sits outside the classified tail", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose human action");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+
+    await completeTurn(
+      value,
+      sessionId,
+      "turn-prose-human",
+      `The publish step needs npm login first.\n\n${filler}Everything else is staged. Should I proceed?`,
+    );
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      outcome: "gate_failed:human_action_cue",
+    });
+  });
+
+  test("refuses a denylist cue that the classifier stripped with the code fence", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose denylist");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+
+    await completeTurn(
+      value,
+      sessionId,
+      "turn-prose-denylist",
+      "The cleanup script is staged.\n\n```sh\ndrop the production database\n```\n\nShould I proceed?",
+    );
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      outcome: "gate_failed:denylist_cue",
+    });
+  });
+
+  test("refuses a message at or beyond the four-thousand character bound", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose long");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+
+    await completeTurn(
+      value,
+      sessionId,
+      "turn-prose-long",
+      `${"Bounded progress prose without any cue at all. ".repeat(120)}\n\nShould I proceed?`,
+    );
+
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      outcome: "gate_failed:message_too_long",
+    });
+  });
+
+  test("escalates once the consecutive budget is spent and resumes after a human send", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose budget");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+
+    // Each autoresponse must leave the fake provider idle so the next turn can
+    // start; the daemon refuses to send into an active turn.
+    value.codex.turnStatus = "completed";
+    const sent = () => proseEvidence(value, sessionId).filter((row) => row.outcome === "sent").length;
+    let expected = 0;
+    for (const turn of ["budget-1", "budget-2", "budget-3"]) {
+      expected += 1;
+      await completeTurn(value, sessionId, turn, "Ready to apply. Should I proceed?");
+      await waitFor(() => sent() === expected);
+    }
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(3);
+
+    await completeTurn(value, sessionId, "budget-4", "Ready to apply. Should I proceed?");
+    await waitFor(() => proseEvidence(value, sessionId).length === 4);
+    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+      outcome: "gate_failed:consecutive_limit",
+    });
+    expect(sent()).toBe(3);
+
+    // Only a human-authored send clears the consecutive counter.
+    await value.service.execute(
+      { kind: "session.send", session: sessionId, message: "carry on" },
+      { signal },
+    );
+    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+  });
+
+  test("answers at most one prose approval per turn", async () => {
+    const value = await proseFixture();
+    const { sessionId } = await createIdleSession(value, "Prose once");
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+
+    await completeTurn(value, sessionId, "turn-prose-once", "Ready to apply. Should I proceed?");
+    await waitFor(() => proseEvidence(value, sessionId).length === 1);
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    await value.service.observeCodexFact(
+      { id: profile.id, generation: profile.processGeneration, codexHome: "unused", desktopUserData: "unused" },
+      {
+        type: "turnCompleted",
+        threadId: session.providerThreadId as string,
+        turn: { id: "turn-prose-once", items: [], status: "completed", startedAt: 1, completedAt: 2, durationMs: 1 },
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(proseEvidence(value, sessionId)).toHaveLength(1);
+  });
+
+  test("reports gateway custody status without ever exposing the key", async () => {
+    const value = await proseFixture({ gatewayKeys: new InMemoryGatewayKeyStore() });
+    const before = await value.service.execute({ kind: "autorespond.status" }, { signal });
+    expect(before).toMatchObject({ gateway: "not configured" });
+
+    await value.service.execute(
+      { kind: "autorespond.gateway-set", key: testGatewayKey },
+      { signal },
+    );
+    const after = await value.service.execute({ kind: "autorespond.status" }, { signal });
+    expect(after).toMatchObject({ gateway: "configured" });
+    expect(JSON.stringify(after)).not.toContain(testGatewayKey);
+
+    expect(await value.service.execute({ kind: "autorespond.gateway-clear" }, { signal }))
+      .toMatchObject({ cleared: true, gateway: "not configured" });
+    expect(await value.service.execute({ kind: "autorespond.status" }, { signal }))
+      .toMatchObject({ gateway: "not configured" });
   });
 });
