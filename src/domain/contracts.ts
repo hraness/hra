@@ -188,6 +188,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   }).strict(),
   z.object({ kind: z.literal("session.show"), session: selectorSchema, detail: z.boolean() }).strict(),
   z.object({ kind: z.literal("session.status"), session: selectorSchema }).strict(),
+  z.object({ kind: z.literal("session.state"), session: selectorSchema }).strict(),
   z.object({
     kind: z.literal("session.events"),
     session: selectorSchema,

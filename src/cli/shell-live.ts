@@ -398,6 +398,7 @@ const renderNonDeltaEvent = (event: SessionEvent): string | null => {
     case "token_usage": return null;
     case "interaction_requested": return null;
     case "interaction_state": return `Interaction ${body.interactionId}: ${safeLiveText(body.state)}, revision ${String(body.revision)}.`;
+    case "session_state": return `State: ${safeLiveText(body.state)}${body.attention ? " (needs you)" : ""}.`;
     case "warning": return `Warning ${safeLiveText(body.code)}: ${safeLiveText(body.message)}`;
     case "error": return `Error ${safeLiveText(body.code)}${body.terminal ? " (terminal)" : ""}: ${safeLiveText(body.message)}`;
     case "protocol_incompatible": return `Protocol notice: unsupported ${safeLiveText(body.method)}.`;
