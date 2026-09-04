@@ -5237,7 +5237,7 @@ describe("device command execution", () => {
     expect((await journal.read()).state.deviceCommands).toEqual([]);
   });
 
-  test("marks a single-use relay result so the hosted row releases it once", async () => {
+  test("encrypts the complete login handoff and marks it single use", async () => {
     const cloud = new FakeCloud();
     const deviceExecutor = new RecordingDeviceExecutor();
     deviceExecutor.outcome = {
@@ -5246,6 +5246,7 @@ describe("device command execution", () => {
         expiresAt: fixedNow + 60_000,
         kind: "account_login_start",
         loginUrl: "https://auth.example.test/device",
+        userCode: "ABCD-EFGH",
       },
       singleUseResult: true,
       state: "applied",
@@ -5258,9 +5259,22 @@ describe("device command execution", () => {
     });
     const daemon = bridge({ cloud, device: "device_daemon1", deviceExecutor, local: new FakeLocal("session_deviceco", events) });
     await daemon.cycle(new AbortController().signal);
-    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+    const settled = cloud.requireDeviceCommand(commandPublicId);
+    expect(settled).toMatchObject({
       singleUseResult: true,
       state: "applied",
+    });
+    expect(JSON.stringify(settled.result)).not.toContain("ABCD-EFGH");
+    expect(await decryptDeviceCommandResult(settled.result!, key, {
+      entityPublicId: commandPublicId,
+      keyVersion: 1,
+      kind: "device_command_result",
+      userPublicId,
+    })).toEqual({
+      expiresAt: fixedNow + 60_000,
+      kind: "account_login_start",
+      loginUrl: "https://auth.example.test/device",
+      userCode: "ABCD-EFGH",
     });
   });
 

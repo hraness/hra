@@ -5,6 +5,7 @@ import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Switch } from "../components/ui/switch";
+import { AccountLoginRelay } from "../components/account-login-relay";
 import {
   BackIcon,
   ChoiceGroup,
@@ -26,7 +27,11 @@ import { useDevices, useServerNow, type DeviceView } from "../data/devices";
 import { useDeviceRegistries } from "../data/registry";
 import { useSessionHeads } from "../data/session-heads";
 import { pageSize } from "../env";
-import type { CommandState, RemoteCommandPayload } from "../hra/cloud";
+import type {
+  CommandState,
+  DeviceCommandResultPayload,
+  RemoteCommandPayload,
+} from "../hra/cloud";
 import { formatRelativeTime, formatUtcDay } from "../model/relative-time";
 import {
   accountLoginStartCommand,
@@ -87,6 +92,11 @@ type SettingsCommandInput = Readonly<{
   payload: RemoteCommandPayload;
   target: CommandTarget;
 }>;
+
+type AccountLoginRelayResult = Extract<
+  DeviceCommandResultPayload,
+  { kind: "account_login_start" }
+>;
 
 type SettingsCommandRunner = Readonly<{
   busy: boolean;
@@ -345,17 +355,20 @@ function ArchivedSessionRow({
  *
  * With the opt-in off the row shows the CLI instruction and nothing else: the
  * button is absent rather than disabled, because a machine that has not opted in
- * would refuse the command anyway. With it on, "Link here" relays a provider
- * login URL that is single use and short lived — the hosted row erases the
- * ciphertext on the first read, so it opens once and cannot be replayed. Poll
- * asks the machine what its login is doing; it is one way and returns only a
- * status and an instruction.
+ * would refuse the command anyway. With it on, "Link here" relays the complete
+ * provider device-code handoff. The URL and one-time code are account-key
+ * encrypted, single use, and short lived — the hosted row erases their shared
+ * ciphertext on the first read. Poll asks the machine what its login is doing;
+ * it is one way and returns only a status and an instruction.
  */
-function AccountRow({ account }: Readonly<{ account: AccountRowView }>) {
+function AccountRow({
+  account,
+  now,
+}: Readonly<{ account: AccountRowView; now: number }>) {
   const submitDeviceCommand = useSubmitDeviceCommand();
   const consumeResult = useConsumeDeviceCommandResult();
   const [commandPublicId, setCommandPublicId] = useState<string | null>(null);
-  const [relay, setRelay] = useState<string | null>(null);
+  const [relay, setRelay] = useState<AccountLoginRelayResult | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const command = useDeviceCommandState(commandPublicId);
@@ -374,12 +387,32 @@ function AccountRow({ account }: Readonly<{ account: AccountRowView }>) {
     let cancelled = false;
     void consumeResult(command.publicId)
       .then((result) => {
-        if (cancelled || result === null) return;
-        if (result.kind === "account_login_start") setRelay(result.loginUrl);
+        if (cancelled) return;
+        if (result === null) {
+          setStatus("No login handoff was available. It may already have been read; update HRA on the machine before trying again.");
+          return;
+        }
+        if (result.kind === "account_login_start") setRelay(result);
       })
-      .catch(() => { /* The notice already reports a settled command. */ });
+      .catch(() => {
+        if (!cancelled) {
+          setStatus("The machine returned an incompatible login handoff. Update HRA on the machine before trying again.");
+        }
+      });
     return () => { cancelled = true; };
   }, [command, consumeResult]);
+
+  // The provider code is short lived. Server-corrected `now` handles clock
+  // skew, while the timer removes it from memory at the deadline between ticks.
+  useEffect(() => {
+    if (relay === null) return;
+    const maximumBrowserTimerMs = 2_147_483_647;
+    const delay = Math.min(Math.max(0, relay.expiresAt - now), maximumBrowserTimerMs);
+    const timer = setTimeout(() => {
+      setRelay((current) => current === relay ? null : current);
+    }, delay);
+    return () => { clearTimeout(timer); };
+  }, [now, relay]);
 
   useEffect(() => {
     if (command?.state !== "applied" || command.kind !== "account_login_status") return;
@@ -389,6 +422,7 @@ function AccountRow({ account }: Readonly<{ account: AccountRowView }>) {
   const run = (payload: Parameters<typeof submitDeviceCommand>[0]["payload"]) => {
     if (busy) return;
     setBusy(true);
+    // A later start or status check supersedes any earlier one-time handoff.
     setRelay(null);
     setStatus(null);
     void submitDeviceCommand({ payload, targetDevicePublicId: account.targetDevicePublicId })
@@ -435,11 +469,13 @@ function AccountRow({ account }: Readonly<{ account: AccountRowView }>) {
         <CommandHint>{`hra account login ${account.label}`}</CommandHint>
       )}
       {relay === null ? null : (
-        <p className="text-xs text-ink-muted">
-          <a className="underline" href={relay} rel="noreferrer noopener" target="_blank">
-            Open the provider login (single use, expires shortly)
-          </a>
-        </p>
+        <AccountLoginRelay
+          expiresAt={relay.expiresAt}
+          key={relay.userCode}
+          loginUrl={relay.loginUrl}
+          now={now}
+          userCode={relay.userCode}
+        />
       )}
       {notice === null ? null : (
         <p
@@ -601,7 +637,11 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
           <SettingsCard>
             {accounts.length === 0 ? <EmptyRow>No accounts published yet.</EmptyRow> : null}
             {accounts.map((account) => (
-              <AccountRow account={account} key={`${account.machineLabel}:${account.publicId}`} />
+              <AccountRow
+                account={account}
+                key={`${account.machineLabel}:${account.publicId}`}
+                now={now}
+              />
             ))}
             <SettingsRow
               description="Relaying a login link to this browser is off until a machine opts in."

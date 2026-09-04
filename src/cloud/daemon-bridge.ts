@@ -369,8 +369,8 @@ export type CloudDeviceCommandExecutionResult = Readonly<{
   /** Settled back to the requester, account-key encrypted, when present. */
   result?: DeviceCommandResultPayload;
   /**
-   * Marks the result readable exactly once. Only the account-linking relay sets
-   * it; the hosted row erases the ciphertext on the requester's first read.
+   * Marks the result readable exactly once. Only the account-linking handoff
+   * sets it; the hosted row erases the ciphertext on the requester's first read.
    */
   singleUseResult?: boolean;
   state: "applied" | "failed" | "ambiguous";

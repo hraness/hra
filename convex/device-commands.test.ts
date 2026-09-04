@@ -359,7 +359,7 @@ describe("device commands", () => {
       authority: daemonAuthority,
       commandPublicId: world.uuid("28"),
     });
-    // A relay result that is not marked single use is refused outright.
+    // A login handoff that is not marked single use is refused outright.
     await expectPromiseToReject(world.daemon.mutation(settle, {
       authority: daemonAuthority,
       commandPublicId: world.uuid("28"),

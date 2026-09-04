@@ -366,7 +366,7 @@ export default defineSchema({
     requestDigest: v.string(),
     requestingDeviceId: v.id("devices"),
     requesterAcknowledgedAt: v.optional(v.number()),
-    // Set when a settled result is single use (an account-linking relay URL).
+    // Set when a settled result is a single-use account-linking handoff.
     // `deviceCommands:consumeResult` clears `result` on the first read and
     // stamps this, so a second read can prove the result is spent rather than
     // absent.

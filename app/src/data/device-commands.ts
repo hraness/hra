@@ -87,7 +87,7 @@ export type ConsumeDeviceCommandResult =
 /**
  * Exchanges a single-use result for its plaintext, once. The hosted row erases
  * the ciphertext in the same transaction, so a second call resolves to null and
- * the relayed login URL cannot be replayed from another tab.
+ * the relayed login URL and user code cannot be replayed from another tab.
  */
 export function useConsumeDeviceCommandResult(): ConsumeDeviceCommandResult {
   const custody = useCustody();
