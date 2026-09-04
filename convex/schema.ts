@@ -183,6 +183,19 @@ export default defineSchema({
     .index("by_device", ["deviceId"])
     .index("by_presence_until", ["presenceUntil"])
     .index("by_user", ["userId"]),
+  deviceRegistries: defineTable({
+    createdAt: v.number(),
+    deviceId: v.id("devices"),
+    devicePublicId: v.string(),
+    envelope: encryptedEnvelope,
+    keyVersion: v.number(),
+    revision: v.number(),
+    updatedAt: v.number(),
+    userId: v.id("users"),
+  })
+    .index("by_device", ["deviceId"])
+    .index("by_user_and_device_public_id", ["userId", "devicePublicId"])
+    .index("by_user", ["userId"]),
   sessionHeads: defineTable({
     compactHasRecoveryGap: v.optional(v.boolean()),
     compactHeadSequence: v.number(),

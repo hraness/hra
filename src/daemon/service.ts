@@ -863,12 +863,23 @@ export class HraService {
         case "project.list": return { projects: this.#store.listProjects() };
         case "project.add": return { project: await this.#addProject(command.label, command.path) };
         case "project.use": return { project: this.#store.setDefaultProject(this.#store.requireProject(command.project).id) };
+        case "session.archive": {
+          const session = this.#store.requireSession(command.session);
+          const archived = this.#store.setSessionArchived(session.id, command.archived);
+          return {
+            version: 1,
+            session: archived.id,
+            archived: archived.archivedAt !== undefined,
+            archivedAt: archived.archivedAt ?? null,
+          };
+        }
         case "session.list": {
           if (command.account === undefined) {
             return await this.#listSessions(
               undefined,
               command.limit,
               command.cursor,
+              command.archived,
               context.signal,
             );
           }
@@ -877,6 +888,7 @@ export class HraService {
             profile.id,
             command.limit,
             command.cursor,
+            command.archived,
             context.signal,
           ));
         }
@@ -6064,6 +6076,7 @@ export class HraService {
     account: string | undefined,
     limit: number,
     cursor: string | undefined,
+    includeArchived: boolean,
     signal: AbortSignal,
   ): Promise<unknown> {
     if (account === undefined) {
@@ -6075,7 +6088,7 @@ export class HraService {
       }
       return {
         accountId: null,
-        sessions: this.#store.listSessions(limit),
+        sessions: this.#store.listSessions(limit, undefined, includeArchived),
         nextCursor: null,
       };
     }
@@ -6097,6 +6110,7 @@ export class HraService {
               createdAt: decodedCursor.afterCreatedAt,
               sessionId: decodedCursor.afterSessionId,
             },
+        includeArchived,
         limit,
       });
       const nextCursor = page.nextPosition === null
@@ -6141,7 +6155,7 @@ export class HraService {
       }
       return {
         accountId: profile.id,
-        sessions: this.#store.listSessions(limit, profile.id),
+        sessions: this.#store.listSessions(limit, profile.id, includeArchived),
         nextCursor: null,
         recovery: {
           diagnostic: "Provider reconciliation is paused while compact-projection recovery preserves exact local authority.",
@@ -6189,7 +6203,13 @@ export class HraService {
       sessions.push(session);
       await this.#reconcileCommittedSessionFactsMemory(session);
     }
-    return { accountId: profile.id, sessions, nextCursor };
+    return {
+      accountId: profile.id,
+      // Archive is a listing filter over locally known sessions: the
+      // provider has no archive concept, so its page is filtered here.
+      sessions: includeArchived ? sessions : sessions.filter((session) => session.archivedAt === undefined),
+      nextCursor,
+    };
   }
 
   async #showSession(selector: string, detail: boolean, signal: AbortSignal): Promise<unknown> {

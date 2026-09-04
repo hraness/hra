@@ -666,6 +666,58 @@ describe("StateStore", () => {
     expect(updated.fastEnabled).toBe(true);
   });
 
+  test("archives sessions out of the default listing and keeps them readable", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Archive");
+    const kept = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    const archived = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    expect(store.requireSession(archived.id).archivedAt).toBeUndefined();
+
+    const marked = store.setSessionArchived(archived.id, true);
+    expect(marked.archivedAt).toBeGreaterThan(0);
+    // Archive is presentation state, not session authority: the revision is
+    // untouched so an in-flight optimistic update still applies.
+    expect(marked.revision).toBe(archived.revision);
+    expect(store.listSessions(50).map((session) => session.id)).toEqual([kept.id]);
+    expect(store.listSessions(50, profile.id).map((session) => session.id)).toEqual([kept.id]);
+    expect(store.listSessions(50, undefined, true).map((session) => session.id).sort())
+      .toEqual([kept.id, archived.id].sort());
+    expect(store.listLocalSessionPage({ profileId: profile.id, after: null, limit: 50 })
+      .sessions.map((session) => session.id)).toEqual([kept.id]);
+    expect(store.listLocalSessionPage({ profileId: profile.id, after: null, includeArchived: true, limit: 50 })
+      .sessions).toHaveLength(2);
+    // The session itself is never hidden from a direct read.
+    expect(store.requireSession(archived.id).id).toBe(archived.id);
+
+    expect(store.setSessionArchived(archived.id, false).archivedAt).toBeUndefined();
+    expect(store.listSessions(50)).toHaveLength(2);
+    expect(() => store.setSessionArchived("sess_00000000000000000000000000000001", true))
+      .toThrow(SelectionError);
+  });
+
+  test("keeps show-thinking and the default preset as daemon settings with session overrides", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Settings");
+    const session = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+
+    expect(store.readDefaultShowThinking()).toBe(false);
+    expect(store.readSessionShowThinking(session.id)).toEqual({ enabled: false, source: "default" });
+    store.setSessionShowThinking(session.id, true);
+    expect(store.readSessionShowThinking(session.id)).toEqual({ enabled: true, source: "session" });
+    store.setDefaultShowThinking(true);
+    store.setSessionShowThinking(session.id, false);
+    expect(store.readSessionShowThinking(session.id)).toEqual({ enabled: false, source: "session" });
+    store.setSessionShowThinking(session.id, null);
+    expect(store.readSessionShowThinking(session.id)).toEqual({ enabled: true, source: "default" });
+    expect(() => store.setSessionShowThinking("sess_00000000000000000000000000000001", true))
+      .toThrow(SelectionError);
+
+    expect(store.readDefaultPreset()).toBe("ultra");
+    store.setDefaultPreset("low");
+    expect(store.readDefaultPreset()).toBe("low");
+    expect(() => store.setDefaultPreset("max" as "low")).toThrow();
+  });
+
   test("keeps session recovery absorbing across passive and exact-state reconciliation", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Recovery", "recovery@example.com");

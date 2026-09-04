@@ -1107,6 +1107,54 @@ describe("HraService", () => {
     expect(codex.calls).toEqual([]);
   });
 
+  test("archives and unarchives a session and filters the default listing", async () => {
+    const { service, documents } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Archiving" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Archive docs", path: documents }, { signal });
+    const started = await service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      preset: "high",
+      fast: false,
+    }, { signal }) as { session: { id: `sess_${string}` } };
+
+    const archived = await service.execute({
+      kind: "session.archive",
+      session: started.session.id,
+      archived: true,
+    }, { signal }) as { archived: boolean; archivedAt: number | null; session: string };
+    expect(archived.session).toBe(started.session.id);
+    expect(archived.archived).toBe(true);
+    expect(archived.archivedAt).toBeGreaterThan(0);
+
+    const hidden = await service.execute({ kind: "session.list", archived: false, limit: 100 }, { signal }) as {
+      sessions: readonly { id: string }[];
+    };
+    expect(hidden.sessions.map((session) => session.id)).not.toContain(started.session.id);
+    const shown = await service.execute({ kind: "session.list", archived: true, limit: 100 }, { signal }) as {
+      sessions: readonly { id: string }[];
+    };
+    expect(shown.sessions.map((session) => session.id)).toContain(started.session.id);
+
+    // The session itself stays fully readable while archived.
+    expect(await service.execute({ kind: "session.status", session: started.session.id }, { signal }))
+      .toMatchObject({ session: expect.objectContaining({ id: started.session.id }) });
+
+    expect(await service.execute({
+      kind: "session.archive",
+      session: started.session.id,
+      archived: false,
+    }, { signal })).toMatchObject({ archived: false, archivedAt: null });
+    const restored = await service.execute({ kind: "session.list", archived: false, limit: 100 }, { signal }) as {
+      sessions: readonly { id: string }[];
+    };
+    expect(restored.sessions.map((session) => session.id)).toContain(started.session.id);
+  });
+
   test("lists a selected signed-out account's locally stored sessions without provider access", async () => {
     const { service, codex, documents } = await fixture();
     const added = await service.execute(
@@ -1137,10 +1185,12 @@ describe("HraService", () => {
 
     const unfiltered = await service.execute({
       kind: "session.list",
+      archived: false,
       limit: 100,
     }, { signal }) as { sessions: readonly { id: string; profileId: string }[] };
     const selected = await service.execute({
       kind: "session.list",
+      archived: false,
       account: added.account.id,
       limit: 100,
     }, { signal });
@@ -1186,6 +1236,7 @@ describe("HraService", () => {
     do {
       const page = await service.execute({
         kind: "session.list",
+        archived: false,
         account: added.account.id,
         limit: 37,
         ...(cursor === undefined ? {} : { cursor }),
@@ -1222,12 +1273,14 @@ describe("HraService", () => {
     ) as { account: { id: `acct_${string}` } };
     await expect(service.execute({
       kind: "session.list",
+      archived: false,
       account: other.account.id,
       limit: 37,
       cursor: firstCursor,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(service.execute({
       kind: "session.list",
+      archived: false,
       account: added.account.id,
       limit: 36,
       cursor: firstCursor,
@@ -1235,6 +1288,7 @@ describe("HraService", () => {
     const replacement = firstCursor.at(-1) === "A" ? "B" : "A";
     await expect(service.execute({
       kind: "session.list",
+      archived: false,
       account: added.account.id,
       limit: 37,
       cursor: `${firstCursor.slice(0, -1)}${replacement}`,
@@ -1567,6 +1621,7 @@ describe("HraService", () => {
 
     const first = await value.service.execute({
       kind: "session.list",
+      archived: false,
       account: "Mutable label",
       limit: 1,
     }, { signal }) as {
@@ -1589,6 +1644,7 @@ describe("HraService", () => {
     value.codex.listedNextCursor = null;
     await expect(value.service.execute({
       kind: "session.list",
+      archived: false,
       account: firstAccount.account.id,
       cursor: first.nextCursor,
       limit: 1,
@@ -1613,18 +1669,21 @@ describe("HraService", () => {
     const tampered = `${first.nextCursor.slice(0, -1)}${first.nextCursor.at(-1) === "A" ? "B" : "A"}`;
     await expect(value.service.execute({
       kind: "session.list",
+      archived: false,
       account: firstAccount.account.id,
       cursor: tampered,
       limit: 1,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(value.service.execute({
       kind: "session.list",
+      archived: false,
       account: firstAccount.account.id,
       cursor: first.nextCursor,
       limit: 2,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(value.service.execute({
       kind: "session.list",
+      archived: false,
       cursor: first.nextCursor,
       limit: 1,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
@@ -1640,6 +1699,7 @@ describe("HraService", () => {
     }, { signal });
     await expect(value.service.execute({
       kind: "session.list",
+      archived: false,
       account: secondAccount.account.id,
       cursor: first.nextCursor,
       limit: 1,
@@ -1667,6 +1727,7 @@ describe("HraService", () => {
     value.codex.listedNextCursor = "provider-a";
     const first = await value.service.execute({
       kind: "session.list",
+      archived: false,
       account: added.account.id,
       limit: 1,
     }, { signal }) as { nextCursor: string };
@@ -1679,6 +1740,7 @@ describe("HraService", () => {
     value.codex.listedNextCursor = "provider-b";
     const second = await value.service.execute({
       kind: "session.list",
+      archived: false,
       account: added.account.id,
       cursor: first.nextCursor,
       limit: 1,
@@ -1692,6 +1754,7 @@ describe("HraService", () => {
     value.codex.listedNextCursor = "provider-a";
     const third = await value.service.execute({
       kind: "session.list",
+      archived: false,
       account: added.account.id,
       cursor: second.nextCursor,
       limit: 1,
@@ -1705,6 +1768,7 @@ describe("HraService", () => {
     value.codex.listedNextCursor = "provider-b";
     await expect(value.service.execute({
       kind: "session.list",
+      archived: false,
       account: added.account.id,
       cursor: third.nextCursor,
       limit: 1,
@@ -1888,6 +1952,7 @@ describe("HraService", () => {
     await value.service.execute({
       account: session.profileId,
       kind: "session.list",
+      archived: false,
       limit: 20,
     }, { signal });
     expect(value.store.requireSession(sessionId).state).toBe("terminal");
@@ -2036,6 +2101,7 @@ describe("HraService", () => {
     await value.service.execute({
       account: profile.id,
       kind: "session.list",
+      archived: false,
       limit: 20,
     }, { signal });
     expect(factsMemory.ensures.at(-1)).toEqual({
@@ -4460,6 +4526,7 @@ describe("HraService", () => {
     await expect(value.service.execute({
       account: profile.id,
       kind: "session.list",
+      archived: false,
       limit: 25,
     }, { signal })).resolves.toMatchObject({ recovery: { required: true } });
     await value.service.observeCodexFact(
@@ -6284,6 +6351,7 @@ describe("HraService", () => {
     }];
     await value.service.execute({
       kind: "session.list",
+      archived: false,
       account: profile.id,
       limit: 100,
     }, { signal });
@@ -6530,7 +6598,7 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
 
     codex.listedProjections = [{ providerThreadId: "provider-thread", title: "Passive", status: "active", activeTurnId: "turn-passive", providerUpdatedAt: 11 }];
-    await service.execute({ kind: "session.list", account: added.account.id, limit: 20 }, { signal });
+    await service.execute({ kind: "session.list", account: added.account.id, archived: false, limit: 20 }, { signal });
     expect(store.requireSession(started.session.id)).toEqual(quarantined);
 
     codex.readProjection = { providerThreadId: "provider-thread", title: "Exact", status: "active", activeTurnId: "turn-exact", providerUpdatedAt: 12 };

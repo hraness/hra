@@ -2,10 +2,13 @@ import { describe, expect, test } from "bun:test";
 
 import { randomKeyBytes } from "./crypto";
 import {
+  decryptDeviceRegistry,
   decryptUsageProjection,
   decryptRemoteCommand,
+  encryptDeviceRegistry,
   encryptUsageProjection,
   encryptRemoteCommand,
+  parseDeviceRegistryPayload,
   parseRemoteCommandPayload,
   parseSessionMetadataPayload,
 } from "./payloads";
@@ -120,6 +123,178 @@ describe("remote decision payloads", () => {
       interactionId,
       revision: 1,
       answers: { q1: { answers: ["/opt/someone/secret"] } },
+    })).toBeNull();
+  });
+});
+
+describe("settings command payloads", () => {
+  test("accepts every settings kind with its exact key set", () => {
+    expect(parseRemoteCommandPayload({ kind: "set_approval_mode", mode: "auto:workspace", scope: "session" }))
+      .toEqual({ kind: "set_approval_mode", mode: "auto:workspace", scope: "session" });
+    expect(parseRemoteCommandPayload({ kind: "set_show_thinking", enabled: true, scope: "default" }))
+      .toEqual({ enabled: true, kind: "set_show_thinking", scope: "default" });
+    expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "ultra" }))
+      .toEqual({ kind: "set_default_preset", preset: "ultra" });
+    expect(parseRemoteCommandPayload({ kind: "archive_session", archived: true }))
+      .toEqual({ archived: true, kind: "archive_session" });
+    expect(parseRemoteCommandPayload({ kind: "rename_session", name: "Nightly review" }))
+      .toEqual({ kind: "rename_session", name: "Nightly review" });
+    expect(parseRemoteCommandPayload({ kind: "rename_session", name: null }))
+      .toEqual({ kind: "rename_session", name: null });
+    expect(parseRemoteCommandPayload({ kind: "set_gateway_key", key: ["gw", "x".repeat(24)].join("-") }))
+      .toMatchObject({ kind: "set_gateway_key" });
+  });
+
+  test("refuses unknown scopes, modes, presets, extra keys, and unsafe names", () => {
+    expect(parseRemoteCommandPayload({ kind: "set_approval_mode", mode: "auto:all", scope: "device" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_approval_mode", mode: "auto", scope: "session" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_approval_mode", mode: "auto:all" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_show_thinking", enabled: "yes", scope: "session" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "max" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "archive_session", archived: 1 })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "archive_session", archived: true, session: "sess" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "rename_session", name: "" })).toBeNull();
+    expect(parseRemoteCommandPayload({
+      kind: "rename_session",
+      name: ["", "srv", "runner", "job"].join("/"),
+    })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "rename_session", name: `bell${String.fromCharCode(7)}` })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_gateway_key", key: "short" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_gateway_key", key: `gw ${"x".repeat(24)}` })).toBeNull();
+  });
+
+  test("carries a settings command through the encrypted command envelope", async () => {
+    const key = randomKeyBytes();
+    const authority = {
+      entityPublicId: "command_12345678",
+      keyVersion: 4,
+      kind: "command",
+      userPublicId: "user_12345678",
+    } as const;
+    const payload = { kind: "set_show_thinking", enabled: true, scope: "session" } as const;
+    const envelope = await encryptRemoteCommand(payload, key, authority);
+    expect(await decryptRemoteCommand(envelope, key, authority)).toEqual(payload);
+  });
+});
+
+describe("session metadata archive", () => {
+  test("keeps archive optional and additive", () => {
+    expect(parseSessionMetadataPayload({ name: "Session", note: null }))
+      .toEqual({ name: "Session", note: null });
+    expect(parseSessionMetadataPayload({ archived: true, name: "Session", note: null }))
+      .toEqual({ archived: true, name: "Session", note: null });
+    expect(parseSessionMetadataPayload({ archived: false, name: "Session", note: null }))
+      .toEqual({ archived: false, name: "Session", note: null });
+    expect(parseSessionMetadataPayload({ archived: "yes", name: "Session", note: null })).toBeNull();
+    expect(parseSessionMetadataPayload({ archived: true, name: "Session", note: null, extra: 1 })).toBeNull();
+  });
+});
+
+describe("device registry payloads", () => {
+  const registry = {
+    accounts: [{ label: "Work", provider: "codex", publicId: "acct_00000000000000000000000000000001", status: "signed_in" }],
+    daemonVersion: "0.3.0",
+    defaultApprovalMode: "auto:all",
+    defaultPreset: "ultra",
+    heartbeatAt: 1_700_000_000_000,
+    machineLabel: "Studio",
+    projects: [{ label: "Control plane", publicId: "proj_00000000000000000000000000000001" }],
+    proseAutorespondConfigured: false,
+    scheduledTasks: [
+      {
+        cadence: "every 60 minutes",
+        id: "stask_00000000000000000000000000000001",
+        kind: "hra_conversation",
+        label: "Nightly sweep",
+        nextRunAt: 1_700_000_060_000,
+        sessionPublicId: "sess_00000000000000000000000000000001",
+      },
+      {
+        cadence: "FREQ=WEEKLY;BYDAY=MO",
+        id: "upload-usage",
+        kind: "codex_automation",
+        label: "Upload usage",
+        nextRunAt: null,
+        sessionPublicId: null,
+      },
+    ],
+    showThinkingDefault: false,
+    version: 1,
+  } as const;
+  const authority = {
+    entityPublicId: "device_12345678",
+    keyVersion: 2,
+    kind: "device_registry",
+    userPublicId: "user_12345678",
+  } as const;
+
+  test("round-trips through the account-key envelope under its own authority kind", async () => {
+    const key = randomKeyBytes();
+    const envelope = await encryptDeviceRegistry(registry, key, authority);
+    expect(await decryptDeviceRegistry(envelope, key, authority)).toEqual(registry);
+    await expectPromiseToReject(decryptDeviceRegistry(envelope, key, {
+      ...authority,
+      entityPublicId: "device_87654321",
+    }));
+    await expectPromiseToReject(decryptDeviceRegistry(envelope, key, {
+      ...authority,
+      kind: "session_metadata",
+    }));
+  });
+
+  test("refuses a path-shaped label anywhere in the projection", async () => {
+    const absolutePath = ["", "srv", "runner", "checkout"].join("/");
+    const homePath = `~/${["projects", "control-plane"].join("/")}`;
+    expect(parseDeviceRegistryPayload({ ...registry, machineLabel: absolutePath })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      projects: [{ label: homePath, publicId: "proj_00000000000000000000000000000001" }],
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      accounts: [{ ...registry.accounts[0], label: absolutePath }],
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      scheduledTasks: [{ ...registry.scheduledTasks[1], label: absolutePath }],
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      scheduledTasks: [{ ...registry.scheduledTasks[1], cadence: absolutePath }],
+    })).toBeNull();
+    await expectPromiseToReject(encryptDeviceRegistry(
+      { ...registry, machineLabel: absolutePath },
+      randomKeyBytes(),
+      authority,
+    ), "Invalid device registry payload");
+  });
+
+  test("refuses unknown versions, unknown keys, and out-of-range members", () => {
+    expect(parseDeviceRegistryPayload({ ...registry, version: 2 })).toBeNull();
+    expect(parseDeviceRegistryPayload({ ...registry, extra: true })).toBeNull();
+    expect(parseDeviceRegistryPayload({ ...registry, defaultPreset: "max" })).toBeNull();
+    expect(parseDeviceRegistryPayload({ ...registry, defaultApprovalMode: "auto" })).toBeNull();
+    expect(parseDeviceRegistryPayload({ ...registry, showThinkingDefault: "on" })).toBeNull();
+    expect(parseDeviceRegistryPayload({ ...registry, heartbeatAt: -1 })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      accounts: [{ ...registry.accounts[0], provider: "codex-cloud" }],
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      accounts: [{ ...registry.accounts[0], status: "removed" }],
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      scheduledTasks: [{ ...registry.scheduledTasks[0], kind: "codex_plugin" }],
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      scheduledTasks: [{ ...registry.scheduledTasks[0], sessionPublicId: "sess 1" }],
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      projects: Array.from({ length: 201 }, () => registry.projects[0]),
     })).toBeNull();
   });
 });

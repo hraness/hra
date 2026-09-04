@@ -102,6 +102,7 @@ export const ACCOUNT_DELETION_TABLE_STRATEGY = {
   deviceKeyEnvelopes: "user_index",
   recoveryEnvelopes: "user_index",
   devicePresence: "user_index",
+  deviceRegistries: "user_index",
   sessionHeads: "user_index",
   sessionChunks: "user_index_immutable_erasure",
   sessionStreamEpochs: "user_index_immutable_erasure",
@@ -399,13 +400,24 @@ async function deleteDeviceCustody(
     await ctx.db.delete(record._id);
   }
   remaining -= presence.length;
+  if (remaining === 0) return { deleted: limit, empty: false };
+
+  const registries = await ctx.db.query("deviceRegistries")
+    .withIndex("by_user", (builder) => builder.eq("userId", userId))
+    .take(remaining);
+  for (const record of registries) {
+    await releaseQuotaForDelete(ctx, userId, "custody", record);
+    await ctx.db.delete(record._id);
+  }
+  remaining -= registries.length;
   return {
     deleted: limit - remaining,
     empty: sessions.length === 0
       && challenges.length === 0
       && keys.length === 0
       && recovery.length === 0
-      && presence.length === 0,
+      && presence.length === 0
+      && registries.length === 0,
   };
 }
 

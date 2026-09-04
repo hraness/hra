@@ -3,6 +3,7 @@
 - The daemon hosts the local command authority, long-running Codex processes, and opaque session-memory lifecycle coordination.
 - The Unix socket transports one bounded authenticated request at a time.
 - Autorespond decides who answers an approval: the protocol path answers provider requests, the prose path answers an assistant turn that asks only for consent through the responder port.
+- Gateway key custody keeps the responder credential in one user-only file, never in a journal, log, or projection.
 
 # Guidelines
 
