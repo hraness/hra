@@ -1,7 +1,7 @@
 {
   "name": "hra-local-efficiency",
-  "version": "0.2.1",
-  "description": "Machine-wide local scheduling, swarm throughput telemetry, CI isolation, and guarded maintenance for Hraness Codex work.",
+  "version": "0.3.0",
+  "description": "Managed Codex and Claude autonomy, local scheduling, CI isolation, and guarded maintenance for Hraness repository work.",
   "author": {
     "name": "Hraness",
     "url": "https://github.com/hraness"
@@ -11,7 +11,9 @@
   "license": "MIT",
   "keywords": [
     "codex",
+    "claude-code",
     "local-development",
+    "permissions",
     "scheduling",
     "validation",
     "worktrees"
@@ -19,12 +21,14 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "HRA Local Efficiency",
-    "shortDescription": "Coordinate fast, safe local Codex work.",
-    "longDescription": "Preserves useful agent fan-out while reducing duplicate checkouts and validation, coordinating capability lanes, measuring local throughput, isolating complete-history CI, and reclaiming verified clean worktrees.",
+    "shortDescription": "Coordinate autonomous, safe local agent work.",
+    "longDescription": "Keeps Codex and Claude approval defaults and repository guidance aligned while preserving useful agent fan-out, coordinating capability lanes, measuring local throughput, isolating complete-history CI, and reclaiming verified clean worktrees.",
     "developerName": "Hraness",
     "category": "Productivity",
     "capabilities": [
       "Local scheduling",
+      "Codex and Claude approval baseline",
+      "Repository guidance adoption",
       "Validation receipts",
       "Throughput telemetry",
       "CI ref isolation",
@@ -32,6 +36,7 @@
     ],
     "defaultPrompt": [
       "Install the local efficiency baseline on this Mac.",
+      "Check Codex, Claude, and repository approval-policy drift.",
       "Audit local Codex resource and worktree health.",
       "Measure and improve this machine's Codex throughput."
     ]

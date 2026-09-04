@@ -42,7 +42,7 @@ The operation is safe to replay after a crash or refusal. Exact copies are accep
 
 ## Replace a quarantined current target
 
-Use this exceptional preproduction recovery path only after the exact `approve both` authorization and only when the current default production deployment is unsuitable for bootstrap. It stays inside the current project and never reads, selects, imports, recreates, or modifies a retired v0 resource.
+Use this exceptional preproduction recovery path only when the active task already authorizes hosted delivery and the current default production deployment is unsuitable for bootstrap. It stays inside the current project and never reads, selects, imports, recreates, or modifies a retired v0 resource. The retired `approve both` phrase is not a recurring authorization gate.
 
 Log in with the Convex CLI first. Its global `config.json` must be a regular, single-link, mode-`0600` file. Do not supply a deploy key or deployment selector through an environment variable, `.env`, or `.env.local`. Choose one UUIDv7 replacement ID and one unused absolute evidence path whose existing parent is an invoking-user-owned mode-`0700` directory. Both values remain fixed across the whole transaction.
 
@@ -322,7 +322,7 @@ Any other state is an incident and must remain quarantined for inspection.
 
 Read the capability file only into HRA's protected authentication JSON input. Never print it, substitute it into argv, copy it into an environment variable, or route it through a log. Complete the verified-email code flow and confirm the identity and first device are active. Consuming this specific bound invitation atomically records a durable bootstrap-accepted timestamp in service control. Later friend invitation issuance depends on that durable fact, so maintenance may remove the terminal invitation receipt without relocking the service. Then remove the one-time capability file.
 
-Continue launch acceptance with a second pending device approved by the active device against the key fingerprint that `hra device list` shows for it, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. Hosted acceptance does not authorize domain movement or publication. Those effects require a future current-project-only release design; retired HRA v0 resources cannot satisfy one of its gates.
+Continue launch acceptance with a second pending device approved by the active device against the key fingerprint that `hra device list` shows for it, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. Hosted acceptance does not authorize domain movement or publication. Those effects use their own separately gated operators: current-package publication now uses the owner-authenticated local `release:tag` command plus the protected tag-push workflow, while domain movement remains outside this hosted-acceptance scope. Retired HRA v0 resources cannot satisfy either operator's gates.
 
 ## Operate friend-beta invitations
 

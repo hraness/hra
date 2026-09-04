@@ -2,7 +2,7 @@
 [![npm version](https://img.shields.io/npm/v/%40hraness%2Fhra)](https://www.npmjs.com/package/@hraness/hra) [![provenance: sigstore](https://img.shields.io/badge/provenance-sigstore-2e7d32)](https://www.npmjs.com/package/@hraness/hra#provenance) [![CI](https://img.shields.io/github/actions/workflow/status/hraness/hra/ci.yml?branch=main&label=CI)](https://github.com/hraness/hra/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/npm/l/%40hraness%2Fhra)](https://github.com/hraness/hra/blob/main/LICENSE) [![Bun 1.3.14](https://img.shields.io/badge/Bun-1.3.14-14151a)](https://bun.sh) [![runtimes: Codex 0.153.2](https://img.shields.io/badge/runtimes-Codex%200.153.2-0b5fa5)](https://www.npmjs.com/package/@openai/codex/v/0.153.2)\
 HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.
 
-Status: public beta. The local CLI v0.5.0 is release-ready for macOS and Linux; hosted sync is live as an open beta.
+Status: public beta. The local CLI v0.5.0 is live for macOS and Linux; hosted sync is live as an open beta.
 
 ```sh
 test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.5.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.5.0/hraness-hra-0.5.0.tgz d4c6f33971eaf106dcde0d54b0f7e6c96591c9f591bb7e04cbdc9c2f2310a641)" = hra-install-safe
@@ -20,7 +20,7 @@ hra init --yes
 
 Give each account its own Codex home, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.
 
-macOS and Linux CLI · macOS desktop switching · local v0.5.0 release-ready · hosted sync live (open beta)
+macOS and Linux CLI · macOS desktop switching · local v0.5.0 live · hosted sync live (open beta)
 
 ### One request, one exact account and session
 
@@ -29,7 +29,7 @@ macOS and Linux CLI · macOS desktop switching · local v0.5.0 release-ready · 
 3. **Direct:** `hra session send <session-id> -- "Review this project."`. Send work to that session without switching account authority.
 4. **Observe:** `hra session watch <session-id> --cursor <status-cursor> --jsonl`. Follow safe live updates from the cursor returned by status.
 
-> **Immutable local CLI release candidate; hosted sync live as an open beta.** The exact install command below works once GitHub exposes the immutable `v0.5.0` GitHub Release and its verified archive. The website and optional hosted sync are live; the public CLI stays immutable once admitted.
+> **Immutable local CLI beta; hosted sync live as an open beta.** The exact install command below uses the published immutable `v0.5.0` GitHub Release and its verified archive. The website, public CLI, and optional hosted sync are live; the public CLI remains immutable.
 
 HRA is one Bun CLI plus a local daemon. It keeps Codex accounts isolated, gives you a compact session interface, and optionally syncs encrypted session projections and commands across your enrolled machines.
 
@@ -150,7 +150,7 @@ hra session task delete <session-id> <task-id> --revision <revision>
 
 ## Agent work protocol
 
-> **Local release boundary.** These commands are part of the immutable `v0.5.0` local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol.
+> **Local release boundary.** These commands are part of the immutable `v0.5.0` local CLI beta and are installable through the exact command above. Hosted sync is not required for this local protocol.
 
 The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing Codex sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex app-server still owns model execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine.
 

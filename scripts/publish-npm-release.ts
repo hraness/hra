@@ -17,6 +17,7 @@ import {
   runNpmPublisher,
 } from "./npm-publisher-boundary";
 import { assertReleasePackageReady, releaseArchiveName } from "./release-package-policy";
+import { fetchLiveReleaseRepository } from "./release-repository-identity";
 import { verifyNpmProvenance, type NpmProvenanceAttemptPolicy } from "./verify-npm-provenance";
 
 const maximumAttestationBytes = 512 * 1024;
@@ -161,10 +162,8 @@ if (transition.action === "admit_existing") {
   await admitProvenance(transition.attemptPolicy, transition.maximumProvenanceAttempt);
   console.log(`${inspection.name}@${inspection.version} already contains the exact trusted-publisher bytes.`);
 } else {
-  if (process.env.HRA_APPROVE_NPM_PUBLICATION !== `publish:${inspection.name}@${inspection.version}`) {
-    throw new Error("The first npm publication requires its exact explicit approval value.");
-  }
   assertNpmPublisherIdentity(process.env, releaseTag, releaseSha);
+  await fetchLiveReleaseRepository(process.env.GITHUB_TOKEN);
   const publication = await runNpmPublisher({
     dryRun: false,
     source: process.env,

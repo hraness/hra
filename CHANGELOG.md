@@ -4,7 +4,7 @@ Every entry names the release or the plan wave it belongs to. Unreleased work si
 
 ## v0.5.0
 
-HRA Web v1 wave 3: interaction detail, wider remote decisions, subagent activity, the Claude Code provider seam, and device commands. Release candidate until the release workflow admits the tag.
+HRA Web v1 wave 3: interaction detail, wider remote decisions, subagent activity, the Claude Code provider seam, and device commands. Admitted by the immutable release workflow on 2026-09-04.
 
 - The compact `interaction_state` event gains a versioned optional detail block: label, headline, redacted markdown detail, command class, the decisions the provider actually offered, and for a question an id, label, and secret flag each. Every field is bounded and re-checked by the parser, the emitter drops the whole block rather than projecting anything unsafe, and a detail-free event digests exactly as it did before.
 - Remote decisions widen. Beyond command approvals and file-change declines, the daemon accepts a decision on a permission approval whose requested categories it re-verifies as workspace-only, and answers to a question set that carries no secret, including a plain-text MCP form. Each remaining refusal keeps its own code, and the browser panel renders the detail and offers a control only where the daemon would accept it.
@@ -93,7 +93,7 @@ Release and site:
 
 - `bun run install-pins:update` re-pins the installer's embedded CLI and normalizer digests between releases; the public command's digest is proven against the tagged runtime in the tag workflow instead of against the working tree.
 - One `CODEX_PIN` constant and `bun run codex:bump` replace scattered Codex version literals; the account usage digest domain no longer changes when the pin changes.
-- Retired release scripts are deleted, duplicate CI steps are removed, and the tag workflow reads back the tagged commit's successful CI run instead of rerunning the gate.
+- Retired release scripts are deleted, duplicate CI steps are removed, and the tag workflow reads back the tagged commit's successful CI run instead of rerunning the gate. A fail-closed local command verifies immutable owner identity, exact CI-green current `main`, monotonic version, and split tag rulesets before pushing one annotated tag; the redundant mutable npm approval variable is gone.
 - The README leads with a thesis and badges, the social card is a build-time PNG, and public copy is checked for em dashes.
 
 Plan:

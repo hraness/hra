@@ -44,6 +44,7 @@ describe("release workflow", () => {
       "/scripts/npm-publisher-boundary.ts",
       "/scripts/publish-github-release.ts",
       "/scripts/publish-npm-release.ts",
+      "/scripts/release-repository-identity.ts",
       "/scripts/verify-npm-provenance-crypto.mjs",
       "/scripts/verify-npm-provenance.ts",
     ]) expect(codeowners).toContain(`${path} @0thernet`);
@@ -62,6 +63,7 @@ describe("release workflow", () => {
     expect(npmPublisher).toContain('metadata(versionUrl, "version")');
     expect(npmPublisher).toContain('metadata(latestUrl, "latest")');
     expect(npmPublisher).toContain("lookupCompleteRelease()");
+    expect(npmPublisher).not.toContain("HRA_APPROVE_NPM_PUBLICATION");
     expect(npmBoundary).toContain("maximumPublisherOutputBytes");
     expect(npmBoundary).toContain("Successfully retrieved and set token");
     expect(npmBoundary).toContain("GITHUB_REPOSITORY_OWNER_ID");
@@ -73,6 +75,29 @@ describe("release workflow", () => {
     expect(githubPublisher).toContain("maxBuffer: maximumStdoutBytes + 1");
     expect(githubPublisher.match(/false, maximumArtifactBytes\)\.stdout/gu)?.length).toBe(2);
     expect(githubPublisher).not.toContain("maxBuffer: 32 * 1_024 * 1_024");
+  });
+
+  test("revalidates exact live public repository identity at each publication boundary", async () => {
+    const [identity, npmPublisher, githubPublisher] = await Promise.all([
+      readFile(join(import.meta.dir, "release-repository-identity.ts"), "utf8"),
+      readFile(join(import.meta.dir, "publish-npm-release.ts"), "utf8"),
+      readFile(join(import.meta.dir, "publish-github-release.ts"), "utf8"),
+    ]);
+    for (const required of [
+      'default_branch: z.literal("main")',
+      'full_name: z.literal(publicRepository)',
+      "id: z.literal(repositoryId)",
+      "owner: z.object({ id: z.literal(repositoryOwnerId) })",
+      "private: z.literal(false)",
+      'visibility: z.literal("public")',
+    ]) expect(identity).toContain(required);
+    expect(identity).toContain("readBoundedJsonResponse(");
+    expect(npmPublisher).toContain("await fetchLiveReleaseRepository(process.env.GITHUB_TOKEN);");
+    expect(npmPublisher.indexOf("await fetchLiveReleaseRepository(process.env.GITHUB_TOKEN);"))
+      .toBeLessThan(npmPublisher.indexOf("const publication = await runNpmPublisher({"));
+    expect(githubPublisher.match(/verifyLivePublicRepository\(\);/gu)?.length).toBe(3);
+    expect(githubPublisher).toContain("verifyLivePublicRepository();\n    run([\n      \"gh\", \"api\", \"--method\", \"POST\"");
+    expect(githubPublisher).toContain("verifyLivePublicRepository();\n  const published = readJson([\n    \"gh\", \"api\", \"--method\", \"PATCH\"");
   });
 
   test("matches current Fulcio V2 bytes while retaining every signer claim", async () => {
@@ -153,6 +178,28 @@ describe("release workflow", () => {
       expect(fetch).toContain("Unexpected ref entered governed release history");
       expect(fetch).not.toContain("--all");
     }
+  });
+
+  test("requires the immutable owner as the original release-tag pusher", async () => {
+    const source = await readFile(join(import.meta.dir, "..", ".github", "workflows", "release.yml"), "utf8");
+    const workflow = asRecord(Bun.YAML.parse(source), "release workflow");
+    const jobs = asRecord(workflow.jobs, "release jobs");
+    const verify = asRecord(jobs.verify, "release verify job");
+    if (!Array.isArray(verify.steps)) throw new TypeError("release verify steps must be an array");
+    const first = asRecord(verify.steps[0], "first release step");
+    expect(first.name).toBe("Require one stable tag push");
+    expect(asRecord(first.env, "release request environment")).toMatchObject({
+      ACTOR_ID: "${{ github.actor_id }}",
+      REPOSITORY_PRIVATE: "${{ github.event.repository.private }}",
+      REPOSITORY_VISIBILITY: "${{ github.event.repository.visibility }}",
+      SENDER_ID: "${{ github.event.sender.id }}",
+      SENDER_TYPE: "${{ github.event.sender.type }}",
+    });
+    expect(String(first.run)).toContain('"$ACTOR_ID" != "894119"');
+    expect(String(first.run)).toContain('"$SENDER_ID" != "894119"');
+    expect(String(first.run)).toContain('"$SENDER_TYPE" != "User"');
+    expect(String(first.run)).toContain('"$REPOSITORY_PRIVATE" != "false"');
+    expect(String(first.run)).toContain('"$REPOSITORY_VISIBILITY" != "public"');
   });
 
   test("keeps release authority-supervisor prerequisites byte-aligned with CI", async () => {
@@ -373,7 +420,7 @@ describe("release workflow", () => {
     expect(thirdPartyNotices).toContain("immutable `v0.5.0` release source tag");
     expect(thirdPartyNotices).not.toContain("SPDX");
     expect(changelog).toContain("## v0.5.0");
-    expect(security).toContain("| `v0.5.0` | Release candidate. Supported once the release workflow admits it. |");
+    expect(security).toContain("| `v0.5.0` | Supported beta. Receives security fixes. |");
   });
 
   test("keeps the retired fallback-bound path unreachable and exposes only the exact artifact workflow", async () => {
@@ -402,7 +449,7 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: `v0.5.0` release-ready; immutable public `v0.4.1` remains the admitted release until exact `v0.5.0` admission.");
+    expect(releaseRecord).toContain("Status: immutable public `v0.5.0` admitted on 2026-09-04.");
     expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
     expect(releaseRecord).toContain("Release workflow run `33363290345`, attempt 1");
@@ -519,17 +566,26 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("The package gate still scans `rev-list --all`");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
     expect(releaseRecord).toContain("npm trusted publishing names repository `hraness/hra` and workflow `release.yml`");
-    expect(releaseRecord).toContain("Stable `@hraness/hra@0.4.1` is authoritative until the next release is admitted");
+    expect(releaseRecord).toContain("Stable `@hraness/hra@0.5.0` is authoritative");
     expect(releaseRecord).toContain("The canonical README and website use a two-phase local-release surface");
-    expect(releaseRecord).toContain("The website remains live and the `v0.5.0` local CLI tag stays release-ready until exact release admission");
-    expect(releaseRecord).toContain("the install command names the `v0.5.0` GitHub Release and verified archive that admission will publish");
-    expect(releaseRecord).toContain("Hosted invite-only sync went live separately on 2026-09-03");
+    expect(releaseRecord).toContain("The website and immutable `v0.5.0` local CLI are live");
+    expect(releaseRecord).toContain("the install command names the admitted GitHub Release and verified archive");
+    expect(releaseRecord).toContain("Hosted sync went live separately on 2026-09-03");
+    expect(releaseRecord).toContain("## Immutable v0.5.0 successful release record");
+    expect(releaseRecord).toContain("tag object `b91b0d30168cc684b762483ea2f652d2a576fe3a`");
+    expect(releaseRecord).toContain("Release workflow run `33903621032` completed on attempt 3");
+    expect(releaseRecord).toContain("GitHub Release `382922988`");
+    expect(releaseRecord).toContain("npm `latest` names `@hraness/hra@0.5.0`");
     expect(releaseRecord).toContain("strict successful `Required` checks, resolved review conversations");
     expect(releaseRecord).toContain("These main-branch rulesets have no administrator bypass");
     expect(releaseRecord).toContain("GitHub does not currently require approving reviews, CODEOWNERS approval, or stale-approval dismissal");
-    expect(releaseRecord).toContain("record an independent review of the exact release commit and tree");
-    expect(releaseRecord).toContain("Repeat that review after any tree change; successful CI alone is not review evidence");
-    expect(releaseRecord).toContain("may create\none annotated stable-semver tag before or after");
+    expect(releaseRecord).toContain("Record an independent agent review of the exact release commit and tree");
+    expect(releaseRecord).toContain("repeat it after any tree change; successful CI alone is not review evidence");
+    expect(releaseRecord).toContain("immutable owner User ID `894119`");
+    expect(releaseRecord).toContain("`Release tag creation` ruleset `22307191` restricts creation only");
+    expect(releaseRecord).toContain("provider readback of both rulesets is a release prerequisite");
+    expect(releaseRecord).toContain("sole always-bypass to immutable owner User ID `894119`");
+    expect(releaseRecord).toContain("Never put creation, update, and deletion in one bypassed ruleset");
     expect(releaseRecord).toContain("outer digest is a transport assertion, not independent release authority");
     expect(releaseRecord).toContain("`@hraness/hra@0.1.0-bootstrap.0`");
     expect(releaseRecord).toContain("npm also assigns `latest` to the first published version");
@@ -541,7 +597,10 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("every earlier attempt's bounded GitHub Jobs API record");
     expect(releaseRecord).toContain("again immediately before the POST");
     expect(releaseRecord).toContain("`dist-tags.latest` to name `0.5.0`");
-    expect(releaseRecord).toContain("`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.5.0`");
+    expect(releaseRecord).toContain("the owner-authorized exact annotated tag is the publication authorization");
+    expect(releaseRecord).toContain("exact event `push`");
+    expect(releaseRecord).not.toContain("must remove it before the next release");
+    expect(releaseRecord).not.toContain("must replace it before the next release");
     expect(releaseRecord).toContain("npm CLI 11.19.0");
     expect(releaseRecord).toContain("numeric owner ID\n`307125679`");
     expect(releaseRecord).toContain("owner ID `307125679`");
@@ -558,6 +617,7 @@ describe("release workflow", () => {
     expect(workflow).toContain("os: [ubuntu-24.04, macos-15]");
     expect(workflow).toContain("npm_preflight_run_attempt");
     expect(workflow).toContain("HRA_NPM_PREFLIGHT_RUN_ATTEMPT");
+    expect(workflow).not.toContain("HRA_APPROVE_NPM_PUBLICATION");
     expect(workflow).not.toContain("release-candidate.ts");
     expect(workflow).not.toContain("publish-beta-release.ts");
     for (const retired of [
@@ -712,6 +772,7 @@ describe("release workflow", () => {
     )), "release workflow");
     const jobs = asRecord(workflow.jobs, "release workflow jobs");
     const publish = asRecord(jobs.publish, "release publish job");
+    expect(publish.environment).toBe("npm-release");
     expect(asRecord(publish.permissions, "release publish permissions")).toEqual({
       actions: "read",
       contents: "write",
@@ -762,7 +823,9 @@ describe("release workflow", () => {
       "Download validated release bytes": {},
       "Revalidate remote authority and checksum": { GH_TOKEN: "${{ github.token }}" },
       "Prove npm trusted-publisher exchange without publication": {},
-      "Publish exact tarball through npm trusted publishing": {},
+      "Publish exact tarball through npm trusted publishing": {
+        GITHUB_TOKEN: "${{ github.token }}",
+      },
       "Create immutable GitHub Release from the same bytes": { GH_TOKEN: "${{ github.token }}" },
       "Admit exact public npm and GitHub state": { GITHUB_TOKEN: "${{ github.token }}" },
     });

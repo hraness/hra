@@ -9,6 +9,7 @@ import {
   readlinkSync,
   realpathSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -27,8 +28,15 @@ import { resolveAtetHostResourceModule, resolveAtetRuntimeRoot } from "./host-ru
 
 type Mode = "apply" | "check";
 
+export type ClaudeAutoModeCapability = Readonly<{
+  available: boolean;
+  reason: "available" | "cli_missing" | "cli_too_old" | "config_unavailable";
+  version: string | null;
+}>;
+
 export type BootstrapOptions = {
   readonly bunBin: string;
+  readonly claudeHome?: string;
   readonly codexHome: string;
   readonly installDependency: boolean;
   readonly mode: Mode;
@@ -39,6 +47,16 @@ const startMarker = "<!-- hra-local-efficiency:start -->";
 const endMarker = "<!-- hra-local-efficiency:end -->";
 const rulesStartMarker = "# hra-local-efficiency:rules:start";
 const rulesEndMarker = "# hra-local-efficiency:rules:end";
+const codexConfigStartMarker = "# hra-local-efficiency:config:start";
+const codexConfigEndMarker = "# hra-local-efficiency:config:end";
+const claudeSettings = Object.freeze({
+  // Do not widen Claude's data-flow boundary here. The current repository's
+  // own remote is discovered by Claude; sibling repositories and public npm
+  // remain separate destinations whose publication must be judged in context.
+  autoModeEnvironment: Object.freeze(["$defaults"]),
+  defaultMode: "auto",
+});
+const minimumClaudeAutoModeVersion = Object.freeze([2, 1, 83] as const);
 const atetRelease = "Atet v2.0.0 host-resource runtime";
 const atetCommit = "58132fa6e8ac09a87d1fdffc17be40c8b1fd9d6d";
 const pluginName = "hra-local-efficiency";
@@ -89,6 +107,9 @@ function regularFileModeOrDefault(
     if (!metadata.isFile()) {
       throw new Error(`refusing to replace non-regular ${description}: ${path}`);
     }
+    if (metadata.nlink !== 1) {
+      throw new Error(`refusing to replace hard-linked ${description}: ${path}`);
+    }
     return metadata.mode & 0o777;
   } catch (error: unknown) {
     if (
@@ -101,8 +122,21 @@ function regularFileModeOrDefault(
   }
 }
 
+export function resolvedClaudeHome(
+  environment: Readonly<NodeJS.ProcessEnv> = process.env,
+  userHome = homedir(),
+): string {
+  const configured = environment.CLAUDE_CONFIG_DIR;
+  if (configured !== undefined && configured !== "") {
+    if (!isAbsolute(configured)) throw new Error("CLAUDE_CONFIG_DIR must be absolute");
+    return resolve(configured);
+  }
+  return join(userHome, ".claude");
+}
+
 export function parseBootstrapArguments(arguments_: readonly string[]): BootstrapOptions {
   let bunBin = resolvedBunBin();
+  let claudeHome = resolvedClaudeHome();
   let codexHome = resolvedCodexHome();
   let installDependency = true;
   let mode: Mode | undefined;
@@ -118,12 +152,17 @@ export function parseBootstrapArguments(arguments_: readonly string[]): Bootstra
       installDependency = false;
       continue;
     }
-    if (argument === "--codex-home" || argument === "--bun-bin") {
+    if (
+      argument === "--codex-home"
+      || argument === "--claude-home"
+      || argument === "--bun-bin"
+    ) {
       const value = arguments_[index + 1];
       if (value === undefined || !value.startsWith("/")) {
         throw new Error(`${argument} requires an absolute path`);
       }
       if (argument === "--codex-home") codexHome = resolve(value);
+      else if (argument === "--claude-home") claudeHome = resolve(value);
       else bunBin = resolve(value);
       index += 1;
       continue;
@@ -131,7 +170,7 @@ export function parseBootstrapArguments(arguments_: readonly string[]): Bootstra
     throw new Error(`unknown bootstrap argument: ${argument}`);
   }
   if (mode === undefined) throw new Error("choose --apply or --check");
-  return { bunBin, codexHome, installDependency, mode, runtimeRoot };
+  return { bunBin, claudeHome, codexHome, installDependency, mode, runtimeRoot };
 }
 
 function skillRoot(): string {
@@ -140,6 +179,78 @@ function skillRoot(): string {
 
 function asset(name: string): string {
   return readFileSync(join(skillRoot(), "assets", name), "utf8");
+}
+
+function versionAtLeast(
+  actual: readonly [number, number, number],
+  minimum: readonly [number, number, number],
+): boolean {
+  for (let index = 0; index < actual.length; index += 1) {
+    const difference = (actual[index] ?? 0) - (minimum[index] ?? 0);
+    if (difference !== 0) return difference > 0;
+  }
+  return true;
+}
+
+export function claudeAutoModeCapability(
+  environment: Readonly<NodeJS.ProcessEnv> = process.env,
+): ClaudeAutoModeCapability {
+  try {
+    const versionProbe = Bun.spawnSync({
+      cmd: ["claude", "--version"],
+      env: environment,
+      maxBuffer: 1024 * 1024,
+      stderr: "pipe",
+      stdout: "pipe",
+      timeout: 10_000,
+    });
+    if (versionProbe.exitCode !== 0) {
+      return Object.freeze({ available: false, reason: "cli_missing", version: null });
+    }
+    const versionText = versionProbe.stdout.toString().trim();
+    const match = /^(\d+)\.(\d+)\.(\d+)(?:\s|$)/u.exec(versionText);
+    if (match === null) {
+      return Object.freeze({ available: false, reason: "cli_too_old", version: null });
+    }
+    const version = `${match[1]}.${match[2]}.${match[3]}`;
+    const coordinates = [Number(match[1]), Number(match[2]), Number(match[3])] as const;
+    if (!versionAtLeast(coordinates, minimumClaudeAutoModeVersion)) {
+      return Object.freeze({ available: false, reason: "cli_too_old", version });
+    }
+    for (const action of ["config", "defaults"] as const) {
+      const probe = Bun.spawnSync({
+        cmd: ["claude", "auto-mode", action],
+        env: environment,
+        maxBuffer: 1024 * 1024,
+        stderr: "pipe",
+        stdout: "pipe",
+        timeout: 10_000,
+      });
+      const output = probe.stdout;
+      if (probe.exitCode !== 0 || output.byteLength < 2 || output.byteLength > 1024 * 1024) {
+        return Object.freeze({ available: false, reason: "config_unavailable", version });
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(output.toString());
+      } catch {
+        return Object.freeze({ available: false, reason: "config_unavailable", version });
+      }
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        return Object.freeze({ available: false, reason: "config_unavailable", version });
+      }
+      const lists = parsed as Record<string, unknown>;
+      if (!["allow", "environment", "hard_deny", "soft_deny"].every((key) => {
+        const list = lists[key];
+        return Array.isArray(list)
+          && list.length > 0
+          && list.every((entry) => typeof entry === "string" && entry.length > 0);
+      })) return Object.freeze({ available: false, reason: "config_unavailable", version });
+    }
+    return Object.freeze({ available: true, reason: "available", version });
+  } catch {
+    return Object.freeze({ available: false, reason: "cli_missing", version: null });
+  }
 }
 
 export function commandTargets(bunBin: string): readonly [string, string][] {
@@ -292,6 +403,15 @@ export function ensureManagedCommandSymlink(
   link: string,
   codexHome: string,
 ): "created" | "current" | "updated" {
+  preflightManagedCommandSymlink(target, link, codexHome);
+  return ensureExactSymlink(target, link);
+}
+
+function preflightManagedCommandSymlink(
+  target: string,
+  link: string,
+  codexHome: string,
+): void {
   try {
     const metadata = lstatSync(link);
     if (!metadata.isSymbolicLink()) {
@@ -307,7 +427,6 @@ export function ensureManagedCommandSymlink(
   } catch (error: unknown) {
     if (!missingPath(error)) throw error;
   }
-  return ensureExactSymlink(target, link);
 }
 
 function dependencyAvailable(
@@ -409,6 +528,404 @@ function expectedGlobalAgents(codexHome: string): string {
   );
 }
 
+function markerOccurrences(value: string, marker: string): number {
+  return value.split(marker).length - 1;
+}
+
+function managedMarkerLine(
+  value: string,
+  marker: string,
+  description: string,
+): { readonly after: number; readonly start: number } {
+  const markerIndex = value.indexOf(marker);
+  const start = value.lastIndexOf("\n", markerIndex - 1) + 1;
+  const newline = value.indexOf("\n", markerIndex + marker.length);
+  const lineEnd = newline < 0 ? value.length : newline;
+  if (value.slice(start, lineEnd).replace(/\r$/u, "").trim() !== marker) {
+    throw new Error(`${description} managed marker must occupy its own line`);
+  }
+  return { after: newline < 0 ? value.length : newline + 1, start };
+}
+
+function assertTomlCommentMarker(value: string, marker: string, description: string): void {
+  const markerIndex = value.indexOf(marker);
+  const lineStart = value.lastIndexOf("\n", markerIndex - 1) + 1;
+  const newline = value.indexOf("\n", markerIndex + marker.length);
+  const lineEnd = newline < 0 ? value.length : newline;
+  const probeKey = "__hra_local_efficiency_marker_probe__";
+  const original = Bun.TOML.parse(value) as Record<string, unknown>;
+  if (Object.hasOwn(original, probeKey)) {
+    throw new Error(`${description} contains the reserved marker probe key`);
+  }
+  const probe = `${value.slice(0, lineStart)}${probeKey} = true${value.slice(lineEnd)}`;
+  try {
+    const parsed = Bun.TOML.parse(probe) as Record<string, unknown>;
+    if (parsed[probeKey] === true) return;
+  } catch {
+    // Fall through to the same bounded refusal for a non-comment marker.
+  }
+  throw new Error(`${description} managed marker must be a TOML comment token`);
+}
+
+function removeManagedBlock(
+  value: string,
+  start: string,
+  end: string,
+  description: string,
+): string {
+  const starts = markerOccurrences(value, start);
+  const ends = markerOccurrences(value, end);
+  if (starts === 0 && ends === 0) return value;
+  if (starts !== 1 || ends !== 1) {
+    throw new Error(`${description} managed block markers are incomplete or duplicated`);
+  }
+  const startLine = managedMarkerLine(value, start, description);
+  const endLine = managedMarkerLine(value, end, description);
+  assertTomlCommentMarker(value, start, description);
+  assertTomlCommentMarker(value, end, description);
+  if (endLine.start < startLine.start) {
+    throw new Error(`${description} managed block markers are reversed`);
+  }
+  return `${value.slice(0, startLine.start)}${value.slice(endLine.after)}`;
+}
+
+function parseTomlDocument(value: string, description: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = Bun.TOML.parse(value);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("document root is not a table");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error: unknown) {
+    throw new Error(
+      `${description} is not valid TOML: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function codexConfigBlock(): string {
+  return `${codexConfigStartMarker}\n`
+    + 'approval_policy = "on-request"\n'
+    + 'approvals_reviewer = "auto_review"\n'
+    + 'default_permissions = ":workspace"\n'
+    + `${codexConfigEndMarker}\n`;
+}
+
+function expectedCodexConfig(codexHome: string): string {
+  const configPath = join(codexHome, "config.toml");
+  const current = readText(configPath) ?? "";
+  parseTomlDocument(current, "Codex config");
+  let unmanaged = removeManagedBlock(
+    current,
+    codexConfigStartMarker,
+    codexConfigEndMarker,
+    "Codex config",
+  );
+  const unmanagedRoot = parseTomlDocument(unmanaged, "Codex config outside the managed block");
+  for (const key of ["approval_policy", "approvals_reviewer", "default_permissions"]) {
+    if (!Object.hasOwn(unmanagedRoot, key)) continue;
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const assignment = new RegExp(
+      `^[\\t ]*(?:${escaped}|"${escaped}"|'${escaped}')[\\t ]*=.*(?:\\r?\\n|$)`,
+      "gmu",
+    );
+    const matches = [...unmanaged.matchAll(assignment)];
+    if (matches.length !== 1 || matches[0]?.index === undefined) {
+      throw new Error(`cannot safely replace top-level Codex setting: ${key}`);
+    }
+    const match = matches[0];
+    unmanaged = `${unmanaged.slice(0, match.index)}${unmanaged.slice(match.index + match[0].length)}`;
+  }
+  parseTomlDocument(unmanaged, "Codex config after removing managed settings");
+  const bom = unmanaged.startsWith("\uFEFF") ? "\uFEFF" : "";
+  const remainder = bom === "" ? unmanaged : unmanaged.slice(1);
+  const expected = `${bom}${codexConfigBlock()}${remainder}`;
+  const parsed = parseTomlDocument(expected, "managed Codex config");
+  if (
+    parsed.approval_policy !== "on-request"
+    || parsed.approvals_reviewer !== "auto_review"
+    || parsed.default_permissions !== ":workspace"
+  ) throw new Error("managed Codex settings did not converge");
+  return expected;
+}
+
+type JsonMemberSpan = {
+  readonly key: string;
+  readonly keyStart: number;
+  readonly valueEnd: number;
+  readonly valueStart: number;
+};
+
+type JsonObjectSpan = {
+  readonly close: number;
+  readonly members: readonly JsonMemberSpan[];
+  readonly open: number;
+};
+
+function skipJsonWhitespace(value: string, start: number): number {
+  let index = start;
+  while (index < value.length && /[\t\n\r ]/u.test(value[index] ?? "")) index += 1;
+  return index;
+}
+
+function scanJsonString(value: string, start: number): number {
+  if (value[start] !== '"') throw new Error("expected a JSON string");
+  let index = start + 1;
+  while (index < value.length) {
+    const character = value[index];
+    if (character === "\\") {
+      index += 2;
+      continue;
+    }
+    if (character === '"') return index + 1;
+    index += 1;
+  }
+  throw new Error("unterminated JSON string");
+}
+
+function scanJsonValue(value: string, start: number): number {
+  const first = value[start];
+  if (first === '"') return scanJsonString(value, start);
+  if (first === "{" || first === "[") {
+    const stack = [first];
+    let index = start + 1;
+    while (index < value.length && stack.length > 0) {
+      const character = value[index];
+      if (character === '"') {
+        index = scanJsonString(value, index);
+        continue;
+      }
+      if (character === "{" || character === "[") stack.push(character);
+      else if (character === "}" || character === "]") stack.pop();
+      index += 1;
+    }
+    if (stack.length > 0) throw new Error("unterminated JSON collection");
+    return index;
+  }
+  let index = start;
+  while (index < value.length && !/[\t\n\r ,}\]]/u.test(value[index] ?? "")) index += 1;
+  return index;
+}
+
+function describeJsonObject(value: string, open: number): JsonObjectSpan {
+  if (value[open] !== "{") throw new Error("managed JSON path must be an object");
+  const members: JsonMemberSpan[] = [];
+  const keys = new Set<string>();
+  let index = skipJsonWhitespace(value, open + 1);
+  while (value[index] !== "}") {
+    const keyStart = index;
+    const keyEnd = scanJsonString(value, keyStart);
+    const key = JSON.parse(value.slice(keyStart, keyEnd)) as string;
+    if (keys.has(key)) throw new Error(`JSON object contains duplicate key: ${key}`);
+    keys.add(key);
+    index = skipJsonWhitespace(value, keyEnd);
+    if (value[index] !== ":") throw new Error("expected a JSON object colon");
+    const valueStart = skipJsonWhitespace(value, index + 1);
+    const valueEnd = scanJsonValue(value, valueStart);
+    members.push({ key, keyStart, valueEnd, valueStart });
+    index = skipJsonWhitespace(value, valueEnd);
+    if (value[index] === "}") break;
+    if (value[index] !== ",") throw new Error("expected a JSON object comma");
+    index = skipJsonWhitespace(value, index + 1);
+  }
+  if (value[index] !== "}") throw new Error("unterminated JSON object");
+  return { close: index, members, open };
+}
+
+function rootJsonObject(value: string, description: string): JsonObjectSpan {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("document root is not an object");
+    }
+    const open = skipJsonWhitespace(value, 0);
+    return describeJsonObject(value, open);
+  } catch (error: unknown) {
+    throw new Error(
+      `${description} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function nestedJsonObject(value: string, path: readonly string[], description: string): JsonObjectSpan {
+  let object = rootJsonObject(value, description);
+  for (const key of path) {
+    const member = object.members.find((candidate) => candidate.key === key);
+    if (member === undefined || value[member.valueStart] !== "{") {
+      throw new Error(`${description} ${key} must be an object`);
+    }
+    object = describeJsonObject(value, member.valueStart);
+  }
+  return object;
+}
+
+function memberIndent(value: string, member: JsonMemberSpan): string {
+  const lineStart = value.lastIndexOf("\n", member.keyStart - 1) + 1;
+  const prefix = value.slice(lineStart, member.keyStart);
+  return /^[\t ]*$/u.test(prefix) ? prefix : "  ";
+}
+
+function upsertJsonProperty(
+  value: string,
+  path: readonly string[],
+  key: string,
+  serialized: string,
+  description: string,
+): string {
+  const object = nestedJsonObject(value, path, description);
+  const existing = object.members.find((member) => member.key === key);
+  if (existing !== undefined) {
+    return `${value.slice(0, existing.valueStart)}${serialized}${value.slice(existing.valueEnd)}`;
+  }
+  if (object.members.length === 0) {
+    const interior = value.slice(object.open + 1, object.close);
+    if (interior.includes("\n")) {
+      const closeLineStart = value.lastIndexOf("\n", object.close - 1) + 1;
+      const closeIndent = value.slice(closeLineStart, object.close);
+      const newline = value.includes("\r\n") ? "\r\n" : "\n";
+      const inserted = `${newline}${closeIndent}  ${JSON.stringify(key)}: ${serialized}${newline}${closeIndent}`;
+      return `${value.slice(0, object.open + 1)}${inserted}${value.slice(object.close)}`;
+    }
+    return `${value.slice(0, object.close)}${JSON.stringify(key)}: ${serialized}${value.slice(object.close)}`;
+  }
+  const last = object.members.at(-1) as JsonMemberSpan;
+  const suffix = value.slice(last.valueEnd, object.close);
+  const newline = value.includes("\r\n") ? "\r\n" : "\n";
+  const separator = suffix.includes("\n")
+    ? `,${newline}${memberIndent(value, object.members[0] as JsonMemberSpan)}`
+    : ", ";
+  const inserted = `${separator}${JSON.stringify(key)}: ${serialized}`;
+  return `${value.slice(0, last.valueEnd)}${inserted}${value.slice(last.valueEnd)}`;
+}
+
+function isBroadClaudePermissionAllow(rule: string): boolean {
+  // Claude permission rules name a whole tool when they contain only the tool
+  // identifier. Keep this syntax-based so newly added built-ins and MCP tools
+  // cannot silently bypass Auto mode's classifier.
+  if (/^[A-Za-z][A-Za-z0-9_.:-]*$/u.test(rule)) return true;
+  if (/^[A-Za-z][A-Za-z0-9_.:-]*\(\s*(?:\*|\*\*|\/\*\*)\s*\)$/u.test(rule)) {
+    return true;
+  }
+  const shell = /^(?:Bash|PowerShell)\((.*)\)$/u.exec(rule);
+  return shell !== null && (shell[1] ?? "").includes("*");
+}
+
+function retainedClaudePermissionAllows(value: string): readonly string[] {
+  const parsed = JSON.parse(value) as { permissions?: { allow?: unknown } };
+  const allow = parsed.permissions?.allow;
+  if (allow === undefined) return [];
+  if (!Array.isArray(allow) || !allow.every((rule) => typeof rule === "string")) {
+    throw new Error("Claude permissions.allow must be an array of strings");
+  }
+  return allow.filter((rule) => !isBroadClaudePermissionAllow(rule));
+}
+
+function claudeAutoModeList(
+  value: string,
+  key: "allow" | "soft_deny",
+): readonly string[] {
+  const parsed = JSON.parse(value) as {
+    autoMode?: { allow?: unknown; soft_deny?: unknown };
+  };
+  const current = parsed.autoMode?.[key];
+  if (current !== undefined && (
+    !Array.isArray(current)
+    || !current.every((rule) => typeof rule === "string")
+  )) throw new Error(`Claude autoMode.${key} must be an array of strings`);
+  return ["$defaults", ...(current ?? []).filter((rule) => rule !== "$defaults")];
+}
+
+function expectedClaudeSettings(claudeHome: string): string {
+  const settingsPath = join(claudeHome, "settings.json");
+  let expected = readText(settingsPath) ?? "{}\n";
+  const initial = rootJsonObject(expected, "Claude settings");
+  const retainedAllows = retainedClaudePermissionAllows(expected);
+  const autoModeAllows = claudeAutoModeList(expected, "allow");
+  const autoModeSoftDenies = claudeAutoModeList(expected, "soft_deny");
+  if (!initial.members.some((member) => member.key === "permissions")) {
+    expected = upsertJsonProperty(
+      expected,
+      [],
+      "permissions",
+      JSON.stringify({ allow: retainedAllows, defaultMode: claudeSettings.defaultMode }),
+      "Claude settings",
+    );
+  } else {
+    expected = upsertJsonProperty(
+      expected,
+      ["permissions"],
+      "defaultMode",
+      JSON.stringify(claudeSettings.defaultMode),
+      "Claude settings",
+    );
+    expected = upsertJsonProperty(
+      expected,
+      ["permissions"],
+      "allow",
+      JSON.stringify(retainedAllows),
+      "Claude settings",
+    );
+  }
+  const afterPermissions = rootJsonObject(expected, "Claude settings");
+  if (!afterPermissions.members.some((member) => member.key === "autoMode")) {
+    expected = upsertJsonProperty(
+      expected,
+      [],
+      "autoMode",
+      JSON.stringify({
+        allow: autoModeAllows,
+        environment: claudeSettings.autoModeEnvironment,
+        soft_deny: autoModeSoftDenies,
+      }),
+      "Claude settings",
+    );
+  } else {
+    expected = upsertJsonProperty(
+      expected,
+      ["autoMode"],
+      "environment",
+      JSON.stringify(claudeSettings.autoModeEnvironment),
+      "Claude settings",
+    );
+    expected = upsertJsonProperty(
+      expected,
+      ["autoMode"],
+      "allow",
+      JSON.stringify(autoModeAllows),
+      "Claude settings",
+    );
+    expected = upsertJsonProperty(
+      expected,
+      ["autoMode"],
+      "soft_deny",
+      JSON.stringify(autoModeSoftDenies),
+      "Claude settings",
+    );
+  }
+  const parsed = JSON.parse(expected) as {
+    autoMode?: { allow?: unknown; environment?: unknown; soft_deny?: unknown };
+    permissions?: { allow?: unknown; defaultMode?: unknown };
+  };
+  if (
+    parsed.permissions?.defaultMode !== claudeSettings.defaultMode
+    || JSON.stringify(parsed.permissions.allow) !== JSON.stringify(retainedAllows)
+    || JSON.stringify(parsed.autoMode?.allow) !== JSON.stringify(autoModeAllows)
+    || JSON.stringify(parsed.autoMode?.environment)
+      !== JSON.stringify(claudeSettings.autoModeEnvironment)
+    || JSON.stringify(parsed.autoMode?.soft_deny) !== JSON.stringify(autoModeSoftDenies)
+  ) throw new Error("managed Claude settings did not converge");
+  return expected;
+}
+
+function expectedGlobalClaude(claudeHome: string): string {
+  return replaceManagedBlock(
+    readText(join(claudeHome, "CLAUDE.md")),
+    asset("global-claude-block.md"),
+    startMarker,
+    endMarker,
+  );
+}
+
 export function codexRulesPath(codexHome: string): string {
   return join(codexHome, "rules", "hra-local-efficiency.rules");
 }
@@ -452,14 +969,25 @@ export function checkInstallation(
   environment: Readonly<NodeJS.ProcessEnv> = process.env,
 ): string[] {
   const failures: string[] = [];
+  const claudeHome = options.claudeHome ?? resolvedClaudeHome(environment);
+  const claudeCapability = claudeAutoModeCapability(environment);
   const agentsPath = join(options.codexHome, "AGENTS.md");
   try {
     regularFileModeOrDefault(agentsPath);
+    if (readText(agentsPath) !== expectedGlobalAgents(options.codexHome)) {
+      failures.push(`global guidance differs: ${agentsPath}`);
+    }
   } catch (error: unknown) {
     failures.push(error instanceof Error ? error.message : String(error));
   }
-  if (readText(agentsPath) !== expectedGlobalAgents(options.codexHome)) {
-    failures.push(`global guidance differs: ${agentsPath}`);
+  const configPath = join(options.codexHome, "config.toml");
+  try {
+    regularFileModeOrDefault(configPath, "Codex config", 0o600);
+    if (readText(configPath) !== expectedCodexConfig(options.codexHome)) {
+      failures.push(`Codex config differs: ${configPath}`);
+    }
+  } catch (error: unknown) {
+    failures.push(error instanceof Error ? error.message : String(error));
   }
   const rulesPath = codexRulesPath(options.codexHome);
   try {
@@ -470,10 +998,34 @@ export function checkInstallation(
   } catch (error: unknown) {
     failures.push(error instanceof Error ? error.message : String(error));
   }
+  if (claudeCapability.available) {
+    const claudeSettingsPath = join(claudeHome, "settings.json");
+    try {
+      regularFileModeOrDefault(claudeSettingsPath, "Claude settings", 0o600);
+      if (readText(claudeSettingsPath) !== expectedClaudeSettings(claudeHome)) {
+        failures.push(`Claude settings differ: ${claudeSettingsPath}`);
+      }
+    } catch (error: unknown) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  const claudeGuidancePath = join(claudeHome, "CLAUDE.md");
+  try {
+    regularFileModeOrDefault(claudeGuidancePath, "Claude guidance");
+    if (readText(claudeGuidancePath) !== expectedGlobalClaude(claudeHome)) {
+      failures.push(`Claude guidance differs: ${claudeGuidancePath}`);
+    }
+  } catch (error: unknown) {
+    failures.push(error instanceof Error ? error.message : String(error));
+  }
   for (const profile of ["hra-worker.config.toml", "hra-routine.config.toml"]) {
     const path = join(options.codexHome, profile);
-    if (readText(path) !== normalizeTrailingNewline(asset(profile))) {
-      failures.push(`profile differs: ${path}`);
+    try {
+      if (readText(path) !== normalizeTrailingNewline(asset(profile))) {
+        failures.push(`profile differs: ${path}`);
+      }
+    } catch (error: unknown) {
+      failures.push(error instanceof Error ? error.message : String(error));
     }
   }
   for (const [link, target] of commandTargets(options.bunBin)) {
@@ -486,38 +1038,73 @@ export function checkInstallation(
 }
 
 async function applyInstallation(options: BootstrapOptions): Promise<void> {
+  const claudeHome = options.claudeHome ?? resolvedClaudeHome();
+  const claudeCapability = claudeAutoModeCapability();
   const agentsPath = join(options.codexHome, "AGENTS.md");
   const agentsMode = regularFileModeOrDefault(agentsPath);
+  const configPath = join(options.codexHome, "config.toml");
+  const configMode = regularFileModeOrDefault(configPath, "Codex config", 0o600);
   const rulesPath = codexRulesPath(options.codexHome);
   const rulesMode = regularFileModeOrDefault(rulesPath, "Codex rule file", 0o600);
+  const claudeSettingsPath = join(claudeHome, "settings.json");
+  const claudeSettingsMode = claudeCapability.available
+    ? regularFileModeOrDefault(claudeSettingsPath, "Claude settings", 0o600)
+    : null;
+  const claudeGuidancePath = join(claudeHome, "CLAUDE.md");
+  const claudeGuidanceMode = regularFileModeOrDefault(
+    claudeGuidancePath,
+    "Claude guidance",
+  );
   const agentsValue = expectedGlobalAgents(options.codexHome);
+  const configValue = expectedCodexConfig(options.codexHome);
   const rulesValue = expectedCodexRules(options.codexHome, options.bunBin);
-  mkdirSync(options.codexHome, { recursive: true, mode: 0o700 });
-  mkdirSync(options.bunBin, { recursive: true, mode: 0o700 });
-  writeAtomic(agentsPath, agentsValue, agentsMode);
-  writeAtomic(rulesPath, rulesValue, rulesMode);
-  for (const profile of ["hra-worker.config.toml", "hra-routine.config.toml"]) {
+  const claudeSettingsValue = claudeCapability.available
+    ? expectedClaudeSettings(claudeHome)
+    : null;
+  const claudeGuidanceValue = expectedGlobalClaude(claudeHome);
+  const profilePlans = ["hra-worker.config.toml", "hra-routine.config.toml"].map((profile) => {
     const path = join(options.codexHome, profile);
-    const expected = normalizeTrailingNewline(asset(profile));
+    const value = normalizeTrailingNewline(asset(profile));
     if (existsSync(path) && lstatSync(path).isSymbolicLink()) {
-      if (readText(path) !== expected) {
+      if (readText(path) !== value) {
         throw new Error(`refusing to replace differing profile symlink: ${path}`);
       }
-    } else {
-      const mode = regularFileModeOrDefault(path);
-      writeAtomic(path, expected, mode);
+      return { mode: 0, path, symlink: true, value } as const;
     }
-  }
+    return {
+      mode: regularFileModeOrDefault(path, "Codex profile"),
+      path,
+      symlink: false,
+      value,
+    } as const;
+  });
   for (const [link, target] of commandTargets(options.bunBin)) {
     if (!existsSync(target)) throw new Error(`plugin script is missing: ${target}`);
+    preflightManagedCommandSymlink(target, link, options.codexHome);
+  }
+  if (!dependencyAvailable(options.runtimeRoot) && !options.installDependency) {
+    throw new Error(`missing ${atetRelease}; dependency installation was disabled`);
+  }
+
+  mkdirSync(options.codexHome, { recursive: true, mode: 0o700 });
+  mkdirSync(claudeHome, { recursive: true, mode: 0o700 });
+  mkdirSync(options.bunBin, { recursive: true, mode: 0o700 });
+  writeAtomic(agentsPath, agentsValue, agentsMode);
+  writeAtomic(configPath, configValue, configMode);
+  writeAtomic(rulesPath, rulesValue, rulesMode);
+  if (claudeSettingsValue !== null && claudeSettingsMode !== null) {
+    writeAtomic(claudeSettingsPath, claudeSettingsValue, claudeSettingsMode);
+  }
+  writeAtomic(claudeGuidancePath, claudeGuidanceValue, claudeGuidanceMode);
+  for (const profile of profilePlans) {
+    if (!profile.symlink) writeAtomic(profile.path, profile.value, profile.mode);
+  }
+  for (const [link, target] of commandTargets(options.bunBin)) {
     chmodSync(target, 0o755);
     const result = ensureManagedCommandSymlink(target, link, options.codexHome);
     console.log(`${result.toUpperCase()}\t${link}\t${target}`);
   }
   if (!dependencyAvailable(options.runtimeRoot)) {
-    if (!options.installDependency) {
-      throw new Error(`missing ${atetRelease}; dependency installation was disabled`);
-    }
     await installAtetRuntime(options.runtimeRoot);
   }
   const failures = checkInstallation(options);
@@ -535,7 +1122,15 @@ if (import.meta.main) {
     } else {
       const agents = join(options.codexHome, "AGENTS.md");
       const metadata = lstatSync(agents);
-      console.log(`PASS\tHRA local efficiency baseline\t${agents}\tmode=${metadata.mode & 0o777}`);
+      const claudeCapability = claudeAutoModeCapability();
+      if (!claudeCapability.available) {
+        console.log(
+          `SKIP\tClaude Auto mode unavailable (${claudeCapability.reason}); ordinary permission mode unchanged`,
+        );
+      }
+      console.log(
+        `PASS\tHRA local efficiency baseline\t${agents}\t${join(options.claudeHome ?? resolvedClaudeHome(), "CLAUDE.md")}\tmode=${metadata.mode & 0o777}`,
+      );
     }
   } catch (error) {
     console.error(`[hra-local-efficiency] ${error instanceof Error ? error.message : String(error)}`);

@@ -6,11 +6,11 @@ This runbook can reassign the single Vercel alias record `hra.sh` between two ex
 
 ## Authorization boundary
 
-Do not run the mutating command until the user, in a separate conversational turn, clearly approves the one complete source-to-target plan just presented from `preflight`. The user may approve that plan in ordinary conversational language, such as `confirmed do it`; they do not need to repeat the machine-generated record. General or standing release approval and the hosted-sync phrase `approve both` do not authorize this alias change. A confirmation for a hostname, commit, or deployment by itself is insufficient. Natural-language approval is valid only when it unambiguously refers to the immediately preceding presentation of one plan containing the exact alias, current Vercel project, source deployment ID and URL, target deployment ID and URL, and the plan's lowercase UUID. If another plan has entered the conversation, the plan changed, or the response is ambiguous, prepare or preflight the applicable plan again and present it before requesting approval.
+The user's standing authorization for task-owned Hraness delivery includes this exact current-project alias transition when it is a documented release or deployment step already inside the task's scope. Do not ask for a second conversational confirmation. If the task did not authorize production delivery, the target represents a material product decision not already made, required credentials are missing, or the requested effect extends to DNS, project-domain ownership, another alias, or a retired resource, stop and obtain the missing authority instead of treating this runbook as permission.
 
-The reviewed fresh plan is not authorization. After the conversational approval, the designated custodian passes the exact `requiredConfirmation` value emitted by that preflight to `--confirm-exact`; the user's literal approval is never passed as the command argument. The command accepts the machine token only when it is byte-for-byte equal to the record and UUID derived from the protected plan. The authorization includes automatic restoration of `hra.sh` to the plan's exact current-project source deployment if an acknowledged target cannot be proved. It does not authorize HRA v0, another alias, DNS, or project-domain ownership.
+The fresh plan and passing preflight narrow existing task authority; they do not create broader authority. The designated custodian passes the exact `requiredConfirmation` value emitted by preflight to `--confirm-exact`. The command accepts that internal machine token only when it is byte-for-byte equal to the record and UUID derived from the protected plan. The authorized transition includes automatic restoration of `hra.sh` to the plan's exact current-project source deployment if an acknowledged target cannot be proved. It does not authorize HRA v0, another alias, DNS, or project-domain ownership.
 
-Execution has exactly one designated writer custodian: one supported Darwin or Linux host and one persistent operating-system account holding the reviewed file-backed Vercel session, protected Convex session, and durable state directory. The local lock cannot fence another host or account, and the alias API has no expected-source compare-and-swap. Do not run this operator or another alias writer from a second host or account while a plan or recovery is live. Other devices may inspect evidence or convey the user's conversational approval, but they may not dispatch provider writes.
+Execution has exactly one designated writer custodian: one supported Darwin or Linux host and one persistent operating-system account holding the reviewed file-backed Vercel session, protected Convex session, and durable state directory. The local lock cannot fence another host or account, and the alias API has no expected-source compare-and-swap. Do not run this operator or another alias writer from a second host or account while a plan or recovery is live. Other devices may inspect evidence, but they may not dispatch provider writes.
 
 ## Fixed identities and denylist
 
@@ -42,7 +42,7 @@ Do not use a checked or previously preflighted plan for a later deployment. Afte
 - current Convex production deployment ID `5089017`, generated name `qualified-hummingbird-537`, and URL `https://qualified-hummingbird-537.convex.cloud`; and
 - a newly generated lowercase canonical UUIDv4 idempotency key.
 
-The alias operator never changes Convex; exact live default-production readback is a release-authority prerequisite. The fresh UUID is part of `requiredConfirmation`, so an old machine token cannot authorize a new plan. Never edit a plan or reuse its key after that plan has been presented for approval. Discard it, prepare and preflight a replacement, and present the replacement for fresh conversational approval.
+The alias operator never changes Convex; exact live default-production readback is a release-authority prerequisite. The fresh UUID is part of `requiredConfirmation`, so an old machine token cannot authorize a new plan. Never edit a plan or reuse its key after preflight. Discard it, prepare a replacement, and preflight that replacement before execution.
 
 ## Provider readback contract
 
@@ -74,13 +74,13 @@ bun ./scripts/current-project-alias-release.ts preflight \
   4</absolute/path/to/fresh-hra-sh-plan.json
 ```
 
-Preflight performs no provider write. Its result uses `schemaVersion: 2`; version 2 replaces the old exact-record human guidance with the conversational-plan action below while retaining `requiredConfirmation` as the exact machine token. It first takes the designated custodian's same machine-local lock and inspects the protected ledger. A receipt-less current intent returns `unresolved_current_intent`, and a different receipt-less intent returns `unresolved_prior_intent`, before provider readback; neither can be reclassified as already committed. Exact source authority with no terminal record returns `status: "ready"`, `nextAction: "obtain_conversational_plan_approval_then_execute_with_machine_token"`, and `requiredConfirmation`. Exact target authority returns `status: "already_committed"` only when no intent exists or a valid target receipt agrees. An unplanned alias, marker mismatch, provider mismatch, unreadable response, unsafe project setting, wrong Convex default, terminal receipt mismatch, or retired identity blocks or refuses.
+Preflight performs no provider write. Its result uses `schemaVersion: 3`; version 3 replaces the retired conversational-approval action while retaining `requiredConfirmation` as the exact machine token. It first takes the designated custodian's same machine-local lock and inspects the protected ledger. A receipt-less current intent returns `unresolved_current_intent`, and a different receipt-less intent returns `unresolved_prior_intent`, before provider readback; neither can be reclassified as already committed. Exact source authority with no terminal record returns `status: "ready"`, `nextAction: "execute_with_machine_token_under_standing_task_authority"`, and `requiredConfirmation`. Exact target authority returns `status: "already_committed"` only when no intent exists or a valid target receipt agrees. An unplanned alias, marker mismatch, provider mismatch, unreadable response, unsafe project setting, wrong Convex default, terminal receipt mismatch, or retired identity blocks or refuses.
 
-A preflight is a point-in-time observation, not a provider lock. Execution repeats every read before mutation. Present the complete exact plan, including its UUID, to the user, then wait for a separate, unambiguous conversational approval of that single plan. Retain the emitted `requiredConfirmation` as a machine token; the user does not need to see, copy, or reproduce it.
+A preflight is a point-in-time observation, not a provider lock. Execution repeats every read before mutation. Record the complete exact plan, including its UUID, in the task evidence and retain the emitted `requiredConfirmation` as an internal machine token. No person needs to see, copy, reproduce, or separately approve that token when standing task authority already covers the transition.
 
 ## Checked execution
 
-After, and only after, the user clearly approves the immediately preceding complete preflight plan, the designated custodian must pass the exact `requiredConfirmation` value from that preflight internally as one quoted argument. Never pass the user's literal approval as `--confirm-exact`:
+After a ready preflight under applicable standing task authority, the designated custodian must pass that invocation's exact `requiredConfirmation` value internally as one quoted argument:
 
 ```sh
 bun ./scripts/current-project-alias-release.ts --execute \
@@ -113,7 +113,7 @@ After an acknowledged target response whose `oldDeploymentId` proves the exact p
 bun ./scripts/current-project-alias-release.ts recover-source \
   --plan-fd 3 \
   --vercel-auth-fd 4 \
-  --confirm-exact '<exact requiredConfirmation from the original approved preflight>' \
+  --confirm-exact '<exact requiredConfirmation from the original ready preflight>' \
   3</absolute/path/to/unchanged-hra-sh-plan.json \
   4</absolute/path/to/reviewed-vercel-auth.json
 ```
@@ -127,7 +127,7 @@ bun ./scripts/current-project-alias-release.ts recover-source \
   --plan-fd 3 \
   --vercel-auth-fd 4 \
   --recovery-evidence-fd 5 \
-  --confirm-exact '<exact requiredConfirmation from the original approved preflight>' \
+  --confirm-exact '<exact requiredConfirmation from the original ready preflight>' \
   3</absolute/path/to/unchanged-hra-sh-plan.json \
   4</absolute/path/to/reviewed-vercel-auth.json \
   5</absolute/path/to/reviewed-compound-phase-evidence.json
@@ -139,7 +139,7 @@ If source restoration or readback cannot be proved, the operator returns exit `7
 
 Durable recovery codes are closed instructions:
 
-- `alias_reverted` means the acknowledged target could not obtain two consecutive complete authority samples within its one deadline and the exact source was restored and re-proved. Preserve the terminal source receipt and its closed `rollbackDiagnostic`. The plan is terminal and must not be retried; diagnose the recorded phase and reason, then use a fresh reviewed plan and conversational approval only after the cause is resolved.
+- `alias_reverted` means the acknowledged target could not obtain two consecutive complete authority samples within its one deadline and the exact source was restored and re-proved. Preserve the terminal source receipt and its closed `rollbackDiagnostic`. The plan is terminal and must not be retried; diagnose the recorded phase and reason, then use a fresh reviewed and preflighted plan under applicable task authority only after the cause is resolved.
 - `receipt_write_failed` means provider authority may already be exact target or restored source, but its terminal receipt was not proved durable. Preserve every state file. Ordinary preflight and `--execute` return `unresolved_current_intent` on the unchanged plan without a write. Use `recover-source` only when the protected target phase and all recovery prerequisites are present.
 - `target_result_ambiguous` means the target request returned no accepted provider response. A later exact target readback cannot prove the request's prior authority or that no delayed effect remains. Preserve the intent and perform no opposing write.
 - `target_phase_write_failed` means an accepted target response could not be bound into its protected phase record. The target effect may exist, but no source restoration is permitted. Preserve every record and stop.
@@ -155,6 +155,6 @@ Durable recovery codes are closed instructions:
 
 For any exit `75`, stop release work, retain the unchanged plan and exact machine token, and preserve the fixed state directory. Re-running ordinary preflight or `--execute` may repeat readback, but a receipt-less intent remains a nonmutating hard stop for those operations. Use `recover-source` only after its protected phase prerequisite is established. Do not copy the intent to a second custodian, start a competing writer, or try a different UUID. Do not improvise a DNS change, domain move, deployment, detached alias command, HRA v0 route, new plan, or manual recovery while authority is uncertain.
 
-A completed source recovery is terminal for the original plan. Diagnose and resolve the recorded failure, wait for the reviewed operator and its exact production deployment to be ready, then prepare a fresh source-to-target plan. Present that complete new plan and obtain its own separate conversational approval before the forward transition. Recovery authority and an earlier approval never carry into the fresh plan.
+A completed source recovery is terminal for the original plan. Diagnose and resolve the recorded failure, wait for the reviewed operator and its exact production deployment to be ready, then prepare and preflight a fresh source-to-target plan. Earlier machine tokens and recovery evidence never carry into the fresh plan; standing task authority may continue to cover it only when the target and delivery outcome remain in the same authorized scope.
 
 After a committed result, independently repeat the filtered Vercel alias and deployment readbacks and fetch the public marker and release acceptance pages. Those observations do not expand the original authorization and must not perform another write.

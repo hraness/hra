@@ -218,29 +218,29 @@ describe("public content contract", () => {
     }
   });
 
-  test("marks the local release ready while the website and open hosted sync stay live", () => {
-    expect(publicReleaseState).toBe("release-ready");
+  test("marks the local release, website, and open hosted sync live", () => {
+    expect(publicReleaseState).toBe("live");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "release-ready",
+      betaTag: "live",
       githubRepository: "live",
       hostedSync: "live",
       website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("The local CLI v0.5.0 is release-ready for macOS and Linux");
+    expect(renderReadmeMarkdown()).toContain("The local CLI v0.5.0 is live for macOS and Linux");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Immutable local CLI release candidate; hosted sync live as an open beta");
-      expect(surface).toContain("works once GitHub exposes the immutable");
-      expect(surface).toContain("public CLI stays immutable once admitted");
+      expect(surface).toContain("Immutable local CLI beta; hosted sync live as an open beta");
+      expect(surface).toContain("uses the published immutable");
+      expect(surface).toContain("public CLI remains immutable");
       expect(surface).not.toContain("beta-not-yet-live");
       expect(surface).not.toContain("not yet live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("become installable through the exact command above once its GitHub Release exists");
+      expect(surface).toContain("are installable through the exact command above");
       expect(surface).not.toContain("install command becomes usable");
       expect(surface).not.toContain("Beta not yet live");
       expect(surface).not.toContain("No published `v0.5.0` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Install after the v0.5.0 beta tag is live");
-    expect(renderLlmsText()).not.toContain("Install the live v0.5.0 beta");
+    expect(renderLlmsText()).toContain("Install the live v0.5.0 beta");
+    expect(renderLlmsText()).not.toContain("Install after the v0.5.0 beta tag is live");
   });
 
   test("states one hosted sign-up claim everywhere and switches it in one place", () => {
