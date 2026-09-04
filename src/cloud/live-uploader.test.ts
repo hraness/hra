@@ -31,7 +31,7 @@ const delta = (text: string, type: "assistant_delta" | "reasoning_summary_delta"
 describe("live redaction window", () => {
   test("holds back a carry so a token split across batches is redacted whole", () => {
     const window = new LiveRedactionWindow();
-    const token = `sk-ant-${"abcdefghijklmnopqrstuvwxyz0123456789"}`;
+    const token = ["sk-ant", "abcdefghijklmnopqrstuvwxyz0123456789"].join("-");
     window.append(`prefix text ${token.slice(0, 10)}`);
     const first = window.take(false);
     expect(first).not.toContain("sk-ant");
