@@ -247,6 +247,8 @@ hra status --json
 
 `hra session state <session> --json` returns the daemon's latest classification of who must act next: working, needs approval, needs an answer, needs a human action, done, done with followups, done with caveats, or aborted, with an attention flag, a short reason, and a monotonic revision. The daemon classifies the final assistant text of every completed turn with ordered lexical rules in which human-action cues beat approval cues, so a login or a code from email never reads as consent, and it reclassifies when a provider interaction is requested or resolved. The same classification is appended to the session event stream as a `session_state` event.
 
+Autorespond answers provider approvals on your behalf. By default every session runs in approval mode `auto:all`: command, file-change, and permission approvals are accepted immediately at once scope, never for the session, and each answer leaves an evidence row with the approval class, decision, mode, latency, and outcome. `hra autorespond workspace` keeps commands and file changes automatic but escalates network, MCP, and unknown-tool permissions to you; `hra autorespond off` restores manual approvals; add `--session <session>` to override one session and `default` to clear the override. Questions and MCP forms are never answered automatically. A session stops autoresponding after three consecutive answers without a human message, ten in an hour, or forty in a day, and `hra autorespond status` shows the counters and the last twenty evidence rows.
+
 For snapshot-to-stream continuity, start selected-session monitoring at the atomic status cursor. `hra session watch <session> [--cursor <cursor>]` renders a bounded human stream by default; add `--jsonl` for a machine stream. Watch is a presentation alias over the existing session event stream, and it drains each output page before advancing its internal cursor. The shell drains every signed pending-interaction continuation page before following newer committed ledger events from the status cursor. Standalone human watch buffers that initial guidance until enumeration is complete, caps the atomic bootstrap at 1 MiB of UTF-8, and writes none of it if enumeration or the bound fails. Resolution guidance appears only from a complete current interaction record and only for a supported decision; an event-only interaction notice points to the exact show command without proposing a mutation. Those events cover bounded lifecycle, tool, interaction, warning, error, and terminal updates, but the ledger is not a complete wake source for every authority transition. Agents that need exact current authority must also repeat bounded session status or pending-interaction reads. Human watch renders assistant and provider-visible reasoning-summary text only after observing that item's start boundary, then redacts credentials and absolute paths with state carried across chunks and interleaved events. A mid-item join omits ambiguous delta suffixes until the next item starts. Gaps, shutdown, malformed repeated starts, and exhausted redaction capacity discard undecided tails with an explicit notice rather than releasing text whose boundary cannot be proved.
 
 ```text
@@ -317,7 +319,7 @@ The machine that created a provider session remains its only executor in v1. It 
 
 Paired machines can read the encrypted projection and submit bounded send, queue, steer, stop, preset, and Fast commands. The origin daemon claims each command by lease generation and idempotency key. Commands remain pending within their deadline while the origin machine is offline; another machine cannot take over or become a second provider writer.
 
-`hra remote show` includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary. Provider request IDs, permission values, MCP fields, protected answers, and response digests remain local. Resolve a pending callback on its execution device; remote interaction responses are unavailable in v1.
+`hra remote show` includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary. Provider request IDs, permission values, MCP fields, protected answers, and response digests remain local. A pending command or file-change approval can be decided from another device with `hra remote resolve <cloud-session> --interaction <id> --revision <n> --decision once|decline|cancel`: the encrypted decision travels as a remote command in its own scheduling lane, and the execution device applies it only when the interaction is still pending at that revision, belongs to that session, is inside its deadline, offers that decision, and the requesting device is still active. Session scope and secret answers never travel remotely. `hra remote send --or-steer` lets the execution device decide whether a message steers the active turn or starts a new one, because a remote view of turn state is always slightly stale.
 
 ```text
 hra remote list
@@ -422,6 +424,7 @@ hra session rename <session> <name>
 hra session recover|abandon <session>
 hra session note get|edit|clear <session>
 hra session note set <session> <note>
+hra session state <session>
 hra session preset <session> <low|high|ultra>
 hra session fast <session> <on|off>
 hra session project <session> <project>
@@ -438,10 +441,13 @@ hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolut
 hra interaction decide <interaction-id> --revision <n> --decision <once|session|decline|cancel>
 hra interaction grant|answer <interaction-id> --revision <n> --input-stdin|--input-fd <fd>
 hra interaction submit <interaction-id> --revision <n> --action <accept|decline|cancel> [--input-stdin|--input-fd <fd>]
+hra autorespond on|workspace|off|default|status [--session <session>]
 hra remote list [--limit <1-100>]
 hra remote show <cloud-session>
 hra remote command <uuidv7>
 hra remote send|queue|steer <cloud-session> <message>
+hra remote send --or-steer <cloud-session> <message>
+hra remote resolve <cloud-session> --interaction <interaction-id> --revision <n> --decision <once|decline|cancel>
 hra remote stop <cloud-session>
 hra remote preset <cloud-session> <low|high|ultra>
 hra remote fast <cloud-session> <on|off>
