@@ -148,7 +148,7 @@ export type RemoteCliCommand =
       session: string;
     }>
   | Readonly<{ kind: "remote.stop"; session: string }>
-  | Readonly<{ kind: "remote.preset"; preset: "low" | "high" | "ultra"; session: string }>
+  | Readonly<{ kind: "remote.preset"; preset: "low" | "high" | "ultra" | "fable-max"; session: string }>
   | Readonly<{ enabled: boolean; kind: "remote.fast"; session: string }>;
 
 export class CliUsageError extends Error {
@@ -200,9 +200,10 @@ Mutation safety:
   --idempotency-key <uuid>  Reuse after a lost response; changed reuse fails closed.
 
 Recommended profiles:
-  low     Luna Max
-  high    Sol Max
-  ultra   Sol Ultra
+  low         Luna Max        (codex)
+  high        Sol Max         (codex)
+  ultra       Sol Ultra       (codex)
+  fable-max   Claude Fable    (claude)
 
 Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
 
@@ -296,14 +297,14 @@ Usage:
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
+  hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]
   hra session send|queue|steer <session> <message>
   hra session stop|recover|abandon <session>
   hra session archive|unarchive <session>
   hra session rename <session> <name>
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
-  hra session preset <session> <low|high|ultra>
+  hra session preset <session> <low|high|ultra|fable-max>
   hra session fast <session> <on|off>
   hra session project <session> <project>
   hra session task list <session>
@@ -314,6 +315,7 @@ Usage:
 
 Examples:
   hra session start personal --project jungle --preset high
+  hra session start personal --provider claude --preset fable-max
   hra session watch my-session
   hra session watch my-session --jsonl
   hra session events my-session --wait-ms 30000 --jsonl
@@ -365,7 +367,7 @@ Usage:
   hra remote command <uuidv7>
   hra remote send|queue|steer <cloud-session> <message>
   hra remote stop <cloud-session>
-  hra remote preset <cloud-session> <low|high|ultra>
+  hra remote preset <cloud-session> <low|high|ultra|fable-max>
   hra remote fast <cloud-session> <on|off>
 
 Examples:
@@ -1083,7 +1085,20 @@ const parseSession = (
       finish(cursor);
       return command({ kind: "session.interactions", session, pending, limit, cursor: interactionCursor });
     }
-    case "start": { const project = option(cursor, "--project"); const preset = option(cursor, "--preset") ?? "high"; const fast = flag(cursor, "--fast"); const account = take(cursor, "account"); finish(cursor); return command({ kind: "session.start", account, project, preset, fast }); }
+    case "start": {
+      const project = option(cursor, "--project");
+      const provider = option(cursor, "--provider") ?? "codex";
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      // The provider chooses the default preset, so an unchanged `hra session
+      // start` keeps its exact Codex behaviour.
+      const preset = option(cursor, "--preset") ?? (provider === "claude" ? "fable-max" : "high");
+      const fast = flag(cursor, "--fast");
+      const account = take(cursor, "account");
+      finish(cursor);
+      return command({ kind: "session.start", account, project, provider, preset, fast });
+    }
     case "send": { const session = take(cursor, "session"); return command({ kind: "session.send", session, message: remainder(cursor, "message") }); }
     case "queue": { const session = take(cursor, "session"); return command({ kind: "session.queue", session, message: remainder(cursor, "message") }); }
     case "steer": { const session = take(cursor, "session"); return command({ kind: "session.steer", session, message: remainder(cursor, "message") }); }
@@ -1441,8 +1456,8 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
       const session = take(cursor, "session");
       const preset = take(cursor, "preset");
       finish(cursor);
-      if (preset !== "low" && preset !== "high" && preset !== "ultra") {
-        throw new CliUsageError("Preset must be `low`, `high`, or `ultra`.");
+      if (preset !== "low" && preset !== "high" && preset !== "ultra" && preset !== "fable-max") {
+        throw new CliUsageError("Preset must be `low`, `high`, `ultra`, or `fable-max`.");
       }
       return { kind: "remote.preset", session, preset };
     }

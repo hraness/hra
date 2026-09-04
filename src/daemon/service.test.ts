@@ -86,6 +86,7 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
 });
 
 class FakeCodex implements CodexRuntimePort {
+  readonly provider = "codex" as const;
   readonly calls: string[] = [];
   readonly observedThreads: string[] = [];
   readonly freshThreads = new Set<string>();
@@ -1105,6 +1106,52 @@ describe("HraService", () => {
     expect(failure.message).not.toContain(privateLabel);
     expect(JSON.stringify(failure.details)).not.toContain(privateLabel);
     expect(codex.calls).toEqual([]);
+  });
+
+  test("refuses a preset the chosen provider cannot run and a provider the daemon cannot start", async () => {
+    const { service, documents } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Providers" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Provider docs", path: documents }, { signal });
+
+    // A Claude preset on a Codex session is refused, never silently ignored.
+    await expect(service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      preset: "fable-max",
+      fast: false,
+    }, { signal })).rejects.toThrow("does not support the `fable-max` model preset");
+
+    // A Codex preset on a Claude session is refused for the same reason.
+    await expect(service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "claude",
+      preset: "ultra",
+      fast: false,
+    }, { signal })).rejects.toThrow("does not support the `ultra` model preset");
+
+    // The Claude runtime is not wired into this daemon's durable session-start
+    // evidence yet, so the coherent pair is refused with one clear message.
+    await expect(service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+    }, { signal })).rejects.toThrow("cannot start a claude session yet");
+
+    // Every existing Codex path is unchanged.
+    const started = await service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      preset: "high",
+      fast: false,
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    expect(started.session.id).toMatch(/^sess_/u);
   });
 
   test("archives and unarchives a session and filters the default listing", async () => {
@@ -2809,10 +2856,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 31 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 32 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }]);
     } finally {
       inspector.close(false);
     }

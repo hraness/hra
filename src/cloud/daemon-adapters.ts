@@ -84,6 +84,7 @@ import {
   type CompactMessageActor,
   type CompactSessionEvent,
   type GitAction,
+  type ModelPreset,
 } from "./projection";
 import {
   parseUsageProjection,
@@ -143,7 +144,7 @@ type CompactSessionEventBody =
       filesTouched: readonly string[];
       gitActions: readonly GitAction[];
       kind: "turn_summary";
-      model?: "low" | "high" | "ultra";
+      model?: ModelPreset;
       runtimeMs: number;
       turnId: string;
     }>;

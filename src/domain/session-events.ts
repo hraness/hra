@@ -139,6 +139,19 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     summaryPart: z.number().int().nonnegative().max(10_000).optional(),
     text: boundedText(32_768),
   }).strict(),
+  // W3 providers. `itemId` is the spawning tool call, so a subagent's whole
+  // life correlates to one parent item; no subagent transcript text is ever
+  // projected, only its bounded nickname, role, depth, and last status.
+  z.object({
+    type: z.literal("subagent_activity"),
+    turnId: publicProviderIdentifierSchema,
+    itemId: publicProviderIdentifierSchema,
+    activity: z.enum(["started", "interacted", "interrupted"]),
+    nickname: boundedText(256),
+    role: boundedText(128),
+    depth: z.number().int().nonnegative().max(64),
+    status: boundedText(64).optional(),
+  }).strict(),
   z.object({
     type: z.literal("tool_progress"),
     turnId: publicProviderIdentifierSchema,

@@ -2,7 +2,7 @@ import { isAbsolute, normalize } from "node:path";
 
 import { z } from "zod";
 
-import { presetSchema } from "./presets";
+import { presetSchema, providerSchema } from "./presets";
 import { interactionResolutionSchema } from "./interactions";
 import {
   SESSION_EVENT_PAGE_LIMIT,
@@ -95,6 +95,7 @@ export const publicSessionListItemSchema = z.object({
   projectId: projectIdSchema.optional(),
   title: titleSchema,
   state: z.enum(["starting", "active", "idle", "terminal", "recovery_required"]),
+  provider: providerSchema,
   preset: presetSchema,
   fastEnabled: z.boolean(),
   revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
@@ -218,7 +219,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     limit: z.number().int().min(1).max(100),
     cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
-  z.object({ kind: z.literal("session.start"), account: selectorSchema, project: selectorSchema.optional(), preset: presetSchema, fast: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.start"), account: selectorSchema, project: selectorSchema.optional(), provider: providerSchema.optional(), preset: presetSchema, fast: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.send"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.queue"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.steer"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),

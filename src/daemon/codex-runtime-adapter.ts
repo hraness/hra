@@ -19,6 +19,7 @@ import {
   type ResolvedPreset,
   type ThreadStartResult,
 } from "../codex/index";
+import { assertPresetSupportedByProvider, type Preset } from "../domain/presets";
 import { redactAbsolutePaths } from "../domain/text-safety";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import { redactCompleteSensitiveText } from "../sensitive-text";
@@ -713,6 +714,7 @@ export const projectBoundedThread = (
 };
 
 export class PinnedCodexRuntimeManager implements CodexRuntimePort {
+  readonly provider = "codex" as const;
   readonly #clients = new Map<string, RunningClient>();
   readonly #lifecycleTails = new Map<string, Promise<void>>();
   readonly #background = new Set<Promise<unknown>>();
@@ -861,7 +863,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
-  async reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: "low" | "high" | "ultra"; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview> {
+  async reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview> {
     return await this.#admit(async () => {
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a session.");
       if (input.signal.aborted) throw input.signal.reason;
@@ -1015,7 +1017,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
-  async reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: "low" | "high" | "ultra"; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview> {
+  async reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview> {
     return await this.#admit(async () => {
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a turn.");
       if (input.signal.aborted) throw input.signal.reason;
@@ -2295,7 +2297,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
 
   async #reviewedPreset(
     running: RunningClient,
-    alias: "low" | "high" | "ultra",
+    alias: Preset,
     fast: boolean,
     cwd: string,
     threadId: string | undefined,
@@ -2305,6 +2307,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     profile: EffectiveRuntimeProfile;
   }> {
     signal.throwIfAborted();
+    // A preset that names another provider's model is refused here, never
+    // silently coerced into a Codex model.
+    assertPresetSupportedByProvider("codex", alias);
     await running.client.assertCredentialStores(cwd, signal);
     signal.throwIfAborted();
     const capabilities = await running.client.discoverCapabilities({

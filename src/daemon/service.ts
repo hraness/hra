@@ -42,6 +42,10 @@ import {
   type ProviderObservation,
   type SessionStatus,
 } from "../domain/observation";
+import {
+  isPresetSupportedByProvider,
+  PresetProviderMismatchError,
+} from "../domain/presets";
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import {
   SESSION_CONVERSATION_AUTOMATION_CAPABILITY,
@@ -6260,6 +6264,26 @@ export class HraService {
     const project = command.project === undefined ? this.#store.listProjects().find((candidate) => candidate.default) : this.#store.requireProject(command.project);
     if (project === undefined) throw new CommandFailure("INTERACTION_REQUIRED", "Add or select a project directory before starting a session.");
     await this.#requireUsableProjectRoot(project.rootPath);
+    const provider = command.provider ?? "codex";
+    // A preset the chosen provider cannot run is refused here, before any
+    // durable placeholder or provider effect exists.
+    if (!isPresetSupportedByProvider(provider, command.preset)) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        new PresetProviderMismatchError(provider, command.preset).message,
+      );
+    }
+    if (provider !== this.#codex.provider) {
+      // W3-C: the Claude port exists (`ClaudeRuntimePort`,
+      // `src/daemon/claude-runtime-adapter.ts`) but the daemon's durable
+      // session-start evidence still carries only the Codex runtime profile,
+      // so a Claude session is refused with one clear message rather than
+      // silently started on the other provider.
+      throw new CommandFailure(
+        "INTERACTION_REQUIRED",
+        `This daemon cannot start a ${provider} session yet. Start it with \`--provider codex\`, or run the Claude provider once the daemon's Claude runtime is enabled.`,
+      );
+    }
     const key = command.idempotencyKey ?? randomUUID();
     let localSessionId: SessionRecord["id"] | undefined;
     let clientMessageId: string | undefined;
@@ -6288,6 +6312,7 @@ export class HraService {
           profileId: profile.id,
           profileGeneration: profile.processGeneration,
           projectId: project.id,
+          provider,
           preset: command.preset,
           fastEnabled: command.fast,
           evidence: {

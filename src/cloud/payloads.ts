@@ -9,6 +9,7 @@ import {
   type EncryptedEnvelope,
 } from "./contracts";
 import { decryptBytes, encryptBytes } from "./crypto";
+import { isModelPreset, type ModelPreset } from "./projection";
 import {
   parseUsageEncryptedEnvelope,
   parseUsageProjection,
@@ -63,7 +64,7 @@ export type ResolveInteractionAnswersPayload = Readonly<{
 export type RemoteCommandPayload =
   | Readonly<{ kind: "send" | "queue" | "steer" | "send_or_steer"; message: string }>
   | Readonly<{ kind: "stop" }>
-  | Readonly<{ kind: "set_model"; preset: "low" | "high" | "ultra" }>
+  | Readonly<{ kind: "set_model"; preset: ModelPreset }>
   | Readonly<{ enabled: boolean; kind: "set_fast" }>
   | ResolveInteractionDecisionPayload
   | ResolveInteractionAnswersPayload
@@ -73,7 +74,7 @@ export type RemoteCommandPayload =
       scope: "session" | "default";
     }>
   | Readonly<{ enabled: boolean; kind: "set_show_thinking"; scope: "session" | "default" }>
-  | Readonly<{ kind: "set_default_preset"; preset: "low" | "high" | "ultra" }>
+  | Readonly<{ kind: "set_default_preset"; preset: ModelPreset }>
   | Readonly<{ archived: boolean; kind: "archive_session" }>
   | Readonly<{ kind: "rename_session"; name: string | null }>
   | Readonly<{ key: string; kind: "set_gateway_key" }>;
@@ -113,7 +114,7 @@ export type DeviceRegistryPayload = Readonly<{
   accounts: readonly DeviceRegistryAccount[];
   daemonVersion: string;
   defaultApprovalMode: "auto:all" | "auto:workspace" | "manual";
-  defaultPreset: "low" | "high" | "ultra";
+  defaultPreset: ModelPreset;
   heartbeatAt: number;
   machineLabel: string;
   projects: readonly DeviceRegistryProject[];
@@ -156,7 +157,7 @@ export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload 
   if (
     value.kind === "set_model"
     && hasExactKeys(value, ["kind", "preset"])
-    && (value.preset === "low" || value.preset === "high" || value.preset === "ultra")
+    && isModelPreset(value.preset)
   ) return { kind: value.kind, preset: value.preset };
   if (
     value.kind === "set_fast"
@@ -207,7 +208,7 @@ export function parseRemoteCommandPayload(value: unknown): RemoteCommandPayload 
   if (
     value.kind === "set_default_preset"
     && hasExactKeys(value, ["kind", "preset"])
-    && (value.preset === "low" || value.preset === "high" || value.preset === "ultra")
+    && isModelPreset(value.preset)
   ) return { kind: value.kind, preset: value.preset };
   if (
     value.kind === "archive_session"
@@ -391,7 +392,7 @@ export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayloa
       && value.defaultApprovalMode !== "auto:workspace"
       && value.defaultApprovalMode !== "manual")
     || typeof value.showThinkingDefault !== "boolean"
-    || (value.defaultPreset !== "low" && value.defaultPreset !== "high" && value.defaultPreset !== "ultra")
+    || !isModelPreset(value.defaultPreset)
     || typeof value.proseAutorespondConfigured !== "boolean"
   ) return null;
   const accounts = parseRegistryAccounts(value.accounts);

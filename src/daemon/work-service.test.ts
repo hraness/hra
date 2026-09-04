@@ -66,6 +66,7 @@ const effectiveRuntimeProfile = (
 });
 
 class WorkRuntime implements CodexRuntimePort {
+  readonly provider = "codex" as const;
   logoutCalls = 0;
   readonly startTurnCalls: Array<Readonly<{
     clientMessageId: string;

@@ -85,6 +85,25 @@ describe("encrypted session projections", () => {
     ));
   });
 
+  test("carries the fable-max preset in a turn summary", () => {
+    // W3: adding a preset widens the compact projection format. The parser is
+    // forward compatible for unknown *keys*, never for unknown enum values, so
+    // a reader older than this build rejects the chunk below and a reader from
+    // this build accepts it.
+    const claudeTurn = [{
+      fast: false,
+      filesTouched: [],
+      gitActions: [],
+      kind: "turn_summary",
+      model: "fable-max",
+      runtimeMs: 2_259,
+      sequence: 1,
+      turnId: "turn_12345678",
+    }] as const;
+    expect(parseCompactSessionEvents(claudeTurn)).toEqual(claudeTurn);
+    expect(parseCompactSessionEvents([{ ...claudeTurn[0], model: "fable" }])).toBeNull();
+  });
+
   test("requires contiguous closed compact events", () => {
     expect(parseCompactSessionEvents(events)).toEqual(events);
     expect(parseCompactSessionEvents([events[0], { ...events[1], sequence: 3 }])).toBeNull();

@@ -231,6 +231,14 @@ const sanitizeCompleteBody = (
       ...(body.server === undefined ? {} : { server: sanitizeProviderToolLabel(body.server) }),
       ...(body.tool === undefined ? {} : { tool: sanitizeProviderToolLabel(body.tool) }),
     };
+    case "subagent_activity": return {
+      ...body,
+      turnId: publicId(body.turnId),
+      itemId: publicId(body.itemId),
+      nickname: safeInline(body.nickname),
+      role: safeInline(body.role),
+      ...(body.status === undefined ? {} : { status: safeInline(body.status) }),
+    };
     case "tool_progress": return {
       ...body,
       turnId: publicId(body.turnId),

@@ -2,6 +2,18 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## HRA Web v1 wave 3
+
+Unreleased. Claude Code as a second provider behind the runtime port (W3-C).
+
+- The runtime port has a provider-neutral seam. `SessionRuntimePort` carries everything a session needs to exist, take turns, be steered, be stopped, and answer a brokered interaction; `CodexRuntimePort` and the new `ClaudeRuntimePort` are its two implementations, each parameterised by the runtime profile document its provider proves. Nothing about the Codex path changed shape.
+- `src/claude/` speaks the pinned Claude Code stream-json dialect: one exact pinned version, its exact Fable model id, a reviewed event matrix with digests that fail closed on drift, a bounded JSONL decoder, a parser that reads every line from `unknown`, and a delta assembler that owns turn, item, and subagent identity. The bridge knows the dialect; the runtime knows the timeline.
+- The Claude adapter spawns the pinned binary with `--output-format stream-json --input-format stream-json --verbose` under an isolated absolute `CLAUDE_CONFIG_DIR` and the same environment allowlist Codex uses. HRA never reads, copies, or forwards a Claude credential.
+- `can_use_tool` becomes a durable HRA interaction: `Bash` a command approval, `Edit`, `Write`, and `NotebookEdit` a file-change approval, everything else a permission approval, and `AskUserQuestion` (or any request the runtime marks as needing a person) a question. An allow echoes only the request's own input and never a persistent-allow rule, so HRA can grant nothing beyond `once`. Steering writes another `user` line mid-turn; stopping writes an interrupt.
+- `system/task_started`, `task_progress`, `task_updated`, `task_notification`, and `parent_tool_use_id` become `subagent_activity` session events carrying only a bounded nickname, role, depth, and last status. A subagent's own message never enters the parent transcript.
+- The model preset union gains `fable-max`, the local Fable model at `max` reasoning effort and never `ultracode`. A preset the session's provider cannot run is refused with a clear message, never silently ignored. Adding a preset widens the encrypted compact projection format: the parser tolerates a newer writer's unknown keys but never an unknown enum value, so a reader older than this build rejects a chunk whose `turn_summary.model` names `fable-max`.
+- A session records its provider. `hra session start --provider claude` selects it and defaults its preset to `fable-max`; without the flag every existing path is byte-identical Codex behaviour. Store schema version 32 adds the column additively with a `codex` default.
+
 ## v0.4.1
 
 Patch release for the local state schema migration. Release candidate until the release workflow admits the tag.
