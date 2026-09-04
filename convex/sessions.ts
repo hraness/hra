@@ -399,6 +399,7 @@ export const getHead = query({
         : { compactTailDigest: session.compactTailDigest }),
       createdAt: session.createdAt,
       detailHeadSequence: session.detailHeadSequence,
+      detailStreamEpoch: currentDetailStreamEpoch(session),
       ...(session.detailTailDigest === undefined
         ? {}
         : { detailTailDigest: session.detailTailDigest }),

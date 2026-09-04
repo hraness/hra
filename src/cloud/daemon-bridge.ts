@@ -76,9 +76,12 @@ import {
   type RemoteCommandPayload,
   type SessionMetadataPayload,
 } from "./payloads";
+import type { SessionEvent } from "../domain/session-events";
+import { assignDetailSequences, LiveBatcher } from "./live-uploader";
 import {
   decryptCompactEvents,
   encryptCompactEvents,
+  encryptDetailEvents,
   parseCompactSessionEvents,
   type CompactSessionEvent,
 } from "./projection";
@@ -265,6 +268,23 @@ export interface CloudDaemonLocalSourcePort {
     complete: boolean;
     events: readonly CompactSessionEvent[];
   }>>;
+  /*
+   * Live projection source: local ledger events after a local sequence for
+   * one session, in ledger order, already filtered to the event kinds the
+   * live batcher consumes. `includeThinking` reports the session's current
+   * show-thinking setting so the bridge can decide whether reasoning summary
+   * deltas are projected.
+   */
+  readLiveEvents?(input: Readonly<{
+    afterLocalSequence: number | null;
+    limit: number;
+    sessionPublicId: string;
+    signal: AbortSignal;
+  }>): Promise<Readonly<{
+    events: readonly SessionEvent[];
+    includeThinking: boolean;
+    observedThroughSequence: number;
+  }>>;
   recordCompactUploadIntent?(input: Readonly<{
     cacheId: string;
     digest: string;
@@ -448,9 +468,16 @@ export function projectionRecoveryStatusFromJournalState(
   };
 }
 
+export type CloudLiveTickResult = Readonly<{
+  errors: readonly string[];
+  sessionsUploaded: number;
+}>;
+
 export interface CloudDaemonBridge {
   close?(): Promise<void>;
   cycle(signal: AbortSignal): Promise<CloudDaemonCycleResult>;
+  /** Uploads coalesced live text for sessions this daemon executes; safe to call every second. */
+  liveTick?(signal: AbortSignal): Promise<CloudLiveTickResult>;
   projectionRecoveryStatus?(): Promise<CloudProjectionRecoveryStatus>;
   isCompactProjectionRecoveryUnsettledForProfile?(profileId: string): Promise<boolean>;
   isCompactProjectionRecoveryUnsettled?(sessionPublicId: string): Promise<boolean>;
@@ -517,6 +544,9 @@ type CloudSessionHead = Readonly<{
   compactHeadSequence: number;
   compactStreamEpoch: number;
   compactTailDigest?: string;
+  detailHeadSequence: number;
+  detailStreamEpoch: number;
+  detailTailDigest?: string;
   executionDevicePublicId: string;
   metadata?: EncryptedEnvelope;
   metadataRevision: number;
@@ -525,6 +555,18 @@ type CloudSessionHead = Readonly<{
   state: "active" | "idle" | "terminal" | "orphaned";
   updatedAt: number;
 }>;
+
+type LiveSessionState = {
+  afterLocalSequence: number | null;
+  batcher: LiveBatcher | null;
+  detailHeadSequence: number;
+  detailStreamEpoch: number;
+  detailTailDigest: string | undefined;
+  lease: CloudLease;
+  publicId: string;
+};
+
+const maximumLiveEventsPerTick = 200;
 
 type CloudSessionHeadPage = Readonly<{
   continueCursor: string;
@@ -872,6 +914,7 @@ function parseSessionHead(value: unknown): CloudSessionHead {
     "compactHasRecoveryGap",
     "compactStreamEpoch",
     "compactTailDigest",
+    "detailStreamEpoch",
     "detailTailDigest",
     "metadata",
   ];
@@ -913,6 +956,10 @@ function parseSessionHead(value: unknown): CloudSessionHead {
       && value.state !== "orphaned")
     || !isFiniteTimestamp(value.updatedAt)
     || (value.compactTailDigest !== undefined && !isDigest(value.compactTailDigest))
+    || !isSafeNonNegativeInteger(value.detailHeadSequence)
+    || (value.detailStreamEpoch !== undefined && !isSafeNonNegativeInteger(value.detailStreamEpoch))
+    || (value.detailHeadSequence === 0 && value.detailTailDigest !== undefined)
+    || (value.detailHeadSequence > 0 && !isDigest(value.detailTailDigest))
     || (value.metadata !== undefined && metadata === null)
   ) throw new Error("Cloud session response is invalid.");
   return {
@@ -921,6 +968,11 @@ function parseSessionHead(value: unknown): CloudSessionHead {
     compactStreamEpoch: value.compactStreamEpoch ?? 0,
     ...(typeof value.compactTailDigest === "string"
       ? { compactTailDigest: value.compactTailDigest }
+      : {}),
+    detailHeadSequence: value.detailHeadSequence,
+    detailStreamEpoch: value.detailStreamEpoch ?? 0,
+    ...(typeof value.detailTailDigest === "string"
+      ? { detailTailDigest: value.detailTailDigest }
       : {}),
     executionDevicePublicId: value.executionDevicePublicId,
     ...(metadata === undefined || metadata === null ? {} : { metadata }),
@@ -1752,6 +1804,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   readonly #identity: CloudDaemonIdentityPort;
   readonly #journal: CloudDaemonJournalPort;
   readonly #leaseDurationMs: number;
+  readonly #live = new Map<string, LiveSessionState>();
   readonly #local: CloudDaemonLocalSourcePort;
   readonly #now: () => number;
   readonly #optionalSyncBudgetMs: number;
@@ -1928,6 +1981,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
               const lease = await this.#ensureLease(session.publicId, identity);
               abortBeforeEffect(optionalController.signal);
               leases.set(session.publicId, lease);
+              this.#registerLive(session, head, lease);
               head = await this.#updateMetadata(
                 identity,
                 session,
@@ -2895,6 +2949,151 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     abortBeforeEffect(signal);
     await this.#local.acknowledgeCompactUpload?.(checkpoint);
     return { complete: local.complete, uploaded: true };
+  }
+
+  /*
+   * Live projection. The full cycle registers every session this daemon
+   * executes together with its current head and lease; liveTick then streams
+   * new ledger text for those sessions on its own short cadence. A session
+   * leaves the live set when it goes terminal, when its lease is lost, or when
+   * the remote detail head no longer matches what this daemon believes, in
+   * which case the next full cycle re-registers it with a fresh head.
+   */
+  #registerLive(session: CloudLocalSessionHead, head: CloudSessionHead, lease: CloudLease): void {
+    if (this.#local.readLiveEvents === undefined) return;
+    if (session.state === "terminal" || head.state === "terminal" || head.state === "orphaned") {
+      this.#live.delete(session.publicId);
+      return;
+    }
+    const existing = this.#live.get(session.publicId);
+    if (
+      existing !== undefined
+      && existing.detailHeadSequence === head.detailHeadSequence
+      && existing.detailStreamEpoch === head.detailStreamEpoch
+    ) {
+      existing.lease = lease;
+      return;
+    }
+    this.#live.set(session.publicId, {
+      afterLocalSequence: null,
+      batcher: null,
+      detailHeadSequence: head.detailHeadSequence,
+      detailStreamEpoch: head.detailStreamEpoch,
+      detailTailDigest: head.detailTailDigest,
+      lease,
+      publicId: session.publicId,
+    });
+  }
+
+  async liveTick(signal: AbortSignal): Promise<CloudLiveTickResult> {
+    const errors: string[] = [];
+    let sessionsUploaded = 0;
+    if (this.#live.size === 0 || this.#local.readLiveEvents === undefined) {
+      return { errors, sessionsUploaded };
+    }
+    let identity: ActiveCloudIdentity;
+    try {
+      identity = await this.#identity.requireActive(signal);
+    } catch (error: unknown) {
+      if (signal.aborted) throw error;
+      return { errors: [normalizeError(error)], sessionsUploaded };
+    }
+    for (const state of [...this.#live.values()]) {
+      try {
+        abortBeforeEffect(signal);
+        if (state.lease.leaseUntil <= this.#now()) {
+          this.#live.delete(state.publicId);
+          continue;
+        }
+        if (await this.#appendLive(identity, state, signal)) sessionsUploaded += 1;
+      } catch (error: unknown) {
+        if (signal.aborted) throw error;
+        this.#live.delete(state.publicId);
+        errors.push(`${state.publicId}: ${normalizeError(error)}`);
+      }
+    }
+    return { errors, sessionsUploaded };
+  }
+
+  async #appendLive(
+    identity: ActiveCloudIdentity,
+    state: LiveSessionState,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (this.#local.readLiveEvents === undefined) return false;
+    const local = await this.#local.readLiveEvents({
+      afterLocalSequence: state.afterLocalSequence,
+      limit: maximumLiveEventsPerTick,
+      sessionPublicId: state.publicId,
+      signal,
+    });
+    abortBeforeEffect(signal);
+    if (state.afterLocalSequence === null) {
+      // First observation: start streaming from now rather than replaying
+      // history the compact stream already carries.
+      state.afterLocalSequence = local.observedThroughSequence;
+      state.batcher = new LiveBatcher({ includeThinking: local.includeThinking });
+      return false;
+    }
+    const batcher = state.batcher ?? new LiveBatcher({ includeThinking: local.includeThinking });
+    state.batcher = batcher;
+    for (const event of local.events) batcher.observe(event);
+    if (local.events.length > 0) {
+      state.afterLocalSequence = local.events[local.events.length - 1]?.sequence ?? state.afterLocalSequence;
+    }
+    const batch = batcher.drain();
+    if (batch.bodies.length === 0) return false;
+    const events = assignDetailSequences(batch.bodies, state.detailHeadSequence);
+    const first = events[0];
+    const last = events[events.length - 1];
+    if (first === undefined || last === undefined) return false;
+    const authority = authorityOf(state.lease);
+    const envelope = await encryptDetailEvents(events, identity.accountKey, {
+      firstSequence: first.sequence,
+      keyVersion: identity.keyVersion,
+      lastSequence: last.sequence,
+      ...(state.detailTailDigest === undefined ? {} : { previousDigest: state.detailTailDigest }),
+      sessionPublicId: state.publicId,
+      sourceBootId: authority.bootId,
+      sourceDevicePublicId: identity.devicePublicId,
+      sourceFence: authority.fence,
+      stream: "detail",
+      userPublicId: identity.userPublicId,
+    });
+    const digest = await sha256Hex(JSON.stringify({
+      authority,
+      envelope,
+      firstSequence: first.sequence,
+      lastSequence: last.sequence,
+      previousDigest: state.detailTailDigest ?? null,
+      sessionPublicId: state.publicId,
+      stream: "detail",
+    }));
+    abortBeforeEffect(signal);
+    const receipt = await this.#mutation("sessions:appendChunk", {
+      authority,
+      digest,
+      envelope,
+      expectedHeadSequence: state.detailHeadSequence,
+      expectedStreamEpoch: state.detailStreamEpoch,
+      ...(state.detailTailDigest === undefined ? {} : { expectedTailDigest: state.detailTailDigest }),
+      firstSequence: first.sequence,
+      lastSequence: last.sequence,
+      ...(state.detailTailDigest === undefined ? {} : { previousDigest: state.detailTailDigest }),
+      sessionPublicId: state.publicId,
+      stream: "detail",
+    });
+    if (
+      !isRecord(receipt)
+      || receipt.digest !== digest
+      || receipt.headSequence !== last.sequence
+      || (receipt.replay !== undefined && typeof receipt.replay !== "boolean")
+      || !isSafeNonNegativeInteger(receipt.streamEpoch)
+    ) throw new Error("Cloud live append receipt is invalid.");
+    state.detailHeadSequence = last.sequence;
+    state.detailTailDigest = digest;
+    state.detailStreamEpoch = receipt.streamEpoch;
+    return true;
   }
 
   async #ensureLease(
