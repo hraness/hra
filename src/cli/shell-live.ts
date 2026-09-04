@@ -389,7 +389,6 @@ const renderNonDeltaEvent = (event: SessionEvent): string | null => {
     case "session_status": return `Session: ${safeLiveText(body.status)}.`;
     case "turn_started": return "Turn started.";
     case "turn_completed": return `Turn ${safeLiveText(body.status)}${body.errorCode === undefined ? "." : ` (${safeLiveText(body.errorCode)}).`}`;
-    case "subagent_activity": return `Subagent ${safeLiveText(body.activity)}: ${safeLiveText(body.nickname)}${body.status === undefined ? "." : ` (${safeLiveText(body.status)}).`}`;
     case "item_started": return `Item started: ${safeLiveText(body.itemKind)}${liveToolTarget(body.server, body.tool, body.itemKind)}.`;
     case "item_completed": return `Item completed: ${safeLiveText(body.itemKind)}${liveToolTarget(body.server, body.tool, body.itemKind)}${body.status === undefined ? "." : ` (${safeLiveText(body.status)}).`}`;
     case "tool_progress": return `Tool: ${safeLiveText(body.toolKind)}${liveToolTarget(body.server, body.tool, body.toolKind)}${body.status === undefined ? "." : `, ${safeLiveText(body.status)}.`}`;

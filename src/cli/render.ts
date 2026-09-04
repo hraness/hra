@@ -396,7 +396,6 @@ const renderSingleEvent = (event: SessionEvent): string => {
     case "turn_started": return `Turn started: ${line(body.turnId)}`;
     case "turn_completed": return `Turn ${line(body.turnId)}: ${line(body.status)}${body.errorCode === undefined ? "" : ` (${line(body.errorCode)})`}`;
     case "session_state": return `State: ${line(body.state)}${body.attention ? ", needs you" : ""} (${line(body.reason)}), revision ${String(body.revision)}`;
-    case "subagent_activity": return `Subagent ${line(body.activity)}: ${line(body.nickname)} (${line(body.role)}, depth ${String(body.depth)})${body.status === undefined ? "" : ` - ${line(body.status)}`}`;
     case "item_started": return `Item started: ${line(body.itemKind)}${eventToolTarget(body.server, body.tool, body.itemKind)} ${line(body.itemId)}`;
     case "item_completed": return `Item completed: ${line(body.itemKind)}${eventToolTarget(body.server, body.tool, body.itemKind)} ${line(body.itemId)}${body.status === undefined ? "" : ` (${line(body.status)})`}`;
     case "assistant_delta": return `Codex\n${indented(body.text)}`;

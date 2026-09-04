@@ -1,4 +1,10 @@
 {
+  "src/claude/process.ts": {
+    "safeEnvironmentKeys": 2
+  },
+  "src/claude/protocol.ts": {
+    "redactCompleteSensitiveText": 1
+  },
   "src/cli/protected-output.ts": {
     "O_NOFOLLOW": 2,
     "fsync": 2,
@@ -41,6 +47,9 @@
   },
   "src/codex/protocol.ts": {
     "redactCompleteSensitiveText": 1
+  },
+  "src/daemon/claude-runtime-adapter.ts": {
+    "assertCurrent": 4
   },
   "src/daemon/codex-runtime-adapter.ts": {
     "redactCompleteSensitiveText": 1

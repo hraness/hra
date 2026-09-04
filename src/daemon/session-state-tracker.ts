@@ -162,7 +162,6 @@ export class SessionStateTracker {
       case "item_started":
       case "item_completed":
       case "reasoning_summary_delta":
-      case "subagent_activity":
       case "tool_progress":
       case "file_change":
       case "plan_updated":
