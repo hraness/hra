@@ -325,6 +325,7 @@ describe("CLI parser", () => {
       command: {
         kind: "session.list",
         account: "mutable-label",
+        archived: false,
         limit: 37,
         cursor,
       },
@@ -334,6 +335,22 @@ describe("CLI parser", () => {
       .toThrow(CliUsageError);
     expect(() => parseCli(["session", "list", "--limit", "1.5"]))
       .toThrow("session limit must be an integer from 1 to 100");
+  });
+
+  test("parses session archive, unarchive, and the archived listing filter", () => {
+    expect(parseCli(["session", "archive", "sess-1"]))
+      .toEqual({ kind: "command", command: { kind: "session.archive", session: "sess-1", archived: true }, json: false });
+    expect(parseCli(["session", "unarchive", "sess-1"]))
+      .toEqual({ kind: "command", command: { kind: "session.archive", session: "sess-1", archived: false }, json: false });
+    expect(parseCli(["session", "list", "--archived"]))
+      .toEqual({ kind: "command", command: { kind: "session.list", archived: true, limit: 50 }, json: false });
+    expect(parseCli(["session", "list"]))
+      .toMatchObject({ command: { archived: false } });
+    for (const argv of [
+      ["session", "archive"],
+      ["session", "archive", "sess-1", "extra"],
+      ["session", "unarchive"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
   });
 
   test("maps cloud session reads and the closed remote command set", () => {

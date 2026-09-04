@@ -29,6 +29,12 @@ export const commandKind = v.union(
   v.literal("set_fast"),
   v.literal("resolve_interaction"),
   v.literal("send_or_steer"),
+  v.literal("set_approval_mode"),
+  v.literal("set_show_thinking"),
+  v.literal("set_default_preset"),
+  v.literal("archive_session"),
+  v.literal("rename_session"),
+  v.literal("set_gateway_key"),
 );
 export const commandState = v.union(
   v.literal("pending"),

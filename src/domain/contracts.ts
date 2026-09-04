@@ -191,6 +191,8 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("session.list"),
     account: selectorSchema.optional(),
+    /** Include archived sessions; the default listing hides them. */
+    archived: z.boolean(),
     limit: z.number().int().min(1).max(100),
     cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
@@ -217,6 +219,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.steer"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.stop"), session: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.rename"), session: selectorSchema, name: titleSchema, idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.archive"), session: selectorSchema, archived: z.boolean() }).strict(),
   z.object({ kind: z.literal("session.recover"), session: selectorSchema }).strict(),
   z.object({ kind: z.literal("session.abandon"), session: selectorSchema }).strict(),
   z.object({ kind: z.literal("session.note.get"), session: selectorSchema }).strict(),

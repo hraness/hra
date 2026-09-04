@@ -4,6 +4,7 @@
 - Transport owns one app-server process and bounded JSONL.
 - Protocol schemas and operation descriptors form the only app-server boundary.
 - Projection converts provider facts into HRA session and usage data.
+- Automations is a read-only, tolerant reader for Codex Desktop's on-disk scheduled tasks.
 
 # Guidelines
 

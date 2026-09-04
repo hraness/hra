@@ -1099,7 +1099,8 @@ const renderSessionList = (
     : `${localHeader.join("\n")}\n\n${tableListing}`;
   const nextCursor = opaqueCursor(root?.nextCursor);
   if (nextCursor === undefined || !accountId.success) return listing;
-  return `${listing}\n\nContinue: hra session list --account ${accountId.data} --limit ${String(command.limit)} --cursor ${nextCursor}`;
+  const archived = command.archived ? " --archived" : "";
+  return `${listing}\n\nContinue: hra session list --account ${accountId.data}${archived} --limit ${String(command.limit)} --cursor ${nextCursor}`;
 };
 
 const renderSessionTaskList = (data: unknown): string => {

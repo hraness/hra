@@ -164,7 +164,7 @@ Usage:
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session rename|recover|abandon|note|preset|fast|project
+  hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
   hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
   hra remote list|show|command|send|queue|steer|stop|preset|fast
@@ -274,7 +274,7 @@ Examples:
 Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
 Usage:
-  hra session list [--account <profile>] [--limit <1..100>] [--cursor <cursor>]
+  hra session list [--account <profile>] [--archived] [--limit <1..100>] [--cursor <cursor>]
   hra session show <session> [--detail]
   hra session status <session> [--json]
   hra session state <session> [--json]
@@ -285,6 +285,7 @@ Usage:
   hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
   hra session send|queue|steer <session> <message>
   hra session stop|recover|abandon <session>
+  hra session archive|unarchive <session>
   hra session rename <session> <name>
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
@@ -1004,10 +1005,11 @@ const parseSession = (
   switch (action) {
     case "list": {
       const account = option(cursor, "--account");
+      const archived = flag(cursor, "--archived");
       const limit = boundedDecimal(option(cursor, "--limit"), "session limit", 1, 100, 50);
       const sessionCursor = option(cursor, "--cursor");
       finish(cursor);
-      return command({ kind: "session.list", account, limit, cursor: sessionCursor });
+      return command({ kind: "session.list", account, archived, limit, cursor: sessionCursor });
     }
     case "show": { const detail = flag(cursor, "--detail"); const session = take(cursor, "session"); finish(cursor); return { kind: "session.show", session, detail }; }
     case "status": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.status", session }; }
@@ -1069,6 +1071,8 @@ const parseSession = (
     case "steer": { const session = take(cursor, "session"); return command({ kind: "session.steer", session, message: remainder(cursor, "message") }); }
     case "stop": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.stop", session }; }
     case "rename": { const session = take(cursor, "session"); return command({ kind: "session.rename", session, name: remainder(cursor, "name") }); }
+    case "archive": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.archive", session, archived: true }; }
+    case "unarchive": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.archive", session, archived: false }; }
     case "recover": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.recover", session }; }
     case "abandon": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.abandon", session }; }
     case "note": return parseSessionNote(cursor);

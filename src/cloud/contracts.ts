@@ -24,6 +24,7 @@ export const cloudLimits = Object.freeze({
   identifierCharacters: 96,
   metadataCiphertextCharacters: 16_384,
   pageSize: 100,
+  registryCiphertextCharacters: 65_536,
   resultCodeCharacters: 64,
 } as const);
 
@@ -56,7 +57,39 @@ export type CommandKind =
   | "set_model"
   | "set_fast"
   | "resolve_interaction"
-  | "send_or_steer";
+  | "send_or_steer"
+  | "set_approval_mode"
+  | "set_show_thinking"
+  | "set_default_preset"
+  | "archive_session"
+  | "rename_session"
+  | "set_gateway_key";
+
+/**
+ * Every command kind, in one ordered list, so the closed unions in the cloud
+ * client, the journal, the bridge, and the hosted validator can be compared
+ * against a single source instead of drifting apart.
+ */
+export const COMMAND_KINDS: readonly CommandKind[] = Object.freeze([
+  "send",
+  "queue",
+  "steer",
+  "stop",
+  "set_model",
+  "set_fast",
+  "resolve_interaction",
+  "send_or_steer",
+  "set_approval_mode",
+  "set_show_thinking",
+  "set_default_preset",
+  "archive_session",
+  "rename_session",
+  "set_gateway_key",
+] as const);
+
+export function isCommandKind(value: unknown): value is CommandKind {
+  return typeof value === "string" && (COMMAND_KINDS as readonly string[]).includes(value);
+}
 
 export type CommandState =
   | "pending"

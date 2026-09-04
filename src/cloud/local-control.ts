@@ -25,6 +25,7 @@ import {
   containsAbsolutePath,
   hasExactKeys,
   isBase64Url,
+  isCommandKind,
   isDigest,
   isFiniteTimestamp,
   isOpaqueIdentifier,
@@ -1532,14 +1533,7 @@ function parsePendingRemoteCommand(value: string): PendingRemoteCommand {
     || !isFiniteTimestamp(decoded.deadline)
     || envelope === null
     || !isUuidV7(decoded.idempotencyKey)
-    || (decoded.kind !== "send"
-      && decoded.kind !== "queue"
-      && decoded.kind !== "steer"
-      && decoded.kind !== "stop"
-      && decoded.kind !== "set_model"
-      && decoded.kind !== "set_fast"
-      && decoded.kind !== "resolve_interaction"
-      && decoded.kind !== "send_or_steer")
+    || !isCommandKind(decoded.kind)
     || !isDigest(decoded.payloadDigest)
     || !isDigest(decoded.requestDigest)
     || (decoded.version === 2
@@ -1904,16 +1898,7 @@ function parseCommandState(value: unknown): CommandState | null {
 }
 
 function parseRemoteCommandKind(value: unknown): RemoteCommandPayload["kind"] | null {
-  return value === "send"
-    || value === "queue"
-    || value === "steer"
-    || value === "stop"
-    || value === "set_model"
-    || value === "set_fast"
-    || value === "resolve_interaction"
-    || value === "send_or_steer"
-    ? value
-    : null;
+  return isCommandKind(value) ? value : null;
 }
 
 function parseRemoteCommandReceipt(value: unknown): Readonly<{

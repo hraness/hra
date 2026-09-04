@@ -236,6 +236,16 @@ async function deleteCustody(
     await ctx.db.delete(envelope._id);
   }
   remaining -= envelopes.length;
+  if (remaining === 0) return { processed: input.limit };
+
+  const registries = await ctx.db.query("deviceRegistries")
+    .withIndex("by_device", (builder) => builder.eq("deviceId", input.deviceId))
+    .take(remaining);
+  for (const registry of registries) {
+    await releaseQuotaForDelete(ctx, input.userId, "custody", registry);
+    await ctx.db.delete(registry._id);
+  }
+  remaining -= registries.length;
   return { processed: input.limit - remaining };
 }
 

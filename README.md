@@ -424,7 +424,7 @@ hra plugin show <account> <plugin> [--project <project>] [--refresh]
 hra project add --path <directory> [--name <name>]
 hra project list
 hra project use <project>
-hra session list [--account <profile>] [--limit <1-100>] [--cursor <cursor>]
+hra session list [--account <profile>] [--archived] [--limit <1-100>] [--cursor <cursor>]
 hra session show <session> [--detail]
 hra session status <session> [--json]
 hra session watch <session> [--cursor <cursor>] [--jsonl]
@@ -435,6 +435,7 @@ hra session send|queue|steer <session> <message>
 hra session stop <session>
 hra session rename <session> <name>
 hra session recover|abandon <session>
+hra session archive|unarchive <session>
 hra session note get|edit|clear <session>
 hra session note set <session> <note>
 hra session state <session>

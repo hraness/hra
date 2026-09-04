@@ -11,6 +11,7 @@ import {
   containsAbsolutePath,
   containsUnsafeTerminalScalar,
   hasExactKeys,
+  isCommandKind,
   isDigest,
   isFiniteTimestamp,
   isOpaqueIdentifier,
@@ -70,9 +71,11 @@ import {
 import {
   decryptRemoteCommand,
   decryptSessionMetadata,
+  encryptDeviceRegistry,
   encryptSessionMetadata,
   encryptUsageProjection,
   parseSessionMetadataPayload,
+  type DeviceRegistryPayload,
   type RemoteCommandPayload,
   type SessionMetadataPayload,
 } from "./payloads";
@@ -117,6 +120,12 @@ const maximumIdempotencyLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
 const maximumIdempotencyFutureSkewMs = 5 * 60 * 1_000;
 const refreshAfterMs = 10 * 60 * 1_000;
 const defaultLeaseDurationMs = 60_000;
+/*
+ * The device registry is republished whenever its inputs change and, when
+ * nothing changed, at most once a minute so the settings screen can tell a
+ * live daemon from a stale one without a per-cycle write.
+ */
+const deviceRegistryHeartbeatMs = 60_000;
 const defaultOptionalSyncBudgetMs = 10_000;
 const minimumPresenceCycleTtlMs = 15_000;
 const maximumPresenceTtlMs = 120_000;
@@ -285,6 +294,12 @@ export interface CloudDaemonLocalSourcePort {
     includeThinking: boolean;
     observedThroughSequence: number;
   }>>;
+  /*
+   * The device settings projection (machine, daemon defaults, accounts,
+   * projects, scheduled tasks) as labels only. The bridge encrypts it under
+   * the account key and publishes it to `devices:updateRegistry`.
+   */
+  readDeviceRegistry?(input: Readonly<{ signal: AbortSignal }>): Promise<DeviceRegistryPayload>;
   recordCompactUploadIntent?(input: Readonly<{
     cacheId: string;
     digest: string;
@@ -408,6 +423,18 @@ type CloudPresenceResponse = Readonly<{
   sequence: number;
   serverNow: number;
   serverTtlMs: number;
+}>;
+
+/*
+ * What this process last published to `devices:updateRegistry`: the digest of
+ * the projection with its heartbeat removed (so a heartbeat alone is not a
+ * change), when it went out, and the revision the server returned, which is
+ * the expected revision of the next write.
+ */
+type CloudDeviceRegistryState = Readonly<{
+  digest: string;
+  publishedAt: number;
+  revision: number;
 }>;
 
 type CloudPresenceState = {
@@ -1192,16 +1219,7 @@ function isTerminalCommandState(state: CommandState): boolean {
 }
 
 function parseCommandKind(value: unknown): CommandKind | null {
-  return value === "send"
-    || value === "queue"
-    || value === "steer"
-    || value === "stop"
-    || value === "set_model"
-    || value === "set_fast"
-    || value === "resolve_interaction"
-    || value === "send_or_steer"
-    ? value
-    : null;
+  return isCommandKind(value) ? value : null;
 }
 
 function parseCloudCommand(value: unknown): CloudCommand {
@@ -1825,6 +1843,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   #closed = false;
   #optionalTask: OptionalCloudSyncTask | null = null;
   #presenceState: CloudPresenceState | null = null;
+  #deviceRegistryState: CloudDeviceRegistryState | null = null;
   readonly #projectionRecoverySupersededSessions = new Set<string>();
   #tail: Promise<unknown> = Promise.resolve();
 
@@ -1901,6 +1920,17 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         await this.#maintainPresence(registeredIdentity, signal);
         if (registeredIdentity.status === "pending") return result;
         const identity = registeredIdentity.activeIdentity;
+        await this.#assertDaemonCurrent(signal);
+        try {
+          await this.#publishDeviceRegistry(identity, signal);
+        } catch (error: unknown) {
+          if (signal.aborted) throw error;
+          // The settings projection is auxiliary: a failed publish is
+          // reported and retried next cycle, it never stops command
+          // execution or session sync.
+          this.#deviceRegistryState = null;
+          result.errors.push(`device registry: ${normalizeError(error)}`);
+        }
         await this.#assertDaemonCurrent(signal);
         const heads = parseSessionHeadPage(await this.#transport.query(
           "sessions:listHeadsPage",
@@ -2770,6 +2800,65 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     await this.#assertDaemonCurrent(signal);
   }
 
+  /**
+   * Publish this device's settings projection. The payload is republished
+   * when any input changed and otherwise at most every
+   * `deviceRegistryHeartbeatMs`, under an expected revision so two daemons
+   * that both believe they own the device cannot silently overwrite each
+   * other: a conflict drops the cached revision and the next cycle re-reads
+   * the server's.
+   */
+  async #publishDeviceRegistry(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const readRegistry = this.#local.readDeviceRegistry?.bind(this.#local);
+    if (readRegistry === undefined) return;
+    const payload = await readRegistry({ signal });
+    await this.#assertDaemonCurrent(signal);
+    const digest = await sha256Hex(JSON.stringify({ ...payload, heartbeatAt: 0 }));
+    const now = this.#now();
+    const cached = this.#deviceRegistryState;
+    if (
+      cached !== null
+      && cached.digest === digest
+      && now - cached.publishedAt < deviceRegistryHeartbeatMs
+    ) return;
+    const expectedRevision = cached?.revision ?? await this.#readDeviceRegistryRevision(identity);
+    await this.#assertDaemonCurrent(signal);
+    const envelope = await encryptDeviceRegistry(payload, identity.accountKey, {
+      entityPublicId: identity.devicePublicId,
+      keyVersion: identity.keyVersion,
+      kind: "device_registry",
+      userPublicId: identity.userPublicId,
+    });
+    abortBeforeEffect(signal);
+    const response = await this.#mutation("devices:updateRegistry", {
+      envelope,
+      expectedRevision,
+      keyVersion: identity.keyVersion,
+    });
+    if (
+      !isRecord(response)
+      || response.devicePublicId !== identity.devicePublicId
+      || !isSafePositiveInteger(response.revision)
+    ) throw new Error("Device registry publish response is invalid.");
+    this.#deviceRegistryState = { digest, publishedAt: now, revision: response.revision };
+  }
+
+  async #readDeviceRegistryRevision(identity: ActiveCloudIdentity): Promise<number> {
+    const value = await this.#transport.query("devices:getRegistry", {
+      devicePublicId: identity.devicePublicId,
+    });
+    if (value === null) return 0;
+    if (
+      !isRecord(value)
+      || value.devicePublicId !== identity.devicePublicId
+      || !isSafePositiveInteger(value.revision)
+    ) throw new Error("Device registry response is invalid.");
+    return value.revision;
+  }
+
   async #createSession(
     identity: ActiveCloudIdentity,
     session: CloudLocalSessionHead,
@@ -2819,7 +2908,11 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         },
       );
       abortBeforeEffect(signal);
-      if (current.name === session.metadata.name && current.note === session.metadata.note) {
+      if (
+        current.name === session.metadata.name
+        && current.note === session.metadata.note
+        && (current.archived ?? false) === (session.metadata.archived ?? false)
+      ) {
         return head;
       }
     }

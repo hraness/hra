@@ -1,3 +1,10 @@
+export { parseCodexAutomationToml, readCodexAutomations } from "./automations.ts";
+export type {
+  CodexAutomation,
+  CodexAutomationDiagnostic,
+  CodexAutomationScan,
+  ReadCodexAutomationsInput,
+} from "./automations.ts";
 export { CodexAppServerClient } from "./client.ts";
 export type {
   CodexAppServerClientOptions,

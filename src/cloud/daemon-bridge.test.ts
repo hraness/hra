@@ -44,7 +44,12 @@ import {
 } from "./local-control";
 import { PollingCloudDaemonLifecycle } from "./daemon-lifecycle";
 import { hmacSha256Hex, sha256Hex } from "./crypto";
-import { encryptRemoteCommand, type RemoteCommandPayload } from "./payloads";
+import {
+  decryptDeviceRegistry,
+  encryptRemoteCommand,
+  type DeviceRegistryPayload,
+  type RemoteCommandPayload,
+} from "./payloads";
 import { encryptCompactEvents, type CompactSessionEvent } from "./projection";
 
 const fixedNow = 1_900_000_000_000;
@@ -4542,5 +4547,135 @@ describe("cloud daemon bridge", () => {
     await lifecycle.join();
     expect(calls).toBeGreaterThanOrEqual(1);
     expect(closeCalls).toBe(1);
+  });
+});
+
+describe("device registry publication", () => {
+  const registry = {
+    accounts: [],
+    daemonVersion: "0.3.0",
+    defaultApprovalMode: "auto:all",
+    defaultPreset: "ultra",
+    heartbeatAt: 0,
+    machineLabel: "Studio",
+    projects: [],
+    proseAutorespondConfigured: false,
+    scheduledTasks: [],
+    showThinkingDefault: false,
+    version: 1,
+  } as const;
+
+  function registryWorld(readDeviceRegistry: () => Promise<DeviceRegistryPayload>) {
+    const cloud = new FakeCloud();
+    const device = "device_registry_1";
+    const inner = cloud.connect(device);
+    const rows = new Map<string, Readonly<{ envelope: EncryptedEnvelope; keyVersion: number; revision: number }>>();
+    const writes: Array<Readonly<{ expectedRevision: number }>> = [];
+    const local: CloudDaemonLocalSourcePort = Object.assign(new EmptyLocal(), { readDeviceRegistry });
+    const transport: CloudTransport = {
+      action: (name, args) => inner.action(name, args),
+      mutation: async (name, args) => {
+        if (name !== "devices:updateRegistry") return await inner.mutation(name, args);
+        const expectedRevision = args.expectedRevision as number;
+        writes.push({ expectedRevision });
+        const current = rows.get(device);
+        if ((current?.revision ?? 0) !== expectedRevision) {
+          throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
+        }
+        const revision = expectedRevision + 1;
+        rows.set(device, {
+          envelope: args.envelope as unknown as EncryptedEnvelope,
+          keyVersion: args.keyVersion as number,
+          revision,
+        });
+        return { devicePublicId: device, revision, updatedAt: cloud.now };
+      },
+      query: async (name, args) => {
+        if (name !== "devices:getRegistry") return await inner.query(name, args);
+        const row = rows.get(args.devicePublicId as string);
+        return row === undefined ? null : { devicePublicId: device, ...row, updatedAt: cloud.now };
+      },
+    };
+    return { cloud, device, local, rows, transport, writes };
+  }
+
+  test("publishes on start, republishes on change, and otherwise heartbeats at most once a minute", async () => {
+    let projection: DeviceRegistryPayload = { ...registry, heartbeatAt: 1_000 };
+    const world = registryWorld(() => Promise.resolve(projection));
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      local: world.local,
+      now: () => world.cloud.now,
+      transport: world.transport,
+    });
+    const signal = new AbortController().signal;
+
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }]);
+    const stored = world.rows.get(world.device);
+    expect(stored?.revision).toBe(1);
+    expect(await decryptDeviceRegistry(
+      stored?.envelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "device_registry",
+        userPublicId,
+      },
+    )).toEqual(projection);
+
+    // Unchanged inputs inside the heartbeat window write nothing.
+    projection = { ...projection, heartbeatAt: projection.heartbeatAt + 1_000 };
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toHaveLength(1);
+
+    // A changed input republishes immediately under the returned revision.
+    projection = { ...projection, showThinkingDefault: true };
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }, { expectedRevision: 1 }]);
+    expect(world.rows.get(world.device)?.revision).toBe(2);
+
+    // With inputs unchanged, the heartbeat republishes after the interval.
+    world.cloud.now += 60_000;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toHaveLength(3);
+    expect(world.rows.get(world.device)?.revision).toBe(3);
+  });
+
+  test("reports a registry failure without stopping the cycle and recovers the server revision", async () => {
+    let failures = 1;
+    const world = registryWorld(() => {
+      if (failures > 0) {
+        failures -= 1;
+        return Promise.reject(new Error("local registry unavailable"));
+      }
+      return Promise.resolve({ ...registry, heartbeatAt: 1_000 });
+    });
+    // A row written by an earlier daemon process: this process knows no
+    // revision and must read the server's rather than assuming zero.
+    world.rows.set(world.device, {
+      envelope: { algorithm: "A256GCM", ciphertext: "AAAA", keyVersion: 1, nonce: "BBBB" },
+      keyVersion: 1,
+      revision: 7,
+    });
+    const daemon = bridge({
+      cloud: world.cloud,
+      device: world.device,
+      local: world.local,
+      now: () => world.cloud.now,
+      transport: world.transport,
+    });
+    const signal = new AbortController().signal;
+
+    const failed = await daemon.cycle(signal);
+    expect(failed.online).toBe(true);
+    expect(failed.errors).toEqual(["device registry: local registry unavailable"]);
+    expect(world.writes).toEqual([]);
+
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toEqual([{ expectedRevision: 7 }]);
+    expect(world.rows.get(world.device)?.revision).toBe(8);
   });
 });

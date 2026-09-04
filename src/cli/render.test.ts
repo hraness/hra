@@ -1944,7 +1944,7 @@ describe("CLI rendering", () => {
     };
     const human = capture();
     renderSuccess(
-      { kind: "session.list", account: "mutable-label", limit: 37, cursor: "earlier" },
+      { kind: "session.list", account: "mutable-label", archived: false, limit: 37, cursor: "earlier" },
       listing,
       false,
       human.output,
@@ -1963,7 +1963,7 @@ describe("CLI rendering", () => {
 
     const json = capture();
     renderSuccess(
-      { kind: "session.list", account: "mutable-label", limit: 37 },
+      { kind: "session.list", account: "mutable-label", archived: false, limit: 37 },
       listing,
       true,
       json.output,
@@ -1980,7 +1980,7 @@ describe("CLI rendering", () => {
     const privateSentinel = "PRIVATE-PROVIDER-THREAD-SENTINEL";
     const stripped = capture();
     renderSuccess(
-      { kind: "session.list", account: accountId, limit: 37 },
+      { kind: "session.list", account: accountId, archived: false, limit: 37 },
       {
         ...listing,
         sessions: listing.sessions.map((session) => ({
@@ -2016,7 +2016,7 @@ describe("CLI rendering", () => {
     ]) {
       const mismatched = capture();
       expect(() => renderSuccess(
-        { kind: "session.list", account: accountId, limit: 37 },
+        { kind: "session.list", account: accountId, archived: false, limit: 37 },
         response,
         true,
         mismatched.output,
@@ -2026,7 +2026,7 @@ describe("CLI rendering", () => {
 
     const malformed = capture();
     expect(() => renderSuccess(
-      { kind: "session.list", account: "mutable-label", limit: 37 },
+      { kind: "session.list", account: "mutable-label", archived: false, limit: 37 },
       { ...listing, nextCursor: "provider-cursor-must-not-render" },
       false,
       malformed.output,
@@ -2036,7 +2036,7 @@ describe("CLI rendering", () => {
 
     const unsafeMetadata = capture();
     expect(() => renderSuccess(
-      { kind: "session.list", account: "mutable-label", limit: 37 },
+      { kind: "session.list", account: "mutable-label", archived: false, limit: 37 },
       {
         ...listing,
         listing: {

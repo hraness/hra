@@ -191,6 +191,7 @@ const sessionRowSchema = z.object({
   state: sessionStateSchema,
   active_turn_id: z.string().nullable(),
   provider_updated_at: z.number().nonnegative().nullable(),
+  archived_at: unixMillisecondsSchema.nullable(),
   revision: z.number().int().positive(),
   created_at: unixMillisecondsSchema,
   updated_at: unixMillisecondsSchema,
@@ -311,6 +312,8 @@ export type SessionRecord = {
   state: z.infer<typeof sessionStateSchema>;
   activeTurnId?: string;
   providerUpdatedAt?: number;
+  /** Set when the session was archived out of the default listing (W2 settings). */
+  archivedAt?: number;
   revision: number;
   createdAt: number;
   updatedAt: number;
@@ -748,7 +751,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 30;
+const currentSchemaVersion = 31;
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -2185,6 +2188,42 @@ const schemaVersion30ResolvedByColumn =
 /** Per-session evidence rows kept for `hra autorespond status`; oldest rows past this cap are pruned on insert. */
 export const AUTORESPOND_EVIDENCE_PER_SESSION_CAP = 500;
 
+// Session archive and the settings projection's daemon-level defaults (W2
+// settings). Every object here is additive and independently guarded, so a
+// second schema-version-31 migration authored in parallel can be reconciled
+// by applying both constants in either order; nothing below rewrites a row
+// that another migration owns.
+const schemaVersion31Archive = `
+CREATE TABLE IF NOT EXISTS session_show_thinking (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+) STRICT;
+CREATE INDEX IF NOT EXISTS sessions_archived ON sessions(archived_at, updated_at DESC, id);
+`;
+const schemaVersion31ArchiveSessionColumn =
+  "ALTER TABLE sessions ADD COLUMN archived_at INTEGER "
+  + "CHECK(archived_at IS NULL OR archived_at >= 0)";
+const schemaVersion31ArchiveShowThinkingColumn =
+  "ALTER TABLE daemon_state ADD COLUMN default_show_thinking INTEGER NOT NULL DEFAULT 0 "
+  + "CHECK(default_show_thinking IN (0,1))";
+const schemaVersion31ArchiveDefaultPresetColumn =
+  "ALTER TABLE daemon_state ADD COLUMN default_preset TEXT NOT NULL DEFAULT 'ultra' "
+  + "CHECK(default_preset IN ('low','high','ultra'))";
+
+const applySchemaVersion31Archive = (database: Database): void => {
+  if (!hasTableColumn(database, "sessions", "archived_at")) {
+    database.exec(schemaVersion31ArchiveSessionColumn);
+  }
+  if (!hasTableColumn(database, "daemon_state", "default_show_thinking")) {
+    database.exec(schemaVersion31ArchiveShowThinkingColumn);
+  }
+  if (!hasTableColumn(database, "daemon_state", "default_preset")) {
+    database.exec(schemaVersion31ArchiveDefaultPresetColumn);
+  }
+  database.exec(schemaVersion31Archive);
+};
+
 const schemaVersion28Objects = [
   {
     name: "account_rate_limit_reset_policies",
@@ -3538,6 +3577,13 @@ const migrateWritableDatabase = (
       version = 30;
     }
 
+    if (version < 31) {
+      applySchemaVersion31Archive(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(31, now());
+      database.exec("PRAGMA user_version = 31");
+      version = 31;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -3573,6 +3619,7 @@ const migrateWritableDatabase = (
     database.exec(SESSION_TASK_SCHEMA_SQL);
     assertSessionTaskSchema(database);
     database.exec(schemaVersion30);
+    applySchemaVersion31Archive(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -3621,6 +3668,7 @@ const mapSession = (row: unknown): SessionRecord => {
     state: parsed.state,
     ...(parsed.active_turn_id === null ? {} : { activeTurnId: parsed.active_turn_id }),
     ...(parsed.provider_updated_at === null ? {} : { providerUpdatedAt: parsed.provider_updated_at }),
+    ...(parsed.archived_at === null ? {} : { archivedAt: parsed.archived_at }),
     revision: parsed.revision,
     createdAt: parsed.created_at,
     updatedAt: parsed.updated_at,
@@ -4442,17 +4490,99 @@ export class StateStore {
     return this.requireSession(id);
   }
 
-  listSessions(limit = 50, profileId?: ProfileId): readonly SessionRecord[] {
+  /**
+   * Archived sessions are excluded unless `includeArchived` is set: archive is
+   * a listing filter, never a deletion, so every other read path still sees
+   * the session and its history.
+   */
+  listSessions(limit = 50, profileId?: ProfileId, includeArchived = false): readonly SessionRecord[] {
     const bounded = Math.max(1, Math.min(100, Math.trunc(limit)));
+    const archiveClause = includeArchived ? "" : " AND archived_at IS NULL";
     const rows = profileId === undefined
-      ? this.#database.query("SELECT * FROM sessions ORDER BY updated_at DESC,id LIMIT ?").all(bounded)
-      : this.#database.query("SELECT * FROM sessions WHERE profile_id=? ORDER BY updated_at DESC,id LIMIT ?").all(profileId, bounded);
+      ? this.#database.query(
+        `SELECT * FROM sessions WHERE 1=1${archiveClause} ORDER BY updated_at DESC,id LIMIT ?`,
+      ).all(bounded)
+      : this.#database.query(
+        `SELECT * FROM sessions WHERE profile_id=?${archiveClause} ORDER BY updated_at DESC,id LIMIT ?`,
+      ).all(profileId, bounded);
     return rows.map(mapSession);
+  }
+
+  /**
+   * Archive or unarchive a session. The row's `revision` is left alone: this
+   * is local presentation state, not provider-observable session authority,
+   * so it must not invalidate an in-flight optimistic session update.
+   */
+  setSessionArchived(sessionId: SessionId, archived: boolean): SessionRecord {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const now = this.#now();
+    const write = this.#database.transaction(() => {
+      const result = this.#database.query(
+        "UPDATE sessions SET archived_at=? WHERE id=?",
+      ).run(archived ? now : null, parsedSessionId);
+      if (result.changes !== 1) throw new SelectionError("NOT_FOUND");
+    });
+    write.immediate();
+    return this.requireSession(parsedSessionId);
+  }
+
+  // --- Settings projection: show thinking and the daemon default preset ----
+
+  readDefaultShowThinking(): boolean {
+    const row = this.#database.query("SELECT default_show_thinking FROM daemon_state WHERE singleton=1").get();
+    return z.object({ default_show_thinking: z.union([z.literal(0), z.literal(1)]) })
+      .strict().parse(row).default_show_thinking === 1;
+  }
+
+  setDefaultShowThinking(enabled: boolean): void {
+    const result = this.#database.query("UPDATE daemon_state SET default_show_thinking=? WHERE singleton=1")
+      .run(enabled ? 1 : 0);
+    if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
+  }
+
+  readSessionShowThinking(sessionId: SessionId): Readonly<{ enabled: boolean; source: "session" | "default" }> {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const row = this.#database.query("SELECT enabled FROM session_show_thinking WHERE session_id=?").get(parsedSessionId);
+    if (row !== null) {
+      const parsed = z.object({ enabled: z.union([z.literal(0), z.literal(1)]) }).strict().parse(row);
+      return { enabled: parsed.enabled === 1, source: "session" };
+    }
+    return { enabled: this.readDefaultShowThinking(), source: "default" };
+  }
+
+  setSessionShowThinking(sessionId: SessionId, enabled: boolean | null): void {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    if (enabled === null) {
+      this.#database.query("DELETE FROM session_show_thinking WHERE session_id=?").run(parsedSessionId);
+      return;
+    }
+    const write = this.#database.transaction(() => {
+      if (this.#database.query("SELECT 1 FROM sessions WHERE id=?").get(parsedSessionId) === null) {
+        throw new SelectionError("NOT_FOUND");
+      }
+      this.#database.query(
+        `INSERT INTO session_show_thinking(session_id,enabled,updated_at) VALUES (?,?,?)
+         ON CONFLICT(session_id) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at`,
+      ).run(parsedSessionId, enabled ? 1 : 0, this.#now());
+    });
+    write.immediate();
+  }
+
+  readDefaultPreset(): Preset {
+    const row = this.#database.query("SELECT default_preset FROM daemon_state WHERE singleton=1").get();
+    return z.object({ default_preset: presetSchema }).strict().parse(row).default_preset;
+  }
+
+  setDefaultPreset(preset: Preset): void {
+    const parsed = presetSchema.parse(preset);
+    const result = this.#database.query("UPDATE daemon_state SET default_preset=? WHERE singleton=1").run(parsed);
+    if (result.changes !== 1) throw new Error("DAEMON_STATE_MISSING");
   }
 
   listLocalSessionPage(input: Readonly<{
     profileId: ProfileId;
     after: Readonly<{ createdAt: number; sessionId: SessionId }> | null;
+    includeArchived?: boolean;
     limit: number;
   }>): Readonly<{
     sessions: readonly SessionRecord[];
@@ -4466,16 +4596,17 @@ export class StateStore {
           createdAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER).parse(input.after.createdAt),
           sessionId: sessionIdSchema.parse(input.after.sessionId),
         };
+    const archiveClause = input.includeArchived === true ? "" : " AND archived_at IS NULL";
     const rows = (after === null
       ? this.#database.query(
         `SELECT * FROM sessions
-         WHERE profile_id=?
+         WHERE profile_id=?${archiveClause}
          ORDER BY created_at DESC,id ASC
          LIMIT ?`,
       ).all(profileId, limit + 1)
       : this.#database.query(
         `SELECT * FROM sessions
-         WHERE profile_id=?
+         WHERE profile_id=?${archiveClause}
            AND (created_at < ? OR (created_at = ? AND id > ?))
          ORDER BY created_at DESC,id ASC
          LIMIT ?`,

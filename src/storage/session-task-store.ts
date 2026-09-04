@@ -782,6 +782,23 @@ export class SessionTaskStore {
     ).all(parsedSessionId).map((row) => summarizeSessionTask(mapTask(row)));
   }
 
+  /**
+   * Every live conversation scheduled task across sessions, bounded, for the
+   * device settings projection. This is a read-only listing: it takes no
+   * idempotency receipt because it changes nothing.
+   */
+  listAll(limit: number): readonly SessionTaskSummary[] {
+    const bounded = Math.max(1, Math.min(SESSION_TASK_LIMIT * 32, Math.trunc(limit)));
+    return this.#database.query(
+      `SELECT id,session_id,name,prompt,schedule_kind,interval_minutes,status,revision,
+              next_due_at,created_at,updated_at,deleted_at
+       FROM session_tasks
+       WHERE deleted_at IS NULL
+       ORDER BY created_at,id
+       LIMIT ?`,
+    ).all(bounded).map((row) => summarizeSessionTask(mapTask(row)));
+  }
+
   listIdempotent(
     sessionId: SessionId,
     idempotencyKey: string,

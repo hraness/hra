@@ -8,6 +8,7 @@ import {
   isBase64Url,
   isDigest,
   isOpaqueIdentifier,
+  isSafeNonNegativeInteger,
   isSafePositiveInteger,
   parseEncryptedEnvelope,
   parseWrappedKeyEnvelope,
@@ -863,5 +864,115 @@ export const listKeyEnvelopes = query({
       createdAt: entry.createdAt,
       envelope: entry.envelope,
     }));
+  },
+});
+
+function publicRegistry(registry: Readonly<{
+  devicePublicId: string;
+  envelope: Parameters<typeof parseEncryptedEnvelope>[0];
+  keyVersion: number;
+  revision: number;
+  updatedAt: number;
+}>) {
+  return {
+    devicePublicId: registry.devicePublicId,
+    envelope: registry.envelope,
+    keyVersion: registry.keyVersion,
+    revision: registry.revision,
+    updatedAt: registry.updatedAt,
+  };
+}
+
+// A device writes only its own registry row: the calling device's identity is
+// the row key, so no target-device argument exists and no device can overwrite
+// another device's projection. Reads stay user-scoped so a second device can
+// resolve what the rest of the account has published.
+export const updateRegistry = mutation({
+  args: {
+    envelope: encryptedEnvelope,
+    expectedRevision: v.number(),
+    keyVersion: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const authority = await requireDeviceAuthority(ctx);
+    if (
+      parseEncryptedEnvelope(args.envelope, cloudLimits.registryCiphertextCharacters) === null
+      || !isSafePositiveInteger(args.keyVersion)
+      || args.keyVersion !== args.envelope.keyVersion
+      || !isSafeNonNegativeInteger(args.expectedRevision)
+    ) rejectAuthority();
+    const matches = await ctx.db
+      .query("deviceRegistries")
+      .withIndex("by_device", (builder) => builder.eq("deviceId", authority.deviceId))
+      .take(2);
+    if (matches.length > 1) rejectAuthority();
+    const existing = matches[0];
+    const now = Date.now();
+    if (existing === undefined) {
+      if (args.expectedRevision !== 0) throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
+      const document = {
+        createdAt: now,
+        deviceId: authority.deviceId,
+        devicePublicId: authority.device.publicId,
+        envelope: args.envelope,
+        keyVersion: args.keyVersion,
+        revision: 1,
+        updatedAt: now,
+        userId: authority.userId,
+      } as const;
+      await reserveQuotaForInsert(ctx, authority.userId, "custody", document);
+      await ctx.db.insert("deviceRegistries", document);
+      return {
+        devicePublicId: document.devicePublicId,
+        revision: document.revision,
+        updatedAt: document.updatedAt,
+      };
+    }
+    if (existing.revision !== args.expectedRevision) {
+      throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
+    }
+    const patch = {
+      envelope: args.envelope,
+      keyVersion: args.keyVersion,
+      revision: existing.revision + 1,
+      updatedAt: now,
+    } as const;
+    await adjustQuotaForPatch(ctx, authority.userId, "custody", existing, patch);
+    await ctx.db.patch(existing._id, patch);
+    return {
+      devicePublicId: existing.devicePublicId,
+      revision: patch.revision,
+      updatedAt: patch.updatedAt,
+    };
+  },
+});
+
+export const getRegistry = query({
+  args: { devicePublicId: v.string() },
+  handler: async (ctx, args) => {
+    const authority = await requireDeviceAuthority(ctx);
+    if (!isOpaqueIdentifier(args.devicePublicId)) rejectAuthority();
+    const matches = await ctx.db
+      .query("deviceRegistries")
+      .withIndex("by_user_and_device_public_id", (builder) => builder
+        .eq("userId", authority.userId)
+        .eq("devicePublicId", args.devicePublicId))
+      .take(2);
+    if (matches.length > 1) rejectAuthority();
+    const registry = matches[0];
+    if (registry === undefined) return null;
+    return publicRegistry(registry);
+  },
+});
+
+export const listRegistries = query({
+  args: {},
+  handler: async (ctx) => {
+    const authority = await requireDeviceAuthority(ctx);
+    const registries = await ctx.db
+      .query("deviceRegistries")
+      .withIndex("by_user", (builder) => builder.eq("userId", authority.userId))
+      .take(cloudLimits.pageSize);
+    return registries.map((registry) => publicRegistry(registry));
   },
 });
