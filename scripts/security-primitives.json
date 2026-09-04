@@ -27,6 +27,9 @@
   "src/cloud/identity-custody.ts": {
     "assertCurrent": 8
   },
+  "src/cloud/live-uploader.ts": {
+    "redactCompleteSensitiveText": 1
+  },
   "src/cloud/local-control.ts": {
     "assertCurrent": 20
   },
@@ -113,7 +116,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 66,
+    "immediateTransaction": 70,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 2
