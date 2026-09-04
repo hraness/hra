@@ -1,10 +1,19 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from "react";
 
 import { SettingsIcon } from "../components/icons";
 import { SessionCard } from "../components/session-card";
 import { ChoiceGroup } from "../components/settings-list";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
+import { useCardOrder } from "../data/card-order";
 import { useSubmitCommand } from "../data/commands";
 import { useDeviceCommandState, useSubmitDeviceCommand } from "../data/device-commands";
 import { useDeviceRegistries } from "../data/registry";
@@ -40,6 +49,13 @@ const presetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[]
   { label: "Sol Ultra", value: "ultra" },
 ];
 
+/** The card under the pointer during a drag, resolved from the DOM. */
+function cardUnderPointer(clientX: number, clientY: number): string | null {
+  const element = document.elementFromPoint(clientX, clientY);
+  const host = element?.closest("[data-session-id]") ?? null;
+  return host?.getAttribute("data-session-id") ?? null;
+}
+
 /**
  * The grid.
  *
@@ -47,6 +63,13 @@ const presetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[]
  * decides the order, and the cards themselves stay mounted across a reorder
  * because they are keyed by session id: a card that floats to the front keeps
  * its subscription and its scroll position rather than remounting.
+ *
+ * Ordering is manual once the reader drags a card. There is no grid layout
+ * library: `react-grid-layout` positions with style attributes and
+ * `style-src 'self'` refuses them, so the drag is Pointer Events over the
+ * ordinary CSS grid — the same code path for mouse, pen, and touch — and the
+ * arrangement is a sequence of session ids, not a set of coordinates. Every
+ * visual state of the drag is a class.
  *
  * The composer has two modes. With a session selected it steers that session,
  * as it has since W2. With nothing selected it starts a real session on a
@@ -65,6 +88,7 @@ export function GridScreen({
   const submit = useSubmitCommand();
   const submitDeviceCommand = useSubmitDeviceCommand();
   const registries = useDeviceRegistries();
+  const cardOrder = useCardOrder();
 
   const [summaries, setSummaries] = useState<Readonly<Record<string, SessionCardSummary>>>({});
   const [message, setMessage] = useState("");
@@ -103,7 +127,10 @@ export function GridScreen({
     [heads, summaries],
   );
 
-  const ordered = useMemo(() => orderSessionCards(known), [known]);
+  const ordered = useMemo(
+    () => orderSessionCards(known, cardOrder.order),
+    [cardOrder.order, known],
+  );
   const steerTarget = useMemo(
     () => selectedSessionId === null
       ? null
@@ -189,14 +216,94 @@ export function GridScreen({
       .finally(() => { setSending(false); });
   };
 
-  const visible = ordered
-    .map((summary) => headById.get(summary.publicId))
-    .filter((head): head is NonNullable<typeof head> => head !== undefined);
-  // A head whose card has not reported yet is still rendered, otherwise nothing
-  // would ever mount to report.
-  const reported = new Set(known.map((summary) => summary.publicId));
-  const pendingHeads = heads.filter((head) => !reported.has(head.publicId));
-  const rendered = [...visible, ...pendingHeads];
+  const rendered = useMemo(() => {
+    const visible = ordered
+      .map((summary) => headById.get(summary.publicId))
+      .filter((head): head is NonNullable<typeof head> => head !== undefined);
+    // A head whose card has not reported yet is still rendered, otherwise
+    // nothing would ever mount to report.
+    const reported = new Set(known.map((summary) => summary.publicId));
+    return [...visible, ...heads.filter((head) => !reported.has(head.publicId))];
+  }, [headById, heads, known, ordered]);
+
+  // The sequence the reader is actually looking at. Every reorder is expressed
+  // against it, so a drop lands where the card appeared to be dropped even
+  // while the automatic ladder is still moving cards that were never arranged.
+  const displayed = useMemo(() => rendered.map((head) => head.publicId), [rendered]);
+  const displayedRef = useRef(displayed);
+  displayedRef.current = displayed;
+
+  const [drag, setDrag] = useState<Readonly<{ activeId: string; overId: string | null }> | null>(
+    null,
+  );
+  const dragRef = useRef<
+    Readonly<{ activeId: string; overId: string | null; pointerId: number }> | null
+  >(null);
+  const dragging = drag !== null;
+  const { move: moveCard, nudge } = cardOrder;
+
+  /** The keyboard path, from the card menu or the handle's arrow keys. */
+  const moveInDisplayedOrder = useCallback((
+    sessionPublicId: string,
+    direction: "left" | "right",
+  ) => {
+    nudge(displayedRef.current, sessionPublicId, direction);
+  }, [nudge]);
+
+  const beginDrag = useCallback((
+    sessionPublicId: string,
+    event: ReactPointerEvent<HTMLElement>,
+  ) => {
+    // A secondary mouse button opens a context menu; it does not drag.
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    // The default action would start a text selection and a scroll. Suppressing
+    // it also suppresses the focus that follows a press, so the handle takes
+    // focus explicitly and its arrow keys keep working after a drag.
+    event.preventDefault();
+    event.currentTarget.focus();
+    dragRef.current = {
+      activeId: sessionPublicId,
+      overId: sessionPublicId,
+      pointerId: event.pointerId,
+    };
+    setDrag({ activeId: sessionPublicId, overId: sessionPublicId });
+  }, []);
+
+  // The gesture is followed on the document rather than on the card, so a
+  // finger that leaves the card, or a pointer that is cancelled by the browser,
+  // still ends the drag exactly once.
+  useEffect(() => {
+    if (!dragging) return;
+    const onPointerMove = (event: PointerEvent) => {
+      const current = dragRef.current;
+      if (current === null || event.pointerId !== current.pointerId) return;
+      event.preventDefault();
+      const overId = cardUnderPointer(event.clientX, event.clientY);
+      if (overId === current.overId) return;
+      dragRef.current = { ...current, overId };
+      setDrag({ activeId: current.activeId, overId });
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      const current = dragRef.current;
+      if (current === null || event.pointerId !== current.pointerId) return;
+      dragRef.current = null;
+      setDrag(null);
+      const overId = cardUnderPointer(event.clientX, event.clientY) ?? current.overId;
+      if (overId !== null) moveCard(displayedRef.current, current.activeId, overId);
+    };
+    const onPointerCancel = () => {
+      dragRef.current = null;
+      setDrag(null);
+    };
+    document.addEventListener("pointermove", onPointerMove, { passive: false });
+    document.addEventListener("pointerup", onPointerUp);
+    document.addEventListener("pointercancel", onPointerCancel);
+    return () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerup", onPointerUp);
+      document.removeEventListener("pointercancel", onPointerCancel);
+    };
+  }, [dragging, moveCard]);
 
   const hint = starting
     ? startTarget === null || project === null
@@ -311,6 +418,18 @@ export function GridScreen({
               key={head.publicId}
               onOpen={open}
               onSummary={reportSummary}
+              ordering={{
+                arranged: cardOrder.arranged,
+                canMoveLeft: cardOrder.canMove(displayed, head.publicId, "left"),
+                canMoveRight: cardOrder.canMove(displayed, head.publicId, "right"),
+                dragging: drag?.activeId === head.publicId,
+                dropTarget: drag !== null
+                  && drag.overId === head.publicId
+                  && drag.activeId !== head.publicId,
+                onDragStart: beginDrag,
+                onMove: moveInDisplayedOrder,
+                onReset: cardOrder.reset,
+              }}
               selected={head.publicId === selectedSessionId}
             />
           ))}

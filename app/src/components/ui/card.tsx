@@ -2,7 +2,15 @@ import type { HTMLAttributes } from "react";
 
 import { cn } from "../../lib/cn";
 
-export type CardProps = HTMLAttributes<HTMLDivElement>;
+/**
+ * `data-session-id` is declared rather than left to JSX's hyphen escape hatch,
+ * because a component's props are type checked: the grid's pointer drag reads
+ * it back through `elementFromPoint`, so the attribute has to survive the
+ * spread onto the element.
+ */
+export type CardProps = HTMLAttributes<HTMLDivElement> & Readonly<{
+  "data-session-id"?: string;
+}>;
 
 export function Card({ className, ...rest }: CardProps) {
   return (

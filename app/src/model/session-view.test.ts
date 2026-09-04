@@ -12,8 +12,11 @@ import {
   sessionStateLabel,
   sessionStateTone,
   shortSessionLabel,
+  subagentChipCharacters,
+  subagentChips,
   turnSummaryLine,
   type SessionCardSummary,
+  type SubagentChipInput,
 } from "./session-view";
 
 const allStates: readonly SessionStateValue[] = [
@@ -114,6 +117,172 @@ describe("orderSessionCards", () => {
     const input = [card("b", { lastActivityAt: 1 }), card("a", { lastActivityAt: 2 })];
     orderSessionCards(input);
     expect(input.map((entry) => entry.publicId)).toEqual(["b", "a"]);
+  });
+});
+
+describe("orderSessionCards with a manual arrangement", () => {
+  test("an empty arrangement orders exactly as the automatic ladder does", () => {
+    const summaries = [
+      card("done-old", { lastActivityAt: 10 }),
+      card("working", { lastActivityAt: 20, state: "working" }),
+      card("attention", { attention: true, lastActivityAt: 1, state: "needs_answer" }),
+      card("done-new", { lastActivityAt: 30 }),
+    ];
+    expect(orderSessionCards(summaries, []).map((entry) => entry.publicId))
+      .toEqual(orderSessionCards(summaries).map((entry) => entry.publicId));
+  });
+
+  test("the arrangement decides the order, not the activity", () => {
+    const ordered = orderSessionCards(
+      [
+        card("a", { lastActivityAt: 1 }),
+        card("b", { lastActivityAt: 100, state: "working" }),
+        card("c", { lastActivityAt: 50 }),
+      ],
+      ["c", "a", "b"],
+    );
+    expect(ordered.map((entry) => entry.publicId)).toEqual(["c", "a", "b"]);
+  });
+
+  test("an attention card still floats to the front of an arrangement", () => {
+    const ordered = orderSessionCards(
+      [
+        card("first", { lastActivityAt: 9 }),
+        card("second", { lastActivityAt: 8 }),
+        card("asking", { attention: true, lastActivityAt: 1, state: "needs_approval" }),
+      ],
+      ["first", "second", "asking"],
+    );
+    expect(ordered.map((entry) => entry.publicId)).toEqual(["asking", "first", "second"]);
+  });
+
+  test("an arranged card takes its place back when the question is answered", () => {
+    const arrangement = ["first", "second", "third"];
+    const asking = orderSessionCards(
+      [
+        card("first"),
+        card("second", { attention: true, state: "needs_answer" }),
+        card("third"),
+      ],
+      arrangement,
+    );
+    expect(asking.map((entry) => entry.publicId)).toEqual(["second", "first", "third"]);
+    const answered = orderSessionCards(
+      [card("first"), card("second"), card("third")],
+      arrangement,
+    );
+    expect(answered.map((entry) => entry.publicId)).toEqual(arrangement);
+  });
+
+  test("a card the arrangement does not name falls in behind every card it does", () => {
+    const ordered = orderSessionCards(
+      [
+        card("new", { lastActivityAt: 999, state: "working" }),
+        card("placed", { lastActivityAt: 1 }),
+      ],
+      ["placed"],
+    );
+    expect(ordered.map((entry) => entry.publicId)).toEqual(["placed", "new"]);
+  });
+
+  test("unnamed cards keep the automatic ladder among themselves", () => {
+    const ordered = orderSessionCards(
+      [
+        card("idle-new", { lastActivityAt: 30 }),
+        card("working-old", { lastActivityAt: 5, state: "working" }),
+        card("placed", { lastActivityAt: 1 }),
+      ],
+      ["placed"],
+    );
+    expect(ordered.map((entry) => entry.publicId)).toEqual(["placed", "working-old", "idle-new"]);
+  });
+
+  test("an arrangement naming sessions that are gone changes nothing for the rest", () => {
+    const ordered = orderSessionCards(
+      [card("a", { lastActivityAt: 1 }), card("b", { lastActivityAt: 2 })],
+      ["ghost", "b", "a"],
+    );
+    expect(ordered.map((entry) => entry.publicId)).toEqual(["b", "a"]);
+  });
+
+  test("an arranged archived session still leaves the grid", () => {
+    const ordered = orderSessionCards(
+      [card("kept"), card("gone", { archived: true })],
+      ["gone", "kept"],
+    );
+    expect(ordered.map((entry) => entry.publicId)).toEqual(["kept"]);
+  });
+});
+
+describe("subagentChips", () => {
+  const agent = (
+    agentId: string,
+    overrides: Partial<SubagentChipInput> = {},
+  ): SubagentChipInput => ({
+    agentId,
+    depth: 1,
+    nickname: null,
+    role: null,
+    ...overrides,
+  });
+
+  test("a session with no subagents gets nothing", () => {
+    expect(subagentChips([])).toEqual({ chips: [], overflow: 0 });
+  });
+
+  test("the face is the nickname, then the role, then an opaque short id", () => {
+    const { chips } = subagentChips([
+      agent("aaaaaaaaaaaa", { nickname: "Scout", role: "reviewer" }),
+      agent("bbbbbbbbbbbb", { role: "reviewer" }),
+      agent("cccccccccccc"),
+    ]);
+    expect(chips.map((chip) => chip.label)).toEqual(["Agent cccccc", "Scout", "reviewer"]);
+  });
+
+  test("the detail line carries the role and the depth", () => {
+    const { chips } = subagentChips([agent("a", { depth: 2, role: "reviewer" })]);
+    expect(chips[0]?.detail).toBe("reviewer · depth 2");
+  });
+
+  test("an unreported role or depth says so rather than inventing one", () => {
+    const { chips } = subagentChips([agent("a", { depth: null })]);
+    expect(chips[0]?.detail).toBe("No role reported · depth unknown");
+  });
+
+  test("shows three and counts the rest", () => {
+    const set = subagentChips([
+      agent("a", { nickname: "one" }),
+      agent("b", { nickname: "two" }),
+      agent("c", { nickname: "three" }),
+      agent("d", { nickname: "four" }),
+      agent("e", { nickname: "five" }),
+    ]);
+    expect(set.chips.length).toBe(3);
+    expect(set.overflow).toBe(2);
+  });
+
+  test("orders shallowest first so a repainting card does not reshuffle", () => {
+    const input = [
+      agent("a", { depth: 3, nickname: "deep" }),
+      agent("b", { depth: null, nickname: "unknown" }),
+      agent("c", { depth: 1, nickname: "shallow" }),
+    ];
+    const first = subagentChips(input).chips.map((chip) => chip.label);
+    const second = subagentChips([...input].reverse()).chips.map((chip) => chip.label);
+    expect(first).toEqual(["shallow", "deep", "unknown"]);
+    expect(second).toEqual(first);
+  });
+
+  test("a long face is clamped", () => {
+    const { chips } = subagentChips([agent("a", { nickname: "n".repeat(80) })]);
+    expect(chips[0]?.label.length).toBe(subagentChipCharacters);
+    expect(chips[0]?.label.endsWith("…")).toBe(true);
+  });
+
+  test("leaves the input array untouched", () => {
+    const input = [agent("b", { depth: 2 }), agent("a", { depth: 1 })];
+    subagentChips(input);
+    expect(input.map((entry) => entry.agentId)).toEqual(["b", "a"]);
   });
 });
 

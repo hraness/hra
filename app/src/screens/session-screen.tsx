@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { BackIcon, KebabIcon, StopIcon } from "../components/icons";
 import { InteractionPanel } from "../components/interaction-panel";
+import { ScheduledTasksBadge } from "../components/scheduled-tasks-badge";
 import { StateIndicator } from "../components/state-indicator";
 import { TranscriptView } from "../components/transcript-view";
 import { Button } from "../components/ui/button";
@@ -160,6 +161,8 @@ export function SessionScreen({
           <KebabIcon />
         </Button>
       </header>
+
+      <ScheduledTasksBadge sessionPublicId={sessionPublicId} />
 
       <div
         className="flex-1 overflow-y-auto px-[max(1rem,env(safe-area-inset-left))] py-4"

@@ -64,23 +64,122 @@ export type SessionCardSummary = Readonly<{
  * with the public id as the final tie break so the order never depends on the
  * arrival order of two equal timestamps. Archived sessions leave the grid; they
  * come back from the settings screen.
+ *
+ * `manualOrder` is the reader's own arrangement (`model/card-order.ts`), and it
+ * applies inside the attention grouping: a card the reader placed third still
+ * loses its place to a card that starts asking for a human, and takes it back
+ * when the question is answered. A card the arrangement does not name falls
+ * through to the automatic ladder behind every card it does name, so an empty
+ * arrangement orders the grid exactly as it did before there was one.
  */
 export function orderSessionCards(
   summaries: readonly SessionCardSummary[],
+  manualOrder: readonly string[] = [],
 ): readonly SessionCardSummary[] {
-  const rank = (summary: SessionCardSummary): number => {
+  const placed = new Map(manualOrder.map((publicId, index) => [publicId, index]));
+  const attentionRank = (summary: SessionCardSummary): number => (summary.attention ? 0 : 1);
+  const manualRank = (summary: SessionCardSummary): number =>
+    placed.get(summary.publicId) ?? Number.MAX_SAFE_INTEGER;
+  const activityRank = (summary: SessionCardSummary): number => {
     if (summary.attention) return 0;
     return summary.state === "working" ? 1 : 2;
   };
   return [...summaries]
     .filter((summary) => !summary.archived)
     .sort((left, right) => {
-      const byRank = rank(left) - rank(right);
+      const byAttention = attentionRank(left) - attentionRank(right);
+      if (byAttention !== 0) return byAttention;
+      const byManual = manualRank(left) - manualRank(right);
+      if (byManual !== 0) return byManual;
+      const byRank = activityRank(left) - activityRank(right);
       if (byRank !== 0) return byRank;
       const byActivity = right.lastActivityAt - left.lastActivityAt;
       if (byActivity !== 0) return byActivity;
       return left.publicId < right.publicId ? -1 : left.publicId > right.publicId ? 1 : 0;
     });
+}
+
+/** What a card knows about one running subagent, as the detail stream reports it. */
+export type SubagentChipInput = Readonly<{
+  agentId: string;
+  depth: number | null;
+  nickname: string | null;
+  role: string | null;
+}>;
+
+export type SubagentChip = Readonly<{
+  agentId: string;
+  depth: number | null;
+  /** The one line shown when the chip is hovered or tapped. */
+  detail: string;
+  /** The chip face: the nickname, else the role, else an opaque short id. */
+  label: string;
+  role: string | null;
+}>;
+
+export type SubagentChipSet = Readonly<{
+  chips: readonly SubagentChip[];
+  /** How many running subagents the chips do not name. */
+  overflow: number;
+}>;
+
+export const maximumSubagentChips = 3;
+
+/** A chip face stays short enough that three of them fit a phone-width card. */
+export const subagentChipCharacters = 24;
+
+function chipLabel(subagent: SubagentChipInput): string {
+  const named = subagent.nickname?.trim() ?? "";
+  const role = subagent.role?.trim() ?? "";
+  const text = named.length > 0
+    ? named
+    : role.length > 0 ? role : `Agent ${subagent.agentId.slice(0, 6)}`;
+  return text.length <= subagentChipCharacters
+    ? text
+    : `${text.slice(0, subagentChipCharacters - 1)}…`;
+}
+
+function chipDetail(subagent: SubagentChipInput): string {
+  const role = subagent.role?.trim() ?? "";
+  const depth = subagent.depth === null || !Number.isFinite(subagent.depth)
+    ? "depth unknown"
+    : `depth ${String(subagent.depth)}`;
+  return `${role.length > 0 ? role : "No role reported"} · ${depth}`;
+}
+
+/**
+ * The card's subagent chips.
+ *
+ * A session with no running subagent gets nothing at all, not an empty row.
+ * Beyond `maximum` the count is carried by an overflow chip rather than by
+ * shrinking the faces, and the order is derived rather than arrival based —
+ * shallowest first, then by face — so a card that repaints every second does
+ * not reshuffle its own chips.
+ */
+export function subagentChips(
+  subagents: readonly SubagentChipInput[],
+  maximum: number = maximumSubagentChips,
+): SubagentChipSet {
+  const all = [...subagents]
+    .map((subagent) => ({
+      agentId: subagent.agentId,
+      depth: subagent.depth,
+      detail: chipDetail(subagent),
+      label: chipLabel(subagent),
+      role: subagent.role,
+    }))
+    .sort((left, right) => {
+      const leftDepth = left.depth ?? Number.MAX_SAFE_INTEGER;
+      const rightDepth = right.depth ?? Number.MAX_SAFE_INTEGER;
+      if (leftDepth !== rightDepth) return leftDepth - rightDepth;
+      // Code point order rather than a locale collation: the chip row must not
+      // depend on the runtime's locale data.
+      if (left.label !== right.label) return left.label < right.label ? -1 : 1;
+      if (left.agentId === right.agentId) return 0;
+      return left.agentId < right.agentId ? -1 : 1;
+    });
+  const kept = maximum < 1 ? [] : all.slice(0, maximum);
+  return { chips: kept, overflow: all.length - kept.length };
 }
 
 const idleStates = new Set<SessionStateValue>([
