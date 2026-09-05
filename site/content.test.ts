@@ -9,6 +9,7 @@ import {
   buildHraGlobalInstallCommand,
   HRA_INSTALL_PREFLIGHT_SOURCE_URL,
 } from "../src/install-preflight";
+import { helpGroupNames, usageForGroup } from "../src/cli/parser";
 import packageJson from "../package.json";
 import {
   hostedSignupCopy,
@@ -37,6 +38,14 @@ const htmlText = (value: string): string => value
   .replaceAll(">", "&gt;")
   .replaceAll('"', "&quot;")
   .replaceAll("'", "&#39;");
+
+const htmlVisibleText = (value: string): string => value
+  .replaceAll(/<[^>]+>/gu, "")
+  .replaceAll("&quot;", '"')
+  .replaceAll("&#39;", "'")
+  .replaceAll("&lt;", "<")
+  .replaceAll("&gt;", ">")
+  .replaceAll("&amp;", "&");
 
 describe("public content contract", () => {
   test("publishes the exact HRA release identity", () => {
@@ -70,7 +79,7 @@ describe("public content contract", () => {
     expect(lines[6]).toBe("```sh");
     expect(lines[7]).toBe(publicContent.installCommand);
     expect(publicContent.thesis).toBe(
-      "HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.",
+      "HRA runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.",
     );
     expect(publicContent.statusLine).toContain(`v${publicContent.releaseVersion}`);
     expect(publicContent.statusLine).toContain("hosted sync is live as an open beta");
@@ -88,10 +97,12 @@ describe("public content contract", () => {
       "CI",
       "license: MIT",
       `Bun ${packageJson.engines.bun}`,
-      `runtimes: Codex ${packageJson.dependencies["@openai/codex"]}`,
+      `runtime: Codex ${packageJson.dependencies["@openai/codex"]}`,
+      `runtime: Claude Code ${publicPins.claude}`,
     ]);
     expect(publicPins).toEqual({
       bun: packageJson.engines.bun,
+      claude: "2.1.260",
       codex: packageJson.dependencies["@openai/codex"],
     });
     for (const badge of publicContent.badges) {
@@ -100,7 +111,8 @@ describe("public content contract", () => {
     }
     expect(publicContent.badges[2]?.image).toContain("/hraness/hra/ci.yml?branch=main");
     expect(publicContent.badges[4]?.image).toBe("https://img.shields.io/badge/Bun-1.3.14-14151a");
-    expect(publicContent.badges[5]?.image).toBe("https://img.shields.io/badge/runtimes-Codex%200.153.2-0b5fa5");
+    expect(publicContent.badges[5]?.image).toBe("https://img.shields.io/badge/runtime-Codex%200.153.2-0b5fa5");
+    expect(publicContent.badges[6]?.image).toBe("https://img.shields.io/badge/runtime-Claude%20Code%202.1.260-6f42c1");
     expect(renderSiteHtml()).not.toContain("img.shields.io");
   });
 
@@ -110,24 +122,25 @@ describe("public content contract", () => {
     expect(jsonLd).toBeDefined();
     const structured = JSON.parse(jsonLd ?? "{}") as Record<string, unknown>;
 
-    expect(publicContent.tagline).toBe("Control plane for coding-agent subscriptions");
-    expect(publicContent.providerRoadmap).toBe("Codex today, Claude next.");
+    expect(publicContent.tagline).toBe("Control plane for Codex and Claude Code");
+    expect(publicContent.providerRoadmap).toBe("Codex and Claude Code, side by side.");
     expect(packageJson.description).toBe(publicContent.description);
-    expect(publicContent.description).toStartWith(`${publicContent.tagline}:`);
-    expect(publicContent.description).toEndWith(publicContent.providerRoadmap);
+    expect(publicContent.description).toStartWith(`${publicContent.tagline} in current source;`);
     expect(structured).toMatchObject({
       "@type": "SoftwareApplication",
       applicationSubCategory: publicContent.tagline,
       author: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
       description: publicContent.description,
       maintainer: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
-      softwareVersion: publicContent.releaseVersion,
     });
+    expect(structured).not.toHaveProperty("softwareVersion");
+    expect(publicContent.description).toContain("current source");
+    expect(publicContent.description).toContain("published v0.5.0 is Codex-only");
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
     expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · control plane for coding-agent subscriptions · hra.sh",
+      alt: "HRA · current source: Codex + Claude Code · published v0.5.0: Codex-only · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -150,7 +163,7 @@ describe("public content contract", () => {
   });
 
   test("names the product and its maintainer once, beside what HRA does", () => {
-    const nameSentence = "HRA is short for harness: the control plane that keeps your coding-agent subscriptions working together, and ";
+    const nameSentence = "HRA is short for harness: the control plane that keeps Codex and Claude Code sessions working together, and ";
     const maintainerSentence = "The Hraness organization maintains HRA and publishes it under the MIT license.";
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
@@ -180,26 +193,25 @@ describe("public content contract", () => {
   test("leads the site with the outcome and keeps the README install-first", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
-    const encodedInstallCommand = htmlText(publicContent.installCommand);
+    const installIndex = html.indexOf('<pre class="install-command"');
+    const doctorIndex = html.indexOf('<pre class="doctor-command"');
+    const initIndex = html.indexOf('<pre class="init-command"');
 
     expect(markdown).toStartWith(`# ${publicContent.productName}\n`);
     expect(markdown.indexOf("```sh")).toBeLessThan(markdown.indexOf(`## ${publicContent.hero.heading}`));
     expect(html.indexOf(`>${publicContent.hero.heading}</h1>`)).toBeLessThan(
-      html.indexOf(encodedInstallCommand),
+      installIndex,
     );
     expect(html).toContain('class="hraness-marketing-hero"');
     expect(html).toContain('data-hraness-marketing="flow"');
     expect(html).toContain('data-hraness-marketing="facts"');
     expect(html).toContain('data-hraness-marketing="install"');
     expect(html.indexOf(htmlText(publicContent.hero.steps[0]!.command))).toBeLessThan(
-      html.indexOf(encodedInstallCommand),
+      installIndex,
     );
-    expect(html.indexOf(encodedInstallCommand)).toBeLessThan(
-      html.indexOf(publicContent.doctorCommand),
-    );
-    expect(html.indexOf(publicContent.doctorCommand)).toBeLessThan(
-      html.indexOf(publicContent.initCommand),
-    );
+    expect(installIndex).toBeGreaterThan(0);
+    expect(installIndex).toBeLessThan(doctorIndex);
+    expect(doctorIndex).toBeLessThan(initIndex);
     expect(markdown.indexOf(publicContent.installCommand)).toBeLessThan(
       markdown.indexOf(publicContent.doctorCommand),
     );
@@ -218,7 +230,20 @@ describe("public content contract", () => {
     }
   });
 
-  test("marks the local release, website, and open hosted sync live", () => {
+  test("highlights documentation commands without touching classified hero code", () => {
+    const html = renderSiteHtml();
+    expect(html).toContain('<code class="hra-inline-code">v0.5.0</code>');
+    expect(html).toContain('<pre class="command-list" tabindex="0"><code class="syntax-code language-shell">');
+    expect(html).toContain('<pre class="install-command" tabindex="0"><code class="syntax-code language-shell">');
+    expect(html).toContain('class="syntax-token syntax-token--command"');
+    expect(html).toContain(
+      `<code class="hraness-marketing-flow__code">${htmlText(publicContent.hero.steps[0]!.command)}</code>`,
+    );
+    expect(html).not.toContain('<code class="hraness-marketing-flow__code"><span');
+    expect(html).not.toMatch(/<code>(?:.|\n)*?<\/code>/u);
+  });
+
+  test("distinguishes the current source from the live Codex-only release", () => {
     expect(publicReleaseState).toBe("live");
     expect(publicContent.endpoints).toEqual({
       betaTag: "live",
@@ -226,21 +251,20 @@ describe("public content contract", () => {
       hostedSync: "live",
       website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("The local CLI v0.5.0 is live for macOS and Linux");
-    for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Immutable local CLI beta; hosted sync live as an open beta");
-      expect(surface).toContain("uses the published immutable");
-      expect(surface).toContain("public CLI remains immutable");
+    expect(renderReadmeMarkdown()).toContain("The immutable local CLI v0.5.0 is live for macOS and Linux and is Codex-only");
+    for (const surface of [renderReadmeMarkdown().replaceAll("`", ""), htmlVisibleText(renderSiteHtml())]) {
+      expect(surface).toContain("Immutable v0.5.0 local CLI is live and Codex-only; hosted sync live as an open beta");
+      expect(surface).toContain("uses the published immutable v0.5.0 GitHub Release");
+      expect(surface).toContain("installs the Codex-only public CLI");
+      expect(surface).toContain("current source adds end-to-end Claude Code and provider portability");
+      expect(surface).toContain("claims no later immutable CLI release");
       expect(surface).not.toContain("beta-not-yet-live");
-      expect(surface).not.toContain("not yet live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("are installable through the exact command above");
-      expect(surface).not.toContain("install command becomes usable");
+      expect(surface).toContain("CLI installs through the exact command above but is Codex-only");
+      expect(surface).toContain("Claude Code execution and provider switching remain unreleased");
       expect(surface).not.toContain("Beta not yet live");
-      expect(surface).not.toContain("No published `v0.5.0` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Install the live v0.5.0 beta");
-    expect(renderLlmsText()).not.toContain("Install after the v0.5.0 beta tag is live");
+    expect(renderLlmsText()).toContain("Install the live v0.5.0 Codex-only beta");
   });
 
   test("states one hosted sign-up claim everywhere and switches it in one place", () => {
@@ -272,6 +296,7 @@ describe("public content contract", () => {
   test("publishes protected cloud auth and the exact device-pairing path", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
+    const visibleHtml = htmlVisibleText(html);
     const documents = [
       '{"email":"you@example.com"}',
       '{"email":"you@example.com","invite":"<identity-invite>"}',
@@ -285,21 +310,13 @@ describe("public content contract", () => {
       "hra device pair",
     ]) {
       expect(markdown).toContain(command);
-      expect(html).toContain(
-        command.replaceAll("<", "&lt;").replaceAll(">", "&gt;"),
-      );
+      expect(visibleHtml).toContain(command);
     }
     for (const document of documents) {
       expect(markdown).toContain(document);
-      expect(html).toContain(
-        document
-          .replaceAll("&", "&amp;")
-          .replaceAll("<", "&lt;")
-          .replaceAll(">", "&gt;")
-          .replaceAll('"', "&quot;"),
-      );
+      expect(visibleHtml).toContain(document);
     }
-    for (const surface of [markdown, html]) {
+    for (const surface of [markdown, visibleHtml]) {
       expect(surface).not.toContain("auth login --email");
       expect(surface).not.toContain("auth login --code");
     }
@@ -307,7 +324,7 @@ describe("public content contract", () => {
       "hra device approve <pending-device-id-or-prefix> --fingerprint <value>"
       + " [--idempotency-key <current-uuidv7>]",
     );
-    expect(html).toContain("hra device approve &lt;pending-device-id-or-prefix&gt;");
+    expect(visibleHtml).toContain("hra device approve <pending-device-id-or-prefix>");
     for (const claim of [
       "hra device key-loss --acknowledge-no-key-holders",
       "the account key as a closed status",
@@ -320,7 +337,7 @@ describe("public content contract", () => {
       "does not mint, replace, or delete a key or ciphertext",
       "fail with a bounded next command",
       "Pairing the real account key later supersedes the observation",
-      "Local Codex accounts, sessions, credentials, and execution are unaffected",
+      "Local provider profiles, sessions, credentials, and execution are unaffected",
       "existing encrypted cloud content cannot be decrypted",
       "Search again for an existing holder",
       "the real key restores ready status and supersedes the acknowledgement",
@@ -330,9 +347,9 @@ describe("public content contract", () => {
       "not the default response to a key-loss acknowledgement",
     ]) {
       expect(markdown).toContain(claim);
-      expect(html).toContain(htmlText(claim));
+      expect(visibleHtml).toContain(claim);
     }
-    for (const surface of [markdown, html]) {
+    for (const surface of [markdown, visibleHtml]) {
       expect(surface).toContain("An unset");
       expect(surface).toContain("hosted deployment");
       expect(surface).toContain("explicit empty value");
@@ -348,16 +365,16 @@ describe("public content contract", () => {
       expect(surface).not.toContain("device pair` to create a pending device request");
       expect(surface).not.toContain("device pair</code> to create a pending device request");
     }
-    for (const surface of [markdown, html]) {
+    for (const surface of [markdown, visibleHtml]) {
       expect(surface).toContain("capability-only progress");
-      expect(surface).toContain("does not delete local Codex accounts");
+      expect(surface).toContain("does not delete local provider profiles");
       expect(surface).not.toContain("account deletion remains a launch gate and must be implemented");
     }
   });
 
   test("publishes exact lost-login recovery without retaining provider credentials", () => {
     const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const html = htmlVisibleText(renderSiteHtml());
     for (const surface of [markdown, html]) {
       expect(surface).toContain("the daemon restarts before completion");
       expect(surface).toContain("hra account show personal");
@@ -367,6 +384,9 @@ describe("public content contract", () => {
       expect(surface).toContain("--handoff-file /absolute/private/login.json --json");
       expect(surface).toContain("A same-key replay never claims or rewrites a handoff");
       expect(surface).toContain("after completion or cancellation it reports the terminal account state");
+      expect(surface).toContain("Claude Code sign-in");
+      expect(surface).toContain("HRA does not implement Claude Code sign-in, sign-out, account listing, usage, provider-side session listing, rename, resume, plugin discovery, desktop switching, or protected turn inspection");
+      expect(surface).toContain("never reads, copies, or forwards the Claude credential");
     }
   });
 
@@ -382,16 +402,10 @@ describe("public content contract", () => {
       "Opaque openai/form, unsupported schema constructs, and URL elicitation fail before durable admission",
     ];
     const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const html = htmlVisibleText(renderSiteHtml());
     for (const claim of claims) {
       expect(markdown).toContain(claim);
-      expect(html).toContain(
-        claim
-          .replaceAll("&", "&amp;")
-          .replaceAll("<", "&lt;")
-          .replaceAll(">", "&gt;")
-          .replaceAll("'", "&#39;"),
-      );
+      expect(html).toContain(claim);
     }
   });
 
@@ -407,16 +421,10 @@ describe("public content contract", () => {
       "does not provide the exact affected paths or change detail needed for informed approval",
     ];
     const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const html = htmlVisibleText(renderSiteHtml());
     for (const claim of claims) {
       expect(markdown).toContain(claim);
-      expect(html).toContain(
-        claim
-          .replaceAll("&", "&amp;")
-          .replaceAll("<", "&lt;")
-          .replaceAll(">", "&gt;")
-          .replaceAll("'", "&#39;"),
-      );
+      expect(html).toContain(claim);
     }
   });
 
@@ -462,19 +470,22 @@ describe("public content contract", () => {
   });
 
   test("states the origin-machine execution boundary and exact remote command set", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = htmlVisibleText(renderSiteHtml());
     const claims = [
       "The machine that created a provider session remains its only executor in v1.",
-      "send, queue, steer, stop, preset, and Fast commands",
+      "send, queue, steer, stop, preset, provider-switch, and Codex Fast commands",
       "Project directories are local-only and are neither synced nor remotely changed.",
       "hra remote send <cloud-session> <message>",
       "hra remote command <uuidv7>",
+      "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
       "--idempotency-key <current-uuidv7>",
       "includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary",
       "A pending command or file-change approval can be decided from another device with",
       "Session scope and secret answers never travel remotely.",
       "Transcript upload is bound to a durable local stream ledger",
       "HRA never resets, aliases, overwrites, or destructively reseeds encrypted history.",
-      "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
+      "hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
       "performs no daemon call and returns",
       "JSON mode never prompts.",
       "preserves all older encrypted cloud history and changes no provider or app state.",
@@ -484,23 +495,19 @@ describe("public content contract", () => {
     ];
 
     for (const claim of claims) {
-      expect(renderReadmeMarkdown()).toContain(claim);
-      expect(renderSiteHtml()).toContain(
-        claim.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"),
-      );
+      expect(markdown).toContain(claim);
+      expect(html).toContain(claim);
     }
   });
 
   test("publishes append-only projection recovery on every relevant public surface", () => {
     const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const html = htmlVisibleText(renderSiteHtml());
     const privacy = renderPrivacyMarkdown();
-    const command = "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]";
+    const command = "hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]";
 
     expect(markdown).toContain(command);
-    expect(html).toContain(
-      command.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"),
-    );
+    expect(html).toContain(command);
     for (const surface of [markdown, html, privacy]) {
       expect(surface).toContain("Compact-projection recovery is append-only.");
       expect(surface).toContain("preserves every older encrypted cloud chunk");
@@ -523,7 +530,7 @@ describe("public content contract", () => {
   test("keeps the full privacy boundary on the readme, site, and policy page", () => {
     const sentinelClaims = [
       "Codex account labels and observed provider email and plan metadata when cloud sync is enabled.",
-      "Codex credentials, profile files, plugin credentials, or OAuth material.",
+      "Codex or Claude Code credentials, provider profile or configuration files, plugin credentials, or OAuth material.",
       "Raw reasoning, hidden chain of thought, or approval secrets.",
       "Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.",
       "Provider login and request IDs, permission values, MCP field contracts, protected answers, or response digests.",
@@ -536,7 +543,7 @@ describe("public content contract", () => {
       "Collection runs only on the canonical production host",
       "honors Do Not Track",
       "disables person profiles, autocapture, heatmaps, feature flags, surveys, conversations, and session recording",
-      "HRA sends no form values, account identity, Codex data, URL query, or fragment.",
+      "HRA sends no form values, account identity, provider or session data, URL query, or fragment.",
       "Vercel serves hra.sh",
       "GitHub hosts the source repository, releases, and release downloads",
     ];
@@ -556,7 +563,7 @@ describe("public content contract", () => {
 
   test("publishes exact beta prerequisites and package lifecycle limits", () => {
     const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const html = htmlVisibleText(renderSiteHtml());
     const surfaces = [markdown, html];
     expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("| bun -e '");
@@ -567,7 +574,7 @@ describe("public content contract", () => {
     expect(publicContent.installCommand).not.toContain("bun add --global");
     expect(publicContent.installCommand).not.toContain("install-normalizer.ts");
     expect(markdown).toContain(publicContent.installCommand);
-    expect(html).toContain(htmlText(publicContent.installCommand));
+    expect(html).toContain(publicContent.installCommand);
     for (const surface of surfaces) {
       expect(surface).toContain("HRA requires Bun 1.3.14");
       expect(surface).toContain("curl with HTTPS and TLS 1.2 support");
@@ -608,21 +615,26 @@ describe("public content contract", () => {
 
   test("publishes first-session walkthroughs for humans and agents", () => {
     const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const rawHtml = renderSiteHtml();
+    const html = htmlVisibleText(rawHtml);
     const claims = [
       "Human terminal",
-      "hra session start personal --preset high",
+      "hra session start personal --provider codex --preset high",
       "/account personal",
       "/session <session-id>",
       "Agent caller",
       "data.session.id",
       "data.eventStream.cursor",
-      "hra session start personal --preset high --json",
+      "hra session start personal --provider codex --preset high --json",
       "hra session status <session-id> --json",
       "hra session watch <session-id> --cursor <status-cursor> --jsonl",
       "--follow",
       "equivalent compatibility spelling",
       "hra session interactions <session-id> --pending --json",
+      "Claude Code and provider switching",
+      "hra session start personal --provider claude --preset fable-max --json",
+      "hra session switch <session-id> --provider claude --preset fable-max",
+      "hra session export <session-id> --format json",
       "Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form.",
       "Scheduled work in the same conversation",
       "hra session task create <session-id> --name daily-review --every-minutes 1440",
@@ -631,23 +643,23 @@ describe("public content contract", () => {
       "hra session task edit <session-id> <task-id> --revision <revision> --pause",
       "hra session task edit <session-id> <task-id> --revision <revision> --resume",
       "hra session task delete <session-id> <task-id> --revision <revision>",
-      "A task cannot independently retarget its account, project, model, or execution environment",
+      "A task cannot independently retarget its account, provider, project, model, or execution environment",
       "later explicit changes to the session apply to future runs",
       "Missed intervals coalesce into one queued turn",
-      "HRA never creates a replacement conversation or writes Codex's private automation registry",
+      "HRA never creates a replacement provider conversation or writes a provider's private automation registry",
     ];
 
     expect(markdown).toContain("## First session");
-    expect(html).toContain('id="first-session"');
+    expect(rawHtml).toContain('id="first-session"');
     for (const claim of claims) {
       expect(markdown).toContain(claim);
-      expect(html).toContain(htmlText(claim));
+      expect(html).toContain(claim);
     }
   });
 
   test("publishes bounded status and cursor-safe observation contracts", () => {
     const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const html = htmlVisibleText(renderSiteHtml());
     const claims = [
       "Bounded local status",
       "hra status [--json]",
@@ -660,7 +672,7 @@ describe("public content contract", () => {
       "registered and online device counts are unknown rather than zero",
       "Session observation",
       "returns status version 2",
-      "one typed provider-observation result, attempting a Codex app-server read only when the current local state makes one applicable",
+      "one typed provider-observation result, attempting the bound provider's reviewed observation path only when the current local state makes one applicable",
       "Execution, attention, provider, and queue remain separate axes",
       "Pending and response-in-flight counts are exact",
       "at most 10 bounded safe summaries",
@@ -681,7 +693,7 @@ describe("public content contract", () => {
 
     for (const claim of claims) {
       expect(markdown).toContain(claim);
-      expect(html).toContain(htmlText(claim));
+      expect(html).toContain(claim);
     }
 
     const documentedCommands = publicContent.sections.flatMap((section) =>
@@ -690,11 +702,30 @@ describe("public content contract", () => {
     expect(documentedCommands).toContain("hra status [--json]");
     expect(documentedCommands).toContain("hra session watch <session> [--cursor <cursor>] [--jsonl]");
     expect(documentedCommands.some((command) => command.startsWith("hra session wait"))).toBe(false);
+    expect(documentedCommands.some((command) => /<\d+-\d+>/u.test(command))).toBe(false);
+  });
+
+  test("keeps the public command reference in parity with CLI group help", () => {
+    const commandReference = publicContent.sections.find((section) => section.id === "command-reference");
+    expect(commandReference).toBeDefined();
+    const documentedCommands = new Set(commandReference?.blocks.flatMap((block) =>
+      block.kind === "commands" ? block.commands : []
+    ) ?? []);
+
+    for (const group of helpGroupNames) {
+      const usageSection = usageForGroup(group).split("\n\n")
+        .find((section) => section.startsWith("Usage:\n"));
+      expect(usageSection).toBeDefined();
+      for (const line of usageSection?.split("\n").slice(1) ?? []) {
+        const command = line.trim();
+        if (command.startsWith("hra ")) expect(documentedCommands).toContain(command);
+      }
+    }
   });
 
   test("documents safe optional full local-data removal without a recursive command", () => {
     const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const html = htmlVisibleText(renderSiteHtml());
     const claims = [
       "Optional full local-data removal",
       "hra auth delete --acknowledge-erasure",
@@ -704,14 +735,14 @@ describe("public content contract", () => {
       "$HOME/.local/state/hra-control-plane-v1",
       "explicitly accepts permanent loss",
       "move only the exact platform directory to Trash",
-      "Do not move or remove its parent.",
+      "Do not move or remove the state directory's parent.",
       "obtain explicit destructive approval",
       "An install, update, or daemon-stop request does not authorize local-data removal.",
     ];
 
     for (const claim of claims) {
       expect(markdown).toContain(claim);
-      expect(html).toContain(htmlText(claim));
+      expect(html).toContain(claim);
     }
     expect(markdown).not.toContain("rm -r");
     expect(html).not.toContain("rm -r");
@@ -745,14 +776,14 @@ describe("public content contract", () => {
     }
     for (const [status, meaning] of statuses) {
       expect(markdown).toContain(`- \`${status}\`: ${meaning}`);
-      expect(html).toContain(`<code>${status}</code>: ${htmlText(meaning)}`);
+      expect(html).toContain(`<code class="hra-inline-code">${status}</code>: ${htmlText(meaning)}`);
     }
   });
 
   test("publishes the local interaction deadline boundary", () => {
-    const surfaces = [renderReadmeMarkdown(), renderSiteHtml()];
+    const surfaces = [renderReadmeMarkdown(), htmlVisibleText(renderSiteHtml())];
     for (const surface of surfaces) {
-      expect(surface).toContain("anchored when Codex delivered it");
+      expect(surface).toContain("anchored when the provider delivered it");
       expect(surface).toContain("caps the pending interval at 30 minutes");
       expect(surface).toContain("never invents an answer or grant");
       expect(surface).toContain("encrypted remote interaction metadata does not include it");
@@ -788,9 +819,9 @@ describe("public content contract", () => {
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
       expect(footer).toContain('data-slot="hraness-site-footer"');
       expect(footer?.match(/data-slot="hraness-mark"/gu)).toHaveLength(1);
-      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(10);
+      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(11);
       expect(footer).toContain('data-mailing-list="none"');
-      expect(footer).not.toContain("substack.com");
+      expect(footer).toContain('href="https://substack.com/@hraness"');
       expect(
         [...(footer?.matchAll(/<a\b[^>]*\shref="([^"]+)"/gu) ?? [])]
           .map((match) => match[1]),
@@ -815,7 +846,9 @@ describe("public content contract", () => {
       [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "",
     })).toEqual({ kind: "none" });
 
-    const footer = renderHraSiteFooter(sitekey);
+    const footer = renderHraSiteFooter({
+      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
+    });
     expect(footer).toContain('data-mailing-list="signup"');
     expect(footer).toContain('name="audience" type="hidden" value="hra"');
     expect(footer).toContain('data-action="mailing_hra"');
@@ -825,7 +858,7 @@ describe("public content contract", () => {
     expect(footer).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
-    expect(footer).not.toContain("substack.com");
+    expect(footer).toContain('href="https://substack.com/@hraness"');
   });
 
   test("fails production closed on missing or malformed Turnstile configuration", () => {

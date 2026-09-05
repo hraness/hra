@@ -1,24 +1,25 @@
 # Roadmap
 
-This page summarizes the proposed HRA v2 plan (`kb/plans/hra-v2.md`) for readers who want to know what is coming without the implementation detail. Nothing here is a commitment until the plan is adopted; the plan file records status.
+This page summarizes the active HRA plans for readers who want the provider and product direction without the implementation detail. The plan files record exact status; a release-candidate row is not a claim that its immutable release has been published.
 
 ## Direction
 
-HRA becomes a control plane for coding-agent subscriptions. Codex is supported today. Claude subscriptions are next, run only through the unmodified Claude Code runtime signed in by the user, with HRA never touching the credential. Humans get a terminal shell and a keyboard-first web surface; agents get one machine-readable CLI schema and one work protocol.
+HRA is a control plane for Codex and Claude Code. Both providers run through their pinned, unmodified runtimes under user-selected isolated profiles. HRA owns the provider-neutral conversation and control record while each provider owns authentication, native sessions, execution, tools, approvals, and hidden state. Humans get a terminal shell and a keyboard-first web surface; agents get the same machine-readable CLI and work protocol.
 
 ## Waves
 
 | Wave | Focus | What you will notice |
 | --- | --- | --- |
-| 0 | Robustness, security, boundaries | The daemon survives many concurrent agents; `hra help` and offline `work protocol`; README leads with a thesis. |
-| 1 | Contract and install | Additive JSON envelope fields; `bun add -g @hraness/hra` as the primary install; hosted sync switched on for the maintainer. |
-| 2 | Decomposition, Claude, schema | A Claude account beside a Codex account; `hra schema --json`; a README under 800 words; the browser reads a live session. |
-| 3 | Routing and telemetry | Typed task classes enforced at admission; a routing report from real work; plugins consume policy data. |
-| 4 | Provider port and web parity | One provider port behind both runtimes; session start and current usage from the browser. |
+| 0 | Robustness, security, boundaries | Published: bounded daemon concurrency, offline status and work protocol, hardened local and release custody. |
+| 1–2 | Live projection and browser control | Published: encrypted live session projection, provider interactions, autorespond, browser devices, and remote commands. |
+| 3 | Provider seam | Published in v0.5.0: reviewed Codex and Claude Code ports, a pinned Claude dialect, provider-tagged sessions, and provider-specific presets. Claude execution was still refused in that release. |
+| 4 | Claude Code execution | Implemented in the current unreleased source: start, turn, steer, stop, interaction, projection, and queue dispatch run through the selected provider. Claude Code sign-in, native listing, rename, resume, usage, and protected turn inspection remain unavailable. |
+| 5 | Conversation portability | Implemented in the current unreleased source: HRA's neutral transcript, local and remote provider switching, and trajectory or JSON export. Switching preserves the HRA record, not provider-native hidden state or cached context. |
 
 ## What HRA will not do
 
 - Rotate, pool, or fail over between accounts or providers automatically.
 - Hold, read, or forward any provider credential.
 - Route through a learned model router or a cost cascade.
+- Pretend provider-specific features have parity: Codex account, usage, plugin, desktop, and native transcript operations remain Codex-specific until an independently reviewed Claude Code contract exists.
 - Offer provider login from the web surface.

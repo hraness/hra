@@ -97,9 +97,9 @@ describe("social card", () => {
 
   test("keeps every card line inside its row and states the exact positioning text", () => {
     const lines = socialCardLines();
-    expect(lines.tagline).toBe("HRA · control plane for coding-agent subscriptions · hra.sh");
+    expect(lines.tagline).toBe("Published v0.5.0: Codex-only · hra.sh");
     expect(lines.title).toBe("HRA");
-    expect(lines.comment).toBe("# Codex today, Claude next.");
+    expect(lines.comment).toBe("# Current source: Codex and Claude Code, side by side.");
     expect(lines.commands).toEqual([
       `$ ${publicContent.hero.steps[0]!.command}`,
       `$ ${publicContent.hero.steps[3]!.command}`,

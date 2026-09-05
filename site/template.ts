@@ -2,6 +2,7 @@ import {
   renderHranessSiteFooter,
   type HranessMailingListConfig,
 } from "@hraness/site-footer";
+import { highlightCode } from "@hraness/design-kit/syntax-highlighting";
 import { AskAiAboutThis } from "@hraness/ui";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -23,13 +24,20 @@ const escapeHtml = (value: string): string =>
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 
+const renderShellCode = (value: string): string => {
+  const highlighted = highlightCode(value, "shell");
+  return `<code class="${highlighted.className}">${highlighted.html}</code>`;
+};
+
 export const HRA_MAILING_TURNSTILE_SITEKEY_ENV =
   "NEXT_PUBLIC_HRANESS_MAILING_TURNSTILE_SITEKEY" as const;
 
 const turnstileSitekeyPattern = /^[A-Za-z0-9_-]{20,100}$/u;
+const emptySiteEnvironment: Readonly<Record<string, string | undefined>> =
+  Object.freeze({});
 
 export const hraMailingListConfig = (
-  environment: Readonly<Record<string, string | undefined>> = process.env,
+  environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
 ): HranessMailingListConfig => {
   const turnstileSitekey = environment[HRA_MAILING_TURNSTILE_SITEKEY_ENV];
   if (turnstileSitekey === undefined || turnstileSitekey.length === 0) {
@@ -53,16 +61,10 @@ export const hraMailingListConfig = (
 };
 
 export const renderHraSiteFooter = (
-  turnstileSitekey = process.env[HRA_MAILING_TURNSTILE_SITEKEY_ENV],
-): string => {
-  const environment: Record<string, string | undefined> = {
-    [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
-    VERCEL_ENV: process.env.VERCEL_ENV,
-  };
-  return renderHranessSiteFooter({
-    mailingList: hraMailingListConfig(environment),
-  });
-};
+  environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
+): string => renderHranessSiteFooter({
+  mailingList: hraMailingListConfig(environment),
+});
 
 export const renderAskAiAboutThis = (canonicalUrl: string): string =>
   renderToStaticMarkup(createElement(AskAiAboutThis, {
@@ -78,7 +80,7 @@ const renderInline = (content: readonly InlineContent[]): string =>
     .map((part) => {
       switch (part.kind) {
         case "code":
-          return `<code>${escapeHtml(part.value)}</code>`;
+          return `<code class="hra-inline-code">${escapeHtml(part.value)}</code>`;
         case "link":
           return `<a href="${escapeHtml(part.href)}">${escapeHtml(part.label)}</a>`;
         case "text":
@@ -95,7 +97,7 @@ const renderBlock = (
 ): string => {
   switch (block.kind) {
     case "commands":
-      return `<pre class="command-list" tabindex="0"><code>${escapeHtml(block.commands.join("\n"))}</code></pre>`;
+      return `<pre class="command-list" tabindex="0">${renderShellCode(block.commands.join("\n"))}</pre>`;
     case "list":
       return `<ul>${block.items.map((item) => `<li>${renderInline(item)}</li>`).join("")}</ul>`;
     case "notice":
@@ -172,7 +174,6 @@ const renderHead = (
     },
     name: content.productName,
     operatingSystem: "macOS, Linux",
-    softwareVersion: content.releaseVersion,
     url: canonicalUrl,
   }).replaceAll("<", "\\u003c");
   const robots = options.robots === undefined
@@ -244,10 +245,10 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
       <h2 class="hraness-marketing-install__heading" id="install-command-heading">Install the verified CLI.</h2>
     </div>
     <div class="hraness-marketing-install__commands">
-      <pre class="install-command" tabindex="0"><code>${escapeHtml(content.installCommand)}</code></pre>
+      <pre class="install-command" tabindex="0">${renderShellCode(content.installCommand)}</pre>
       <div class="install-checks">
-        <pre class="doctor-command" tabindex="0"><code>${escapeHtml(content.doctorCommand)}</code></pre>
-        <pre class="init-command" tabindex="0"><code>${escapeHtml(content.initCommand)}</code></pre>
+        <pre class="doctor-command" tabindex="0">${renderShellCode(content.doctorCommand)}</pre>
+        <pre class="init-command" tabindex="0">${renderShellCode(content.initCommand)}</pre>
       </div>
     </div>
   </section>
@@ -255,7 +256,10 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
     ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n    ")}
   </div>`;
 
-export const renderSiteHtml = (content: PublicContent = publicContent): string => {
+export const renderSiteHtml = (
+  content: PublicContent = publicContent,
+  environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
+): string => {
   const navigation = content.sections
     .map((section) => `<a href="#${escapeHtml(section.id)}">${escapeHtml(section.heading)}</a>`)
     .join("");
@@ -278,7 +282,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
-${renderHraSiteFooter()}
+${renderHraSiteFooter(environment)}
 ${renderHraAnalyticsScript()}
 </body>
 </html>
@@ -315,7 +319,10 @@ ${renderHead(content, {
 </html>
 `;
 
-export const renderPrivacyHtml = (content: PublicContent = publicContent): string => {
+export const renderPrivacyHtml = (
+  content: PublicContent = publicContent,
+  environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
+): string => {
   const privacy = findSection(content, "privacy");
   return `<!doctype html>
 <html lang="en">
@@ -335,7 +342,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/privacy/`)}
 ${renderProjectResources(content)}
-${renderHraSiteFooter()}
+${renderHraSiteFooter(environment)}
 ${renderHraAnalyticsScript()}
 </body>
 </html>
