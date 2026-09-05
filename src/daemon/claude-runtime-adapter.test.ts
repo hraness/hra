@@ -296,6 +296,7 @@ describe("pinned Claude runtime manager", () => {
         terminal_reason: "completed",
         type: "result",
         usage: { input_tokens: 2, output_tokens: 4 },
+        uuid: "00000000-0000-4000-8000-000000000010",
       },
     );
     await settle();
@@ -307,7 +308,26 @@ describe("pinned Claude runtime manager", () => {
       "tokenUsageUpdated",
       "turnCompleted",
       "turnSummary",
+      "usageAccountingObserved",
     ]);
+    const accountingFact = facts[6];
+    if (accountingFact?.type !== "usageAccountingObserved") {
+      throw new Error("expected accounted terminal result");
+    }
+    expect(accountingFact).toMatchObject({
+      accounting: {
+        models: [],
+        tokens: { inputTokens: 2, outputTokens: 4 },
+        totalCostUsd: null,
+      },
+      observationRevision: 1,
+      observedAt: 1_700_000_000_000,
+      receivedAt: 1_700_000_000_000,
+      sourceEventId: "00000000-0000-4000-8000-000000000010",
+      turnId,
+      type: "usageAccountingObserved",
+    });
+    expect(accountingFact.sourceEventDigest).toMatch(/^[0-9a-f]{64}$/u);
     expect(facts.every((fact) => fact.providerThreadId === started.providerThreadId)).toBe(true);
     const observation = await manager.observeSession({
       authority,

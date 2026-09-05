@@ -16,6 +16,8 @@ import {
   claudeInteractionKind,
   claudeMatrixDigest,
   claudeUserLine,
+  CLAUDE_RATE_LIMIT_WINDOW_LIMIT,
+  CLAUDE_RESULT_MODEL_LIMIT,
   parseClaudeStreamLine,
   sanitizeClaudeText,
   PINNED_CLAUDE_CONTROL_REQUEST_MATRIX,
@@ -100,15 +102,59 @@ describe("Claude stream-json fixtures", () => {
     expect(assistant.thinking).toBe("");
     expect(assistant.parentToolUseId).toBeNull();
 
+    const rateLimit = events[8];
+    if (rateLimit?.type !== "rate_limit") throw new Error("expected rate_limit");
+    expect(rateLimit.eventId).toBe("bee4e95a-9a7d-4f23-a5d2-a50045b22dec");
+    expect(rateLimit.quota).toEqual({
+      isUsingOverage: false,
+      overageDisabledReason: "org_level_disabled",
+      overageStatus: "rejected",
+      rateLimitType: "five_hour",
+      resetsAtMs: 1_788_499_800_000,
+      status: { state: "known", value: "allowed" },
+      windows: [
+        { id: "five_hour", resetsAtMs: 1_788_499_800_000, usedPercent: 50 },
+        { id: "seven_day", resetsAtMs: 1_788_908_400_000, usedPercent: 30 },
+        {
+          id: "seven_day_overage_included",
+          resetsAtMs: 1_788_908_400_000,
+          usedPercent: 60,
+        },
+      ],
+    });
+    expect(rateLimit.sourceEventDigest).toMatch(/^[0-9a-f]{64}$/u);
+
     const result = events[9];
     if (result?.type !== "result") throw new Error("expected result");
     expect(result.isError).toBe(false);
     expect(result.stopReason).toBe("end_turn");
     expect(result.terminalReason).toBe("completed");
-    expect(result.model).toBeNull();
+    expect(result.model).toBe("claude-fable-5-1");
     expect(result.usage.inputTokens).toBe(2);
     expect(result.usage.outputTokens).toBe(4);
     expect(result.usage.cachedInputTokens).toBe(11_059 + 10_123);
+    expect(result.accounting).toEqual({
+      models: [{
+        cacheCreationInputTokens: 11_059,
+        cacheReadInputTokens: 10_123,
+        contextWindow: 1_000_000,
+        costUsd: 0.22393074999999998,
+        inputTokens: 2,
+        maxOutputTokens: 64_000,
+        model: "claude-fable-5-1",
+        outputTokens: 4,
+        thinkingTokens: 0,
+      }],
+      tokens: {
+        cacheCreationInputTokens: 11_059,
+        cacheReadInputTokens: 10_123,
+        inputTokens: 2,
+        outputTokens: 4,
+        thinkingTokens: 0,
+      },
+      totalCostUsd: 0.22393074999999998,
+    });
+    expect(result.sourceEventDigest).toMatch(/^[0-9a-f]{64}$/u);
   });
 
   test("classifies the authenticated and unauthenticated result envelopes", async () => {
@@ -117,7 +163,7 @@ describe("Claude stream-json fixtures", () => {
     expect(authenticated.isError).toBe(false);
     expect(authenticated.terminalReason).toBe("completed");
     expect(authenticated.resultText).toBe("ok");
-    expect(authenticated.model).toBeNull();
+    expect(authenticated.model).toBe("claude-fable-5-1");
 
     const [unauthenticated] = await parseFixture("output-json-unauthenticated");
     if (unauthenticated?.type !== "result") throw new Error("expected result");
@@ -186,6 +232,278 @@ describe("Claude stream-json fixtures", () => {
     const notification = events[9];
     if (notification?.type !== "task_notification") throw new Error("expected task_notification");
     expect(notification.status).toBe("completed");
+  });
+});
+
+const rateLimitLine = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  rate_limit_info: {
+    isUsingOverage: false,
+    overageDisabledReason: "org_level_disabled",
+    overageStatus: "rejected",
+    rateLimitType: "five_hour",
+    resetsAt: 1_788_499_800,
+    status: "allowed",
+    unifiedWindows: {
+      five_hour: { resetsAt: 1_788_499_800, utilization: 0.5 },
+    },
+  },
+  session_id: "726b1b3d-ed97-4b55-9904-e58fa7d7eb45",
+  type: "rate_limit_event",
+  uuid: "bee4e95a-9a7d-4f23-a5d2-a50045b22dec",
+  ...overrides,
+});
+
+const resultLine = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  duration_ms: 25,
+  is_error: false,
+  modelUsage: {
+    "claude-fable-5-1": {
+      cacheCreationInputTokens: 3,
+      cacheReadInputTokens: 5,
+      canonicalModel: "claude-fable-5-1",
+      contextWindow: 1_000_000,
+      costUSD: 0.25,
+      inputTokens: 2,
+      maxOutputTokens: 64_000,
+      outputTokens: 7,
+      thinkingTokens: 1,
+    },
+  },
+  num_turns: 1,
+  result: "ok",
+  session_id: "726b1b3d-ed97-4b55-9904-e58fa7d7eb45",
+  total_cost_usd: 0.25,
+  type: "result",
+  usage: {
+    cache_creation_input_tokens: 3,
+    cache_read_input_tokens: 5,
+    input_tokens: 2,
+    output_tokens: 7,
+    output_tokens_details: { thinking_tokens: 1 },
+  },
+  uuid: "48c87f50-1645-4f71-a091-4949d337eb87",
+  ...overrides,
+});
+
+describe("Claude usage observation parsing", () => {
+  test("keeps the closed status set distinct and preserves bounded unknown codes", () => {
+    for (const status of ["allowed", "warning", "blocked", "denied", "rejected"] as const) {
+      const event = parseClaudeStreamLine(rateLimitLine({
+        rate_limit_info: { status },
+      }));
+      if (event.type !== "rate_limit") throw new Error("expected rate_limit");
+      expect(event.quota.status).toEqual({ state: "known", value: status });
+      expect(event.quota.windows).toEqual([]);
+      expect(event.quota.resetsAtMs).toBeNull();
+    }
+    const unknown = parseClaudeStreamLine(rateLimitLine({
+      rate_limit_info: { status: "provider_future_state" },
+    }));
+    if (unknown.type !== "rate_limit") throw new Error("expected rate_limit");
+    expect(unknown.quota.status).toEqual({
+      state: "unknown",
+      value: "provider_future_state",
+    });
+    const maximum = "X".repeat(128);
+    const bounded = parseClaudeStreamLine(rateLimitLine({
+      rate_limit_info: { status: maximum },
+    }));
+    if (bounded.type !== "rate_limit") throw new Error("expected rate_limit");
+    expect(bounded.quota.status).toEqual({ state: "unknown", value: maximum });
+  });
+
+  test("normalizes ordering before deriving an exact source digest", () => {
+    const first = parseClaudeStreamLine(rateLimitLine({
+      extra: "discarded",
+      rate_limit_info: {
+        status: "allowed",
+        unifiedWindows: {
+          seven_day: { resetsAt: 1_788_908_400, utilization: 0.3 },
+          five_hour: { resetsAt: 1_788_499_800, utilization: 0.5 },
+        },
+      },
+    }));
+    const reordered = parseClaudeStreamLine(rateLimitLine({
+      rate_limit_info: {
+        ignored: true,
+        status: "allowed",
+        unifiedWindows: {
+          five_hour: { resetsAt: 1_788_499_800, utilization: 0.5 },
+          seven_day: { resetsAt: 1_788_908_400, utilization: 0.3 },
+        },
+      },
+    }));
+    if (first.type !== "rate_limit" || reordered.type !== "rate_limit") {
+      throw new Error("expected rate_limit");
+    }
+    expect(first.quota.windows.map(({ id }) => id)).toEqual(["five_hour", "seven_day"]);
+    expect(first.sourceEventDigest).toBe(reordered.sourceEventDigest);
+
+    const changed = parseClaudeStreamLine(rateLimitLine({
+      rate_limit_info: {
+        status: "allowed",
+        unifiedWindows: {
+          five_hour: { resetsAt: 1_788_499_800, utilization: 0.6 },
+          seven_day: { resetsAt: 1_788_908_400, utilization: 0.3 },
+        },
+      },
+    }));
+    if (changed.type !== "rate_limit") throw new Error("expected rate_limit");
+    expect(changed.sourceEventDigest).not.toBe(first.sourceEventDigest);
+  });
+
+  test("keeps missing optional accounting fields explicitly null", () => {
+    const event = parseClaudeStreamLine(resultLine({
+      modelUsage: undefined,
+      total_cost_usd: undefined,
+      usage: undefined,
+    }));
+    if (event.type !== "result") throw new Error("expected result");
+    expect(event.accounting).toEqual({
+      models: [],
+      tokens: {
+        cacheCreationInputTokens: null,
+        cacheReadInputTokens: null,
+        inputTokens: null,
+        outputTokens: null,
+        thinkingTokens: null,
+      },
+      totalCostUsd: null,
+    });
+    expect(event.usage).toEqual({
+      cachedInputTokens: 0,
+      inputTokens: null,
+      modelContextWindow: null,
+      outputTokens: null,
+      reasoningOutputTokens: null,
+      totalTokens: null,
+    });
+  });
+
+  test("reduces malformed, ambiguous, and unbounded quota data to a notice", () => {
+    const rateInfo = (window: Record<string, unknown>): Record<string, unknown> => ({
+      status: "allowed",
+      unifiedWindows: { five_hour: window },
+    });
+    for (const utilization of [Number.NaN, Number.POSITIVE_INFINITY, -0.01, 1.01]) {
+      expect(parseClaudeStreamLine(rateLimitLine({
+        rate_limit_info: rateInfo({ resetsAt: 1_788_499_800, utilization }),
+      }))).toEqual({ event: "rate_limit_event/invalid", type: "protocol_notice" });
+    }
+    expect(parseClaudeStreamLine(rateLimitLine({
+      rate_limit_info: rateInfo({ resetsAt: 1_788_499_800_000, utilization: 0.5 }),
+    }))).toEqual({ event: "rate_limit_event/invalid", type: "protocol_notice" });
+    expect(parseClaudeStreamLine(rateLimitLine({
+      rate_limit_info: {
+        status: "allowed",
+        unifiedWindows: Object.fromEntries(
+          Array.from({ length: CLAUDE_RATE_LIMIT_WINDOW_LIMIT + 1 }, (_, index) => [
+            `window_${index}`,
+            { resetsAt: 1_788_499_800, utilization: 0.5 },
+          ]),
+        ),
+      },
+    }))).toEqual({ event: "rate_limit_event/invalid", type: "protocol_notice" });
+    expect(parseClaudeStreamLine(rateLimitLine({
+      rate_limit_info: { status: "x".repeat(129) },
+    }))).toEqual({ event: "rate_limit_event/invalid", type: "protocol_notice" });
+    expect(parseClaudeStreamLine(rateLimitLine({
+      rate_limit_info: { status: "é".repeat(65) },
+    }))).toEqual({ event: "rate_limit_event/invalid", type: "protocol_notice" });
+  });
+
+  test("drops malformed result accounting without erasing the terminal timeline", () => {
+    const expectAccountingDrop = (
+      line: Record<string, unknown>,
+      expectedNeutralTotal = 17,
+    ): void => {
+      const event = parseClaudeStreamLine(line);
+      if (event.type !== "result") throw new Error("expected result");
+      expect(event.accounting).toBeNull();
+      expect(event.eventId).toBeNull();
+      expect(event.sourceEventDigest).toBeNull();
+      expect(event.resultText).toBe("ok");
+      expect(event.usage.totalTokens).toBe(expectedNeutralTotal);
+    };
+    expectAccountingDrop(resultLine({ total_cost_usd: Number.NaN }));
+    expectAccountingDrop(resultLine({ uuid: "not-a-uuid" }));
+    expectAccountingDrop(resultLine({
+      usage: { input_tokens: -1 },
+    }), -1);
+    expectAccountingDrop(resultLine({
+      modelUsage: {
+        alias: {
+          cacheCreationInputTokens: 0,
+          cacheReadInputTokens: 0,
+          canonicalModel: "different",
+          contextWindow: 1,
+          costUSD: 0,
+          inputTokens: 0,
+          maxOutputTokens: 1,
+          outputTokens: 0,
+          thinkingTokens: 0,
+        },
+      },
+    }));
+    expectAccountingDrop(resultLine({
+      modelUsage: Object.fromEntries(
+        Array.from({ length: CLAUDE_RESULT_MODEL_LIMIT + 1 }, (_, index) => [
+          `model-${index}`,
+          {},
+        ]),
+      ),
+    }));
+    const oversizedModel = "x".repeat(129);
+    expectAccountingDrop(resultLine({
+      modelUsage: {
+        [oversizedModel]: { canonicalModel: oversizedModel },
+      },
+    }));
+    expectAccountingDrop(resultLine({
+      modelUsage: {
+        model: { canonicalModel: "model", costUSD: -0.01 },
+      },
+    }));
+    expectAccountingDrop(resultLine({
+      modelUsage: {
+        model: {
+          canonicalModel: "model",
+          inputTokens: Number.MAX_SAFE_INTEGER + 1,
+        },
+      },
+    }));
+  });
+
+  test("preserves the existing neutral result metadata parser outside usage accounting", () => {
+    const event = parseClaudeStreamLine(resultLine({
+      duration_ms: -7,
+      num_turns: -1,
+    }));
+    if (event.type !== "result") throw new Error("expected result");
+    expect(event.durationMs).toBe(-7);
+    expect(event.numTurns).toBe(-1);
+    expect(event.accounting).not.toBeNull();
+  });
+
+  test("keeps absent per-model advisory fields null rather than inventing zero", () => {
+    const event = parseClaudeStreamLine(resultLine({
+      modelUsage: {
+        "Claude.Model/VNext": { canonicalModel: "Claude.Model/VNext" },
+      },
+    }));
+    if (event.type !== "result") throw new Error("expected result");
+    expect(event.model).toBe("Claude.Model/VNext");
+    expect(event.accounting?.models).toEqual([{
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+      contextWindow: null,
+      costUsd: null,
+      inputTokens: null,
+      maxOutputTokens: null,
+      model: "Claude.Model/VNext",
+      outputTokens: null,
+      thinkingTokens: null,
+    }]);
   });
 });
 

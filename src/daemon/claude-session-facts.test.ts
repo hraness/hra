@@ -90,19 +90,66 @@ const interactionRequested = (requestId: string): ClaudeSessionFact => ({
   type: "interactionRequested",
 });
 
+const quotaObserved = (): Extract<ClaudeSessionFact, { type: "rateLimitObserved" }> => ({
+  connectionId,
+  observationRevision: 2,
+  observedAt: 10,
+  providerThreadId,
+  quota: {
+    isUsingOverage: false,
+    overageDisabledReason: null,
+    overageStatus: "rejected",
+    rateLimitType: "five_hour",
+    resetsAtMs: 20_000,
+    status: { state: "known", value: "warning" },
+    windows: [{ id: "five_hour", resetsAtMs: 20_000, usedPercent: 99 }],
+  },
+  receivedAt: 10,
+  sourceEventDigest: "a".repeat(64),
+  sourceEventId: "00000000-0000-4000-8000-000000000001",
+  turnId: "same-turn",
+  type: "rateLimitObserved",
+});
+
+const accountingObserved = (): Extract<
+  ClaudeSessionFact,
+  { type: "usageAccountingObserved" }
+> => ({
+  accounting: {
+    models: [],
+    tokens: {
+      cacheCreationInputTokens: 3,
+      cacheReadInputTokens: 5,
+      inputTokens: 2,
+      outputTokens: 7,
+      thinkingTokens: 1,
+    },
+    totalCostUsd: 0.25,
+  },
+  connectionId,
+  observationRevision: 1,
+  observedAt: 11,
+  providerThreadId,
+  receivedAt: 11,
+  sourceEventDigest: "b".repeat(64),
+  sourceEventId: "00000000-0000-4000-8000-000000000002",
+  turnId: "same-turn",
+  type: "usageAccountingObserved",
+});
+
 describe("ClaudeSessionFactTranslator provider authority", () => {
   test("keeps same-thread item lifecycle state isolated across replacement authorities", () => {
     const value = translator();
 
-    expect(value.translate(firstAuthority, assistantDelta()).map((fact) => fact.type))
+    expect(value.translate(firstAuthority, assistantDelta()).timelineFacts.map((fact) => fact.type))
       .toEqual(["itemStarted", "assistantDelta"]);
-    expect(value.translate(replacementAuthority, assistantDelta()).map((fact) => fact.type))
+    expect(value.translate(replacementAuthority, assistantDelta()).timelineFacts.map((fact) => fact.type))
       .toEqual(["itemStarted", "assistantDelta"]);
 
     value.forgetSession(firstAuthority, providerThreadId);
-    expect(value.translate(firstAuthority, assistantDelta()).map((fact) => fact.type))
+    expect(value.translate(firstAuthority, assistantDelta()).timelineFacts.map((fact) => fact.type))
       .toEqual(["itemStarted", "assistantDelta"]);
-    expect(value.translate(replacementAuthority, assistantDelta()).map((fact) => fact.type))
+    expect(value.translate(replacementAuthority, assistantDelta()).timelineFacts.map((fact) => fact.type))
       .toEqual(["assistantDelta"]);
   });
 
@@ -118,13 +165,45 @@ describe("ClaudeSessionFactTranslator provider authority", () => {
       requestId,
       type: "interactionCanceled",
     });
-    expect(canceled(firstAuthority)[0]).toMatchObject({
+    expect(canceled(firstAuthority).timelineFacts[0]).toMatchObject({
       provider: interactionAuthority(firstAuthority, requestId),
       type: "interactionResolved",
     });
-    expect(canceled(replacementAuthority)[0]).toMatchObject({
+    expect(canceled(replacementAuthority).timelineFacts[0]).toMatchObject({
       provider: interactionAuthority(replacementAuthority, requestId),
       type: "interactionResolved",
     });
+  });
+
+  test("splits normalized usage from the neutral timeline with frozen exact authority", () => {
+    const value = translator();
+    const quota = value.translate(firstAuthority, quotaObserved());
+    expect(quota.timelineFacts).toEqual([]);
+    expect(quota.usageObservations).toEqual([{
+      authority: firstAuthority,
+      component: "quota",
+      connectionId,
+      observationRevision: 2,
+      observedAt: 10,
+      providerThreadId,
+      quota: quotaObserved().quota,
+      receivedAt: 10,
+      sourceEventDigest: "a".repeat(64),
+      sourceEventId: "00000000-0000-4000-8000-000000000001",
+      turnId: "same-turn",
+    }]);
+
+    const accounting = value.translate(replacementAuthority, accountingObserved());
+    expect(accounting.timelineFacts).toEqual([]);
+    expect(accounting.usageObservations[0]).toMatchObject({
+      authority: replacementAuthority,
+      component: "accounting",
+      observationRevision: 1,
+      observedAt: 11,
+      receivedAt: 11,
+      sourceEventId: "00000000-0000-4000-8000-000000000002",
+      turnId: "same-turn",
+    });
+    expect(accounting.usageObservations[0]?.authority).not.toEqual(firstAuthority);
   });
 });

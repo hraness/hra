@@ -156,8 +156,10 @@ class FakeCodex implements CodexRuntimePort {
   accountProjection: CodexAccountProjection = { signedIn: true, email: "person@example.com", plan: "Plus" };
   usageResult: { revision: number; observedAt: number; payload: unknown } = { revision: 1, observedAt: 2_000, payload: { primary: { usedPercent: 25 } } };
   readonly usageResults: Array<{ revision: number; observedAt: number; payload: unknown }> = [];
+  readonly readAccountAuthorities: ProfileAuthority[] = [];
+  readonly readUsageAuthorities: ProfileAuthority[] = [];
   usageError: Error | undefined;
-  beforeReadUsageReturn?: () => Promise<void>;
+  beforeReadUsageReturn?: (input: Parameters<CodexRuntimePort["readUsage"]>[0]) => Promise<void>;
   resetOutcome: "reset" | "alreadyRedeemed" | "nothingToReset" | "noCredit" = "reset";
   resetError: Error | undefined;
   beforeResetReturn?: () => Promise<void>;
@@ -205,19 +207,25 @@ class FakeCodex implements CodexRuntimePort {
   cancelLoginResult: { status: "canceled" | "not_found" } = { status: "canceled" };
   beforeLoginReturn?: (input: { authority: ProfileAuthority; method: "browser" | "device_code" }) => Promise<void>;
   beforeCancelLoginReturn: (() => Promise<void>) | undefined = undefined;
-  beforeReadAccountReturn?: () => Promise<void>;
+  beforeReadAccountReturn?: (input: Parameters<CodexRuntimePort["readAccount"]>[0]) => Promise<void>;
   async login(input: { authority: ProfileAuthority; method: "browser" | "device_code" }): Promise<CodexLoginOutcome> { this.calls.push(`login:${input.authority.id}:${input.authority.generation}:${input.method}`); await this.beforeLoginReturn?.(input); return this.loginResult; }
   async cancelLogin(input: { authority: ProfileAuthority; loginId: string }): Promise<{ status: "canceled" | "not_found" }> { this.calls.push(`login-cancel:${input.authority.id}:${input.authority.generation}:${input.loginId}`); await this.beforeCancelLoginReturn?.(); return this.cancelLoginResult; }
   async logout(): Promise<void> { this.calls.push("logout"); await this.beforeLogoutReturn?.(); if (this.logoutError !== undefined) throw this.logoutError; }
-  async readAccount(): Promise<CodexAccountProjection> { this.calls.push("readAccount"); await this.beforeReadAccountReturn?.(); return this.accountProjection; }
+  async readAccount(input: Parameters<CodexRuntimePort["readAccount"]>[0]): Promise<CodexAccountProjection> {
+    this.calls.push("readAccount");
+    this.readAccountAuthorities.push(input.authority);
+    await this.beforeReadAccountReturn?.(input);
+    return this.accountProjection;
+  }
   async listPlugins(input: Parameters<CodexRuntimePort["listPlugins"]>[0]): Promise<CodexPluginCatalog> {
     this.calls.push("plugins");
     this.pluginRequests.push(input);
     return this.pluginCatalog;
   }
-  async readUsage(): Promise<{ revision: number; observedAt: number; payload: unknown }> {
+  async readUsage(input: Parameters<CodexRuntimePort["readUsage"]>[0]): Promise<{ revision: number; observedAt: number; payload: unknown }> {
     this.calls.push("usage");
-    await this.beforeReadUsageReturn?.();
+    this.readUsageAuthorities.push(input.authority);
+    await this.beforeReadUsageReturn?.(input);
     if (this.usageError !== undefined) throw this.usageError;
     return this.usageResults.shift() ?? this.usageResult;
   }
@@ -2617,6 +2625,191 @@ describe("HraService", () => {
     expect(codex.resetIdempotencyKeys).toEqual([]);
   });
 
+  test("rejects an initial usage identity proof when its exact provider binding is replaced", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage initial authority race",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const captured = store.requireProviderAccountAuthority(added.account.id, "codex");
+    codex.beforeReadAccountReturn = async () => {
+      expect(store.setProfileState(
+        added.account.id,
+        captured.processGeneration,
+        "signed_out",
+      )).toBe(true);
+    };
+
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+
+    expect(codex.readAccountAuthorities.slice(-1)[0]).toMatchObject({
+      bindingGeneration: captured.bindingGeneration,
+      generation: captured.processGeneration,
+      id: captured.profileId,
+      provider: "codex",
+      providerAccountId: captured.providerAccountId,
+    });
+    expect(codex.readUsageAuthorities).toEqual([]);
+    expect(store.requireProviderAccountAuthority(added.account.id, "codex")).toMatchObject({
+      bindingGeneration: captured.bindingGeneration + 1,
+      processGeneration: captured.processGeneration,
+    });
+    expect(store.latestUsage(added.account.id)).toBeNull();
+  });
+
+  test("does not cross to a replacement binding after a successful Codex usage read", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage success authority race",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const captured = store.requireProviderAccountAuthority(added.account.id, "codex");
+    const accountReadsBefore = codex.readAccountAuthorities.length;
+    codex.beforeReadUsageReturn = async () => {
+      expect(store.setProfileState(
+        added.account.id,
+        captured.processGeneration,
+        "signed_out",
+      )).toBe(true);
+    };
+
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+
+    const dispatched = [
+      ...codex.readAccountAuthorities.slice(accountReadsBefore),
+      ...codex.readUsageAuthorities,
+    ];
+    expect(dispatched).toHaveLength(2);
+    for (const authority of dispatched) {
+      expect(authority).toMatchObject({
+        bindingGeneration: captured.bindingGeneration,
+        generation: captured.processGeneration,
+        id: captured.profileId,
+        provider: "codex",
+        providerAccountId: captured.providerAccountId,
+      });
+    }
+    expect(store.requireProviderAccountAuthority(added.account.id, "codex")).toMatchObject({
+      bindingGeneration: captured.bindingGeneration + 1,
+      processGeneration: captured.processGeneration,
+    });
+    expect(store.latestUsage(added.account.id)).toBeNull();
+  });
+
+  test("preserves the original read failure and writes no failure row after authority replacement", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage failure authority race",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const captured = store.requireProviderAccountAuthority(added.account.id, "codex");
+    const readFailure = new Error("provider usage exploded");
+    codex.usageError = readFailure;
+    codex.beforeReadUsageReturn = async () => {
+      expect(store.setProfileState(
+        added.account.id,
+        captured.processGeneration,
+        "signed_out",
+      )).toBe(true);
+    };
+
+    let rejected: unknown;
+    try {
+      await service.execute({
+        kind: "account.usage",
+        account: added.account.id,
+        refresh: true,
+      }, { signal });
+    } catch (error: unknown) {
+      rejected = error;
+    }
+    expect(rejected).toBe(readFailure);
+    expect(codex.readUsageAuthorities.slice(-1)[0]).toMatchObject({
+      bindingGeneration: captured.bindingGeneration,
+      generation: captured.processGeneration,
+      providerAccountId: captured.providerAccountId,
+    });
+    const fingerprint = createHash("sha256").update("person@example.com").digest("hex");
+    expect(store.latestUsagePollFailure(added.account.id, fingerprint)).toBeNull();
+    expect(store.latestUsage(added.account.id)).toBeNull();
+  });
+
+  test("rejects a replacement that lands during the exact post-read identity proof", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage second proof authority race",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const captured = store.requireProviderAccountAuthority(added.account.id, "codex");
+    const accountReadsBefore = codex.readAccountAuthorities.length;
+    let usageProofReads = 0;
+    codex.beforeReadAccountReturn = async () => {
+      usageProofReads += 1;
+      if (usageProofReads === 2) {
+        expect(store.setProfileState(
+          added.account.id,
+          captured.processGeneration,
+          "signed_out",
+        )).toBe(true);
+      }
+    };
+
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+
+    expect(usageProofReads).toBe(2);
+    const dispatched = [
+      ...codex.readAccountAuthorities.slice(accountReadsBefore),
+      ...codex.readUsageAuthorities,
+    ];
+    expect(dispatched).toHaveLength(3);
+    for (const authority of dispatched) {
+      expect(authority).toMatchObject({
+        bindingGeneration: captured.bindingGeneration,
+        generation: captured.processGeneration,
+        id: captured.profileId,
+        provider: "codex",
+        providerAccountId: captured.providerAccountId,
+      });
+    }
+    expect(store.requireProviderAccountAuthority(added.account.id, "codex")).toMatchObject({
+      bindingGeneration: captured.bindingGeneration + 1,
+      processGeneration: captured.processGeneration,
+    });
+    expect(store.latestUsage(added.account.id)).toBeNull();
+  });
+
   test("keeps below-threshold usage polling to the identity sandwich", async () => {
     const { service, codex } = await fixture();
     const added = await service.execute({
@@ -3089,10 +3282,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }]);
     } finally {
       inspector.close(false);
     }
@@ -4249,6 +4442,10 @@ describe("HraService", () => {
       account: added.account.id,
       deviceCode: false,
     }, { signal });
+    const providerAuthority = value.store.requireProviderAccountAuthority(
+      added.account.id,
+      "codex",
+    );
     const accountFingerprint = createHash("sha256")
       .update("person@example.com")
       .digest("hex");
@@ -4262,7 +4459,7 @@ describe("HraService", () => {
       observedAt: now - 180_000,
       receivedAt: now - 179_000,
       accountFingerprint,
-      providerGeneration: 0,
+      providerGeneration: providerAuthority.processGeneration,
       daemonGeneration: 1,
       previousPayload: null,
     });
@@ -4275,23 +4472,37 @@ describe("HraService", () => {
       observedAt: now - 60_000,
       receivedAt: now - 59_000,
       accountFingerprint,
-      providerGeneration: 0,
+      providerGeneration: providerAuthority.processGeneration,
       daemonGeneration: 1,
       previousPayload: first,
     });
-    value.store.recordUsage(added.account.id, 1, first.observation.observedAt, first);
+    value.store.recordUsage(
+      added.account.id,
+      1,
+      first.observation.observedAt,
+      first,
+      providerAuthority,
+    );
     value.store.recordUsagePollFailure(
       added.account.id,
       accountFingerprint,
       2,
       now - 120_000,
+      providerAuthority,
     );
-    value.store.recordUsage(added.account.id, 3, third.observation.observedAt, third);
+    value.store.recordUsage(
+      added.account.id,
+      3,
+      third.observation.observedAt,
+      third,
+      providerAuthority,
+    );
     value.store.recordUsagePollFailure(
       added.account.id,
       accountFingerprint,
       4,
       now - 30_000,
+      providerAuthority,
     );
 
     const firstPage = await value.service.execute({
@@ -4385,6 +4596,10 @@ describe("HraService", () => {
       account: added.account.id,
       deviceCode: false,
     }, { signal });
+    const providerAuthority = value.store.requireProviderAccountAuthority(
+      added.account.id,
+      "codex",
+    );
     const firstFingerprint = createHash("sha256")
       .update("person@example.com")
       .digest("hex");
@@ -4394,16 +4609,23 @@ describe("HraService", () => {
       observedAt: now - 2_000,
       receivedAt: now - 1_900,
       accountFingerprint: firstFingerprint,
-      providerGeneration: 1,
+      providerGeneration: providerAuthority.processGeneration,
       daemonGeneration: 1,
       previousPayload: null,
     });
-    value.store.recordUsage(added.account.id, 1, first.observation.observedAt, first);
+    value.store.recordUsage(
+      added.account.id,
+      1,
+      first.observation.observedAt,
+      first,
+      providerAuthority,
+    );
     value.store.recordUsagePollFailure(
       added.account.id,
       firstFingerprint,
       2,
       now - 1_000,
+      providerAuthority,
     );
     const firstPage = await value.service.execute({
       kind: "account.usage-history",

@@ -124,6 +124,7 @@ describe("Claude stream client", () => {
       {
         duration_ms: 2_259,
         is_error: false,
+        modelUsage: {},
         num_turns: 1,
         result: "ok",
         session_id: "sess",
@@ -131,6 +132,7 @@ describe("Claude stream client", () => {
         terminal_reason: "completed",
         type: "result",
         usage: { input_tokens: 2, output_tokens: 4 },
+        uuid: "00000000-0000-4000-8000-000000000001",
       },
     );
     await settle();
@@ -142,6 +144,7 @@ describe("Claude stream client", () => {
       "tokenUsageUpdated",
       "turnCompleted",
       "turnSummary",
+      "usageAccountingObserved",
     ]);
     expect(client.activeTurnId).toBeNull();
     expect(client.providerSessionId).toBe("sess");
@@ -172,17 +175,30 @@ describe("Claude stream client", () => {
     const interrupt = writtenLines(process).at(-1);
     expect(interrupt).toMatchObject({ request: { subtype: "interrupt" }, type: "control_request" });
 
-    process.emit({
-      duration_ms: 10,
-      is_error: false,
-      num_turns: 1,
-      result: "stopped",
-      session_id: "sess",
-      stop_reason: "end_turn",
-      terminal_reason: "completed",
-      type: "result",
-      usage: {},
-    });
+    process.emit(
+      {
+        claude_code_version: "2.1.260",
+        model: "claude-fable-5-1",
+        permissionMode: "default",
+        session_id: "sess",
+        subtype: "init",
+        tools: [],
+        type: "system",
+      },
+      {
+        duration_ms: 10,
+        is_error: false,
+        modelUsage: {},
+        num_turns: 1,
+        result: "stopped",
+        session_id: "sess",
+        stop_reason: "end_turn",
+        terminal_reason: "completed",
+        type: "result",
+        usage: {},
+        uuid: "00000000-0000-4000-8000-000000000002",
+      },
+    );
     await settle();
     expect(facts.find((fact) => fact.type === "turnCompleted"))
       .toMatchObject({ status: "interrupted" });
@@ -321,6 +337,58 @@ describe("Claude stream client", () => {
     process.end();
     await settle();
     expect(facts).toEqual([{ reason: "eof", type: "providerDisconnected" }]);
+    await client.close();
+  });
+
+  test("keeps malformed usage advisories from faulting or abandoning a turn", async () => {
+    const { client, facts, process } = open();
+    await client.startTurn({ message: "say ok", turnId: "turn-1" });
+    process.emit(
+      {
+        claude_code_version: "2.1.260",
+        model: "claude-fable-5-1",
+        permissionMode: "default",
+        session_id: "sess",
+        subtype: "init",
+        tools: [],
+        type: "system",
+      },
+      {
+        rate_limit_info: {
+          status: "allowed",
+          unifiedWindows: {
+            five_hour: { resetsAt: 1_788_499_800_000, utilization: 0.5 },
+          },
+        },
+        session_id: "sess",
+        type: "rate_limit_event",
+        uuid: "00000000-0000-4000-8000-000000000003",
+      },
+      {
+        duration_ms: 10,
+        is_error: false,
+        modelUsage: { model: { canonicalModel: "different" } },
+        num_turns: 1,
+        result: "ok",
+        session_id: "sess",
+        total_cost_usd: Number.NaN,
+        type: "result",
+        usage: { input_tokens: 2, output_tokens: 4 },
+        uuid: "not-a-uuid",
+      },
+    );
+    await settle();
+    expect(facts.map((fact) => fact.type)).toEqual([
+      "turnStarted",
+      "sessionBootstrapped",
+      "protocolNotice",
+      "tokenUsageUpdated",
+      "turnCompleted",
+      "turnSummary",
+      "protocolNotice",
+    ]);
+    expect(facts.filter((fact) => fact.type === "providerDisconnected")).toEqual([]);
+    expect(client.activeTurnId).toBeNull();
     await client.close();
   });
 

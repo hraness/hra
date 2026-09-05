@@ -21,9 +21,19 @@ import {
   SESSION_EVENT_RETAIN_AGE_MS,
 } from "../domain/session-events";
 import {
+  canonicalProviderUsageJson,
+  createClaudeAccountingUsageComponent,
+  createClaudeQuotaUsageComponent,
+  providerUsageDigest,
+  type ClaudeProviderUsageAccountingComponent,
+  type ClaudeProviderUsageQuotaComponent,
+  type ProviderUsageComponent,
+} from "../domain/provider-usage";
+import {
   accountUsageCounterSamples,
   createStoredAccountUsageSnapshot,
   observedAccountTokenVelocity,
+  storedAccountUsageSnapshotSchema,
   type StoredAccountUsageSnapshot,
 } from "../domain/usage-metrics";
 import { utf8Bytes, type ProfileId } from "../domain/values";
@@ -40,6 +50,9 @@ import {
   USAGE_LOCAL_RETAIN_AGE_MS,
   USAGE_LOCAL_RETAIN_BYTES,
   USAGE_LOCAL_RETAIN_SUCCESS_COUNT,
+  PROVIDER_USAGE_COMPONENT_RETAIN_BYTES,
+  PROVIDER_USAGE_COMPONENT_RETAIN_COUNT,
+  ProviderUsageTurnNotBoundError,
   SelectionError,
   StateSecurityScrubRequiredError,
   StateStore,
@@ -300,9 +313,279 @@ const downgradeProviderAuthoritySchemaToVersion34 = (database: Database): void =
   }
 };
 
+const schemaVersion36ProviderUsageTables = [
+  "codex_usage_authority_prune_targets",
+  "provider_usage_prune_targets",
+  "provider_usage_observation_components",
+  "provider_usage_observation_receipts",
+] as const;
+
+const downgradeProviderUsageSchemaToVersion35 = (database: Database): void => {
+  database.exec("PRAGMA foreign_keys=OFF");
+  try {
+    database.exec(`
+      DROP TRIGGER IF EXISTS account_scoped_provider_authorities_insert_guard;
+      DROP TRIGGER IF EXISTS account_scoped_provider_authorities_immutable_update;
+      DROP TRIGGER IF EXISTS account_scoped_provider_authorities_immutable_delete;
+      DROP TRIGGER IF EXISTS usage_snapshots_prune_authority;
+      DROP TRIGGER IF EXISTS usage_poll_failures_prune_authority;
+      DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_prune_authority;
+      DROP TRIGGER IF EXISTS usage_snapshots_immutable_update;
+      DROP TRIGGER IF EXISTS usage_poll_failures_immutable_update;
+      DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_immutable_update;
+    `);
+    for (const table of schemaVersion36ProviderUsageTables) {
+      database.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    database.exec("DELETE FROM migrations WHERE version=36; PRAGMA user_version=35");
+  } finally {
+    database.exec("PRAGMA foreign_keys=ON");
+  }
+};
+
 const usageFingerprint = "a".repeat(64);
 const resetAccountFingerprint = (email: string): string =>
   createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
+
+const recordUsageForTest = (
+  store: StateStore,
+  profileId: ProfileId,
+  sourceRevision: number,
+  observedAt: number,
+  payload: unknown,
+): StoredAccountUsageSnapshot => {
+  const authority = store.requireProviderAccountAuthority(profileId, "codex");
+  const existing = storedAccountUsageSnapshotSchema.safeParse(payload);
+  const stored = existing.success
+    ? payload as StoredAccountUsageSnapshot
+    : storedAccountUsageSnapshotSchema.parse({
+        version: 1,
+        providerPayload: payload,
+        observation: {
+          version: 1,
+          sourceSequence: sourceRevision,
+          accountFingerprint: usageFingerprint,
+          usageEpoch: "00000000-0000-4000-8000-000000000001",
+          schemaDigest: "a".repeat(64),
+          counterName: "lifetimeTokens",
+          clock: "received",
+          observedAt,
+          receivedAt: observedAt,
+          lifetimeTokens: null,
+          gapBefore: false,
+          providerGeneration: authority.processGeneration,
+          daemonGeneration: 1,
+        },
+      });
+  store.recordUsage(profileId, sourceRevision, observedAt, stored, authority);
+  return stored;
+};
+
+const recordUsagePollFailureForTest = (
+  store: StateStore,
+  profileId: ProfileId,
+  accountFingerprint: string | null,
+  sourceRevision: number,
+  observedAt: number,
+): void => store.recordUsagePollFailure(
+  profileId,
+  accountFingerprint,
+  sourceRevision,
+  observedAt,
+  store.requireProviderAccountAuthority(profileId, "codex"),
+);
+
+const bindClaudeTurnForUsageTest = (
+  store: StateStore,
+  profileId: ProfileId,
+  turnId: string,
+) => {
+  const authority = store.requireProviderAccountAuthority(profileId, "claude");
+  const created = store.createSession({
+    fastEnabled: false,
+    preset: "fable-max",
+    profileId,
+    provider: "claude",
+  });
+  const session = store.bindSession({
+    expectedRevision: created.revision,
+    providerThreadId: `thread-${turnId}`,
+    providerUpdatedAt: 10,
+    sessionId: created.id,
+    state: "idle",
+  });
+  const runtimeProfile = reviewedClaudeProfile({
+    id: profileId,
+    processGeneration: authority.processGeneration,
+  });
+  const attempt = store.prepareMutation({
+    authorityGeneration: authority.processGeneration,
+    authorityId: session.id,
+    idempotencyKey: crypto.randomUUID(),
+    kind: "session.send",
+    providerAuthorities: [{
+      authority,
+      provenance: "session_send",
+      role: "primary",
+    }],
+    request: { message: `observe ${turnId}` },
+  });
+  store.beginSessionMutationEffect({
+    attemptId: attempt.id,
+    evidence: {
+      baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
+      clientMessageId: attempt.id,
+      kind: "session.send",
+      messageDigest: createHash("sha256").update(turnId).digest("hex"),
+      providerThreadId: `thread-${turnId}`,
+      runtimeProfile,
+    },
+    profileGeneration: authority.processGeneration,
+    providerAuthority: authority,
+    sessionId: session.id,
+  });
+  store.completeSessionTurnEffect({
+    applyResponseState: false,
+    attemptId: attempt.id,
+    expectedSessionRevision: session.revision,
+    providerAuthority: authority,
+    receipt: { turnId },
+    runtimeProfile,
+    sessionId: session.id,
+    turnId,
+    turnStatus: "completed",
+  });
+  return { authority, sessionId: session.id, turnId };
+};
+
+const claudeQuotaForUsageTest = (input: Readonly<{
+  authority: ReturnType<StateStore["requireProviderAccountAuthority"]>;
+  event?: number;
+  observedAt: number;
+  revision: number;
+  sessionId: string;
+  turnId: string;
+  usedPercent?: number;
+}>): ClaudeProviderUsageQuotaComponent => createClaudeQuotaUsageComponent({
+  authority: input.authority,
+  observationRevision: input.revision,
+  observedAt: input.observedAt,
+  quota: {
+    isUsingOverage: null,
+    overageDisabledReason: null,
+    overageStatus: null,
+    rateLimitType: "five_hour",
+    resetsAtMs: input.observedAt + 10_000,
+    status: { state: "known", value: "allowed" },
+    windows: [{
+      id: "five_hour",
+      resetsAtMs: input.observedAt + 10_000,
+      scope: "account",
+      usedPercent: input.usedPercent ?? 25,
+    }],
+  },
+  receivedAt: input.observedAt,
+  sessionId: input.sessionId,
+  sourceEventDigest: providerUsageDigest({ event: input.event ?? input.revision, kind: "quota" }),
+  sourceEventId: `00000000-0000-4000-8000-${String(input.event ?? input.revision).padStart(12, "0")}`,
+  turnId: input.turnId,
+});
+
+const claudeAccountingForUsageTest = (input: Readonly<{
+  authority: ReturnType<StateStore["requireProviderAccountAuthority"]>;
+  event?: number;
+  observedAt: number;
+  revision: number;
+  sessionId: string;
+  turnId: string;
+}>): ClaudeProviderUsageAccountingComponent => createClaudeAccountingUsageComponent({
+  accounting: {
+    cacheCreationInputTokens: null,
+    cacheReadInputTokens: 3,
+    inputTokens: 2,
+    models: [{
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: 3,
+      contextWindow: null,
+      costUsd: null,
+      inputTokens: 2,
+      maxOutputTokens: null,
+      model: "claude-fable-5-1",
+      outputTokens: 1,
+      thinkingTokens: null,
+    }],
+    outputTokens: 1,
+    thinkingTokens: null,
+    totalCostUsd: null,
+  },
+  authority: input.authority,
+  observationRevision: input.revision,
+  observedAt: input.observedAt,
+  receivedAt: input.observedAt,
+  sessionId: input.sessionId,
+  sourceEventDigest: providerUsageDigest({
+    event: input.event ?? input.revision,
+    kind: "accounting",
+  }),
+  sourceEventId: `10000000-0000-4000-8000-${String(input.event ?? input.revision).padStart(12, "0")}`,
+  turnId: input.turnId,
+});
+
+const seedProviderUsageForTest = (
+  databasePath: string,
+  count: number,
+  observation: (revision: number) => ProviderUsageComponent,
+): void => {
+  const database = new Database(databasePath, { create: false, strict: true });
+  try {
+    const insertReceipt = database.query(
+      `INSERT INTO provider_usage_observation_receipts(
+         idempotency_key,component,provider_account_id,profile_id,provider,
+         binding_generation,process_generation,session_id,turn_id,
+         observation_revision,source,source_event_digest,component_digest,
+         observed_at,received_at,recorded_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    );
+    const insertComponent = database.query(
+      `INSERT INTO provider_usage_observation_components(
+         idempotency_key,component_digest,component_json
+       ) VALUES (?,?,?)`,
+    );
+    database.transaction(() => {
+      for (let revision = 1; revision <= count; revision += 1) {
+        const value = observation(revision);
+        if (value.turn === null || value.authority.provider !== "claude") {
+          throw new Error("Test provider usage seed must be Claude turn evidence.");
+        }
+        insertReceipt.run(
+          value.idempotencyKey,
+          value.component,
+          value.authority.providerAccountId,
+          value.authority.profileId,
+          value.authority.provider,
+          value.authority.bindingGeneration,
+          value.authority.processGeneration,
+          value.turn.sessionId,
+          value.turn.turnId,
+          value.observationRevision,
+          value.source,
+          value.sourceEventDigest,
+          value.componentDigest,
+          value.observedAt,
+          value.receivedAt,
+          value.receivedAt,
+        );
+        insertComponent.run(
+          value.idempotencyKey,
+          value.componentDigest,
+          canonicalProviderUsageJson(value),
+        );
+      }
+    }).immediate();
+  } finally {
+    database.close(false);
+  }
+};
 
 const prepareAuthorizedReset = (
   store: StateStore,
@@ -332,6 +615,7 @@ function usageSnapshot(input: Readonly<{
   lifetimeTokens: number;
   observedAt: number;
   previous: StoredAccountUsageSnapshot | null;
+  providerGeneration: number;
   receivedAt: number;
   sourceSequence: number;
 }>): StoredAccountUsageSnapshot {
@@ -340,7 +624,7 @@ function usageSnapshot(input: Readonly<{
     daemonGeneration: 1,
     observedAt: input.observedAt,
     previousPayload: input.previous,
-    providerGeneration: 1,
+    providerGeneration: input.providerGeneration,
     providerPayload: {
       usage: { summary: { lifetimeTokens: input.lifetimeTokens } },
       ...(input.fillerBytes === undefined ? {} : { filler: "x".repeat(input.fillerBytes) }),
@@ -3021,7 +3305,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -3199,13 +3483,14 @@ describe("StateStore", () => {
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
-    // A dangling child row passes every identity check and is visible only to
-    // PRAGMA foreign_key_check, so it separates the two open paths exactly.
+    // This legacy revision cursor is outside the v36 usage-evidence audits but
+    // still owns a profile foreign key, so only PRAGMA foreign_key_check sees
+    // the dangling child and separates the two open paths exactly.
     const raw = new Database(paths.database, { strict: true });
     try {
       raw.exec("PRAGMA foreign_keys=OFF");
       raw.query(
-        "INSERT INTO usage_cloud_upload_anchors(profile_id,source_revision,received_at) VALUES (?,1,1)",
+        "INSERT INTO usage_revision_authority(profile_id,next_revision) VALUES (?,1)",
       ).run(`acct_${"f".repeat(32)}`);
       expect(raw.query("PRAGMA foreign_key_check").all()).toHaveLength(1);
     } finally {
@@ -4735,22 +5020,22 @@ describe("StateStore", () => {
     const failed = signInProfile(store, "Failed private label", "failed-private@example.com");
     const missing = store.createProfile("Missing private label");
     const removed = signInProfile(store, "Removed private label", "removed-private@example.com");
-    store.recordUsage(observed.id, 1, 100, { sentinel: "old-observed-payload" });
-    store.recordUsagePollFailure(
+    recordUsageForTest(store, observed.id, 1, 100, { sentinel: "old-observed-payload" });
+    recordUsagePollFailureForTest(store,
       observed.id,
       resetAccountFingerprint("observed-private@example.com"),
       2,
       200,
     );
-    store.recordUsage(observed.id, 3, 300, { sentinel: "latest-observed-payload" });
-    store.recordUsage(failed.id, 1, 100, { sentinel: "old-failed-payload" });
-    store.recordUsagePollFailure(
+    recordUsageForTest(store, observed.id, 3, 300, { sentinel: "latest-observed-payload" });
+    recordUsageForTest(store, failed.id, 1, 100, { sentinel: "old-failed-payload" });
+    recordUsagePollFailureForTest(store,
       failed.id,
       resetAccountFingerprint("failed-private@example.com"),
       2,
       200,
     );
-    store.recordUsage(removed.id, 1, 100, { sentinel: "removed-account-payload" });
+    recordUsageForTest(store, removed.id, 1, 100, { sentinel: "removed-account-payload" });
     store.removeProfile(removed.id);
 
     const session = store.createSession({
@@ -6240,18 +6525,19 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const profile = store.createProfile("Usage ledger");
     expect(store.allocateNextUsageRevision(profile.id)).toBe(1);
-    store.recordUsage(profile.id, 1, 10_000, { totalTokens: 100 });
+    recordUsageForTest(store, profile.id, 1, 10_000, { totalTokens: 100 });
     expect(store.allocateNextUsageRevision(profile.id)).toBe(2);
-    store.recordUsage(profile.id, 2, 20_000, { totalTokens: 250 });
-    store.recordUsage(profile.id, 2, 20_000, { totalTokens: 250 });
-    expect(() => store.recordUsage(profile.id, 2, 20_000, { totalTokens: 251 })).toThrow("Usage source revision conflict");
+    const secondUsage = recordUsageForTest(store, profile.id, 2, 20_000, { totalTokens: 250 });
+    recordUsageForTest(store, profile.id, 2, 20_000, { totalTokens: 250 });
+    expect(() => recordUsageForTest(store, profile.id, 2, 20_000, { totalTokens: 251 }))
+      .toThrow("Usage source revision conflict");
     expect(store.usageRange({ profileId: profile.id, fromObservedAt: 15_000, throughObservedAt: 25_000 })).toEqual([
-      { sourceRevision: 2, observedAt: 20_000, payload: { totalTokens: 250 } },
+      { sourceRevision: 2, observedAt: 20_000, payload: secondUsage },
     ]);
     expect(store.latestUsage(profile.id)).toEqual({
       sourceRevision: 2,
       observedAt: 20_000,
-      payload: { totalTokens: 250 },
+      payload: secondUsage,
     });
   });
 
@@ -6445,7 +6731,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -7646,6 +7932,7 @@ describe("StateStore", () => {
       lifetimeTokens: 100,
       observedAt: 30_000,
       previous: null,
+      providerGeneration: profile.processGeneration,
       receivedAt: 30_000,
       sourceSequence: 1,
     });
@@ -7653,13 +7940,14 @@ describe("StateStore", () => {
       lifetimeTokens: 300,
       observedAt: 20_000,
       previous: firstPayload,
+      providerGeneration: profile.processGeneration,
       receivedAt: 20_000,
       sourceSequence: 3,
     });
-    store.recordUsage(profile.id, 1, 30_000, firstPayload);
-    store.recordUsagePollFailure(profile.id, usageFingerprint, 2, 10_000);
-    store.recordUsage(profile.id, 3, 20_000, thirdPayload);
-    store.recordUsagePollFailure(profile.id, usageFingerprint, 4, 50_000);
+    recordUsageForTest(store, profile.id, 1, 30_000, firstPayload);
+    recordUsagePollFailureForTest(store, profile.id, usageFingerprint, 2, 10_000);
+    recordUsageForTest(store, profile.id, 3, 20_000, thirdPayload);
+    recordUsagePollFailureForTest(store, profile.id, usageFingerprint, 4, 50_000);
 
     const first = store.usageHistoryPage({
       profileId: profile.id,
@@ -7706,15 +7994,15 @@ describe("StateStore", () => {
   test("selects latest usage outcomes by durable source revision instead of provider time", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Usage source order");
-    store.recordUsage(profile.id, 1, 30_000, { totalTokens: 100 });
-    store.recordUsage(profile.id, 2, 10_000, { totalTokens: 200 });
-    store.recordUsagePollFailure(profile.id, usageFingerprint, 3, 40_000);
-    store.recordUsagePollFailure(profile.id, usageFingerprint, 4, 5_000);
+    recordUsageForTest(store, profile.id, 1, 30_000, { totalTokens: 100 });
+    const second = recordUsageForTest(store, profile.id, 2, 10_000, { totalTokens: 200 });
+    recordUsagePollFailureForTest(store, profile.id, usageFingerprint, 3, 40_000);
+    recordUsagePollFailureForTest(store, profile.id, usageFingerprint, 4, 5_000);
 
     expect(store.latestUsage(profile.id)).toEqual({
       sourceRevision: 2,
       observedAt: 10_000,
-      payload: { totalTokens: 200 },
+      payload: second,
     });
     expect(store.latestUsagePollFailure(profile.id, usageFingerprint)).toEqual({
       sourceRevision: 4,
@@ -7735,11 +8023,12 @@ describe("StateStore", () => {
       lifetimeTokens: 100,
       observedAt: 10_000,
       previous: null,
+      providerGeneration: profile.processGeneration,
       receivedAt: 1_000,
       sourceSequence: 1,
     });
-    store.recordUsage(profile.id, 1, 10_000, first);
-    store.recordUsagePollFailure(profile.id, firstFingerprint, 2, 20_000);
+    recordUsageForTest(store, profile.id, 1, 10_000, first);
+    recordUsagePollFailureForTest(store, profile.id, firstFingerprint, 2, 20_000);
 
     expect(store.setProfileState(
       profile.id,
@@ -7752,21 +8041,23 @@ describe("StateStore", () => {
       lifetimeTokens: 200,
       observedAt: 30_000,
       previous: null,
+      providerGeneration: profile.processGeneration,
       receivedAt: 1_000 + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
       sourceSequence: 3,
     });
-    store.recordUsage(profile.id, 3, 30_000, second);
-    store.recordUsagePollFailure(profile.id, secondFingerprint, 4, 40_000);
+    recordUsageForTest(store, profile.id, 3, 30_000, second);
+    recordUsagePollFailureForTest(store, profile.id, secondFingerprint, 4, 40_000);
     const staleFirst = usageSnapshot({
       accountFingerprint: firstFingerprint,
       lifetimeTokens: 300,
       observedAt: 50_000,
       previous: first,
+      providerGeneration: profile.processGeneration,
       receivedAt: 1_000 + 2 * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
       sourceSequence: 5,
     });
-    store.recordUsage(profile.id, 5, 50_000, staleFirst);
-    store.recordUsagePollFailure(profile.id, null, 6, 60_000);
+    recordUsageForTest(store, profile.id, 5, 50_000, staleFirst);
+    recordUsagePollFailureForTest(store, profile.id, null, 6, 60_000);
 
     expect(store.latestUsage(profile.id)).toMatchObject({ sourceRevision: 5 });
     expect(store.latestUsageForAccount(profile.id, firstFingerprint))
@@ -7813,6 +8104,7 @@ describe("StateStore", () => {
       lifetimeTokens: 100,
       observedAt: 30_000,
       previous: null,
+      providerGeneration: profile.processGeneration,
       receivedAt: 1_000,
       sourceSequence: 1,
     });
@@ -7820,6 +8112,7 @@ describe("StateStore", () => {
       lifetimeTokens: 200,
       observedAt: 10_000,
       previous: first,
+      providerGeneration: profile.processGeneration,
       receivedAt: 1_000 + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
       sourceSequence: 2,
     });
@@ -7827,13 +8120,14 @@ describe("StateStore", () => {
       lifetimeTokens: 400,
       observedAt: 20_000,
       previous: second,
+      providerGeneration: profile.processGeneration,
       receivedAt: 1_000 + 2 * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
       sourceSequence: 4,
     });
-    store.recordUsage(profile.id, 1, 30_000, first);
-    store.recordUsage(profile.id, 2, 10_000, second);
-    store.recordUsagePollFailure(profile.id, usageFingerprint, 3, 40_000);
-    store.recordUsage(profile.id, 4, 20_000, fourth);
+    recordUsageForTest(store, profile.id, 1, 30_000, first);
+    recordUsageForTest(store, profile.id, 2, 10_000, second);
+    recordUsagePollFailureForTest(store, profile.id, usageFingerprint, 3, 40_000);
+    recordUsageForTest(store, profile.id, 4, 20_000, fourth);
 
     expect(store.usageAfterRevision({
       afterSourceRevision: 1,
@@ -7871,10 +8165,17 @@ describe("StateStore", () => {
         lifetimeTokens: sourceSequence * 100,
         observedAt: receivedAt + 10_000,
         previous,
+        providerGeneration: profile.processGeneration,
         receivedAt,
         sourceSequence,
       });
-      store.recordUsage(profile.id, sourceSequence, snapshot.observation.observedAt, snapshot);
+      recordUsageForTest(
+        store,
+        profile.id,
+        sourceSequence,
+        snapshot.observation.observedAt,
+        snapshot,
+      );
       previous = snapshot;
     }
 
@@ -7908,10 +8209,11 @@ describe("StateStore", () => {
         lifetimeTokens: sourceSequence * 100,
         observedAt: now,
         previous,
+        providerGeneration: profile.processGeneration,
         receivedAt: now,
         sourceSequence,
       });
-      store.recordUsage(profile.id, sourceSequence, now, snapshot);
+      recordUsageForTest(store, profile.id, sourceSequence, now, snapshot);
       previous = snapshot;
     }
 
@@ -7939,10 +8241,11 @@ describe("StateStore", () => {
       lifetimeTokens: 7_100,
       observedAt: now,
       previous,
+      providerGeneration: profile.processGeneration,
       receivedAt: now,
       sourceSequence: 71,
     });
-    store.recordUsage(profile.id, 71, now, next);
+    recordUsageForTest(store, profile.id, 71, now, next);
     expect(store.usageAfterRevision({
       afterSourceRevision: 1,
       accountFingerprint: usageFingerprint,
@@ -7965,7 +8268,7 @@ describe("StateStore", () => {
       sourceRevision += 1
     ) {
       now = 1_000 + (sourceRevision - 1) * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS;
-      store.recordUsage(profile.id, sourceRevision, now, { totalTokens: sourceRevision });
+      recordUsageForTest(store, profile.id, sourceRevision, now, { totalTokens: sourceRevision });
     }
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
@@ -7996,10 +8299,11 @@ describe("StateStore", () => {
         lifetimeTokens: sourceSequence * 100,
         observedAt: now,
         previous,
+        providerGeneration: profile.processGeneration,
         receivedAt: now,
         sourceSequence,
       });
-      store.recordUsage(profile.id, sourceSequence, now, snapshot);
+      recordUsageForTest(store, profile.id, sourceSequence, now, snapshot);
       previous = snapshot;
     }
 
@@ -8034,14 +8338,15 @@ describe("StateStore", () => {
       sourceRevision += 1
     ) {
       now += 1;
-      store.recordUsage(profile.id, sourceRevision, now, { totalTokens: sourceRevision });
+      recordUsageForTest(store, profile.id, sourceRevision, now, { totalTokens: sourceRevision });
     }
     const bounded = store.usageRange({ profileId: profile.id, limit: 10_000 });
     expect(bounded).toHaveLength(USAGE_LOCAL_RETAIN_SUCCESS_COUNT);
     expect(bounded[0]?.sourceRevision).toBe(3);
 
     now += USAGE_LOCAL_RETAIN_AGE_MS + 1;
-    store.recordUsage(
+    const finalPayload = recordUsageForTest(
+      store,
       profile.id,
       USAGE_LOCAL_RETAIN_SUCCESS_COUNT + 3,
       now,
@@ -8049,9 +8354,911 @@ describe("StateStore", () => {
     );
     expect(store.usageRange({ profileId: profile.id, limit: 10_000 })).toEqual([{
       observedAt: now,
-      payload: { totalTokens: USAGE_LOCAL_RETAIN_SUCCESS_COUNT + 3 },
+      payload: finalPayload,
       sourceRevision: USAGE_LOCAL_RETAIN_SUCCESS_COUNT + 3,
     }]);
+  });
+
+  test("freezes exact Codex usage authority for snapshots, failures, and upload anchors", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Exact Codex usage", "exact-usage@example.com");
+    const authority = store.requireProviderAccountAuthority(profile.id, "codex");
+    const snapshot = usageSnapshot({
+      lifetimeTokens: 100,
+      observedAt: 10_000,
+      previous: null,
+      providerGeneration: profile.processGeneration,
+      receivedAt: 10_000,
+      sourceSequence: 1,
+    });
+    store.recordUsage(profile.id, 1, 10_000, snapshot, authority);
+    expect(() => store.recordUsage(
+      profile.id,
+      1,
+      10_000,
+      snapshot,
+      { ...authority, bindingGeneration: authority.bindingGeneration + 1 },
+    )).toThrow("CODEX_USAGE_AUTHORITY_REPLAY_CONFLICT");
+    store.recordUsagePollFailure(
+      profile.id,
+      usageFingerprint,
+      2,
+      20_000,
+      authority,
+    );
+
+    expect(store.readCodexUsageAuthorityMetadata("usage_snapshot", profile.id, 1))
+      .toMatchObject({
+        authority,
+        binding: { processGeneration: authority.processGeneration, provenance: "usage_snapshot_v36" },
+        canAuthorizeQuota: true,
+        mode: "mutation_authoritative",
+      });
+    expect(store.readCodexUsageAuthorityMetadata("usage_poll_failure", profile.id, 2))
+      .toMatchObject({
+        authority,
+        binding: {
+          processGeneration: authority.processGeneration,
+          provenance: "usage_poll_failure_v36",
+        },
+        canAuthorizeQuota: false,
+        mode: "mutation_authoritative",
+      });
+    expect(store.readCodexUsageAuthorityMetadata("usage_upload_anchor", profile.id, 1))
+      .toMatchObject({
+        authority,
+        binding: {
+          processGeneration: authority.processGeneration,
+          provenance: "usage_upload_anchor_v36",
+        },
+        canAuthorizeQuota: false,
+        mode: "mutation_authoritative",
+      });
+
+    const mismatchedPayload = {
+      ...snapshot,
+      observation: {
+        ...snapshot.observation,
+        observedAt: 30_000,
+        providerGeneration: authority.processGeneration + 1,
+        sourceSequence: 3,
+      },
+    };
+    expect(() => store.recordUsage(
+      profile.id,
+      3,
+      30_000,
+      mismatchedPayload,
+      authority,
+    )).toThrow("CODEX_USAGE_PAYLOAD_AUTHORITY_MISMATCH");
+
+    const stalePayload = usageSnapshot({
+      lifetimeTokens: 200,
+      observedAt: 40_000,
+      previous: snapshot,
+      providerGeneration: profile.processGeneration,
+      receivedAt: 40_000,
+      sourceSequence: 4,
+    });
+    store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: authority.processGeneration,
+      profileId: profile.id,
+      provider: "codex",
+    });
+    expect(() => store.recordUsage(
+      profile.id,
+      4,
+      40_000,
+      stalePayload,
+      authority,
+    )).toThrow("PROVIDER_ACCOUNT_AUTHORITY_STALE");
+    expect(() => store.recordUsagePollFailure(
+      profile.id,
+      usageFingerprint,
+      5,
+      50_000,
+      authority,
+    )).toThrow("PROVIDER_ACCOUNT_AUTHORITY_STALE");
+
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT scope_kind,process_generation,provenance
+         FROM account_scoped_provider_authorities
+         WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
+         ORDER BY scope_kind,scope_id`,
+      ).all()).toEqual([
+        {
+          process_generation: authority.processGeneration,
+          provenance: "usage_poll_failure_v36",
+          scope_kind: "usage_poll_failure",
+        },
+        {
+          process_generation: authority.processGeneration,
+          provenance: "usage_snapshot_v36",
+          scope_kind: "usage_snapshot",
+        },
+        {
+          process_generation: authority.processGeneration,
+          provenance: "usage_upload_anchor_v36",
+          scope_kind: "usage_upload_anchor",
+        },
+      ]);
+      expect(inspector.query(
+        "SELECT source_revision FROM usage_snapshots WHERE source_revision IN (3,4)",
+      ).all()).toEqual([]);
+      expect(inspector.query(
+        "SELECT source_revision FROM usage_poll_failures WHERE source_revision=5",
+      ).all()).toEqual([]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("makes Codex usage rows immutable and rejects a stored-byte digest mismatch", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Immutable Codex usage", "immutable-usage@example.com");
+    const authority = store.requireProviderAccountAuthority(profile.id, "codex");
+    const snapshot = usageSnapshot({
+      lifetimeTokens: 100,
+      observedAt: 10_000,
+      previous: null,
+      providerGeneration: profile.processGeneration,
+      receivedAt: 10_000,
+      sourceSequence: 1,
+    });
+    store.recordUsage(profile.id, 1, 10_000, snapshot, authority);
+    store.recordUsagePollFailure(profile.id, usageFingerprint, 2, 20_000, authority);
+
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(() => inspector.query(
+        `UPDATE usage_snapshots SET observed_at=observed_at+1
+         WHERE profile_id=? AND source_revision=1`,
+      ).run(profile.id)).toThrow("Codex usage snapshot is immutable");
+      expect(() => inspector.query(
+        `UPDATE usage_poll_failures SET observed_at=observed_at+1
+         WHERE profile_id=? AND source_revision=2`,
+      ).run(profile.id)).toThrow("Codex usage failure is immutable");
+      expect(() => inspector.query(
+        `UPDATE usage_cloud_upload_anchors SET received_at=received_at+1
+         WHERE profile_id=? AND source_revision=1`,
+      ).run(profile.id)).toThrow("Codex usage upload anchor is immutable");
+    } finally {
+      inspector.close(false);
+    }
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const corrupt = new Database(paths.database, { create: false, strict: true });
+    corrupt.exec("DROP TRIGGER usage_snapshots_immutable_update");
+    corrupt.query(
+      `UPDATE usage_snapshots SET digest=?
+       WHERE profile_id=? AND source_revision=1`,
+    ).run("0".repeat(64), profile.id);
+    corrupt.close(false);
+
+    expect(() => new StateStore(paths)).toThrow("CODEX_USAGE_SNAPSHOT_DIGEST_INVALID");
+  });
+
+  test("repairs weakened same-name v36 guards while readonly refuses them", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Repair v36 guards", "repair-v36@example.com");
+    const codexAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
+    const claudeAuthority = store.requireProviderAccountAuthority(profile.id, "claude");
+    const snapshot = usageSnapshot({
+      lifetimeTokens: 100,
+      observedAt: 10_000,
+      previous: null,
+      providerGeneration: profile.processGeneration,
+      receivedAt: 10_000,
+      sourceSequence: 1,
+    });
+    store.recordUsage(profile.id, 1, 10_000, snapshot, codexAuthority);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    try {
+      weakened.exec(`
+        DROP TRIGGER provider_usage_observation_receipts_insert_guard;
+        CREATE TRIGGER provider_usage_observation_receipts_insert_guard
+        BEFORE INSERT ON provider_usage_observation_receipts
+        BEGIN SELECT 1; END;
+        DROP TRIGGER usage_snapshots_immutable_update;
+        CREATE TRIGGER usage_snapshots_immutable_update
+        BEFORE UPDATE ON usage_snapshots
+        BEGIN SELECT 1; END;
+        DROP TRIGGER account_scoped_provider_authorities_immutable_update;
+        CREATE TRIGGER account_scoped_provider_authorities_immutable_update
+        BEFORE UPDATE ON account_scoped_provider_authorities
+        BEGIN SELECT 1; END;
+      `);
+    } finally {
+      weakened.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V36_STRUCTURE_INVALID");
+
+    const repaired = new StateStore(paths, { now: () => 20_000 });
+    stores.push(repaired);
+    repaired.close();
+    stores.splice(stores.indexOf(repaired), 1);
+    const writer = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(() => writer.query(
+        `UPDATE usage_snapshots SET observed_at=observed_at
+         WHERE profile_id=? AND source_revision=1`,
+      ).run(profile.id)).toThrow("Codex usage snapshot is immutable");
+      expect(() => writer.query(
+        `UPDATE account_scoped_provider_authorities SET recorded_at=recorded_at
+         WHERE scope_kind='usage_snapshot' AND scope_id=?`,
+      ).run(`${profile.id}:1`)).toThrow(
+        "account provider compatibility authority is immutable",
+      );
+      expect(() => writer.query(
+        `INSERT INTO provider_usage_observation_receipts(
+           idempotency_key,component,provider_account_id,profile_id,provider,
+           binding_generation,process_generation,session_id,turn_id,
+           observation_revision,source,source_event_digest,component_digest,
+           observed_at,received_at,recorded_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        "d".repeat(64),
+        "quota",
+        claudeAuthority.providerAccountId,
+        claudeAuthority.profileId,
+        "claude",
+        claudeAuthority.bindingGeneration,
+        claudeAuthority.processGeneration,
+        "missing-session",
+        "missing-turn",
+        1,
+        "claude_rate_limit_event",
+        "e".repeat(64),
+        "f".repeat(64),
+        10_000,
+        10_000,
+        10_000,
+      )).toThrow("provider usage turn authority mismatch");
+    } finally {
+      writer.close(false);
+    }
+  });
+
+  test("audits missing Codex usage authority before startup retention", async () => {
+    for (const scopeKind of [
+      "usage_snapshot",
+      "usage_poll_failure",
+      "usage_upload_anchor",
+    ] as const) {
+      const { store } = await fixture();
+      const profile = signInProfile(
+        store,
+        `Missing ${scopeKind}`,
+        `${scopeKind}@example.com`,
+      );
+      const authority = store.requireProviderAccountAuthority(profile.id, "codex");
+      const snapshot = usageSnapshot({
+        lifetimeTokens: 100,
+        observedAt: 10_000,
+        previous: null,
+        providerGeneration: profile.processGeneration,
+        receivedAt: 10_000,
+        sourceSequence: 1,
+      });
+      store.recordUsage(profile.id, 1, 10_000, snapshot, authority);
+      store.recordUsagePollFailure(profile.id, usageFingerprint, 2, 20_000, authority);
+      const sourceRevision = scopeKind === "usage_poll_failure" ? 2 : 1;
+      const paths = store.paths;
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+
+      const corrupt = new Database(paths.database, { create: false, strict: true });
+      corrupt.exec("DROP TRIGGER account_scoped_provider_authorities_immutable_delete");
+      corrupt.query(
+        `DELETE FROM account_scoped_provider_authorities
+         WHERE scope_kind=? AND scope_id=?`,
+      ).run(scopeKind, `${profile.id}:${sourceRevision}`);
+      corrupt.close(false);
+
+      expect(() => new StateStore(paths, {
+        now: () => USAGE_LOCAL_RETAIN_AGE_MS + 100_000,
+      })).toThrow("CODEX_USAGE_AUTHORITY_MISSING");
+    }
+  });
+
+  test("stores Claude quota and accounting against immutable turn authority", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-provider-usage-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
+    await initializeStatePaths(paths);
+    const store = new StateStore(paths, { now: () => 20_000 });
+    stores.push(store);
+    const profile = store.createProfile("Claude usage");
+    store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: 0,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    const beforeReadiness = store.requireProviderAccountForProfile(profile.id, "claude");
+    store.observeProviderAccountReadiness({
+      expectedBindingGeneration: beforeReadiness.bindingGeneration,
+      observedAt: 1_000,
+      profileId: profile.id,
+      provider: "claude",
+      readiness: "signed_in",
+    });
+    const oldTurn = bindClaudeTurnForUsageTest(store, profile.id, "turn-old-authority");
+    const newerQuota = claudeQuotaForUsageTest({
+      ...oldTurn,
+      event: 2,
+      observedAt: 9_000,
+      revision: 2,
+    });
+    const olderQuota = claudeQuotaForUsageTest({
+      ...oldTurn,
+      event: 1,
+      observedAt: 8_000,
+      revision: 1,
+    });
+    const accounting = claudeAccountingForUsageTest({
+      ...oldTurn,
+      event: 3,
+      observedAt: 10_000,
+      revision: 1,
+    });
+
+    expect(store.recordProviderUsageObservation(newerQuota).status).toBe("inserted");
+    expect(store.recordProviderUsageObservation(newerQuota).status).toBe("replayed");
+    expect(() => store.recordProviderUsageObservation(claudeQuotaForUsageTest({
+      ...oldTurn,
+      event: 2,
+      observedAt: 9_000,
+      revision: 2,
+      usedPercent: 99,
+    }))).toThrow("PROVIDER_USAGE_IDEMPOTENCY_CONFLICT");
+    expect(() => store.recordProviderUsageObservation(claudeQuotaForUsageTest({
+      ...oldTurn,
+      event: 22,
+      observedAt: 9_000,
+      revision: 2,
+    }))).toThrow("PROVIDER_USAGE_REVISION_CONFLICT");
+    expect(store.recordProviderUsageObservation(olderQuota).status).toBe("inserted");
+    expect(store.recordProviderUsageObservation(accounting).status).toBe("inserted");
+
+    expect(store.latestProviderUsage(oldTurn.authority.providerAccountId)).toMatchObject({
+      accounting: { observationRevision: 1, observedAt: 10_000 },
+      authority: oldTurn.authority,
+      quota: { observationRevision: 2, observedAt: 9_000 },
+    });
+    let pendingTurnError: unknown;
+    try {
+      store.recordProviderUsageObservation(claudeQuotaForUsageTest({
+        ...oldTurn,
+        event: 23,
+        observedAt: 11_000,
+        revision: 3,
+        turnId: "turn-not-bound",
+      }));
+    } catch (error: unknown) {
+      pendingTurnError = error;
+    }
+    expect(pendingTurnError).toBeInstanceOf(ProviderUsageTurnNotBoundError);
+    expect((pendingTurnError as Error).message).toBe("PROVIDER_USAGE_TURN_NOT_BOUND");
+    expect(() => store.recordProviderUsageObservation(claudeQuotaForUsageTest({
+      ...oldTurn,
+      authority: {
+        ...oldTurn.authority,
+        bindingGeneration: oldTurn.authority.bindingGeneration + 1,
+      },
+      event: 24,
+      observedAt: 11_000,
+      revision: 3,
+    }))).toThrow("provider usage turn authority mismatch");
+
+    const currentAccount = store.requireProviderAccountForProfile(profile.id, "claude");
+    store.observeProviderAccountReadiness({
+      expectedBindingGeneration: currentAccount.bindingGeneration,
+      observedAt: 12_000,
+      profileId: profile.id,
+      provider: "claude",
+      readiness: "signed_out",
+    });
+    const rebound = store.requireProviderAccountAuthority(profile.id, "claude");
+    const replacement = store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: rebound.processGeneration,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    const delayed = claudeQuotaForUsageTest({
+      ...oldTurn,
+      event: 4,
+      observedAt: 12_500,
+      revision: 3,
+    });
+    expect(store.recordProviderUsageObservation(delayed).status).toBe("inserted");
+
+    const replacementTurn = bindClaudeTurnForUsageTest(
+      store,
+      profile.id,
+      "turn-replacement-authority",
+    );
+    expect(replacementTurn.authority).toEqual(replacement);
+    const replacementAccounting = claudeAccountingForUsageTest({
+      ...replacementTurn,
+      event: 5,
+      observedAt: 13_000,
+      revision: 1,
+    });
+    store.recordProviderUsageObservation(replacementAccounting);
+    expect(store.latestProviderUsage(oldTurn.authority.providerAccountId)).toMatchObject({
+      accounting: replacementAccounting,
+      authority: replacement,
+      quota: null,
+    });
+
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      const stored = inspector.query(
+        `SELECT component_json FROM provider_usage_observation_components
+         WHERE idempotency_key=?`,
+      ).get(newerQuota.idempotencyKey) as { component_json: string };
+      expect(stored.component_json).not.toContain("00000000-0000-4000-8000-000000000002");
+      expect(stored.component_json).not.toContain("eventId\"");
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("uses the digest as the shared final ordering tie break", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Claude usage ordering");
+    store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: 0,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    const firstTurn = bindClaudeTurnForUsageTest(store, profile.id, "turn-\u{1f600}");
+    const secondTurn = bindClaudeTurnForUsageTest(store, profile.id, "turn-\ue000");
+    const first = claudeQuotaForUsageTest({
+      ...firstTurn,
+      event: 101,
+      observedAt: 2_000,
+      revision: 1,
+    });
+    const second = claudeQuotaForUsageTest({
+      ...secondTurn,
+      event: 102,
+      observedAt: 2_000,
+      revision: 1,
+    });
+    store.recordProviderUsageObservation(second);
+    store.recordProviderUsageObservation(first);
+    const expected = first.idempotencyKey < second.idempotencyKey ? second : first;
+
+    expect(store.providerUsageObservations({
+      component: "quota",
+      providerAccountId: firstTurn.authority.providerAccountId,
+    })[0]).toEqual(expected);
+    expect(store.latestProviderUsage(firstTurn.authority.providerAccountId)?.quota)
+      .toEqual(expected);
+  });
+
+  test("replays retained Claude evidence before expiry and prunes components independently", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-provider-usage-prune-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const profile = store.createProfile("Claude usage retention");
+    store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: 0,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    const turn = bindClaudeTurnForUsageTest(store, profile.id, "turn-retention");
+    const oldQuota = claudeQuotaForUsageTest({
+      ...turn,
+      observedAt: now,
+      revision: 1,
+    });
+    store.recordProviderUsageObservation(oldQuota);
+    now = 5_000;
+    const retainedAccounting = claudeAccountingForUsageTest({
+      ...turn,
+      observedAt: now,
+      revision: 1,
+    });
+    store.recordProviderUsageObservation(retainedAccounting);
+
+    now = 24 * 60 * 60 * 1_000 + 2_001;
+    expect(store.recordProviderUsageObservation(oldQuota).status).toBe("replayed");
+    const freshQuota = claudeQuotaForUsageTest({
+      ...turn,
+      event: 2,
+      observedAt: now,
+      revision: 2,
+    });
+    store.recordProviderUsageObservation(freshQuota);
+    expect(store.providerUsageObservations({
+      component: "quota",
+      providerAccountId: turn.authority.providerAccountId,
+    })).toEqual([freshQuota]);
+    expect(store.providerUsageObservations({
+      component: "accounting",
+      providerAccountId: turn.authority.providerAccountId,
+    })).toEqual([retainedAccounting]);
+  });
+
+  test("bounds Claude provider usage independently by component count and bytes", async () => {
+    const countHome = await realpath(await mkdtemp(join(tmpdir(), "hra-provider-usage-count-")));
+    const countPaths = resolveStatePaths({ homeDirectory: countHome, platform: "linux" });
+    await initializeStatePaths(countPaths);
+    let countNow = 10_000;
+    const countStore = new StateStore(countPaths, { now: () => countNow });
+    stores.push(countStore);
+    const countProfile = countStore.createProfile("Claude usage count bound");
+    countStore.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: 0,
+      profileId: countProfile.id,
+      provider: "claude",
+    });
+    const countTurn = bindClaudeTurnForUsageTest(
+      countStore,
+      countProfile.id,
+      "turn-count-bound",
+    );
+    seedProviderUsageForTest(
+      countPaths.database,
+      PROVIDER_USAGE_COMPONENT_RETAIN_COUNT,
+      (revision) => claudeQuotaForUsageTest({
+        ...countTurn,
+        event: revision,
+        observedAt: 10_000 + revision,
+        revision,
+      }),
+    );
+    countNow = 10_000 + PROVIDER_USAGE_COMPONENT_RETAIN_COUNT + 1;
+    countStore.recordProviderUsageObservation(claudeQuotaForUsageTest({
+      ...countTurn,
+      event: PROVIDER_USAGE_COMPONENT_RETAIN_COUNT + 1,
+      observedAt: countNow,
+      revision: PROVIDER_USAGE_COMPONENT_RETAIN_COUNT + 1,
+    }));
+    const countInspector = new Database(countPaths.database, { readonly: true, strict: true });
+    try {
+      expect(countInspector.query(
+        `SELECT COUNT(*) AS count,MIN(observation_revision) AS minimum
+         FROM provider_usage_observation_receipts WHERE component='quota'`,
+      ).get()).toEqual({ count: PROVIDER_USAGE_COMPONENT_RETAIN_COUNT, minimum: 2 });
+    } finally {
+      countInspector.close(false);
+    }
+
+    const bytesHome = await realpath(await mkdtemp(join(tmpdir(), "hra-provider-usage-bytes-")));
+    const bytesPaths = resolveStatePaths({ homeDirectory: bytesHome, platform: "linux" });
+    await initializeStatePaths(bytesPaths);
+    let bytesNow = 20_000;
+    const bytesStore = new StateStore(bytesPaths, { now: () => bytesNow });
+    stores.push(bytesStore);
+    const bytesProfile = bytesStore.createProfile("Claude usage byte bound");
+    bytesStore.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: 0,
+      profileId: bytesProfile.id,
+      provider: "claude",
+    });
+    const bytesTurn = bindClaudeTurnForUsageTest(
+      bytesStore,
+      bytesProfile.id,
+      "turn-byte-bound",
+    );
+    const largeModels = Array.from({ length: 32 }, (_, index) => ({
+      cacheCreationInputTokens: Number.MAX_SAFE_INTEGER,
+      cacheReadInputTokens: Number.MAX_SAFE_INTEGER,
+      contextWindow: Number.MAX_SAFE_INTEGER,
+      costUsd: Number.MAX_SAFE_INTEGER,
+      inputTokens: Number.MAX_SAFE_INTEGER,
+      maxOutputTokens: Number.MAX_SAFE_INTEGER,
+      model: `${String(index).padStart(3, "0")}${"x".repeat(125)}`,
+      outputTokens: Number.MAX_SAFE_INTEGER,
+      thinkingTokens: Number.MAX_SAFE_INTEGER,
+    }));
+    const insertedForByteBound = 1_200;
+    const largeAccounting = (revision: number) => createClaudeAccountingUsageComponent({
+        accounting: {
+          cacheCreationInputTokens: Number.MAX_SAFE_INTEGER,
+          cacheReadInputTokens: Number.MAX_SAFE_INTEGER,
+          inputTokens: Number.MAX_SAFE_INTEGER,
+          models: largeModels,
+          outputTokens: Number.MAX_SAFE_INTEGER,
+          thinkingTokens: Number.MAX_SAFE_INTEGER,
+          totalCostUsd: Number.MAX_SAFE_INTEGER,
+        },
+        authority: bytesTurn.authority,
+        observationRevision: revision,
+        observedAt: 20_000 + revision,
+        receivedAt: 20_000 + revision,
+        sessionId: bytesTurn.sessionId,
+        sourceEventDigest: providerUsageDigest({ kind: "accounting-byte-bound", revision }),
+        sourceEventId: `20000000-0000-4000-8000-${String(revision).padStart(12, "0")}`,
+        turnId: bytesTurn.turnId,
+      });
+    seedProviderUsageForTest(
+      bytesPaths.database,
+      insertedForByteBound - 1,
+      largeAccounting,
+    );
+    bytesNow = 20_000 + insertedForByteBound;
+    bytesStore.recordProviderUsageObservation(largeAccounting(insertedForByteBound));
+    const bytesInspector = new Database(bytesPaths.database, { readonly: true, strict: true });
+    try {
+      const retained = bytesInspector.query(
+        `SELECT COUNT(*) AS count,
+                SUM(length(CAST(value.component_json AS BLOB))) AS bytes
+         FROM provider_usage_observation_receipts receipt
+         JOIN provider_usage_observation_components value
+           ON value.idempotency_key=receipt.idempotency_key
+         WHERE receipt.component='accounting'`,
+      ).get() as { bytes: number; count: number };
+      expect(retained.count).toBeLessThan(insertedForByteBound);
+      expect(retained.bytes).toBeLessThanOrEqual(PROVIDER_USAGE_COMPONENT_RETAIN_BYTES);
+    } finally {
+      bytesInspector.close(false);
+    }
+  }, 30_000);
+
+  test("migrates v35 Codex usage sidecars byte-identically and reruns v36", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Legacy Codex usage", "legacy-usage@example.com");
+    const first = usageSnapshot({
+      lifetimeTokens: 100,
+      observedAt: 10_000,
+      previous: null,
+      providerGeneration: profile.processGeneration,
+      receivedAt: 1_000,
+      sourceSequence: 1,
+    });
+    const third = usageSnapshot({
+      lifetimeTokens: 300,
+      observedAt: 30_000,
+      previous: first,
+      providerGeneration: profile.processGeneration,
+      receivedAt: 1_001,
+      sourceSequence: 3,
+    });
+    recordUsageForTest(store, profile.id, 1, 10_000, first);
+    recordUsagePollFailureForTest(store, profile.id, usageFingerprint, 2, 20_000);
+    recordUsageForTest(store, profile.id, 3, 30_000, third);
+    recordUsagePollFailureForTest(store, profile.id, usageFingerprint, 4, 40_000);
+    const fifth = usageSnapshot({
+      lifetimeTokens: 500,
+      observedAt: 50_000,
+      previous: third,
+      providerGeneration: profile.processGeneration,
+      receivedAt: 1_000 + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+      sourceSequence: 5,
+    });
+    recordUsageForTest(store, profile.id, 5, 50_000, fifth);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    downgradeProviderUsageSchemaToVersion35(legacy);
+    legacy.query(
+      `UPDATE account_scoped_provider_authorities
+       SET process_generation=NULL,provenance=CASE scope_kind
+         WHEN 'usage_snapshot' THEN 'usage_snapshot'
+         WHEN 'usage_poll_failure' THEN 'usage_poll_failure'
+         WHEN 'usage_upload_anchor' THEN 'usage_upload_anchor'
+       END
+       WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')`,
+    ).run();
+    legacy.query(
+      `UPDATE account_scoped_provider_authorities
+       SET provenance='legacy_codex_compatibility'
+       WHERE scope_kind='usage_snapshot' AND scope_id=?`,
+    ).run(`${profile.id}:3`);
+    legacy.query(
+      "DELETE FROM usage_poll_failures WHERE profile_id=? AND source_revision=4",
+    ).run(profile.id);
+    legacy.query(
+      "DELETE FROM usage_cloud_upload_anchors WHERE profile_id=? AND source_revision=5",
+    ).run(profile.id);
+    legacy.query(
+      "DELETE FROM usage_snapshots WHERE profile_id=? AND source_revision=5",
+    ).run(profile.id);
+    const storedBytes = {
+      failures: legacy.query(
+        "SELECT * FROM usage_poll_failures WHERE profile_id=? ORDER BY source_revision",
+      ).all(profile.id),
+      snapshots: legacy.query(
+        `SELECT source_revision,observed_at,payload_json,digest FROM usage_snapshots
+         WHERE profile_id=? ORDER BY source_revision`,
+      ).all(profile.id),
+    };
+    legacy.close(false);
+
+    const migrated = new StateStore(paths, { now: () => 40_000 });
+    stores.push(migrated);
+    expect(migrated.readCodexUsageAuthorityMetadata("usage_snapshot", profile.id, 1))
+      .toMatchObject({
+        binding: { processGeneration: null, provenance: "usage_snapshot" },
+        canAuthorizeQuota: false,
+        mode: "compatibility_display_only",
+      });
+    expect(migrated.readCodexUsageAuthorityMetadata("usage_poll_failure", profile.id, 2))
+      .toMatchObject({
+        binding: { processGeneration: null, provenance: "usage_poll_failure" },
+        canAuthorizeQuota: false,
+        mode: "compatibility_display_only",
+      });
+    expect(migrated.readCodexUsageAuthorityMetadata("usage_upload_anchor", profile.id, 1))
+      .toMatchObject({
+        binding: { processGeneration: null, provenance: "usage_upload_anchor" },
+        canAuthorizeQuota: false,
+        mode: "compatibility_display_only",
+      });
+    expect(migrated.readCodexUsageAuthorityMetadata("usage_snapshot", profile.id, 3))
+      .toMatchObject({
+        binding: { processGeneration: null, provenance: "legacy_codex_compatibility" },
+        canAuthorizeQuota: false,
+        mode: "compatibility_display_only",
+      });
+    const currentAuthority = migrated.requireProviderAccountAuthority(profile.id, "codex");
+    expect(() => migrated.recordUsage(
+      profile.id,
+      1,
+      10_000,
+      first,
+      currentAuthority,
+    )).toThrow("CODEX_USAGE_AUTHORITY_REPLAY_CONFLICT");
+    expect(() => migrated.recordUsagePollFailure(
+      profile.id,
+      usageFingerprint,
+      2,
+      20_000,
+      currentAuthority,
+    )).toThrow("CODEX_USAGE_FAILURE_AUTHORITY_REPLAY_CONFLICT");
+    const orphanInspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(orphanInspector.query(
+        `SELECT scope_kind,scope_id FROM account_scoped_provider_authorities
+         WHERE scope_id IN (?,?) ORDER BY scope_kind,scope_id`,
+      ).all(`${profile.id}:4`, `${profile.id}:5`)).toEqual([]);
+      expect(orphanInspector.query(
+        "SELECT COUNT(*) AS count FROM codex_usage_authority_prune_targets",
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      orphanInspector.close(false);
+    }
+    const migratedInspector = new Database(paths.database, { readonly: true, strict: true });
+    expect({
+      failures: migratedInspector.query(
+        "SELECT * FROM usage_poll_failures WHERE profile_id=? ORDER BY source_revision",
+      ).all(profile.id),
+      snapshots: migratedInspector.query(
+        `SELECT source_revision,observed_at,payload_json,digest FROM usage_snapshots
+         WHERE profile_id=? ORDER BY source_revision`,
+      ).all(profile.id),
+    }).toEqual(storedBytes);
+    const firstV36Rows = migratedInspector.query(
+      `SELECT * FROM account_scoped_provider_authorities
+       WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
+       ORDER BY scope_kind,scope_id`,
+    ).all();
+    expect(migratedInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+    migratedInspector.close(false);
+    migrated.close();
+    stores.splice(stores.indexOf(migrated), 1);
+
+    const interrupted = new Database(paths.database, { create: false, strict: true });
+    interrupted.exec("DELETE FROM migrations WHERE version=36; PRAGMA user_version=35");
+    interrupted.close(false);
+    const rerun = new StateStore(paths, { now: () => 40_001 });
+    stores.push(rerun);
+    const rerunInspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(rerunInspector.query(
+        `SELECT * FROM account_scoped_provider_authorities
+         WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
+         ORDER BY scope_kind,scope_id`,
+      ).all()).toEqual(firstV36Rows);
+      expect(rerunInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+    } finally {
+      rerunInspector.close(false);
+    }
+  });
+
+  test("rejects a trigger-disabled provider usage receipt-to-JSON mismatch on reopen", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Provider usage corruption");
+    store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: 0,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    const turn = bindClaudeTurnForUsageTest(store, profile.id, "turn-corrupt-usage");
+    const observation = claudeQuotaForUsageTest({
+      ...turn,
+      observedAt: 2_000,
+      revision: 1,
+    });
+    store.recordProviderUsageObservation(observation);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const corrupt = new Database(paths.database, { create: false, strict: true });
+    corrupt.exec("DROP TRIGGER provider_usage_observation_components_immutable_update");
+    corrupt.query(
+      `UPDATE provider_usage_observation_components
+       SET component_json=json_set(component_json,'$.observedAt',?)
+       WHERE idempotency_key=?`,
+    ).run(observation.observedAt + 1, observation.idempotencyKey);
+    corrupt.close(false);
+    expect(() => new StateStore(paths))
+      .toThrow("PROVIDER_USAGE_COMPONENT_EVIDENCE_MISMATCH");
+  });
+
+  test("rejects noncanonical provider usage bytes and unowned Codex usage sidecars", async () => {
+    const canonicalFixture = await fixture();
+    const canonicalProfile = canonicalFixture.store.createProfile("Provider usage canonical bytes");
+    canonicalFixture.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: 0,
+      profileId: canonicalProfile.id,
+      provider: "claude",
+    });
+    const turn = bindClaudeTurnForUsageTest(
+      canonicalFixture.store,
+      canonicalProfile.id,
+      "turn-noncanonical-usage",
+    );
+    const observation = claudeQuotaForUsageTest({
+      ...turn,
+      observedAt: 2_000,
+      revision: 1,
+    });
+    canonicalFixture.store.recordProviderUsageObservation(observation);
+    const canonicalPaths = canonicalFixture.store.paths;
+    canonicalFixture.store.close();
+    stores.splice(stores.indexOf(canonicalFixture.store), 1);
+    const noncanonical = new Database(canonicalPaths.database, { create: false, strict: true });
+    noncanonical.exec("DROP TRIGGER provider_usage_observation_components_immutable_update");
+    noncanonical.query(
+      `UPDATE provider_usage_observation_components
+       SET component_json=' '||component_json WHERE idempotency_key=?`,
+    ).run(observation.idempotencyKey);
+    noncanonical.close(false);
+    expect(() => new StateStore(canonicalPaths)).toThrow("PROVIDER_USAGE_COMPONENT_INVALID");
+
+    const orphanFixture = await fixture();
+    const orphanProfile = signInProfile(
+      orphanFixture.store,
+      "Orphan Codex usage",
+      "orphan-usage@example.com",
+    );
+    recordUsagePollFailureForTest(
+      orphanFixture.store,
+      orphanProfile.id,
+      usageFingerprint,
+      1,
+      2_000,
+    );
+    const orphanPaths = orphanFixture.store.paths;
+    orphanFixture.store.close();
+    stores.splice(stores.indexOf(orphanFixture.store), 1);
+    const orphan = new Database(orphanPaths.database, { create: false, strict: true });
+    orphan.exec("DROP TRIGGER usage_poll_failures_prune_authority");
+    orphan.query(
+      "DELETE FROM usage_poll_failures WHERE profile_id=? AND source_revision=1",
+    ).run(orphanProfile.id);
+    orphan.close(false);
+    expect(() => new StateStore(orphanPaths)).toThrow("CODEX_USAGE_AUTHORITY_ORPHANED");
   });
 
   test("reopens v9 event and interaction state read-only without rotating authority", async () => {
@@ -8799,8 +10006,8 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }]);
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -9067,7 +10274,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -9176,7 +10383,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -9280,7 +10487,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -9333,7 +10540,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -9424,7 +10631,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -9530,7 +10737,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -9644,7 +10851,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -9681,6 +10888,7 @@ describe("StateStore", () => {
         { version: 33, applied_at: 2000 },
         { version: 34, applied_at: 2000 },
         { version: 35, applied_at: 2000 },
+        { version: 36, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -9727,7 +10935,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -9747,9 +10955,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 36");
+    newer.exec("PRAGMA user_version = 37");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:36:35");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:37:36");
   });
 });

@@ -31,6 +31,7 @@ export interface ClaudeStreamClientOptions {
   readonly maxJsonLineBytes?: number;
   readonly shutdownTermGraceMs?: number;
   readonly shutdownSettlementMs?: number;
+  readonly now?: () => number;
 }
 
 type PendingInteraction = {
@@ -51,7 +52,7 @@ export class ClaudeStreamClient {
   readonly #configDir: string;
   readonly #onFact: ClaudeStreamClientOptions["onFact"];
   readonly #onSafeDiagnostic: ((message: string) => void) | undefined;
-  readonly #assembler = new ClaudeDeltaAssembler();
+  readonly #assembler: ClaudeDeltaAssembler;
   readonly #decoder: ClaudeJsonLineDecoder;
   readonly #pending = new Map<string, PendingInteraction>();
   readonly #encoder = new TextEncoder();
@@ -68,6 +69,9 @@ export class ClaudeStreamClient {
     this.#configDir = options.configDir;
     this.#onFact = options.onFact;
     this.#onSafeDiagnostic = options.onSafeDiagnostic;
+    this.#assembler = new ClaudeDeltaAssembler(
+      options.now === undefined ? {} : { now: options.now },
+    );
     this.#decoder = new ClaudeJsonLineDecoder(
       options.maxJsonLineBytes === undefined ? {} : { maxLineBytes: options.maxJsonLineBytes },
     );

@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { ClaudeDeltaAssembler, type ClaudeFact } from "./assembler";
+import {
+  CLAUDE_USAGE_EVENTS_PER_TURN_LIMIT,
+  ClaudeDeltaAssembler,
+  type ClaudeFact,
+} from "./assembler";
 import { ClaudeError } from "./errors";
 import { parseClaudeStreamLine } from "./protocol";
 
@@ -16,6 +20,18 @@ const fixtureFacts = async (
     .split("\n")
     .filter((line) => line.trim().length > 0)
     .flatMap((line) => [...assembler.apply(parseClaudeStreamLine(JSON.parse(line) as unknown))]);
+};
+
+const bootstrap = (assembler: ClaudeDeltaAssembler, sessionId = "s"): void => {
+  assembler.apply(parseClaudeStreamLine({
+    claude_code_version: "2.1.260",
+    model: "claude-fable-5-1",
+    permissionMode: "default",
+    session_id: sessionId,
+    subtype: "init",
+    tools: [],
+    type: "system",
+  }));
 };
 
 describe("Claude delta assembler", () => {
@@ -33,6 +49,7 @@ describe("Claude delta assembler", () => {
       "tokenUsageUpdated",
       "turnCompleted",
       "turnSummary",
+      "usageAccountingObserved",
     ]);
     expect(facts[0]).toMatchObject({
       model: "claude-fable-5-1",
@@ -40,6 +57,20 @@ describe("Claude delta assembler", () => {
       type: "sessionBootstrapped",
     });
     expect(facts[1]).toMatchObject({ text: "ok", turnId: "turn-1", type: "assistantDelta" });
+    expect(facts[2]).toMatchObject({
+      observationRevision: 1,
+      quota: { status: { state: "known", value: "allowed" } },
+      sourceEventId: "bee4e95a-9a7d-4f23-a5d2-a50045b22dec",
+      turnId: "turn-1",
+      type: "rateLimitObserved",
+    });
+    expect(facts[6]).toMatchObject({
+      accounting: { totalCostUsd: 0.22393074999999998 },
+      observationRevision: 1,
+      sourceEventId: "48c87f50-1645-4f71-a091-4949d337eb87",
+      turnId: "turn-1",
+      type: "usageAccountingObserved",
+    });
     expect(facts[4]).toEqual({ status: "completed", turnId: "turn-1", type: "turnCompleted" });
     expect(facts[5]).toMatchObject({
       resultText: "ok",
@@ -57,12 +88,14 @@ describe("Claude delta assembler", () => {
   test("classifies an unauthenticated result as a failed turn with a bounded error", async () => {
     const assembler = new ClaudeDeltaAssembler();
     assembler.beginTurn("turn-1");
+    bootstrap(assembler, "3ab362ae-4119-4012-aee7-05f6e96682a2");
     const facts = await fixtureFacts("output-json-unauthenticated", assembler);
     expect(facts.map((fact) => fact.type)).toEqual([
       "tokenUsageUpdated",
       "providerError",
       "turnCompleted",
       "turnSummary",
+      "usageAccountingObserved",
     ]);
     expect(facts[1]).toMatchObject({ code: "api_error", terminal: false, type: "providerError" });
     expect(facts[2]).toMatchObject({ status: "failed" });
@@ -71,6 +104,7 @@ describe("Claude delta assembler", () => {
   test("marks an interrupted turn even when Claude reports success", () => {
     const assembler = new ClaudeDeltaAssembler();
     assembler.beginTurn("turn-1");
+    bootstrap(assembler);
     assembler.markInterrupted();
     const facts = assembler.apply(parseClaudeStreamLine({
       duration_ms: 12,
@@ -82,6 +116,7 @@ describe("Claude delta assembler", () => {
       terminal_reason: "completed",
       type: "result",
       usage: {},
+      uuid: "00000000-0000-4000-8000-000000000001",
     }));
     expect(facts.find((fact) => fact.type === "turnCompleted")).toEqual({
       status: "interrupted",
@@ -218,5 +253,181 @@ describe("Claude delta assembler", () => {
       session_id: "s",
       type: "assistant",
     }))).toEqual([]);
+    expect(assembler.apply(parseClaudeStreamLine({
+      rate_limit_info: {
+        status: "allowed",
+        unifiedWindows: {},
+      },
+      session_id: "s",
+      type: "rate_limit_event",
+      uuid: "00000000-0000-4000-8000-000000000002",
+    }))).toEqual([{
+      event: "rate_limit_event/outside_turn",
+      type: "protocolNotice",
+    }]);
+  });
+
+  test("assigns quota revisions synchronously and replays an exact event idempotently", () => {
+    let now = 100;
+    const assembler = new ClaudeDeltaAssembler({ now: () => now++ });
+    assembler.beginTurn("turn-1");
+    bootstrap(assembler);
+    const event = parseClaudeStreamLine({
+      rate_limit_info: {
+        status: "warning",
+        unifiedWindows: {
+          five_hour: { resetsAt: 1_788_499_800, utilization: 0.99 },
+        },
+      },
+      session_id: "s",
+      type: "rate_limit_event",
+      uuid: "00000000-0000-4000-8000-000000000003",
+    });
+    const first = assembler.apply(event);
+    const replay = assembler.apply(event);
+    expect(first).toEqual(replay);
+    expect(first[0]).toMatchObject({
+      observationRevision: 1,
+      observedAt: 100,
+      quota: { status: { state: "known", value: "warning" } },
+      receivedAt: 100,
+      turnId: "turn-1",
+      type: "rateLimitObserved",
+    });
+
+    const next = assembler.apply(parseClaudeStreamLine({
+      rate_limit_info: { status: "blocked", unifiedWindows: {} },
+      session_id: "s",
+      type: "rate_limit_event",
+      uuid: "00000000-0000-4000-8000-000000000004",
+    }));
+    expect(next[0]).toMatchObject({
+      observationRevision: 2,
+      observedAt: 101,
+      receivedAt: 101,
+      type: "rateLimitObserved",
+    });
+
+    assembler.abandonTurn("test boundary");
+    assembler.beginTurn("turn-2");
+    // The provider session remains pinned across turns.
+    expect(assembler.apply(event)[0]).toMatchObject({
+      observationRevision: 1,
+      observedAt: 102,
+      receivedAt: 102,
+      turnId: "turn-2",
+    });
+  });
+
+  test("drops a conflicting duplicate and bounds retained quota event identity", () => {
+    const assembler = new ClaudeDeltaAssembler();
+    assembler.beginTurn("turn-1");
+    bootstrap(assembler);
+    const firstLine = {
+      rate_limit_info: { status: "allowed", unifiedWindows: {} },
+      session_id: "s",
+      type: "rate_limit_event",
+      uuid: "00000000-0000-4000-8000-000000000005",
+    };
+    assembler.apply(parseClaudeStreamLine(firstLine));
+    expect(assembler.apply(parseClaudeStreamLine({
+      ...firstLine,
+      rate_limit_info: { status: "denied", unifiedWindows: {} },
+    }))).toEqual([{
+      event: "rate_limit_event/conflicting_duplicate",
+      type: "protocolNotice",
+    }]);
+
+    const bounded = new ClaudeDeltaAssembler();
+    bounded.beginTurn("turn-bounded");
+    bootstrap(bounded);
+    let lastFacts: readonly ClaudeFact[] = [];
+    for (let index = 0; index <= CLAUDE_USAGE_EVENTS_PER_TURN_LIMIT; index += 1) {
+      lastFacts = bounded.apply(parseClaudeStreamLine({
+        rate_limit_info: { status: "allowed", unifiedWindows: {} },
+        session_id: "s",
+        type: "rate_limit_event",
+        uuid: `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+      }));
+    }
+    expect(lastFacts).toEqual([{
+      event: "rate_limit_event/observation_limit",
+      type: "protocolNotice",
+    }]);
+  });
+
+  test("keeps a malformed accounting advisory from erasing turn completion", () => {
+    const assembler = new ClaudeDeltaAssembler();
+    assembler.beginTurn("turn-1");
+    bootstrap(assembler);
+    const facts = assembler.apply(parseClaudeStreamLine({
+      duration_ms: 12,
+      is_error: false,
+      modelUsage: { model: { canonicalModel: "different" } },
+      num_turns: 1,
+      result: "ok",
+      session_id: "s",
+      total_cost_usd: Number.NaN,
+      type: "result",
+      usage: { input_tokens: 2, output_tokens: 4 },
+      uuid: "not-a-uuid",
+    }));
+    expect(facts.map((fact) => fact.type)).toEqual([
+      "tokenUsageUpdated",
+      "turnCompleted",
+      "turnSummary",
+      "protocolNotice",
+    ]);
+    expect(facts[3]).toEqual({ event: "result/accounting_invalid", type: "protocolNotice" });
+    expect(facts[1]).toEqual({ status: "completed", turnId: "turn-1", type: "turnCompleted" });
+    expect(assembler.activeTurnId).toBeNull();
+  });
+
+  test("does not correlate quota or results from a different provider session", () => {
+    const assembler = new ClaudeDeltaAssembler({ now: () => 123 });
+    assembler.beginTurn("turn-1");
+    bootstrap(assembler, "session-one");
+    const mismatchedRate = parseClaudeStreamLine({
+      rate_limit_info: { status: "allowed", unifiedWindows: {} },
+      session_id: "session-two",
+      type: "rate_limit_event",
+      uuid: "00000000-0000-4000-8000-000000000006",
+    });
+    expect(assembler.apply(mismatchedRate)).toEqual([{
+      event: "rate_limit_event/session_mismatch",
+      type: "protocolNotice",
+    }]);
+    expect(assembler.apply(parseClaudeStreamLine({
+      rate_limit_info: { status: "allowed", unifiedWindows: {} },
+      session_id: "session-one",
+      type: "rate_limit_event",
+      uuid: "00000000-0000-4000-8000-000000000007",
+    }))[0]).toMatchObject({ observationRevision: 1, observedAt: 123 });
+
+    const result = (sessionId: string, uuid: string) => parseClaudeStreamLine({
+      duration_ms: 1,
+      is_error: false,
+      modelUsage: {},
+      num_turns: 1,
+      result: "ok",
+      session_id: sessionId,
+      type: "result",
+      usage: {},
+      uuid,
+    });
+    expect(assembler.apply(result(
+      "session-two",
+      "00000000-0000-4000-8000-000000000008",
+    ))).toEqual([{ event: "result/session_mismatch", type: "protocolNotice" }]);
+    expect(assembler.activeTurnId).toBe("turn-1");
+    expect(assembler.apply(result(
+      "session-one",
+      "00000000-0000-4000-8000-000000000009",
+    )).map((fact) => fact.type)).toEqual([
+      "tokenUsageUpdated",
+      "turnCompleted",
+      "turnSummary",
+      "usageAccountingObserved",
+    ]);
   });
 });

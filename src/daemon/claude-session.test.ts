@@ -26,6 +26,7 @@ import {
 import { HraService } from "./service";
 
 const signal = new AbortController().signal;
+const PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT = 1_024;
 
 /**
  * The exact `system/init`, `assistant`, `control_request`, `rate_limit_event`,
@@ -110,21 +111,53 @@ const subagentStartedLine = {
   type: "system",
 };
 
+const rateLimitLine = (uuid: string, utilization = 0.5) => ({
+  rate_limit_info: {
+    isUsingOverage: false,
+    overageDisabledReason: "org_level_disabled",
+    overageStatus: "rejected",
+    rateLimitType: "five_hour",
+    resetsAt: 1_788_499_800,
+    status: "allowed",
+    unifiedWindows: {
+      five_hour: { resetsAt: 1_788_499_800, utilization },
+    },
+  },
+  session_id: FIXTURE_SESSION_ID,
+  type: "rate_limit_event",
+  uuid,
+});
+
 const resultLine = (resultText: string) => ({
   duration_ms: 2_374,
   is_error: false,
+  modelUsage: {
+    [CLAUDE_PIN_MODEL]: {
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 10_123,
+      canonicalModel: CLAUDE_PIN_MODEL,
+      contextWindow: 1_000_000,
+      costUSD: 0.2,
+      inputTokens: 2,
+      maxOutputTokens: 64_000,
+      outputTokens: 4,
+      thinkingTokens: 0,
+    },
+  },
   num_turns: 1,
   result: resultText,
   session_id: FIXTURE_SESSION_ID,
   stop_reason: "end_turn",
   subtype: "success",
   terminal_reason: "completed",
+  total_cost_usd: 0.2,
   type: "result",
   usage: {
     cache_read_input_tokens: 10_123,
     input_tokens: 2,
     output_tokens: 4,
   },
+  uuid: "48c87f50-1645-4f71-a091-4949d337eb87",
 });
 
 const pinnedRuntime: PinnedClaudeRuntime = {
@@ -143,6 +176,7 @@ class FakeClaudeProcess implements ClaudeProcess {
   readonly stderr: AsyncIterable<Uint8Array> = {
     async *[Symbol.asyncIterator]() { /* silent */ },
   };
+  beforeWriteReturn: ((line: string) => Promise<void> | void) | undefined;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
@@ -173,7 +207,9 @@ class FakeClaudeProcess implements ClaudeProcess {
   }
 
   async write(bytes: Uint8Array): Promise<void> {
-    this.written.push(new TextDecoder().decode(bytes));
+    const line = new TextDecoder().decode(bytes);
+    this.written.push(line);
+    await this.beforeWriteReturn?.(line);
   }
 
   terminate(): void {
@@ -222,9 +258,12 @@ class SignInOnlyCodex implements CodexRuntimePort {
 }
 
 class OfflineCloud extends UnavailableCloudControl {
-  constructor() {
+  constructor(beforeProjectionRecoveryCheck?: () => Promise<void>) {
     super({
-      isCompactProjectionRecoveryUnsettled: async () => false,
+      isCompactProjectionRecoveryUnsettled: async () => {
+        await beforeProjectionRecoveryCheck?.();
+        return false;
+      },
       isCompactProjectionRecoveryUnsettledForProfile: async () => false,
       supersedeCompactProjectionRecoveryForProviderDeletion: async () => ({ superseded: false }),
       supersedeTerminalCompactProjectionRecoveries: async () => ({ superseded: 0 }),
@@ -252,7 +291,10 @@ type ClaudeFixture = Readonly<{
 
 async function claudeFixture(
   options: Readonly<{
+    beforeProjectionRecoveryCheck?: () => Promise<void>;
     immediatelyEndProcess?: boolean;
+    now?: () => number;
+    onFactObserved?: (fact: Readonly<{ type: string }>) => void;
     resolveRuntime?: () => Promise<PinnedClaudeRuntime>;
   }> = {},
 ): Promise<ClaudeFixture> {
@@ -262,7 +304,10 @@ async function claudeFixture(
   const documents = join(home, "Documents");
   await mkdir(documents, { recursive: true });
   await initializeStatePaths(paths);
-  const store = new StateStore(paths);
+  const store = new StateStore(
+    paths,
+    options.now === undefined ? {} : { now: options.now },
+  );
   stores.push(store);
   // These tests drive every approval by hand.
   store.setDefaultApprovalMode("manual");
@@ -290,6 +335,7 @@ async function claudeFixture(
     observer: {
       fact: async (authority, fact) => {
         await reference.current?.observeClaudeFact(authority, fact);
+        options.onFactObserved?.(fact);
       },
     },
     processFactory: () => {
@@ -299,8 +345,9 @@ async function claudeFixture(
       return process;
     },
     resolveRuntime: options.resolveRuntime ?? (async () => pinnedRuntime),
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
-  const cloud = new OfflineCloud();
+  const cloud = new OfflineCloud(options.beforeProjectionRecoveryCheck);
   const service = new HraService({
     claude,
     cloud,
@@ -309,6 +356,7 @@ async function claudeFixture(
     paths,
     requestStop: () => undefined,
     store,
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
   reference.current = service;
   services.push(service);
@@ -448,8 +496,41 @@ describe("Claude sessions on the local authority", () => {
     expect(process.written.join("")).toContain("Only the first line, please");
 
     process.emit(assistantLine("HTTP/2 200", "msg_2"));
+    process.emit(rateLimitLine("bee4e95a-9a7d-4f23-a5d2-a50045b22dec"));
     process.emit(resultLine("HTTP/2 200"));
     await settle();
+    await value.service.settled();
+
+    const providerAuthority = value.store.requireProviderAccountAuthority(account, "claude");
+    const usage = value.store.latestProviderUsage(providerAuthority.providerAccountId);
+    expect(usage).toMatchObject({
+      authority: providerAuthority,
+      authorityMode: "mutation_authoritative",
+      quota: {
+        observationRevision: 1,
+        source: "claude_rate_limit_event",
+        turn: { sessionId, turnId: sent.turnId },
+        quota: {
+          format: "claude_v1",
+          status: { state: "known", value: "allowed" },
+          windows: [{
+            id: "five_hour",
+            resetsAtMs: 1_788_499_800_000,
+            scope: "account",
+            usedPercent: 50,
+          }],
+        },
+      },
+      accounting: {
+        observationRevision: 1,
+        source: "claude_result",
+        turn: { sessionId, turnId: sent.turnId },
+        accounting: {
+          format: "claude_v1",
+          totalCostUsd: 0.2,
+        },
+      },
+    });
 
     const bodies = await eventBodies(value, sessionId);
     const types = bodies.map((body) => body.type);
@@ -562,6 +643,541 @@ describe("Claude sessions on the local authority", () => {
       .toMatchObject({ interactionKind: "user_input" });
     expect(bodies.filter((body) => body.type === "interaction_state").at(-1))
       .toMatchObject({ state: "resolved" });
+  });
+
+  test("returns the usage callback before attempting deferred persistence", async () => {
+    let observed!: () => void;
+    const callbackReturned = new Promise<void>((resolve) => { observed = resolve; });
+    const value = await claudeFixture({
+      now: () => 10_000,
+      onFactObserved: (fact) => {
+        if (fact.type === "rateLimitObserved") observed();
+      },
+    });
+    const account = await signedInClaudeAccount(value, "Claude deferred usage");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    const sent = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Observe quota",
+      session: started.session.id,
+    }, { signal }) as { turnId: string };
+
+    let writes = 0;
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      return record(observation);
+    };
+    process.emit(rateLimitLine("00000000-0000-4000-8000-000000000010"));
+    await callbackReturned;
+    expect(writes).toBe(0);
+    await value.service.settled();
+    expect(writes).toBe(1);
+    const authority = value.store.requireProviderAccountAuthority(account, "claude");
+    expect(value.store.latestProviderUsage(authority.providerAccountId)).toMatchObject({
+      quota: {
+        observedAt: 10_000,
+        receivedAt: 10_000,
+        turn: { sessionId: started.session.id, turnId: sent.turnId },
+      },
+    });
+  });
+
+  test("retries direct-turn usage only after that exact turn binding commits", async () => {
+    const value = await claudeFixture({ now: () => 10_000 });
+    const account = await signedInClaudeAccount(value, "Claude direct usage race");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+
+    let attempts = 0;
+    let signalFirstAttempt!: () => void;
+    const firstAttempt = new Promise<void>((resolve) => {
+      signalFirstAttempt = resolve;
+    });
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      attempts += 1;
+      if (attempts === 1) signalFirstAttempt();
+      return record(observation);
+    };
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      process.emit(rateLimitLine("00000000-0000-4000-8000-000000000030"));
+      await firstAttempt;
+    };
+
+    const sending = value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Race the direct turn binding",
+      session: started.session.id,
+    }, { signal }) as Promise<{ turnId: string }>;
+    await firstAttempt;
+    expect(attempts).toBe(1);
+    const sent = await sending;
+    await value.service.settled();
+
+    expect(attempts).toBe(2);
+    const authority = value.store.requireProviderAccountAuthority(account, "claude");
+    expect(value.store.latestProviderUsage(authority.providerAccountId)).toMatchObject({
+      authority,
+      quota: {
+        turn: { sessionId: started.session.id, turnId: sent.turnId },
+      },
+    });
+    expect(value.service.backgroundDiagnostics().byCode).not.toContainEqual(
+      expect.objectContaining({ code: "provider_usage_persistence_failed" }),
+    );
+  });
+
+  test("retries queued-turn usage only after that exact turn binding commits", async () => {
+    const value = await claudeFixture({ now: () => 10_000 });
+    const account = await signedInClaudeAccount(value, "Claude queued usage race");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+
+    let attempts = 0;
+    let signalFirstAttempt!: () => void;
+    const firstAttempt = new Promise<void>((resolve) => {
+      signalFirstAttempt = resolve;
+    });
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      attempts += 1;
+      if (attempts === 1) signalFirstAttempt();
+      return record(observation);
+    };
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      process.emit(rateLimitLine("00000000-0000-4000-8000-000000000031"));
+      await firstAttempt;
+    };
+
+    const result = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.queue",
+      message: "Race the queued turn binding",
+      session: started.session.id,
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    await firstAttempt;
+    expect(attempts).toBe(1);
+    await value.service.settled();
+
+    expect(attempts).toBe(2);
+    expect(value.store.requireQueue(result.queued.id)).toMatchObject({ state: "applied" });
+    const authority = value.store.requireProviderAccountAuthority(account, "claude");
+    const quota = value.store.providerUsageObservations({
+      component: "quota",
+      providerAccountId: authority.providerAccountId,
+    })[0];
+    expect(quota).toMatchObject({
+      authority,
+      turn: { sessionId: started.session.id },
+    });
+    if (quota?.turn === null || quota?.turn === undefined) {
+      throw new Error("Expected queued usage to retain exact turn provenance.");
+    }
+    expect(value.store.runtimeProfileForTurn(started.session.id, quota.turn.turnId)).not.toBeNull();
+    expect(value.service.backgroundDiagnostics().byCode).not.toContainEqual(
+      expect.objectContaining({ code: "provider_usage_persistence_failed" }),
+    );
+  });
+
+  test("settles a pre-bind usage writer when close races a failed provider start", async () => {
+    const value = await claudeFixture({ now: () => 10_000 });
+    const account = await signedInClaudeAccount(value, "Claude failed usage race");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+
+    let attempts = 0;
+    let signalFirstAttempt!: () => void;
+    const firstAttempt = new Promise<void>((resolve) => {
+      signalFirstAttempt = resolve;
+    });
+    let releaseProviderWrite!: () => void;
+    const providerWriteGate = new Promise<void>((resolve) => {
+      releaseProviderWrite = resolve;
+    });
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      attempts += 1;
+      if (attempts === 1) signalFirstAttempt();
+      return record(observation);
+    };
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      process.emit(rateLimitLine("00000000-0000-4000-8000-000000000033"));
+      await firstAttempt;
+      await providerWriteGate;
+      throw new Error("test-only provider write failure");
+    };
+
+    const sending = value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Fail before binding the turn",
+      session: started.session.id,
+    }, { signal });
+    await firstAttempt;
+    expect(attempts).toBe(1);
+    const closing = value.service.close();
+    releaseProviderWrite();
+    const [sendOutcome, closeOutcome] = await Promise.allSettled([sending, closing]);
+
+    expect(sendOutcome.status).toBe("rejected");
+    expect(closeOutcome.status).toBe("fulfilled");
+    expect(attempts).toBe(1);
+    const authority = value.store.requireProviderAccountAuthority(account, "claude");
+    expect(value.store.latestProviderUsage(authority.providerAccountId)).toBeNull();
+    expect(value.service.backgroundDiagnostics().last).toMatchObject({
+      cause: "error",
+      code: "provider_usage_persistence_failed",
+      count: 1,
+    });
+  });
+
+  test("persists admitted historical usage after the account process generation advances", async () => {
+    let signalCallbackReturned!: () => void;
+    const callbackReturned = new Promise<void>((resolve) => {
+      signalCallbackReturned = resolve;
+    });
+    const value = await claudeFixture({
+      now: () => 10_000,
+      onFactObserved: (fact) => {
+        if (fact.type === "rateLimitObserved") signalCallbackReturned();
+      },
+    });
+    const account = await signedInClaudeAccount(value, "Claude historical usage");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    const sent = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Bind historical usage",
+      session: started.session.id,
+    }, { signal }) as { turnId: string };
+    const frozenAuthority = value.store.requireProviderAccountAuthority(account, "claude");
+
+    let writes = 0;
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      return record(observation);
+    };
+    process.emit(rateLimitLine("00000000-0000-4000-8000-000000000032"));
+    await callbackReturned;
+    expect(writes).toBe(0);
+    value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: frozenAuthority.processGeneration,
+      profileId: account,
+      provider: "claude",
+    });
+    await value.service.settled();
+
+    expect(writes).toBe(1);
+    const stored = value.store.providerUsageObservations({
+      component: "quota",
+      providerAccountId: frozenAuthority.providerAccountId,
+    })[0];
+    expect(stored).toMatchObject({
+      authority: frozenAuthority,
+      turn: { sessionId: started.session.id, turnId: sent.turnId },
+    });
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toMatchObject({
+      bindingGeneration: frozenAuthority.bindingGeneration,
+      processGeneration: frozenAuthority.processGeneration + 1,
+    });
+  });
+
+  test("reduces a result timeline before scheduling deferred accounting persistence", async () => {
+    let holdProjectionCheck = false;
+    let signalProjectionCheck!: () => void;
+    const projectionCheckStarted = new Promise<void>((resolve) => {
+      signalProjectionCheck = resolve;
+    });
+    let releaseProjectionCheck!: () => void;
+    const projectionCheckGate = new Promise<void>((resolve) => {
+      releaseProjectionCheck = resolve;
+    });
+    let signalCallbackReturned!: () => void;
+    const callbackReturned = new Promise<void>((resolve) => {
+      signalCallbackReturned = resolve;
+    });
+    let didReturn = false;
+    const value = await claudeFixture({
+      beforeProjectionRecoveryCheck: async () => {
+        if (!holdProjectionCheck) return;
+        signalProjectionCheck();
+        await projectionCheckGate;
+      },
+      onFactObserved: (fact) => {
+        if (fact.type !== "usageAccountingObserved") return;
+        didReturn = true;
+        signalCallbackReturned();
+      },
+    });
+    const account = await signedInClaudeAccount(value, "Claude result ordering");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Observe terminal accounting",
+      session: started.session.id,
+    }, { signal });
+
+    let writes = 0;
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      return record(observation);
+    };
+    holdProjectionCheck = true;
+    process.emit(resultLine("done"));
+    await projectionCheckStarted;
+    await new Promise((resolve) => { setTimeout(resolve, 5); });
+    expect(didReturn).toBe(false);
+    expect(writes).toBe(0);
+
+    releaseProjectionCheck();
+    await callbackReturned;
+    expect(value.store.requireSession(started.session.id).state).toBe("idle");
+    expect(writes).toBe(0);
+    await value.service.settled();
+    expect(writes).toBe(1);
+  });
+
+  test("drops Claude usage callbacks stamped with a retired provider authority", async () => {
+    const value = await claudeFixture();
+    const account = await signedInClaudeAccount(value, "Claude stale usage");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const session = value.store.requireSession(started.session.id);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound Claude thread.");
+    const captured = value.store.requireProviderAccountAuthority(account, "claude");
+    const retiredAuthority = {
+      bindingGeneration: captured.bindingGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+      generation: captured.processGeneration,
+      id: captured.profileId,
+      provider: "claude" as const,
+      providerAccountId: captured.providerAccountId,
+    };
+    value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: captured.processGeneration,
+      profileId: account,
+      provider: "claude",
+    });
+
+    let writes = 0;
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      return record(observation);
+    };
+    const frame = {
+      connectionId: "00000000-0000-4000-8000-000000000020",
+      observationRevision: 1,
+      observedAt: 10_000,
+      providerThreadId: session.providerThreadId,
+      receivedAt: 10_000,
+      sourceEventDigest: "a".repeat(64),
+      turnId: "turn-retired-authority",
+    };
+    await value.service.observeClaudeFact(retiredAuthority, {
+      ...frame,
+      quota: {
+        isUsingOverage: false,
+        overageDisabledReason: null,
+        overageStatus: null,
+        rateLimitType: "five_hour",
+        resetsAtMs: 11_000,
+        status: { state: "known", value: "allowed" },
+        windows: [],
+      },
+      sourceEventId: "00000000-0000-4000-8000-000000000021",
+      type: "rateLimitObserved",
+    });
+    await value.service.observeClaudeFact(retiredAuthority, {
+      ...frame,
+      accounting: {
+        models: [],
+        tokens: {
+          cacheCreationInputTokens: null,
+          cacheReadInputTokens: null,
+          inputTokens: 1,
+          outputTokens: 1,
+          thinkingTokens: null,
+        },
+        totalCostUsd: null,
+      },
+      sourceEventId: "00000000-0000-4000-8000-000000000022",
+      type: "usageAccountingObserved",
+    });
+    await value.service.settled();
+
+    expect(writes).toBe(0);
+    expect(value.store.latestProviderUsage(captured.providerAccountId)).toBeNull();
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toMatchObject({
+      bindingGeneration: captured.bindingGeneration,
+      processGeneration: captured.processGeneration + 1,
+    });
+  });
+
+  test("retains a deferred persistence diagnostic after close begins", async () => {
+    let observed!: () => void;
+    const callbackReturned = new Promise<void>((resolve) => { observed = resolve; });
+    const value = await claudeFixture({
+      onFactObserved: (fact) => {
+        if (fact.type === "rateLimitObserved") observed();
+      },
+    });
+    const account = await signedInClaudeAccount(value, "Claude close usage failure");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Observe quota before close",
+      session: started.session.id,
+    }, { signal });
+
+    let writes = 0;
+    value.store.recordProviderUsageObservation = () => {
+      writes += 1;
+      throw new Error("test-only persistence failure");
+    };
+    process.emit(rateLimitLine("00000000-0000-4000-8000-000000000011"));
+    await callbackReturned;
+    expect(writes).toBe(0);
+    await value.service.close();
+    expect(writes).toBe(1);
+    expect(value.service.backgroundDiagnostics().last).toMatchObject({
+      cause: "error",
+      code: "provider_usage_persistence_failed",
+      count: 1,
+    });
+  });
+
+  test("drops only the new usage observation when the owned queue is full", async () => {
+    let observed!: () => void;
+    const accountingCallbackReturned = new Promise<void>((resolve) => { observed = resolve; });
+    const value = await claudeFixture({
+      onFactObserved: (fact) => {
+        if (fact.type === "usageAccountingObserved") observed();
+      },
+    });
+    const account = await signedInClaudeAccount(value, "Claude usage overflow");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Fill the informational usage queue",
+      session: started.session.id,
+    }, { signal });
+
+    let writes = 0;
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      return { observation, status: "inserted" };
+    };
+    process.emit(
+      ...Array.from({ length: PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT }, (_, index) => rateLimitLine(
+        `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+        index / 2_048,
+      )),
+      resultLine("done"),
+    );
+    await accountingCallbackReturned;
+    expect(writes).toBe(0);
+    expect(value.service.backgroundDiagnostics().last).toMatchObject({
+      code: "provider_usage_queue_overflow",
+      count: 1,
+    });
+    await value.service.settled();
+    expect(writes).toBe(PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT);
+    expect(value.store.requireSession(started.session.id).state).toBe("idle");
   });
 
   test("stops an in-flight Claude turn through the same interrupt path", async () => {

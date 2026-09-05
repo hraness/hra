@@ -64,6 +64,11 @@ import {
   type ProviderAccountReadiness,
 } from "../domain/provider-accounts";
 import {
+  createClaudeAccountingUsageComponent,
+  createClaudeQuotaUsageComponent,
+  type ProviderUsageComponent,
+} from "../domain/provider-usage";
+import {
   reviewedRuntimeProfileSchema,
   type ReviewedRuntimeProfile,
 } from "../domain/runtime-profile";
@@ -145,6 +150,7 @@ import { initializeProfilePaths, profilePaths, type StatePaths } from "../storag
 import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
 import { WorkCapabilityCodec } from "../storage/work-capability";
 import {
+  ProviderUsageTurnNotBoundError,
   SelectionError,
   StateSecurityScrubRequiredError,
   UnusableProjectRootError,
@@ -191,6 +197,7 @@ import {
 import {
   ClaudeSessionFactTranslator,
   type ClaudeSessionFact,
+  type ClaudeUsageObservation,
 } from "./claude-session-facts";
 import {
   SessionEventCursorCodec,
@@ -821,6 +828,9 @@ export const BACKGROUND_DIAGNOSTIC_CODES = [
   "usage_refresh_failed",
   "usage_poll_account_failed",
   "provider_switch_seed_failed",
+  "provider_usage_admission_failed",
+  "provider_usage_persistence_failed",
+  "provider_usage_queue_overflow",
   "usage_poll_tick_failed",
   "user_message_record_failed",
 ] as const;
@@ -852,6 +862,8 @@ const classifyBackgroundDiagnosticCause = (error: unknown): BackgroundDiagnostic
 const SESSION_FACT_EPOCH_LIMIT = 4_096;
 /** Upper bound on exact Claude exits that race their durable session-start commit. */
 const PENDING_CLAUDE_DISCONNECT_LIMIT = 1_024;
+/** Upper bound on admitted informational usage writes not yet attempted. */
+const PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT = 1_024;
 
 type PendingClaudeDisconnect = Readonly<{
   authority: ProfileAuthority;
@@ -859,6 +871,32 @@ type PendingClaudeDisconnect = Readonly<{
   providerThreadId: string;
   reason: "eof" | "protocol_fault";
 }>;
+
+type ProviderUsageTurnBindingSettlement = Readonly<{
+  authority: ProviderAccountAuthority;
+  bound: boolean;
+  turnId: string | null;
+}>;
+
+type ProviderUsageTurnBindingOwner = Readonly<{
+  authority: ProviderAccountAuthority;
+  settlement: Promise<ProviderUsageTurnBindingSettlement>;
+  settle: (value: ProviderUsageTurnBindingSettlement) => void;
+}>;
+
+type ProviderUsagePersistenceJob = Readonly<{
+  observation: ProviderUsageComponent;
+  turnBindingSettlement: Promise<ProviderUsageTurnBindingSettlement> | null;
+}>;
+
+const sameProviderUsageAuthority = (
+  left: ProviderAccountAuthority,
+  right: ProviderAccountAuthority,
+): boolean => left.providerAccountId === right.providerAccountId
+  && left.profileId === right.profileId
+  && left.provider === right.provider
+  && left.bindingGeneration === right.bindingGeneration
+  && left.processGeneration === right.processGeneration;
 
 export class HraService {
   readonly #store: StateStore;
@@ -902,6 +940,13 @@ export class HraService {
   readonly #queuePreEffectRetryScheduled = new Set<string>();
   readonly #usageRefreshes = new Map<string, Promise<void>>();
   readonly #usageRefreshDirty = new Set<string>();
+  readonly #providerUsagePersistenceQueue: ProviderUsagePersistenceJob[] = [];
+  readonly #providerUsageTurnBindings = new Map<
+    SessionRecord["id"],
+    ProviderUsageTurnBindingOwner
+  >();
+  #providerUsagePersistencePending = 0;
+  #providerUsagePersistenceTask: Promise<void> | undefined;
   readonly #backgroundAbort = new AbortController();
   readonly #interactionDeadlineAbort = new AbortController();
   #interactionDeadlineTask: Promise<void> | undefined;
@@ -2175,6 +2220,21 @@ export class HraService {
    */
   recordBackgroundDiagnostic(code: BackgroundDiagnosticCode, error?: unknown): void {
     if (this.#state !== "open") return;
+    this.#recordDiagnostic(code, error);
+  }
+
+  /** Admitted usage jobs remain owned while close is draining them. */
+  #recordProviderUsageDiagnostic(code: Extract<
+    BackgroundDiagnosticCode,
+    | "provider_usage_admission_failed"
+    | "provider_usage_persistence_failed"
+    | "provider_usage_queue_overflow"
+  >, error?: unknown): void {
+    if (this.#state === "closed") return;
+    this.#recordDiagnostic(code, error);
+  }
+
+  #recordDiagnostic(code: BackgroundDiagnosticCode, error?: unknown): void {
     const previous = this.#backgroundDiagnostics.get(code);
     const diagnostic: BackgroundDiagnostic = {
       code,
@@ -2558,7 +2618,7 @@ export class HraService {
       ) {
         return;
       }
-      let translated: readonly CodexFact[];
+      let translated: ReturnType<ClaudeSessionFactTranslator["translate"]>;
       try {
         translated = this.#claudeFacts.translate(
           this.#providerAccountAuthority(authority),
@@ -2570,8 +2630,19 @@ export class HraService {
         this.recordBackgroundDiagnostic("claude_fact_untranslatable", error);
         return;
       }
-      for (const neutral of translated) {
+      const usageComponents: ProviderUsageComponent[] = [];
+      for (const observation of translated.usageObservations) {
+        try {
+          usageComponents.push(this.#claudeUsageComponent(session.id, observation));
+        } catch (error: unknown) {
+          this.#recordProviderUsageDiagnostic("provider_usage_admission_failed", error);
+        }
+      }
+      for (const neutral of translated.timelineFacts) {
         await this.#observeCodexFactAdmitted(authority, neutral);
+      }
+      for (const component of usageComponents) {
+        this.#enqueueProviderUsagePersistence(component);
       }
     } catch (error: unknown) {
       if (error instanceof InteractionPersistenceBoundaryError) this.#scheduleStop();
@@ -2579,6 +2650,168 @@ export class HraService {
       throw error;
     } finally {
       finish();
+    }
+  }
+
+  #claudeUsageComponent(
+    sessionId: SessionRecord["id"],
+    observation: ClaudeUsageObservation,
+  ): ProviderUsageComponent {
+    const base = {
+      authority: observation.authority,
+      observationRevision: observation.observationRevision,
+      observedAt: observation.observedAt,
+      receivedAt: observation.receivedAt,
+      sessionId,
+      sourceEventDigest: observation.sourceEventDigest,
+      sourceEventId: observation.sourceEventId,
+      turnId: observation.turnId,
+    };
+    if (observation.component === "quota") {
+      return createClaudeQuotaUsageComponent({
+        ...base,
+        quota: {
+          ...observation.quota,
+          windows: observation.quota.windows.map((window) => ({
+            ...window,
+            scope: "account" as const,
+          })),
+        },
+      });
+    }
+    return createClaudeAccountingUsageComponent({
+      ...base,
+      accounting: {
+        ...observation.accounting.tokens,
+        models: observation.accounting.models,
+        totalCostUsd: observation.accounting.totalCostUsd,
+      },
+    });
+  }
+
+  /**
+   * Admission freezes the complete component synchronously. The timer starts
+   * persistence only after the provider callback can return; the owned task
+   * remains in #background until every older admitted component was attempted.
+   */
+  #enqueueProviderUsagePersistence(observation: ProviderUsageComponent): void {
+    if (this.#providerUsagePersistencePending >= PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT) {
+      this.#recordProviderUsageDiagnostic("provider_usage_queue_overflow");
+      return;
+    }
+    const owner = observation.turn === null
+      ? undefined
+      : this.#providerUsageTurnBindings.get(observation.turn.sessionId);
+    this.#providerUsagePersistenceQueue.push({
+      observation,
+      turnBindingSettlement: owner !== undefined
+        && sameProviderUsageAuthority(owner.authority, observation.authority)
+        ? owner.settlement
+        : null,
+    });
+    this.#providerUsagePersistencePending += 1;
+    this.#scheduleProviderUsagePersistence();
+  }
+
+  #beginProviderUsageTurnBinding(
+    sessionId: SessionRecord["id"],
+    authority: ProviderAccountAuthority,
+  ): ProviderUsageTurnBindingOwner {
+    if (this.#providerUsageTurnBindings.has(sessionId)) {
+      throw new Error("PROVIDER_USAGE_TURN_BINDING_ALREADY_PENDING");
+    }
+    let resolveSettlement!: (value: ProviderUsageTurnBindingSettlement) => void;
+    let settled = false;
+    const settlement = new Promise<ProviderUsageTurnBindingSettlement>((resolve) => {
+      resolveSettlement = resolve;
+    });
+    const owner: ProviderUsageTurnBindingOwner = {
+      authority,
+      settlement,
+      settle: (value) => {
+        if (settled) return;
+        settled = true;
+        resolveSettlement(value);
+      },
+    };
+    this.#providerUsageTurnBindings.set(sessionId, owner);
+    return owner;
+  }
+
+  #settleProviderUsageTurnBinding(
+    sessionId: SessionRecord["id"],
+    owner: ProviderUsageTurnBindingOwner,
+    turnId: string | null,
+    bound: boolean,
+  ): void {
+    const ownsSettlement = this.#providerUsageTurnBindings.get(sessionId) === owner;
+    if (ownsSettlement) this.#providerUsageTurnBindings.delete(sessionId);
+    owner.settle({
+      authority: owner.authority,
+      bound: ownsSettlement && bound,
+      turnId,
+    });
+  }
+
+  #scheduleProviderUsagePersistence(): void {
+    if (this.#providerUsagePersistenceTask !== undefined) return;
+    if (this.#providerUsagePersistenceQueue.length === 0) return;
+    let finishTask!: () => void;
+    const task = new Promise<void>((resolveTask) => {
+      finishTask = resolveTask;
+    });
+    this.#providerUsagePersistenceTask = task;
+    this.#background.add(task);
+    setTimeout(() => {
+      void this.#drainProviderUsagePersistence().then(
+        finishTask,
+        (error: unknown) => {
+          this.#recordProviderUsageDiagnostic("provider_usage_persistence_failed", error);
+          finishTask();
+        },
+      );
+    }, 0);
+    void task.then(() => {
+      if (this.#providerUsagePersistenceTask === task) {
+        this.#providerUsagePersistenceTask = undefined;
+      }
+      this.#background.delete(task);
+      this.#scheduleProviderUsagePersistence();
+    });
+  }
+
+  async #drainProviderUsagePersistence(): Promise<void> {
+    for (;;) {
+      const job = this.#providerUsagePersistenceQueue.shift();
+      if (job === undefined) return;
+      try {
+        await this.#persistProviderUsageObservation(job);
+      } catch (error: unknown) {
+        this.#recordProviderUsageDiagnostic("provider_usage_persistence_failed", error);
+      } finally {
+        this.#providerUsagePersistencePending -= 1;
+      }
+      await Promise.resolve();
+    }
+  }
+
+  async #persistProviderUsageObservation(job: ProviderUsagePersistenceJob): Promise<void> {
+    try {
+      this.#store.recordProviderUsageObservation(job.observation);
+      return;
+    } catch (error: unknown) {
+      if (
+        !(error instanceof ProviderUsageTurnNotBoundError)
+        || job.observation.turn === null
+        || job.turnBindingSettlement === null
+      ) throw error;
+      const settlement = await job.turnBindingSettlement;
+      if (
+        !settlement.bound
+        || settlement.turnId !== job.observation.turn.turnId
+        || !sameProviderUsageAuthority(settlement.authority, job.observation.authority)
+      ) throw error;
+      this.#store.recordProviderUsageObservation(job.observation);
     }
   }
 
@@ -5031,21 +5264,24 @@ export class HraService {
       signal,
     });
     verifiedProfile = this.#store.requireProfileById(profile.id);
+    const usageProfileAuthority = this.#profileAuthority(verifiedProfile, "codex");
+    const usageProviderAuthority = this.#providerAccountAuthority(usageProfileAuthority);
     const sourceSequence = this.#store.allocateNextUsageRevision(profile.id);
     let snapshot: Awaited<ReturnType<CodexRuntimePort["readUsage"]>>;
     try {
       snapshot = await this.#fencedEffect(async () =>
         await this.#codex.readUsage({
-          authority: this.#profileAuthority(verifiedProfile, "codex"),
+          authority: usageProfileAuthority,
           signal,
         }));
     } catch (error: unknown) {
-      if (!signal.aborted) {
+      if (!signal.aborted && this.#profileAuthorityIsCurrent(usageProfileAuthority)) {
         this.#store.recordUsagePollFailure(
           profile.id,
           accountFingerprint,
           sourceSequence,
           this.#now(),
+          usageProviderAuthority,
           "account_usage_read_failed",
         );
       }
@@ -5053,6 +5289,7 @@ export class HraService {
     }
     const receivedAt = this.#now();
     const confirmedFingerprint = await this.#proveUsageAccountIdentity({
+      authority: usageProfileAuthority,
       profile: verifiedProfile,
       expectedFingerprint: accountFingerprint,
       signal,
@@ -5061,6 +5298,9 @@ export class HraService {
       throw new Error("ACCOUNT_USAGE_IDENTITY_PROOF_CHANGED_WITHOUT_CONFLICT");
     }
     verifiedProfile = this.#store.requireProfileById(profile.id);
+    if (!this.#profileAuthorityIsCurrent(usageProfileAuthority)) {
+      throw new Error("ACCOUNT_USAGE_PROVIDER_AUTHORITY_CHANGED_BEFORE_COMMIT");
+    }
     const previous = this.#store.latestUsageForAccount(
       profile.id,
       accountFingerprint,
@@ -5071,11 +5311,17 @@ export class HraService {
       observedAt: snapshot.observedAt,
       receivedAt,
       accountFingerprint,
-      providerGeneration: verifiedProfile.processGeneration,
+      providerGeneration: usageProviderAuthority.processGeneration,
       daemonGeneration: this.#daemonGeneration,
       previousPayload: previous?.payload ?? null,
     });
-    this.#store.recordUsage(profile.id, sourceSequence, snapshot.observedAt, stored);
+    this.#store.recordUsage(
+      profile.id,
+      sourceSequence,
+      snapshot.observedAt,
+      stored,
+      usageProviderAuthority,
+    );
     return { accountFingerprint, snapshot };
   }
 
@@ -5331,15 +5577,25 @@ export class HraService {
   }
 
   async #proveUsageAccountIdentity(input: {
+    authority?: ProfileAuthority;
     profile: ProfileRecord;
     expectedFingerprint: string | null;
     signal: AbortSignal;
   }): Promise<string> {
+    const authority = input.authority ?? this.#profileAuthority(input.profile, "codex");
+    if (
+      authority.id !== input.profile.id
+      || authority.provider !== "codex"
+      || !this.#profileAuthorityIsCurrent(authority)
+    ) throw new CommandFailure("CONFLICT", "Usage account authority changed before identity proof.");
     const account = await this.#fencedEffect(async () =>
       await this.#codex.readAccount({
-        authority: this.#profileAuthority(input.profile, "codex"),
+        authority,
         signal: input.signal,
       }));
+    if (!this.#profileAuthorityIsCurrent(authority)) {
+      throw new CommandFailure("CONFLICT", "Usage account authority changed during identity proof.");
+    }
     const verifiedEmail = !account.signedIn || account.email === undefined
       ? null
       : account.email;
@@ -7928,10 +8184,16 @@ export class HraService {
     let dispatchSessionRevision: number | undefined;
     let dispatchFactEpoch: number | undefined;
     let startedResult: { turnId: string; status: "completed" | "interrupted" | "failed" | "inProgress"; effectiveRuntimeProfile: ReviewedRuntimeProfile } | undefined;
-    const result = await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_send" }], effect: async (attemptId) => {
+    let turnBindingOwner: ProviderUsageTurnBindingOwner | undefined;
+    let turnBindingTurnId: string | null = null;
+    let turnBindingBound = false;
+    const result = await (async () => {
+      try {
+        return await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_send" }], effect: async (attemptId) => {
       if (baseline === undefined || review === undefined) throw new Error("Session send lost its exact pre-effect provider baseline or runtime review.");
       const runtimeReview = review;
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
+      turnBindingOwner = this.#beginProviderUsageTurnBinding(session.id, providerAuthority);
       startedResult = await this.#fencedEffect(async () => {
         const projectRoot = project === undefined
           ? undefined
@@ -7947,6 +8209,7 @@ export class HraService {
           signal,
         });
       });
+      turnBindingTurnId = startedResult.turnId;
       return { ...startedResult, sourceId: attemptId };
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
@@ -8007,7 +8270,19 @@ export class HraService {
         runtimeProfile: startedResult.effectiveRuntimeProfile,
         receipt,
       });
+      turnBindingBound = true;
     }, onAmbiguous: () => this.#quarantineSession(session.id) });
+      } finally {
+        if (turnBindingOwner !== undefined) {
+          this.#settleProviderUsageTurnBinding(
+            session.id,
+            turnBindingOwner,
+            turnBindingTurnId,
+            turnBindingBound,
+          );
+        }
+      }
+    })();
     await this.#sweepAttachmentCustody(attachments.values.length > 0);
     const reconciled = this.#store.requireSession(session.id);
     this.#recordUserMessage(reconciled.id, profile, result.turnId, actor, message);
@@ -8827,33 +9102,50 @@ export class HraService {
       this.#queuePreEffectRetryCounts.delete(queued.id);
       const dispatchRevision = this.#store.requireSession(session.id).revision;
       const dispatchFactEpoch = this.#snapshotSessionFactEpoch(session.id);
-      const result = await this.#fencedEffect(async () => {
-        const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
-        return await this.#runtimeForSession(session).startTurn({
-          authority,
-          providerThreadId: boundSession.providerThreadId,
-          projectRoot,
-          review,
-          message: queued.message,
-          ...(queuedAttachments.values.length === 0
-            ? {}
-            : { attachments: queuedAttachments.values }),
-          clientMessageId: queued.id,
-          signal,
-        });
-      });
-      providerApplied = true;
-      this.#store.completeQueueEffect({
-        queueId: queued.id,
-        expectedEvidenceDigest: evidence.digest,
-        expectedSessionRevision: dispatchRevision,
+      const turnBindingOwner = this.#beginProviderUsageTurnBinding(
+        session.id,
         providerAuthority,
-        applyResponseState: this.#currentSessionFactEpoch(session.id) === dispatchFactEpoch,
-        turnId: result.turnId,
-        turnStatus: result.status,
-        runtimeProfile: result.effectiveRuntimeProfile,
-        receipt: { turnId: result.turnId, sourceId: queued.id, status: result.status },
-      });
+      );
+      let turnBindingTurnId: string | null = null;
+      let turnBindingBound = false;
+      try {
+        const result = await this.#fencedEffect(async () => {
+          const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
+          return await this.#runtimeForSession(session).startTurn({
+            authority,
+            providerThreadId: boundSession.providerThreadId,
+            projectRoot,
+            review,
+            message: queued.message,
+            ...(queuedAttachments.values.length === 0
+              ? {}
+              : { attachments: queuedAttachments.values }),
+            clientMessageId: queued.id,
+            signal,
+          });
+        });
+        turnBindingTurnId = result.turnId;
+        providerApplied = true;
+        this.#store.completeQueueEffect({
+          queueId: queued.id,
+          expectedEvidenceDigest: evidence.digest,
+          expectedSessionRevision: dispatchRevision,
+          providerAuthority,
+          applyResponseState: this.#currentSessionFactEpoch(session.id) === dispatchFactEpoch,
+          turnId: result.turnId,
+          turnStatus: result.status,
+          runtimeProfile: result.effectiveRuntimeProfile,
+          receipt: { turnId: result.turnId, sourceId: queued.id, status: result.status },
+        });
+        turnBindingBound = true;
+      } finally {
+        this.#settleProviderUsageTurnBinding(
+          session.id,
+          turnBindingOwner,
+          turnBindingTurnId,
+          turnBindingBound,
+        );
+      }
       this.#wakeSessionTaskPump();
       const observed = this.#store.requireSession(session.id);
       if (observed.state === "idle") this.#scheduleQueueDispatch(observed);

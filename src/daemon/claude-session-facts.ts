@@ -16,6 +16,43 @@ export type ClaudeSessionFact = ClaudeFact & {
   readonly connectionId: string;
 };
 
+export type ClaudeUsageObservation =
+  | Readonly<{
+      component: "quota";
+      authority: ProviderAccountAuthority;
+      providerThreadId: string;
+      connectionId: string;
+      turnId: string;
+      observationRevision: number;
+      observedAt: number;
+      receivedAt: number;
+      sourceEventId: string;
+      sourceEventDigest: string;
+      quota: Extract<ClaudeFact, { type: "rateLimitObserved" }>[
+        "quota"
+      ];
+    }>
+  | Readonly<{
+      component: "accounting";
+      authority: ProviderAccountAuthority;
+      providerThreadId: string;
+      connectionId: string;
+      turnId: string;
+      observationRevision: number;
+      observedAt: number;
+      receivedAt: number;
+      sourceEventId: string;
+      sourceEventDigest: string;
+      accounting: Extract<ClaudeFact, { type: "usageAccountingObserved" }>[
+        "accounting"
+      ];
+    }>;
+
+export type ClaudeFactTranslation = Readonly<{
+  timelineFacts: readonly CodexFact[];
+  usageObservations: readonly ClaudeUsageObservation[];
+}>;
+
 /**
  * The interaction identity a pending Claude control request bound, remembered
  * only until the request is answered or cancelled.
@@ -68,9 +105,45 @@ export class ClaudeSessionFactTranslator {
   translate(
     authority: ProviderAccountAuthority,
     fact: ClaudeSessionFact,
-  ): readonly CodexFact[] {
+  ): ClaudeFactTranslation {
+    if (fact.type === "rateLimitObserved") {
+      return {
+        timelineFacts: [],
+        usageObservations: [{
+          authority,
+          component: "quota",
+          connectionId: fact.connectionId,
+          observationRevision: fact.observationRevision,
+          observedAt: fact.observedAt,
+          providerThreadId: fact.providerThreadId,
+          quota: fact.quota,
+          receivedAt: fact.receivedAt,
+          sourceEventDigest: fact.sourceEventDigest,
+          sourceEventId: fact.sourceEventId,
+          turnId: fact.turnId,
+        }],
+      };
+    }
+    if (fact.type === "usageAccountingObserved") {
+      return {
+        timelineFacts: [],
+        usageObservations: [{
+          accounting: fact.accounting,
+          authority,
+          component: "accounting",
+          connectionId: fact.connectionId,
+          observationRevision: fact.observationRevision,
+          observedAt: fact.observedAt,
+          providerThreadId: fact.providerThreadId,
+          receivedAt: fact.receivedAt,
+          sourceEventDigest: fact.sourceEventDigest,
+          sourceEventId: fact.sourceEventId,
+          turnId: fact.turnId,
+        }],
+      };
+    }
     const single = this.#translate(authority, fact);
-    if (single === null) return [];
+    if (single === null) return { timelineFacts: [], usageObservations: [] };
     // A text stream is only readable once its item has been announced: the
     // daemon's streaming redactor protects a delta whose item it never saw
     // open. Claude publishes no item lifecycle of its own, so the assembler's
@@ -83,16 +156,24 @@ export class ClaudeSessionFactTranslator {
         single.itemId,
         single.type === "assistantDelta" ? "agentMessage" : "reasoning",
       );
-      return opened === null ? [single] : [{ ...opened, ...this.#itemFrame(fact, single) }, single];
+      return {
+        timelineFacts: opened === null
+          ? [single]
+          : [{ ...opened, ...this.#itemFrame(fact, single) }, single],
+        usageObservations: [],
+      };
     }
     if (single.type === "turnCompleted") {
-      return [...this.#closeItems(authority, fact, single.turn.id), single];
+      return {
+        timelineFacts: [...this.#closeItems(authority, fact, single.turn.id), single],
+        usageObservations: [],
+      };
     }
     if (single.type === "turnStarted") {
       this.#openItems.delete(this.#sessionKey(authority, fact.providerThreadId));
-      return [single];
+      return { timelineFacts: [single], usageObservations: [] };
     }
-    return [single];
+    return { timelineFacts: [single], usageObservations: [] };
   }
 
   #itemFrame(
@@ -293,6 +374,7 @@ export class ClaudeSessionFactTranslator {
       // no Codex usage counter HRA could refresh.
       case "turnSummary":
       case "rateLimitObserved":
+      case "usageAccountingObserved":
         return null;
     }
   }

@@ -89,6 +89,17 @@ import {
   type AccountRateLimitResetOutcome,
 } from "../domain/usage-metrics";
 import {
+  canonicalProviderUsageComponent,
+  canonicalProviderUsageJson,
+  mergeProviderUsageComponents,
+  projectCodexV1Usage,
+  providerUsageComponentKindSchema,
+  providerUsageComponentSchema,
+  type ProviderUsageComponent,
+  type ProviderUsageComponentKind,
+  type ProviderUsageObservationV2,
+} from "../domain/provider-usage";
+import {
   SESSION_EVENT_MAX_BYTES,
   SESSION_EVENT_PAGE_BYTES,
   SESSION_EVENT_PAGE_LIMIT,
@@ -532,6 +543,19 @@ export type UsageSnapshotRecord = {
   payload: unknown;
 };
 
+export type ProviderUsageWriteResult = Readonly<{
+  status: "inserted" | "replayed";
+  observation: ProviderUsageComponent;
+}>;
+
+export type CodexUsageAuthorityMetadata = Readonly<{
+  scopeKind: "usage_snapshot" | "usage_poll_failure" | "usage_upload_anchor";
+  mode: "mutation_authoritative" | "compatibility_display_only";
+  canAuthorizeQuota: boolean;
+  binding: AccountScopedProviderAuthority;
+  authority: ProviderAccountAuthority | null;
+}>;
+
 export type UsagePollFailureRecord = {
   sourceRevision: number;
   observedAt: number;
@@ -643,6 +667,14 @@ export type AccountRateLimitResetProviderAuthority = Readonly<{
 }>;
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
+
+const assertCodexUsageSnapshotDigest = (payloadJson: string, digest: string): void => {
+  const parsedDigest = sha256Schema.safeParse(digest);
+  const actual = createHash("sha256").update(payloadJson).digest("hex");
+  if (!parsedDigest.success || parsedDigest.data !== actual) {
+    throw new Error("CODEX_USAGE_SNAPSHOT_DIGEST_INVALID");
+  }
+};
 
 const accountScopedProviderAuthorityKindSchema = z.enum([
   "provider_login",
@@ -1000,7 +1032,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 35;
+const currentSchemaVersion = 36;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -1133,6 +1165,10 @@ export const USAGE_LOCAL_RETAIN_AGE_MS = 24 * 60 * 60_000;
 export const USAGE_LOCAL_RETAIN_SUCCESS_COUNT = 2_048;
 export const USAGE_LOCAL_RETAIN_FAILURE_COUNT = 2_048;
 export const USAGE_LOCAL_RETAIN_BYTES = 16 * 1_024 * 1_024;
+export const PROVIDER_USAGE_COMPONENT_RETAIN_AGE_MS = 24 * 60 * 60_000;
+export const PROVIDER_USAGE_COMPONENT_RETAIN_COUNT = 2_048;
+export const PROVIDER_USAGE_COMPONENT_RETAIN_BYTES = 16 * 1_024 * 1_024;
+const PROVIDER_USAGE_COMPONENT_MAX_BYTES = 256 * 1_024;
 export const USAGE_LOCAL_SNAPSHOT_MAX_BYTES = 262_144;
 
 const schemaVersion1 = `
@@ -3252,6 +3288,426 @@ const applySchemaVersion35ProviderAccounts = (database: Database): void => {
   database.exec(schemaVersion35ProviderAccounts);
 };
 
+const schemaVersion36ProviderUsage = `
+CREATE TABLE IF NOT EXISTS provider_usage_observation_receipts (
+  idempotency_key TEXT PRIMARY KEY CHECK(
+    length(idempotency_key)=64 AND idempotency_key NOT GLOB '*[^a-f0-9]*'
+  ),
+  component TEXT NOT NULL CHECK(component IN ('quota','accounting')),
+  provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL CHECK(provider='claude'),
+  binding_generation INTEGER NOT NULL CHECK(binding_generation BETWEEN 1 AND 9007199254740991),
+  process_generation INTEGER NOT NULL CHECK(process_generation BETWEEN 0 AND 9007199254740991),
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL CHECK(length(turn_id) BETWEEN 1 AND 200),
+  observation_revision INTEGER NOT NULL CHECK(observation_revision BETWEEN 1 AND 9007199254740991),
+  source TEXT NOT NULL CHECK(
+    (component='quota' AND source='claude_rate_limit_event')
+    OR (component='accounting' AND source='claude_result')
+  ),
+  source_event_digest TEXT NOT NULL CHECK(
+    length(source_event_digest)=64 AND source_event_digest NOT GLOB '*[^a-f0-9]*'
+  ),
+  component_digest TEXT NOT NULL CHECK(
+    length(component_digest)=64 AND component_digest NOT GLOB '*[^a-f0-9]*'
+  ),
+  observed_at INTEGER NOT NULL CHECK(observed_at BETWEEN 0 AND 9007199254740991),
+  received_at INTEGER NOT NULL CHECK(received_at=observed_at),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN received_at AND 9007199254740991),
+  UNIQUE(
+    provider_account_id,binding_generation,process_generation,
+    session_id,turn_id,component,observation_revision
+  ),
+  FOREIGN KEY(session_id,turn_id)
+    REFERENCES session_turn_runtime_profiles(session_id,turn_id)
+) STRICT;
+CREATE TABLE IF NOT EXISTS provider_usage_observation_components (
+  idempotency_key TEXT PRIMARY KEY
+    REFERENCES provider_usage_observation_receipts(idempotency_key) ON DELETE CASCADE,
+  component_digest TEXT NOT NULL CHECK(
+    length(component_digest)=64 AND component_digest NOT GLOB '*[^a-f0-9]*'
+  ),
+  component_json TEXT NOT NULL CHECK(
+    json_valid(component_json)=1
+    AND length(CAST(component_json AS BLOB)) BETWEEN 2 AND 262144
+  )
+) STRICT;
+CREATE TABLE IF NOT EXISTS provider_usage_prune_targets (
+  idempotency_key TEXT PRIMARY KEY
+    REFERENCES provider_usage_observation_receipts(idempotency_key) ON DELETE CASCADE,
+  selected_at INTEGER NOT NULL CHECK(selected_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+CREATE TABLE IF NOT EXISTS codex_usage_authority_prune_targets (
+  scope_kind TEXT NOT NULL CHECK(
+    scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
+  ),
+  scope_id TEXT NOT NULL CHECK(length(scope_id) BETWEEN 1 AND 512),
+  selected_at INTEGER NOT NULL CHECK(selected_at BETWEEN 0 AND 9007199254740991),
+  PRIMARY KEY(scope_kind,scope_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS provider_usage_observation_receipts_latest
+  ON provider_usage_observation_receipts(
+    provider_account_id,component,observed_at DESC,received_at DESC,
+    observation_revision DESC,idempotency_key DESC
+  );
+
+CREATE TRIGGER IF NOT EXISTS provider_usage_observation_receipts_insert_guard
+BEFORE INSERT ON provider_usage_observation_receipts
+WHEN NOT EXISTS(
+  SELECT 1
+  FROM session_turn_runtime_profiles turn
+  JOIN session_runtime_profiles runtime
+    ON runtime.session_id=turn.session_id
+   AND runtime.source_kind=turn.source_kind AND runtime.source_id=turn.source_id
+  JOIN runtime_profile_provider_authorities authority
+    ON authority.session_id=runtime.session_id AND authority.revision=runtime.revision
+  WHERE turn.session_id=NEW.session_id AND turn.turn_id=NEW.turn_id
+    AND turn.profile_id=NEW.profile_id
+    AND turn.process_generation=NEW.process_generation
+    AND authority.provider_account_id=NEW.provider_account_id
+    AND authority.profile_id=NEW.profile_id AND authority.provider=NEW.provider
+    AND authority.binding_generation=NEW.binding_generation
+    AND authority.process_generation=NEW.process_generation
+)
+BEGIN SELECT RAISE(ABORT, 'provider usage turn authority mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS provider_usage_observation_receipts_immutable_update
+BEFORE UPDATE ON provider_usage_observation_receipts
+BEGIN SELECT RAISE(ABORT, 'provider usage receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS provider_usage_observation_receipts_immutable_delete
+BEFORE DELETE ON provider_usage_observation_receipts
+WHEN NOT EXISTS(
+  SELECT 1 FROM provider_usage_prune_targets target
+  WHERE target.idempotency_key=OLD.idempotency_key
+)
+BEGIN SELECT RAISE(ABORT, 'provider usage receipt deletion lacks prune custody'); END;
+CREATE TRIGGER IF NOT EXISTS provider_usage_observation_components_insert_guard
+BEFORE INSERT ON provider_usage_observation_components
+WHEN NOT EXISTS(
+  SELECT 1 FROM provider_usage_observation_receipts receipt
+  WHERE receipt.idempotency_key=NEW.idempotency_key
+    AND receipt.component_digest=NEW.component_digest
+    AND json_extract(NEW.component_json,'$.version')=2
+    AND json_extract(NEW.component_json,'$.component')=receipt.component
+    AND json_extract(NEW.component_json,'$.source')=receipt.source
+    AND json_extract(NEW.component_json,'$.idempotencyKey')=receipt.idempotency_key
+    AND json_extract(NEW.component_json,'$.sourceEventDigest')=receipt.source_event_digest
+    AND json_extract(NEW.component_json,'$.componentDigest')=receipt.component_digest
+    AND json_extract(NEW.component_json,'$.observationRevision')=receipt.observation_revision
+    AND json_extract(NEW.component_json,'$.observedAt')=receipt.observed_at
+    AND json_extract(NEW.component_json,'$.receivedAt')=receipt.received_at
+    AND json_extract(NEW.component_json,'$.authority.providerAccountId')=receipt.provider_account_id
+    AND json_extract(NEW.component_json,'$.authority.profileId')=receipt.profile_id
+    AND json_extract(NEW.component_json,'$.authority.provider')=receipt.provider
+    AND json_extract(NEW.component_json,'$.authority.bindingGeneration')=receipt.binding_generation
+    AND json_extract(NEW.component_json,'$.authority.processGeneration')=receipt.process_generation
+    AND json_extract(NEW.component_json,'$.turn.sessionId')=receipt.session_id
+    AND json_extract(NEW.component_json,'$.turn.turnId')=receipt.turn_id
+)
+BEGIN SELECT RAISE(ABORT, 'provider usage component evidence mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS provider_usage_observation_components_immutable_update
+BEFORE UPDATE ON provider_usage_observation_components
+BEGIN SELECT RAISE(ABORT, 'provider usage component is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS provider_usage_observation_components_delete_guard
+BEFORE DELETE ON provider_usage_observation_components
+WHEN NOT EXISTS(
+  SELECT 1 FROM provider_usage_prune_targets target
+  WHERE target.idempotency_key=OLD.idempotency_key
+)
+BEGIN SELECT RAISE(ABORT, 'provider usage component deletion lacks prune custody'); END;
+
+CREATE TRIGGER IF NOT EXISTS usage_snapshots_immutable_update
+BEFORE UPDATE ON usage_snapshots
+BEGIN SELECT RAISE(ABORT, 'Codex usage snapshot is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS usage_poll_failures_immutable_update
+BEFORE UPDATE ON usage_poll_failures
+BEGIN SELECT RAISE(ABORT, 'Codex usage failure is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS usage_cloud_upload_anchors_immutable_update
+BEFORE UPDATE ON usage_cloud_upload_anchors
+BEGIN SELECT RAISE(ABORT, 'Codex usage upload anchor is immutable'); END;
+
+DROP TRIGGER IF EXISTS account_scoped_provider_authorities_immutable_update;
+CREATE TRIGGER account_scoped_provider_authorities_immutable_update
+BEFORE UPDATE ON account_scoped_provider_authorities
+BEGIN SELECT RAISE(ABORT, 'account provider compatibility authority is immutable'); END;
+DROP TRIGGER IF EXISTS account_scoped_provider_authorities_immutable_delete;
+CREATE TRIGGER account_scoped_provider_authorities_immutable_delete
+BEFORE DELETE ON account_scoped_provider_authorities
+WHEN NOT (
+  OLD.scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
+  AND EXISTS(
+    SELECT 1 FROM codex_usage_authority_prune_targets target
+    WHERE target.scope_kind=OLD.scope_kind AND target.scope_id=OLD.scope_id
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'account provider compatibility authority is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS usage_snapshots_prune_authority
+BEFORE DELETE ON usage_snapshots
+WHEN NOT EXISTS(
+  SELECT 1 FROM usage_cloud_upload_anchors anchor
+  WHERE anchor.profile_id=OLD.profile_id AND anchor.source_revision=OLD.source_revision
+)
+AND EXISTS(
+  SELECT 1 FROM account_scoped_provider_authorities authority
+  WHERE authority.scope_kind='usage_snapshot'
+    AND authority.scope_id=OLD.profile_id||':'||OLD.source_revision
+)
+BEGIN
+  INSERT INTO codex_usage_authority_prune_targets(scope_kind,scope_id,selected_at)
+  VALUES ('usage_snapshot',OLD.profile_id||':'||OLD.source_revision,OLD.observed_at);
+  DELETE FROM account_scoped_provider_authorities
+  WHERE scope_kind='usage_snapshot'
+    AND scope_id=OLD.profile_id||':'||OLD.source_revision;
+  SELECT CASE WHEN changes()!=1
+    THEN RAISE(ABORT, 'Codex usage snapshot authority prune conflict') END;
+  DELETE FROM codex_usage_authority_prune_targets
+  WHERE scope_kind='usage_snapshot'
+    AND scope_id=OLD.profile_id||':'||OLD.source_revision;
+END;
+CREATE TRIGGER IF NOT EXISTS usage_poll_failures_prune_authority
+BEFORE DELETE ON usage_poll_failures
+WHEN EXISTS(
+  SELECT 1 FROM account_scoped_provider_authorities authority
+  WHERE authority.scope_kind='usage_poll_failure'
+    AND authority.scope_id=OLD.profile_id||':'||OLD.source_revision
+)
+BEGIN
+  INSERT INTO codex_usage_authority_prune_targets(scope_kind,scope_id,selected_at)
+  VALUES ('usage_poll_failure',OLD.profile_id||':'||OLD.source_revision,OLD.observed_at);
+  DELETE FROM account_scoped_provider_authorities
+  WHERE scope_kind='usage_poll_failure'
+    AND scope_id=OLD.profile_id||':'||OLD.source_revision;
+  SELECT CASE WHEN changes()!=1
+    THEN RAISE(ABORT, 'Codex usage failure authority prune conflict') END;
+  DELETE FROM codex_usage_authority_prune_targets
+  WHERE scope_kind='usage_poll_failure'
+    AND scope_id=OLD.profile_id||':'||OLD.source_revision;
+END;
+CREATE TRIGGER IF NOT EXISTS usage_cloud_upload_anchors_prune_authority
+BEFORE DELETE ON usage_cloud_upload_anchors
+BEGIN
+  INSERT INTO codex_usage_authority_prune_targets(scope_kind,scope_id,selected_at)
+  SELECT 'usage_upload_anchor',OLD.profile_id||':'||OLD.source_revision,OLD.received_at
+  WHERE EXISTS(
+    SELECT 1 FROM account_scoped_provider_authorities authority
+    WHERE authority.scope_kind='usage_upload_anchor'
+      AND authority.scope_id=OLD.profile_id||':'||OLD.source_revision
+  );
+  DELETE FROM account_scoped_provider_authorities
+  WHERE scope_kind='usage_upload_anchor'
+    AND scope_id=OLD.profile_id||':'||OLD.source_revision;
+  DELETE FROM codex_usage_authority_prune_targets
+  WHERE scope_kind='usage_upload_anchor'
+    AND scope_id=OLD.profile_id||':'||OLD.source_revision;
+
+  INSERT INTO codex_usage_authority_prune_targets(scope_kind,scope_id,selected_at)
+  SELECT 'usage_snapshot',OLD.profile_id||':'||OLD.source_revision,OLD.received_at
+  WHERE NOT EXISTS(
+    SELECT 1 FROM usage_snapshots snapshot
+    WHERE snapshot.profile_id=OLD.profile_id
+      AND snapshot.source_revision=OLD.source_revision
+  ) AND EXISTS(
+    SELECT 1 FROM account_scoped_provider_authorities authority
+    WHERE authority.scope_kind='usage_snapshot'
+      AND authority.scope_id=OLD.profile_id||':'||OLD.source_revision
+  );
+  DELETE FROM account_scoped_provider_authorities
+  WHERE scope_kind='usage_snapshot'
+    AND scope_id=OLD.profile_id||':'||OLD.source_revision
+    AND NOT EXISTS(
+      SELECT 1 FROM usage_snapshots snapshot
+      WHERE snapshot.profile_id=OLD.profile_id
+        AND snapshot.source_revision=OLD.source_revision
+    );
+  DELETE FROM codex_usage_authority_prune_targets
+  WHERE scope_kind='usage_snapshot'
+    AND scope_id=OLD.profile_id||':'||OLD.source_revision;
+END;
+
+DROP TRIGGER IF EXISTS account_scoped_provider_authorities_insert_guard;
+CREATE TRIGGER account_scoped_provider_authorities_insert_guard
+BEFORE INSERT ON account_scoped_provider_authorities
+WHEN NOT (
+  EXISTS(
+    SELECT 1 FROM provider_accounts a
+    WHERE a.id=NEW.provider_account_id AND a.profile_id=NEW.profile_id
+      AND a.provider=NEW.provider AND a.binding_generation=NEW.binding_generation
+  )
+  AND (
+    (NEW.scope_kind='provider_login' AND EXISTS(
+      SELECT 1 FROM provider_login_authorities value
+      WHERE value.attempt_id=NEW.scope_id AND value.profile_id=NEW.profile_id
+        AND value.process_generation=NEW.process_generation
+    ))
+    OR (NEW.scope_kind='usage_snapshot'
+      AND NEW.process_generation IS NOT NULL
+      AND NEW.provenance='usage_snapshot_v36'
+      AND EXISTS(
+        SELECT 1 FROM provider_accounts current
+        WHERE current.id=NEW.provider_account_id
+          AND current.profile_id=NEW.profile_id AND current.provider='codex'
+          AND current.binding_generation=NEW.binding_generation
+          AND current.process_generation=NEW.process_generation
+      )
+      AND EXISTS(
+        SELECT 1 FROM usage_snapshots value
+        WHERE value.profile_id=NEW.profile_id
+          AND NEW.scope_id=value.profile_id||':'||value.source_revision
+          AND json_valid(value.payload_json)=1
+          AND json_extract(value.payload_json,'$.version')=1
+          AND json_extract(value.payload_json,'$.observation.version')=1
+          AND json_extract(value.payload_json,'$.observation.sourceSequence')=value.source_revision
+          AND json_extract(value.payload_json,'$.observation.providerGeneration')=NEW.process_generation
+      ))
+    OR (NEW.scope_kind='usage_poll_failure'
+      AND NEW.process_generation IS NOT NULL
+      AND NEW.provenance='usage_poll_failure_v36'
+      AND EXISTS(
+        SELECT 1 FROM provider_accounts current
+        WHERE current.id=NEW.provider_account_id
+          AND current.profile_id=NEW.profile_id AND current.provider='codex'
+          AND current.binding_generation=NEW.binding_generation
+          AND current.process_generation=NEW.process_generation
+      )
+      AND EXISTS(
+        SELECT 1 FROM usage_poll_failures value
+        WHERE value.profile_id=NEW.profile_id
+          AND NEW.scope_id=value.profile_id||':'||value.source_revision
+      ))
+    OR (NEW.scope_kind='usage_upload_anchor'
+      AND NEW.process_generation IS NOT NULL
+      AND NEW.provenance='usage_upload_anchor_v36'
+      AND EXISTS(
+        SELECT 1 FROM provider_accounts current
+        WHERE current.id=NEW.provider_account_id
+          AND current.profile_id=NEW.profile_id AND current.provider='codex'
+          AND current.binding_generation=NEW.binding_generation
+          AND current.process_generation=NEW.process_generation
+      )
+      AND EXISTS(
+        SELECT 1 FROM usage_cloud_upload_anchors value
+        JOIN account_scoped_provider_authorities snapshot
+          ON snapshot.scope_kind='usage_snapshot'
+         AND snapshot.scope_id=value.profile_id||':'||value.source_revision
+        WHERE value.profile_id=NEW.profile_id
+          AND NEW.scope_id=value.profile_id||':'||value.source_revision
+          AND snapshot.provider_account_id=NEW.provider_account_id
+          AND snapshot.profile_id=NEW.profile_id
+          AND snapshot.provider=NEW.provider
+          AND snapshot.binding_generation=NEW.binding_generation
+          AND snapshot.process_generation=NEW.process_generation
+      ))
+    OR (NEW.scope_kind='reset_attempt' AND EXISTS(
+      SELECT 1 FROM account_rate_limit_reset_attempts value
+      WHERE NEW.scope_id=value.profile_id||':'||value.attempt_sequence
+        AND value.profile_id=NEW.profile_id
+        AND value.origin_process_generation=NEW.process_generation
+    ))
+    OR (NEW.scope_kind='reset_policy' AND NEW.process_generation IS NULL AND EXISTS(
+      SELECT 1 FROM account_rate_limit_reset_policies value
+      WHERE value.profile_id=NEW.scope_id AND value.profile_id=NEW.profile_id
+    ))
+    OR (NEW.scope_kind='desktop_switch_source' AND EXISTS(
+      SELECT 1 FROM desktop_switches value
+      WHERE NEW.scope_id=value.attempt_id||':source'
+        AND value.source_profile_id=NEW.profile_id
+        AND value.source_generation=NEW.process_generation
+    ))
+    OR (NEW.scope_kind='desktop_switch_target' AND EXISTS(
+      SELECT 1 FROM desktop_switches value
+      WHERE NEW.scope_id=value.attempt_id||':target'
+        AND value.target_profile_id=NEW.profile_id
+        AND value.target_generation=NEW.process_generation
+    ))
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'account provider compatibility authority mismatch'); END;
+`;
+
+const applySchemaVersion36ProviderUsage = (database: Database): void => {
+  database.exec(`
+    DROP TRIGGER IF EXISTS provider_usage_observation_receipts_insert_guard;
+    DROP TRIGGER IF EXISTS provider_usage_observation_receipts_immutable_update;
+    DROP TRIGGER IF EXISTS provider_usage_observation_receipts_immutable_delete;
+    DROP TRIGGER IF EXISTS provider_usage_observation_components_insert_guard;
+    DROP TRIGGER IF EXISTS provider_usage_observation_components_immutable_update;
+    DROP TRIGGER IF EXISTS provider_usage_observation_components_delete_guard;
+    DROP TRIGGER IF EXISTS usage_snapshots_immutable_update;
+    DROP TRIGGER IF EXISTS usage_poll_failures_immutable_update;
+    DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_immutable_update;
+    DROP TRIGGER IF EXISTS usage_snapshots_prune_authority;
+    DROP TRIGGER IF EXISTS usage_poll_failures_prune_authority;
+    DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_prune_authority;
+    DROP TRIGGER IF EXISTS account_scoped_provider_authorities_insert_guard;
+    DROP TRIGGER IF EXISTS account_scoped_provider_authorities_immutable_update;
+    DROP TRIGGER IF EXISTS account_scoped_provider_authorities_immutable_delete;
+    DROP INDEX IF EXISTS provider_usage_observation_receipts_latest;
+  `);
+  database.exec(schemaVersion36ProviderUsage);
+};
+
+const retireMigratedOrphanCodexUsageAuthorities = (
+  database: Database,
+  selectedAt: number,
+): void => {
+  const rows = database.query(
+    `SELECT authority.scope_kind,authority.scope_id
+     FROM account_scoped_provider_authorities authority
+     WHERE (
+       authority.scope_kind='usage_snapshot'
+       AND NOT EXISTS(
+         SELECT 1 FROM usage_snapshots value
+         WHERE authority.scope_id=value.profile_id||':'||value.source_revision
+       )
+       AND NOT EXISTS(
+         SELECT 1
+         FROM usage_cloud_upload_anchors anchor
+         JOIN account_scoped_provider_authorities upload
+           ON upload.scope_kind='usage_upload_anchor'
+          AND upload.scope_id=anchor.profile_id||':'||anchor.source_revision
+         WHERE authority.scope_id=anchor.profile_id||':'||anchor.source_revision
+           AND upload.provider_account_id=authority.provider_account_id
+           AND upload.profile_id=authority.profile_id
+           AND upload.provider=authority.provider
+           AND upload.binding_generation=authority.binding_generation
+           AND upload.process_generation IS authority.process_generation
+       )
+     ) OR (
+       authority.scope_kind='usage_poll_failure'
+       AND NOT EXISTS(
+         SELECT 1 FROM usage_poll_failures value
+         WHERE authority.scope_id=value.profile_id||':'||value.source_revision
+       )
+     ) OR (
+       authority.scope_kind='usage_upload_anchor'
+       AND NOT EXISTS(
+         SELECT 1 FROM usage_cloud_upload_anchors value
+         WHERE authority.scope_id=value.profile_id||':'||value.source_revision
+       )
+     )
+     ORDER BY authority.scope_kind,authority.scope_id`,
+  ).all().map((row) => z.object({
+    scope_kind: z.enum(["usage_snapshot", "usage_poll_failure", "usage_upload_anchor"]),
+    scope_id: z.string().min(1).max(512),
+  }).strict().parse(row));
+  for (const row of rows) {
+    database.query(
+      `INSERT INTO codex_usage_authority_prune_targets(scope_kind,scope_id,selected_at)
+       VALUES (?,?,?)`,
+    ).run(row.scope_kind, row.scope_id, selectedAt);
+    const removed = database.query(
+      `DELETE FROM account_scoped_provider_authorities
+       WHERE scope_kind=? AND scope_id=?`,
+    ).run(row.scope_kind, row.scope_id);
+    if (removed.changes !== 1) throw new Error("CODEX_USAGE_MIGRATION_PRUNE_CONFLICT");
+    database.query(
+      `DELETE FROM codex_usage_authority_prune_targets
+       WHERE scope_kind=? AND scope_id=?`,
+    ).run(row.scope_kind, row.scope_id);
+  }
+};
+
 const sqliteTableExists = (database: Database, table: string): boolean => {
   if (!/^[a-z_]+$/u.test(table)) throw new Error("Unsafe SQLite table identifier.");
   return database.query(
@@ -4478,7 +4934,7 @@ const assertProviderAccountAuthority = (database: Database): void => {
          SELECT 1 FROM account_scoped_provider_authorities c
          WHERE c.scope_kind='usage_snapshot'
            AND c.scope_id=u.profile_id||':'||u.source_revision
-           AND c.profile_id=u.profile_id AND c.process_generation IS NULL
+           AND c.profile_id=u.profile_id
        )
        UNION ALL
        SELECT u.profile_id||':'||u.source_revision FROM usage_poll_failures u
@@ -4487,7 +4943,7 @@ const assertProviderAccountAuthority = (database: Database): void => {
          SELECT 1 FROM account_scoped_provider_authorities c
          WHERE c.scope_kind='usage_poll_failure'
            AND c.scope_id=u.profile_id||':'||u.source_revision
-           AND c.profile_id=u.profile_id AND c.process_generation IS NULL
+           AND c.profile_id=u.profile_id
        )
        UNION ALL
        SELECT u.profile_id||':'||u.source_revision FROM usage_cloud_upload_anchors u
@@ -4496,7 +4952,7 @@ const assertProviderAccountAuthority = (database: Database): void => {
          SELECT 1 FROM account_scoped_provider_authorities c
          WHERE c.scope_kind='usage_upload_anchor'
            AND c.scope_id=u.profile_id||':'||u.source_revision
-           AND c.profile_id=u.profile_id AND c.process_generation IS NULL
+           AND c.profile_id=u.profile_id
        )
        UNION ALL
        SELECT r.profile_id||':'||r.attempt_sequence FROM account_rate_limit_reset_attempts r
@@ -4541,6 +4997,345 @@ const assertProviderAccountAuthority = (database: Database): void => {
   ).get());
   if (missingAccountScopedCompatibility.count !== 0) {
     throw new Error("ACCOUNT_SCOPED_PROVIDER_AUTHORITY_MISSING");
+  }
+};
+
+const schemaVersion36ProviderUsageObjects = [
+  { name: "provider_usage_observation_receipts", table: "provider_usage_observation_receipts", type: "table" },
+  { name: "provider_usage_observation_components", table: "provider_usage_observation_components", type: "table" },
+  { name: "provider_usage_prune_targets", table: "provider_usage_prune_targets", type: "table" },
+  { name: "codex_usage_authority_prune_targets", table: "codex_usage_authority_prune_targets", type: "table" },
+  { name: "provider_usage_observation_receipts_latest", table: "provider_usage_observation_receipts", type: "index" },
+  { name: "provider_usage_observation_receipts_insert_guard", table: "provider_usage_observation_receipts", type: "trigger" },
+  { name: "provider_usage_observation_receipts_immutable_update", table: "provider_usage_observation_receipts", type: "trigger" },
+  { name: "provider_usage_observation_receipts_immutable_delete", table: "provider_usage_observation_receipts", type: "trigger" },
+  { name: "provider_usage_observation_components_insert_guard", table: "provider_usage_observation_components", type: "trigger" },
+  { name: "provider_usage_observation_components_immutable_update", table: "provider_usage_observation_components", type: "trigger" },
+  { name: "provider_usage_observation_components_delete_guard", table: "provider_usage_observation_components", type: "trigger" },
+  { name: "usage_snapshots_immutable_update", table: "usage_snapshots", type: "trigger" },
+  { name: "usage_poll_failures_immutable_update", table: "usage_poll_failures", type: "trigger" },
+  { name: "usage_cloud_upload_anchors_immutable_update", table: "usage_cloud_upload_anchors", type: "trigger" },
+  { name: "usage_snapshots_prune_authority", table: "usage_snapshots", type: "trigger" },
+  { name: "usage_poll_failures_prune_authority", table: "usage_poll_failures", type: "trigger" },
+  { name: "usage_cloud_upload_anchors_prune_authority", table: "usage_cloud_upload_anchors", type: "trigger" },
+  { name: "account_scoped_provider_authorities_insert_guard", table: "account_scoped_provider_authorities", type: "trigger" },
+  { name: "account_scoped_provider_authorities_immutable_update", table: "account_scoped_provider_authorities", type: "trigger" },
+  { name: "account_scoped_provider_authorities_immutable_delete", table: "account_scoped_provider_authorities", type: "trigger" },
+] as const;
+
+const schemaVersion36ProviderUsageObjectSql = (
+  object: (typeof schemaVersion36ProviderUsageObjects)[number],
+): string => {
+  const marker = object.type === "table"
+    ? `CREATE TABLE IF NOT EXISTS ${object.name}`
+    : object.type === "index"
+      ? `CREATE INDEX IF NOT EXISTS ${object.name}`
+      : schemaVersion36ProviderUsage.includes(`CREATE TRIGGER IF NOT EXISTS ${object.name}`)
+        ? `CREATE TRIGGER IF NOT EXISTS ${object.name}`
+        : `CREATE TRIGGER ${object.name}`;
+  const start = schemaVersion36ProviderUsage.indexOf(marker);
+  if (start < 0) throw new Error("STATE_SCHEMA_V36_DEFINITION_INVALID");
+  if (object.type !== "trigger") {
+    const terminator = object.type === "table" ? ") STRICT;" : ";";
+    const end = schemaVersion36ProviderUsage.indexOf(terminator, start);
+    if (end < 0) throw new Error("STATE_SCHEMA_V36_DEFINITION_INVALID");
+    return schemaVersion36ProviderUsage.slice(start, end + terminator.length);
+  }
+  let cursor = start;
+  for (;;) {
+    const end = schemaVersion36ProviderUsage.indexOf("END;", cursor);
+    if (end < 0) throw new Error("STATE_SCHEMA_V36_DEFINITION_INVALID");
+    const remainder = schemaVersion36ProviderUsage.slice(end + "END;".length)
+      .trimStart();
+    if (/^(?:CREATE|DROP)\b/u.test(remainder) || remainder.length === 0) {
+      return schemaVersion36ProviderUsage.slice(start, end + "END;".length);
+    }
+    cursor = end + "END;".length;
+  }
+};
+
+const assertSchemaVersion36ProviderUsage = (database: Database): void => {
+  const names = schemaVersion36ProviderUsageObjects
+    .map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== schemaVersion36ProviderUsageObjects.length) {
+    throw new Error("STATE_SCHEMA_V36_STRUCTURE_INVALID");
+  }
+  for (const expected of schemaVersion36ProviderUsageObjects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    const observedSql = observed?.sql.replace(/\bIF NOT EXISTS\b/giu, "");
+    const expectedSql = schemaVersion36ProviderUsageObjectSql(expected)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observedSql ?? "")
+        !== normalizeSqlStructure(expectedSql)
+    ) throw new Error(`STATE_SCHEMA_V36_STRUCTURE_INVALID:${expected.name}`);
+  }
+
+  // Run this reverse-coverage audit before startup retention. Otherwise an
+  // aged parent row whose immutable authority sidecar was lost could be pruned
+  // first and make the authority loss disappear from the final integrity scan.
+  const missingCodexUsageAuthority = z.object({
+    count: z.number().int().nonnegative(),
+  }).strict().parse(database.query(
+    `SELECT COUNT(*) AS count FROM (
+       SELECT value.profile_id||':'||value.source_revision AS scope_id
+       FROM usage_snapshots value
+       WHERE NOT EXISTS(
+         SELECT 1 FROM account_scoped_provider_authorities authority
+         WHERE authority.scope_kind='usage_snapshot'
+           AND authority.scope_id=value.profile_id||':'||value.source_revision
+           AND authority.profile_id=value.profile_id
+       )
+       UNION ALL
+       SELECT value.profile_id||':'||value.source_revision
+       FROM usage_poll_failures value
+       WHERE NOT EXISTS(
+         SELECT 1 FROM account_scoped_provider_authorities authority
+         WHERE authority.scope_kind='usage_poll_failure'
+           AND authority.scope_id=value.profile_id||':'||value.source_revision
+           AND authority.profile_id=value.profile_id
+       )
+       UNION ALL
+       SELECT value.profile_id||':'||value.source_revision
+       FROM usage_cloud_upload_anchors value
+       WHERE NOT EXISTS(
+         SELECT 1 FROM account_scoped_provider_authorities authority
+         WHERE authority.scope_kind='usage_upload_anchor'
+           AND authority.scope_id=value.profile_id||':'||value.source_revision
+           AND authority.profile_id=value.profile_id
+       )
+     )`,
+  ).get());
+  if (missingCodexUsageAuthority.count !== 0) {
+    throw new Error("CODEX_USAGE_AUTHORITY_MISSING");
+  }
+
+  const codexSnapshots = database.query(
+    `SELECT payload_json,digest FROM usage_snapshots
+     ORDER BY profile_id,source_revision`,
+  ).all().map((row) => z.object({
+    payload_json: z.string(),
+    digest: z.string(),
+  }).strict().parse(row));
+  for (const snapshot of codexSnapshots) {
+    assertCodexUsageSnapshotDigest(snapshot.payload_json, snapshot.digest);
+  }
+
+  const invalidUsageAuthorityMode = z.object({
+    count: z.number().int().nonnegative(),
+  }).strict().parse(database.query(
+    `SELECT COUNT(*) AS count FROM account_scoped_provider_authorities authority
+     WHERE authority.scope_kind IN (
+       'usage_snapshot','usage_poll_failure','usage_upload_anchor'
+     ) AND NOT (
+       (authority.process_generation IS NULL
+        AND authority.provenance IN (
+          'legacy_codex_compatibility',
+          CASE authority.scope_kind
+            WHEN 'usage_snapshot' THEN 'usage_snapshot'
+            WHEN 'usage_poll_failure' THEN 'usage_poll_failure'
+            WHEN 'usage_upload_anchor' THEN 'usage_upload_anchor'
+          END
+        ))
+       OR (authority.process_generation IS NOT NULL AND authority.provenance=CASE authority.scope_kind
+         WHEN 'usage_snapshot' THEN 'usage_snapshot_v36'
+         WHEN 'usage_poll_failure' THEN 'usage_poll_failure_v36'
+         WHEN 'usage_upload_anchor' THEN 'usage_upload_anchor_v36'
+       END)
+     )`,
+  ).get());
+  if (invalidUsageAuthorityMode.count !== 0) {
+    throw new Error("CODEX_USAGE_AUTHORITY_MODE_INVALID");
+  }
+
+  const orphanedUsageAuthority = z.object({
+    count: z.number().int().nonnegative(),
+  }).strict().parse(database.query(
+    `SELECT COUNT(*) AS count
+     FROM account_scoped_provider_authorities authority
+     WHERE (
+       authority.scope_kind='usage_snapshot'
+       AND NOT EXISTS(
+         SELECT 1 FROM usage_snapshots value
+         WHERE authority.scope_id=value.profile_id||':'||value.source_revision
+       )
+       AND NOT EXISTS(
+         SELECT 1
+         FROM usage_cloud_upload_anchors anchor
+         JOIN account_scoped_provider_authorities upload
+           ON upload.scope_kind='usage_upload_anchor'
+          AND upload.scope_id=anchor.profile_id||':'||anchor.source_revision
+         WHERE authority.scope_id=anchor.profile_id||':'||anchor.source_revision
+           AND upload.provider_account_id=authority.provider_account_id
+           AND upload.profile_id=authority.profile_id
+           AND upload.provider=authority.provider
+           AND upload.binding_generation=authority.binding_generation
+           AND upload.process_generation IS authority.process_generation
+       )
+     ) OR (
+       authority.scope_kind='usage_poll_failure'
+       AND NOT EXISTS(
+         SELECT 1 FROM usage_poll_failures value
+         WHERE authority.scope_id=value.profile_id||':'||value.source_revision
+       )
+     ) OR (
+       authority.scope_kind='usage_upload_anchor'
+       AND NOT EXISTS(
+         SELECT 1 FROM usage_cloud_upload_anchors value
+         WHERE authority.scope_id=value.profile_id||':'||value.source_revision
+       )
+     )`,
+  ).get());
+  if (orphanedUsageAuthority.count !== 0) {
+    throw new Error("CODEX_USAGE_AUTHORITY_ORPHANED");
+  }
+
+  const invalidCodexAuthority = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+    database.query(
+      `SELECT COUNT(*) AS count FROM account_scoped_provider_authorities authority
+       LEFT JOIN usage_snapshots snapshot
+         ON authority.scope_kind='usage_snapshot'
+        AND authority.scope_id=snapshot.profile_id||':'||snapshot.source_revision
+       WHERE authority.scope_kind='usage_snapshot'
+         AND authority.process_generation IS NOT NULL
+         AND snapshot.profile_id IS NOT NULL
+         AND (
+           json_valid(snapshot.payload_json)!=1
+           OR json_extract(snapshot.payload_json,'$.version')!=1
+           OR json_extract(snapshot.payload_json,'$.observation.version')!=1
+           OR json_extract(snapshot.payload_json,'$.observation.sourceSequence')!=snapshot.source_revision
+           OR json_extract(snapshot.payload_json,'$.observation.observedAt')!=snapshot.observed_at
+           OR json_extract(snapshot.payload_json,'$.observation.providerGeneration')
+                !=authority.process_generation
+         )`,
+    ).get(),
+  );
+  if (invalidCodexAuthority.count !== 0) {
+    throw new Error("CODEX_USAGE_EXACT_AUTHORITY_INVALID");
+  }
+  const invalidUploadAuthority = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+    database.query(
+      `SELECT COUNT(*) AS count FROM account_scoped_provider_authorities upload
+       JOIN usage_cloud_upload_anchors anchor
+         ON upload.scope_kind='usage_upload_anchor'
+        AND upload.scope_id=anchor.profile_id||':'||anchor.source_revision
+       WHERE upload.scope_kind='usage_upload_anchor'
+         AND NOT EXISTS(
+           SELECT 1 FROM account_scoped_provider_authorities snapshot
+           WHERE snapshot.scope_kind='usage_snapshot'
+             AND snapshot.scope_id=upload.scope_id
+             AND snapshot.provider_account_id=upload.provider_account_id
+             AND snapshot.profile_id=upload.profile_id
+             AND snapshot.provider=upload.provider
+             AND snapshot.binding_generation=upload.binding_generation
+             AND snapshot.process_generation IS upload.process_generation
+         )`,
+    ).get(),
+  );
+  if (invalidUploadAuthority.count !== 0) {
+    throw new Error("CODEX_USAGE_UPLOAD_AUTHORITY_INVALID");
+  }
+
+  const invalidReceipts = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+    database.query(
+      `SELECT COUNT(*) AS count FROM provider_usage_observation_receipts receipt
+       WHERE NOT EXISTS(
+         SELECT 1
+         FROM session_turn_runtime_profiles turn
+         JOIN session_runtime_profiles runtime
+           ON runtime.session_id=turn.session_id
+          AND runtime.source_kind=turn.source_kind AND runtime.source_id=turn.source_id
+         JOIN runtime_profile_provider_authorities authority
+           ON authority.session_id=runtime.session_id AND authority.revision=runtime.revision
+         WHERE turn.session_id=receipt.session_id AND turn.turn_id=receipt.turn_id
+           AND turn.profile_id=receipt.profile_id
+           AND turn.process_generation=receipt.process_generation
+           AND authority.provider_account_id=receipt.provider_account_id
+           AND authority.profile_id=receipt.profile_id AND authority.provider=receipt.provider
+           AND authority.binding_generation=receipt.binding_generation
+           AND authority.process_generation=receipt.process_generation
+       )`,
+    ).get(),
+  );
+  if (invalidReceipts.count !== 0) throw new Error("PROVIDER_USAGE_TURN_AUTHORITY_INVALID");
+
+  const missingComponents = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+    database.query(
+      `SELECT COUNT(*) AS count FROM provider_usage_observation_receipts receipt
+       LEFT JOIN provider_usage_observation_components value
+         ON value.idempotency_key=receipt.idempotency_key
+       WHERE value.idempotency_key IS NULL
+          OR value.component_digest!=receipt.component_digest`,
+    ).get(),
+  );
+  if (missingComponents.count !== 0) throw new Error("PROVIDER_USAGE_COMPONENT_MISSING");
+
+  const relationalComponentMismatch = z.object({
+    count: z.number().int().nonnegative(),
+  }).strict().parse(database.query(
+    `SELECT COUNT(*) AS count
+     FROM provider_usage_observation_receipts receipt
+     JOIN provider_usage_observation_components value
+       ON value.idempotency_key=receipt.idempotency_key
+     WHERE json_extract(value.component_json,'$.version') IS NOT 2
+        OR json_extract(value.component_json,'$.component') IS NOT receipt.component
+        OR json_extract(value.component_json,'$.source') IS NOT receipt.source
+        OR json_extract(value.component_json,'$.idempotencyKey') IS NOT receipt.idempotency_key
+        OR json_extract(value.component_json,'$.sourceEventDigest')
+             IS NOT receipt.source_event_digest
+        OR json_extract(value.component_json,'$.componentDigest')
+             IS NOT receipt.component_digest
+        OR json_extract(value.component_json,'$.observationRevision')
+             IS NOT receipt.observation_revision
+        OR json_extract(value.component_json,'$.observedAt') IS NOT receipt.observed_at
+        OR json_extract(value.component_json,'$.receivedAt') IS NOT receipt.received_at
+        OR json_extract(value.component_json,'$.authority.providerAccountId')
+             IS NOT receipt.provider_account_id
+        OR json_extract(value.component_json,'$.authority.profileId') IS NOT receipt.profile_id
+        OR json_extract(value.component_json,'$.authority.provider') IS NOT receipt.provider
+        OR json_extract(value.component_json,'$.authority.bindingGeneration')
+             IS NOT receipt.binding_generation
+        OR json_extract(value.component_json,'$.authority.processGeneration')
+             IS NOT receipt.process_generation
+        OR json_extract(value.component_json,'$.turn.sessionId') IS NOT receipt.session_id
+        OR json_extract(value.component_json,'$.turn.turnId') IS NOT receipt.turn_id`,
+  ).get());
+  if (relationalComponentMismatch.count !== 0) {
+    throw new Error("PROVIDER_USAGE_COMPONENT_EVIDENCE_MISMATCH");
+  }
+
+  const pruneTargets = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+    database.query("SELECT COUNT(*) AS count FROM provider_usage_prune_targets").get(),
+  );
+  if (pruneTargets.count !== 0) throw new Error("PROVIDER_USAGE_PRUNE_CUSTODY_OPEN");
+  const codexPruneTargets = z.object({
+    count: z.number().int().nonnegative(),
+  }).strict().parse(database.query(
+    "SELECT COUNT(*) AS count FROM codex_usage_authority_prune_targets",
+  ).get());
+  if (codexPruneTargets.count !== 0) throw new Error("CODEX_USAGE_PRUNE_CUSTODY_OPEN");
+
+  const componentRows = database.query(
+    `SELECT component_json FROM provider_usage_observation_components ORDER BY idempotency_key`,
+  ).all().map((row) => z.object({ component_json: z.string() }).strict().parse(row));
+  try {
+    for (const row of componentRows) {
+      const canonical = canonicalProviderUsageComponent(
+        providerUsageComponentSchema.parse(JSON.parse(row.component_json) as unknown),
+      );
+      if (row.component_json !== canonicalProviderUsageJson(canonical)) {
+        throw new Error("Provider usage component bytes are not canonical.");
+      }
+    }
+  } catch (error: unknown) {
+    throw new Error("PROVIDER_USAGE_COMPONENT_INVALID", { cause: error });
   }
 };
 
@@ -5514,6 +6309,79 @@ const pruneAllUsageHistory = (database: Database, now: number): void => {
   }
 };
 
+const providerUsagePruneIds = (
+  database: Database,
+  providerAccountId: ProviderAccountId,
+  component: ProviderUsageComponentKind,
+  now: number,
+): readonly string[] => {
+  const cutoff = Math.max(0, now - PROVIDER_USAGE_COMPONENT_RETAIN_AGE_MS);
+  const rows = database.query(
+    `SELECT receipt.idempotency_key,receipt.received_at,
+            length(CAST(value.component_json AS BLOB)) AS payload_bytes
+     FROM provider_usage_observation_receipts receipt
+     JOIN provider_usage_observation_components value
+       ON value.idempotency_key=receipt.idempotency_key
+     WHERE receipt.provider_account_id=? AND receipt.component=?
+     ORDER BY receipt.observed_at DESC,receipt.received_at DESC,
+              receipt.observation_revision DESC,receipt.idempotency_key DESC`,
+  ).all(providerAccountId, component).map((row) => z.object({
+    idempotency_key: sha256Schema,
+    received_at: unixMillisecondsSchema,
+    payload_bytes: z.number().int().positive().max(PROVIDER_USAGE_COMPONENT_MAX_BYTES),
+  }).strict().parse(row));
+  const selected = new Set<string>();
+  let retainedBytes = 0;
+  for (const [index, row] of rows.entries()) {
+    retainedBytes += row.payload_bytes;
+    if (
+      row.received_at < cutoff
+      || index >= PROVIDER_USAGE_COMPONENT_RETAIN_COUNT
+      || retainedBytes > PROVIDER_USAGE_COMPONENT_RETAIN_BYTES
+    ) selected.add(row.idempotency_key);
+  }
+  return [...selected].sort();
+};
+
+const pruneProviderUsageComponents = (
+  database: Database,
+  providerAccountId: ProviderAccountId,
+  now: number,
+): void => {
+  for (const component of providerUsageComponentKindSchema.options) {
+    const ids = providerUsagePruneIds(database, providerAccountId, component, now);
+    for (const idempotencyKey of ids) {
+      database.query(
+        `INSERT INTO provider_usage_prune_targets(idempotency_key,selected_at) VALUES (?,?)`,
+      ).run(idempotencyKey, now);
+    }
+    for (const idempotencyKey of ids) {
+      const componentRemoved = database.query(
+        "DELETE FROM provider_usage_observation_components WHERE idempotency_key=?",
+      ).run(idempotencyKey);
+      if (componentRemoved.changes !== 1) throw new Error("PROVIDER_USAGE_PRUNE_CONFLICT");
+      const removed = database.query(
+        "DELETE FROM provider_usage_observation_receipts WHERE idempotency_key=?",
+      ).run(idempotencyKey);
+      // SQLite may include the cascaded prune-custody row in `changes`.
+      if (removed.changes < 1) throw new Error("PROVIDER_USAGE_PRUNE_CONFLICT");
+    }
+  }
+  const open = database.query("SELECT 1 FROM provider_usage_prune_targets LIMIT 1").get();
+  if (open !== null) throw new Error("PROVIDER_USAGE_PRUNE_CUSTODY_NOT_CLOSED");
+};
+
+const pruneAllProviderUsageComponents = (database: Database, now: number): void => {
+  const rows = database.query(
+    "SELECT DISTINCT provider_account_id FROM provider_usage_observation_receipts ORDER BY provider_account_id",
+  ).all().map((row) => z.object({
+    provider_account_id: providerAccountIdSchema,
+  }).strict().parse(row));
+  for (const row of rows) {
+    pruneProviderUsageComponents(database, row.provider_account_id, now);
+  }
+};
+
 const migrateWritableDatabase = (
   database: Database,
   now: () => number,
@@ -5523,7 +6391,14 @@ const migrateWritableDatabase = (
   if (initialVersion > currentSchemaVersion) {
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
-  if (initialVersion === currentSchemaVersion) assertCanonicalLabelKeys(database);
+  if (initialVersion === currentSchemaVersion) {
+    assertCanonicalLabelKeys(database);
+    // Audit evidence before startup retention can remove an invalid row.
+    // Reapplying additive v36 objects first keeps pre-release partial fixtures
+    // restartable without rewriting any retained evidence.
+    applySchemaVersion36ProviderUsage(database);
+    assertSchemaVersion36ProviderUsage(database);
+  }
 
   // Security migrations may replace secret-bearing legacy records. SQLite must
   // overwrite superseded cell content instead of leaving it in free pages.
@@ -5953,6 +6828,19 @@ const migrateWritableDatabase = (
       version = 35;
     }
 
+    if (version < 36) {
+      applySchemaVersion36ProviderUsage(database);
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      retireMigratedOrphanCodexUsageAuthorities(database, migratedAt);
+      assertProviderAccountAuthority(database);
+      assertSchemaVersion36ProviderUsage(database);
+      database.query(
+        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(36, migratedAt);
+      database.exec("PRAGMA user_version = 36");
+      version = 36;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -5994,12 +6882,15 @@ const migrateWritableDatabase = (
     applySchemaVersion33DeviceCommands(database);
     applySchemaVersion34Attachments(database);
     applySchemaVersion35ProviderAccounts(database);
+    applySchemaVersion36ProviderUsage(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
     pruneAllUsageHistory(database, now());
+    pruneAllProviderUsageComponents(database, now());
     assertWorkSchema(database);
     assertProviderAccountAuthority(database);
+    assertSchemaVersion36ProviderUsage(database);
     return hasPendingSecurityScrub(database);
   })();
   if (securityScrubPending) completePendingSecurityScrub(database, false, securityScrubCheckpoint);
@@ -6490,6 +7381,13 @@ export class SelectionError extends Error {
   }
 }
 
+export class ProviderUsageTurnNotBoundError extends Error {
+  constructor() {
+    super("PROVIDER_USAGE_TURN_NOT_BOUND");
+    this.name = "ProviderUsageTurnNotBoundError";
+  }
+}
+
 export class StateSecurityScrubRequiredError extends Error {
   constructor(
     readonly operationCommitted: boolean,
@@ -6562,6 +7460,7 @@ export class StateStore {
       assertAccountRateLimitResetPolicies(this.#database);
       assertSessionTaskSchema(this.#database);
       assertProviderAccountAuthority(this.#database);
+      assertSchemaVersion36ProviderUsage(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
@@ -10438,6 +11337,93 @@ export class StateStore {
       processGeneration: parsed.process_generation,
       provenance: parsed.provenance,
       recordedAt: parsed.recorded_at,
+    };
+  }
+
+  readCodexUsageAuthorityMetadata(
+    scopeKind: "usage_snapshot" | "usage_poll_failure" | "usage_upload_anchor",
+    profileId: ProfileId,
+    sourceRevision: number,
+  ): CodexUsageAuthorityMetadata {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedRevision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+      .parse(sourceRevision);
+    const scopeId = `${parsedProfileId}:${parsedRevision}`;
+    const binding = this.readAccountScopedProviderAuthority(scopeKind, scopeId);
+    if (binding === null || binding.profileId !== parsedProfileId) {
+      throw new Error("ACCOUNT_SCOPED_PROVIDER_AUTHORITY_MISSING");
+    }
+    const exact = binding.processGeneration !== null;
+    const scopeProvenance = scopeKind === "usage_snapshot"
+      ? "usage_snapshot"
+      : scopeKind === "usage_poll_failure"
+        ? "usage_poll_failure"
+        : "usage_upload_anchor";
+    const expectedProvenance = exact
+      ? scopeKind === "usage_snapshot"
+        ? "usage_snapshot_v36"
+        : scopeKind === "usage_poll_failure"
+          ? "usage_poll_failure_v36"
+          : "usage_upload_anchor_v36"
+      : scopeProvenance;
+    if (
+      binding.provenance !== expectedProvenance
+      && !(binding.processGeneration === null
+        && binding.provenance === "legacy_codex_compatibility")
+    ) {
+      throw new Error("CODEX_USAGE_AUTHORITY_MODE_INVALID");
+    }
+    const providerAccount = this.#database.query(
+      `SELECT 1 FROM provider_accounts
+       WHERE id=? AND profile_id=? AND provider='codex'`,
+    ).get(binding.providerAccountId, binding.profileId);
+    if (providerAccount === null) throw new Error("ACCOUNT_SCOPED_PROVIDER_AUTHORITY_MISMATCH");
+
+    let processGeneration = binding.processGeneration;
+    if (scopeKind === "usage_snapshot" || scopeKind === "usage_upload_anchor") {
+      const snapshot = this.#database.query(
+        `SELECT payload_json,digest FROM usage_snapshots
+         WHERE profile_id=? AND source_revision=?`,
+      ).get(parsedProfileId, parsedRevision) as {
+        payload_json: string;
+        digest: string;
+      } | null;
+      if (snapshot !== null) {
+        assertCodexUsageSnapshotDigest(snapshot.payload_json, snapshot.digest);
+        const parsed = storedAccountUsageSnapshotSchema.safeParse(
+          JSON.parse(snapshot.payload_json) as unknown,
+        );
+        if (parsed.success) {
+          if (
+            processGeneration !== null
+            && (
+              parsed.data.observation.sourceSequence !== parsedRevision
+              || parsed.data.observation.providerGeneration !== processGeneration
+            )
+          ) throw new Error("CODEX_USAGE_EXACT_AUTHORITY_INVALID");
+          processGeneration ??= parsed.data.observation.providerGeneration;
+        } else if (exact) {
+          throw new Error("CODEX_USAGE_EXACT_AUTHORITY_INVALID");
+        }
+      } else if (scopeKind === "usage_snapshot") {
+        throw new Error("USAGE_SNAPSHOT_MISSING");
+      }
+    }
+    const authority = processGeneration === null
+      ? null
+      : providerAccountAuthoritySchema.parse({
+          providerAccountId: binding.providerAccountId,
+          profileId: binding.profileId,
+          provider: "codex",
+          bindingGeneration: binding.bindingGeneration,
+          processGeneration,
+        });
+    return {
+      scopeKind,
+      mode: exact ? "mutation_authoritative" : "compatibility_display_only",
+      canAuthorizeQuota: scopeKind === "usage_snapshot" && exact,
+      binding,
+      authority,
     };
   }
 
@@ -15460,19 +16446,219 @@ export class StateStore {
     return recover.immediate();
   }
 
-  recordUsage(profileId: ProfileId, sourceRevision: number, observedAt: number, payload: unknown): void {
+  recordProviderUsageObservation(
+    observationInput: ProviderUsageComponent,
+  ): ProviderUsageWriteResult {
+    const observation = canonicalProviderUsageComponent(observationInput);
+    if (
+      observation.authority.provider !== "claude"
+      || observation.source === "codex_app_server"
+      || observation.turn === null
+    ) throw new Error("PROVIDER_USAGE_STORAGE_CLAUDE_ONLY");
+    const json = canonicalProviderUsageJson(observation);
+    if (new TextEncoder().encode(json).byteLength > PROVIDER_USAGE_COMPONENT_MAX_BYTES) {
+      throw new Error("PROVIDER_USAGE_COMPONENT_TOO_LARGE");
+    }
+    const now = unixMillisecondsSchema.parse(this.#now());
+    const recordedAt = Math.max(now, observation.receivedAt);
+    const write = this.#database.transaction((): ProviderUsageWriteResult => {
+      const existingByKey = this.#database.query(
+        `SELECT component_digest,source_event_digest
+         FROM provider_usage_observation_receipts WHERE idempotency_key=?`,
+      ).get(observation.idempotencyKey) as {
+        component_digest: string;
+        source_event_digest: string;
+      } | null;
+      if (existingByKey !== null) {
+        if (
+          existingByKey.component_digest !== observation.componentDigest
+          || existingByKey.source_event_digest !== observation.sourceEventDigest
+        ) throw new Error("PROVIDER_USAGE_IDEMPOTENCY_CONFLICT");
+        return { status: "replayed", observation };
+      }
+      if (observation.receivedAt < Math.max(0, now - PROVIDER_USAGE_COMPONENT_RETAIN_AGE_MS)) {
+        throw new Error("PROVIDER_USAGE_OBSERVATION_EXPIRED");
+      }
+      const turnBound = this.#database.query(
+        `SELECT 1 FROM session_turn_runtime_profiles
+         WHERE session_id=? AND turn_id=?`,
+      ).get(observation.turn.sessionId, observation.turn.turnId);
+      if (turnBound === null) throw new ProviderUsageTurnNotBoundError();
+      const existingRevision = this.#database.query(
+        `SELECT idempotency_key FROM provider_usage_observation_receipts
+         WHERE provider_account_id=? AND binding_generation=? AND process_generation=?
+           AND session_id=? AND turn_id=? AND component=? AND observation_revision=?`,
+      ).get(
+        observation.authority.providerAccountId,
+        observation.authority.bindingGeneration,
+        observation.authority.processGeneration,
+        observation.turn.sessionId,
+        observation.turn.turnId,
+        observation.component,
+        observation.observationRevision,
+      ) as { idempotency_key: string } | null;
+      if (existingRevision !== null) throw new Error("PROVIDER_USAGE_REVISION_CONFLICT");
+      this.#database.query(
+        `INSERT INTO provider_usage_observation_receipts(
+           idempotency_key,component,provider_account_id,profile_id,provider,
+           binding_generation,process_generation,session_id,turn_id,
+           observation_revision,source,source_event_digest,component_digest,
+           observed_at,received_at,recorded_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        observation.idempotencyKey,
+        observation.component,
+        observation.authority.providerAccountId,
+        observation.authority.profileId,
+        observation.authority.provider,
+        observation.authority.bindingGeneration,
+        observation.authority.processGeneration,
+        observation.turn.sessionId,
+        observation.turn.turnId,
+        observation.observationRevision,
+        observation.source,
+        observation.sourceEventDigest,
+        observation.componentDigest,
+        observation.observedAt,
+        observation.receivedAt,
+        recordedAt,
+      );
+      this.#database.query(
+        `INSERT INTO provider_usage_observation_components(
+           idempotency_key,component_digest,component_json
+         ) VALUES (?,?,?)`,
+      ).run(observation.idempotencyKey, observation.componentDigest, json);
+      pruneProviderUsageComponents(
+        this.#database,
+        observation.authority.providerAccountId,
+        recordedAt,
+      );
+      return { status: "inserted", observation };
+    });
+    return write.immediate();
+  }
+
+  providerUsageObservations(input: Readonly<{
+    providerAccountId: ProviderAccountId;
+    component?: ProviderUsageComponentKind;
+    limit?: number;
+  }>): readonly ProviderUsageComponent[] {
+    const providerAccountId = providerAccountIdSchema.parse(input.providerAccountId);
+    const component = input.component === undefined
+      ? null
+      : providerUsageComponentKindSchema.parse(input.component);
+    const limit = z.number().int().positive().max(10_000).parse(input.limit ?? 4_096);
+    const rows = this.#database.query(
+      `SELECT value.component_json
+       FROM provider_usage_observation_receipts receipt
+       JOIN provider_usage_observation_components value
+         ON value.idempotency_key=receipt.idempotency_key
+       WHERE receipt.provider_account_id=? AND (? IS NULL OR receipt.component=?)
+       ORDER BY receipt.observed_at DESC,receipt.received_at DESC,
+                receipt.observation_revision DESC,receipt.idempotency_key DESC
+       LIMIT ?`,
+    ).all(providerAccountId, component, component, limit);
+    return rows.map((row) => {
+      const parsed = z.object({ component_json: z.string() }).strict().parse(row);
+      return canonicalProviderUsageComponent(
+        providerUsageComponentSchema.parse(JSON.parse(parsed.component_json) as unknown),
+      );
+    });
+  }
+
+  latestProviderUsage(
+    providerAccountIdInput: ProviderAccountId,
+  ): ProviderUsageObservationV2 | null {
+    const providerAccountId = providerAccountIdSchema.parse(providerAccountIdInput);
+    const account = z.object({
+      profile_id: profileIdSchema,
+      provider: providerSchema,
+    }).strict().nullable().parse(this.#database.query(
+      "SELECT profile_id,provider FROM provider_accounts WHERE id=?",
+    ).get(providerAccountId));
+    if (account === null) throw new SelectionError("NOT_FOUND");
+    if (account.provider === "claude") {
+      const components = this.providerUsageObservations({ providerAccountId });
+      const newestAuthority = components[0]?.authority;
+      if (newestAuthority === undefined) return null;
+      return mergeProviderUsageComponents({
+        components: components.filter((component) =>
+          sameProviderAccountAuthority(component.authority, newestAuthority)),
+      });
+    }
+    const row = this.#database.query(
+      `SELECT usage.source_revision,usage.observed_at,usage.payload_json,usage.digest
+       FROM usage_snapshots usage
+       JOIN account_scoped_provider_authorities authority
+         ON authority.scope_kind='usage_snapshot'
+        AND authority.scope_id=usage.profile_id||':'||usage.source_revision
+       WHERE authority.provider_account_id=? AND usage.profile_id=?
+       ORDER BY usage.source_revision DESC LIMIT 1`,
+    ).get(providerAccountId, account.profile_id) as {
+      source_revision: number;
+      observed_at: number;
+      payload_json: string;
+      digest: string;
+    } | null;
+    if (row === null) return null;
+    const metadata = this.readCodexUsageAuthorityMetadata(
+      "usage_snapshot",
+      account.profile_id,
+      row.source_revision,
+    );
+    if (metadata.authority === null) return null;
+    return projectCodexV1Usage({
+      snapshot: JSON.parse(row.payload_json) as unknown,
+      sourceRevision: row.source_revision,
+      observedAt: row.observed_at,
+      storedDigest: row.digest,
+      authority: metadata.authority,
+      authorityMode: metadata.mode,
+    }).observation;
+  }
+
+  recordUsage(
+    profileId: ProfileId,
+    sourceRevision: number,
+    observedAt: number,
+    payload: unknown,
+    providerAuthorityInput: ProviderAccountAuthority,
+  ): void {
     const parsedProfileId = profileIdSchema.parse(profileId);
     const parsedRevision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(sourceRevision);
     const parsedObservedAt = unixMillisecondsSchema.parse(observedAt);
+    const stored = storedAccountUsageSnapshotSchema.parse(payload);
+    const providerAuthority = providerAccountAuthoritySchema.parse(providerAuthorityInput);
+    if (
+      providerAuthority.provider !== "codex"
+      || providerAuthority.profileId !== parsedProfileId
+      || stored.observation.sourceSequence !== parsedRevision
+      || stored.observation.observedAt !== parsedObservedAt
+      || stored.observation.providerGeneration !== providerAuthority.processGeneration
+    ) throw new Error("CODEX_USAGE_PAYLOAD_AUTHORITY_MISMATCH");
     const json = JSON.stringify(payload);
     if (new TextEncoder().encode(json).byteLength > USAGE_LOCAL_SNAPSHOT_MAX_BYTES) {
       throw new Error("Usage snapshot exceeds the local bound.");
     }
     const digest = createHash("sha256").update(json).digest("hex");
     const record = this.#database.transaction(() => {
-      const providerAuthority = this.requireProviderAccountAuthority(parsedProfileId, "codex");
       const existing = this.#database.query("SELECT digest FROM usage_snapshots WHERE profile_id=? AND source_revision=?").get(parsedProfileId, parsedRevision) as { digest: string } | null;
       if (existing !== null && existing.digest !== digest) throw new Error("Usage source revision conflict.");
+      if (existing !== null) {
+        const previousAuthority = this.readCodexUsageAuthorityMetadata(
+          "usage_snapshot",
+          parsedProfileId,
+          parsedRevision,
+        );
+        if (
+          previousAuthority.mode !== "mutation_authoritative"
+          || (
+            previousAuthority.authority === null
+            || !sameProviderAccountAuthority(previousAuthority.authority, providerAuthority)
+          )
+        ) throw new Error("CODEX_USAGE_AUTHORITY_REPLAY_CONFLICT");
+        return;
+      }
       const failed = this.#database.query(
         "SELECT 1 FROM usage_poll_failures WHERE profile_id=? AND source_revision=?",
       ).get(parsedProfileId, parsedRevision);
@@ -15482,8 +16668,8 @@ export class StateStore {
         scopeKind: "usage_snapshot",
         scopeId: `${parsedProfileId}:${parsedRevision}`,
         authority: providerAuthority,
-        processGeneration: null,
-        provenance: "usage_snapshot",
+        processGeneration: providerAuthority.processGeneration,
+        provenance: "usage_snapshot_v36",
         recordedAt: parsedObservedAt,
       });
       this.#database.query(
@@ -15508,8 +16694,8 @@ export class StateStore {
           scopeKind: "usage_upload_anchor",
           scopeId: `${parsedProfileId}:${parsedRevision}`,
           authority: providerAuthority,
-          processGeneration: null,
-          provenance: "usage_upload_anchor",
+          processGeneration: providerAuthority.processGeneration,
+          provenance: "usage_upload_anchor_v36",
           recordedAt: parsedObservedAt,
         });
       }
@@ -15523,6 +16709,7 @@ export class StateStore {
     accountFingerprint: string | null,
     sourceRevision: number,
     observedAt: number,
+    providerAuthorityInput: ProviderAccountAuthority,
     reasonCode: UsagePollFailureRecord["reasonCode"] = "account_usage_read_failed",
   ): void {
     const parsedProfileId = profileIdSchema.parse(profileId);
@@ -15530,8 +16717,12 @@ export class StateStore {
     const parsedRevision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(sourceRevision);
     const parsedObservedAt = unixMillisecondsSchema.parse(observedAt);
     const parsedReason = z.literal("account_usage_read_failed").parse(reasonCode);
+    const providerAuthority = providerAccountAuthoritySchema.parse(providerAuthorityInput);
+    if (
+      providerAuthority.provider !== "codex"
+      || providerAuthority.profileId !== parsedProfileId
+    ) throw new Error("CODEX_USAGE_FAILURE_AUTHORITY_MISMATCH");
     const record = this.#database.transaction(() => {
-      const providerAuthority = this.requireProviderAccountAuthority(parsedProfileId, "codex");
       const observed = this.#database.query(
         "SELECT 1 FROM usage_snapshots WHERE profile_id=? AND source_revision=?",
       ).get(parsedProfileId, parsedRevision);
@@ -15552,6 +16743,21 @@ export class StateStore {
           || existing.reason_code !== parsedReason
         )
       ) throw new Error("Usage failure source revision conflict.");
+      if (existing !== null) {
+        const previousAuthority = this.readCodexUsageAuthorityMetadata(
+          "usage_poll_failure",
+          parsedProfileId,
+          parsedRevision,
+        );
+        if (
+          previousAuthority.mode !== "mutation_authoritative"
+          || (
+            previousAuthority.authority === null
+            || !sameProviderAccountAuthority(previousAuthority.authority, providerAuthority)
+          )
+        ) throw new Error("CODEX_USAGE_FAILURE_AUTHORITY_REPLAY_CONFLICT");
+        return;
+      }
       this.#database.query(
         `INSERT OR IGNORE INTO usage_poll_failures(
            profile_id,account_fingerprint,source_revision,observed_at,reason_code
@@ -15567,8 +16773,8 @@ export class StateStore {
         scopeKind: "usage_poll_failure",
         scopeId: `${parsedProfileId}:${parsedRevision}`,
         authority: providerAuthority,
-        processGeneration: null,
-        provenance: "usage_poll_failure",
+        processGeneration: providerAuthority.processGeneration,
+        provenance: "usage_poll_failure_v36",
         recordedAt: parsedObservedAt,
       });
       this.#database.query(
@@ -15648,11 +16854,10 @@ export class StateStore {
         observed_at: unixMillisecondsSchema,
         payload_json: z.string(),
       }).strict().parse(row);
-      this.#requireAccountScopedProviderAuthority(
+      this.readCodexUsageAuthorityMetadata(
         "usage_snapshot",
-        `${profileId}:${parsed.source_revision}`,
         profileId,
-        null,
+        parsed.source_revision,
       );
       return {
         sourceRevision: parsed.source_revision,
@@ -15725,11 +16930,10 @@ export class StateStore {
         if (parsed.payload_json === null || parsed.reason_code !== null) {
           throw new Error("USAGE_HISTORY_ROW_INVALID");
         }
-        this.#requireAccountScopedProviderAuthority(
+        this.readCodexUsageAuthorityMetadata(
           "usage_snapshot",
-          `${profileId}:${parsed.source_revision}`,
           profileId,
-          null,
+          parsed.source_revision,
         );
         return {
           state: "observed",
@@ -15741,11 +16945,10 @@ export class StateStore {
       if (parsed.payload_json !== null || parsed.reason_code === null) {
         throw new Error("USAGE_HISTORY_ROW_INVALID");
       }
-      this.#requireAccountScopedProviderAuthority(
+      this.readCodexUsageAuthorityMetadata(
         "usage_poll_failure",
-        `${profileId}:${parsed.source_revision}`,
         profileId,
-        null,
+        parsed.source_revision,
       );
       return {
         state: "failed",
@@ -15804,17 +17007,15 @@ export class StateStore {
         observed_at: unixMillisecondsSchema,
         payload_json: z.string(),
       }).strict().parse(row);
-      this.#requireAccountScopedProviderAuthority(
+      this.readCodexUsageAuthorityMetadata(
         "usage_upload_anchor",
-        `${profileId}:${parsed.source_revision}`,
         profileId,
-        null,
+        parsed.source_revision,
       );
-      this.#requireAccountScopedProviderAuthority(
+      this.readCodexUsageAuthorityMetadata(
         "usage_snapshot",
-        `${profileId}:${parsed.source_revision}`,
         profileId,
-        null,
+        parsed.source_revision,
       );
       return {
         sourceRevision: parsed.source_revision,
@@ -15829,11 +17030,10 @@ export class StateStore {
     const parsedProfileId = profileIdSchema.parse(profileId);
     const row = this.#database.query("SELECT source_revision,observed_at,payload_json FROM usage_snapshots WHERE profile_id=? ORDER BY source_revision DESC LIMIT 1").get(parsedProfileId) as { source_revision: number; observed_at: number; payload_json: string } | null;
     if (row === null) return null;
-    this.#requireAccountScopedProviderAuthority(
+    this.readCodexUsageAuthorityMetadata(
       "usage_snapshot",
-      `${parsedProfileId}:${row.source_revision}`,
       parsedProfileId,
-      null,
+      row.source_revision,
     );
     return { sourceRevision: row.source_revision, observedAt: row.observed_at, payload: JSON.parse(row.payload_json) as unknown };
   }
@@ -15856,11 +17056,10 @@ export class StateStore {
       payload_json: string;
     } | null;
     if (row === null) return null;
-    this.#requireAccountScopedProviderAuthority(
+    this.readCodexUsageAuthorityMetadata(
       "usage_snapshot",
-      `${parsedProfileId}:${row.source_revision}`,
       parsedProfileId,
-      null,
+      row.source_revision,
     );
     return {
       sourceRevision: row.source_revision,
@@ -15885,11 +17084,10 @@ export class StateStore {
       reason_code: UsagePollFailureRecord["reasonCode"];
     } | null;
     if (row === null) return null;
-    this.#requireAccountScopedProviderAuthority(
+    this.readCodexUsageAuthorityMetadata(
       "usage_poll_failure",
-      `${parsedProfileId}:${row.source_revision}`,
       parsedProfileId,
-      null,
+      row.source_revision,
     );
     return {
       observedAt: row.observed_at,

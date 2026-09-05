@@ -208,6 +208,7 @@ async function fixture(): Promise<Readonly<{
   const codex = new FakeCodex();
   const usage = await codex.readUsage();
   const sourceSequence = store.allocateNextUsageRevision(current.id);
+  const usageAuthority = store.requireProviderAccountAuthority(current.id, "codex");
   store.recordUsage(current.id, sourceSequence, usage.observedAt, createStoredAccountUsageSnapshot({
     providerPayload: usage.payload,
     sourceSequence,
@@ -217,7 +218,7 @@ async function fixture(): Promise<Readonly<{
     providerGeneration: current.processGeneration,
     daemonGeneration: 1,
     previousPayload: null,
-  }));
+  }), usageAuthority);
   return {
     codex,
     paths,
@@ -759,6 +760,7 @@ describe("state-backed cloud daemon adapter", () => {
       "signed_in",
       { email: secondEmail, plan: "Plus" },
     )).toBe(true);
+    const usageAuthority = value.store.requireProviderAccountAuthority(profile.id, "codex");
     const provider = await value.codex.readUsage();
     value.store.recordUsage(profile.id, 2, 2_000, createStoredAccountUsageSnapshot({
       accountFingerprint: sha256(secondEmail),
@@ -769,7 +771,7 @@ describe("state-backed cloud daemon adapter", () => {
       providerPayload: provider.payload,
       receivedAt: firstReceivedAt + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
       sourceSequence: 2,
-    }));
+    }), usageAuthority);
     value.store.recordUsage(profile.id, 3, 3_000, createStoredAccountUsageSnapshot({
       accountFingerprint: sha256("person@example.com"),
       daemonGeneration: 1,
@@ -779,7 +781,7 @@ describe("state-backed cloud daemon adapter", () => {
       providerPayload: provider.payload,
       receivedAt: firstReceivedAt + 2 * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
       sourceSequence: 3,
-    }));
+    }), usageAuthority);
     expect(value.store.latestUsage(profile.id)).toMatchObject({ sourceRevision: 3 });
 
     const adapter = new StateBackedCloudDaemonAdapter({
@@ -1858,6 +1860,7 @@ describe("state-backed cloud daemon adapter", () => {
     if (head === null) throw new Error("missing usage fixture");
     const firstReceivedAt = storedAccountUsageSnapshotSchema.parse(head.payload)
       .observation.receivedAt;
+    const usageAuthority = value.store.requireProviderAccountAuthority(profile.id, "codex");
     for (const [sourceSequence, observedAt] of [[2, 9_000], [3, 8_000]] as const) {
       const provider = await value.codex.readUsage();
       value.store.recordUsage(profile.id, sourceSequence, observedAt, createStoredAccountUsageSnapshot({
@@ -1870,7 +1873,7 @@ describe("state-backed cloud daemon adapter", () => {
         receivedAt: firstReceivedAt
           + (sourceSequence - 1) * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
         sourceSequence,
-      }));
+      }), usageAuthority);
     }
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,

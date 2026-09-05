@@ -320,6 +320,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
           connectionId,
           fact,
         ),
+        now: this.#now,
         process,
       }),
       connectionId,
