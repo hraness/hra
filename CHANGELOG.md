@@ -2,6 +2,18 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## Unreleased
+
+HRA Web v1 wave 5: session portability. HRA owns a provider-neutral transcript, a session can move between Codex and Claude Code while it runs, and a session can be exported in the letta-ai trajectory v1 shape.
+
+- HRA owns the conversation. A `user_message` session event records exactly what HRA sent and the actor that authored it (`human`, `autorespond`, or `provider_switch`), written after the provider accepted it and bounded with an exact omitted-character count. `item_started` and `item_completed` gain a stable opaque `callId`, so a tool result links to its call, and a bounded `summary` assembled only from labels the protocol layer had already reduced: the item kind, the MCP server and tool names, and the closed-vocabulary command class. Raw tool arguments and raw tool output are still never stored.
+- `src/domain/transcript.ts` reads those events back into an ordered, bounded, paged, provider-neutral conversation with a digest over its canonical serialization. It asks no provider, so a session whose provider thread is gone still has a readable conversation, and it is the single artifact the switch and the export both consume.
+- `hra session switch <session> --provider codex|claude [--preset <preset>] [--account <account>]` moves a live session. It starts the target thread first, then releases the outgoing provider through a new neutral `endSession` port method, then commits the provider, account, preset, provider thread, reviewed runtime profile, and conversation-automation row in one transaction, appends a `provider_switched` event carrying both digests, and seeds the new thread with a capped, clearly labelled handoff summary that states its own omission count. A switch during an active turn, on a quarantined or terminal session, or to a preset the target cannot run is refused with no effect. A target that refuses to start leaves the session exactly where it was.
+- `set_provider {provider, preset?}` joins `set_model` in the hosted command union and runs on the ordinary execution path under the same lease as a turn, because a provider switch is a provider effect rather than local state. It carries no account: account selection stays on the machine that holds the credentials. `hra remote provider` is the CLI form.
+- `hra session export <session> [--format trajectory|json] [--out <path>]` writes the neutral transcript, by default in the letta-ai trajectory v1 shape. That format is import-oriented upstream, so HRA emits it rather than depending on it, and a tool call's `arguments` is a stringified object stating that HRA retained none rather than inventing input.
+- A session's account is no longer fixed for life, so session-event continuity follows the account across a switch instead of failing closed on it. One event page still never mixes two account identities.
+- `docs/providers/portability.md` states what a switch preserves, what it cannot (the provider's hidden state, its native thread, cached context), and the seeding rule.
+
 ## v0.5.0
 
 HRA Web v1 wave 3: interaction detail, wider remote decisions, subagent activity, the Claude Code provider seam, and device commands. Admitted by the immutable release workflow on 2026-09-04.

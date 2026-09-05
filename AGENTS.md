@@ -9,6 +9,7 @@
 - `.agents/plugins/` contains the repository marketplace catalog.
 - `plugins/hra-local-efficiency/` contains the local-only Codex efficiency plugin and its operating skill.
 - `plugins/hra-cloud-efficiency/` contains the Codex Cloud repository-worker routing plugin and its operating skill.
+- `docs/attachments.md` documents message file and image attachments end to end, including the contract a browser client follows.
 - `docs/local-efficiency-plugin.md` documents cross-machine marketplace installation and maintainer validation.
 - `docs/cloud-efficiency-plugin.md` documents Cloud routing, environment profiles, installation, and pilot operation.
 - `README.md`, `SECURITY.md`, `CONTRIBUTING.md`, `WRITING.md`, and `STYLE.md` define the public product and contribution contract.

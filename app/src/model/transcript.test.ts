@@ -133,3 +133,67 @@ describe("deriveTranscript", () => {
     expect(deriveTranscript([], { streamingText: "text", turnId: null })).toEqual([]);
   });
 });
+
+/*
+ * The attachment manifest rides on a compact `user_message`. The projection
+ * that writes it is landing in parallel, so the derivation reads the key off
+ * the event rather than off the type: until the projection carries it, every
+ * message derives `attachments: null` and the transcript is unchanged.
+ */
+describe("attachment manifests on a user message", () => {
+  const withAttachments = (
+    sequence: number,
+    attachments: unknown,
+  ): CompactSessionEvent => ({
+    ...userMessage(sequence, "look at this"),
+    attachments,
+  } as unknown as CompactSessionEvent);
+
+  test("a message with no manifest carries none", () => {
+    const [entry] = deriveTranscript([userMessage(1, "plain")], {
+      streamingText: "",
+      turnId: null,
+    });
+    expect(entry).toMatchObject({ attachments: null, kind: "user", text: "plain" });
+  });
+
+  test("a bounded manifest reaches the entry, with the kind derived", () => {
+    const [entry] = deriveTranscript([withAttachments(1, [{
+      digest: "f".repeat(64),
+      mediaType: "image/png",
+      name: "screenshot.png",
+      size: 4096,
+    }])], { streamingText: "", turnId: null });
+    expect(entry).toMatchObject({
+      attachments: [{
+        digest: "f".repeat(64),
+        kind: "image",
+        mediaType: "image/png",
+        name: "screenshot.png",
+        size: 4096,
+      }],
+      kind: "user",
+    });
+  });
+
+  test("a manifest that fails the bounds renders as no manifest, not as junk", () => {
+    for (const bad of [
+      "screenshot.png",
+      [],
+      [{ digest: "short", mediaType: "image/png", name: "a.png", size: 1 }],
+      [{ bytesBase64: "AQID", digest: "f".repeat(64), mediaType: "image/png", name: "a.png", size: 1 }],
+      Array.from({ length: 9 }, () => ({
+        digest: "f".repeat(64),
+        mediaType: "image/png",
+        name: "a.png",
+        size: 1,
+      })),
+    ]) {
+      const [entry] = deriveTranscript([withAttachments(1, bad)], {
+        streamingText: "",
+        turnId: null,
+      });
+      expect(entry).toMatchObject({ attachments: null, kind: "user" });
+    }
+  });
+});

@@ -85,12 +85,15 @@ export const projectPublicSessionEventBody = (
 ): unknown => {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
   const body = value as Readonly<Record<string, unknown>>;
-  const project = (key: "activeTurnId" | "agentId" | "itemId" | "turnId") => {
+  const project = (key: "activeTurnId" | "agentId" | "callId" | "itemId" | "turnId") => {
     const candidate = body[key];
     return candidate === null
       ? null
       : projector(rawProviderIdentifierSchema.parse(candidate));
   };
+  /** An absent optional identifier stays absent rather than becoming null. */
+  const projectOptional = (key: "callId") =>
+    body[key] === undefined ? {} : { [key]: project(key) };
   switch (body.type) {
     case "session_status": return { ...body, activeTurnId: project("activeTurnId") };
     case "turn_started":
@@ -98,7 +101,13 @@ export const projectPublicSessionEventBody = (
     case "plan_updated":
     case "diff_updated": return { ...body, turnId: project("turnId") };
     case "item_started":
-    case "item_completed":
+    case "item_completed": return {
+      ...body,
+      turnId: project("turnId"),
+      itemId: project("itemId"),
+      ...projectOptional("callId"),
+    };
+    case "user_message": return { ...body, turnId: project("turnId") };
     case "assistant_delta":
     case "reasoning_summary_delta":
     case "tool_progress":

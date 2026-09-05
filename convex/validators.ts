@@ -41,6 +41,7 @@ export const commandKind = v.union(
   v.literal("steer"),
   v.literal("stop"),
   v.literal("set_model"),
+  v.literal("set_provider"),
   v.literal("set_fast"),
   v.literal("resolve_interaction"),
   v.literal("send_or_steer"),
@@ -60,6 +61,18 @@ export const deviceCommandKind = v.union(
   v.literal("account_login_status"),
   v.literal("usage_refresh"),
 );
+/*
+ * A session command payload is one opaque encrypted envelope, so the hosted
+ * side never sees a message, an attachment name, or an attachment byte. What
+ * it does enforce is size: `commandPayloadCiphertextCharacters` is the exact
+ * bound `commands:enqueue` applies to `payload.ciphertext`, and it is what
+ * makes the client-side attachment bounds in `src/cloud/payloads.ts`
+ * (`remoteAttachmentLimits`) fit inside one Convex document with room to
+ * spare. Raising the client bounds without raising this one produces a
+ * rejected command, not a truncated one.
+ */
+export const commandPayloadCiphertextCharacters = 350_000;
+
 export const commandState = v.union(
   v.literal("pending"),
   v.literal("prepared"),

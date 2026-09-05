@@ -50,6 +50,10 @@ import {
 import {
   isPresetSupportedByProvider,
   PresetProviderMismatchError,
+  presetsForProvider,
+  presetTiers,
+  providerSchema,
+  type Preset,
   type Provider,
 } from "../domain/presets";
 import {
@@ -61,7 +65,22 @@ import {
   summarizeSessionTask,
   type SessionTaskPatch,
 } from "../domain/session-tasks";
-import { sessionEventPageSchema, type SessionEventBody, type SessionEventPage } from "../domain/session-events";
+import {
+  SESSION_EVENT_PAGE_LIMIT,
+  SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
+  sessionEventPageSchema,
+  type SessionEvent,
+  type SessionEventBody,
+  type SessionEventPage,
+  type SessionMessageActor,
+} from "../domain/session-events";
+import {
+  buildSessionTranscript,
+  renderTranscriptSeed,
+  sessionTranscriptSchema,
+  TRANSCRIPT_PAGE_LIMIT,
+  type SessionTranscript,
+} from "../domain/transcript";
 import {
   AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT,
   AUTO_RATE_LIMIT_RESET_USED_PERCENT,
@@ -97,6 +116,7 @@ import {
   type WorkPoll,
   type WorkPreparedEffect,
 } from "../domain/work";
+import { resolveMessageAttachments } from "./attachments";
 import { describeWorkProtocol } from "../domain/work-protocol";
 import { workPreparedEffectMessage } from "../domain/work-message";
 import {
@@ -105,6 +125,15 @@ import {
   sessionIdSchema,
   sessionTaskIdSchema,
 } from "../domain/values";
+import {
+  attachmentReferenceOf,
+  type AttachmentReference,
+  type PreparedAttachment,
+} from "../domain/attachments";
+import {
+  ATTACHMENT_BLOB_SWEEP_GRACE_MS,
+  AttachmentBlobStore,
+} from "../storage/attachment-store";
 import { initializeProfilePaths, profilePaths, type StatePaths } from "../storage/paths";
 import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
 import { WorkCapabilityCodec } from "../storage/work-capability";
@@ -120,6 +149,7 @@ import {
   type ProfileRecord,
   type SessionRecord,
   type StateStore,
+  type StoredMessageAttachment,
 } from "../storage/state-store";
 import {
   WorkStoreError,
@@ -532,6 +562,78 @@ const authorityFor = (paths: StatePaths, profile: ProfileRecord): ProfileAuthori
   return { id: profile.id, generation: profile.processGeneration, codexHome: owned.codexHome, desktopUserData: owned.desktopUserData };
 };
 
+/**
+ * Item kinds that are conversation rather than a tool call. Everything else a
+ * provider announces as an item is treated as a tool call, so an unknown kind
+ * still gets its neutral call identity instead of being silently dropped.
+ * `src/domain/transcript.ts` applies the same rule when it reads the events
+ * back, and `session-events.test.ts` pins the two lists equal.
+ */
+export const NEUTRAL_NON_TOOL_ITEM_KINDS = Object.freeze([
+  "agentMessage",
+  "assistantMessage",
+  "reasoning",
+  "subAgentActivity",
+  "userMessage",
+] as const);
+
+const nonToolItemKinds: ReadonlySet<string> = new Set(NEUTRAL_NON_TOOL_ITEM_KINDS);
+
+const isNeutralToolItemKind = (itemKind: string): boolean => !nonToolItemKinds.has(itemKind);
+
+/**
+ * The bounded one-line label HRA keeps for a tool call. It is assembled only
+ * from values the protocol layer already reduced to safe labels: the item
+ * kind, the MCP server and tool names, and the closed-vocabulary command
+ * class. No raw argument reaches it.
+ */
+const neutralToolSummary = (fact: Readonly<{
+  commandClass?: string;
+  itemKind: string;
+  server?: string;
+  tool?: string;
+}>): string => {
+  const target = fact.tool === undefined
+    ? undefined
+    : fact.server === undefined ? fact.tool : `${fact.server}/${fact.tool}`;
+  const detail = fact.commandClass ?? target;
+  return (detail === undefined ? fact.itemKind : `${fact.itemKind}: ${detail}`).slice(0, 256);
+};
+
+/**
+ * The most stored event pages one transcript page reads before it answers.
+ * A transcript is bounded twice: by the records it returns and by the events
+ * it is willing to walk to find them.
+ */
+const TRANSCRIPT_EVENT_PAGE_BUDGET = 20;
+
+/** The turn the handoff seed opened, when the provider named one. */
+const seededTurnId = (value: unknown): string | null => {
+  const parsed = z.object({ turnId: z.string().min(1).max(200) }).safeParse(value);
+  return parsed.success ? parsed.data.turnId : null;
+};
+
+const sessionSwitchReceiptSchema = z.object({
+  providerThreadId: z.string().min(1).max(200),
+  sessionId: sessionIdSchema,
+  toProvider: providerSchema,
+}).strict();
+
+/**
+ * The preset a switch uses when the operator named none: the session's own
+ * tier when the target provider has one, and otherwise that provider's
+ * highest tier. A preset the target cannot run is still refused, never
+ * silently downgraded.
+ */
+const defaultPresetForProviderSwitch = (provider: Provider, current: Preset): Preset => {
+  const supported = presetsForProvider(provider);
+  const sameTier = supported.find((preset) => presetTiers[preset] === presetTiers[current]);
+  const fallback = supported[supported.length - 1];
+  if (sameTier !== undefined) return sameTier;
+  if (fallback === undefined) throw new Error(`No preset exists for the ${provider} provider.`);
+  return fallback;
+};
+
 const loginReceiptSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("pending"),
@@ -665,6 +767,7 @@ type RemoteSessionCommand = Extract<LocalCommand, { kind:
   | "session.stop"
   | "session.rename"
   | "session.preset"
+  | "session.switch"
   | "session.fast"
   | "interaction.resolve"
 }>;
@@ -684,6 +787,7 @@ const restoreLoginReceipt = (value: unknown): LoginOutcome => {
 /** Background tasks that swallow their own rejection record one of these closed codes. */
 export const BACKGROUND_DIAGNOSTIC_CODES = [
   "account_fact_apply_failed",
+  "attachment_sweep_failed",
   "autorespond_failed",
   "claude_fact_untranslatable",
   "prose_autorespond_failed",
@@ -693,7 +797,9 @@ export const BACKGROUND_DIAGNOSTIC_CODES = [
   "session_state_tracking_failed",
   "usage_refresh_failed",
   "usage_poll_account_failed",
+  "provider_switch_seed_failed",
   "usage_poll_tick_failed",
+  "user_message_record_failed",
 ] as const;
 export type BackgroundDiagnosticCode = (typeof BACKGROUND_DIAGNOSTIC_CODES)[number];
 export type BackgroundDiagnosticCause =
@@ -725,6 +831,7 @@ const SESSION_FACT_EPOCH_LIMIT = 4_096;
 export class HraService {
   readonly #store: StateStore;
   readonly #paths: StatePaths;
+  #attachmentBlobs: AttachmentBlobStore | undefined;
   readonly #codex: CodexRuntimePort;
   readonly #claude: ClaudeRuntimePort;
   readonly #claudeFacts: ClaudeSessionFactTranslator;
@@ -1059,9 +1166,9 @@ export class HraService {
           });
         }
         case "session.start": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#startSession({ ...command, account: profile.id }, context.signal)); }
-        case "session.send": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#send(session.id, command.message, command.idempotencyKey, context.signal)); }
-        case "session.queue": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#queue(session.id, command.message, command.idempotencyKey)); }
-        case "session.steer": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#steer(session.id, command.message, command.idempotencyKey, context.signal)); }
+        case "session.send": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#send(session.id, command.message, command.idempotencyKey, context.signal, undefined, "human", command.attachments ?? [])); }
+        case "session.queue": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#queue(session.id, command.message, command.idempotencyKey, undefined, command.attachments ?? [])); }
+        case "session.steer": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#steer(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? [])); }
         case "session.stop": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#stop(session.id, command.idempotencyKey, context.signal)); }
         case "session.rename": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#rename(session.id, command.name, command.idempotencyKey, context.signal)); }
         case "session.recover": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#resolveSessionRecovery(session.id, "recover", context.signal)); }
@@ -1081,6 +1188,8 @@ export class HraService {
         case "session.note.set": return { session: await this.#updateSession(command.session, (session) => ({ note: command.note, expectedRevision: session.revision })) };
         case "session.note.clear": return { session: await this.#updateSession(command.session, (session) => ({ note: "", expectedRevision: session.revision })) };
         case "session.preset": return { session: await this.#updateSession(command.session, (session) => ({ preset: command.preset, expectedRevision: session.revision })) };
+        case "session.switch": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#switchProvider(command, context.signal)); }
+        case "session.transcript": return this.#readTranscript(command.session, command.after, command.limit);
         case "session.fast": return { session: await this.#updateSession(command.session, (session) => ({ fastEnabled: command.enabled, expectedRevision: session.revision })) };
         case "session.project": {
           const project = this.#store.requireProject(command.project);
@@ -1499,9 +1608,9 @@ export class HraService {
       }
       this.#assertSignedIn(profile);
       switch (command.kind) {
-        case "session.send": return await this.#send(session.id, command.message, command.idempotencyKey, context.signal);
-        case "session.queue": return await this.#queue(session.id, command.message, command.idempotencyKey);
-        case "session.steer": return await this.#steer(session.id, command.message, command.idempotencyKey, context.signal);
+        case "session.send": return await this.#send(session.id, command.message, command.idempotencyKey, context.signal, undefined, "human", command.attachments ?? []);
+        case "session.queue": return await this.#queue(session.id, command.message, command.idempotencyKey, undefined, command.attachments ?? []);
+        case "session.steer": return await this.#steer(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? []);
         case "session.stop": return await this.#stop(session.id, command.idempotencyKey, context.signal);
         case "session.rename": return await this.#rename(session.id, command.name, command.idempotencyKey, context.signal);
         case "session.preset": return {
@@ -1511,6 +1620,7 @@ export class HraService {
             sessionId: session.id,
           }),
         };
+        case "session.switch": return await this.#switchProvider(command, context.signal);
         case "session.fast": return {
           session: this.#store.updateSessionMetadata({
             expectedRevision: session.revision,
@@ -3088,6 +3198,15 @@ export class HraService {
             kind: fact.subagent.kind,
           };
         }
+        // A tool-shaped item carries the stable call identity a later result
+        // binds back to, plus a classified one-line summary. Both are built
+        // only from fields the protocol layer already reduced to safe labels.
+        const toolIdentity = isNeutralToolItemKind(fact.itemKind)
+          ? {
+              callId: fact.itemId,
+              summary: neutralToolSummary(fact),
+            }
+          : {};
         return fact.type === "itemStarted"
           ? {
               type: "item_started",
@@ -3099,6 +3218,7 @@ export class HraService {
               ...(fact.liveAcceptanceCommandDigest === undefined
                 ? {}
                 : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
+              ...toolIdentity,
             }
           : {
               type: "item_completed",
@@ -3111,6 +3231,7 @@ export class HraService {
                 ? {}
                 : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
               ...(fact.status === undefined ? {} : { status: fact.status }),
+              ...toolIdentity,
             };
       }
       // Only a spawned subagent thread reaches here, and only its bounded
@@ -6417,6 +6538,27 @@ export class HraService {
     };
   }
 
+  /*
+   * Adds each user message`s attachment manifest to a provider projection.
+   * The manifest names the file, its declared media type, its length, and its
+   * digest; the bytes stay in local custody and never enter a projection, a
+   * rendered result, or a log.
+   */
+  #withAttachmentManifests(
+    sessionId: SessionRecord["id"],
+    projection: CodexSessionProjection,
+  ): CodexSessionProjection {
+    const messages = projection.messages;
+    if (messages === undefined || messages.length === 0) return projection;
+    const enriched = messages.map((message) => {
+      if (message.role !== "user" || message.clientId === undefined) return message;
+      const manifest = this.#store.messageAttachmentManifest(sessionId, message.clientId);
+      return manifest.length === 0 ? message : { ...message, attachments: manifest };
+    });
+    const changed = enriched.some((message, index) => message !== messages[index]);
+    return changed ? { ...projection, messages: enriched } : projection;
+  }
+
   async #showSession(selector: string, detail: boolean, signal: AbortSignal): Promise<unknown> {
     const session = this.#store.requireSession(selector);
     if (session.providerThreadId === undefined) return { session, effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null };
@@ -6431,7 +6573,8 @@ export class HraService {
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettled(session.id);
     await this.#daemonAuthority.assertCurrent();
-    const projection = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: authorityFor(this.#paths, profile), providerThreadId, detail, signal }));
+    const observed = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: authorityFor(this.#paths, profile), providerThreadId, detail, signal }));
+    const projection = this.#withAttachmentManifests(session.id, observed);
     if (projectionRecoveryUnsettled || this.#projectionRecoveriesInFlight.has(session.id)) {
       const runtimeProfile = this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null;
       const coherentSession = this.#store.requireSession(session.id);
@@ -6594,15 +6737,346 @@ export class HraService {
     };
   }
 
+  /**
+   * Read one bounded page of the provider-neutral conversation.
+   *
+   * Everything here comes from HRA's own event stream. Nothing asks a
+   * provider, so a session whose provider thread is gone, whose provider is
+   * unavailable, or which has already been switched still answers.
+   */
+  #readTranscript(
+    selector: string,
+    after: number | undefined,
+    limit: number,
+  ): SessionTranscript {
+    const session = this.#store.requireSession(selector);
+    const events: SessionEvent[] = [];
+    let cursor = after ?? null;
+    let exhausted = false;
+    for (let page = 0; page < TRANSCRIPT_EVENT_PAGE_BUDGET; page += 1) {
+      const list = this.#store.listSessionEvents({
+        sessionId: session.id,
+        afterSequence: cursor,
+        limit: SESSION_EVENT_PAGE_LIMIT,
+      });
+      if (list.events.length === 0) {
+        exhausted = true;
+        break;
+      }
+      events.push(...list.events);
+      cursor = list.events[list.events.length - 1]?.sequence ?? cursor;
+      if (page === TRANSCRIPT_EVENT_PAGE_BUDGET - 1) break;
+    }
+    const transcript = buildSessionTranscript({ sessionId: session.id, events, limit });
+    const nextSequence = transcript.nextSequence !== null
+      ? transcript.nextSequence
+      : exhausted || transcript.throughSequence === null
+        ? null
+        : transcript.throughSequence + 1;
+    return sessionTranscriptSchema.parse({ ...transcript, nextSequence });
+  }
+
+  /**
+   * Move one live conversation from its current provider to another one.
+   *
+   * What this does, in order: refuse an unsafe or impossible switch, build the
+   * neutral transcript and render the bounded handoff seed from it, release
+   * the outgoing provider's hold on the thread, start a thread on the target
+   * provider and account, commit the whole rebinding in one transaction,
+   * append the `provider_switched` record, and send the seed as the first user
+   * message of the new thread.
+   *
+   * What it cannot do is carry the provider's own state across. The target
+   * gets HRA's record of the conversation, not the source provider's thread,
+   * hidden reasoning, or cached context — `docs/providers/portability.md`
+   * states that boundary.
+   */
+  async #switchProvider(
+    command: Extract<LocalCommand, { kind: "session.switch" }>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const session = this.#requireBoundSession(command.session);
+    const currentProfile = this.#store.requireProfile(session.profileId);
+    const targetProfile = command.account === undefined
+      ? currentProfile
+      : this.#store.requireProfile(command.account);
+    this.#assertSignedIn(targetProfile);
+    if (
+      session.provider === command.provider
+      && targetProfile.id === currentProfile.id
+      && (command.preset === undefined || command.preset === session.preset)
+    ) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        `That session already runs on ${command.provider} with the \`${session.preset}\` preset.`,
+      );
+    }
+    // A switch mid-turn would strand the running turn on the outgoing
+    // provider with no way to attribute its result.
+    if (session.state === "active" || session.activeTurnId !== undefined) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "That session has an active turn. Stop it with `hra session stop` before switching provider.",
+      );
+    }
+    if (session.state === "recovery_required" || session.state === "terminal") {
+      throw new CommandFailure(
+        "CONFLICT",
+        `A ${session.state === "terminal" ? "terminal" : "quarantined"} session cannot switch provider.`,
+      );
+    }
+    const preset = command.preset ?? defaultPresetForProviderSwitch(command.provider, session.preset);
+    if (!isPresetSupportedByProvider(command.provider, preset)) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        new PresetProviderMismatchError(command.provider, preset).message,
+      );
+    }
+    const project = session.projectId === undefined
+      ? undefined
+      : this.#store.requireProject(session.projectId);
+    const projectRoot = project === undefined
+      ? undefined
+      : await this.#requireUsableProjectRoot(project.rootPath);
+
+    const transcript = this.#readTranscript(session.id, undefined, TRANSCRIPT_PAGE_LIMIT);
+    const seed = renderTranscriptSeed({
+      transcript,
+      fromProvider: session.provider,
+      toProvider: command.provider,
+    });
+
+    const runtime = this.#sessionRuntime(command.provider);
+    const key = command.idempotencyKey ?? randomUUID();
+    const fromProvider = session.provider;
+    const fromPreset = session.preset;
+    let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
+    let started:
+      | (CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile })
+      | undefined;
+    const outcome = await this.#effect<z.infer<typeof sessionSwitchReceiptSchema>>({
+      kind: "session.switch",
+      authorityId: session.id,
+      authorityGeneration: targetProfile.processGeneration,
+      request: {
+        provider: command.provider,
+        preset,
+        targetProfileId: targetProfile.id,
+        seedDigest: seed.digest,
+      },
+      idempotencyKey: key,
+      effect: async () => {
+        // The target thread is started before the source is released. A target
+        // that refuses then leaves the session exactly where it was, still
+        // observed and still runnable, instead of stranding it with a released
+        // thread it can no longer resume.
+        review = await this.#fencedEffect(async () => await runtime.reviewSessionStart({
+          authority: authorityFor(this.#paths, targetProfile),
+          ...(projectRoot === undefined ? {} : { projectRoot }),
+          preset,
+          fast: session.fastEnabled,
+          signal,
+        }));
+        const runtimeReview = review;
+        started = await this.#fencedEffect(async () => await runtime.startSession({
+          authority: authorityFor(this.#paths, targetProfile),
+          ...(projectRoot === undefined ? {} : { projectRoot }),
+          review: runtimeReview,
+          signal,
+        }));
+        // Now release the outgoing provider: a per-session runtime process is
+        // stopped rather than left running behind an abandoned thread.
+        await this.#endProviderSession(session, currentProfile, signal);
+        return {
+          providerThreadId: started.providerThreadId,
+          sessionId: session.id,
+          toProvider: command.provider,
+        };
+      },
+      receipt: (value) => sessionSwitchReceiptSchema.parse(value),
+      restore: (value) => sessionSwitchReceiptSchema.parse(value),
+      commit: (attemptId) => {
+        if (started === undefined) {
+          throw new Error("Provider switch commit lost its exact provider projection.");
+        }
+        const current = this.#store.requireSession(session.id);
+        this.#store.completeSessionProviderSwitch({
+          attemptId,
+          sessionId: current.id,
+          expectedSessionRevision: current.revision,
+          provider: command.provider,
+          profileId: targetProfile.id,
+          preset,
+          providerThreadId: started.providerThreadId,
+          state: started.status,
+          ...(started.activeTurnId === undefined ? {} : { activeTurnId: started.activeTurnId }),
+          ...(started.providerUpdatedAt === undefined
+            ? {}
+            : { providerUpdatedAt: started.providerUpdatedAt }),
+          runtimeProfile: started.effectiveRuntimeProfile,
+          receipt: {
+            providerThreadId: started.providerThreadId,
+            sessionId: current.id,
+            toProvider: command.provider,
+          },
+        });
+      },
+      onAmbiguous: () => this.#quarantineSession(session.id),
+    });
+
+    const switched = this.#store.requireSession(outcome.sessionId);
+    this.#appendSessionEvent(
+      authorityFor(this.#paths, targetProfile),
+      switched.id,
+      null,
+      {
+        type: "provider_switched",
+        fromProvider,
+        toProvider: command.provider,
+        fromPreset,
+        toPreset: preset,
+        accountChanged: targetProfile.id !== currentProfile.id,
+        transcriptDigest: transcript.digest,
+        seedDigest: seed.digest,
+        seedOmittedRecords: seed.omittedRecords,
+      },
+    );
+    await this.#ensureSessionObservedLocked(switched.id, signal);
+    // The handoff summary is an ordinary first turn on the new thread, so it
+    // records its own `user_message` and produces an ordinary reply. The
+    // rebinding is already durable at this point, so a seed the new provider
+    // refuses is reported as an undelivered seed rather than raised as a
+    // failed switch the operator would wrongly retry.
+    let seeded: unknown;
+    let seedFailure: string | undefined;
+    try {
+      seeded = await this.#send(
+        switched.id,
+        seed.text,
+        undefined,
+        signal,
+        undefined,
+        "provider_switch",
+      );
+    } catch (error: unknown) {
+      seedFailure = error instanceof CommandFailure
+        ? error.code
+        : error instanceof Error ? error.name : "error";
+      this.recordBackgroundDiagnostic("provider_switch_seed_failed", error);
+    }
+    return {
+      session: this.#store.requireSession(switched.id),
+      from: { provider: fromProvider, preset: fromPreset, account: currentProfile.id },
+      to: { provider: command.provider, preset, account: targetProfile.id },
+      seed: {
+        delivered: seedFailure === undefined,
+        digest: seed.digest,
+        ...(seedFailure === undefined ? {} : { failureCode: seedFailure }),
+        includedRecords: seed.includedRecords,
+        omittedRecords: seed.omittedRecords,
+      },
+      transcriptDigest: transcript.digest,
+      turnId: seededTurnId(seeded),
+      idempotencyKey: key,
+    };
+  }
+
+  /**
+   * Release the outgoing provider's hold on a session's thread and close
+   * HRA's live view of it. The thread itself is never deleted.
+   */
+  async #endProviderSession(
+    session: SessionRecord & { providerThreadId: string },
+    profile: ProfileRecord,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const connectionId = this.#sessionProviderConnections.get(session.id) ?? null;
+    this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
+      accountId: profile.id,
+      providerConnectionId: connectionId,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    }));
+    this.#appendSessionEvent(authorityFor(this.#paths, profile), session.id, connectionId, {
+      type: "connection",
+      state: "disconnected",
+      reason: "provider switch",
+    });
+    this.#sessionProviderConnections.delete(session.id);
+    this.#sessionObservationFailures.delete(session.id);
+    this.#sessionResubscriptionConnections.delete(session.id);
+    this.#sessionsAwaitingResubscription.delete(session.id);
+    this.#forgetSessionFactEpoch(session.id);
+    await this.#runtimeForSession(session).endSession({
+      authority: authorityFor(this.#paths, profile),
+      providerThreadId: session.providerThreadId,
+      signal,
+    });
+  }
+
+  /*
+   * Local attachment custody for one message.
+   *
+   * The command carries digests, never paths and never bytes. This reads the
+   * bytes back from the content-addressed store, re-proves each digest, and
+   * re-runs the same admission the ingest path ran. An attachment that is not
+   * in custody on this machine, or whose bytes no longer match what its
+   * reference claims, refuses the whole command before any provider effect.
+   */
+  #blobs(): AttachmentBlobStore {
+    this.#attachmentBlobs ??= AttachmentBlobStore.forStatePaths(this.#paths);
+    return this.#attachmentBlobs;
+  }
+
+  /*
+   * Bounded attachment custody maintenance. It runs only after a message that
+   * actually carried attachments, so a text-only daemon never pays for it.
+   *
+   * First it drops accounting rows that no message references any more — a
+   * session was deleted, or the per-session manifest cap pruned the oldest
+   * source — and removes their blobs. Then it removes blob files that local
+   * custody does not account for at all, which is how a blob written for a
+   * command that never reached the daemon is reclaimed. Blobs younger than
+   * the grace window are never touched, so an in-flight command is safe.
+   */
+  async #sweepAttachmentCustody(active: boolean): Promise<void> {
+    if (!active) return;
+    try {
+      const blobs = this.#blobs();
+      for (const row of this.#store.listUnreferencedAttachments(64)) {
+        await blobs.remove(row.digest, row.canonicalMediaType);
+        this.#store.forgetAttachment(row.digest);
+      }
+      await blobs.sweepUnaccounted(
+        this.#store.accountedAttachmentDigests(),
+        ATTACHMENT_BLOB_SWEEP_GRACE_MS,
+        Date.now(),
+      );
+    } catch (error: unknown) {
+      this.recordBackgroundDiagnostic("attachment_sweep_failed", error);
+    }
+  }
+
+  async #prepareAttachments(
+    references: readonly AttachmentReference[],
+  ): Promise<Readonly<{ stored: readonly StoredMessageAttachment[]; values: readonly PreparedAttachment[] }>> {
+    if (references.length === 0) return { stored: [], values: [] };
+    const resolved = await resolveMessageAttachments(this.#blobs(), references);
+    if (resolved.kind === "refused") throw new CommandFailure("INVALID_INPUT", resolved.message);
+    return { stored: resolved.stored, values: resolved.values };
+  }
+
   async #send(
     selector: string,
     message: string,
     idempotencyKey: string | undefined,
     signal: AbortSignal,
     beforeEffect?: (attemptId: MutationAttemptRecord["id"]) => void,
-    actor: "human" | "autorespond" = "human",
+    actor: SessionMessageActor = "human",
+    attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
+    const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
@@ -6619,7 +7093,7 @@ export class HraService {
     let dispatchSessionRevision: number | undefined;
     let dispatchFactEpoch: number | undefined;
     let startedResult: { turnId: string; status: "completed" | "interrupted" | "failed" | "inProgress"; effectiveRuntimeProfile: ReviewedRuntimeProfile } | undefined;
-    const result = await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message }, idempotencyKey: key, effect: async (attemptId) => {
+    const result = await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, effect: async (attemptId) => {
       if (baseline === undefined || review === undefined) throw new Error("Session send lost its exact pre-effect provider baseline or runtime review.");
       const runtimeReview = review;
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
@@ -6633,6 +7107,7 @@ export class HraService {
           ...(projectRoot === undefined ? {} : { projectRoot }),
           review: runtimeReview,
           message,
+          ...(attachments.values.length === 0 ? {} : { attachments: attachments.values }),
           clientMessageId: attemptId,
           signal,
         });
@@ -6674,6 +7149,13 @@ export class HraService {
           runtimeProfile: review.effectiveRuntimeProfile,
         },
       });
+      if (attachments.stored.length > 0) {
+        this.#store.recordMessageAttachments({
+          attachments: attachments.stored,
+          sessionId: session.id,
+          sourceId: attemptId,
+        });
+      }
       dispatchSessionRevision = this.#store.requireSession(session.id).revision;
       dispatchFactEpoch = this.#snapshotSessionFactEpoch(session.id);
     }, receipt: (value) => turnStartReceiptSchema.parse(value), restore: (value) => turnStartReceiptSchema.parse(value), commit: (attemptId, _value, receipt) => {
@@ -6689,9 +7171,52 @@ export class HraService {
         receipt,
       });
     }, onAmbiguous: () => this.#quarantineSession(session.id) });
+    await this.#sweepAttachmentCustody(attachments.values.length > 0);
     const reconciled = this.#store.requireSession(session.id);
+    this.#recordUserMessage(reconciled.id, profile, result.turnId, actor, message);
     if (reconciled.state === "idle") this.#scheduleQueueDispatch(reconciled);
-    return { session: reconciled, turnId: result.turnId, effectiveRuntimeProfile: result.effectiveRuntimeProfile ?? null, idempotencyKey: key };
+    return {
+      session: reconciled,
+      turnId: result.turnId,
+      effectiveRuntimeProfile: result.effectiveRuntimeProfile ?? null,
+      ...(attachments.values.length === 0
+        ? {}
+        : { attachments: attachments.values.map(attachmentReferenceOf) }),
+      idempotencyKey: key,
+    };
+  }
+
+  /**
+   * Append the neutral record of one message HRA sent. It is written after the
+   * provider accepted the message, so the transcript never claims HRA sent
+   * something the provider rejected, and it carries the exact actor that
+   * authored it. A failure here is a background diagnostic: an already
+   * dispatched turn is never failed for a missing transcript record.
+   */
+  #recordUserMessage(
+    sessionId: SessionRecord["id"],
+    profile: ProfileRecord,
+    turnId: string | null,
+    actor: SessionMessageActor,
+    message: string,
+  ): void {
+    try {
+      const text = message.slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS);
+      this.#appendSessionEvent(
+        authorityFor(this.#paths, profile),
+        sessionId,
+        this.#sessionProviderConnections.get(sessionId) ?? null,
+        {
+          type: "user_message",
+          turnId,
+          actor,
+          text,
+          omittedCharacters: message.length - text.length,
+        },
+      );
+    } catch (error: unknown) {
+      this.recordBackgroundDiagnostic("user_message_record_failed", error);
+    }
   }
 
   async #steer(
@@ -6700,8 +7225,10 @@ export class HraService {
     idempotencyKey: string | undefined,
     signal: AbortSignal,
     beforeEffect?: (attemptId: MutationAttemptRecord["id"]) => void,
+    attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
+    const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
     this.#requireLiveProviderObservation(
@@ -6710,10 +7237,10 @@ export class HraService {
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let activeTurnId: string | undefined;
-    const result = await this.#effect({ kind: "session.steer", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message }, idempotencyKey: key, effect: async (attemptId) => {
+    const result = await this.#effect({ kind: "session.steer", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, effect: async (attemptId) => {
       if (activeTurnId === undefined) throw new CommandFailure("CONFLICT", "The session has no active turn to steer.");
       const turnId = activeTurnId;
-      await this.#fencedEffect(async () => await this.#runtimeForSession(session).steer({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, message, clientMessageId: attemptId, signal }));
+      await this.#fencedEffect(async () => await this.#runtimeForSession(session).steer({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, message, ...(attachments.values.length === 0 ? {} : { attachments: attachments.values }), clientMessageId: attemptId, signal }));
       return { steered: true as const, activeTurnId: turnId };
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
@@ -6733,8 +7260,24 @@ export class HraService {
           messageDigest: digestText(message),
         },
       });
+      if (attachments.stored.length > 0) {
+        this.#store.recordMessageAttachments({
+          attachments: attachments.stored,
+          sessionId: session.id,
+          sourceId: attemptId,
+        });
+      }
     }, receipt: (value) => steeredReceiptSchema.parse(value), restore: (value) => steeredReceiptSchema.parse(value), onAmbiguous: () => this.#quarantineSession(session.id) });
-    return { steered: true, turnId: result.activeTurnId, idempotencyKey: key };
+    this.#recordUserMessage(session.id, profile, result.activeTurnId, "human", message);
+    await this.#sweepAttachmentCustody(attachments.values.length > 0);
+    return {
+      steered: true,
+      turnId: result.activeTurnId,
+      ...(attachments.values.length === 0
+        ? {}
+        : { attachments: attachments.values.map(attachmentReferenceOf) }),
+      idempotencyKey: key,
+    };
   }
 
   async #queue(
@@ -6742,19 +7285,37 @@ export class HraService {
     message: string,
     idempotencyKey: string | undefined,
     beforeEffect?: () => void,
+    attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
+    // Custody is proved before anything durable exists, so a queue entry never
+    // outlives the attachments it references.
+    const attachments = await this.#prepareAttachments(attachmentReferences);
     const key = idempotencyKey ?? randomUUID();
     // Work authorization and durable enqueue are one synchronous fence boundary.
     beforeEffect?.();
     const queued = this.#store.enqueueIdempotent({ sessionId: session.id, profileGeneration: profile.processGeneration, message, idempotencyKey: key });
+    if (attachments.stored.length > 0) {
+      this.#store.recordMessageAttachments({
+        attachments: attachments.stored,
+        sessionId: session.id,
+        sourceId: queued.id,
+      });
+    }
+    await this.#sweepAttachmentCustody(attachments.values.length > 0);
     const observed = this.#store.requireSession(session.id);
     if (queued.state === "pending" && observed.state === "idle") {
       this.#scheduleQueueDispatch(observed);
     }
-    return { queued, idempotencyKey: key };
+    return {
+      queued,
+      ...(attachments.values.length === 0
+        ? {}
+        : { attachments: attachments.values.map(attachmentReferenceOf) }),
+      idempotencyKey: key,
+    };
   }
 
   #scheduleQueueDispatch(session: SessionRecord): void {
@@ -7324,6 +7885,11 @@ export class HraService {
           signal,
         });
       });
+      // The queued manifest is durable; its bytes are re-proved here, at
+      // dispatch, exactly as they were at enqueue.
+      const queuedAttachments = await this.#prepareAttachments(
+        this.#store.messageAttachmentManifest(session.id, queued.id),
+      );
       evidence = this.#store.beginQueueEffect({
         queueId: queued.id,
         sessionId: session.id,
@@ -7351,6 +7917,9 @@ export class HraService {
           projectRoot,
           review,
           message: queued.message,
+          ...(queuedAttachments.values.length === 0
+            ? {}
+            : { attachments: queuedAttachments.values }),
           clientMessageId: queued.id,
           signal,
         });

@@ -3,6 +3,7 @@
 - Command modules map strict argv into one domain intent.
 - Renderers produce stable human output or versioned JSON.
 - Exit codes map closed domain failures to shell behavior.
+- `--attach` collects file paths; the composition entry stores each file and reissues the command with digest references, so no path ever crosses the local socket.
 
 # Guidelines
 

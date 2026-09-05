@@ -11,10 +11,16 @@
  * Nothing in this file touches React.
  */
 import type { CompactMessageActor, CompactSessionEvent, GitAction } from "../hra/cloud";
+import { parseAttachmentManifest, type AttachmentManifestEntry } from "./attachments";
 
 export type TranscriptEntry =
   | Readonly<{
       actor: CompactMessageActor;
+      /**
+       * The bounded manifest a `user_message` may carry: name, media type,
+       * size, and digest, never bytes. Null when the message had none.
+       */
+      attachments: readonly AttachmentManifestEntry[] | null;
       key: string;
       kind: "user";
       text: string;
@@ -52,6 +58,24 @@ function gitActionLabels(actions: readonly GitAction[]): readonly string[] {
   return actions.map((action) => action.label ?? action.kind);
 }
 
+/**
+ * The attachment manifest on a compact `user_message`, parsed from `unknown`.
+ *
+ * The field is read off the event rather than off the type on purpose. The
+ * daemon-side projection is being widened in parallel, and until it is,
+ * `parseCompactSessionEvent` drops the key and this returns null: the transcript
+ * renders exactly as it does today. When the projection starts carrying the
+ * manifest, nothing here changes. `parseAttachmentManifest` bounds it and
+ * refuses any entry that carries bytes, so a projection that started shipping
+ * image data would render nothing rather than being trusted.
+ */
+function readAttachmentManifest(
+  event: CompactSessionEvent,
+): readonly AttachmentManifestEntry[] | null {
+  const record = event as unknown as Readonly<Record<string, unknown>>;
+  return parseAttachmentManifest(record.attachments);
+}
+
 export type LiveTurn = Readonly<{
   streamingText: string;
   turnId: string | null;
@@ -73,6 +97,7 @@ export function deriveTranscript(
       case "user_message":
         entries.push({
           actor: event.actor ?? "human",
+          attachments: readAttachmentManifest(event),
           key: `compact-${String(event.sequence)}`,
           kind: "user",
           text: event.text,

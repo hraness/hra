@@ -1,3 +1,4 @@
+import type { AttachmentManifestEntry, PreparedAttachment } from "../domain/attachments";
 import type { Preset, Provider } from "../domain/presets";
 import type {
   EffectiveClaudeRuntimeProfile,
@@ -66,6 +67,13 @@ export type CodexProjectedMessage = {
   turnId?: string;
   clientId?: string;
   omission?: ProjectionTextOmission;
+  /**
+   * The bounded manifest of what the human attached to this message: name,
+   * declared media type, length, and digest. Never bytes. Absent unless local
+   * custody recorded attachments for this message`s client id, so a message
+   * without attachments projects exactly as it did before.
+   */
+  attachments?: readonly AttachmentManifestEntry[];
 };
 
 export type CodexTurnSummary = {
@@ -149,9 +157,19 @@ export interface SessionRuntimePort<Profile> {
   startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: Profile }>;
   observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation>;
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
+  /**
+   * Release this runtime's hold on one provider thread without deleting it.
+   * `hra session switch` calls it on the provider a session is leaving, so a
+   * runtime that owns a per-session process stops that process instead of
+   * leaking it. It never destroys the user's thread: a switched-away Codex
+   * thread stays exactly where it is on the provider.
+   */
+  endSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<void>;
   reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
-  startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; message: string; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurnStatus; effectiveRuntimeProfile: Profile }>;
-  steer(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; message: string; clientMessageId: string; signal: AbortSignal }): Promise<void>;
+  // `attachments` is absent unless the message carried one, so every
+  // existing text-only turn reaches the provider byte for byte as before.
+  startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; message: string; attachments?: readonly PreparedAttachment[]; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurnStatus; effectiveRuntimeProfile: Profile }>;
+  steer(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; message: string; attachments?: readonly PreparedAttachment[]; clientMessageId: string; signal: AbortSignal }): Promise<void>;
   interrupt(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; signal: AbortSignal }): Promise<void>;
   inspectInteractionAuthority(input: {
     authority: ProfileAuthority;
@@ -313,6 +331,7 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  endSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewTurnStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   startTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
   steer(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -367,6 +386,7 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  endSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewTurnStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   startTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
   steer(): Promise<never> { return Promise.reject(this.#unavailable()); }

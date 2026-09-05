@@ -879,6 +879,13 @@ type CodexFactBody =
       readonly turnId: string;
       readonly itemId: string;
       readonly itemKind: string;
+      /**
+       * The closed-vocabulary class of an executed command, from the same
+       * classifier the command-approval display uses. It is a label such as
+       * `git commit` or `command`, never the command itself: HRA does not
+       * retain raw tool arguments.
+       */
+      readonly commandClass?: string;
       readonly liveAcceptanceCommandDigest?: string;
       readonly status?: string;
       readonly server?: string;
@@ -3110,6 +3117,9 @@ export function parseFact(method: string, params: unknown): CodexFact {
     const liveAcceptanceCommandDigest = itemKind === "commandExecution"
       ? safeLiveAcceptanceCommandDigest(string(item.command, "command", { max: 1_000_000 }))
       : undefined;
+    const commandClass = itemKind === "commandExecution" && item.command !== undefined
+      ? classifyApprovalCommand(item.command)
+      : undefined;
     const subagent = itemKind === "subAgentActivity"
       ? {
           agentThreadId: identifier(item.agentThreadId, "subagent thread id"),
@@ -3122,6 +3132,7 @@ export function parseFact(method: string, params: unknown): CodexFact {
       turnId: identifier(root.turnId, "turn id"),
       itemId: identifier(item.id, "thread item id"),
       itemKind,
+      ...(commandClass === undefined ? {} : { commandClass }),
       ...(liveAcceptanceCommandDigest === undefined ? {} : { liveAcceptanceCommandDigest }),
       ...(status === undefined ? {} : { status }),
       ...(server === undefined ? {} : { server }),

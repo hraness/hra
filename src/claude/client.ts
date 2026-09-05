@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import type { PreparedAttachment } from "../domain/attachments.ts";
 import { ClaudeDeltaAssembler, type ClaudeFact } from "./assembler.ts";
 import { ClaudeError } from "./errors.ts";
 import { ClaudeJsonLineDecoder } from "./jsonl.ts";
@@ -87,20 +88,27 @@ export class ClaudeStreamClient {
   }
 
   /** Starts a turn: HRA mints the turn id, then writes the turn's `user` line. */
-  async startTurn(input: Readonly<{ turnId: string; message: string }>): Promise<void> {
+  async startTurn(input: Readonly<{
+    turnId: string;
+    message: string;
+    attachments?: readonly PreparedAttachment[];
+  }>): Promise<void> {
     this.#assertOpen();
     const facts = this.#assembler.beginTurn(input.turnId);
-    await this.#write(claudeUserLine(input.message));
+    await this.#write(claudeUserLine(input.message, input.attachments ?? []));
     for (const fact of facts) await this.#onFact(fact);
   }
 
   /** Steering is the same wire shape: another `user` line while a turn runs. */
-  async steer(message: string): Promise<void> {
+  async steer(
+    message: string,
+    attachments: readonly PreparedAttachment[] = [],
+  ): Promise<void> {
     this.#assertOpen();
     if (this.#assembler.activeTurnId === null) {
       throw new ClaudeError("INVALID_INPUT", "No Claude turn is in flight to steer");
     }
-    await this.#write(claudeUserLine(message));
+    await this.#write(claudeUserLine(message, attachments));
   }
 
   /** Asks the runtime to stop the in-flight turn. Its `result` reads interrupted. */

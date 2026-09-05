@@ -1282,6 +1282,142 @@ describe("StateStore", () => {
       .toMatchObject({ profile: claudeProfile });
   });
 
+  test("rebinds a session to another provider and account in one transaction", async () => {
+    const { store, home } = await fixture();
+    const codexAccount = signInProfile(store, "Codex account", "codex@example.com");
+    const claudeAccount = signInProfile(store, "Claude account", "claude@example.com");
+    const projectRoot = join(home, "switch-project");
+    await mkdir(projectRoot);
+    const project = await store.createProject("Switch project", projectRoot, true);
+    const codexProfile = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-5.6-sol",
+      observedAt: 2_000,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: codexAccount.processGeneration,
+      profileId: codexAccount.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+    const claudeProfile = {
+      claudeVersion: "2.1.260",
+      inputFormat: "stream-json" as const,
+      isolatedConfigDir: true as const,
+      model: "claude-fable-5-1",
+      observedAt: 2_100,
+      outputFormat: "stream-json" as const,
+      permissionMode: "default" as const,
+      preset: "fable-max" as const,
+      processGeneration: claudeAccount.processGeneration,
+      profileId: claudeAccount.id,
+      reasoningEffort: "max" as const,
+    };
+    const startAttempt = store.prepareMutation({
+      authorityGeneration: codexAccount.processGeneration,
+      authorityId: codexAccount.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b0",
+      kind: "session.start",
+      request: { fast: false, preset: "high", projectId: project.id },
+    });
+    const started = store.beginSessionStartEffect({
+      attemptId: startAttempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        projectId: project.id,
+        runtimeProfile: codexProfile,
+      },
+      fastEnabled: false,
+      preset: "high",
+      profileGeneration: codexAccount.processGeneration,
+      profileId: codexAccount.id,
+      projectId: project.id,
+      provider: "codex",
+    });
+    store.completeSessionStartEffect({
+      attemptId: startAttempt.id,
+      expectedSessionRevision: started.revision,
+      providerThreadId: "codex-thread",
+      receipt: { effectiveRuntimeProfile: codexProfile, sessionId: started.id },
+      runtimeProfile: codexProfile,
+      sessionId: started.id,
+      state: "idle",
+    });
+
+    const switchAttempt = store.prepareMutation({
+      authorityGeneration: claudeAccount.processGeneration,
+      authorityId: started.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b1",
+      kind: "session.switch",
+      request: { preset: "fable-max", provider: "claude" },
+    });
+    expect(store.transitionMutation(switchAttempt.id, "prepared", "effect_started")).toBe(true);
+    const before = store.requireSession(started.id);
+    const switched = store.completeSessionProviderSwitch({
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: before.revision,
+      preset: "fable-max",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread",
+      receipt: { providerThreadId: "claude-thread", sessionId: started.id, toProvider: "claude" },
+      runtimeProfile: claudeProfile,
+      sessionId: started.id,
+      state: "idle",
+    });
+    // The provider, the account, the preset, and the thread are one binding.
+    expect(switched).toMatchObject({
+      preset: "fable-max",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread",
+    });
+    // The runtime-profile authority guard requires the row's account to equal
+    // the session's, so the rebind must land before the profile is inserted.
+    expect(store.latestSessionRuntimeProfile(started.id)).toMatchObject({
+      profile: { ...claudeProfile, profileId: claudeAccount.id },
+      sourceKind: "session_start",
+    });
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006b1")).toMatchObject({
+      state: "applied",
+    });
+
+    // A stale revision never rebinds, and a preset the target cannot run is
+    // refused before anything is written.
+    expect(() => store.completeSessionProviderSwitch({
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: before.revision,
+      preset: "fable-max",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread-2",
+      receipt: {},
+      runtimeProfile: claudeProfile,
+      sessionId: started.id,
+      state: "idle",
+    })).toThrow("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
+    expect(() => store.completeSessionProviderSwitch({
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: switched.revision,
+      preset: "high",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread-2",
+      receipt: {},
+      runtimeProfile: claudeProfile,
+      sessionId: started.id,
+      state: "idle",
+    })).toThrow("does not support the `high` model preset");
+    expect(store.requireSession(started.id).providerThreadId).toBe("claude-thread");
+  });
+
   test("refuses a session-start evidence row whose profile names another provider", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Mismatch", "mismatch@example.com");
@@ -2045,7 +2181,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -5029,7 +5165,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -6683,8 +6819,8 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }]);
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -6951,7 +7087,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -7059,7 +7195,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -7174,7 +7310,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -7231,7 +7367,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -7319,7 +7455,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -7425,7 +7561,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -7539,7 +7675,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -7574,6 +7710,7 @@ describe("StateStore", () => {
         { version: 31, applied_at: 2000 },
         { version: 32, applied_at: 2000 },
         { version: 33, applied_at: 2000 },
+        { version: 34, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -7620,7 +7757,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 33 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -7640,9 +7777,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 34");
+    newer.exec("PRAGMA user_version = 35");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:34:33");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:35:34");
   });
 });

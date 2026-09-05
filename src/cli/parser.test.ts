@@ -138,6 +138,47 @@ describe("CLI parser", () => {
     expect(parseCli(["session", "send", "session", "hello", "from", "the", "CLI"])).toMatchObject({ command: { message: "hello from the CLI" } });
   });
 
+  test("collects repeated --attach paths and leaves the message untouched", () => {
+    // No `--attach` means the exact command the parser always produced.
+    expect(parseCli(["session", "send", "s", "hello"])).toMatchObject({
+      kind: "command",
+      command: { kind: "session.send", message: "hello" },
+    });
+    for (const action of ["send", "queue", "steer"] as const) {
+      expect(parseCli([
+        "session", action, "s", "--attach", "a.png", "--attach", "notes.md", "look", "here",
+      ])).toMatchObject({
+        attach: ["a.png", "notes.md"],
+        kind: "session.attach",
+        command: { kind: `session.${action}`, message: "look here", session: "s" },
+      });
+    }
+  });
+
+  test("refuses --attach without a value, past the bound, and off a message command", () => {
+    expect(() => parseCli(["session", "send", "s", "--attach"]))
+      .toThrow("Missing value for --attach.");
+    expect(() => parseCli(["session", "send", "s", "--attach", "--attach", "a.png", "hi"]))
+      .toThrow("Missing value for --attach.");
+    const nine = Array.from({ length: 9 }, (_, index) => ["--attach", `f${String(index)}.txt`]).flat();
+    expect(() => parseCli(["session", "send", "s", ...nine, "hi"]))
+      .toThrow("At most 8 --attach values are accepted.");
+    expect(() => parseCli(["session", "rename", "s", "--attach", "a.png", "new name"]))
+      .toThrow("Unknown option");
+  });
+
+  test("a literal message word after -- is never read as --attach", () => {
+    expect(parseCli(["session", "send", "s", "--", "--attach", "is", "a", "word"]))
+      .toMatchObject({ kind: "command", command: { message: "--attach is a word" } });
+  });
+
+  test("an attached message still carries its idempotency key", () => {
+    const parsed = parseCli(["session", "send", "s", "--attach", "a.png", "hello"]);
+    expect(parsed.kind).toBe("session.attach");
+    if (parsed.kind !== "session.attach") return;
+    expect(typeof parsed.command.idempotencyKey).toBe("string");
+  });
+
   test("chooses a session provider and its default preset", () => {
     // Unchanged: no `--provider` means Codex with the existing default preset.
     expect(parseCli(["session", "start", "work"])).toMatchObject({
@@ -158,6 +199,34 @@ describe("CLI parser", () => {
       .toMatchObject({ command: { kind: "remote.preset", preset: "fable-max" } });
     expect(() => parseCli(["remote", "preset", "s", "fable"]))
       .toThrow("Preset must be `low`, `high`, `ultra`, or `fable-max`.");
+  });
+
+  test("parses a provider switch, an export, and the remote provider command", () => {
+    expect(parseCli(["session", "switch", "s", "--provider", "claude"]))
+      .toMatchObject({ command: { kind: "session.switch", provider: "claude", session: "s" } });
+    expect(parseCli([
+      "session", "switch", "s", "--provider", "codex", "--preset", "ultra", "--account", "work",
+    ])).toMatchObject({
+      command: { account: "work", kind: "session.switch", preset: "ultra", provider: "codex" },
+    });
+    expect(() => parseCli(["session", "switch", "s"]))
+      .toThrow("Provider must be `codex` or `claude`.");
+    expect(() => parseCli(["session", "switch", "s", "--provider", "gemini"]))
+      .toThrow("Provider must be `codex` or `claude`.");
+
+    expect(parseCli(["session", "export", "s"]))
+      .toMatchObject({ format: "trajectory", kind: "session.export", session: "s" });
+    expect(parseCli(["session", "export", "s", "--format", "json", "--out", "out.json"]))
+      .toMatchObject({ format: "json", kind: "session.export", out: "out.json", session: "s" });
+    expect(() => parseCli(["session", "export", "s", "--format", "csv"]))
+      .toThrow("Export format must be `trajectory` or `json`.");
+
+    expect(parseCli(["remote", "provider", "s", "claude"]))
+      .toMatchObject({ command: { kind: "remote.provider", provider: "claude", session: "s" } });
+    expect(parseCli(["remote", "provider", "s", "claude", "--preset", "fable-max"]))
+      .toMatchObject({ command: { kind: "remote.provider", preset: "fable-max" } });
+    expect(() => parseCli(["remote", "provider", "s", "gemini"]))
+      .toThrow("Provider must be `codex` or `claude`.");
   });
 
   test("parses conversation-bound session task reads with exact task IDs", () => {
@@ -1436,7 +1505,7 @@ describe("CLI help", () => {
     expect(decide.usage).not.toContain("hra interaction list");
 
     const send = resolveUsage("session", "send");
-    expect(send.usage).toContain("  hra session send|queue|steer <session> <message>");
+    expect(send.usage).toContain("  hra session send|queue|steer <session> [--attach <path>]... <message>");
     expect(send.usage).toContain('  hra session send my-session -- "run --help exactly"');
     expect(send.usage).not.toContain("hra session events");
 

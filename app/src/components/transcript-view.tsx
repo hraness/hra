@@ -1,7 +1,9 @@
 import { memo, useState, type ReactNode } from "react";
 
+import { MessageAttachmentChips } from "./attachment-chips";
 import { ChevronIcon } from "./icons";
 import { StaticMarkdown, StreamingMarkdown } from "../markdown/markdown";
+import type { AttachmentManifestEntry } from "../model/attachments";
 import { turnSummaryLine } from "../model/session-view";
 import type { TranscriptEntry } from "../model/transcript";
 
@@ -16,10 +18,21 @@ const ClosedMessage = memo(function ClosedMessage(
   return <StaticMarkdown text={text} />;
 });
 
+/**
+ * A sent message. Attachments render as a chip row under the bubble, never as
+ * the image itself: the projection carries a manifest and no bytes, so the only
+ * picture available is one this tab sent and still holds, which the chip
+ * resolves for itself.
+ */
 const UserBubble = memo(function UserBubble({
   actor,
+  attachments,
   text,
-}: Readonly<{ actor: "human" | "autorespond"; text: string }>): ReactNode {
+}: Readonly<{
+  actor: "human" | "autorespond";
+  attachments: readonly AttachmentManifestEntry[] | null;
+  text: string;
+}>): ReactNode {
   return (
     <div className="flex flex-col items-end gap-1">
       <span className="text-[0.7rem] tracking-wide text-ink-muted uppercase">
@@ -28,6 +41,7 @@ const UserBubble = memo(function UserBubble({
       <div className="max-w-[85%] rounded-lg rounded-tr-sm border border-line bg-surface-input px-3 py-2 text-sm break-words whitespace-pre-wrap">
         {text}
       </div>
+      {attachments === null ? null : <MessageAttachmentChips attachments={attachments} />}
     </div>
   );
 });
@@ -86,7 +100,14 @@ export type TranscriptViewProps = Readonly<{
 function renderEntry(entry: TranscriptEntry): ReactNode {
   switch (entry.kind) {
     case "user":
-      return <UserBubble actor={entry.actor} key={entry.key} text={entry.text} />;
+      return (
+        <UserBubble
+          actor={entry.actor}
+          attachments={entry.attachments}
+          key={entry.key}
+          text={entry.text}
+        />
+      );
     case "turn_summary":
       return (
         <TurnMarker

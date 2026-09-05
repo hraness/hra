@@ -6,12 +6,13 @@
 - `src/hra/` re-exports the browser-safe repository modules the app is allowed to reach.
 - `src/auth/` holds the Convex client, the in-memory token storage adapter, and the one-time-code sign-in screen.
 - `src/custody/` holds device key generation, IndexedDB key storage, the enrollment flow, the account-key unlock context, idle lock, and presence.
-- `src/data/` holds the wire parsers, the session heads and one head, the compact history walk, the subscribed compact and detail stream tails, the session metadata cache, the session and device command hooks, the device, device registry, and archived session hooks, and the manual grid arrangement bound to this browser.
-- `src/model/` holds the framework-free session model reducer, the transcript derivation, the grid and interaction view models, the manual card-order reducer, the session scheduled-task selection, the settings and device command view models and builders, and time formatting.
+- `src/data/` holds the wire parsers, the session heads and one head, the compact history walk, the subscribed compact and detail stream tails, the session metadata cache, the session and device command hooks, the device, device registry, and archived session hooks, the composer attachment state, the in-memory hold of bytes this tab sent, and the manual grid arrangement bound to this browser.
+- `src/model/` holds the framework-free session model reducer, the transcript derivation, the grid and interaction view models, the manual card-order reducer, the session scheduled-task selection, the settings and device command view models and builders, the composer attachment rules and the one send-payload builder, the image downscaling arithmetic, the provider switch payload builder, and time formatting.
 - `src/markdown/` holds the sanitiser and the markdown renderer.
+- `src/lib/` holds the class-name helper, the cancellation helper, and the canvas image wrapper the downscaler injects.
 - `src/routing/` holds the hash route model and the router hook.
 - `src/components/ui/` holds the interface primitives as owned source.
-- `src/components/` holds the icons, the state indicator, the streaming tail, the session card, the subagent chips, the scheduled-tasks badge, the transcript, and the interaction panel.
+- `src/components/` holds the icons, the state indicator, the streaming tail, the session card, the subagent chips, the scheduled-tasks badge, the transcript, the attachment chips, and the interaction panel.
 - `src/screens/` holds the grid, session, and settings screens.
 
 # Guidelines
@@ -19,6 +20,8 @@
 - Import repository source only from `src/cloud/crypto`, `src/cloud/projection`, `src/cloud/payloads`, `src/cloud/contracts`, `src/cloud/client`, and `src/domain/*`, and reach all of them through `app/src/hra/`. The other `src/cloud` modules are node-only and must never enter the bundle.
 - Never write an inline style attribute or a style element. `style-src 'self'` blocks both. Express every visual through a Tailwind class.
 - Never render raw HTML from projection text, and never resolve a non-https URL from it. Projection text reaches the reader only through `src/markdown/`, which removes zero-width and bidi characters, refuses every href that is not an absolute `https:` URL, and renders an image as its alt text.
+- Render an image only from bytes the tab already holds. `img-src data: blob:` names no origin, so an `img` element cannot fetch anything; a projected attachment is a manifest with no bytes and renders as a chip, and a thumbnail appears only for an attachment this tab sent itself.
+- Build an attachment send payload only in `src/model/attachments.ts` and a provider switch payload only in `src/model/provider-switch.ts`. Both shapes are ahead of the repository contract, both ask the repository parser whether this build accepts them, and neither is constructed anywhere else.
 - Offer a device command only where the machine would accept one. `src/model/device-commands.ts` derives the pickers from the projected registry, so a machine with the kill switch set, an account that is signed out, or a machine with no project is never offered as a target, and the account-linking flow appears only behind that machine's local opt-in.
 - Offer a remote decision only where the daemon will accept one. `src/model/session-view.ts` holds that table with the verification rule behind each entry.
 - Never register a service worker, load an analytics script, or reference an origin outside the pinned Convex deployment.
