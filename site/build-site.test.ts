@@ -13,6 +13,7 @@ import { publicContent } from "./content.ts";
 import { renderSocialCardPng, renderSocialCardSvg } from "./social-card.ts";
 import { readPngDimensions } from "./social-card-raster.ts";
 import {
+  HRA_MAILING_TURNSTILE_SITEKEY_ENV,
   renderAskAiAboutThis,
   renderHraAnalyticsScript,
   renderHraSiteFooter,
@@ -186,7 +187,7 @@ describe("static-site build", () => {
     })).rejects.toThrow("Release commit");
   });
 
-  test("fails Production closed without one valid public PostHog token", async () => {
+  test("fails Production closed without valid public analytics and mailing configuration", async () => {
     const validToken = "phc_public_production_token";
     expect(resolveHraAnalyticsProjectToken({ VERCEL_ENV: "preview" })).toBe("");
     expect(resolveHraAnalyticsProjectToken({
@@ -209,6 +210,16 @@ describe("static-site build", () => {
         repositoryRoot: root,
       })).rejects.toThrow(HRA_POSTHOG_PROJECT_TOKEN_ENV);
     }
+
+    const missingTurnstileRoot = await createFixtureRoot();
+    await expect(buildSite({
+      check: false,
+      environment: {
+        [HRA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
+        VERCEL_ENV: "production",
+      },
+      repositoryRoot: missingTurnstileRoot,
+    })).rejects.toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
   });
 
   test("embeds only the public token in the self-hosted Production bundle", async () => {
@@ -217,6 +228,7 @@ describe("static-site build", () => {
     await buildSite({
       check: false,
       environment: {
+        [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "1x00000000000000000000AA",
         [HRA_POSTHOG_PROJECT_TOKEN_ENV]: publicToken,
         VERCEL_ENV: "production",
       },
@@ -224,9 +236,14 @@ describe("static-site build", () => {
     });
 
     const analytics = await readFile(join(root, "dist/site/analytics.js"), "utf8");
+    const html = await readFile(join(root, "dist/site/index.html"), "utf8");
     expect(analytics).toContain(publicToken);
     expect(analytics).not.toMatch(/\bphx_[A-Za-z0-9_-]+\b/u);
     expect(analytics).not.toContain("POSTHOG_API_KEY");
+    expect(html).toContain('data-mailing-list="signup"');
+    expect(html).toContain(
+      'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
+    );
   });
 
   test("keeps the hosted identity marker at the fixed release-evidence version", async () => {
@@ -331,7 +348,9 @@ describe("static-site build", () => {
     expect(html.match(/<script[^>]+src=/gu)).toHaveLength(1);
     expect(html).toContain(renderHraAnalyticsScript());
     expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
-    expect(renderHraSiteFooter("1x00000000000000000000AA")).toContain(
+    expect(renderHraSiteFooter({
+      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "1x00000000000000000000AA",
+    })).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
     expect(html).not.toMatch(/<link[^>]+rel="(?:icon|stylesheet)"[^>]+href="https?:\/\//);

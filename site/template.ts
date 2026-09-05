@@ -33,9 +33,11 @@ export const HRA_MAILING_TURNSTILE_SITEKEY_ENV =
   "NEXT_PUBLIC_HRANESS_MAILING_TURNSTILE_SITEKEY" as const;
 
 const turnstileSitekeyPattern = /^[A-Za-z0-9_-]{20,100}$/u;
+const emptySiteEnvironment: Readonly<Record<string, string | undefined>> =
+  Object.freeze({});
 
 export const hraMailingListConfig = (
-  environment: Readonly<Record<string, string | undefined>> = process.env,
+  environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
 ): HranessMailingListConfig => {
   const turnstileSitekey = environment[HRA_MAILING_TURNSTILE_SITEKEY_ENV];
   if (turnstileSitekey === undefined || turnstileSitekey.length === 0) {
@@ -59,16 +61,10 @@ export const hraMailingListConfig = (
 };
 
 export const renderHraSiteFooter = (
-  turnstileSitekey = process.env[HRA_MAILING_TURNSTILE_SITEKEY_ENV],
-): string => {
-  const environment: Record<string, string | undefined> = {
-    [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
-    VERCEL_ENV: process.env.VERCEL_ENV,
-  };
-  return renderHranessSiteFooter({
-    mailingList: hraMailingListConfig(environment),
-  });
-};
+  environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
+): string => renderHranessSiteFooter({
+  mailingList: hraMailingListConfig(environment),
+});
 
 export const renderAskAiAboutThis = (canonicalUrl: string): string =>
   renderToStaticMarkup(createElement(AskAiAboutThis, {
@@ -260,7 +256,10 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
     ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n    ")}
   </div>`;
 
-export const renderSiteHtml = (content: PublicContent = publicContent): string => {
+export const renderSiteHtml = (
+  content: PublicContent = publicContent,
+  environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
+): string => {
   const navigation = content.sections
     .map((section) => `<a href="#${escapeHtml(section.id)}">${escapeHtml(section.heading)}</a>`)
     .join("");
@@ -283,7 +282,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
-${renderHraSiteFooter()}
+${renderHraSiteFooter(environment)}
 ${renderHraAnalyticsScript()}
 </body>
 </html>
@@ -320,7 +319,10 @@ ${renderHead(content, {
 </html>
 `;
 
-export const renderPrivacyHtml = (content: PublicContent = publicContent): string => {
+export const renderPrivacyHtml = (
+  content: PublicContent = publicContent,
+  environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
+): string => {
   const privacy = findSection(content, "privacy");
   return `<!doctype html>
 <html lang="en">
@@ -340,7 +342,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/privacy/`)}
 ${renderProjectResources(content)}
-${renderHraSiteFooter()}
+${renderHraSiteFooter(environment)}
 ${renderHraAnalyticsScript()}
 </body>
 </html>

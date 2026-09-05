@@ -846,7 +846,9 @@ describe("public content contract", () => {
       [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "",
     })).toEqual({ kind: "none" });
 
-    const footer = renderHraSiteFooter(sitekey);
+    const footer = renderHraSiteFooter({
+      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
+    });
     expect(footer).toContain('data-mailing-list="signup"');
     expect(footer).toContain('name="audience" type="hidden" value="hra"');
     expect(footer).toContain('data-action="mailing_hra"');
