@@ -34,6 +34,7 @@ function ruleset(name: string, rules: readonly string[], bypass = false): unknow
 
 function fakeReleaseRunner(options: Readonly<{
   hiddenIndex?: "assume-unchanged" | "skip-worktree";
+  mainAdvancesBeforePush?: boolean;
   published?: boolean;
   pushFails?: boolean;
   wrongUser?: boolean;
@@ -43,6 +44,7 @@ function fakeReleaseRunner(options: Readonly<{
   stdout: string;
 } } {
   const calls: string[] = [];
+  let mainReadCount = 0;
   const result = (stdout = "", exitCode = 0, stderr = "") => ({ exitCode, stderr, stdout });
   const immutableMain = {
     bypass_actors: [],
@@ -117,7 +119,9 @@ function fakeReleaseRunner(options: Readonly<{
       return result(JSON.stringify({ name: "@hraness/hra", version: "0.6.0" }));
     }
     if (key === "git\u0000ls-remote\u0000--heads\u0000origin\u0000refs/heads/main") {
-      return result(`${sha}\trefs/heads/main\n`);
+      mainReadCount += 1;
+      const current = options.mainAdvancesBeforePush === true && mainReadCount > 1 ? object : sha;
+      return result(`${current}\trefs/heads/main\n`);
     }
     if (key === "git\u0000ls-remote\u0000--tags\u0000origin\u0000refs/tags/v*") {
       const current = `${object}\trefs/tags/v0.5.0\n${sha}\trefs/tags/v0.5.0^{}\n`;
@@ -374,7 +378,7 @@ describe("owner-authorized release tag", () => {
     )).toThrow("hraness/hra as origin");
   });
 
-  test("orders every authorization read before one exact tag and push", async () => {
+  test("revalidates current main immediately before one exact tag push", async () => {
     const fake = fakeReleaseRunner();
     await expect(createReleaseTag(fake.runner, async () => ({
       name: "@hraness/hra",
@@ -383,11 +387,28 @@ describe("owner-authorized release tag", () => {
     const tag = fake.calls.findIndex((call) => call.includes("\u0000tag\u0000-a\u0000v0.6.0"));
     const push = fake.calls.indexOf("git\u0000push\u0000origin\u0000refs/tags/v0.6.0:refs/tags/v0.6.0");
     const ci = fake.calls.findIndex((call) => call.includes("actions/runs/10/jobs"));
+    const finalMainRead = fake.calls.lastIndexOf(
+      "git\u0000ls-remote\u0000--heads\u0000origin\u0000refs/heads/main",
+    );
     expect(tag).toBeGreaterThan(ci);
-    expect(push).toBe(tag + 2);
+    expect(finalMainRead).toBe(tag + 2);
+    expect(push).toBe(finalMainRead + 1);
     expect(fake.calls.at(-1)).toBe(
       "git\u0000ls-remote\u0000--tags\u0000origin\u0000refs/tags/v0.6.0\u0000refs/tags/v0.6.0^{}",
     );
+  });
+
+  test("compare-deletes its transient local tag when main advances during preflight", async () => {
+    const fake = fakeReleaseRunner({ mainAdvancesBeforePush: true });
+    await expect(createReleaseTag(fake.runner, async () => ({
+      name: "@hraness/hra",
+      version: "0.6.0",
+    }))).rejects.toThrow("Remote main advanced during release tag preflight");
+    expect(fake.calls.some((call) => call.startsWith("git\u0000push\u0000"))).toBe(false);
+    expect(fake.calls.slice(-2)).toEqual([
+      `git\u0000update-ref\u0000-d\u0000refs/tags/v0.6.0\u0000${nextObject}`,
+      "git\u0000show-ref\u0000--verify\u0000--quiet\u0000refs/tags/v0.6.0",
+    ]);
   });
 
   test("performs no repository mutation after an authorization failure", async () => {

@@ -449,6 +449,13 @@ export async function createReleaseTag(
   }
   const tagObject = requireCommand(runner, ["git", "rev-parse", "--verify", `${plan.tag}^{tag}`]);
   try {
+    const finalRemoteMain = exactSha(
+      requireCommand(runner, ["git", "ls-remote", "--heads", "origin", `refs/heads/${defaultBranch}`]),
+      "Final remote main readback",
+    );
+    if (finalRemoteMain !== sha) {
+      throw new Error("Remote main advanced during release tag preflight.");
+    }
     requireCommand(runner, ["git", "push", "origin", `refs/tags/${plan.tag}:refs/tags/${plan.tag}`]);
     const exactRemote = parseRemoteTags(requireCommand(
       runner,
