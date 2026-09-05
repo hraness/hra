@@ -355,7 +355,7 @@ export const publicContent: PublicContent = {
     heading: "One terminal for every Codex and Claude Code session",
     summary: "HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.",
     example: "Ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
-    boundary: `Free and MIT licensed. Codex runs on macOS and Linux; Claude Code runs on Linux. Local v${releaseVersion} is release-ready; hosted sync is live as an ${hostedBetaLabel}.`,
+    boundary: `Codex on macOS and Linux · Claude Code on Linux · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
@@ -427,7 +427,7 @@ export const publicContent: PublicContent = {
   trust: [
     {
       label: "Your provider credentials stay with the provider",
-      detail: "HRA asks the Codex app-server or Claude Code CLI to sign in inside an isolated profile directory. Each provider writes and owns its credential; HRA never reads, copies, or forwards one.",
+      detail: "HRA launches Codex and Claude Code with the sign-in you already have. It never reads, copies, or forwards the Claude credential, and Codex state stays inside its isolated profile.",
     },
     {
       label: "Local by default",
@@ -445,7 +445,7 @@ export const publicContent: PublicContent = {
   questions: [
     {
       question: "Does HRA need an account?",
-      answer: [text("No HRA cloud account is needed for local use. Add a profile and run hra account login: Codex uses its app-server login, while Claude Code runs its own Linux sign-in inside the isolated directory. An HRA cloud identity is needed only for optional sync and web linking.")],
+      answer: [text("No. Install the CLI, add a Codex profile or sign into Claude Code inside its isolated directory, and start a session. An HRA cloud identity is only needed for optional sync between machines.")],
     },
     {
       question: "What does the release candidate include?",
@@ -465,7 +465,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "Which platforms are supported?",
-      answer: [text("Codex runs on macOS and Linux. Claude Code sessions and sign-in run on Linux and fail closed elsewhere. Supported ChatGPT desktop account switching is macOS-only. HRA requires Bun 1.3.14.")],
+      answer: [text("macOS and Linux with Bun 1.3.14. Supported ChatGPT desktop account switching is macOS-only.")],
     },
   ],
   maker: {

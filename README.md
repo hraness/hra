@@ -20,7 +20,7 @@ hra init --yes
 
 HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.
 
-Free and MIT licensed. Codex runs on macOS and Linux; Claude Code runs on Linux. Local v0.6.0 is release-ready; hosted sync is live as an open beta.
+Codex on macOS and Linux · Claude Code on Linux · local v0.6.0 release-ready · hosted sync live (open beta)
 
 ### One request, one account, one session.
 
