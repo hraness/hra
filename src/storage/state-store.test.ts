@@ -71,6 +71,37 @@ async function fixture(
   return { store, home };
 }
 
+const replaceAutorespondEvidenceWithVersion30Fixture = (
+  database: Database,
+  sessionId: string,
+): void => {
+  database.query("DROP TABLE IF EXISTS autorespond_message_sources").run();
+  database.query("DROP TABLE IF EXISTS autorespond_evidence_next").run();
+  database.query("DROP TABLE autorespond_evidence").run();
+  database.query(`
+    CREATE TABLE autorespond_evidence (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      interaction_id TEXT NOT NULL CHECK(length(interaction_id) = 36),
+      kind TEXT NOT NULL CHECK(kind IN ('command_approval','file_change_approval','permission_approval')),
+      class TEXT NOT NULL CHECK(length(class) BETWEEN 1 AND 256),
+      decision TEXT NOT NULL CHECK(length(decision) BETWEEN 1 AND 64),
+      mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace','manual')),
+      outcome TEXT NOT NULL CHECK(outcome IN ('accepted','refused')),
+      latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
+      subagent INTEGER NOT NULL CHECK(subagent IN (0,1)),
+      occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0)
+    ) STRICT
+  `).run();
+  database.query(`
+    INSERT INTO autorespond_evidence(
+      id,session_id,interaction_id,kind,class,decision,mode,outcome,latency_ms,subagent,occurred_at
+    ) VALUES (7,?,'00000000-0000-4000-8000-000000000731','command_approval','shell','accept','manual','accepted',17,1,1500)
+  `).run(sessionId);
+  database.query("DELETE FROM migrations WHERE version > 30").run();
+  database.query("PRAGMA user_version = 30").run();
+};
+
 // Pinned-reader tests prove the scrub fails once a reader outlives the whole
 // checkpoint budget. The production budget is three 5 s attempts; this policy
 // keeps the same shape and the same failure at a test-sized wait.
@@ -8726,6 +8757,93 @@ describe("StateStore", () => {
     }
     expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
   }, 20_000);
+
+  test("transactionally rebuilds v30 autorespond evidence and preserves rows across reopen", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Autorespond migration");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    replaceAutorespondEvidenceWithVersion30Fixture(legacy, session.id);
+    legacy.close(false);
+
+    const expectedEvidence = {
+      approvalClass: "shell",
+      decision: "accept",
+      interactionId: "00000000-0000-4000-8000-000000000731",
+      kind: "command_approval",
+      latencyMs: 17,
+      mode: "manual",
+      model: null,
+      occurredAt: 1_500,
+      outcome: "accepted",
+      path: "protocol",
+      rule: null,
+      sessionId: session.id,
+      subagent: true,
+    } as const;
+    const migrated = new StateStore(paths, { now: () => 2_000 });
+    stores.push(migrated);
+    expect(migrated.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
+    migrated.close();
+    stores.splice(stores.indexOf(migrated), 1);
+
+    const reopened = new StateStore(paths, { now: () => 3_000 });
+    stores.push(reopened);
+    expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
+        id: 7,
+        path: "protocol",
+        rule: null,
+        model: null,
+      });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rolls back the v31 rebuild when an intermediate schema statement fails", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Autorespond rollback");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    replaceAutorespondEvidenceWithVersion30Fixture(legacy, session.id);
+    legacy.query("CREATE TABLE autorespond_evidence_next (blocked TEXT) STRICT").run();
+    legacy.close(false);
+
+    expect(() => new StateStore(paths, { now: () => 2_000 })).toThrow();
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 30 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version=31").get()).toBeNull();
+      expect(inspector.query("SELECT id,session_id FROM autorespond_evidence").get()).toEqual({
+        id: 7,
+        session_id: session.id,
+      });
+      expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
+        .not.toContainEqual(expect.objectContaining({ name: "path" }));
+    } finally {
+      inspector.close(false);
+    }
+  });
 
   test("opens and transactionally migrates a real v1 database without losing sessions", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-v1-")));

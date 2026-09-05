@@ -4238,6 +4238,7 @@ export class HraService {
       // depend on a fallible provider status probe.
       signedIn = false;
     } else {
+      this.#assertClaudeIsolationAccepted();
       signedIn = (await this.#readClaudeAccount(profile, signal)).signedIn;
     }
     try {

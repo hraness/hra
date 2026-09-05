@@ -550,7 +550,7 @@ from silently starting a second session.
 | Kind | Payload | Result |
 | --- | --- | --- |
 | `session_start` | `{accountPublicId, projectPublicId, prompt, preset, provider}` | `{sessionPublicId}` |
-| `account_login_start` | `{accountPublicId,handoffVersion?:2}` | current: `{handoffVersion:2,loginUrl,userCode,expiresAt}`; legacy: `{loginUrl,expiresAt}`, single use |
+| `account_login_start` | `{accountPublicId,handoffVersion?:2}` | current: `{handoffVersion:2,loginUrl,userCode,expiresAt}`, single use; legacy results remain parser-only during rolling deployment |
 | `account_login_status` | current: `{accountPublicId}`; legacy: none | `{status, instruction}` |
 | `usage_refresh` | none | `{accountsRefreshed}` |
 
@@ -609,10 +609,11 @@ browser-mode loopback callback cannot be completed on another device, so HRA
 does not relay it.
 
 The pending Codex response must carry both the verification URL and its
-separate one-time user code. The URL is bounded and must be an HTTPS URL with
-a hostname, no username or password, and an exact round trip through URL
-parsing. The user code must match the closed device-code grammar. A missing or
-malformed value fails closed with
+separate one-time user code. The URL must be exactly
+`https://auth.openai.com/codex/device`, the value emitted by the pinned Codex
+app-server. Query strings, fragments, alternate paths, ports, credentials, and
+lookalike hosts fail closed. The user code must match the closed device-code
+grammar. A missing or malformed value fails closed with
 `ACCOUNT_LOGIN_RELAY_UNAVAILABLE`.
 
 HRA encrypts the URL and user code together under the account key in one
@@ -638,12 +639,13 @@ switches, and daily cap before starting the provider effect.
 
 The request version makes mixed rollout fail before the wrong provider effect.
 A current browser sends `handoffVersion: 2`; an older daemon rejects that
-unknown shape before login starts. A current daemon treats an unversioned
-request as the legacy browser-mode lane and returns only its legacy URL shape,
-which still fails closed for a loopback callback. A current browser can consume
-that legacy result exactly once only to ask for a machine update. This behavior
-is covered by focused parser, adapter, bridge, and UI tests. It has not yet been
-accepted against production or in a live two-device Codex login.
+unknown shape before login starts. A current daemon refuses an unversioned
+request with `ACCOUNT_LOGIN_RELAY_UNAVAILABLE` before starting any local login.
+Current result parsing retains the legacy URL-only shape solely so a result
+already produced by an older daemon can be consumed once and turned into a
+machine-update instruction. This behavior is covered by focused parser,
+adapter, bridge, and UI tests. It has not yet been accepted against production
+or in a live two-device Codex login.
 
 ### Operator switches
 

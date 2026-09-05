@@ -134,7 +134,7 @@ describe("device command builders", () => {
       expiresAt: 1,
       handoffVersion: 2,
       kind: "account_login_start",
-      loginUrl: "https://auth.example.test/device",
+      loginUrl: "https://auth.openai.com/codex/device",
       userCode: "ABCD-EFGH",
     } as const;
     expect(bindHostedLoginResultExpiry(machineResult, 1_760_000_300_000)).toEqual({

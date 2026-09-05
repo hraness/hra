@@ -20,7 +20,7 @@ hra init --yes
 
 HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.
 
-Free and MIT licensed. Codex runs on macOS and Linux; Claude Code runs on Linux. Local v0.6.0 is release-ready; hosted sync is live as an open beta.
+Codex on macOS and Linux · Claude Code on Linux · local v0.6.0 release-ready · hosted sync live (open beta)
 
 ### One request, one account, one session.
 
@@ -87,7 +87,7 @@ hra account usage personal --refresh
 hra account usage-history personal --limit 50 --json
 ```
 
-Account login is always a dedicated one-shot invocation, including while the persistent shell is running. For Codex, use `hra account login personal --provider codex --device-code` in a foreground TTY for app-server's device-code path. That terminal displays the code and verification URL directly. An opted-in registered machine can also receive a versioned web request that always selects device-code mode; HRA validates the HTTPS URL and separate code, encrypts them to the account key, and lets only the requesting browser read the handoff once before its five-minute hosted expiry. HRA keeps the resulting provider state inside that profile's isolated `CODEX_HOME` without copying `auth.json`.
+Account login is always a dedicated one-shot invocation, including while the persistent shell is running. For Codex, use `hra account login personal --provider codex --device-code` in a foreground TTY for app-server's device-code path. That terminal displays the code and verification URL directly. An opted-in registered machine can also receive a versioned web request that always selects device-code mode; HRA accepts only the pinned Codex device URL and a separate closed code, encrypts them to the account key, and lets only the requesting browser read the handoff once before its five-minute hosted expiry. HRA keeps the resulting provider state inside that profile's isolated `CODEX_HOME` without copying `auth.json`.
 
 On Linux, `hra account login personal --provider claude` launches a realpath-resolved Claude Code executable only after its exact self-reported version matches HRA's pin, in the foreground inside that profile's isolated `CLAUDE_CONFIG_DIR`. Claude owns its prompts and browser handoff. HRA gives it the terminal, joins the exact child, and reports only whether Claude says it is signed in; HRA never opens or copies a Claude credential. Claude exposes no HRA device-code, handoff-file, or web-linking protocol. New Claude effects are refused on macOS pending authenticated isolated-Keychain and detached-read acceptance.
 

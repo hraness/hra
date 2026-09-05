@@ -225,7 +225,7 @@ export type DeviceCommandPayload =
     }>
   | Readonly<{
       accountPublicId: string;
-      /** Absent is the legacy URL-only browser handoff. */
+      /** Absent identifies a legacy requester that the current daemon refuses. */
       handoffVersion?: 2;
       kind: "account_login_start";
     }>
@@ -272,49 +272,17 @@ export type DeviceCommandResultPayload =
 export const deviceCommandLimits = Object.freeze({
   instructionCharacters: 512,
   loginUserCodeCharacters: 38,
-  loginUrlCharacters: 2_048,
   promptCharacters: 16_000,
 } as const);
 
 /** Maximum time a hosted Codex login handoff may remain readable. */
 export const deviceCommandLoginResultLifetimeMs = 5 * 60 * 1_000;
 
-const isLoopbackLoginHost = (hostname: string): boolean => {
-  const host = hostname.toLowerCase().replace(/\.$/u, "");
-  if (
-    host === "localhost"
-    || host.endsWith(".localhost")
-    || host === "0.0.0.0"
-    || host === "[::]"
-    || host === "[::1]"
-    || /^127(?:\.[0-9]{1,3}){3}$/u.test(host)
-  ) return true;
-  // URL canonicalization renders an IPv4-mapped 127/8 address in hexadecimal,
-  // for example [::ffff:127.0.0.1] becomes [::ffff:7f00:1].
-  return /^\[::ffff:7f[0-9a-f]{2}:/u.test(host);
-};
-
-// The relay is a provider login URL and nothing else: https only, no
-// credentials in the authority, no loopback destination, and bounded.
+// Codex owns the device-code endpoint and currently returns this exact URL.
+// An allowlist at the relay boundary prevents a compromised local response
+// from turning the trusted web handoff into an arbitrary phishing link.
 export function isRelayedLoginUrl(value: unknown): value is string {
-  if (
-    typeof value !== "string"
-    || value.length < 12
-    || value.length > deviceCommandLimits.loginUrlCharacters
-    || containsUnsafeTerminalScalar(value)
-  ) return false;
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    return false;
-  }
-  return parsed.protocol === "https:"
-    && parsed.username === ""
-    && parsed.password === ""
-    && parsed.hostname.length > 0
-    && !isLoopbackLoginHost(parsed.hostname)
-    && parsed.href === value;
+  return value === "https://auth.openai.com/codex/device";
 }
 
 /** The same closed device-code grammar accepted by the protected CLI handoff. */
