@@ -4270,6 +4270,7 @@ async function deviceCommandFixture() {
   const project = await value.store.createProject("Control plane", root, true);
   const account = value.store.listProfiles()[0];
   if (account === undefined) throw new Error("missing account fixture");
+  const loginAccount = value.store.createProfile("Link target");
   const executed: LocalCommand[] = [];
   const notices: string[] = [];
   const adapter = new StateBackedCloudDaemonAdapter({
@@ -4304,7 +4305,7 @@ async function deviceCommandFixture() {
     prompt: "continue the migration",
     provider: "codex" as const,
   };
-  return { account, adapter, executed, notices, project, sessionStart, value };
+  return { account, adapter, executed, loginAccount, notices, project, sessionStart, value };
 }
 
 describe("device command execution", () => {
@@ -4411,7 +4412,7 @@ describe("device command execution", () => {
     try {
       const signal = new AbortController().signal;
       const payload = {
-        accountPublicId: world.account.id,
+        accountPublicId: world.loginAccount.id,
         handoffVersion: 2 as const,
         kind: "account_login_start" as const,
       };
@@ -4433,7 +4434,7 @@ describe("device command execution", () => {
       })).toEqual({ code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" });
       expect(world.executed).toHaveLength(1);
       expect(world.executed[0]).toMatchObject({
-        account: world.account.id,
+        account: world.loginAccount.id,
         deviceCode: true,
         kind: "account.login",
       });
@@ -4445,8 +4446,7 @@ describe("device command execution", () => {
 
   test("relays the complete single-use device-code handoff when the machine has opted in", async () => {
     const value = await fixture();
-    const account = value.store.listProfiles()[0];
-    if (account === undefined) throw new Error("missing account fixture");
+    const account = value.store.createProfile("Relay target");
     value.store.setAccountLinkingAllowed(true);
     const executed: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
@@ -4503,7 +4503,7 @@ describe("device command execution", () => {
       world.value.store.setAccountLinkingAllowed(true);
       const outcome = await world.adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000008",
-        payload: { accountPublicId: world.account.id, kind: "account_login_start" },
+        payload: { accountPublicId: world.loginAccount.id, kind: "account_login_start" },
         requestingDevicePublicId: "device_browser1",
         signal: new AbortController().signal,
       });
@@ -4518,10 +4518,31 @@ describe("device command execution", () => {
         state: "applied",
       });
       expect(world.executed[0]).toMatchObject({
-        account: world.account.id,
+        account: world.loginAccount.id,
         deviceCode: false,
         kind: "account.login",
       });
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("refuses to relink a signed-in account before executing a local command", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      world.value.store.setAccountLinkingAllowed(true);
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000e",
+        payload: {
+          accountPublicId: world.account.id,
+          handoffVersion: 2,
+          kind: "account_login_start",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      })).toEqual({ code: "ACCOUNT_LOGIN_NOT_AVAILABLE", state: "failed" });
+      expect(world.executed).toEqual([]);
     } finally {
       world.adapter.close();
       world.value.store.close();

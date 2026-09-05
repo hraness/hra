@@ -75,6 +75,18 @@ describe("pinned Claude runtime", () => {
       executablePath: path,
       probeVersion: async () => "unknown build",
     })).rejects.toThrow(ClaudeError);
+    for (const reported of [
+      `${CLAUDE_PIN}-beta`,
+      `wrapper ${CLAUDE_PIN} around 9.9.9`,
+      `${CLAUDE_PIN} (Claude Code) 9.9.9`,
+      ` ${CLAUDE_PIN} (Claude Code)`,
+    ]) {
+      await expect(resolvePinnedClaudeRuntime({
+        configDir,
+        executablePath: path,
+        probeVersion: async () => reported,
+      })).rejects.toThrow("reported no exact version");
+    }
   });
 
   test("requires an absolute config directory and an absolute executable", async () => {
@@ -125,7 +137,7 @@ describe("pinned Claude runtime", () => {
     const process: ClaudeVersionProbeProcess = {
       exited: new Promise((resolve) => { resolveExit = resolve; }),
       stdout: (async function* () { yield new Uint8Array(513); })(),
-      stderr: (async function* () { await stderrDone; })(),
+      stderr: (async function* () { await stderrDone; yield* []; })(),
       terminate: () => { terminated += 1; resolveStderr(); resolveExit(143); },
       forceTerminate: () => { throw new Error("graceful termination should join"); },
     };
@@ -145,7 +157,7 @@ describe("pinned Claude runtime", () => {
     let resolveStreams!: () => void;
     const trace: string[] = [];
     const streamsDone = new Promise<void>((resolve) => { resolveStreams = resolve; });
-    const empty = () => (async function* () { await streamsDone; })();
+    const empty = () => (async function* () { await streamsDone; yield* []; })();
     const process: ClaudeVersionProbeProcess = {
       exited: new Promise((resolve) => { resolveExit = resolve; }),
       stdout: empty(),

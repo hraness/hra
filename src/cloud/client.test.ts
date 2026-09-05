@@ -47,6 +47,11 @@ describe("bounded Convex transport", () => {
       .toEqual(["accountDeletion:request"]);
   });
 
+  test("admits exact device-command terminal confirmations", () => {
+    expect(cloudMutations).toContain("deviceCommands:confirmRevokedTerminal");
+    expect(cloudMutations).toContain("deviceCommands:confirmTerminalRecovery");
+  });
+
   test("ends a hung query even when fetch ignores its abort signal", async () => {
     let calls = 0;
     let observedSignal: AbortSignal | null | undefined;

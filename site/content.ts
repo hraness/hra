@@ -174,7 +174,7 @@ const privacyBlocks: readonly ContentBlock[] = [
   list(
     [text("User messages and final assistant display text.")],
     [text("Session names, notes, queued messages, and steering input.")],
-    [text("Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not currently projected because HRA does not read that provider's credentials or expose an account-management adapter for it.")],
+    [text("Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not currently projected because its bounded local status path exposes only signedIn and HRA reads no Claude credential, identity, or usage data.")],
     [text("Turn timing, observed model and tier, and provider usage summaries.")],
     [text("Bounded observed file and Git metadata, without unbounded filesystem paths.")],
     [text("Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.")],
@@ -223,16 +223,16 @@ export const siteDocumentPaths: readonly string[] = [
   "/privacy/",
 ];
 
-export const publicReleaseState: "live" | "release-ready" | "staged" = "live";
+export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.5.0/hraness-hra-0.5.0.tgz",
+  "https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz",
 );
 
 const productName = "HRA";
 const tagline = "Control plane for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
-const releaseVersion = "0.5.0";
+const releaseVersion = "0.6.0";
 
 /** Public runtime pins come from their authoritative source modules. */
 export const publicPins = {
@@ -290,15 +290,15 @@ export const publicContent: PublicContent = {
   providerRoadmap,
   releaseVersion,
   thesis: `${productName} runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
-  description: "Control plane for Codex and Claude Code in current source; published v0.5.0 is Codex-only. Run provider sessions side by side through one durable CLI.",
-  statusLine: `Status: current source runs Codex and Claude Code. The immutable local CLI v${releaseVersion} is live for macOS and Linux and is Codex-only; hosted sync is live as an ${hostedBetaLabel}.`,
+  description: `${tagline} in current source; v${releaseVersion} is release-ready. Run provider sessions side by side through one durable CLI.`,
+  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready: Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}.`,
   badges,
   maintainer: {
     name: "Hraness",
     url: links.hraness,
   },
   socialCard: {
-    alt: `${productName} · current source: Codex + Claude Code · published v${releaseVersion}: Codex-only · hra.sh`,
+    alt: `${productName} · Codex + Claude Code · v${releaseVersion} release-ready · hra.sh`,
     height: 630,
     path: "/social-card.png",
     width: 1200,
@@ -308,7 +308,7 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-    betaTag: "live",
+      betaTag: "release-ready",
     githubRepository: "live",
     hostedSync: "live",
     website: "live",
@@ -319,7 +319,7 @@ export const publicContent: PublicContent = {
     eyebrow: tagline,
     heading: "Keep Codex and Claude Code sessions in one durable CLI.",
     summary: "Isolate each provider profile, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.",
-    boundary: `current source: Codex + Claude Code · published v${releaseVersion}: Codex-only · hosted sync live (${hostedBetaLabel})`,
+    boundary: `Codex on macOS and Linux · Claude Code on Linux · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
@@ -377,11 +377,11 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: `Immutable v${releaseVersion} local CLI is live and Codex-only; hosted sync live as an ${hostedBetaLabel}`,
+      label: `Immutable local CLI release candidate; hosted sync live as an ${hostedBetaLabel}`,
       content: [
-        text("The exact install command below uses the published immutable "),
+        text("The exact install command below works once GitHub exposes the immutable "),
         code(`v${releaseVersion}`),
-        text(" GitHub Release and its verified archive. It installs the Codex-only public CLI. The current source adds end-to-end Claude Code and provider portability, but this page claims no later immutable CLI release. The website and optional hosted sync are live."),
+        text(" GitHub Release and its verified archive. The website and optional hosted sync are live; the candidate becomes public only after exact admission."),
       ],
     },
     paragraph(
@@ -408,7 +408,7 @@ export const publicContent: PublicContent = {
       heading: "Install and update",
       blocks: [
         paragraph(
-          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux; supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:"),
+          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:"),
         ),
         {
           kind: "commands",
@@ -420,10 +420,10 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("The single install command streams the exact v0.5.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.5.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
+          text("The single install command streams the exact v0.6.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.6.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
         ),
         paragraph(
-          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.5.0. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
+          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.6.0. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
         ),
         {
           kind: "commands",
@@ -493,22 +493,29 @@ export const publicContent: PublicContent = {
           kind: "commands",
           commands: [
             "hra account add personal",
-            "hra account login personal",
+            "hra account login personal --provider codex --device-code",
             "hra account usage personal --refresh",
             "hra account usage-history personal --limit 50 --json",
           ],
         },
         paragraph(
-          text("Codex account login is always a dedicated one-shot HRA invocation, including while the persistent shell is running. Use "),
-          code("hra account login personal --device-code"),
-          text(" in a foreground TTY for the provider's device-code path. The code and verification URL are shown only on that protected foreground terminal. HRA keeps the resulting provider state inside that profile's isolated "),
+          text("Account login is always a dedicated one-shot invocation, including while the persistent shell is running. For Codex, use "),
+          code("hra account login personal --provider codex --device-code"),
+          text(" in a foreground TTY for app-server's device-code path. The code and verification URL are shown only on that protected foreground terminal. HRA keeps the resulting provider state inside that profile's isolated "),
           code("CODEX_HOME"),
           text(" without copying "),
           code("auth.json"),
           text("."),
         ),
         paragraph(
-          text("JSON and noninteractive callers must create an empty mode-0600 file under a canonical current-user-owned mode-0700 directory, then pass its absolute canonical path:"),
+          text("On Linux, "),
+          code("hra account login personal --provider claude"),
+          text(" launches the exact pinned Claude Code CLI in the foreground inside that profile's isolated "),
+          code("CLAUDE_CONFIG_DIR"),
+          text(". Claude owns its prompts and browser handoff. HRA gives it the terminal, joins the exact child, and reports only whether Claude says it is signed in; HRA never opens or copies a Claude credential. Claude exposes no HRA device-code, handoff-file, or web-linking protocol. New Claude effects are refused on macOS pending authenticated isolated-Keychain and detached-read acceptance."),
+        ),
+        paragraph(
+          text("For a Codex login, JSON and noninteractive callers must create an empty mode-0600 file under a canonical current-user-owned mode-0700 directory, then pass its absolute canonical path:"),
         ),
         {
           kind: "commands",
@@ -521,20 +528,17 @@ export const publicContent: PublicContent = {
         ),
         paragraph(
           text("If the first pending-login handoff is lost or the daemon restarts before completion, "),
-          code("hra account show personal"),
+          code("hra account show personal --provider codex"),
           text(" reports the pending attempt. Then run "),
-          code("hra account login-cancel personal"),
+          code("hra account login-cancel personal --provider codex"),
           text(". A caller that retained the idempotency key may retry it without redispatching. A still-pending replay cannot recover the one-time code or URL; a completed or canceled replay returns terminal signed-in or signed-out evidence instead of stale pending state. HRA cancels only that profile's exact current-generation provider login before allowing a fresh login. Verification URLs and device codes never enter HRA state, logs, or ordinary output; only the caller-owned protected handoff file retains them for completion."),
         ),
-        { kind: "subheading", text: "Claude Code sign-in" },
         paragraph(
-          text("Claude Code uses the same HRA account selector but a separate isolated "),
-          code("CLAUDE_CONFIG_DIR"),
-          text(" below that profile. Install Claude Code "),
-          code(CLAUDE_PIN),
-          text(" exactly and sign in with Claude Code itself inside that directory before starting a Claude session. HRA does not implement Claude Code sign-in, sign-out, account listing, usage, provider-side session listing, rename, resume, plugin discovery, desktop switching, or protected turn inspection, and it never reads, copies, or forwards the Claude credential. The "),
-          link("provider notes", "https://github.com/hraness/hra/blob/main/docs/providers/claude.md"),
-          text(" describe the isolated profile boundary. A profile without a valid Claude Code sign-in fails with a bounded instruction to sign in and retry."),
+          text("If a Claude foreground parent or daemon fails after launch, "),
+          code("hra account show personal --provider claude"),
+          text(" retains the one-child fence even if Claude reports signed in. After confirming that original child has exited, use the exact attempt, generation, and idempotency key in the reported acknowledged "),
+          code("hra account login-cancel"),
+          text(" command to release only the local fence. That recovery does not stop Claude or read, change, or delete a credential."),
         ),
         paragraph(
           code("hra account usage"),
@@ -561,7 +565,7 @@ export const publicContent: PublicContent = {
       heading: "First session",
       blocks: [
         paragraph(
-          text("Complete initialization and provider sign-in before this walkthrough: HRA's dedicated account-login command is Codex-only, while Claude Code must already be signed in inside the selected profile's isolated configuration directory. The session-start command returns the new session ID."),
+          text("Complete initialization and the first provider login before this walkthrough. Account login remains a dedicated one-shot command, and the session-start command returns the new session ID."),
         ),
         { kind: "subheading", text: "Human terminal" },
         paragraph(
@@ -639,9 +643,9 @@ export const publicContent: PublicContent = {
           kind: "notice",
           label: "Local release boundary",
           content: [
-            text("These commands describe the current source. The live immutable "),
+            text("These commands are part of the immutable "),
             code(`v${releaseVersion}`),
-            text(" CLI installs through the exact command above but is Codex-only; Claude Code execution and provider switching remain unreleased, and this page claims no later immutable CLI release. Hosted sync is not required for this local protocol."),
+            text(" local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol."),
           ],
         },
         paragraph(
@@ -1161,11 +1165,12 @@ export const publicContent: PublicContent = {
             "hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <uuidv7>] [--json]",
             "hra device revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]",
             "hra account add <label>",
-            "hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]",
-            "hra account login-cancel <profile>",
+            "hra account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]",
+            "hra account login-cancel <profile> [--provider codex]",
+            "hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited",
             "hra account logout <profile>",
             "hra account list",
-            "hra account show <profile>",
+            "hra account show <profile> [--provider <codex|claude>]",
             "hra account usage [profile] [--refresh]",
             "hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]",
             "hra account switch <profile>",
@@ -1388,7 +1393,7 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     content.thesis,
     content.statusLine,
     "",
-    `Install the live v${content.releaseVersion} Codex-only beta: ${content.installCommand}`,
+    `Install after the v${content.releaseVersion} beta tag is live: ${content.installCommand}`,
     `Initialize: ${content.initCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
     "",

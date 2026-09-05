@@ -62,6 +62,8 @@ export const cloudMutations = [
   "commands:cancelPending",
   "deviceCommands:enqueue",
   "deviceCommands:acknowledgeReceipt",
+  "deviceCommands:confirmRevokedTerminal",
+  "deviceCommands:confirmTerminalRecovery",
   "deviceCommands:consumeResult",
   "deviceCommands:prepare",
   "deviceCommands:markEffectStarted",

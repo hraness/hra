@@ -3667,10 +3667,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }]);
     } finally {
       inspector.close(false);
     }
@@ -6443,6 +6443,34 @@ describe("HraService", () => {
     expect(JSON.stringify(store.readMutation(idempotencyKey)?.result)).not.toContain("secret=1");
   });
 
+  test("an explicitly keyed login on a signed-in account has no authority or session effect", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Already linked");
+    const beforeSession = value.store.requireSession(sessionId);
+    const beforeProfile = value.store.requireProfileById(beforeSession.profileId);
+    const loginCalls = value.codex.calls.filter((call) => call.startsWith("login:")).length;
+    const idempotencyKey = "00000000-0000-4000-8000-000000000119";
+
+    await expect(value.service.execute({
+      kind: "account.login",
+      account: beforeProfile.id,
+      deviceCode: true,
+      idempotencyKey,
+    }, { signal })).resolves.toMatchObject({
+      account: {
+        id: beforeProfile.id,
+        processGeneration: beforeProfile.processGeneration,
+        state: "signed_in",
+      },
+      login: { status: "signed_in" },
+    });
+
+    expect(value.store.requireProfileById(beforeProfile.id)).toEqual(beforeProfile);
+    expect(value.store.requireSession(sessionId)).toEqual(beforeSession);
+    expect(value.store.readMutation(idempotencyKey)).toBeNull();
+    expect(value.codex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(loginCalls);
+  });
+
   test("returns terminal signed-in evidence when replaying a formerly pending login after provider completion", async () => {
     const { service, codex, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Completed login replay" }, { signal }) as { account: { id: `acct_${string}` } };
@@ -7540,7 +7568,7 @@ describe("HraService", () => {
 
     const [session] = store.listSessions();
     expect(session).toMatchObject({ state: "recovery_required" });
-    expect(session?.providerThreadId).toBeUndefined();
+    expect(session?.providerThreadId).toBe("provider-thread");
     if (session === undefined) throw new Error("The quarantined session is missing.");
     await expect(service.execute({ kind: "session.send", session: session.id, message: "must not dispatch", idempotencyKey: "00000000-0000-4000-8000-000000000402" }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -11313,6 +11341,26 @@ describe("HraService", () => {
     expect(JSON.stringify(afterReplacement)).toContain("replacement generation visible");
     expect(JSON.stringify(afterReplacement)).not.toContain("stale generation hidden");
     await restarted.close();
+  });
+
+  test("quarantines the matching provider when runtime close throws synchronously", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Synchronous close failure");
+    const session = value.store.requireSession(sessionId);
+    const generation = value.store.requireProfileById(session.profileId).processGeneration;
+    let closeCalls = 0;
+    Object.defineProperty(value.codex, "close", {
+      configurable: true,
+      value: () => {
+        closeCalls += 1;
+        throw new Error("synchronous Codex close failure");
+      },
+    });
+
+    await expect(value.service.close()).rejects.toThrow("synchronous Codex close failure");
+    expect(closeCalls).toBe(1);
+    expect(value.store.requireSession(sessionId).state).toBe("recovery_required");
+    expect(value.store.requireProfileById(session.profileId).processGeneration).toBe(generation);
   });
 
   test("crash restart atomically fences the old generation and terminalizes ambiguous interaction states", async () => {

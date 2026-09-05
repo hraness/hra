@@ -4407,7 +4407,16 @@ const claudeLoginPrepareResponseSchema = z.object({
       providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     }).strict(),
   ]),
-}).strict();
+}).strict().superRefine((value, context) => {
+  const expectedSignedIn = value.login.status === "signed_in";
+  if (value.authentication.signedIn !== expectedSignedIn) {
+    context.addIssue({
+      code: "custom",
+      path: ["authentication", "signedIn"],
+      message: "Claude authentication state does not match the login preparation status.",
+    });
+  }
+});
 const claudeLoginCompleteResponseSchema = z.object({
   account: claudeLoginAccountSchema,
   authentication: claudeAuthenticationSchema,
@@ -4417,7 +4426,16 @@ const claudeLoginCompleteResponseSchema = z.object({
     idempotencyKey: z.string().uuid(),
     providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   }).strict(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  const expectedSignedIn = value.login.status === "signed_in";
+  if (value.authentication.signedIn !== expectedSignedIn) {
+    context.addIssue({
+      code: "custom",
+      path: ["authentication", "signedIn"],
+      message: "Claude authentication state does not match the login completion status.",
+    });
+  }
+});
 
 const renderClaudeLoginResult = (
   data: z.infer<typeof claudeLoginPrepareResponseSchema> | z.infer<typeof claudeLoginCompleteResponseSchema>,
@@ -4528,7 +4546,8 @@ async function executeClaudeAccountAuthentication(
   const installation = input.installation ?? createProductionInstallation();
   await initializeStatePaths(installation.paths);
   const owned = await initializeProfilePaths(installation.paths, status.data.account.id);
-  const runtime = await (input.resolveClaudeRuntime ?? resolvePinnedClaudeRuntime)({
+  const resolveClaudeRuntime = input.resolveClaudeRuntime ?? resolvePinnedClaudeRuntime;
+  const runtime = await resolveClaudeRuntime({
     configDir: owned.claudeConfigDir,
     signal: controller.signal,
   });
@@ -4599,6 +4618,28 @@ async function executeClaudeAccountAuthentication(
             reason: "interrupted_before_spawn",
             interruptedBy: signalCustody.interruptedBy,
           };
+    }
+    if (foreground === undefined) {
+      try {
+        const revalidated = await resolveClaudeRuntime({
+          configDir: preflight.configDir,
+          executablePath: preflight.runtime.executablePath,
+          signal: controller.signal,
+        });
+        if (
+          revalidated.executablePath !== preflight.runtime.executablePath
+          || JSON.stringify(revalidated.argv) !== JSON.stringify(preflight.runtime.argv)
+        ) throw new Error("Claude runtime identity changed after launch grant.");
+        preflight.runtime = revalidated;
+      } catch {
+        foreground = signalCustody.interruptedBy === null
+          ? { state: "not_started", reason: "preflight_stale" }
+          : {
+              state: "not_started",
+              reason: "interrupted_before_spawn",
+              interruptedBy: signalCustody.interruptedBy,
+            };
+      }
     }
     if (foreground === undefined && signalCustody.interruptedBy !== null) {
       foreground = {

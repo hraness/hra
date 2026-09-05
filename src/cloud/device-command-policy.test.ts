@@ -90,6 +90,7 @@ describe("device command guards", () => {
     }))).toEqual({ code: "ACCOUNT_LINKING_DENIED", kind: "refused" });
     expect(deviceCommandGuardDecision(input({
       accountLinkingAllowed: true,
+      accounts: [{ provider: "codex", publicId: "account_primary", status: "signed_out" }],
       payload: payload({ accountPublicId: "account_primary", kind: "account_login_start" }),
     })).kind).toBe("admitted");
     expect(deviceCommandGuardDecision(input({
@@ -99,6 +100,16 @@ describe("device command guards", () => {
         kind: "account_login_status",
       }),
     })).kind).toBe("admitted");
+  });
+
+  test("starts account linking only from the signed-out state", () => {
+    for (const status of ["signed_in", "login_pending", "recovery_required"] as const) {
+      expect(deviceCommandGuardDecision(input({
+        accountLinkingAllowed: true,
+        accounts: [{ provider: "codex", publicId: "account_primary", status }],
+        payload: payload({ accountPublicId: "account_primary", kind: "account_login_start" }),
+      }))).toEqual({ code: "ACCOUNT_LOGIN_NOT_AVAILABLE", kind: "refused" });
+    }
   });
 
   test("addressing is checked against the projected registry", () => {

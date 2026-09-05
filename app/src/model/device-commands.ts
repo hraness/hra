@@ -86,6 +86,52 @@ export function accountLoginStatusCommand(accountPublicId: string): DeviceComman
   return build({ accountPublicId, kind: "account_login_status" });
 }
 
+export type AccountLoginActionKind = "account_login_start" | "account_login_status";
+
+export type AccountLoginActionState =
+  | Readonly<{ phase: "idle" }>
+  | Readonly<{ kind: AccountLoginActionKind; phase: "submitting" }>
+  | Readonly<{ commandPublicId: string; phase: "awaiting_login_handoff" }>;
+
+export const initialAccountLoginActionState: AccountLoginActionState = { phase: "idle" };
+
+/**
+ * Claims the account row before enqueueing. This synchronous state is also held
+ * in a ref by the screen, so two clicks from the same React render cannot both
+ * reach the hosted mutation.
+ */
+export function beginAccountLoginAction(
+  state: AccountLoginActionState,
+  kind: AccountLoginActionKind,
+): AccountLoginActionState | null {
+  return state.phase === "idle" ? { kind, phase: "submitting" } : null;
+}
+
+/**
+ * A status read may yield after enqueueing, but a login start keeps custody of
+ * the row until its single-use handoff has been consumed or has expired.
+ */
+export function completeAccountLoginSubmission(
+  state: AccountLoginActionState,
+  commandPublicId: string,
+): AccountLoginActionState {
+  if (state.phase !== "submitting") return state;
+  return state.kind === "account_login_start"
+    ? { commandPublicId, phase: "awaiting_login_handoff" }
+    : initialAccountLoginActionState;
+}
+
+/** Release only the exact login-start handoff that currently owns the row. */
+export function finishAccountLoginHandoff(
+  state: AccountLoginActionState,
+  commandPublicId: string,
+): AccountLoginActionState {
+  return state.phase === "awaiting_login_handoff"
+    && state.commandPublicId === commandPublicId
+    ? initialAccountLoginActionState
+    : state;
+}
+
 /**
  * Replaces the daemon-clock expiry with the hosted settlement deadline.
  * Convex owns this timestamp so machine and browser clock skew cannot hide a
@@ -183,6 +229,8 @@ const refusalNotices: Readonly<Record<string, string>> = {
     "Account linking from the browser is off on that machine. Run `hra remote allow account-linking` there first.",
   ACCOUNT_LOGIN_RELAY_UNAVAILABLE:
     "That machine could not relay a login link. Run `hra account login <account>` on the machine instead.",
+  ACCOUNT_LOGIN_NOT_AVAILABLE:
+    "A new login can start only while that account is signed out on the machine.",
   DEVICE_COMMANDS_DENIED:
     "That machine is not accepting commands from other devices. Run `hra remote allow device-commands` there.",
   DEVICE_COMMAND_ACCOUNT_SIGNED_OUT: "That account is signed out on the machine.",

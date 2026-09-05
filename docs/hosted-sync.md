@@ -522,6 +522,7 @@ Every guard is local. Nothing hosted and no browser can change one.
 | Per-device kill switch (`hra remote deny device-commands`) | `DEVICE_COMMANDS_DENIED` |
 | Requesting device revoked after enqueue | `REQUESTING_DEVICE_INACTIVE` |
 | Account linking without the local opt-in | `ACCOUNT_LINKING_DENIED` |
+| Account login start while the account is not exactly signed out | `ACCOUNT_LOGIN_NOT_AVAILABLE` |
 | Account not in the projected registry | `DEVICE_COMMAND_ACCOUNT_UNKNOWN` |
 | Account signed out on the machine | `DEVICE_COMMAND_ACCOUNT_SIGNED_OUT` |
 | Provider does not match the projected account, or browser linking targets non-Codex | `DEVICE_COMMAND_PROVIDER_UNSUPPORTED` |
@@ -561,8 +562,12 @@ releases it only to the requesting browser, exactly once, while erasing the
 ciphertext in the same transaction. Convex returns that server-owned deadline
 with the release, so machine or browser clock skew cannot extend the readable
 window. Settings displays the code before the link, offers a copy control with
-manual selection as the fallback, and clears the handoff at its expiry or when
-a later login start or status check supersedes it.
+manual selection as the fallback, and keeps both account-row actions locked
+while a login-start handoff is outstanding. The exact row unlocks only after
+this tab consumes the single-use result, hosted expiry makes it unavailable, or
+the command terminalizes without a handoff; a later start or status check cannot
+supersede it. Once safely consumed and displayed, the code remains in memory
+until its expiry or until the user starts a later action.
 
 Both local gates still apply: device commands must be enabled and the machine
 must have `hra remote allow account-linking` set. Settings offers the flow only

@@ -64,19 +64,46 @@ In order, a switch:
 
 1. refuses a switch it cannot make safely (below);
 2. builds the neutral transcript and renders the bounded handoff seed from it;
-3. reviews and starts a thread on the target provider and account. A target
-   that refuses leaves the session on its still-runnable outgoing provider;
-4. releases the outgoing provider's hold on the thread, `endSession` on the
-   neutral runtime port, which stops the pinned Claude Code process that served
-   the session and is a documented no-op for Codex, whose app-server owns
-   thread lifetime. The outgoing thread is **never deleted**;
-5. commits the whole rebinding in one transaction, provider, account, preset,
-   provider thread, the target's reviewed runtime profile, and the session's
-   conversation-automation row, which follows the new thread so a scheduled
-   session task keeps addressing a live one;
-6. appends the `provider_switched` event;
-7. sends the seed as the first user message of the new thread, as an ordinary
-   turn that records its own `user_message` with actor `provider_switch`.
+3. writes immutable mutation evidence that fences the exact source and target
+   account generations, then reviews and starts a thread on the target;
+4. records the exact target-thread receipt, writes an immutable seed intent,
+   sends the seed as the first user message of the target thread, and records
+   the returned turn and status. The seed uses the switch attempt id as its
+   provider client-message id, so recovery can prove zero, one, or duplicate
+   acceptance without inventing a retry;
+5. releases the outgoing provider's hold on the thread through `endSession` on
+   the neutral runtime port, then records an immutable source-release receipt.
+   This stops the pinned Claude Code process that served the session and is a
+   documented no-op for Codex, whose app-server owns thread lifetime. The
+   outgoing thread is **never deleted**;
+6. atomically rebinds the provider, account, preset, provider thread, reviewed
+   runtime profiles, and conversation-automation row; appends the
+   `provider_switched` boundary and the seed's `user_message` event; and stores
+   the replay receipt.
+
+Store schema v35 adds the append-only target, seed-intent, seed-result,
+source-release, target-release, and authority-rebind records behind that
+sequence. After a crash, HRA advances only from durable evidence and a complete
+provider projection. It never repeats an unproven target-start or seed effect.
+Before the seed result exists, abandonment may release the addressable target
+and retain the source. After the target is seeded, HRA preserves it until it can
+prove the source release and complete the atomic rebind; it does not discard the
+only provider that is known to contain the handoff.
+
+Every new switch receipt also names the daemon generation that admitted its
+provider effects. Claude sessions exist only in the runtime manager that
+started their isolated CLI process, so an unreleased Claude source or target
+cannot be read, resumed, or released after that generation changes. In that
+case `hra session recover` returns `RECOVERY_REQUIRED` without starting,
+seeding, ending, or otherwise probing either provider. Only an explicit
+`hra session abandon` settles the local authority: it terminalizes the session
+with provider-state-unknown evidence, never calls the inaccessible Claude
+side, and narrows what remains unknown only by observing an addressable Codex
+source or releasing an addressable Codex target. It never reports all provider
+state deleted while an unreleased Claude side remains unknown. A durable
+Claude source-release receipt is sufficient for recovery to inspect and adopt
+a seeded Codex target after restart; durable rows alone cannot prove a seeded
+Claude target is still live.
 
 A switch is refused, with no effect, when:
 

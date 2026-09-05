@@ -4,11 +4,15 @@ import { parseDeviceCommandPayload, parseDeviceRegistryPayload } from "../hra/cl
 import {
   accountLoginStartCommand,
   accountLoginStatusCommand,
+  beginAccountLoginAction,
+  completeAccountLoginSubmission,
+  finishAccountLoginHandoff,
   admitHostedLoginHandoff,
   bindHostedLoginResultExpiry,
   defaultSessionStartPreset,
   deviceCommandNotice,
   hostedLoginHandoffDeadline,
+  initialAccountLoginActionState,
   sessionStartCommand,
   sessionStartTargetHint,
   sessionStartTargetLabel,
@@ -172,6 +176,55 @@ describe("device command builders", () => {
   });
 });
 
+describe("account login action gate", () => {
+  test("a status check or duplicate start cannot supersede an outstanding login handoff", () => {
+    const submitting = beginAccountLoginAction(
+      initialAccountLoginActionState,
+      "account_login_start",
+    );
+    expect(submitting).not.toBeNull();
+    if (submitting === null) throw new Error("expected the login start to be admitted");
+
+    // The first mutation has not returned yet. A second click in the same
+    // render must be refused synchronously, before React can paint `disabled`.
+    expect(beginAccountLoginAction(submitting, "account_login_start")).toBeNull();
+    expect(beginAccountLoginAction(submitting, "account_login_status")).toBeNull();
+
+    // Enqueue completion is not handoff completion. Keep the original command
+    // selected while the machine settles it and the browser consumes its result.
+    const awaitingHandoff = completeAccountLoginSubmission(
+      submitting,
+      "018bcfe5-6800-7000-8000-000000000001",
+    );
+    expect(awaitingHandoff).toEqual({
+      commandPublicId: "018bcfe5-6800-7000-8000-000000000001",
+      phase: "awaiting_login_handoff",
+    });
+    expect(beginAccountLoginAction(awaitingHandoff, "account_login_status")).toBeNull();
+    expect(finishAccountLoginHandoff(awaitingHandoff, "a-different-command"))
+      .toBe(awaitingHandoff);
+
+    const released = finishAccountLoginHandoff(
+      awaitingHandoff,
+      "018bcfe5-6800-7000-8000-000000000001",
+    );
+    expect(released).toBe(initialAccountLoginActionState);
+    expect(beginAccountLoginAction(released, "account_login_status")).not.toBeNull();
+  });
+
+  test("a status request unlocks as soon as its enqueue finishes", () => {
+    const submitting = beginAccountLoginAction(
+      initialAccountLoginActionState,
+      "account_login_status",
+    );
+    if (submitting === null) throw new Error("expected the status check to be admitted");
+    expect(completeAccountLoginSubmission(
+      submitting,
+      "018bcfe5-6800-7000-8000-000000000002",
+    )).toBe(initialAccountLoginActionState);
+  });
+});
+
 describe("session start targets", () => {
   test("offers one entry per signed-in account, carrying its machine's projects", () => {
     expect(sessionStartTargets([machine()])).toEqual([
@@ -265,6 +318,8 @@ describe("device command notices", () => {
       .toContain("hra remote allow account-linking");
     expect(notice("failed", "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", "account_login_start")?.text)
       .toContain("hra account login");
+    expect(notice("failed", "ACCOUNT_LOGIN_NOT_AVAILABLE", "account_login_start")?.text)
+      .toContain("only while that account is signed out");
     expect(notice("failed", "DEVICE_COMMAND_DAILY_CAP")?.text).toContain("daily limit");
     expect(notice("failed", "SOMETHING_NEW")?.text).toBe("The machine refused this request.");
   });

@@ -41,6 +41,10 @@ const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumSerializedJournalBytes = 65_536;
 const maximumSerializedSessionSyncCursorBytes = 20_480;
 const maximumRemoteSessionCursorCharacters = 16_384;
+// The largest valid device-command result is the bounded login URL plus its
+// code and envelope overhead. Reserve a little over the exact current shape so
+// every admitted prepared entry can still become a durable terminal entry.
+const maximumDeviceCommandResultCiphertextCharacters = 4_096;
 const utf8Encoder = new TextEncoder();
 const remoteSessionCursorDigestPattern = /^[0-9a-f]{64}$/u;
 
@@ -94,8 +98,12 @@ export type CloudDeviceCommandJournalEntry = Readonly<{
   | Readonly<{ phase: "effect_started" }>
   | Readonly<{
       phase: "terminal";
+      /** Present only on a migrated v4 login terminal whose ciphertext was not journaled. */
+      legacyResultMissing?: true;
+      result?: EncryptedEnvelope;
       resultCode: string;
       resultDigest: string;
+      singleUseResult?: true;
       terminalState: "applied" | "failed" | "ambiguous";
     }>
 );
@@ -253,6 +261,16 @@ export type CloudDaemonJournalState = Readonly<{
   projectionRecoveries: readonly CloudProjectionRecoveryJournalEntry[];
   projectionRecoveryReceipts: readonly CloudProjectionRecoveryTerminalReceipt[];
   usageAccounts: readonly CloudUsageAccountCursor[];
+  version: 5;
+}>;
+
+export type LegacyCloudDaemonJournalV4State = Readonly<{
+  commands: readonly CloudCommandJournalEntry[];
+  deviceCommands: readonly CloudDeviceCommandJournalEntry[];
+  pendingUsageAccount: PendingCloudUsageAccount | null;
+  projectionRecoveries: readonly CloudProjectionRecoveryJournalEntry[];
+  projectionRecoveryReceipts: readonly CloudProjectionRecoveryTerminalReceipt[];
+  usageAccounts: readonly CloudUsageAccountCursor[];
   version: 4;
 }>;
 
@@ -286,7 +304,8 @@ export type CloudDaemonJournalInputState =
   | CloudDaemonJournalState
   | LegacyCloudDaemonJournalV1State
   | LegacyCloudDaemonJournalV2State
-  | LegacyCloudDaemonJournalV3State;
+  | LegacyCloudDaemonJournalV3State
+  | LegacyCloudDaemonJournalV4State;
 
 export type CloudDaemonJournalObservation = Readonly<{
   generation: number | null;
@@ -515,7 +534,7 @@ export function emptyCloudDaemonJournal(): CloudDaemonJournalState {
     projectionRecoveries: [],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   };
 }
 
@@ -530,8 +549,15 @@ function maximumTerminalDeviceCommandEntry(
       fence: Number.MAX_SAFE_INTEGER,
     },
     phase: "terminal",
+    result: {
+      algorithm: "A256GCM",
+      ciphertext: "c".repeat(maximumDeviceCommandResultCiphertextCharacters),
+      keyVersion: Number.MAX_SAFE_INTEGER,
+      nonce: "n".repeat(16),
+    },
     resultCode: "R".repeat(64),
     resultDigest: "f".repeat(64),
+    ...(entry.kind === "account_login_start" ? { singleUseResult: true } : {}),
     terminalState: "ambiguous",
   });
 }
@@ -1011,19 +1037,28 @@ function parseCommandKind(value: unknown): CommandKind | null {
   return isCommandKind(value) ? value : null;
 }
 
-function parseDeviceCommand(value: unknown): CloudDeviceCommandJournalEntry {
+function parseDeviceCommand(
+  value: unknown,
+  allowLegacyMissingAppliedLoginResult = false,
+): CloudDeviceCommandJournalEntry {
   if (!isRecord(value)) throw new Error("Cloud daemon journal is corrupt.");
   const terminal = value.phase === "terminal";
+  const hasLegacyResultMissing = terminal && Object.hasOwn(value, "legacyResultMissing");
+  const hasResult = terminal && Object.hasOwn(value, "result");
+  const hasSingleUseResult = terminal && Object.hasOwn(value, "singleUseResult");
   const expected = terminal
     ? [
         "authority",
         "commandPublicId",
         "kind",
+        ...(hasLegacyResultMissing ? ["legacyResultMissing"] : []),
         "payloadDigest",
         "phase",
         "requestingDevicePublicId",
+        ...(hasResult ? ["result"] : []),
         "resultCode",
         "resultDigest",
+        ...(hasSingleUseResult ? ["singleUseResult"] : []),
         "terminalState",
       ]
     : [
@@ -1054,10 +1089,30 @@ function parseDeviceCommand(value: unknown): CloudDeviceCommandJournalEntry {
     requestingDevicePublicId: value.requestingDevicePublicId,
   };
   if (value.phase !== "terminal") return { ...base, phase: value.phase };
+  const result = hasResult
+    ? parseEncryptedEnvelope(value.result, maximumDeviceCommandResultCiphertextCharacters)
+    : undefined;
   if (
     typeof value.resultCode !== "string"
     || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(value.resultCode)
     || !isDigest(value.resultDigest)
+    || (hasResult && result === null)
+    || (hasLegacyResultMissing && value.legacyResultMissing !== true)
+    || (hasLegacyResultMissing
+      && (value.kind !== "account_login_start"
+        || value.terminalState !== "applied"
+        || result !== undefined
+        || hasSingleUseResult))
+    || (hasSingleUseResult && value.singleUseResult !== true)
+    || (hasSingleUseResult && (value.kind !== "account_login_start" || result == null))
+    || (value.kind === "account_login_start"
+      && result !== undefined
+      && value.singleUseResult !== true)
+    || (!allowLegacyMissingAppliedLoginResult
+      && value.kind === "account_login_start"
+      && value.terminalState === "applied"
+      && (result === undefined || value.singleUseResult !== true)
+      && value.legacyResultMissing !== true)
     || (value.terminalState !== "applied"
       && value.terminalState !== "failed"
       && value.terminalState !== "ambiguous")
@@ -1065,8 +1120,11 @@ function parseDeviceCommand(value: unknown): CloudDeviceCommandJournalEntry {
   return {
     ...base,
     phase: value.phase,
+    ...(value.legacyResultMissing === true ? { legacyResultMissing: true as const } : {}),
+    ...(result == null ? {} : { result }),
     resultCode: value.resultCode,
     resultDigest: value.resultDigest,
+    ...(value.singleUseResult === true ? { singleUseResult: true as const } : {}),
     terminalState: value.terminalState,
   };
 }
@@ -1720,7 +1778,7 @@ function migrateLegacyProjectionRecovery(
   return { ...entry, ...identity };
 }
 
-function journalExactKeys(version: 1 | 2 | 3 | 4): readonly string[] {
+function journalExactKeys(version: 1 | 2 | 3 | 4 | 5): readonly string[] {
   if (version === 1) return ["commands", "pendingUsageAccount", "usageAccounts", "version"];
   if (version === 2) {
     return [
@@ -1745,7 +1803,11 @@ function journalExactKeys(version: 1 | 2 | 3 | 4): readonly string[] {
 function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalState {
   if (
     !isRecord(value)
-    || (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== 4)
+    || (value.version !== 1
+      && value.version !== 2
+      && value.version !== 3
+      && value.version !== 4
+      && value.version !== 5)
     || !hasExactKeys(value, journalExactKeys(value.version))
     || !Array.isArray(value.commands)
     || value.commands.length > maximumJournalCommands
@@ -1754,16 +1816,32 @@ function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalSta
   ) throw new Error("Cloud daemon journal is corrupt.");
   const commands = value.commands.map(parseCommand);
   let deviceCommands: readonly CloudDeviceCommandJournalEntry[] = [];
-  if (value.version === 4) {
+  if (value.version === 4 || value.version === 5) {
     if (
       !Array.isArray(value.deviceCommands)
       || value.deviceCommands.length > maximumJournalDeviceCommands
     ) throw new Error("Cloud daemon journal is corrupt.");
-    deviceCommands = value.deviceCommands.map(parseDeviceCommand);
+    deviceCommands = value.deviceCommands
+      .map((entry) => parseDeviceCommand(entry, value.version === 4))
+      .map((entry): CloudDeviceCommandJournalEntry => {
+        // v4 terminal entries predated durable result ciphertext. Mark that
+        // exact migrated case so restart recovery can reconcile either a
+        // remotely committed relay or an effect whose settlement never landed.
+        if (
+          value.version === 4
+          && entry.kind === "account_login_start"
+          && entry.phase === "terminal"
+          && entry.terminalState === "applied"
+          && (entry.result === undefined || entry.singleUseResult !== true)
+        ) {
+          return { ...entry, legacyResultMissing: true };
+        }
+        return entry;
+      });
   }
   let projectionRecoveries: readonly CloudProjectionRecoveryJournalEntry[] = [];
   let projectionRecoveryReceipts: readonly CloudProjectionRecoveryTerminalReceipt[] = [];
-  if (value.version === 3 || value.version === 4) {
+  if (value.version === 3 || value.version === 4 || value.version === 5) {
     if (
       !Array.isArray(value.projectionRecoveries)
       || value.projectionRecoveries.length > maximumJournalProjectionRecoveries
@@ -1818,7 +1896,7 @@ function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalSta
     projectionRecoveries,
     projectionRecoveryReceipts,
     usageAccounts,
-    version: 4,
+    version: 5,
   };
   return parsed;
 }

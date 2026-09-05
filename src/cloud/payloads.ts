@@ -279,8 +279,23 @@ export const deviceCommandLimits = Object.freeze({
 /** Maximum time a hosted Codex login handoff may remain readable. */
 export const deviceCommandLoginResultLifetimeMs = 5 * 60 * 1_000;
 
+const isLoopbackLoginHost = (hostname: string): boolean => {
+  const host = hostname.toLowerCase().replace(/\.$/u, "");
+  if (
+    host === "localhost"
+    || host.endsWith(".localhost")
+    || host === "0.0.0.0"
+    || host === "[::]"
+    || host === "[::1]"
+    || /^127(?:\.[0-9]{1,3}){3}$/u.test(host)
+  ) return true;
+  // URL canonicalization renders an IPv4-mapped 127/8 address in hexadecimal,
+  // for example [::ffff:127.0.0.1] becomes [::ffff:7f00:1].
+  return /^\[::ffff:7f[0-9a-f]{2}:/u.test(host);
+};
+
 // The relay is a provider login URL and nothing else: https only, no
-// credentials in the authority, no embedded fragment, and bounded.
+// credentials in the authority, no loopback destination, and bounded.
 export function isRelayedLoginUrl(value: unknown): value is string {
   if (
     typeof value !== "string"
@@ -298,6 +313,7 @@ export function isRelayedLoginUrl(value: unknown): value is string {
     && parsed.username === ""
     && parsed.password === ""
     && parsed.hostname.length > 0
+    && !isLoopbackLoginHost(parsed.hostname)
     && parsed.href === value;
 }
 

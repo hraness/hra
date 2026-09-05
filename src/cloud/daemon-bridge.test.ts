@@ -54,11 +54,16 @@ import {
   type CloudPushWakeSubscriber,
 } from "./push-wake";
 import { hmacSha256Hex, sha256Hex } from "./crypto";
-import { deviceCommandRecoveryAdmitted } from "./device-commands";
+import {
+  compareDeviceAuthority,
+  deviceCommandRecoveryAdmitted,
+  deviceCommandRecoveryReplayAdmitted,
+} from "./device-commands";
 import {
   decryptDeviceRegistry,
   decryptDeviceCommandResult,
   encryptDeviceCommand,
+  encryptDeviceCommandResult,
   encryptRemoteCommand,
   type DeviceCommandPayload,
   type DeviceRegistryPayload,
@@ -159,6 +164,7 @@ type FakeDeviceCommand = {
   requestingDevicePublicId: string;
   result?: EncryptedEnvelope;
   resultCode?: string;
+  resultConsumed?: boolean;
   resultDigest?: string;
   singleUseResult?: boolean;
   state: CommandState;
@@ -171,6 +177,12 @@ class FakeCloud {
   offlineMessage = "network offline";
   failMarkAfterEffectOnce = false;
   failPrepareOnce = false;
+  failDevicePrepareBeforeEffectOnce = false;
+  failDeviceRecoveryAfterEffectOnce = false;
+  revokeDeviceCommandAfterMarkOnce = false;
+  revokeDeviceCommandBeforeSettleOnce = false;
+  failRevokedDeviceCommandConfirmationOnce = false;
+  failTerminalRecoveryConfirmationOnce = false;
   failSettleAfterEffectOnce = false;
   failEpochAfterEffectOnce = false;
   failUsageAccountAfterEffectOnce = false;
@@ -184,6 +196,7 @@ class FakeCloud {
   forcePendingPaginationIncomplete = false;
   stallLatestChunks = false;
   afterPendingScan?: () => Promise<void> | void;
+  afterDeviceCommandPendingScan?: () => Promise<void> | void;
   readonly heads = new Map<string, FakeHead>();
   readonly chunks = new Map<string, unknown[]>();
   readonly leases = new Map<string, FakeLease>();
@@ -317,6 +330,26 @@ class FakeCloud {
       kind: command.kind,
       publicId: command.publicId,
       sessionPublicId: command.sessionPublicId,
+      ...(command.resultCode === undefined ? {} : { resultCode: command.resultCode }),
+      state: command.state,
+      updatedAt: command.updatedAt,
+    });
+    const publicDeviceCommand = (command: FakeDeviceCommand) => ({
+      ...(command.boundAuthority === undefined
+        ? {}
+        : { boundAuthority: command.boundAuthority }),
+      createdAt: command.createdAt,
+      deadline: command.deadline,
+      kind: command.kind,
+      payload: command.payload,
+      publicId: command.publicId,
+      requestingDevicePublicId: command.requestingDevicePublicId,
+      ...(command.singleUseResult === true
+        ? {
+            resultConsumed: command.resultConsumed === true,
+            resultSingleUse: true,
+          }
+        : command.result === undefined ? {} : { result: command.result }),
       ...(command.resultCode === undefined ? {} : { resultCode: command.resultCode }),
       state: command.state,
       updatedAt: command.updatedAt,
@@ -723,6 +756,10 @@ class FakeCloud {
           return { publicId: command.publicId, replay: false, state: command.state };
         }
         if (name === "deviceCommands:prepare") {
+          if (this.failDevicePrepareBeforeEffectOnce) {
+            this.failDevicePrepareBeforeEffectOnce = false;
+            throw new Error("device command prepare unavailable");
+          }
           const command = this.requireDeviceCommand(args.commandPublicId);
           const requested = args.authority as AuthorityTuple;
           if (
@@ -752,30 +789,144 @@ class FakeCloud {
         if (name === "deviceCommands:markEffectStarted") {
           const command = this.requireDeviceCommand(args.commandPublicId);
           if (command.state === "prepared") command.state = "effect_started";
+          if (this.revokeDeviceCommandAfterMarkOnce) {
+            this.revokeDeviceCommandAfterMarkOnce = false;
+            this.revokedDevices.add(command.requestingDevicePublicId);
+            command.state = "ambiguous";
+            throw new Error("lost device command mark response after requester revocation");
+          }
           return { publicId: command.publicId, replay: false, state: "effect_started" };
         }
         if (name === "deviceCommands:settle") {
           const command = this.requireDeviceCommand(args.commandPublicId);
+          if (this.revokeDeviceCommandBeforeSettleOnce) {
+            this.revokeDeviceCommandBeforeSettleOnce = false;
+            this.revokedDevices.add(command.requestingDevicePublicId);
+            command.state = "ambiguous";
+            throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
+          }
+          const legacyAppliedLoginReplay = command.kind === "account_login_start"
+            && command.state === "applied"
+            && args.state === "applied"
+            && args.result === undefined
+            && args.singleUseResult === undefined
+            && command.singleUseResult === true
+            && (command.result !== undefined || command.resultConsumed === true);
+          if (command.state === args.state) {
+            if (
+              command.resultCode !== args.resultCode
+              || command.resultDigest !== args.resultDigest
+              || (!legacyAppliedLoginReplay
+                && JSON.stringify(command.result) !== JSON.stringify(args.result))
+              || (!legacyAppliedLoginReplay
+                && command.singleUseResult !== (args.singleUseResult === true ? true : undefined))
+            ) throw new Error("device command result conflict");
+            return { publicId: command.publicId, replay: true, state: command.state };
+          }
+          if (command.state !== "effect_started") {
+            throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
+          }
           command.state = args.state as CommandState;
           command.resultCode = args.resultCode as string;
           command.resultDigest = args.resultDigest as string;
           if (args.result !== undefined) command.result = args.result as EncryptedEnvelope;
           if (args.singleUseResult === true) command.singleUseResult = true;
+          if (this.failSettleAfterEffectOnce) {
+            this.failSettleAfterEffectOnce = false;
+            throw new Error("lost device command settle response");
+          }
           return { publicId: command.publicId, replay: false, state: command.state };
+        }
+        if (name === "deviceCommands:confirmRevokedTerminal") {
+          if (this.failRevokedDeviceCommandConfirmationOnce) {
+            this.failRevokedDeviceCommandConfirmationOnce = false;
+            throw new Error("revoked terminal confirmation unavailable");
+          }
+          const command = this.requireDeviceCommand(args.commandPublicId);
+          const authority = args.authority as AuthorityTuple;
+          if (
+            command.state !== "ambiguous"
+            || command.boundAuthority === undefined
+            || !sameAuthorityTuple(command.boundAuthority, authority)
+            || !this.revokedDevices.has(command.requestingDevicePublicId)
+            || command.result !== undefined
+            || command.resultCode !== undefined
+            || command.resultDigest !== undefined
+            || command.singleUseResult !== undefined
+          ) throw new Error("DEVICE_COMMAND_REVOCATION_TERMINAL_CONFLICT");
+          return { publicId: command.publicId, replay: true, state: "ambiguous" };
+        }
+        if (name === "deviceCommands:confirmTerminalRecovery") {
+          if (this.failTerminalRecoveryConfirmationOnce) {
+            this.failTerminalRecoveryConfirmationOnce = false;
+            throw new Error("terminal recovery confirmation unavailable");
+          }
+          const command = this.requireDeviceCommand(args.commandPublicId);
+          const localPhase = args.localPhase as "prepared_no_effect" | "effect_started";
+          const staleAuthority = args.staleAuthority as AuthorityTuple;
+          const authorityMatches = command.boundAuthority === undefined
+            ? localPhase === "prepared_no_effect"
+            : sameAuthorityTuple(command.boundAuthority, staleAuthority);
+          const terminalMatches = command.state === "cancelled"
+            || command.state === "expired"
+            || (command.state === "ambiguous"
+              && localPhase === "effect_started"
+              && this.revokedDevices.has(command.requestingDevicePublicId));
+          if (
+            !authorityMatches
+            || !terminalMatches
+            || command.result !== undefined
+            || command.resultCode !== undefined
+            || command.resultConsumed === true
+            || command.resultDigest !== undefined
+            || command.singleUseResult !== undefined
+          ) throw new Error("DEVICE_COMMAND_TERMINAL_RECOVERY_CONFLICT");
+          return { publicId: command.publicId, replay: true, state: command.state };
         }
         if (name === "deviceCommands:recoverEffectStarted") {
           const command = this.requireDeviceCommand(args.commandPublicId);
           const recovery = args.recoveryAuthority as AuthorityTuple;
           const stale = args.staleAuthority as AuthorityTuple;
-          if (!deviceCommandRecoveryAdmitted({
-            recoveryAuthority: recovery,
-            staleAuthority: stale,
-            state: command.state,
-            terminalState: args.state as "applied" | "failed" | "ambiguous",
-          })) throw new Error("stale device command recovery authority");
+          if (command.state === args.state) {
+            if (
+              command.boundAuthority === undefined
+              || !deviceCommandRecoveryReplayAdmitted({
+                boundAuthority: command.boundAuthority,
+                recoveryAuthority: recovery,
+                staleAuthority: stale,
+              })
+              || command.resultCode !== args.resultCode
+              || command.resultDigest !== args.resultDigest
+            ) throw new Error("device command recovery conflict");
+            return { publicId: command.publicId, replay: true, state: command.state };
+          }
+          const pendingWithoutAuthority = command.state === "pending"
+            && command.boundAuthority === undefined;
+          if (pendingWithoutAuthority) {
+            const expectedState = args.localPhase === "prepared_no_effect"
+              ? "failed"
+              : "ambiguous";
+            if (
+              args.state !== expectedState
+              || compareDeviceAuthority(recovery, stale) !== "after"
+            ) throw new Error("stale device command recovery authority");
+          } else if (
+            (command.state !== "prepared" && command.state !== "effect_started")
+            || !deviceCommandRecoveryAdmitted({
+              recoveryAuthority: recovery,
+              staleAuthority: stale,
+              state: command.state,
+              terminalState: args.state as "applied" | "failed" | "ambiguous",
+            })
+          ) throw new Error("stale device command recovery authority");
+          command.boundAuthority = recovery;
           command.resultCode = args.resultCode as string;
           command.resultDigest = args.resultDigest as string;
           command.state = args.state as CommandState;
+          if (this.failDeviceRecoveryAfterEffectOnce) {
+            this.failDeviceRecoveryAfterEffectOnce = false;
+            throw new Error("lost device command recovery response");
+          }
           return { publicId: command.publicId, replay: false, state: command.state };
         }
         throw new Error(`unexpected mutation ${name}`);
@@ -929,21 +1080,25 @@ class FakeCloud {
               };
         }
         if (name === "deviceCommands:listPendingForTarget") {
-          return [...this.deviceCommands.values()]
+          const commands = [...this.deviceCommands.values()]
             .filter((command) => command.state === "pending")
-            .map((command) => ({
-              ...(command.boundAuthority === undefined
-                ? {}
-                : { boundAuthority: command.boundAuthority }),
-              createdAt: command.createdAt,
-              deadline: command.deadline,
-              kind: command.kind,
-              payload: command.payload,
-              publicId: command.publicId,
-              requestingDevicePublicId: command.requestingDevicePublicId,
-              state: command.state,
-              updatedAt: command.updatedAt,
-            }));
+            .map(publicDeviceCommand);
+          if (this.afterDeviceCommandPendingScan !== undefined) {
+            const afterDeviceCommandPendingScan = this.afterDeviceCommandPendingScan;
+            delete this.afterDeviceCommandPendingScan;
+            await afterDeviceCommandPendingScan();
+          }
+          return commands;
+        }
+        if (name === "deviceCommands:get") {
+          const command = this.deviceCommands.get(args.commandPublicId as string);
+          return command === undefined
+            ? null
+            : {
+                ...publicDeviceCommand(command),
+                requestDigest: "d".repeat(64),
+                targetDevicePublicId: devicePublicId,
+              };
         }
         throw new Error(`unexpected query ${name}`);
       },
@@ -1592,6 +1747,7 @@ class RecordingExecutor implements CloudCommandExecutorPort {
 
 function bridge(input: {
   cloud: FakeCloud;
+  daemonAuthority?: AuthorityTuple;
   daemonAuthorityFence?: Readonly<{ assertCurrent(): Promise<void> }>;
   deploymentAuthority?: CloudDeploymentAuthority;
   device: string;
@@ -1609,7 +1765,8 @@ function bridge(input: {
 }) {
   let uuidSequence = 100;
   return new LocalCloudDaemonBridge({
-    daemonAuthority: { bootGeneration: 1, bootId: "boot_12345678" },
+    daemonAuthority: input.daemonAuthority
+      ?? { bootGeneration: 1, bootId: "boot_12345678", fence: 1 },
     daemonAuthorityFence: input.daemonAuthorityFence
       ?? { assertCurrent: () => Promise.resolve() },
     deploymentAuthority: input.deploymentAuthority ?? {
@@ -1748,7 +1905,7 @@ function saturatedCommandJournal(
     projectionRecoveries: [],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   const maximumBytes = 65_536;
   let lower = 22;
@@ -2589,7 +2746,7 @@ describe("cloud daemon bridge", () => {
       projectionRecoveries: [],
       projectionRecoveryReceipts: receipts,
       usageAccounts: [],
-      version: 4,
+      version: 5,
     });
 
     expect(status.recoveries).toHaveLength(128);
@@ -5226,6 +5383,27 @@ describe("device command execution", () => {
     ]);
     const settled = cloud.requireDeviceCommand(commandPublicId);
     expect(settled).toMatchObject({ resultCode: "APPLIED", state: "applied" });
+    const digestInput = JSON.stringify({
+      code: "APPLIED",
+      result: { accountsRefreshed: 2, kind: "usage_refresh" },
+      state: "applied",
+    });
+    expect(settled.resultDigest).toBe(await hmacSha256Hex(
+      key,
+      "device-command-result",
+      digestInput,
+    ));
+    expect(settled.resultDigest).not.toBe(await sha256Hex(digestInput));
+    expect(settled.resultDigest).not.toBe(await hmacSha256Hex(
+      Uint8Array.from(key, (byte) => byte ^ 0xff),
+      "device-command-result",
+      digestInput,
+    ));
+    expect(settled.resultDigest).not.toBe(await hmacSha256Hex(
+      key,
+      "device-command-payload",
+      digestInput,
+    ));
     expect(settled.result).toBeDefined();
     expect(await decryptDeviceCommandResult(settled.result!, key, {
       entityPublicId: commandPublicId,
@@ -5284,6 +5462,324 @@ describe("device command execution", () => {
     });
   });
 
+  test("replays the exact encrypted login handoff after settlement response loss", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    deviceExecutor.outcome = {
+      code: "APPLIED",
+      result: {
+        expiresAt: fixedNow + 60_000,
+        handoffVersion: 2,
+        kind: "account_login_start",
+        loginUrl: "https://auth.example.test/device",
+        userCode: "ABCD-EFGH",
+      },
+      singleUseResult: true,
+      state: "applied",
+    };
+    await cloud.enqueueDeviceCommand({
+      kind: "account_login_start",
+      payload: {
+        accountPublicId: "acct_primary0001",
+        handoffVersion: 2,
+        kind: "account_login_start",
+      },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.failSettleAfterEffectOnce = true;
+
+    const first = await bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(first.errors).toHaveLength(1);
+    const terminal = (await journal.read()).state.deviceCommands[0];
+    expect(terminal).toMatchObject({
+      phase: "terminal",
+      singleUseResult: true,
+      terminalState: "applied",
+    });
+    if (terminal?.phase !== "terminal" || terminal.result === undefined) {
+      throw new Error("missing durable login result fixture");
+    }
+    const durableCiphertext = terminal.result;
+    // Model a crashed daemon whose presence is allowed to expire before the
+    // replacement boot opens the same durable journal.
+    cloud.now += cloud.presenceTtlMs + 1;
+
+    const second = await bridge({
+      cloud,
+      daemonAuthority: { bootGeneration: 2, bootId: "boot_22345678", fence: 1 },
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(deviceExecutor.calls).toHaveLength(1);
+    expect(cloud.requireDeviceCommand(commandPublicId).result).toEqual(durableCiphertext);
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("retires a v5 applied login journal after requester revocation wins the settle race", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    deviceExecutor.outcome = {
+      code: "APPLIED",
+      result: {
+        expiresAt: fixedNow + 60_000,
+        handoffVersion: 2,
+        kind: "account_login_start",
+        loginUrl: "https://auth.example.test/device",
+        userCode: "ABCD-EFGH",
+      },
+      singleUseResult: true,
+      state: "applied",
+    };
+    await cloud.enqueueDeviceCommand({
+      kind: "account_login_start",
+      payload: {
+        accountPublicId: "acct_primary0001",
+        handoffVersion: 2,
+        kind: "account_login_start",
+      },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.revokeDeviceCommandBeforeSettleOnce = true;
+    cloud.failRevokedDeviceCommandConfirmationOnce = true;
+
+    const first = await bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(first.errors).toHaveLength(1);
+    expect(deviceExecutor.calls).toHaveLength(1);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({ state: "ambiguous" });
+    expect(cloud.requireDeviceCommand(commandPublicId).result).toBeUndefined();
+    expect((await journal.read()).state.deviceCommands).toMatchObject([{
+      phase: "terminal",
+      singleUseResult: true,
+      terminalState: "applied",
+    }]);
+
+    cloud.now += cloud.presenceTtlMs + 1;
+    const second = await bridge({
+      cloud,
+      daemonAuthority: { bootGeneration: 2, bootId: "boot_22345678", fence: 1 },
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(deviceExecutor.calls).toHaveLength(1);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({ state: "ambiguous" });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("reconciles a v4 result-less login terminal when remote settlement committed", async () => {
+    for (const consumed of [false, true]) {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const staleAuthority = { bootGeneration: 1, bootId: "boot_00000000", fence: 1 };
+      await cloud.enqueueDeviceCommand({
+        kind: "account_login_start",
+        payload: {
+          accountPublicId: "acct_primary0001",
+          handoffVersion: 2,
+          kind: "account_login_start",
+        },
+        publicId: commandPublicId,
+        requestingDevicePublicId: "device_browser1",
+      });
+      const command = cloud.requireDeviceCommand(commandPublicId);
+      command.boundAuthority = staleAuthority;
+      command.resultCode = "APPLIED";
+      command.resultDigest = "a".repeat(64);
+      command.singleUseResult = true;
+      command.state = "applied";
+      command.result = await encryptDeviceCommandResult({
+        expiresAt: fixedNow + 60_000,
+        handoffVersion: 2,
+        kind: "account_login_start",
+        loginUrl: "https://auth.example.test/device",
+        userCode: "ABCD-EFGH",
+      }, key, {
+        entityPublicId: commandPublicId,
+        keyVersion: 1,
+        kind: "device_command_result",
+        userPublicId,
+      });
+      if (consumed) {
+        delete command.result;
+        command.resultConsumed = true;
+      }
+      const observed = await journal.read();
+      await journal.compareAndSwap(observed.generation, {
+        ...observed.state,
+        deviceCommands: [{
+          authority: staleAuthority,
+          commandPublicId,
+          kind: "account_login_start",
+          payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+          phase: "terminal",
+          requestingDevicePublicId: "device_browser1",
+          resultCode: "APPLIED",
+          resultDigest: "a".repeat(64),
+          terminalState: "applied",
+        }],
+        version: 4,
+      });
+
+      const result = await bridge({
+        cloud,
+        device: "device_daemon1",
+        deviceExecutor: new RecordingDeviceExecutor(),
+        journal,
+        local: new FakeLocal("session_deviceco", events),
+      }).cycle(new AbortController().signal);
+      expect(result.errors).toEqual([]);
+      expect(cloud.requireDeviceCommand(commandPublicId).state).toBe("applied");
+      expect((await journal.read()).state.deviceCommands).toEqual([]);
+    }
+  });
+
+  test("closes a v4 result-less login terminal as ambiguous when settlement never committed", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const staleAuthority = { bootGeneration: 1, bootId: "boot_00000000", fence: 1 };
+    await cloud.enqueueDeviceCommand({
+      kind: "account_login_start",
+      payload: {
+        accountPublicId: "acct_primary0001",
+        handoffVersion: 2,
+        kind: "account_login_start",
+      },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    const command = cloud.requireDeviceCommand(commandPublicId);
+    command.boundAuthority = staleAuthority;
+    command.state = "effect_started";
+    const observed = await journal.read();
+    await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      deviceCommands: [{
+        authority: staleAuthority,
+        commandPublicId,
+        kind: "account_login_start",
+        payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+        phase: "terminal",
+        requestingDevicePublicId: "device_browser1",
+        resultCode: "APPLIED",
+        resultDigest: "a".repeat(64),
+        terminalState: "applied",
+      }],
+      version: 4,
+    });
+
+    const result = await bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor: new RecordingDeviceExecutor(),
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(result.errors).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      resultCode: "LOCAL_RESULT_RECOVERY_REQUIRED",
+      state: "ambiguous",
+    });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("retires a v4 result-less login journal after requester revocation terminalized the command", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    const staleAuthority = { bootGeneration: 1, bootId: "boot_00000000", fence: 1 };
+    await cloud.enqueueDeviceCommand({
+      kind: "account_login_start",
+      payload: {
+        accountPublicId: "acct_primary0001",
+        handoffVersion: 2,
+        kind: "account_login_start",
+      },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    const command = cloud.requireDeviceCommand(commandPublicId);
+    command.boundAuthority = staleAuthority;
+    command.state = "ambiguous";
+    cloud.revokedDevices.add(command.requestingDevicePublicId);
+    const observed = await journal.read();
+    await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      deviceCommands: [{
+        authority: staleAuthority,
+        commandPublicId,
+        kind: "account_login_start",
+        payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+        phase: "terminal",
+        requestingDevicePublicId: "device_browser1",
+        resultCode: "APPLIED",
+        resultDigest: "a".repeat(64),
+        terminalState: "applied",
+      }],
+      version: 4,
+    });
+
+    const result = await bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(result.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({ state: "ambiguous" });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("fails closed when the requesting device is revoked after the pending scan", async () => {
+    const cloud = new FakeCloud();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.afterDeviceCommandPendingScan = () => {
+      cloud.revokedDevices.add("device_browser1");
+    };
+
+    const result = await bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+
+    expect(result.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      resultCode: "REQUESTING_DEVICE_INACTIVE",
+      state: "failed",
+    });
+  });
+
   test("quarantines an executor failure after the effect boundary as ambiguous", async () => {
     const cloud = new FakeCloud();
     const deviceExecutor = new RecordingDeviceExecutor();
@@ -5308,6 +5804,210 @@ describe("device command execution", () => {
       state: "ambiguous",
     });
   });
+
+  test("a later boot fails a prepared journal whose cloud prepare never committed", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.failDevicePrepareBeforeEffectOnce = true;
+    const first = await bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(first.errors).toHaveLength(1);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({ state: "pending" });
+    expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "prepared" }]);
+
+    cloud.now += cloud.presenceTtlMs + 1;
+    const second = await bridge({
+      cloud,
+      daemonAuthority: { bootGeneration: 2, bootId: "boot_22345678", fence: 1 },
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      resultCode: "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT",
+      state: "failed",
+    });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  for (const hostedState of ["cancelled", "expired"] as const) {
+    test(`a later boot retires a prepared journal after hosted ${hostedState} wins`, async () => {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const deviceExecutor = new RecordingDeviceExecutor();
+      await cloud.enqueueDeviceCommand({
+        kind: "account_login_start",
+        payload: {
+          accountPublicId: "acct_primary0001",
+          handoffVersion: 2,
+          kind: "account_login_start",
+        },
+        publicId: commandPublicId,
+        requestingDevicePublicId: "device_browser1",
+      });
+      // The requester cancellation or hosted expiry lands after the daemon's
+      // pending scan but before its prepare mutation reaches the server.
+      cloud.afterDeviceCommandPendingScan = () => {
+        cloud.requireDeviceCommand(commandPublicId).state = hostedState;
+      };
+      const first = await bridge({
+        cloud,
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new FakeLocal("session_deviceco", events),
+      }).cycle(new AbortController().signal);
+      expect(first.errors).toHaveLength(1);
+      expect(deviceExecutor.calls).toEqual([]);
+      expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "prepared" }]);
+
+      cloud.now += cloud.presenceTtlMs + 1;
+      const restarted = bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 2, bootId: "boot_22345678", fence: 1 },
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new FakeLocal("session_deviceco", events),
+      });
+      if (hostedState === "cancelled") cloud.failTerminalRecoveryConfirmationOnce = true;
+      const second = await restarted.cycle(new AbortController().signal);
+      if (hostedState === "cancelled") {
+        expect(second.errors).toHaveLength(1);
+        expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "prepared" }]);
+        expect((await restarted.cycle(new AbortController().signal)).errors).toEqual([]);
+      } else {
+        expect(second.errors).toEqual([]);
+      }
+      expect(deviceExecutor.calls).toEqual([]);
+      expect(cloud.requireDeviceCommand(commandPublicId).state).toBe(hostedState);
+      expect((await journal.read()).state.deviceCommands).toEqual([]);
+    });
+  }
+
+  test("a later boot retires effect-started evidence after requester revocation", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    await cloud.enqueueDeviceCommand({
+      kind: "account_login_start",
+      payload: {
+        accountPublicId: "acct_primary0001",
+        handoffVersion: 2,
+        kind: "account_login_start",
+      },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    // The hosted mark commits, then requester revocation terminalizes the row
+    // before the daemon receives the mark response or invokes the provider.
+    cloud.revokeDeviceCommandAfterMarkOnce = true;
+    const first = await bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(first.errors).toHaveLength(1);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId).state).toBe("ambiguous");
+    expect((await journal.read()).state.deviceCommands).toMatchObject([{
+      phase: "effect_started",
+    }]);
+
+    cloud.now += cloud.presenceTtlMs + 1;
+    const second = await bridge({
+      cloud,
+      daemonAuthority: { bootGeneration: 2, bootId: "boot_22345678", fence: 1 },
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    }).cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId).state).toBe("ambiguous");
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  for (const phase of ["prepared", "effect_started"] as const) {
+    test(`a later boot replays a committed ${phase} recovery after response loss`, async () => {
+      const cloud = new FakeCloud();
+      const journal = new MemoryCloudDaemonJournal();
+      const deviceExecutor = new RecordingDeviceExecutor();
+      const staleAuthority = { bootGeneration: 1, bootId: "boot_00000000", fence: 1 };
+      await cloud.enqueueDeviceCommand({
+        kind: "account_login_start",
+        payload: {
+          accountPublicId: "acct_primary0001",
+          handoffVersion: 2,
+          kind: "account_login_start",
+        },
+        publicId: commandPublicId,
+        requestingDevicePublicId: "device_browser1",
+      });
+      const command = cloud.requireDeviceCommand(commandPublicId);
+      command.boundAuthority = staleAuthority;
+      command.state = phase;
+      const observed = await journal.read();
+      await journal.compareAndSwap(observed.generation, {
+        ...observed.state,
+        deviceCommands: [{
+          authority: staleAuthority,
+          commandPublicId,
+          kind: "account_login_start",
+          payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+          phase,
+          requestingDevicePublicId: "device_browser1",
+        }],
+      });
+
+      cloud.failDeviceRecoveryAfterEffectOnce = true;
+      const recovering = await bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 2, bootId: "boot_22345678", fence: 1 },
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new FakeLocal("session_deviceco", events),
+      }).cycle(new AbortController().signal);
+      expect(recovering.errors).toHaveLength(1);
+      expect(deviceExecutor.calls).toEqual([]);
+      expect(cloud.requireDeviceCommand(commandPublicId).state).toBe(
+        phase === "prepared" ? "failed" : "ambiguous",
+      );
+      expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase }]);
+
+      cloud.now += cloud.presenceTtlMs + 1;
+      const final = await bridge({
+        cloud,
+        daemonAuthority: { bootGeneration: 3, bootId: "boot_32345678", fence: 1 },
+        device: "device_daemon1",
+        deviceExecutor,
+        journal,
+        local: new FakeLocal("session_deviceco", events),
+      }).cycle(new AbortController().signal);
+      expect(final.errors).toEqual([]);
+      expect(deviceExecutor.calls).toEqual([]);
+      expect((await journal.read()).state.deviceCommands).toEqual([]);
+    });
+  }
 
   test("a later boot closes a stale effect_started entry without re-executing it", async () => {
     const cloud = new FakeCloud();

@@ -19,6 +19,8 @@ export const HOSTED_PUBLIC_FUNCTION_AUTHORITY = Object.freeze({
   "commands:settle": "active_device",
   "deviceCommands:acknowledgeReceipt": "active_device",
   "deviceCommands:cancelPending": "active_device",
+  "deviceCommands:confirmRevokedTerminal": "active_device",
+  "deviceCommands:confirmTerminalRecovery": "active_device",
   "deviceCommands:consumeResult": "active_device",
   "deviceCommands:enqueue": "active_device",
   "deviceCommands:get": "active_device",
