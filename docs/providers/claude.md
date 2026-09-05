@@ -4,7 +4,7 @@ Status: the notes below are the W1 spike that the W3-C adapter was built from. T
 
 ## Shape
 
-A Claude profile is one isolated home exported as `CLAUDE_CONFIG_DIR`. The user signs in with `claude auth login` inside that home. HRA spawns the unmodified Claude Code runtime bundled with the pinned Agent SDK through HRA's environment-allowlisted spawner, and never reads, copies, or forwards the credential. Account selection stays user-directed. Claude profiles default to a per-account cap of two concurrent sessions; swarm-scale traffic may be judged non-ordinary by the provider, and users raise the cap knowingly.
+A Claude profile is one isolated home exported as `CLAUDE_CONFIG_DIR`. The user installs the exact pinned Claude Code version separately, signs in with `claude auth login` inside that home, and keeps its `claude` executable on `PATH`. HRA locates and version-checks that unmodified runtime before launching it through HRA's environment-allowlisted spawner, and never reads, copies, or forwards the credential. Account selection stays user-directed. Claude profiles default to a per-account cap of two concurrent sessions; swarm-scale traffic may be judged non-ordinary by the provider, and users raise the cap knowingly.
 
 ## macOS Keychain probe (plan item D2)
 

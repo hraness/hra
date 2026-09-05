@@ -2,9 +2,16 @@
   color-scheme: light dark;
   --background: #f4f1e9;
   --code-background: #1a1916;
+  --code-danger: #f2a090;
   --code-foreground: #f7f3e8;
+  --code-info: #a9d5f5;
+  --code-muted: #c2bbad;
+  --code-success: #a9d49a;
+  --code-warning: #efc778;
   --foreground: #161512;
   --font-sans: "Nebula Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --inverse-background: #1a1916;
+  --inverse-foreground: #f7f3e8;
   --muted: #5d594f;
   --rule: #c9c2b3;
   --surface: #ebe5d8;
@@ -107,8 +114,8 @@ main {
   --hraness-marketing-muted: var(--muted);
   --hraness-marketing-line: var(--rule);
   --hraness-marketing-surface: var(--background);
-  --hraness-marketing-inverse: var(--code-background);
-  --hraness-marketing-inverse-ink: var(--code-foreground);
+  --hraness-marketing-inverse: var(--inverse-background);
+  --hraness-marketing-inverse-ink: var(--inverse-foreground);
   --hraness-marketing-accent: var(--link);
   --hraness-marketing-text-font: var(--font-sans);
   --hraness-marketing-heading-font: var(--font-sans);
@@ -189,13 +196,19 @@ pre:focus-visible {
   outline-offset: 0.25rem;
 }
 
-code {
+.hra-inline-code {
   background: color-mix(in srgb, var(--surface), transparent 16%);
   border-radius: 0.2rem;
   padding: 0.08em 0.24em;
 }
 
 pre {
+  --foreground: var(--code-foreground);
+  --danger: var(--code-danger);
+  --info: var(--code-info);
+  --muted: var(--code-muted);
+  --success: var(--code-success);
+  --warning: var(--code-warning);
   background: var(--code-background);
   border-radius: 0.45rem;
   color: var(--code-foreground);
@@ -445,9 +458,16 @@ li + li {
 @media (prefers-color-scheme: dark) {
   :root {
     --background: #141310;
-    --code-background: #f0ebdf;
-    --code-foreground: #171512;
+    --code-background: #090a0c;
+    --code-danger: #ffad9e;
+    --code-foreground: #fbf8f0;
+    --code-info: #acd9ff;
+    --code-muted: #c8c1b5;
+    --code-success: #b4dfa7;
+    --code-warning: #f3ce81;
     --foreground: #eee9df;
+    --inverse-background: #f0ebdf;
+    --inverse-foreground: #171512;
     --muted: #b9b2a4;
     --rule: #474238;
     --surface: #2a2721;

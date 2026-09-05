@@ -1,12 +1,13 @@
 ---
 title: HRA v1
-description: Release plan for a persistent Codex control plane for humans and agents, with isolated accounts, bounded work coordination, durable interactions and event streams, device presence, historical usage metrics, encrypted multi-device sync, and safe desktop account switching.
+description: Release plan for a persistent Codex and Claude Code control plane for humans and agents, with isolated profiles, a provider-neutral transcript, bounded work coordination, durable interactions and event streams, encrypted multi-device sync, provider switching, and provider-specific account controls.
 type: plan
 status: in-progress
 area: hra
 tags:
   - bun
   - cli
+  - claude-code
   - codex
   - convex
 ---
@@ -15,19 +16,19 @@ tags:
 
 ## Outcome
 
-HRA is a persistent Codex control plane for people and agents. Running `hra` in a terminal starts or attaches to the owner-private daemon, opens a line-oriented shell, and remains connected until the person exits. The same binary exposes bounded one-shot JSON and cursor-based JSONL commands, so an agent can inspect a session repeatedly, follow visible progress during a turn, and respond to an exact pending interaction without scraping terminal presentation.
+HRA is a persistent Codex and Claude Code control plane for people and agents. Running `hra` in a terminal starts or attaches to the owner-private daemon, opens a line-oriented shell, and remains connected until the person exits. The same binary exposes bounded one-shot JSON and cursor-based JSONL commands, so an agent can inspect a session repeatedly, follow visible progress during a turn, and respond to an exact pending interaction without scraping terminal presentation.
 
-HRA keeps several Codex subscriptions isolated on one device, records historical usage, derives honest token-velocity windows, supervises sessions, safely brokers Codex approvals and questions, and coordinates bounded work across exact already-existing sessions. It reports enrolled-device presence and optionally syncs encrypted session projections and remote commands across devices. The supported desktop account switch remains an explicit journaled machine mutation.
+HRA keeps Codex and Claude Code profiles isolated on one device, supervises sessions through their pinned provider runtimes, owns one durable provider-neutral conversation record, and coordinates bounded work across exact already-existing sessions. Codex additionally supplies account identity, historical usage, plugin discovery, native transcript observation, and the supported explicit desktop account switch; HRA does not imply those surfaces exist for Claude Code. HRA reports enrolled-device presence and optionally syncs encrypted session projections and remote commands across devices.
 
-The first beta is complete when a new user can install `hra`, link two Codex accounts, leave the daemon running, start and follow a session from the human shell or JSON interface, coordinate a bounded task graph across exact sessions through the agent-only work protocol, resolve an approval or question by exact interaction ID, inspect account usage history and device presence, control a session from a second enrolled device, switch the supported desktop application to a chosen account, and recover safely from terminal, process, network, and machine restarts.
+The first beta is complete when a new user can install `hra`, prepare isolated profiles for Codex and Claude Code, leave the daemon running, start and follow either provider from the human shell or JSON interface, preserve the HRA conversation while switching its provider, coordinate a bounded task graph across exact sessions through the agent-only work protocol, resolve an approval or question by exact interaction ID, inspect Codex account usage history and device presence, control a session from a second enrolled device, switch the supported ChatGPT desktop application to a chosen Codex account, and recover safely from terminal, process, network, and machine restarts.
 
 ## Main model
 
 The runtime model has three first-class objects. Cloud login identity remains internal and separate.
 
-- An **account** is one isolated Codex subscription profile. It owns a user label, provider identity observations, one supervised app-server generation at a time, capabilities, usage snapshots, and sessions. It never contains copied provider credentials.
+- An **account** is one user-selected HRA profile with an isolated `CODEX_HOME` and an isolated `CLAUDE_CONFIG_DIR`. It owns a user label, provider-specific observations where supported, supervised runtime generations, capabilities, usage snapshots where supported, and sessions. It never contains copied provider credentials.
 - A **device** is one durable HRA installation enrolled under an HRA cloud identity. It owns a revocable credential, encryption-key status, last successful heartbeat, and sessions for which its daemon is execution custodian. A process is not a device. Registering a device does not grant decryption or execution authority.
-- A **session** is an HRA projection of one provider thread, bound to one account and one execution-custodian device. It owns ordered turns, a durable safe event stream, pending interactions, user metadata, queues, recovery records, and an optional cloud execution lease.
+- A **session** is an HRA-owned provider-neutral conversation record bound at any moment to one provider-native session, one account profile, and one execution-custodian device. It owns ordered turns, a durable safe event stream, pending interactions, user metadata, queues, recovery records, and an optional cloud execution lease. A provider switch preserves this record, not the outgoing provider's hidden state, cached context, or native session.
 
 The agent-only coordination model adds six closed local records without adding another model runtime or `Agent` object:
 
@@ -38,14 +39,15 @@ The agent-only coordination model adds six closed local records without adding a
 - **Review** is one immutable decision over an exact submission revision.
 - **Signal** is one attributable bounded message with separate storage, provider acceptance, acknowledgement, failure, and unknown states.
 
-An HRA cloud identity authenticates a person to the optional sync service. It may enroll devices but is never presented as a Codex account and does not imply possession of the encrypted workspace key.
+An HRA cloud identity authenticates a person to the optional sync service. It may enroll devices but is never presented as a Codex or Claude Code account and does not imply possession of the encrypted workspace key.
 
 ## Product boundary
 
 HRA owns:
 
-- named local account profiles and one isolated `CODEX_HOME` per profile;
-- one supervised Codex app-server generation per active profile;
+- named local account profiles with one isolated `CODEX_HOME` and one isolated `CLAUDE_CONFIG_DIR` per profile;
+- supervised pinned Codex app-server and Claude Code runtime generations;
+- the durable provider-neutral transcript and provider-switch record;
 - a local SQLite control plane, append-only safe event and metrics ledgers, mutation journal, device identity, and pathless cloud projection;
 - bounded work graphs, claims, monotonic fences, exact session dispatch bindings, submissions, reviews, signals, and work-scoped event cursors in local SQLite;
 - typed pending interactions with exact provider request identity and compare-and-swap resolution;
@@ -55,20 +57,21 @@ HRA owns:
 - an explicit, journaled desktop application account switch;
 - the CLI, website, package, and release contract.
 
-Codex app-server owns:
+Provider runtimes own:
 
-- ChatGPT/Codex login, token refresh, logout, and provider credentials;
-- provider thread, turn, item, approval, model, plugin, and transcript authority;
-- account usage and rate-limit source data;
-- permission and organization requirements.
+- provider authentication and credentials, native sessions or threads, execution, tools, approvals, models, and hidden state;
+- for Codex specifically, HRA-mediated login, token refresh, logout, account identity and usage source data, plugins, native transcript observation, and desktop switching;
+- for Claude Code specifically, user-operated sign-in inside the isolated `CLAUDE_CONFIG_DIR`; provider-side listing, rename, resume, usage, protected turn inspection, and HRA account login or logout remain absent;
+- provider-native permission and organization requirements.
 
-The Convex deployment coordinates devices and encrypted session projections. It is never required for local login, local execution, local work coordination, local recovery, or reading local Codex sessions.
+The Convex deployment coordinates devices and encrypted session projections. It is never required for local provider authentication, local execution, local work coordination, local recovery, or reading HRA's local session record.
 
 ## Release decisions
 
 ### Runtime
 
 - Pin the official `@openai/codex` package and invoke it through Bun. Do not require a global Node or Codex installation.
+- Pin one exact Claude Code version and model contract, discover only that separately installed executable, run it unmodified under the profile's isolated `CLAUDE_CONFIG_DIR`, and fail closed on protocol or version drift. HRA never reads, copies, or forwards the Claude credential.
 - Use app-server JSONL over private stdio. Keep its method strings inside one exact-version adapter.
 - Parse every response, notification, and server request from `unknown` into a closed HRA fact union generated or checked against the pinned package protocol.
 - Run one daemon per OS user. The CLI talks to it through an owner-private Unix socket and a mode-0600 capability file.
@@ -85,6 +88,7 @@ The Convex deployment coordinates devices and encrypted session projections. It 
 - `hra` with no arguments on a non-TTY prints bounded help and exits successfully. It never consumes stdin as a prompt or grants authority implicitly.
 - Existing one-shot commands remain composable. `--json` emits one versioned value on stdout. `--jsonl` emits only versioned event envelopes on stdout. Diagnostics and interactive prompts use stderr or the foreground TTY.
 - Every Codex account login is a dedicated one-shot CLI invocation. JSON and noninteractive callers must supply `--handoff-file` with an absolute canonical path to an empty single-link mode-`0600` regular file under a canonical current-user-owned mode-`0700` parent. HRA opens and holds both descriptors, strictly resolves the selector through the local account list, and dispatches the provider effect only with that exact account ID. The response must repeat that ID, carry a state coherent with its terminal or pending login status, name the canonical cancellation command, use the pinned HTTPS-or-loopback URL policy without URL credentials, and provide a closed device-code grammar. HRA writes and proves one bounded versioned document after the first pending response, closes both descriptors before reporting success, and emits only its path, disposition, and safe state. Missing protected output returns `INTERACTION_REQUIRED` with the already-generated idempotency key and exact replay command before transport. Same-key replay never claims or reconstructs one-time instructions; a login that has since completed or been canceled returns terminal signed-in or signed-out settlement. A post-effect parse, write, close, or identity-proof failure returns one `RECOVERY_REQUIRED` result with the exact cancellation and same-key recovery commands. A dedicated foreground human TTY renderer may show the validated URL and code directly; the generic renderer cannot.
+- Claude Code authentication remains provider-operated. The user signs in with the pinned Claude Code executable inside the selected profile's isolated `CLAUDE_CONFIG_DIR`; HRA exposes no Claude sign-in, sign-out, account-listing, provider-session-listing, or resume command and never inspects the credential.
 - Agents inspect a session through an atomic snapshot plus opaque versioned cursor and then request events after that cursor. The cursor binds session ID, stream epoch, and sequence and is validated as an indivisible value. `session events --wait-ms` provides bounded long polling; `session events --follow` reconnects internally and prints ordered JSONL. Each line must drain before its cursor advances or another page is fetched. Delivery is monotonic and at least once across pipe or process failure. Consumers deduplicate events by `(sessionId, streamEpoch, sequence)` and persist a page checkpoint only after durably applying every preceding line. A retained page contains no duplicates. A retention, rebuild, restore, or provider-connection gap is typed and never silent. `--follow --json` is rejected instead of silently changing output modes, and cancellation destroys an in-flight local socket request.
 - The live release operator gives agent mode one framed stdin and stdout protocol. Its first stdin frame is the bounded configuration document. Every later request has a fresh UUID and an exact `responseMode`. HRA identity documents use an absolute canonical invoking-user-owned mode-`0600` file. Codex device-login values use a caller-created empty mode-`0600` handoff file under a canonical mode-`0700` directory; HRA opens the child relative to a held parent descriptor with `O_NOFOLLOW | O_NONBLOCK`, writes and verifies the bounded document, preserves it, and emits only its protected path and disposition. Fixed nonsecret question, permission, and acknowledgement responses may be inline only under their declared closed mode. Agent stdout never contains an invite, OTP, device code, verification URL, protected answer, or permission value.
 - Human rendering coalesces small deltas without changing the durable cursor. JSON clients receive the bounded closed event variants and do not parse ANSI presentation.
@@ -97,7 +101,7 @@ The Convex deployment coordinates devices and encrypted session projections. It 
 - Keep six primitives: work, task, attempt, submission, review, and signal. A session is the actor. Task readiness is derived from work state, time bounds, accepted dependency submissions, and absence of a live or ambiguous attempt. Readiness is never a second mutable authority.
 - Route each task to one exact local account ID and project ID with its requested preset and Fast setting. HRA never chooses another subscription from usage, quota, freshness, availability, or incidental order. Provider failure or a limit cannot trigger automatic account rotation, rerouting, or replay.
 - Admit claims in local SQLite with an expected task revision and monotonic task fence. Renewal, release, report, review, signal acknowledgement, and reconciliation require the exact identifiers, scoped capability, revision, and fence named by their closed operation.
-- Bind dispatch to one already-existing exact actor session whose account generation and project match the task route. Persist the attempt, binding, request digest, and prepared provider effect before the send-only turn start. Task queueing is the HRA graph; queue and steer remain signal modes. A result that may have escaped but cannot be proved becomes recovery-required and is never redispatched, stolen, or rerouted speculatively.
+- Bind dispatch to one already-existing exact actor session whose account generation, provider, and project match the task route. Persist the attempt, binding, request digest, and prepared provider effect before the send-only turn start. Task queueing is the HRA graph; queue and steer remain signal modes. A result that may have escaped but cannot be proved becomes recovery-required and is never redispatched, stolen, or rerouted speculatively.
 - Accept every mutation through one strict `hra work apply --input-stdin` request shaped `{protocol,version,requestId,operation}`. The closed nested operation carries its discriminated `kind`, UUIDv7 `idempotencyKey`, and operation-specific fields. No work mutation or capability is encoded as argv fields.
 - Define ordinary same-key replay as preservation of the durable decision, stable identities, and capabilities with no new mutation, event, or revision. Reproject mutable public records and `workRevision` from current state rather than promising byte-identical output. Keep the retained `work.release` tombstone as the exact stored-result exception and the only replay authority after purge.
 - Expose exactly seven agent commands: `protocol`, `apply`, `snapshot`, `task`, `poll`, `events`, and `watch`. `work protocol` has mutually exclusive operation, type, and topic selectors and publishes the recovery-directive and process-exit matrix. Non-streaming work commands always emit compact JSON. `work task` has distinct detail and history modes without adding another command. `watch` emits resumable JSONL gap, event, and checkpoint frames, drains output before cursor advancement, and preserves at-least-once delivery.
@@ -133,8 +137,8 @@ Each event page is one transactionally coherent object containing the requested 
 
 ### Accounts and usage
 
-- Create one user-only profile directory per Codex account. Let app-server perform managed ChatGPT browser or device-code login inside that profile.
-- Never read, parse, copy, export, or sync `auth.json`. Never put provider tokens in argv, logs, SQLite, Convex, JSON output, or receipts.
+- Create one user-only HRA profile with an isolated `CODEX_HOME` and `CLAUDE_CONFIG_DIR` per account label. Let Codex app-server perform managed ChatGPT browser or device-code login inside `CODEX_HOME`; require the user to sign in with the pinned Claude Code executable inside `CLAUDE_CONFIG_DIR` without HRA reading that credential.
+- Never read, parse, copy, export, or sync `auth.json` or Claude Code configuration and credentials. Never put provider tokens in argv, logs, SQLite, Convex, JSON output, or receipts.
 - Persist only the provider's bounded non-secret login ID for a pending handoff. Verification URLs and device codes remain one-response values. Same-key replay is secret-free and names `account login-cancel`; if its provider-login authority has settled, replay projects terminal signed-in evidence or a typed signed-out settlement instead of restoring the stale pending receipt. Daemon restart and unexpected provider disconnect atomically rebind the exact active authority to the new process generation. Cancellation writes the pinned `account/login/cancel` request, re-reads provider account state, and settles only a matching profile, generation, login ID, and original mutation before a fresh login may start. A failed `account/login/completed` notification is terminal evidence only when its non-null login ID matches that exact active authority in the current generation. It queues with explicit cancellation and later disconnect facts under one FIFO account authority, then settles `signed_out` without another provider read; null, successful, mismatched, and stale notifications do nothing. Schema-16 pending receipts that predate the login ID ledger migrate to an append-only abandoned resolution and `signed_out` because their initiating app-server process no longer exists.
 - Read provider identity through `account/read`, quota through `account/rateLimits/read`, and token statistics through `account/usage/read`.
 - Poll only while the daemon is active and on explicit `usage refresh`. Stagger account polls around a 60-second target interval with deterministic per-account jitter from 50 through 70 seconds and exponential backoff capped at 15 minutes. Record source time, observed time, provider generation, digest, freshness, reset detection, and failure state with each snapshot.
@@ -151,27 +155,28 @@ Each event page is one transactionally coherent object containing the requested 
 
 ### Session controls
 
-- List and page threads through app-server. Read condensed history from bounded thread and turn projections. Load full supported item detail only for an explicit `turn inspect`.
+- List and page HRA-owned conversation records through the local store. Codex may add bounded native thread and turn observations; Claude Code has no provider-side listing or resume adapter. Load full provider-native item detail only for the Codex-specific explicit `turn inspect` path.
 - Default condensed output includes user messages, final assistant messages, elapsed turn time, observed model and tier, and bounded observed file or Git actions when the provider emitted them.
 - Full detail and live events never expose hidden chain of thought. They may include provider-visible reasoning summaries, safe tool lifecycle and bounded progress, commands, edits, Git items, timing, interactions, usage, and terminal status.
-- `send` starts a turn only when no turn is active. `queue` records one durable future user turn. `steer` requires the exact active turn ID. `stop` uses `turn/interrupt`.
-- Queue dispatch is serialized per session. A lost `turn/start` or `turn/steer` response reconciles by the exact client message ID before any explicit retry.
-- `rename` writes the provider thread name and updates the encrypted projection. One HRA note per session is encrypted metadata and is never injected into the provider thread.
+- `send` starts a provider turn only when no turn is active. `queue` records one durable future user turn. `steer` requires exact active-turn authority supported by the bound provider. `stop` routes through the provider adapter's reviewed interrupt boundary.
+- Queue dispatch is serialized per session. A lost provider start or steer response reconciles by the exact client message lineage before any explicit retry.
+- Codex `rename` writes the provider thread name and updates the encrypted projection; Claude Code exposes no HRA rename adapter. One HRA note per session is encrypted metadata and is never injected into either provider's native conversation.
 - Changing a project or directory affects future turns only. Canonicalize the selected root and show it before the first provider mutation.
 
 ### Presets and permissions
 
-Resolve models and capabilities from the exact account generation before each first use. User-facing aliases compile to:
+Resolve models and capabilities from the exact account generation and provider before each first use. User-facing aliases compile to:
 
-| Alias | Requested profile |
-| --- | --- |
-| `low` | Luna, maximum supported reasoning |
-| `high` | Sol, maximum supported reasoning |
-| `ultra` | Sol, Ultra reasoning effort |
+| Alias | Provider | Requested profile |
+| --- | --- | --- |
+| `low` | Codex | `gpt-5.6-luna`, maximum supported reasoning |
+| `high` | Codex | `gpt-5.6-sol`, maximum supported reasoning |
+| `ultra` | Codex | `gpt-5.6-sol`, Ultra reasoning effort |
+| `fable-max` | Claude Code | `claude-fable-5-1`, maximum reasoning |
 
-The adapter must discover the current model IDs, effort values, collaboration modes, permission profiles, plugins, and Fast support. An unavailable alias fails closed with the advertised alternatives. It never silently changes quality.
+Each adapter must validate its pinned runtime, model, effort, and supported capabilities. Codex additionally discovers collaboration modes, permission profiles, plugins, apps, and Fast support. An unavailable or wrong-provider alias fails closed with the advertised alternatives; HRA never silently changes quality.
 
-Fast is a per-turn overlay. `fast on` sends the exact advertised Fast tier. `fast off` sends the explicit Standard value so a prior Fast turn cannot leak into a continuation.
+Fast is a Codex-only per-turn overlay. `fast on` sends the exact advertised Fast tier. `fast off` sends the explicit Standard value so a prior Fast turn cannot leak into a continuation. Claude Code rejects Fast instead of ignoring it.
 
 The recommended beta permission policy is opt-in during `hra init`:
 
@@ -202,7 +207,7 @@ An uncertain quit, profile transition, or relaunch is `recovery_required`. HRA d
 
 ### Cloud identity and encryption
 
-- HRA cloud identity is separate from every Codex account.
+- HRA cloud identity is separate from every Codex or Claude Code account.
 - Sign-in uses one Convex verified-email code flow. Store only bounded challenge state and a hashed verifier. Codes are one-time, expire, and consume an account plus global rate-limit budget.
 - Device bootstrap is a closed transactional state machine: identity with zero devices, one first-device bootstrap claim, registered pending, approved without key receipt, active keyed, revoked, or identity deleted. Simultaneous first registrations create exactly one bootstrap device; every loser becomes pending or receives the existing exact result. Registration is not pairing and grants neither ciphertext reads nor session execution authority.
 - Successful sign-in authenticates the HRA identity. The daemon automatically registers this installation if it has no server-side device record. The first bootstrap device generates the client-side workspace encryption key and becomes active. A later registered device remains pending until an active device runs `hra device approve <device>`, after which the new device retrieves and unwraps its key envelope. Email access alone cannot decrypt synced session content. Losing every active key holder makes existing encrypted content unrecoverable in v1.
@@ -226,8 +231,8 @@ Encrypt before upload:
 
 Never upload:
 
-- Codex credentials or profile files;
-- raw app-server requests or responses;
+- Codex or Claude Code credentials and provider profile or configuration files;
+- raw Codex app-server or Claude Code stream requests or responses;
 - raw reasoning or hidden chain of thought;
 - approval secrets, environment variables, arbitrary command output, or unbounded filesystem paths;
 - plugin credentials or OAuth material.
@@ -343,7 +348,7 @@ SQLite is the only work execution authority in v1. The domain schemas and narrow
 
 Bound event payloads and per-session retention by the published constants; advance the floor only by adding visible gap metadata. Coalesce deltas for display without changing stored order. Do not duplicate the provider's raw transcript store. Local projections are rebuildable from bounded app-server reads plus HRA-owned metadata and explicit gap evidence.
 
-Namespace all cloud custody and projection state by cloud user public ID. A same-root A to B to A handoff closes the current lifecycle, selects another namespace, and preserves both identities' key, device, cache, journal, and recovery state. No cloud-identity operation may block local Codex accounts or sessions.
+Namespace all cloud custody and projection state by cloud user public ID. A same-root A to B to A handoff closes the current lifecycle, selects another namespace, and preserves both identities' key, device, cache, journal, and recovery state. No cloud-identity operation may block local provider profiles or sessions.
 
 The new product's physical namespace is deliberately distinct from HRA v0 and from discarded development namespaces: `~/Library/Application Support/HRA Control Plane v1` on macOS, `~/.local/state/hra-control-plane-v1` on Linux, private `secret-values` and `secret-metadata` custody below that root, daemon protocol `hra-control-plane-local-v2`, and `hra-control-plane` cryptographic domain prefixes. This preproduction operator machine already has one generation-zero pointer in the v1 root whose value used the former prerelease Keychain backend. A foreground, daemon-fenced repository operator copies that exact digest-proven value into `secret-values` in place, retains the legacy entry, and never runs automatically. HRA v0 retains its `OPRTE` Application Support root, `kitchen.hraness` bundle and credential services, and every historical compatibility identifier unchanged.
 
@@ -523,6 +528,7 @@ The beta requires all of these scenarios:
 | Phase 4 | Complete; hosted sync live as an open beta | The exact-target hosted operators, custody, denylist, lost-response recovery, quotas, authentication, device, invitation, deletion, and maintenance contracts remain enforced. On 2026-09-03 the current source was deployed to default production `qualified-hummingbird-537`, bootstrap completed, admissions reopened at generation 2, and the first identity, device, and production sync were proved. The old literal phrase gate is retired; routine task-owned hosted delivery follows standing authority through these machine checks, while unavoidable provider authentication and genuinely new DNS or product decisions remain explicit boundaries. |
 | Phase 5 | Closeout and executable acceptance harness adversarially gated; live run pending | Profiles, sessions, interactions, usage, presence, deletion, desktop switching, encrypted sync, compact recovery, shell live updates, generated public contracts, site generation, and package installation pass the revised repository-wide gate. The independently rereviewed two-installation harness drives the production parser and protected-input path, supervises real daemon generations, proves continuous exact-turn authority and HITL settlement, requires exact requested, prepared, written, command-start, every-progress, command-completion, and terminal ordering, and rejects unrelated side effects. Agent OAuth values use a caller-owned protected file; descriptor-relative child opens reject symlinks, FIFOs, and parent substitution. The final focused live suite passes 125 tests with 1,621 assertions. Real Codex two-account and hosted two-device execution remain pending. |
 | Phase 6 | Public local CLI `v0.5.0` and hosted open beta admitted | GitHub repository ID `1334876494` remains only as the archived `hraness/hra-v0` reference, and the retired Vercel and Convex numeric identities remain denylisted tombstones. Current repository ID `1343008607` owns the artifact-only release path. Stable `@hraness/hra@0.5.0`, immutable GitHub Release `382922988`, npm provenance, checksum, and byte-identical tarball are admitted evidence; `latest` names `0.5.0`. The owner-authenticated local `release:tag` command creates and pushes one exact annotated version tag under the creation-only release-tag ruleset, after checking main, CI, repository identity, tag monotonicity, and immutable-tag protections. The tag-push workflow independently rechecks provenance, builds the artifact, and publishes through npm trusted publishing without a conversational or mutable per-version approval gate. Hosted sync is live independently as an open beta. |
+| Phase 7 | Unreleased Claude Code execution and provider portability | The current source starts and drives Claude Code sessions end to end, keeps one provider-neutral transcript, switches an idle session between Codex and Claude Code locally or through its execution custodian, and exports trajectory or JSON. Deterministic Claude and provider-switch suites cover the runtime boundary. Public copy and provider documentation describe that source state, while the immutable install target remains `v0.5.0`, which is Codex-only. This row records no version selection, tag, GitHub Release, npm publication, footer lock update, deployment, or production readback. |
 
 ## Execution evidence
 
@@ -561,7 +567,7 @@ The dated entries below are historical snapshots. Their older dependency and pub
 - 2026-08-23: The persistent shell starts and validates the daemon inside its cleanup boundary before the first prompt, keeps the daemon alive on exit, and follows the selected session from its current durable cursor. Human updates coalesce safe assistant and provider-visible reasoning-summary deltas only after an observed item-start boundary, expose typed interactions and bounded tool/file status, abort the underlying long poll on selection changes, and carry credential, header, and path redaction state across chunks and interleaved events. Completed strong introducers never cross the streaming carry boundary, including arbitrarily aligned ASCII or Unicode delimiters, quoted object keys, structured diagnostic keys, multiline values, and control-obfuscated assignments, while ordinary prose and joined Unicode text remain visible. Selection changes discard held output from the prior observer generation. Wrapped prompt redraw preserves the logical cursor across exact-column autowrap, tabs, atomic wide graphemes, Unicode scalars, and fallible terminal writes. Ctrl-C, Ctrl-D, bounded paste overflow, prompt-normalization failure, and every live-redraw failure retain custody through EOF or fence the input after a native queue flush. Protected TTY input requires a visible prompt and bounded unpredictable begin and return handoffs in raw no-echo mode; cancellation or any failed boundary discards the tail before permanently fencing shell input. Display loss, SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP, raw Ctrl-Z, and raw Ctrl-backslash restore or fence the terminal before propagation. Native terminal and protected-output control loads lazily across macOS, glibc, and common x64 or arm64 musl names. Initialization performs no effect until `--yes` is explicit and is available only as a one-shot maintenance command before the persistent shell. Agent JSONL follows reconnect from the last signed cursor only for typed transient daemon failures.
 - 2026-08-23: Provider process generations are single-use after disconnect. Daemon restart atomically expires or marks unresolved every prior callback, advances all prior profile generations, and appends conservative provider-restart gaps for bound nonterminal sessions. Delayed facts from an older client cannot mutate a newer generation.
 - 2026-08-23: Usage sync drains an exact source-revision backlog instead of uploading only the latest sample. A deterministic 205-snapshot fixture drains across bounded cycles and restart without leapfrogging a failed revision, while multiple accounts receive fair progress in each cycle.
-- 2026-08-23: `hra auth delete --acknowledge-erasure` creates durable identity-scoped deletion authority before transport, recovers exact lost responses after restart, and exposes capability-only progress after authentication disappears. Local Codex accounts, sessions, device keys, and encryption custody remain local.
+- 2026-08-23: `hra auth delete --acknowledge-erasure` creates durable identity-scoped deletion authority before transport, recovers exact lost responses after restart, and exposes capability-only progress after authentication disappears. Local provider profiles, sessions, device keys, and encryption custody remain local.
 - 2026-08-23: The complete local release gate passed ESLint, TypeScript, 615 tests with 12,281 assertions across 65 files, generated-site parity, the production CLI and site build, public-tree and complete-history sensitive-text scanning, and isolated local and global installation of `hra-0.1.0.tgz`. Every temporary-path fixture uses the host temporary directory rather than a macOS-only root.
 - 2026-08-23: The release closeout audit found a private-record/public-renderer schema split, terminal prompting reachable from JSON protected-input commands, and durable MCP authorization URLs. The revision introduces one strict public interaction DTO at the service boundary, renders nested session event and pending-interaction status, rejects a terminal protected-input descriptor before reading or calling the daemon in JSON mode, and returns a classified unsupported-capability response for URL elicitation before query or fragment authority can enter HRA state. Append-only schema migration 11 terminalizes and fully replaces any prerelease URL interaction before reads, then installs durable database guards against new URL records.
 - 2026-08-23: A second interaction audit found that HRA admitted standard and opaque MCP forms without interpreting `requestedSchema`, exposed no operable field contract, could prepare arbitrary protected content, and could accidentally admit the pinned tool-suggestion form for a compound plugin or connector lifecycle effect. The revision brokers only the pinned standard primitive schema: at most 16 bounded fields covering string formats and lengths, finite numbers, safe integers, booleans, single-select choices, and multi-select choices. Public and durable records contain only names, normalized types, requiredness, effective constraints, formats, and allowed values. The service validates exact protected content before its write-ahead transition, and the live provider client validates it again from private request memory before writing `{action, content, _meta: null}`. Opaque `openai/form`, tool-suggestion lifecycle metadata, unsupported, oversized, malformed, and lookalike schemas fail before admission without echoing schema material. Terminal migrated placeholders remain readable but cannot be resolved or newly admitted without an explicit field contract.
@@ -687,7 +693,7 @@ No external source code is to be copied as part of this proposal. Several review
 
 ### What the research changes
 
-HRA already implements most of the hard foundation: an exact Codex version and schema digest, one provider owner per account generation, durable session events with signed cursors and typed gaps, revision-bound interactions, a persistent human shell, one-shot JSON and JSONL, historical usage, device presence, idempotent mutation recovery, and protected input. The proposal extends that foundation instead of replacing it.
+HRA already implements most of the hard foundation: exact Codex and Claude Code runtime pins, a generated Codex schema digest, one provider owner per account generation, durable session events with signed cursors and typed gaps, revision-bound interactions, a persistent human shell, one-shot JSON and JSONL, Codex historical usage, device presence, idempotent mutation recovery, and protected input. The proposal extends that foundation instead of replacing it.
 
 | Mechanism | Decision for HRA |
 | --- | --- |
@@ -699,7 +705,7 @@ HRA already implements most of the hard foundation: an exact Codex version and s
 | Recovery guidance | Represent recovery as a closed typed intent. Render safe command arguments only in the CLI presentation layer; never persist arbitrary argv as authority. |
 | Invariant to proof traceability | Add a small registry that links load-bearing guarantees to existing deterministic and live evidence. Do not build another eval platform. |
 | Authenticated device identity and scoped recovery | Keep the existing account-authorized device model and Convex transport. Fabric is evidence for the principles, not a reason to add peer-to-peer transport. |
-| Generic agent catalog, scheduler, shared-folder bus, or PTY injection | Reject. HRA remains a Codex account, device, and session control plane. |
+| Generic agent catalog, scheduler, shared-folder bus, or PTY injection | Reject. HRA remains a Codex and Claude Code profile, device, and session control plane. |
 | Rust or Zig rewrite | Reject without a measured bottleneck. Event semantics, authority, and recovery are the limiting problems. Native helpers remain narrow and protocol-bound. |
 
 ### Revised model
@@ -708,9 +714,9 @@ The three main objects remain:
 
 | Object | Owns | Does not imply |
 | --- | --- | --- |
-| Account | Codex authentication generation, subscription identity, provider capability evidence, usage observations, and owned sessions | A signed-in account does not imply a responsive provider process, fresh usage, or an online device. |
-| Device | Cryptographic device identity, registration and revocation state, local daemon generation, capabilities, and expiring presence evidence | A heartbeat does not imply that Codex responds, a turn progresses, or the device may execute a session. |
-| Session | Provider thread binding, account binding, current execution authority, queue, ordered semantic events, interactions, and recovery state | Active, blocked on a human, queued, observed live, and healthy are independent facts. |
+| Account | One HRA profile with isolated Codex and Claude Code configuration, provider-specific authentication evidence where supported, usage observations where supported, and owned sessions | A signed-in provider does not imply a responsive runtime, fresh usage, or an online device. |
+| Device | Cryptographic device identity, registration and revocation state, local daemon generation, capabilities, and expiring presence evidence | A heartbeat does not imply that either provider responds, a turn progresses, or the device may execute a session. |
+| Session | HRA conversation record, provider-native binding, account binding, current execution authority, queue, ordered semantic events, interactions, and recovery state | Active, blocked on a human, queued, observed live, and healthy are independent facts. |
 
 Turns, interactions, events, usage observations, device leases, and mutation attempts remain supporting ledgers, not additional top-level product objects.
 
@@ -736,7 +742,7 @@ The implemented agent and human observation surface is a small status and watch 
 The contracts are:
 
 1. hra status is a bounded, current local-only SQLite overview. It performs no provider, cloud, browser, login, usage refresh, recovery, or other effect. It returns state counts plus at most 50 attention records with inspection-only guidance. It omits notes, emails, transcripts, tool content, reasoning, ordinary titles, and device labels. Local coverage is complete for the explicitly listed SQLite tables within one read transaction. Provider and cloud coverage are always `not_attempted`, and device counts are unknown. It has no global cursor.
-2. hra session status produces one typed provider-observation result, attempting a Codex app-server read only when local state makes one applicable, then reads the session row, event cut, pending-interaction count, bounded pending summary, queue depth, and derived axes in one SQLite transaction. Each result carries its source, basis, generation, observed time, freshness, and coverage.
+2. hra session status produces one typed provider-observation result, attempting the bound provider's reviewed observation path only when local state makes one applicable, then reads the session row, event cut, pending-interaction count, bounded pending summary, queue depth, and derived axes in one SQLite transaction. Codex can perform a native app-server read; Claude Code relies on HRA's live neutral projection because provider-side listing and resume are absent. Each result carries its source, basis, generation, observed time, freshness, and coverage.
 3. hra session watch is a presentation alias over the existing session events follow path. It introduces no new daemon stream or storage. Human output remains bounded text; machine stdout is versioned JSONL; diagnostics remain on stderr; output drains before cursor advancement. Standalone human watch commits no initial interaction guidance until complete enumeration and caps that atomic UTF-8 bootstrap at 1 MiB. Foreground-watch resumption retains only bounded exact interaction tuples and filters fresh pages incrementally.
 4. Exact session wait is unavailable. Agents start `session watch` from the status cursor or repeat bounded status reads. HRA will not publish a wait predicate until every transition that can satisfy it advances a predicate revision in the same transaction as its authority change, and waiter registration rechecks that revision before sleeping.
 
@@ -771,7 +777,7 @@ The field-source inventory is:
 | Pending interactions | `provider_interactions`, in the same session-observation transaction | Exact interaction revision plus account process generation in private authority | Current pending rows; public summary capped at 10 | Status exposes ID, kind, revision, blocking state, bounded summary, and deadline. Private request authority is excluded. Admission is not event-atomic, which is one reason wait is withheld. |
 | Responses in flight | `provider_interactions`, in the same session-observation transaction | Exact interaction revision and state | Exact count of `response_prepared` and `response_written` rows | Kept separate from pending human action. It cannot satisfy an interaction wait predicate. |
 | Queue axes | `queue_entries`, in the same session-observation transaction | Queue row identity and state | Current pending, dispatching, ambiguous, and failed rows | Status exposes counts only and never queued message text. Queue transitions are not a complete event wake source. |
-| Provider observation | One typed result before the local transaction. A Codex app-server read is attempted only when local state makes it applicable; otherwise the result records its local-state basis. | Account process generation and live connection ID where applicable | Provider-read results are fresh for that call; local gates report their own basis and make no provider-read claim. There is no shared retention or cursor with SQLite. | Closed live, unavailable, recovery-required, and not-applicable variants carry independent coverage, freshness, and basis. Raw provider payloads are excluded. |
+| Provider observation | One typed result before the local transaction. The bound provider's reviewed observation path is attempted only when local state makes it applicable; Codex has a native app-server read, while Claude Code uses the live HRA projection because provider-side listing and resume are absent. Otherwise the result records its local-state basis. | Account process generation and live connection ID where applicable | Provider-read results are fresh for that call; local gates report their own basis and make no provider-read claim. There is no shared retention or cursor with SQLite. | Closed live, unavailable, recovery-required, and not-applicable variants carry independent coverage, freshness, and basis. Raw provider payloads are excluded. |
 | Root account, session, interaction, queue, and usage overview | Declared local SQLite tables in one root-status read transaction | Row revisions remain internal; root status has no global revision or cursor | Current local counts and latest retained usage outcome per nonremoved account | Counts plus at most 50 ID-and-revision action records. Labels, emails, titles, notes, transcripts, payloads, paths, and queued text are excluded. |
 | Root provider, cloud, and device state | Not read by root status | None | `not_attempted`; device counts are unknown rather than zero | No daemon, provider, cloud, browser, login, usage refresh, or recovery effect is triggered. |
 
@@ -840,13 +846,13 @@ Smalltalk and Convoy show the product-level failure mode: folder names, mtimes, 
 
 | Assumption | Category | Load | Confidence | Testability |
 | --- | --- | --- | --- | --- |
-| HRA remains a Codex account, device, and session control plane with one closed local work protocol rather than a generic executable multi-agent runtime. | Definitional | High | High | Cheap: keep the seven-command surface and six primitives closed under contract review. |
+| HRA remains a Codex and Claude Code profile, device, and session control plane with one closed local work protocol rather than a generic executable multi-agent runtime. | Definitional | High | High | Cheap: keep the seven-command surface and six primitives closed under contract review. |
 | The existing per-session ledger captures every transition needed for idle, terminal, and pending-interaction predicates. | Factual | Critical | Rejected: false | Completed: reducer inventory and crash-boundary analysis disproved it. |
 | A local session, event cut, pending count, and queue depth can be read atomically without treating provider or cloud observation as part of that transaction. | Capability | Critical | High | Medium: one bounded read prototype plus concurrency tests. |
 | Session wait solves the actual agent need better than repeated bounded polling. | People | High | Rejected for the current ledger | Reconsider only after event capture and wake edges become transactionally complete. |
 | A bounded current local overview helps humans and agents without creating pressure for a global feed. | People | Medium | Medium | Cheap: fixture and dogfood review. |
 | Advisory axes remain presentation only and never become hidden mutation authority. | Causal | High | Medium | Medium: dependency rule, property tests, and mutation-path audit. |
-| Exact Codex version pinning and generated-schema review remain operationally affordable. | Continuity | High | High | Cheap: require a schema and behavior diff for every upgrade. |
+| Exact Codex and Claude Code version pinning plus generated Codex-schema review remain operationally affordable. | Continuity | High | High | Cheap: require a protocol and behavior diff for every provider-runtime upgrade. |
 | Bun and TypeScript meet current latency and memory targets. | Capability | Medium | High | Cheap: benchmark startup, event replay, 100-session status, and slow consumers. |
 | Clean-room adaptation avoids unlicensed source reuse. | Factual | High | High | Cheap: diff and provenance review before commit. |
 

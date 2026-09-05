@@ -61,11 +61,12 @@ In order, a switch:
 
 1. refuses a switch it cannot make safely (below);
 2. builds the neutral transcript and renders the bounded handoff seed from it;
-3. releases the outgoing provider's hold on the thread, `endSession` on the
+3. reviews and starts a thread on the target provider and account. A target
+   that refuses leaves the session on its still-runnable outgoing provider;
+4. releases the outgoing provider's hold on the thread, `endSession` on the
    neutral runtime port, which stops the pinned Claude Code process that served
    the session and is a documented no-op for Codex, whose app-server owns
    thread lifetime. The outgoing thread is **never deleted**;
-4. reviews and starts a thread on the target provider and account;
 5. commits the whole rebinding in one transaction, provider, account, preset,
    provider thread, the target's reviewed runtime profile, and the session's
    conversation-automation row, which follows the new thread so a scheduled

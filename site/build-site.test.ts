@@ -45,6 +45,18 @@ afterEach(async () => {
 });
 
 describe("static-site build", () => {
+  test("keeps documentation code roles separate from inverse marketing roles", async () => {
+    const styles = await readFile(join(import.meta.dir, "styles.css"), "utf8");
+    expect(styles).toContain(".hra-inline-code {");
+    expect(styles).not.toMatch(/(?:^|\n)code\s*\{/u);
+    expect(styles).toContain("--hraness-marketing-inverse: var(--inverse-background)");
+    expect(styles).toContain("--hraness-marketing-inverse-ink: var(--inverse-foreground)");
+    expect(styles).toContain("--foreground: var(--code-foreground)");
+    expect(styles).toContain("--code-background: #090a0c");
+    expect(styles).toContain("--code-foreground: #fbf8f0");
+    expect(styles).toContain("--inverse-background: #f0ebdf");
+  });
+
   test("renders one crawlable Ask AI row on each public page with exact provider prompts", () => {
     const subjectUrl = "https://hra.sh/privacy/";
     const prompt = `Tell me about ${subjectUrl}`;
@@ -117,6 +129,8 @@ describe("static-site build", () => {
     expect(builtStyles).toContain('./fonts/nebula-sans/NebulaSans-Book.woff2');
     expect(builtStyles).toContain(".hraness-marketing-hero");
     expect(builtStyles).toContain(".hraness-marketing-interface-grid");
+    expect(builtStyles).toContain(".syntax-code");
+    expect(builtStyles).toContain(".syntax-token--command");
     expect(builtStyles).toContain(".hraness-site-footer {");
 
     expect((await readFile(

@@ -1,7 +1,7 @@
 {
   "name": "@hraness/hra",
   "version": "0.5.0",
-  "description": "Control plane for coding-agent subscriptions: run several accounts side by side, keep their sessions alive in a local daemon, and drive them from a shell or JSON. Codex today, Claude next.",
+  "description": "Control plane for Codex and Claude Code in current source; published v0.5.0 is Codex-only. Run provider sessions side by side through one durable CLI.",
   "license": "MIT",
   "publishConfig": {
     "access": "public",
@@ -74,6 +74,8 @@
   "keywords": [
     "bun",
     "chatgpt",
+    "claude",
+    "claude-code",
     "cli",
     "codex",
     "multi-account"
@@ -90,7 +92,7 @@
     "@eslint/js": "9.34.0",
     "@hraness/design-kit": "github:hraness/design-kit#v0.3.0",
     "@hraness/posthog": "github:hraness/posthog#v0.1.2",
-    "@hraness/site-footer": "github:hraness/site-footer#v0.4.3",
+    "@hraness/site-footer": "github:hraness/site-footer#v0.4.6",
     "@hraness/ui": "github:hraness/ui#v0.4.10",
     "@tailwindcss/vite": "4.3.3",
     "@types/bun": "1.3.14",
