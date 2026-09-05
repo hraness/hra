@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { Dir } from "node:fs";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { constants, Dir } from "node:fs";
+import { mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -53,6 +53,41 @@ async function automationsRoot(): Promise<string> {
   const directory = join(root, "automations");
   await mkdir(directory);
   return directory;
+}
+
+function fifoTestsSupported(): boolean {
+  return process.platform !== "win32" && Bun.which("mkfifo") !== null;
+}
+
+function makeFifo(path: string): void {
+  const created = Bun.spawnSync({ cmd: ["mkfifo", path] });
+  if (created.exitCode !== 0) {
+    throw new Error(`mkfifo failed: ${new TextDecoder().decode(created.stderr)}`);
+  }
+}
+
+async function settleBeforeFifoWriter<T>(pending: Promise<T>, fifo: string): Promise<T> {
+  type Outcome =
+    | Readonly<{ kind: "blocked" }>
+    | Readonly<{ kind: "rejected"; error: unknown }>
+    | Readonly<{ kind: "resolved"; value: T }>;
+  const completion: Promise<Outcome> = pending.then(
+    (value) => ({ kind: "resolved", value }),
+    (error: unknown) => ({ kind: "rejected", error }),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const blocked = new Promise<Outcome>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: "blocked" }), 1_000);
+  });
+  const outcome = await Promise.race([completion, blocked]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (outcome.kind === "resolved") return outcome.value;
+  if (outcome.kind === "rejected") throw outcome.error;
+
+  const writer = await open(fifo, constants.O_WRONLY | constants.O_NONBLOCK);
+  await writer.close();
+  await completion;
+  throw new Error("Automation FIFO open blocked instead of failing promptly.");
 }
 
 async function writeAutomation(
@@ -370,6 +405,24 @@ describe("readCodexAutomations", () => {
     const scan = await readCodexAutomations({ automationsDirectory: directory });
     expect(scan.automations).toEqual([]);
     expect(scan.diagnostics).toEqual([{ automationId: "a-linked", reason: "unreadable" }]);
+  });
+
+  test("fails the public projection promptly when automation.toml is a FIFO", async () => {
+    if (!fifoTestsSupported()) return;
+    const directory = await automationsRoot();
+    await writeAutomation(directory, "a-fifo", null);
+    const fifo = join(directory, "a-fifo", "automation.toml");
+    makeFifo(fifo);
+
+    const scan = await settleBeforeFifoWriter(
+      readCodexAutomations({ automationsDirectory: directory }),
+      fifo,
+    );
+    expect(scan).toEqual({
+      automations: [],
+      complete: true,
+      diagnostics: [{ automationId: "a-fifo", reason: "unreadable" }],
+    });
   });
 });
 
@@ -857,6 +910,29 @@ describe("readCodexAutomationAuthority", () => {
     expect(scan).toEqual({
       complete: true,
       diagnostics: [{ automationId: "scheduled-source", reason: "unreadable" }],
+      entries: [],
+      nextCursor: null,
+    });
+  });
+
+  test("fails private authority promptly when automation.toml is a FIFO", async () => {
+    if (!fifoTestsSupported()) return;
+    const directory = await automationsRoot();
+    await writeAutomation(directory, "scheduled-fifo", null);
+    const fifo = join(directory, "scheduled-fifo", "automation.toml");
+    makeFifo(fifo);
+
+    const scan = await settleBeforeFifoWriter(
+      readCodexAutomationAuthority({
+        automationsDirectory: directory,
+        kind: "sources",
+        sourceDirectoryNames: ["scheduled-fifo"],
+      }),
+      fifo,
+    );
+    expect(scan).toEqual({
+      complete: true,
+      diagnostics: [{ automationId: "scheduled-fifo", reason: "unreadable" }],
       entries: [],
       nextCursor: null,
     });

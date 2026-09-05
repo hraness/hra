@@ -875,7 +875,10 @@ async function readBoundedText(
   try {
     handle = await open(
       path,
-      constants.O_RDONLY | CLOSE_ON_EXEC_OPEN_FLAG | constants.O_NOFOLLOW,
+      constants.O_RDONLY
+        | CLOSE_ON_EXEC_OPEN_FLAG
+        | constants.O_NOFOLLOW
+        | constants.O_NONBLOCK,
     );
   } catch (error) {
     const code = fileSystemErrorCode(error);

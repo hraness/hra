@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { constants, unlinkSync } from "node:fs";
+import { mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -38,6 +39,41 @@ function validClaudeRegistryRecord(sessionId: string, pid: number): Readonly<Rec
     pidDomain: "darwin",
     procStart: `process-start-${pid}`,
   };
+}
+
+function registryFifoTestsSupported(): boolean {
+  return process.platform !== "win32" && Bun.which("mkfifo") !== null;
+}
+
+function makeRegistryFifo(path: string): void {
+  const created = Bun.spawnSync({ cmd: ["mkfifo", path] });
+  if (created.exitCode !== 0) {
+    throw new Error(`mkfifo failed: ${new TextDecoder().decode(created.stderr)}`);
+  }
+}
+
+async function settleRegistryBeforeFifoWriter<T>(pending: Promise<T>, fifo: string): Promise<T> {
+  type Outcome =
+    | Readonly<{ kind: "blocked" }>
+    | Readonly<{ kind: "rejected"; error: unknown }>
+    | Readonly<{ kind: "resolved"; value: T }>;
+  const completion: Promise<Outcome> = pending.then(
+    (value) => ({ kind: "resolved", value }),
+    (error: unknown) => ({ kind: "rejected", error }),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const blocked = new Promise<Outcome>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: "blocked" }), 1_000);
+  });
+  const outcome = await Promise.race([completion, blocked]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (outcome.kind === "resolved") return outcome.value;
+  if (outcome.kind === "rejected") throw outcome.error;
+
+  const writer = await open(fifo, constants.O_WRONLY | constants.O_NONBLOCK);
+  await writer.close();
+  await completion;
+  throw new Error("Claude registry FIFO open blocked instead of failing promptly.");
 }
 
 type ScriptedProcess = Readonly<{
@@ -1180,6 +1216,34 @@ describe("createClaudeRegistrySource", () => {
       maxFileBytes: CLAUDE_REGISTRY_MAX_FILE_BYTES,
       signal: new AbortController().signal,
     })).resolves.toMatchObject({ complete: false });
+  });
+
+  test("fails closed promptly when a regular PID record is swapped to a FIFO", async () => {
+    if (!registryFifoTestsSupported()) return;
+    const root = await mkdtemp(join(tmpdir(), "hra-session-registry-fifo-swap-"));
+    roots.push(root);
+    const recordPath = join(root, "8123.json");
+    await writeFile(recordPath, JSON.stringify(validClaudeRegistryRecord("swapped", 8123)));
+    let clockReads = 0;
+    let swapped = false;
+    const source = createClaudeRegistrySource(root, () => {
+      clockReads += 1;
+      if (clockReads === 3) {
+        unlinkSync(recordPath);
+        makeRegistryFifo(recordPath);
+        swapped = true;
+      }
+      return 1_000;
+    });
+
+    const snapshot = await settleRegistryBeforeFifoWriter(source({
+      deadlineAt: 2_000,
+      maxFiles: CLAUDE_REGISTRY_MAX_RECORDS,
+      maxFileBytes: CLAUDE_REGISTRY_MAX_FILE_BYTES,
+      signal: new AbortController().signal,
+    }), recordPath);
+    expect(swapped).toBe(true);
+    expect(snapshot).toEqual({ records: [], complete: false });
   });
 
   test("marks pid records with missing authority fields incomplete", async () => {

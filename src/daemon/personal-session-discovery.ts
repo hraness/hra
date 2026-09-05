@@ -808,6 +808,12 @@ export function createClaudeRegistrySource(
           complete = false;
           break;
         }
+        // Recheck immediately before the final untrusted path open. The open
+        // itself is nonblocking because this Dirent can be stale after a swap.
+        if (abortRequested(input.signal) || input.deadlineAt <= now()) {
+          complete = false;
+          break;
+        }
         const document = await readBoundedJsonFile(
           join(registryDirectory, entry.name),
           Math.min(input.maxFileBytes, CLAUDE_REGISTRY_MAX_FILE_BYTES),
@@ -1026,7 +1032,10 @@ async function readBoundedJsonFile(
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) return null;
   let handle: FileHandle;
   try {
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
   } catch {
     return null;
   }
