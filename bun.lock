@@ -14,7 +14,7 @@
         "@auth/core": "0.41.3",
         "@convex-dev/auth": "0.0.95",
         "@eslint/js": "9.34.0",
-        "@hraness/design-kit": "github:hraness/design-kit#v0.3.0",
+        "@hraness/design-kit": "github:hraness/design-kit#v0.4.0",
         "@hraness/posthog": "github:hraness/posthog#v0.1.2",
         "@hraness/site-footer": "github:hraness/site-footer#v0.4.6",
         "@hraness/ui": "github:hraness/ui#v0.4.10",
@@ -156,7 +156,7 @@
 
     "@gar/promise-retry": ["@gar/promise-retry@1.0.3", "", {}, "sha512-GmzA9ckNokPypTg10pgpeHNQe7ph+iIKKmhKu3Ob9ANkswreCx7R3cKmY781K8QK3AqVL3xVh9A42JvIAbkkSA=="],
 
-    "@hraness/design-kit": ["@hraness/design-kit@github:hraness/design-kit#a50a8f2", { "dependencies": { "@hugeicons/core-free-icons": "^4.2.2", "@stylexjs/stylex": "0.19.0", "motion": "12.42.0", "next-themes": "0.4.6", "react-aria-components": "1.19.0", "recharts": "3.8.0", "sugar-high": "^1.2.1", "web-haptics": "0.0.6" }, "peerDependencies": { "@hraness/ui": ">=0.4.7 <0.5.0", "react": ">=18 <20", "react-dom": ">=18 <20" }, "optionalPeers": ["@hraness/ui"] }, "hraness-design-kit-a50a8f2", "sha512-nCmHqqXFfIbuakK86yXJSiBuoyaCD3IIihLMWEZzITLnkGsPLkFVMvFdiPI492OjfBY4Aq85YRGdAFV8pm350w=="],
+    "@hraness/design-kit": ["@hraness/design-kit@github:hraness/design-kit#ca58915", { "dependencies": { "@hugeicons/core-free-icons": "^4.2.2", "@stylexjs/stylex": "0.19.0", "motion": "12.42.0", "next-themes": "0.4.6", "react-aria-components": "1.19.0", "recharts": "3.8.0", "sugar-high": "^1.2.1", "web-haptics": "0.0.6" }, "peerDependencies": { "@hraness/ui": ">=0.4.7 <0.5.0", "react": ">=18 <20", "react-dom": ">=18 <20" }, "optionalPeers": ["@hraness/ui"] }, "hraness-design-kit-ca58915", "sha512-wbvg8kHU0aspoNLmRJl4pyZJ3FZfF/TnD5gcd2QP6YFezWlm3QS6jq8bcPIvBff5mViii+1EPnQkpU9ea/V2Gw=="],
 
     "@hraness/oh": ["@hraness/oh@0.2.7", "", { "peerDependencies": { "@libsql/client": ">=0.17.4 <1", "@suss/datalog": "0.20.0", "@tobilu/qmd": "2.5.3" }, "optionalPeers": ["@libsql/client", "@suss/datalog", "@tobilu/qmd"], "bin": { "oh": "dist/cli.js" } }, "sha512-+9OIjJqEzriKdcV2dMze5y6Kl/DzjdbHwSghxVRkxHAhQIsdOoRujFynxgBQL2PXRqFJMRBmSQKnu8R5D/EXLg=="],
 

@@ -198,7 +198,8 @@ ${image.type === undefined ? "" : `<meta property="og:image:type" content="${esc
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="${escapeHtml(image.src)}">
 <meta name="twitter:image:alt" content="${escapeHtml(image.alt)}">
-<meta name="theme-color" content="#11100e">
+<meta name="theme-color" content="#fbfaf7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141310" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/styles.css">${structuredData}`;
 };
@@ -213,36 +214,93 @@ const renderProjectResources = (content: PublicContent): string => `<aside aria-
   </nav>
 </aside>`;
 
-const renderProductHero = (content: PublicContent): string => `<header class="hraness-marketing-hero" data-hraness-marketing="hero" aria-labelledby="hra-title">
-  <div class="hraness-marketing-hero__copy">
-    <p class="hraness-marketing-hero__eyebrow">${escapeHtml(content.hero.eyebrow)}</p>
-    <p class="hraness-marketing-hero__name">${escapeHtml(content.productName)}</p>
-    <h1 class="hraness-marketing-hero__heading" id="hra-title">${escapeHtml(content.hero.heading)}</h1>
-    <p class="hraness-marketing-hero__summary">${escapeHtml(content.hero.summary)}</p>
-    <div class="hraness-marketing-hero__actions">
-      <a class="hraness-marketing-action" data-emphasis="primary" href="${escapeHtml(content.hero.primaryAction.href)}">${escapeHtml(content.hero.primaryAction.label)}</a>
-      <a class="hraness-marketing-action" data-emphasis="secondary" href="${escapeHtml(content.hero.secondaryAction.href)}">${escapeHtml(content.hero.secondaryAction.label)}</a>
+const renderSiteHeader = (
+  content: PublicContent,
+  currentPath: "/" | "/privacy/",
+): string => {
+  const link = (href: string, label: string, current = false): string =>
+    `<a href="${escapeHtml(href)}"${current ? ' aria-current="page"' : ""}>${escapeHtml(label)}</a>`;
+  return `<header class="hraness-marketing-header" data-hraness-marketing="header">
+  <div class="hraness-marketing-header__inner">
+    <a class="hraness-marketing-header__brand" href="/">${escapeHtml(content.productName)}</a>
+    <nav aria-label="Site" class="hraness-marketing-header__nav">
+      ${link("/#how-it-works", "How it works", currentPath === "/")}
+      ${link("/#install-command", "Install")}
+      ${link("/#reference", "Reference")}
+      ${link("/privacy/", "Privacy", currentPath === "/privacy/")}
+      ${link(content.links.github, "GitHub")}
+    </nav>
+    <div class="hraness-marketing-header__actions">
+      <a class="hraness-marketing-action" data-emphasis="primary" href="/#install-command">Install ${escapeHtml(content.productName)}</a>
     </div>
-    <p class="hraness-marketing-hero__boundary">${escapeHtml(content.hero.boundary)}</p>
   </div>
-  <aside class="hraness-marketing-proof" aria-labelledby="hero-proof-heading">
-    <p class="hraness-marketing-proof__kicker">How the first request moves</p>
-    <h2 class="hraness-marketing-proof__heading" id="hero-proof-heading">${escapeHtml(content.hero.proofLabel)}</h2>
-    <ol class="hraness-marketing-flow" data-hraness-marketing="flow" aria-label="First HRA request">
-      ${content.hero.steps.map((step, index) => `<li class="hraness-marketing-flow__step">
-        <span aria-hidden="true" class="hraness-marketing-flow__number">${String(index + 1).padStart(2, "0")}</span>
-        <div class="hraness-marketing-flow__body"><strong class="hraness-marketing-flow__label">${escapeHtml(step.label)}</strong><code class="hraness-marketing-flow__code">${escapeHtml(step.command)}</code><p class="hraness-marketing-flow__detail">${escapeHtml(step.detail)}</p></div>
-      </li>`).join("\n      ")}
-    </ol>
-  </aside>
-  <dl class="hraness-marketing-facts" data-hraness-marketing="facts">
-    ${content.hero.facts.map((fact) => `<div><dt>${escapeHtml(fact.label)}</dt><dd><strong>${escapeHtml(fact.value)}</strong><span>${escapeHtml(fact.detail)}</span></dd></div>`).join("\n    ")}
-  </dl>
+</header>`;
+};
+
+const renderHeroFrame = (content: PublicContent): string => {
+  const firstSession = findSection(content, "first-session");
+  const humanTerminal = firstSession.blocks.find(
+    (block): block is Extract<ContentBlock, { kind: "commands" }> => block.kind === "commands",
+  );
+  if (humanTerminal === undefined) {
+    throw new Error("Public content must publish the human-terminal first-session commands.");
+  }
+  return `<div class="hraness-marketing-hero__frame">
+      <figure class="hraness-marketing-proof-frame" data-hraness-marketing="proof-frame">
+        <div aria-hidden="true" class="hraness-marketing-proof-frame__chrome">
+          <span class="hraness-marketing-proof-frame__lights"><span></span><span></span><span></span></span>
+          <span class="hraness-marketing-proof-frame__title">hra · persistent shell</span>
+        </div>
+        <div class="hraness-marketing-proof-frame__content"><pre class="shell-transcript" tabindex="0">${renderShellCode(humanTerminal.commands.join("\n"))}</pre></div>
+        <figcaption class="hraness-marketing-proof-frame__caption">
+          <span>Start a session, open the shell, select the account and session, then type a request. These are the first-session commands from the reference below.</span>
+          <small>v${escapeHtml(content.releaseVersion)}</small>
+        </figcaption>
+      </figure>
+    </div>`;
+};
+
+const renderProductHero = (content: PublicContent): string => `<header class="hraness-marketing-hero" data-hraness-marketing="hero" data-align="center" data-tone="paper" aria-labelledby="hra-title">
+    <div class="hraness-marketing-hero__copy">
+      <p class="hraness-marketing-hero__eyebrow">${escapeHtml(content.hero.eyebrow)}</p>
+      <p class="hraness-marketing-hero__name">${escapeHtml(content.productName)}</p>
+      <h1 class="hraness-marketing-hero__heading" id="hra-title">${escapeHtml(content.hero.heading)}</h1>
+      <p class="hraness-marketing-hero__summary">${escapeHtml(content.hero.summary)}</p>
+      <p class="hraness-marketing-hero__example">${escapeHtml(content.hero.example)}</p>
+      <div class="hraness-marketing-hero__actions">
+        <a class="hraness-marketing-action" data-emphasis="primary" href="${escapeHtml(content.hero.primaryAction.href)}">${escapeHtml(content.hero.primaryAction.label)}</a>
+        <a class="hraness-marketing-action" data-emphasis="secondary" href="${escapeHtml(content.hero.secondaryAction.href)}">${escapeHtml(content.hero.secondaryAction.label)}</a>
+      </div>
+      <p class="hraness-marketing-hero__boundary">${escapeHtml(content.hero.boundary)}</p>
+    </div>
+    ${renderHeroFrame(content)}
+    <dl class="hraness-marketing-facts" data-hraness-marketing="facts">
+      ${content.hero.facts.map((fact) => `<div><dt>${escapeHtml(fact.label)}</dt><dd><strong>${escapeHtml(fact.value)}</strong><span>${escapeHtml(fact.detail)}</span></dd></div>`).join("\n      ")}
+    </dl>
   </header>
+  <dl class="hraness-marketing-pillars" data-hraness-marketing="pillars" aria-label="${escapeHtml(content.productName)} in three points">
+    ${content.hero.pillars.map((pillar) => `<div><dt>${escapeHtml(pillar.label)}</dt><dd>${escapeHtml(pillar.summary)}</dd></div>`).join("\n    ")}
+  </dl>
+  <section class="hraness-marketing-section" data-hraness-marketing="section" data-layout="split" id="how-it-works" aria-labelledby="how-it-works-heading">
+    <div class="hraness-marketing-section__heading-group">
+      <p class="hraness-marketing-section__label">How it works</p>
+      <h2 class="hraness-marketing-section__heading" id="how-it-works-heading">${escapeHtml(content.hero.proofLabel)}</h2>
+      <p class="hraness-marketing-section__summary">Every step is one command with a JSON form, so a person in the shell and an agent in a subprocess drive the same session the same way.</p>
+    </div>
+    <div class="hraness-marketing-section__body">
+      <ol class="hraness-marketing-flow" data-hraness-marketing="flow" aria-label="First ${escapeHtml(content.productName)} request">
+        ${content.hero.steps.map((step, index) => `<li class="hraness-marketing-flow__step">
+          <span aria-hidden="true" class="hraness-marketing-flow__number">${String(index + 1).padStart(2, "0")}</span>
+          <div class="hraness-marketing-flow__body"><strong class="hraness-marketing-flow__label">${escapeHtml(step.label)}</strong><code class="hraness-marketing-flow__code">${escapeHtml(step.command)}</code><p class="hraness-marketing-flow__detail">${escapeHtml(step.detail)}</p></div>
+        </li>`).join("\n        ")}
+      </ol>
+    </div>
+  </section>
   <section class="hraness-marketing-install" data-hraness-marketing="install" id="install-command" aria-labelledby="install-command-heading">
     <div class="hraness-marketing-install__heading-group">
-      <p class="hraness-marketing-install__eyebrow">Local release</p>
+      <p class="hraness-marketing-install__eyebrow">Local release · v${escapeHtml(content.releaseVersion)}</p>
       <h2 class="hraness-marketing-install__heading" id="install-command-heading">Install the verified CLI.</h2>
+      <p class="install-note">One command downloads the immutable release, verifies its digest, and installs it. Then check the host and initialize.</p>
     </div>
     <div class="hraness-marketing-install__commands">
       <pre class="install-command" tabindex="0">${renderShellCode(content.installCommand)}</pre>
@@ -252,9 +310,54 @@ const renderProductHero = (content: PublicContent): string => `<header class="hr
       </div>
     </div>
   </section>
-  <div class="hero-notes">
-    ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n    ")}
-  </div>`;
+  <section class="hraness-marketing-trust" data-hraness-marketing="trust" id="local-by-design" aria-labelledby="local-by-design-heading">
+    <header class="hraness-marketing-trust__header">
+      <p class="hraness-marketing-trust__label">Local by design</p>
+      <h2 class="hraness-marketing-trust__heading" id="local-by-design-heading">Keep control of the accounts you already have.</h2>
+      <p>${escapeHtml(content.productName)} is infrastructure around the provider tools you chose, not a proxy in front of them.</p>
+    </header>
+    <dl class="hraness-marketing-trust-grid">
+      ${content.trust.map((item) => `<div class="hraness-marketing-trust-item"><dt>${escapeHtml(item.label)}</dt><dd>${escapeHtml(item.detail)}</dd></div>`).join("\n      ")}
+    </dl>
+  </section>
+  <section class="hraness-marketing-questions" data-hraness-marketing="questions" id="questions" aria-labelledby="questions-heading">
+    <header class="hraness-marketing-questions__header">
+      <p class="hraness-marketing-questions__label">Questions</p>
+      <h2 class="hraness-marketing-questions__heading" id="questions-heading">Before you install.</h2>
+    </header>
+    <div class="hraness-marketing-question-list">
+      ${content.questions.map((question) => `<details class="hraness-marketing-question"><summary>${escapeHtml(question.question)}</summary><div class="hraness-marketing-question__answer"><p>${renderInline(question.answer)}</p></div></details>`).join("\n      ")}
+    </div>
+  </section>
+  <section class="hraness-marketing-maker" data-hraness-marketing="maker" id="maker" aria-labelledby="maker-heading">
+    <header class="hraness-marketing-maker__header">
+      <p class="hraness-marketing-maker__label">Built by</p>
+      <h2 class="hraness-marketing-maker__heading" id="maker-heading">${escapeHtml(content.maker.heading)}</h2>
+    </header>
+    <div class="hraness-marketing-maker__body">
+      ${content.maker.bio.length === 0 ? "" : `<p>${renderInline(content.maker.bio)}</p>`}
+      <ul class="hraness-marketing-maker__links">
+        ${content.maker.links.map((entry) => `<li><a href="${escapeHtml(entry.href)}">${escapeHtml(entry.label)}</a></li>`).join("\n        ")}
+      </ul>
+    </div>
+  </section>
+  <section class="hraness-marketing-cta" data-hraness-marketing="cta" data-tone="paper" id="closing" aria-labelledby="closing-heading">
+    <h2 class="hraness-marketing-cta__heading" id="closing-heading">Give every session the same terminal.</h2>
+    <p class="hraness-marketing-cta__summary">Install the CLI, add one account, and start a session that outlives the tab it began in.</p>
+    <div class="hraness-marketing-cta__actions">
+      <a class="hraness-marketing-action" data-emphasis="primary" href="#install-command">Install ${escapeHtml(content.productName)}</a>
+      <a class="hraness-marketing-action" data-emphasis="secondary" href="${escapeHtml(content.links.github)}">Read the source</a>
+    </div>
+    <p class="hraness-marketing-cta__footnote">${escapeHtml(content.hero.boundary)}</p>
+  </section>
+  <div class="reference" id="reference">
+    <div class="reference__intro">
+      <p class="hraness-marketing-section__label">Reference</p>
+      <h2 class="reference__heading">Every command, boundary, and release claim.</h2>
+      <div class="hero-notes">
+        ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n        ")}
+      </div>
+    </div>`;
 
 export const renderSiteHtml = (
   content: PublicContent = publicContent,
@@ -275,10 +378,14 @@ ${renderHead(content, {
 </head>
 <body>
 <a class="skip-link" href="#content">Skip to content</a>
+${renderSiteHeader(content, "/")}
 <main id="content">
+<div class="hraness-marketing-page">
   ${renderProductHero(content)}
-  <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
-  ${content.sections.map((section) => renderSection(section)).join("\n  ")}
+    <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
+    ${content.sections.map((section) => renderSection(section)).join("\n    ")}
+  </div>
+</div>
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
@@ -335,8 +442,8 @@ ${renderHead(content, {
 </head>
 <body>
 <a class="skip-link" href="#content">Skip to content</a>
+${renderSiteHeader(content, "/privacy/")}
 <main id="content" class="narrow-page">
-  <p><a href="/">← ${escapeHtml(content.productName)}</a></p>
   ${renderSection(privacy)}
   <p>Report a suspected boundary violation through <a href="${escapeHtml(content.links.privateSecurityReport)}">private vulnerability reporting</a>.</p>
 </main>

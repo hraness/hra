@@ -264,6 +264,11 @@ describe("public content contract", () => {
     }
     expect(renderLlmsText()).toContain("Install after the v0.6.0 beta tag is live");
     expect(renderLlmsText()).not.toContain("Install the live v0.6.0 beta");
+    const html = htmlVisibleText(renderSiteHtml());
+    expect(html).toContain("What does this release candidate include?");
+    expect(html).toContain("including provider switching and provider-owned sign-in flows");
+    expect(html).not.toContain("immutable v0.6.0 local CLI is live");
+    expect(html).not.toContain("v0.6.0 local CLI is live for macOS and Linux and is Codex-only");
   });
 
   test("states one hosted sign-up claim everywhere and switches it in one place", () => {

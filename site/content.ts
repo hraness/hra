@@ -41,11 +41,20 @@ export interface HeroStep {
   readonly label: string;
 }
 
+export interface HeroPillar {
+  readonly label: string;
+  readonly summary: string;
+}
+
 export interface HeroContent {
   readonly boundary: string;
+  /** A request a reader could make once HRA is installed. */
+  readonly example: string;
   readonly eyebrow: string;
   readonly facts: readonly HeroFact[];
   readonly heading: string;
+  /** Three short statements shown under the hero. */
+  readonly pillars: readonly HeroPillar[];
   readonly primaryAction: {
     readonly href: string;
     readonly label: string;
@@ -75,6 +84,22 @@ export interface SocialCard {
 
 export type HostedSignup = "invite_only" | "open";
 
+export interface SiteQuestion {
+  readonly answer: readonly InlineContent[];
+  readonly question: string;
+}
+
+export interface SiteTrustItem {
+  readonly detail: string;
+  readonly label: string;
+}
+
+export interface SiteMaker {
+  readonly bio: readonly InlineContent[];
+  readonly heading: string;
+  readonly links: readonly { readonly href: string; readonly label: string }[];
+}
+
 export interface PublicContent {
   /** README trust-signal badges, rendered on one line under the H1. */
   readonly badges: readonly Badge[];
@@ -88,6 +113,12 @@ export interface PublicContent {
   readonly hero: HeroContent;
   /** Whether hosted sign-up needs an invitation. Drives every beta claim. */
   readonly hostedSignup: HostedSignup;
+  /** The person behind HRA, in plain words, for the website only. */
+  readonly maker: SiteMaker;
+  /** Reader objections answered on the website before the reference. */
+  readonly questions: readonly SiteQuestion[];
+  /** Local-by-design boundaries stated as reassurance on the website. */
+  readonly trust: readonly SiteTrustItem[];
   readonly links: {
     readonly contributing: string;
     readonly documentation: string;
@@ -321,61 +352,131 @@ export const publicContent: PublicContent = {
   links,
   hero: {
     eyebrow: tagline,
-    heading: "Keep Codex and Claude Code sessions in one durable CLI.",
-    summary: "Isolate each provider profile, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.",
-    boundary: `Codex on macOS and Linux · Claude Code on Linux · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
+    heading: "One terminal for every Codex and Claude Code session",
+    summary: "HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.",
+    example: "Ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
+    boundary: `Free and MIT licensed. Codex runs on macOS and Linux; Claude Code runs on Linux. Local v${releaseVersion} is release-ready; hosted sync is live as an ${hostedBetaLabel}.`,
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
     },
     secondaryAction: {
-      href: "#first-session",
-      label: "Run the first session",
+      href: "#how-it-works",
+      label: "See how it works",
     },
-    proofLabel: "One request, one exact account and session",
+    pillars: [
+      {
+        label: "Isolated accounts",
+        summary: "Each provider profile keeps its own credentials and configuration. Nothing is shared between them.",
+      },
+      {
+        label: "Durable sessions",
+        summary: "A local daemon keeps every session alive after the terminal that started it closes.",
+      },
+      {
+        label: "One interface for people and agents",
+        summary: "The same account and session objects answer to a shell and to versioned JSON.",
+      },
+    ],
+    proofLabel: "One request, one account, one session.",
     steps: [
       {
         label: "Start",
         command: "hra session start personal --provider codex --preset high --json",
-        detail: "Create a Codex session under one explicitly selected account profile.",
+        detail: "Create a Codex session under the account profile you name.",
       },
       {
         label: "Inspect",
         command: "hra session status <session-id> --json",
-        detail: "Read the exact session and its contiguous event cursor.",
+        detail: "Read the session and the cursor where its event stream continues.",
       },
       {
         label: "Switch",
         command: "hra session switch <session-id> --provider claude --preset fable-max",
-        detail: "Move future turns to the signed-in Claude Code profile without changing the HRA conversation.",
+        detail: "Move the next turns to your signed-in Claude Code profile. The HRA conversation stays intact.",
       },
       {
         label: "Direct",
         command: "hra session send <session-id> -- \"Review this project.\"",
-        detail: "Send the next request to that exact session and provider.",
+        detail: "Send the next request to that session and provider.",
       },
     ],
     facts: [
       {
         label: "Accounts",
         value: "Isolated profiles",
-        detail: "Codex uses isolated CODEX_HOME roots; Claude Code uses isolated CLAUDE_CONFIG_DIR roots.",
+        detail: "Codex uses its own CODEX_HOME per profile; Claude Code uses its own CLAUDE_CONFIG_DIR.",
       },
       {
         label: "Sessions",
         value: "Live and durable",
-        detail: "The local daemon remains available after a terminal exits.",
+        detail: "The local daemon keeps running after a terminal exits.",
       },
       {
         label: "Interfaces",
         value: "Shell and JSON",
-        detail: "Humans and agents address the same exact account and session objects.",
+        detail: "People and agents address the same account and session objects.",
       },
       {
         label: "Sync",
         value: "Optional, encrypted",
-        detail: "Local execution works without cloud service availability.",
+        detail: "Everything local works without the cloud service.",
       },
+    ],
+  },
+  trust: [
+    {
+      label: "Your provider credentials stay with the provider",
+      detail: "HRA asks the Codex app-server or Claude Code CLI to sign in inside an isolated profile directory. Each provider writes and owns its credential; HRA never reads, copies, or forwards one.",
+    },
+    {
+      label: "Local by default",
+      detail: "Accounts, sessions, and execution live on your machine. Cloud sync is optional, encrypted before upload, and separate from every provider account.",
+    },
+    {
+      label: "Nothing decrypts server-side",
+      detail: "The sync service sees your verified email, device identifiers, and ciphertext sizes. It cannot read session content without a paired device key.",
+    },
+    {
+      label: "Analytics you can audit",
+      detail: "hra.sh counts page views anonymously, without cookies, only on the production host, and honors Do Not Track. The privacy page lists every field.",
+    },
+  ],
+  questions: [
+    {
+      question: "Does HRA need an account?",
+      answer: [text("No HRA cloud account is needed for local use. Add a profile and run hra account login: Codex uses its app-server login, while Claude Code runs its own Linux sign-in inside the isolated directory. An HRA cloud identity is needed only for optional sync and web linking.")],
+    },
+    {
+      question: "What does this release candidate include?",
+      answer: [text(`The v${releaseVersion} local CLI candidate supports Codex on macOS and Linux and Claude Code on Linux, including provider switching and provider-owned sign-in flows. It becomes public after immutable release admission. Hosted sync is live as an ${hostedBetaLabel}.`)],
+    },
+    {
+      question: "Does HRA use my API keys or provider subscription?",
+      answer: [text("HRA does not broker model access. Each provider CLI keeps using its own account, billing, and terms. HRA adds isolation, durability, and one command surface on top.")],
+    },
+    {
+      question: "How do agents drive it?",
+      answer: [text("Every command that a person runs in the shell has a JSON form. An agent starts a session, reads its status cursor, sends requests, and follows the event stream as a long-running subprocess. The reference below lists the exact commands and protected interaction paths.")],
+    },
+    {
+      question: "What if the terminal closes?",
+      answer: [text("The local daemon keeps the session alive. Reopen the shell, select the account and session, and continue. Claude Code sessions cannot be resumed after the daemon that started them exits.")],
+    },
+    {
+      question: "Which platforms are supported?",
+      answer: [text("Codex runs on macOS and Linux. Claude Code sessions and sign-in run on Linux and fail closed elsewhere. Supported ChatGPT desktop account switching is macOS-only. HRA requires Bun 1.3.14.")],
+    },
+  ],
+  maker: {
+    heading: "Built by Ben Guo",
+    bio: [
+      text("HRA is built by Ben Guo, a musician and builder, formerly a founder and engineering leader at companies including Venmo and Stripe, who now builds his software factory from Puerto Rico. He runs more than a dozen Codex subscriptions at once and built HRA to keep every session alive, isolated, and reachable from the same terminal."),
+    ],
+    links: [
+      { href: links.hraness, label: "hraness.com" },
+      { href: "https://x.com/hraness", label: "@hraness" },
+      { href: links.github, label: "GitHub" },
     ],
   },
   introduction: [

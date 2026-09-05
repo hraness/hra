@@ -16,18 +16,18 @@ hra doctor --offline
 hra init --yes
 ```
 
-## Keep Codex and Claude Code sessions in one durable CLI.
+## One terminal for every Codex and Claude Code session
 
-Isolate each provider profile, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.
+HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.
 
-Codex on macOS and Linux · Claude Code on Linux · local v0.6.0 release-ready · hosted sync live (open beta)
+Free and MIT licensed. Codex runs on macOS and Linux; Claude Code runs on Linux. Local v0.6.0 is release-ready; hosted sync is live as an open beta.
 
-### One request, one exact account and session
+### One request, one account, one session.
 
-1. **Start:** `hra session start personal --provider codex --preset high --json`. Create a Codex session under one explicitly selected account profile.
-2. **Inspect:** `hra session status <session-id> --json`. Read the exact session and its contiguous event cursor.
-3. **Switch:** `hra session switch <session-id> --provider claude --preset fable-max`. Move future turns to the signed-in Claude Code profile without changing the HRA conversation.
-4. **Direct:** `hra session send <session-id> -- "Review this project."`. Send the next request to that exact session and provider.
+1. **Start:** `hra session start personal --provider codex --preset high --json`. Create a Codex session under the account profile you name.
+2. **Inspect:** `hra session status <session-id> --json`. Read the session and the cursor where its event stream continues.
+3. **Switch:** `hra session switch <session-id> --provider claude --preset fable-max`. Move the next turns to your signed-in Claude Code profile. The HRA conversation stays intact.
+4. **Direct:** `hra session send <session-id> -- "Review this project."`. Send the next request to that session and provider.
 
 > **Immutable local CLI release candidate; hosted sync live as an open beta.** The exact install command below works once GitHub exposes the immutable `v0.6.0` GitHub Release and its verified archive. The website and optional hosted sync are live; the candidate becomes public only after exact admission.
 
