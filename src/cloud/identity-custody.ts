@@ -14,6 +14,8 @@ export interface CloudSecretCustodyPort {
 
 const activeIdentitySlot = "cloud-active-identity";
 const deploymentAuthoritySlot = "cloud-deployment-authority";
+const attentionNotificationReconciliationSlot =
+  "cloud-attention-notification-reconciliation";
 const legacyCloudSlots = [
   "cloud-active-identity",
   "cloud-auth",
@@ -23,6 +25,7 @@ export const DEFAULT_CLOUD_DEPLOYMENT_URL = "https://qualified-hummingbird-537.c
 const scopedSlots = new Set([
   "cloud-account-key",
   "cloud-account-deletion",
+  attentionNotificationReconciliationSlot,
   "cloud-command-outbox",
   "cloud-daemon-journal",
   "cloud-device",
@@ -31,6 +34,9 @@ const scopedSlots = new Set([
   "cloud-device-replacement",
   "cloud-retired-devices",
   "cloud-state",
+]);
+const identityGenerationFencedSlots = new Set([
+  attentionNotificationReconciliationSlot,
 ]);
 
 type ActiveIdentity = Readonly<{
@@ -481,8 +487,11 @@ export class IdentityScopedCloudSecretCustody implements CloudSecretCustodyPort 
   }
 
   async read(slot: string): Promise<Readonly<{ generation: number; value: string }> | null> {
+    await this.#assertGenerationFencedSlotCurrent(slot);
     const physical = this.#physicalSlot(slot);
-    return physical === null ? null : await this.#custody.read(physical);
+    const observed = physical === null ? null : await this.#custody.read(physical);
+    await this.#assertGenerationFencedSlotCurrent(slot);
+    return observed;
   }
 
   async compareAndSwap(
@@ -490,24 +499,43 @@ export class IdentityScopedCloudSecretCustody implements CloudSecretCustodyPort 
     expectedGeneration: number | null,
     value: string,
   ): Promise<Readonly<{ generation: number; value: string }> | null> {
+    await this.#assertGenerationFencedSlotCurrent(slot);
     const physical = this.#physicalSlot(slot);
     if (physical === null) {
       throw new Error("Cloud identity selection requires a daemon restart.");
     }
-    return await this.#custody.compareAndSwap(physical, expectedGeneration, value);
+    const committed = await this.#custody.compareAndSwap(physical, expectedGeneration, value);
+    await this.#assertGenerationFencedSlotCurrent(slot);
+    return committed;
   }
 
   async clearIfGeneration(slot: string, expectedGeneration: number): Promise<boolean> {
+    await this.#assertGenerationFencedSlotCurrent(slot);
     const physical = this.#physicalSlot(slot);
-    return physical === null
+    const cleared = physical === null
       ? false
       : await this.#custody.clearIfGeneration(physical, expectedGeneration);
+    await this.#assertGenerationFencedSlotCurrent(slot);
+    return cleared;
+  }
+
+  async #assertGenerationFencedSlotCurrent(slot: string): Promise<void> {
+    if (!identityGenerationFencedSlots.has(slot)) return;
+    await this.assertCurrentIdentity(this.activeUserPublicId);
   }
 
   #physicalSlot(slot: string): string | null {
     if (!scopedSlots.has(slot)) return slot;
     if (this.activeUserPublicId === null) return null;
-    return `i-${namespaceFor(this.activeUserPublicId)}-${slot}`;
+    const identityNamespace = namespaceFor(this.activeUserPublicId);
+    if (slot === attentionNotificationReconciliationSlot) {
+      const slotNamespace = createHash("sha256")
+        .update(`hra-control-plane-cloud-identity-slot:v1:${slot}`)
+        .digest("hex")
+        .slice(0, 32);
+      return `i-${identityNamespace}-s-${slotNamespace}`;
+    }
+    return `i-${identityNamespace}-${slot}`;
   }
 }
 

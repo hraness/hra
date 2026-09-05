@@ -1,5 +1,15 @@
 import { parseAuthSignInResult } from "./authSession";
-import type { LocalAttentionNotificationSnapshot } from "./attention-notifications";
+import {
+  attentionNotificationCandidateLimit,
+  parseAttentionNotificationAuthorityStatus,
+  parseAttentionNotificationReconcileReceipt,
+  parseLocalAttentionNotificationSnapshot,
+  type AttentionNotificationAuthorityStatus,
+  type AttentionNotificationCompleteRequest,
+  type AttentionNotificationInvalidateRequest,
+  type AttentionNotificationReconcileReceipt,
+  type LocalAttentionNotificationSnapshot,
+} from "./attention-notifications";
 import {
   createConvexCloudTransport,
   type CloudArgs,
@@ -40,6 +50,10 @@ import {
 } from "./crypto";
 import {
   type CloudCommandJournalEntry,
+  type CloudAttentionNotificationReconciliationObservation,
+  type CloudAttentionNotificationReconciliationPort,
+  type CloudAttentionNotificationReconciliationRequest,
+  type CloudAttentionNotificationReconciliationState,
   type CloudDaemonJournalPort,
   type CloudDaemonJournalState,
   type CloudDeviceCommandJournalEntry,
@@ -60,7 +74,9 @@ import {
   completePendingCloudUsageAccount,
   createCloudProjectionRecoveryTerminalReceipt,
   CustodyCloudDaemonJournal,
+  CustodyCloudAttentionNotificationReconciliation,
   CustodyCloudSessionSyncCursor,
+  bindCloudAttentionNotificationReconciliationState,
   hasUnsettledCompactProjectionRecovery,
   hasUnsettledCompactProjectionRecoveryForProfile,
   invalidIdempotencyProjectionRecoveryCode,
@@ -69,6 +85,9 @@ import {
   providerDeletionProjectionRecoveryCode,
   pruneExpiredCloudProjectionRecoveryReceipts,
   removeCloudDeviceCommandJournalEntry,
+  replaceCloudAttentionNotificationReconciliationDevice,
+  setCloudAttentionNotificationPending,
+  settleCloudAttentionNotificationReconciliation,
   supersedeCloudProjectionRecoveryForProviderDeletion,
   terminalizeUnreservedPreparedCloudCommands,
   transitionCloudCommandJournalEntry,
@@ -96,6 +115,7 @@ import type { SessionEvent } from "../domain/session-events";
 import type { NotificationEmailHostedAuthority } from "../domain/contracts";
 import type { NotificationEmailPolicy } from "../domain/notification-email";
 import type { NotificationHoursPolicy } from "../domain/notification-hours";
+import { notificationHoursAllowedWindowEnd } from "../domain/notification-hours";
 import { assignDetailSequences, LiveBatcher } from "./live-uploader";
 import {
   decryptCompactEvents,
@@ -150,6 +170,8 @@ const defaultLeaseDurationMs = 60_000;
  * live daemon from a stale one without a per-cycle write.
  */
 const deviceRegistryHeartbeatMs = 60_000;
+const attentionNotificationRetryMs = 15_000;
+const attentionNotificationRenewalMs = 60_000;
 const defaultOptionalSyncBudgetMs = 10_000;
 const minimumPresenceCycleTtlMs = 15_000;
 const maximumPresenceTtlMs = 120_000;
@@ -167,6 +189,10 @@ export type ActiveCloudIdentity = Readonly<{
   keyVersion: number;
   userPublicId: string;
 }>;
+
+function captureActiveCloudIdentity(identity: ActiveCloudIdentity): ActiveCloudIdentity {
+  return { ...identity, accountKey: Uint8Array.from(identity.accountKey) };
+}
 
 export type RegisteredCloudIdentity =
   | Readonly<{
@@ -530,6 +556,11 @@ type CloudDeviceRegistryState = Readonly<{
   revision: number;
 }>;
 
+type AttentionNotificationCadence = Readonly<{
+  fingerprint: string;
+  nextAttemptAt: number;
+}>;
+
 type CloudPresenceState = {
   acknowledged: CloudPresenceRequest | null;
   connectionId: string;
@@ -639,6 +670,7 @@ export interface CloudDaemonBridge {
 }
 
 export type LocalCloudDaemonBridgeOptions = Readonly<{
+  attentionNotificationState: CloudAttentionNotificationReconciliationPort;
   daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
   deploymentAuthority: CloudDeploymentAuthority;
@@ -659,6 +691,7 @@ export type LocalCloudDaemonBridgeOptions = Readonly<{
 }>;
 
 export type LocalCloudDaemonBridgeEnvironmentOptions = Readonly<{
+  attentionNotificationState?: CloudAttentionNotificationReconciliationPort;
   daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
   deploymentUrl?: string;
@@ -1840,7 +1873,10 @@ function validateRegisteredIdentity(value: RegisteredCloudIdentity): RegisteredC
     || !isSafePositiveInteger(value.activeIdentity.keyVersion)
     || value.activeIdentity.userPublicId !== value.userPublicId
   ) throw new Error("Cloud registered-device identity is invalid.");
-  return value;
+  return {
+    ...value,
+    activeIdentity: captureActiveCloudIdentity(value.activeIdentity),
+  };
 }
 
 async function presenceRequest(
@@ -2052,6 +2088,7 @@ async function decryptPrivateLocalReference(
 }
 
 export class LocalCloudDaemonBridge implements CloudDaemonBridge {
+  readonly #attentionNotificationState: CloudAttentionNotificationReconciliationPort;
   readonly #daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   readonly #daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
   readonly #deploymentAuthority: CloudDeploymentAuthority;
@@ -2074,6 +2111,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   #optionalTask: OptionalCloudSyncTask | null = null;
   #presenceState: CloudPresenceState | null = null;
   #deviceRegistryState: CloudDeviceRegistryState | null = null;
+  #attentionNotificationCadence: AttentionNotificationCadence | null = null;
   readonly #projectionRecoverySupersededSessions = new Set<string>();
   #tail: Promise<unknown> = Promise.resolve();
 
@@ -2094,6 +2132,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       !isSafePositiveInteger(options.daemonAuthority.bootGeneration)
       || !isOpaqueIdentifier(options.daemonAuthority.bootId)
     ) throw new Error("Cloud daemon authority is invalid.");
+    this.#attentionNotificationState = options.attentionNotificationState;
     this.#daemonAuthority = options.daemonAuthority;
     this.#daemonAuthorityFence = options.daemonAuthorityFence;
     this.#deploymentAuthority = options.deploymentAuthority;
@@ -2164,14 +2203,20 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           peerDevicePresent: await this.#peerDevicePresent(identity, signal),
         };
         await this.#assertDaemonCurrent(signal);
+        let publishedNotificationPolicyRevision: number | null = null;
+        let registryPublicationSucceeded = true;
         try {
-          await this.#publishDeviceRegistry(identity, signal);
+          publishedNotificationPolicyRevision = await this.#publishDeviceRegistry(
+            identity,
+            signal,
+          );
         } catch (error: unknown) {
           if (signal.aborted) throw error;
           // The settings projection is auxiliary: a failed publish is
           // reported and retried next cycle, it never stops command
           // execution or session sync.
           this.#deviceRegistryState = null;
+          registryPublicationSucceeded = false;
           result.errors.push(`device registry: ${normalizeError(error)}`);
         }
         await this.#assertDaemonCurrent(signal);
@@ -2203,6 +2248,18 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           result.errors,
         );
         result.commandsApplied += deviceCommandResult.applied;
+        try {
+          await this.#reconcileAttentionNotifications({
+            identity,
+            publishedNotificationPolicyRevision,
+            registryPublicationSucceeded,
+            signal,
+          });
+        } catch (error: unknown) {
+          if (signal.aborted) throw error;
+          await this.#assertDaemonCurrent(signal);
+          result.errors.push("attention notifications: reconciliation unavailable.");
+        }
         const previousOptional = this.#optionalTask;
         if (previousOptional !== null) {
           if (previousOptional.state.outcome === null) {
@@ -2439,6 +2496,658 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       return await this.#local.hasActiveTurn?.() ?? false;
     } catch {
       return false;
+    }
+  }
+
+  async observeAttentionNotificationAuthority(
+    signal: AbortSignal,
+  ): Promise<NotificationEmailHostedAuthority> {
+    if (this.#closed) throw new Error("The cloud daemon bridge is closed.");
+    return await this.#exclusive(async () => {
+      await this.#assertDaemonCurrent(signal);
+      let identity: ActiveCloudIdentity;
+      try {
+        identity = captureActiveCloudIdentity(await this.#identity.requireActive(signal));
+      } catch {
+        await this.#assertDaemonCurrent(signal);
+        return await this.#attentionNotificationFallbackWithoutIdentity(signal);
+      }
+      const status = await this.#readAttentionNotificationStatus(signal);
+      if (status === null) {
+        return await this.#attentionNotificationFallback(identity, signal);
+      }
+      await this.#settleObservedInvalidation(identity, status, signal);
+      await this.#assertExactAttentionIdentity(identity, signal);
+      return this.#hostedAttentionNotificationAuthority(status);
+    });
+  }
+
+  async invalidateAttentionNotificationAuthority(input: Readonly<{
+    localNotificationPolicyRevision: number;
+    signal: AbortSignal;
+  }>): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    if (this.#closed) throw new Error("The cloud daemon bridge is closed.");
+    if (!isSafePositiveInteger(input.localNotificationPolicyRevision)) {
+      throw new Error("Local notification policy revision is invalid.");
+    }
+    return await this.#exclusive(async () => {
+      await this.#assertDaemonCurrent(input.signal);
+      let identity: ActiveCloudIdentity;
+      try {
+        identity = captureActiveCloudIdentity(
+          await this.#identity.requireActive(input.signal),
+        );
+      } catch {
+        await this.#assertDaemonCurrent(input.signal);
+        return await this.#attentionNotificationFallbackWithoutIdentity(input.signal);
+      }
+      const status = await this.#readAttentionNotificationStatus(input.signal);
+      if (status === null) {
+        return await this.#attentionNotificationFallback(identity, input.signal);
+      }
+      try {
+        if (await this.#settleObservedInvalidation(identity, status, input.signal)) {
+          return await this.#attentionNotificationFallback(identity, input.signal, status);
+        }
+        const revision = await this.#attentionNotificationInvalidationRevision(
+          identity,
+          input.localNotificationPolicyRevision,
+          status,
+          input.signal,
+        );
+        const receipt = await this.#invalidateAttentionNotifications({
+          identity,
+          localNotificationPolicyRevision: revision,
+          signal: input.signal,
+          status,
+        });
+        if (receipt === null) {
+          return await this.#attentionNotificationFallback(identity, input.signal, status);
+        }
+        await this.#assertExactAttentionIdentity(identity, input.signal);
+        return {
+          acknowledgedAt: receipt.acknowledgedAt,
+          consentLeaseUntil: receipt.consentLeaseUntil,
+          state: "acknowledged",
+        };
+      } catch {
+        await this.#assertDaemonCurrent(input.signal);
+        return await this.#attentionNotificationFallback(identity, input.signal, status);
+      }
+    });
+  }
+
+  #hostedAttentionNotificationAuthority(
+    status: AttentionNotificationAuthorityStatus,
+  ): NotificationEmailHostedAuthority {
+    return {
+      deviceAuthority: status.deviceAuthority === null
+        ? null
+        : {
+            consentLeaseUntil: status.deviceAuthority.consentLeaseUntil,
+            globalNotificationGeneration:
+              status.deviceAuthority.globalNotificationGeneration,
+            localNotificationPolicyRevision:
+              status.deviceAuthority.localNotificationPolicyRevision,
+          },
+      globalNotificationGeneration: status.globalNotificationGeneration,
+      globalState: status.safetyFaultState === "latched"
+        ? "safety_latched"
+        : status.enabled ? "enabled" : "disabled",
+      observedAt: status.observedAt,
+      state: "observed",
+    };
+  }
+
+  async #readAttentionNotificationStatus(
+    signal: AbortSignal,
+  ): Promise<AttentionNotificationAuthorityStatus | null> {
+    try {
+      await this.#assertDaemonCurrent(signal);
+      const value = await this.#mutation("attentionNotifications:authorityStatus", {});
+      await this.#assertDaemonCurrent(signal);
+      return parseAttentionNotificationAuthorityStatus(value);
+    } catch {
+      await this.#assertDaemonCurrent(signal);
+      return null;
+    }
+  }
+
+  async #attentionNotificationObservation(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+    liveStatus?: AttentionNotificationAuthorityStatus,
+  ): Promise<CloudAttentionNotificationReconciliationObservation> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await this.#assertExactAttentionIdentity(identity, signal);
+      const observed = await this.#attentionNotificationState.read();
+      await this.#assertExactAttentionIdentity(identity, signal);
+      try {
+        return {
+          generation: observed.generation,
+          state: bindCloudAttentionNotificationReconciliationState(
+            observed.state,
+            identity.userPublicId,
+            identity.devicePublicId,
+          ),
+        };
+      } catch (error: unknown) {
+        if (liveStatus === undefined) throw error;
+      }
+      await this.#assertExactAttentionIdentity(identity, signal);
+      const replacement = replaceCloudAttentionNotificationReconciliationDevice(
+        observed.state,
+        identity.userPublicId,
+        identity.devicePublicId,
+      );
+      let committed: CloudAttentionNotificationReconciliationObservation | null;
+      try {
+        committed = await this.#attentionNotificationState.compareAndSwap(
+          observed.generation,
+          replacement,
+        );
+      } finally {
+        await this.#assertExactAttentionIdentity(identity, signal);
+      }
+      if (committed !== null) return committed;
+    }
+    throw new Error("Cloud attention notification reconciliation state changed concurrently.");
+  }
+
+  async #assertExactAttentionIdentity(
+    expected: ActiveCloudIdentity,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#assertDaemonCurrent(signal);
+    const current = await this.#identity.requireActive(signal);
+    await this.#assertDaemonCurrent(signal);
+    if (
+      current.devicePublicId !== expected.devicePublicId
+      || current.userPublicId !== expected.userPublicId
+      || current.keyVersion !== expected.keyVersion
+      || current.accountKey.byteLength !== expected.accountKey.byteLength
+      || !current.accountKey.every((byte, index) => byte === expected.accountKey[index])
+    ) throw new Error("Cloud identity changed during attention reconciliation.");
+  }
+
+  async #mutateAttentionNotificationState(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+    transform: (
+      state: CloudAttentionNotificationReconciliationState,
+    ) => CloudAttentionNotificationReconciliationState,
+  ): Promise<CloudAttentionNotificationReconciliationObservation> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const current = await this.#attentionNotificationObservation(identity, signal);
+      const next = transform(current.state);
+      await this.#assertExactAttentionIdentity(identity, signal);
+      let committed: CloudAttentionNotificationReconciliationObservation | null;
+      try {
+        committed = await this.#attentionNotificationState.compareAndSwap(
+          current.generation,
+          next,
+        );
+      } finally {
+        await this.#assertExactAttentionIdentity(identity, signal);
+      }
+      if (committed !== null) return committed;
+    }
+    throw new Error("Cloud attention notification reconciliation state changed concurrently.");
+  }
+
+  async #setAttentionNotificationPending(
+    identity: ActiveCloudIdentity,
+    request: CloudAttentionNotificationReconciliationRequest,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#mutateAttentionNotificationState(identity, signal, (state) =>
+      setCloudAttentionNotificationPending(state, request));
+  }
+
+  async #settleAttentionNotificationReceipt(
+    identity: ActiveCloudIdentity,
+    request: CloudAttentionNotificationReconciliationRequest,
+    receipt: AttentionNotificationReconcileReceipt,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#mutateAttentionNotificationState(identity, signal, (state) =>
+      settleCloudAttentionNotificationReconciliation(state, request, receipt));
+  }
+
+  async #settleObservedInvalidation(
+    identity: ActiveCloudIdentity,
+    status: AttentionNotificationAuthorityStatus,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const observed = await this.#attentionNotificationObservation(identity, signal, status);
+    const pending = observed.state.pending;
+    const authority = status.deviceAuthority;
+    if (
+      pending?.mode !== "invalidate"
+      || authority === null
+      || authority.reconciliationSequence !== pending.reconciliationSequence
+      || authority.localNotificationPolicyRevision
+        !== pending.localNotificationPolicyRevision
+      || authority.consentLeaseUntil > status.observedAt
+    ) return false;
+    const receipt = parseAttentionNotificationReconcileReceipt({
+      acknowledgedAt: authority.consentLeaseUntil,
+      consentLeaseUntil: authority.consentLeaseUntil,
+      globalNotificationGeneration: authority.globalNotificationGeneration,
+      localNotificationPolicyRevision: authority.localNotificationPolicyRevision,
+      reconciliationSequence: authority.reconciliationSequence,
+      state: "invalidated",
+    }, pending);
+    if (receipt === null) return false;
+    await this.#settleAttentionNotificationReceipt(identity, pending, receipt, signal);
+    return true;
+  }
+
+  async #attentionNotificationFallback(
+    identity: ActiveCloudIdentity,
+    signal: AbortSignal,
+    status?: AttentionNotificationAuthorityStatus,
+  ): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    if (
+      status?.deviceAuthority !== null
+      && status?.deviceAuthority !== undefined
+      && status.deviceAuthority.consentLeaseUntil > status.observedAt
+    ) {
+      await this.#assertExactAttentionIdentity(identity, signal);
+      return {
+        expiresNoLaterThan: status.deviceAuthority.consentLeaseUntil,
+        state: "revocation_pending",
+      };
+    }
+    try {
+      const state = (await this.#attentionNotificationObservation(identity, signal)).state;
+      await this.#assertExactAttentionIdentity(identity, signal);
+      return this.#attentionNotificationFallbackFromState(state, status);
+    } catch {
+      await this.#assertDaemonCurrent(signal);
+      await this.#assertExactAttentionIdentity(identity, signal);
+      return { state: "not_observed" };
+    }
+  }
+
+  #attentionNotificationFallbackFromState(
+    state: CloudAttentionNotificationReconciliationState,
+    status?: AttentionNotificationAuthorityStatus,
+  ): Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  > {
+    if (state.pending !== null || state.lastReceipt === null) {
+      return { state: "not_observed" };
+    }
+    const receipt = state.lastReceipt.receipt;
+    if (status !== undefined && status.deviceAuthority !== null) {
+      const authority = status.deviceAuthority;
+      const exactAuthority = authority.consentLeaseUntil === receipt.consentLeaseUntil
+        && authority.globalNotificationGeneration
+          === receipt.globalNotificationGeneration
+        && authority.localNotificationPolicyRevision
+          === receipt.localNotificationPolicyRevision
+        && authority.reconciliationSequence === receipt.reconciliationSequence;
+      if (!exactAuthority) return { state: "not_observed" };
+      if (receipt.state === "invalidated" && authority.consentLeaseUntil > status.observedAt) {
+        return { state: "not_observed" };
+      }
+    } else if (status !== undefined && receipt.state === "complete") {
+      return { state: "not_observed" };
+    }
+    return receipt.state === "invalidated"
+      ? {
+          acknowledgedAt: receipt.acknowledgedAt,
+          consentLeaseUntil: receipt.consentLeaseUntil,
+          state: "acknowledged",
+        }
+      : {
+          expiresNoLaterThan: receipt.consentLeaseUntil,
+          state: "revocation_pending",
+        };
+  }
+
+  async #attentionNotificationFallbackWithoutIdentity(signal: AbortSignal): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    try {
+      const observed = await this.#attentionNotificationState.read();
+      await this.#assertDaemonCurrent(signal);
+      return this.#attentionNotificationFallbackFromState(observed.state);
+    } catch {
+      await this.#assertDaemonCurrent(signal);
+      return { state: "not_observed" };
+    }
+  }
+
+  #attentionNotificationSequence(
+    state: CloudAttentionNotificationReconciliationState,
+    status: AttentionNotificationAuthorityStatus | null,
+    mode: "complete" | "invalidate",
+  ): number | null {
+    const current = Math.max(
+      status?.deviceAuthority?.reconciliationSequence ?? 0,
+      state.pending?.reconciliationSequence ?? 0,
+      state.lastReceipt?.request.reconciliationSequence ?? 0,
+    );
+    if (current >= Number.MAX_SAFE_INTEGER) return null;
+    const next = current + 1;
+    return mode === "complete" && next >= Number.MAX_SAFE_INTEGER ? null : next;
+  }
+
+  async #attentionNotificationInvalidationRevision(
+    identity: ActiveCloudIdentity,
+    requested: number,
+    status: AttentionNotificationAuthorityStatus | null,
+    signal: AbortSignal,
+  ): Promise<number> {
+    const state = (await this.#attentionNotificationObservation(identity, signal)).state;
+    return Math.max(
+      1,
+      requested,
+      status?.deviceAuthority?.localNotificationPolicyRevision ?? 0,
+      state.pending?.localNotificationPolicyRevision ?? 0,
+      state.lastReceipt?.request.localNotificationPolicyRevision ?? 0,
+    );
+  }
+
+  async #invalidateAttentionNotifications(input: Readonly<{
+    identity: ActiveCloudIdentity;
+    localNotificationPolicyRevision: number;
+    signal: AbortSignal;
+    status: AttentionNotificationAuthorityStatus | null;
+  }>): Promise<Extract<AttentionNotificationReconcileReceipt, { state: "invalidated" }> | null> {
+    try {
+      if (input.status !== null) {
+        await this.#settleObservedInvalidation(input.identity, input.status, input.signal);
+      }
+      const observed = await this.#attentionNotificationObservation(
+        input.identity,
+        input.signal,
+      );
+      const sequence = this.#attentionNotificationSequence(
+        observed.state,
+        input.status,
+        "invalidate",
+      );
+      if (sequence === null) return null;
+      const request: AttentionNotificationInvalidateRequest = {
+        localNotificationPolicyRevision: input.localNotificationPolicyRevision,
+        mode: "invalidate",
+        reconciliationSequence: sequence,
+      };
+      await this.#setAttentionNotificationPending(input.identity, request, input.signal);
+      await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      let value: unknown;
+      try {
+        value = await this.#transport.mutation(
+          "attentionNotifications:reconcile",
+          request,
+        );
+      } finally {
+        await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      }
+      const receipt = parseAttentionNotificationReconcileReceipt(value, request);
+      if (receipt?.state !== "invalidated") return null;
+      await this.#settleAttentionNotificationReceipt(
+        input.identity,
+        request,
+        receipt,
+        input.signal,
+      );
+      return receipt;
+    } catch {
+      await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      return null;
+    }
+  }
+
+  async #reconcileAttentionNotifications(input: Readonly<{
+    identity: ActiveCloudIdentity;
+    publishedNotificationPolicyRevision: number | null;
+    registryPublicationSucceeded: boolean;
+    signal: AbortSignal;
+  }>): Promise<void> {
+    const now = this.#now();
+    if (!isSafeNonNegativeInteger(now)) {
+      throw new Error("Attention notification clock is invalid.");
+    }
+    let snapshot: LocalAttentionNotificationSnapshot | null = null;
+    let sourceState: "absent" | "available" | "invalid" = "absent";
+    const readSnapshot = this.#local.readAttentionNotificationSnapshot?.bind(this.#local);
+    if (readSnapshot !== undefined) {
+      try {
+        snapshot = parseLocalAttentionNotificationSnapshot(await readSnapshot({
+          limit: attentionNotificationCandidateLimit,
+          now,
+          signal: input.signal,
+        }), now);
+        sourceState = snapshot === null ? "invalid" : "available";
+      } catch {
+        await this.#assertDaemonCurrent(input.signal);
+        sourceState = "invalid";
+      }
+    }
+    const fingerprint = await sha256Hex(JSON.stringify({
+      publishedNotificationPolicyRevision: input.publishedNotificationPolicyRevision,
+      registryPublicationSucceeded: input.registryPublicationSucceeded,
+      snapshot: snapshot === null ? null : { ...snapshot, observedAt: 0 },
+      sourceState,
+    }));
+    await this.#assertDaemonCurrent(input.signal);
+    const cadence = this.#attentionNotificationCadence;
+    if (
+      cadence !== null
+      && cadence.fingerprint === fingerprint
+      && now < cadence.nextAttemptAt
+    ) return;
+    this.#attentionNotificationCadence = {
+      fingerprint,
+      nextAttemptAt: now + attentionNotificationRetryMs,
+    };
+
+    const status = await this.#readAttentionNotificationStatus(input.signal);
+    if (status !== null) {
+      await this.#settleObservedInvalidation(input.identity, status, input.signal);
+    }
+    const state = (await this.#attentionNotificationObservation(
+      input.identity,
+      input.signal,
+    )).state;
+    const sourceRevision = snapshot?.notificationPolicyRevision
+      ?? input.publishedNotificationPolicyRevision
+      ?? status?.deviceAuthority?.localNotificationPolicyRevision
+      ?? state.pending?.localNotificationPolicyRevision
+      ?? state.lastReceipt?.request.localNotificationPolicyRevision
+      ?? 1;
+    const invalidate = async (): Promise<void> => {
+      const revision = await this.#attentionNotificationInvalidationRevision(
+        input.identity,
+        sourceRevision,
+        status,
+        input.signal,
+      );
+      const currentState = (await this.#attentionNotificationObservation(
+        input.identity,
+        input.signal,
+      )).state;
+      const liveStatusHasNoActiveAuthority = status === null
+        || status.deviceAuthority === null
+        || status.deviceAuthority.consentLeaseUntil <= status.observedAt;
+      if (
+        currentState.pending === null
+        && (
+          (status?.deviceAuthority !== null
+            && status?.deviceAuthority !== undefined
+            && status.deviceAuthority.localNotificationPolicyRevision >= revision
+            && status.deviceAuthority.consentLeaseUntil <= status.observedAt)
+          || (liveStatusHasNoActiveAuthority
+            && currentState.lastReceipt?.receipt.state === "invalidated"
+            && currentState.lastReceipt.request.localNotificationPolicyRevision >= revision)
+        )
+      ) {
+        this.#attentionNotificationCadence = {
+          fingerprint,
+          nextAttemptAt: now + attentionNotificationRenewalMs,
+        };
+        return;
+      }
+      const receipt = await this.#invalidateAttentionNotifications({
+        identity: input.identity,
+        localNotificationPolicyRevision: revision,
+        signal: input.signal,
+        status,
+      });
+      if (receipt !== null) {
+        this.#attentionNotificationCadence = {
+          fingerprint,
+          nextAttemptAt: now + attentionNotificationRenewalMs,
+        };
+      }
+    };
+
+    if (state.pending !== null) {
+      await invalidate();
+      return;
+    }
+    let allowedWindowEnd: number | null = null;
+    if (snapshot !== null) {
+      try {
+        allowedWindowEnd = notificationHoursAllowedWindowEnd(
+          snapshot.notificationHours,
+          now,
+        );
+      } catch {
+        allowedWindowEnd = null;
+      }
+    }
+    if (
+      status === null
+      || snapshot === null
+      || !input.registryPublicationSucceeded
+      || input.publishedNotificationPolicyRevision === null
+      || input.publishedNotificationPolicyRevision
+        !== snapshot.notificationPolicyRevision
+      || !snapshot.notificationEmail.enabled
+      || snapshot.status !== "complete"
+      || allowedWindowEnd === null
+      || !status.enabled
+      || status.safetyFaultState === "latched"
+    ) {
+      await invalidate();
+      return;
+    }
+
+    const authorityBySession = new Map<string, AuthorityTuple>();
+    try {
+      for (const candidate of snapshot.candidates) {
+        if (authorityBySession.has(candidate.sessionPublicId)) continue;
+        await this.#assertDaemonCurrent(input.signal);
+        const lease = await this.#ensureLease(candidate.sessionPublicId, input.identity);
+        await this.#assertDaemonCurrent(input.signal);
+        if (
+          lease.devicePublicId !== input.identity.devicePublicId
+          || lease.bootGeneration !== this.#daemonAuthority.bootGeneration
+          || lease.bootId !== this.#daemonAuthority.bootId
+          || lease.leaseUntil <= now
+        ) throw new Error("Attention notification lease authority is invalid.");
+        authorityBySession.set(candidate.sessionPublicId, authorityOf(lease));
+      }
+    } catch {
+      await this.#assertDaemonCurrent(input.signal);
+      await invalidate();
+      return;
+    }
+    let confirmed: LocalAttentionNotificationSnapshot | null = null;
+    try {
+      confirmed = parseLocalAttentionNotificationSnapshot(await (readSnapshot as NonNullable<
+        typeof readSnapshot
+      >)({
+        limit: attentionNotificationCandidateLimit,
+        now,
+        signal: input.signal,
+      }), now);
+    } catch {
+      await this.#assertDaemonCurrent(input.signal);
+    }
+    if (confirmed === null || JSON.stringify(confirmed) !== JSON.stringify(snapshot)) {
+      await invalidate();
+      return;
+    }
+    const hostedCandidates = snapshot.candidates.map((candidate) => ({
+      ...candidate,
+      executionAuthority: authorityBySession.get(candidate.sessionPublicId) as AuthorityTuple,
+      remoteActions: [...candidate.remoteActions],
+    }));
+    const observed = await this.#attentionNotificationObservation(
+      input.identity,
+      input.signal,
+    );
+    const sequence = this.#attentionNotificationSequence(observed.state, status, "complete");
+    if (sequence === null) {
+      await invalidate();
+      return;
+    }
+    const request: AttentionNotificationCompleteRequest = {
+      allowedWindowEnd,
+      candidateCount: hostedCandidates.length,
+      expectedGlobalNotificationGeneration: status.globalNotificationGeneration,
+      localNotificationPolicyRevision: snapshot.notificationPolicyRevision,
+      mode: "complete",
+      reconciliationSequence: sequence,
+    };
+    await this.#setAttentionNotificationPending(input.identity, request, input.signal);
+    try {
+      await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      let value: unknown;
+      try {
+        value = await this.#transport.mutation("attentionNotifications:reconcile", {
+          allowedWindowEnd: request.allowedWindowEnd,
+          candidates: hostedCandidates,
+          expectedGlobalNotificationGeneration:
+            request.expectedGlobalNotificationGeneration,
+          localNotificationPolicyRevision: request.localNotificationPolicyRevision,
+          mode: request.mode,
+          reconciliationSequence: request.reconciliationSequence,
+        });
+      } finally {
+        await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      }
+      const receipt = parseAttentionNotificationReconcileReceipt(value, request);
+      if (receipt?.state !== "complete") throw new Error("Attention receipt is invalid.");
+      await this.#settleAttentionNotificationReceipt(
+        input.identity,
+        request,
+        receipt,
+        input.signal,
+      );
+      this.#attentionNotificationCadence = {
+        fingerprint,
+        nextAttemptAt: now + attentionNotificationRenewalMs,
+      };
+    } catch {
+      await this.#assertExactAttentionIdentity(input.identity, input.signal);
+      const recoveryStatus = await this.#readAttentionNotificationStatus(input.signal);
+      const revision = await this.#attentionNotificationInvalidationRevision(
+        input.identity,
+        snapshot.notificationPolicyRevision,
+        recoveryStatus,
+        input.signal,
+      );
+      await this.#invalidateAttentionNotifications({
+        identity: input.identity,
+        localNotificationPolicyRevision: revision,
+        signal: input.signal,
+        status: recoveryStatus,
+      });
     }
   }
 
@@ -5544,6 +6253,8 @@ export async function createLocalCloudDaemonBridgeFromEnvironment(
   });
   try {
     return new LocalCloudDaemonBridge({
+      attentionNotificationState: options.attentionNotificationState
+        ?? new CustodyCloudAttentionNotificationReconciliation(fencedCustody),
       daemonAuthority: options.daemonAuthority,
       daemonAuthorityFence: options.daemonAuthorityFence,
       deploymentAuthority,

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { CloudTransport } from "./client";
+import type { LocalAttentionNotificationSnapshot } from "./attention-notifications";
 import type {
   AuthorityTuple,
   CommandKind,
@@ -27,10 +28,17 @@ import {
 } from "./daemon-bridge";
 import {
   CloudDaemonJournalRecoveryBlocker,
+  CustodyCloudAttentionNotificationReconciliation,
+  MemoryCloudAttentionNotificationReconciliation,
   MemoryCloudDaemonJournal,
   MemoryCloudSessionSyncCursor,
   parseCloudDaemonJournal,
+  bindCloudAttentionNotificationReconciliationState,
+  emptyCloudAttentionNotificationReconciliationState,
+  setCloudAttentionNotificationPending,
+  settleCloudAttentionNotificationReconciliation,
   type CloudCommandJournalEntry,
+  type CloudAttentionNotificationReconciliationPort,
   type CloudDaemonJournalState,
   type CloudDaemonJournalInputState,
   type CloudDaemonJournalObservation,
@@ -42,6 +50,7 @@ import {
 import {
   cloudDeploymentAuthorityFromEnvironment,
   type CloudDeploymentAuthority,
+  IdentityScopedCloudSecretCustody,
 } from "./identity-custody";
 import {
   createLocalCloudControlFromEnvironment,
@@ -1783,7 +1792,19 @@ class RecordingExecutor implements CloudCommandExecutorPort {
   }
 }
 
+class TimelineExecutor extends RecordingExecutor {
+  constructor(readonly timeline: string[]) {
+    super();
+  }
+
+  override async execute(input: { idempotencyKey: string; sessionPublicId: string }) {
+    this.timeline.push("command-effect");
+    return await super.execute(input);
+  }
+}
+
 function bridge(input: {
+  attentionNotificationState?: CloudAttentionNotificationReconciliationPort;
   cloud: FakeCloud;
   daemonAuthority?: AuthorityTuple;
   daemonAuthorityFence?: Readonly<{ assertCurrent(): Promise<void> }>;
@@ -1803,6 +1824,8 @@ function bridge(input: {
 }) {
   let uuidSequence = 100;
   return new LocalCloudDaemonBridge({
+    attentionNotificationState: input.attentionNotificationState
+      ?? new MemoryCloudAttentionNotificationReconciliation(),
     daemonAuthority: input.daemonAuthority
       ?? { bootGeneration: 1, bootId: "boot_12345678", fence: 1 },
     daemonAuthorityFence: input.daemonAuthorityFence
@@ -6472,5 +6495,1451 @@ describe("device command execution", () => {
     expect(result.errors).toEqual([]);
     // The row stays pending and expires on its own deadline.
     expect(cloud.requireDeviceCommand(commandPublicId).state).toBe("pending");
+  });
+});
+
+class AttentionLocal extends EmptyLocal {
+  registryRevision = 1;
+  snapshot: LocalAttentionNotificationSnapshot;
+  snapshotReads = 0;
+  afterFirstSnapshot?: () => void;
+  readonly timeline: string[] | undefined;
+
+  constructor(
+    candidates: LocalAttentionNotificationSnapshot["candidates"] = [],
+    sessionPublicId?: string,
+    timeline?: string[],
+  ) {
+    super(sessionPublicId);
+    this.timeline = timeline;
+    this.snapshot = {
+      candidates,
+      notificationEmail: { enabled: true, revision: 1, version: 1 },
+      notificationHours: {
+        endMinute: 19 * 60,
+        revision: 1,
+        startMinute: 17 * 60,
+        timeZone: "UTC",
+        version: 1,
+      },
+      notificationPolicyRevision: 1,
+      observedAt: fixedNow,
+      status: "complete",
+    };
+  }
+
+  async readDeviceRegistryProjection(): Promise<CloudDeviceRegistryProjection> {
+    return {
+      notificationEmail: {
+        ...this.snapshot.notificationEmail,
+        revision: this.registryRevision,
+      },
+      notificationHours: {
+        ...this.snapshot.notificationHours,
+        revision: this.registryRevision,
+      },
+      notificationPolicyRevision: this.registryRevision,
+      registry: {
+        accounts: [],
+        daemonVersion: "0.3.0",
+        defaultApprovalMode: "auto:all",
+        defaultPreset: "ultra",
+        heartbeatAt: fixedNow,
+        machineLabel: "Attention fixture",
+        projects: [],
+        proseAutorespondConfigured: false,
+        scheduledTasks: [],
+        showThinkingDefault: false,
+        version: 1,
+      },
+    };
+  }
+
+  async readAttentionNotificationSnapshot(input: Readonly<{ now: number }>) {
+    this.snapshotReads += 1;
+    if (this.snapshotReads === 1) this.timeline?.push("attention-snapshot");
+    const snapshot = structuredClone({ ...this.snapshot, observedAt: input.now });
+    if (this.snapshotReads === 1) this.afterFirstSnapshot?.();
+    return snapshot;
+  }
+
+  override async listSessions(
+    input: Parameters<CloudDaemonLocalSourcePort["listSessions"]>[0],
+  ): Promise<CloudLocalSessionPage> {
+    this.timeline?.push("optional-work");
+    return await super.listSessions(input);
+  }
+}
+
+type AttentionAuthority = Readonly<{
+  consentLeaseUntil: number;
+  globalNotificationGeneration: number;
+  localNotificationPolicyRevision: number;
+  reconciliationSequence: number;
+}>;
+
+type AttentionIdentityRollover = "device" | "key";
+
+function rollAttentionIdentity(
+  identity: MutableIdentity,
+  kind: AttentionIdentityRollover,
+  currentDevicePublicId: string,
+): void {
+  const devicePublicId = kind === "device"
+    ? "device_attention_rollover_12345678"
+    : currentDevicePublicId;
+  identity.current = {
+    activeIdentity: {
+      accountKey: kind === "key"
+        ? Uint8Array.from(key, (byte) => byte ^ 0xff)
+        : key,
+      devicePublicId,
+      keyVersion: kind === "key" ? 2 : 1,
+      userPublicId,
+    },
+    authEpoch: 2,
+    credentialGeneration: 2,
+    devicePublicId,
+    status: "active",
+    userPublicId,
+  };
+}
+
+function attentionWorld(input: Readonly<{
+  candidates?: LocalAttentionNotificationSnapshot["candidates"];
+  device?: string;
+  sessionPublicId?: string;
+  state?: CloudAttentionNotificationReconciliationPort;
+  timeline?: string[];
+}> = {}) {
+  const cloud = new FakeCloud();
+  const device = input.device ?? "device_attention_12345678";
+  const local = new AttentionLocal(
+    input.candidates,
+    input.sessionPublicId,
+    input.timeline,
+  );
+  const inner = cloud.connect(device);
+  const state = input.state ?? new MemoryCloudAttentionNotificationReconciliation();
+  let authority: AttentionAuthority | null = null;
+  let enabled = true;
+  let fault: "latched" | "none" | "reviewed" = "none";
+  let globalGeneration = 1;
+  let registryRevision = 0;
+  let registryPolicyRevision: number | null = null;
+  let statusMalformed = false;
+  let completeResponse: "normal" | "malformed" | "throw_after" = "normal";
+  let invalidateResponse: "normal" | "throw_after" = "normal";
+  let failRegistry = false;
+  let completeGate: Promise<void> | null = null;
+  let leaseQueries = 0;
+  const calls: Array<Readonly<{ args: Readonly<Record<string, unknown>>; name: string }>> = [];
+  const transport: CloudTransport = {
+    action: (name, args) => inner.action(name, args),
+    mutation: async (name, args) => {
+      if (name === "devices:updateRegistry") {
+        calls.push({ args: structuredClone(args), name });
+        if (failRegistry) throw new Error("foreign registry /private/secret");
+        if (args.expectedRevision !== registryRevision) throw new Error("registry conflict");
+        registryRevision += 1;
+        registryPolicyRevision = args.notificationPolicyRevision as number | null;
+        input.timeline?.push("registry-published");
+        return { devicePublicId: device, revision: registryRevision, updatedAt: cloud.now };
+      }
+      if (name === "attentionNotifications:authorityStatus") {
+        calls.push({ args: {}, name });
+        if (statusMalformed) return { enabled: "foreign" };
+        return {
+          deviceAuthority: authority,
+          enabled: enabled && fault !== "latched",
+          globalNotificationGeneration: globalGeneration,
+          observedAt: cloud.now,
+          safetyFaultState: fault,
+        };
+      }
+      if (name === "attentionNotifications:reconcile") {
+        calls.push({ args: structuredClone(args), name });
+        input.timeline?.push("attention-reconciled");
+        if (args.mode === "complete" && completeGate !== null) await completeGate;
+        const sequence = args.reconciliationSequence as number;
+        if (authority !== null && sequence <= authority.reconciliationSequence) {
+          throw new Error("stale sequence");
+        }
+        const localRevision = args.localNotificationPolicyRevision as number;
+        if (args.mode === "invalidate") {
+          authority = {
+            consentLeaseUntil: cloud.now,
+            globalNotificationGeneration: globalGeneration,
+            localNotificationPolicyRevision: localRevision,
+            reconciliationSequence: sequence,
+          };
+          if (invalidateResponse === "throw_after") {
+            invalidateResponse = "normal";
+            throw new Error("foreign invalidation response text /private/secret");
+          }
+          return {
+            acknowledgedAt: cloud.now,
+            consentLeaseUntil: cloud.now,
+            globalNotificationGeneration: globalGeneration,
+            localNotificationPolicyRevision: localRevision,
+            reconciliationSequence: sequence,
+            state: "invalidated",
+          };
+        }
+        if (
+          !enabled
+          || fault === "latched"
+          || args.expectedGlobalNotificationGeneration !== globalGeneration
+          || registryPolicyRevision !== localRevision
+        ) throw new Error("complete rejected");
+        const candidates = args.candidates as Array<Readonly<{
+          executionAuthority: AuthorityTuple;
+          sessionPublicId: string;
+        }>>;
+        for (const candidate of candidates) {
+          const lease = cloud.requireLease(candidate.sessionPublicId);
+          if (!sameAuthorityTuple(candidate.executionAuthority, lease)) {
+            throw new Error("lease mismatch");
+          }
+        }
+        const consentLeaseUntil = Math.min(
+          cloud.now + 2 * 60_000,
+          args.allowedWindowEnd as number,
+        );
+        authority = {
+          consentLeaseUntil,
+          globalNotificationGeneration: globalGeneration,
+          localNotificationPolicyRevision: localRevision,
+          reconciliationSequence: sequence,
+        };
+        if (completeResponse === "throw_after") {
+          completeResponse = "normal";
+          throw new Error("foreign complete response text /private/secret");
+        }
+        if (completeResponse === "malformed") {
+          completeResponse = "normal";
+          return { state: "complete", secret: "/private/secret" };
+        }
+        return {
+          acknowledgedAt: cloud.now,
+          candidateCount: candidates.length,
+          consentLeaseUntil,
+          globalNotificationGeneration: globalGeneration,
+          localNotificationPolicyRevision: localRevision,
+          reconciliationSequence: sequence,
+          state: "complete",
+        };
+      }
+      const value = await inner.mutation(name, args);
+      if (name === "commands:settle") input.timeline?.push("command-settled");
+      if (name === "deviceCommands:settle") {
+        input.timeline?.push("device-command-settled");
+      }
+      return value;
+    },
+    query: async (name, args) => {
+      if (name === "devices:getRegistry") {
+        return registryRevision === 0
+          ? null
+          : { devicePublicId: device, revision: registryRevision };
+      }
+      if (name === "leases:current") leaseQueries += 1;
+      return await inner.query(name, args);
+    },
+  };
+  const daemon = () => bridge({
+    attentionNotificationState: state,
+    cloud,
+    device,
+    local,
+    transport,
+  });
+  return {
+    calls,
+    cloud,
+    daemon,
+    device,
+    get authority() { return authority; },
+    set authority(value: AttentionAuthority | null) { authority = value; },
+    get leaseQueries() { return leaseQueries; },
+    local,
+    set completeResponse(value: typeof completeResponse) { completeResponse = value; },
+    set completeGate(value: Promise<void> | null) { completeGate = value; },
+    set enabled(value: boolean) { enabled = value; },
+    set failRegistry(value: boolean) { failRegistry = value; },
+    set fault(value: typeof fault) { fault = value; },
+    set globalGeneration(value: number) { globalGeneration = value; },
+    set invalidateResponse(value: typeof invalidateResponse) { invalidateResponse = value; },
+    set statusMalformed(value: boolean) { statusMalformed = value; },
+    state,
+    transport,
+  };
+}
+
+const attentionCandidates = [{
+  interactionDeadline: fixedNow + 10 * 60_000,
+  interactionId: "interaction_attention_12345678",
+  interactionKind: "user_input" as const,
+  interactionRevision: 2,
+  remoteActions: ["decline", "answer"] as const,
+  sessionPublicId: "session_attention_12345678",
+}, {
+  interactionDeadline: fixedNow + 8 * 60_000,
+  interactionId: "interaction_attention_87654321",
+  interactionKind: "permission_approval" as const,
+  interactionRevision: 1,
+  remoteActions: ["decline"] as const,
+  sessionPublicId: "session_attention_12345678",
+}];
+
+describe("attention notification daemon bridge", () => {
+  test("publishes, processes, leases each unique session once, and reconciles one exact payload", async () => {
+    const world = attentionWorld({ candidates: attentionCandidates });
+    const result = await world.daemon().cycle(new AbortController().signal);
+    expect(result.online).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(world.leaseQueries).toBe(1);
+    const attentionCalls = world.calls.filter((call) =>
+      call.name.startsWith("attentionNotifications:"));
+    expect(attentionCalls.map((call) => call.name)).toEqual([
+      "attentionNotifications:authorityStatus",
+      "attentionNotifications:reconcile",
+    ]);
+    expect(world.calls[0]?.name).toBe("devices:updateRegistry");
+    expect(attentionCalls[1]?.args).toMatchObject({
+      expectedGlobalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      mode: "complete",
+      reconciliationSequence: 1,
+    });
+    expect(Object.keys(attentionCalls[1]?.args ?? {}).sort()).toEqual([
+      "allowedWindowEnd",
+      "candidates",
+      "expectedGlobalNotificationGeneration",
+      "localNotificationPolicyRevision",
+      "mode",
+      "reconciliationSequence",
+    ]);
+    expect(attentionCalls[1]?.args.allowedWindowEnd).toBe(
+      Date.parse("2030-03-17T19:00:00.000Z"),
+    );
+    expect(attentionCalls[1]?.args.candidates).toEqual(attentionCandidates.map((candidate) => ({
+      ...candidate,
+      executionAuthority: { bootGeneration: 1, bootId: "boot_12345678", fence: 1 },
+      remoteActions: [...candidate.remoteActions],
+    })));
+    expect(world.authority).toMatchObject({ reconciliationSequence: 1 });
+  });
+
+  test("orders a real remote command before the first attention snapshot and optional work", async () => {
+    const timeline: string[] = [];
+    const sessionPublicId = attentionCandidates[0]!.sessionPublicId;
+    const world = attentionWorld({
+      candidates: attentionCandidates,
+      sessionPublicId,
+      timeline,
+    });
+    world.cloud.heads.set(sessionPublicId, {
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: world.device,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    });
+    const commandPublicId = uuidV7(9_801);
+    await world.cloud.enqueue(
+      "device_attention_requester_12345678",
+      sessionPublicId,
+      commandPublicId,
+      { kind: "stop" },
+    );
+    const result = await bridge({
+      attentionNotificationState: world.state,
+      cloud: world.cloud,
+      device: world.device,
+      executor: new TimelineExecutor(timeline),
+      local: world.local,
+      transport: world.transport,
+    }).cycle(new AbortController().signal);
+
+    expect(result.commandsApplied).toBe(1);
+    expect(world.cloud.requireCommand(commandPublicId).state).toBe("applied");
+    expect(timeline).toEqual([
+      "registry-published",
+      "command-effect",
+      "command-settled",
+      "attention-snapshot",
+      "attention-reconciled",
+      "optional-work",
+    ]);
+  });
+
+  test("orders session and notification-hours commands before revision-fenced attention", async () => {
+    const timeline: string[] = [];
+    const sessionPublicId = attentionCandidates[0]!.sessionPublicId;
+    const world = attentionWorld({ sessionPublicId, timeline });
+    world.cloud.heads.set(sessionPublicId, {
+      compactHeadSequence: 0,
+      createdAt: fixedNow,
+      detailHeadSequence: 0,
+      executionDevicePublicId: world.device,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: sessionPublicId,
+      state: "idle",
+      updatedAt: fixedNow,
+    });
+    const sessionCommandPublicId = uuidV7(9_802);
+    await world.cloud.enqueue(
+      "device_attention_requester_12345678",
+      sessionPublicId,
+      sessionCommandPublicId,
+      { kind: "stop" },
+    );
+    const deviceCommandPublicId = uuidV7(9_803);
+    await world.cloud.enqueueDeviceCommand({
+      kind: "set_notification_hours",
+      payload: {
+        endMinute: 20 * 60,
+        expectedRevision: 1,
+        kind: "set_notification_hours",
+        startMinute: 17 * 60,
+        timeZone: "UTC",
+        version: 1,
+      },
+      publicId: deviceCommandPublicId,
+      requestingDevicePublicId: "device_attention_requester_12345678",
+    });
+    const deviceExecutor: CloudDeviceCommandExecutorPort = {
+      async executeDeviceCommand(input) {
+        timeline.push("device-command-effect");
+        if (
+          input.payload.kind !== "set_notification_hours"
+          || input.payload.expectedRevision !== world.local.snapshot.notificationPolicyRevision
+        ) throw new Error("notification hours fixture revision conflict");
+        const revision = input.payload.expectedRevision + 1;
+        world.local.registryRevision = revision;
+        world.local.snapshot = {
+          ...world.local.snapshot,
+          notificationEmail: { ...world.local.snapshot.notificationEmail, revision },
+          notificationHours: {
+            endMinute: input.payload.endMinute,
+            revision,
+            startMinute: input.payload.startMinute,
+            timeZone: input.payload.timeZone,
+            version: input.payload.version,
+          },
+          notificationPolicyRevision: revision,
+        };
+        return { code: "APPLIED", state: "applied" };
+      },
+    };
+    const daemon = bridge({
+      attentionNotificationState: world.state,
+      cloud: world.cloud,
+      device: world.device,
+      deviceExecutor,
+      executor: new TimelineExecutor(timeline),
+      local: world.local,
+      transport: world.transport,
+    });
+
+    const first = await daemon.cycle(new AbortController().signal);
+    expect(first.commandsApplied).toBe(2);
+    expect(world.cloud.requireCommand(sessionCommandPublicId).state).toBe("applied");
+    expect(world.cloud.requireDeviceCommand(deviceCommandPublicId).state).toBe("applied");
+    expect(timeline).toEqual([
+      "registry-published",
+      "command-effect",
+      "command-settled",
+      "device-command-effect",
+      "device-command-settled",
+      "attention-snapshot",
+      "attention-reconciled",
+      "optional-work",
+    ]);
+    expect(world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile").map((call) => call.args.mode))
+      .toEqual(["invalidate"]);
+
+    timeline.length = 0;
+    const second = await daemon.cycle(new AbortController().signal);
+    expect(second.commandsApplied).toBe(0);
+    expect(timeline).toEqual([
+      "registry-published",
+      "attention-reconciled",
+      "optional-work",
+    ]);
+    expect(world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile").map((call) => call.args.mode))
+      .toEqual(["invalidate", "complete"]);
+    expect(world.calls.filter((call) =>
+      call.name === "devices:updateRegistry").map((call) =>
+      call.args.notificationPolicyRevision)).toEqual([1, 2]);
+    expect(world.local.snapshotReads).toBe(3);
+  });
+
+  test("invalidates every fail-closed local, registry, hosted, and lease condition", async () => {
+    const cases: Array<Readonly<{
+      configure(world: ReturnType<typeof attentionWorld>): void;
+      name: string;
+    }>> = [
+      { name: "opt-out", configure: (world) => {
+        world.local.snapshot = {
+          ...world.local.snapshot,
+          notificationEmail: { enabled: false, revision: 1, version: 1 },
+        };
+      } },
+      { name: "quiet", configure: (world) => {
+        world.local.snapshot = {
+          ...world.local.snapshot,
+          notificationHours: {
+            ...world.local.snapshot.notificationHours,
+            endMinute: 12 * 60,
+            startMinute: 10 * 60,
+          },
+        };
+      } },
+      { name: "overflow", configure: (world) => {
+        world.local.snapshot = { ...world.local.snapshot, candidates: [], status: "overflow" };
+      } },
+      { name: "registry-mismatch", configure: (world) => {
+        world.local.registryRevision = 2;
+      } },
+      { name: "registry-failure", configure: (world) => { world.failRegistry = true; } },
+      { name: "global-off", configure: (world) => { world.enabled = false; } },
+      { name: "safety-latch", configure: (world) => { world.fault = "latched"; } },
+      { name: "malformed-status", configure: (world) => { world.statusMalformed = true; } },
+      { name: "lease-failure", configure: (world) => {
+        world.cloud.leases.set(attentionCandidates[0]!.sessionPublicId, {
+          bootGeneration: 1,
+          bootId: "boot_other_12345678",
+          devicePublicId: world.device,
+          fence: 1,
+          heartbeatFingerprint: "initial",
+          heartbeatSequence: 0,
+          leaseUntil: fixedNow + 60_000,
+        });
+      } },
+    ];
+    for (const fixture of cases) {
+      const world = attentionWorld({ candidates: attentionCandidates });
+      fixture.configure(world);
+      const result = await world.daemon().cycle(new AbortController().signal);
+      expect(result.online, fixture.name).toBe(true);
+      const reconciles = world.calls.filter((call) =>
+        call.name === "attentionNotifications:reconcile");
+      expect(reconciles.at(-1)?.args.mode, fixture.name).toBe("invalidate");
+      expect(Object.keys(reconciles.at(-1)?.args ?? {}).sort(), fixture.name).toEqual([
+        "localNotificationPolicyRevision",
+        "mode",
+        "reconciliationSequence",
+      ]);
+      expect(reconciles.some((call) => call.args.mode === "complete"), fixture.name).toBe(false);
+    }
+  });
+
+  test("invalidates an absent or malformed source without leaking foreign diagnostics", async () => {
+    const absentWorld = attentionWorld();
+    const absent = bridge({
+      attentionNotificationState: absentWorld.state,
+      cloud: absentWorld.cloud,
+      device: absentWorld.device,
+      local: new EmptyLocal(),
+      transport: absentWorld.transport,
+    });
+    await absent.cycle(new AbortController().signal);
+    expect(absentWorld.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile").at(-1)?.args.mode)
+      .toBe("invalidate");
+
+    const world = attentionWorld({ device: "device_attention_malformed" });
+    // The fixture transport is intentionally exercised through a source that
+    // throws after its first strict snapshot read; only the bridge's closed
+    // diagnostic is admitted.
+    world.local.readAttentionNotificationSnapshot = async () => {
+      throw new Error("foreign /private/source-secret Bearer leaked-token");
+    };
+    const result = await world.daemon().cycle(new AbortController().signal);
+    expect(result.errors.join(" ")).not.toContain("source-secret");
+    expect(world.calls.filter((call) => call.name === "attentionNotifications:reconcile")
+      .at(-1)?.args.mode).toBe("invalidate");
+  });
+
+  test("invalidates a local race after leasing and never sends a partial complete", async () => {
+    const world = attentionWorld({ candidates: attentionCandidates });
+    world.local.afterFirstSnapshot = () => {
+      world.local.snapshot = {
+        ...world.local.snapshot,
+        candidates: [attentionCandidates[0]!],
+      };
+    };
+    await world.daemon().cycle(new AbortController().signal);
+    const reconciles = world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile");
+    expect(reconciles).toHaveLength(1);
+    expect(reconciles[0]?.args.mode).toBe("invalidate");
+  });
+
+  test("invalidates a hostile lease response instead of attaching foreign authority", async () => {
+    const world = attentionWorld({ candidates: attentionCandidates });
+    const hostileTransport: CloudTransport = {
+      action: (name, args) => world.transport.action(name, args),
+      mutation: async (name, args) => {
+        const value = await world.transport.mutation(name, args);
+        return name === "leases:acquire" && typeof value === "object" && value !== null
+          ? { ...value, devicePublicId: "device_foreign_12345678" }
+          : value;
+      },
+      query: (name, args) => world.transport.query(name, args),
+    };
+    await bridge({
+      attentionNotificationState: world.state,
+      cloud: world.cloud,
+      device: world.device,
+      local: world.local,
+      transport: hostileTransport,
+    }).cycle(new AbortController().signal);
+    const reconciles = world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile");
+    expect(reconciles).toHaveLength(1);
+    expect(reconciles[0]?.args.mode).toBe("invalidate");
+  });
+
+  test("orders a lost or malformed complete response behind a strictly higher invalidation", async () => {
+    for (const response of ["throw_after", "malformed"] as const) {
+      const world = attentionWorld({ candidates: attentionCandidates });
+      world.completeResponse = response;
+      const result = await world.daemon().cycle(new AbortController().signal);
+      expect(result.errors.join(" "), response).not.toContain("private/secret");
+      const reconciles = world.calls.filter((call) =>
+        call.name === "attentionNotifications:reconcile");
+      expect(reconciles.map((call) => [
+        call.args.mode,
+        call.args.reconciliationSequence,
+      ]), response).toEqual([["complete", 1], ["invalidate", 2]]);
+      expect(world.authority).toMatchObject({
+        consentLeaseUntil: fixedNow,
+        reconciliationSequence: 2,
+      });
+    }
+  });
+
+  test("retains pending uncertainty across restart and exposes only settled receipt bounds offline", async () => {
+    const completeState = new MemoryCloudAttentionNotificationReconciliation();
+    const identityBound = bindCloudAttentionNotificationReconciliationState(
+      emptyCloudAttentionNotificationReconciliationState(),
+      userPublicId,
+      "device_attention_12345678",
+    );
+    const request = {
+      allowedWindowEnd: fixedNow + 120_000,
+      candidateCount: 0,
+      expectedGlobalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      mode: "complete" as const,
+      reconciliationSequence: 1,
+    };
+    const pending = setCloudAttentionNotificationPending(identityBound, request);
+    const receipt = {
+      acknowledgedAt: fixedNow,
+      candidateCount: 0,
+      consentLeaseUntil: fixedNow + 120_000,
+      globalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      reconciliationSequence: 1,
+      state: "complete" as const,
+    };
+    await completeState.compareAndSwap(null, settleCloudAttentionNotificationReconciliation(
+      pending,
+      request,
+      receipt,
+    ));
+    const world = attentionWorld({ state: completeState });
+    world.cloud.offline = true;
+    const unavailableIdentity: CloudDaemonIdentityPort = {
+      async requireActive() { throw new Error("offline identity"); },
+    };
+    const offline = bridge({
+      attentionNotificationState: completeState,
+      cloud: world.cloud,
+      device: world.device,
+      identity: unavailableIdentity,
+      local: world.local,
+      transport: world.cloud.connect(world.device),
+    });
+    expect(await offline.invalidateAttentionNotificationAuthority({
+      localNotificationPolicyRevision: 1,
+      signal: new AbortController().signal,
+    })).toEqual({ expiresNoLaterThan: fixedNow + 120_000, state: "revocation_pending" });
+
+    const observed = await completeState.read();
+    await completeState.compareAndSwap(observed.generation, setCloudAttentionNotificationPending(
+      observed.state,
+      {
+        localNotificationPolicyRevision: 1,
+        mode: "invalidate",
+        reconciliationSequence: 2,
+      },
+    ));
+    expect(await offline.invalidateAttentionNotificationAuthority({
+      localNotificationPolicyRevision: 1,
+      signal: new AbortController().signal,
+    })).toEqual({ state: "not_observed" });
+  });
+
+  test("settles a lost invalidation on restart and retains its exact offline acknowledgement", async () => {
+    const world = attentionWorld();
+    world.local.snapshot = {
+      ...world.local.snapshot,
+      notificationEmail: { enabled: false, revision: 1, version: 1 },
+    };
+    world.invalidateResponse = "throw_after";
+    await world.daemon().cycle(new AbortController().signal);
+    expect((await world.state.read()).state.pending).toMatchObject({
+      mode: "invalidate",
+      reconciliationSequence: 1,
+    });
+
+    const restarted = world.daemon();
+    expect(await restarted.invalidateAttentionNotificationAuthority({
+      localNotificationPolicyRevision: 1,
+      signal: new AbortController().signal,
+    })).toEqual({
+      acknowledgedAt: fixedNow,
+      consentLeaseUntil: fixedNow,
+      state: "acknowledged",
+    });
+    expect(world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile")).toHaveLength(1);
+    expect((await world.state.read()).state.pending).toBeNull();
+
+    world.cloud.offline = true;
+    const offlineIdentity: CloudDaemonIdentityPort = {
+      async requireActive() { throw new Error("offline"); },
+    };
+    const offline = bridge({
+      attentionNotificationState: world.state,
+      cloud: world.cloud,
+      device: world.device,
+      identity: offlineIdentity,
+      local: world.local,
+      transport: world.transport,
+    });
+    expect(await offline.observeAttentionNotificationAuthority(
+      new AbortController().signal,
+    )).toEqual({
+      acknowledgedAt: fixedNow,
+      consentLeaseUntil: fixedNow,
+      state: "acknowledged",
+    });
+  });
+
+  test("does not reset old-device custody offline and resumes only after live current-device status", async () => {
+    const state = new MemoryCloudAttentionNotificationReconciliation();
+    const oldDevice = "device_attention_old_12345678";
+    const newDevice = "device_attention_new_12345678";
+    const oldBound = bindCloudAttentionNotificationReconciliationState(
+      emptyCloudAttentionNotificationReconciliationState(),
+      userPublicId,
+      oldDevice,
+    );
+    const oldPending = setCloudAttentionNotificationPending(oldBound, {
+      localNotificationPolicyRevision: 7,
+      mode: "invalidate",
+      reconciliationSequence: 8,
+    });
+    await state.compareAndSwap(null, oldPending);
+    const world = attentionWorld({ device: newDevice, state });
+    world.statusMalformed = true;
+    const daemon = world.daemon();
+
+    const unavailable = await daemon.cycle(new AbortController().signal);
+    expect(unavailable.online).toBe(true);
+    expect(unavailable.errors).toContain(
+      "attention notifications: reconciliation unavailable.",
+    );
+    expect((await state.read()).state).toEqual(oldPending);
+    expect(world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile")).toEqual([]);
+
+    world.statusMalformed = false;
+    world.cloud.now += 15_000;
+    const resumed = await daemon.cycle(new AbortController().signal);
+    expect(resumed.online).toBe(true);
+    expect(world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile").at(-1)?.args.mode).toBe("complete");
+    expect((await state.read()).state).toMatchObject({
+      devicePublicId: newDevice,
+      lastReceipt: { receipt: { state: "complete" } },
+      pending: null,
+      userPublicId,
+    });
+  });
+
+  test("selector change makes offline fallback hide the prior identity receipt", async () => {
+    const raw = new DeploymentCustody();
+    const unbound = await IdentityScopedCloudSecretCustody.open(raw);
+    await unbound.activateIdentity(userPublicId);
+    const identityA = await IdentityScopedCloudSecretCustody.open(raw);
+    const state = new CustodyCloudAttentionNotificationReconciliation(identityA);
+    const request = {
+      allowedWindowEnd: fixedNow + 120_000,
+      candidateCount: 0,
+      expectedGlobalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      mode: "complete" as const,
+      reconciliationSequence: 1,
+    };
+    const pending = setCloudAttentionNotificationPending(
+      bindCloudAttentionNotificationReconciliationState(
+        emptyCloudAttentionNotificationReconciliationState(),
+        userPublicId,
+        "device_attention_selector_12345678",
+      ),
+      request,
+    );
+    await state.compareAndSwap(null, settleCloudAttentionNotificationReconciliation(
+      pending,
+      request,
+      {
+        acknowledgedAt: fixedNow,
+        candidateCount: 0,
+        consentLeaseUntil: fixedNow + 120_000,
+        globalNotificationGeneration: 1,
+        localNotificationPolicyRevision: 1,
+        reconciliationSequence: 1,
+        state: "complete",
+      },
+    ));
+    await identityA.activateIdentity("user_attention_selector_b_12345678");
+    const world = attentionWorld({ device: "device_attention_selector_12345678" });
+    const daemon = bridge({
+      attentionNotificationState: state,
+      cloud: world.cloud,
+      device: world.device,
+      identity: { async requireActive() { throw new Error("identity unavailable"); } },
+      local: world.local,
+      transport: world.transport,
+    });
+
+    const observed = await daemon.observeAttentionNotificationAuthority(
+      new AbortController().signal,
+    );
+    expect(observed).toEqual({ state: "not_observed" });
+    expect(JSON.stringify(observed)).not.toContain(String(fixedNow + 120_000));
+  });
+
+  test("live active authority defeats stale invalidation evidence and bounds failed disable", async () => {
+    const settledState = async () => {
+      const state = new MemoryCloudAttentionNotificationReconciliation();
+      const request = {
+        localNotificationPolicyRevision: 5,
+        mode: "invalidate" as const,
+        reconciliationSequence: 3,
+      };
+      const pending = setCloudAttentionNotificationPending(
+        bindCloudAttentionNotificationReconciliationState(
+          emptyCloudAttentionNotificationReconciliationState(),
+          userPublicId,
+          "device_attention_12345678",
+        ),
+        request,
+      );
+      await state.compareAndSwap(null, settleCloudAttentionNotificationReconciliation(
+        pending,
+        request,
+        {
+          acknowledgedAt: fixedNow,
+          consentLeaseUntil: fixedNow,
+          globalNotificationGeneration: 1,
+          localNotificationPolicyRevision: 5,
+          reconciliationSequence: 3,
+          state: "invalidated",
+        },
+      ));
+      return state;
+    };
+
+    const cycleState = await settledState();
+    const cycleWorld = attentionWorld({ state: cycleState });
+    cycleWorld.local.snapshot = {
+      ...cycleWorld.local.snapshot,
+      notificationEmail: { enabled: false, revision: 1, version: 1 },
+    };
+    cycleWorld.authority = {
+      consentLeaseUntil: fixedNow + 120_000,
+      globalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 5,
+      reconciliationSequence: 4,
+    };
+    await cycleWorld.daemon().cycle(new AbortController().signal);
+    expect(cycleWorld.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile").at(-1)?.args).toMatchObject({
+      mode: "invalidate",
+      reconciliationSequence: 5,
+    });
+
+    const disableState = await settledState();
+    const disableWorld = attentionWorld({ state: disableState });
+    disableWorld.authority = {
+      consentLeaseUntil: fixedNow + 120_000,
+      globalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 5,
+      reconciliationSequence: Number.MAX_SAFE_INTEGER,
+    };
+    expect(await disableWorld.daemon().invalidateAttentionNotificationAuthority({
+      localNotificationPolicyRevision: 5,
+      signal: new AbortController().signal,
+    })).toEqual({
+      expiresNoLaterThan: fixedNow + 120_000,
+      state: "revocation_pending",
+    });
+    expect(disableWorld.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile")).toEqual([]);
+
+    disableWorld.authority = {
+      consentLeaseUntil: fixedNow,
+      globalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 5,
+      reconciliationSequence: Number.MAX_SAFE_INTEGER,
+    };
+    expect(await disableWorld.daemon().invalidateAttentionNotificationAuthority({
+      localNotificationPolicyRevision: 5,
+      signal: new AbortController().signal,
+    })).toEqual({ state: "not_observed" });
+  });
+
+  test("fences a same-user device replacement before returning live hosted authority", async () => {
+    for (const operation of ["disable", "observe"] as const) {
+      const oldDevice = "device_attention_fallback_old_12345678";
+      const newDevice = "device_attention_fallback_new_12345678";
+      const state = new MemoryCloudAttentionNotificationReconciliation();
+      const bound = bindCloudAttentionNotificationReconciliationState(
+        emptyCloudAttentionNotificationReconciliationState(),
+        userPublicId,
+        oldDevice,
+      );
+      expect(await state.compareAndSwap(null, bound)).not.toBeNull();
+      const world = attentionWorld({ device: oldDevice, state });
+      world.authority = {
+        consentLeaseUntil: fixedNow + 120_000,
+        globalNotificationGeneration: 1,
+        localNotificationPolicyRevision: 1,
+        reconciliationSequence: Number.MAX_SAFE_INTEGER,
+      };
+      const mutableIdentity = new MutableIdentity(activeIdentity({
+        devicePublicId: oldDevice,
+        userPublicId,
+      }));
+      let replaced = false;
+      const transport: CloudTransport = {
+        action: (name, args) => world.transport.action(name, args),
+        mutation: async (name, args) => {
+          const result = await world.transport.mutation(name, args);
+          if (name === "attentionNotifications:authorityStatus") {
+            mutableIdentity.current = activeIdentity({
+              authEpoch: 2,
+              credentialGeneration: 2,
+              devicePublicId: newDevice,
+              userPublicId,
+            });
+            replaced = true;
+          }
+          return result;
+        },
+        query: (name, args) => world.transport.query(name, args),
+      };
+      const daemon = bridge({
+        attentionNotificationState: state,
+        cloud: world.cloud,
+        device: oldDevice,
+        identity: mutableIdentity,
+        local: world.local,
+        transport,
+      });
+
+      const result = operation === "disable"
+        ? daemon.invalidateAttentionNotificationAuthority({
+            localNotificationPolicyRevision: 1,
+            signal: new AbortController().signal,
+          })
+        : daemon.observeAttentionNotificationAuthority(new AbortController().signal);
+      await expect(result, operation).rejects.toThrow(
+        "Cloud identity changed during attention reconciliation.",
+      );
+      expect(replaced, operation).toBe(true);
+      expect(world.calls.filter((call) =>
+        call.name === "attentionNotifications:reconcile"), operation).toEqual([]);
+      expect(await state.read(), operation).toEqual({ generation: 0, state: bound });
+    }
+  });
+
+  test("fences same-user device and key rollovers across attention custody reads", async () => {
+    for (const rollover of ["device", "key"] as const) {
+      const device = "device_attention_read_race_12345678";
+      const identity = new MutableIdentity(activeIdentity({ devicePublicId: device }));
+      const innerState = new MemoryCloudAttentionNotificationReconciliation();
+      const bound = bindCloudAttentionNotificationReconciliationState(
+        emptyCloudAttentionNotificationReconciliationState(),
+        userPublicId,
+        device,
+      );
+      expect(await innerState.compareAndSwap(null, bound)).not.toBeNull();
+      let rolled = false;
+      const state: CloudAttentionNotificationReconciliationPort = {
+        async read() {
+          const observed = await innerState.read();
+          if (!rolled) {
+            rolled = true;
+            rollAttentionIdentity(identity, rollover, device);
+          }
+          return observed;
+        },
+        compareAndSwap: (generation, value) =>
+          innerState.compareAndSwap(generation, value),
+      };
+      const world = attentionWorld({ device, state });
+      world.authority = {
+        consentLeaseUntil: fixedNow + 120_000,
+        globalNotificationGeneration: 1,
+        localNotificationPolicyRevision: 1,
+        reconciliationSequence: 1,
+      };
+      const daemon = bridge({
+        attentionNotificationState: state,
+        cloud: world.cloud,
+        device,
+        identity,
+        local: world.local,
+        transport: world.transport,
+      });
+
+      await expect(daemon.invalidateAttentionNotificationAuthority({
+        localNotificationPolicyRevision: 1,
+        signal: new AbortController().signal,
+      }), rollover).rejects.toThrow("Cloud identity changed during attention reconciliation.");
+      expect(world.calls.filter((call) =>
+        call.name === "attentionNotifications:reconcile"), rollover).toEqual([]);
+      expect(await innerState.read(), rollover).toEqual({ generation: 0, state: bound });
+    }
+  });
+
+  test("captures Buffer-backed account key bytes before an in-place rollover", async () => {
+    const device = "device_attention_buffer_key_12345678";
+    const mutableKey = Buffer.from(key);
+    const identity = new MutableIdentity({
+      activeIdentity: {
+        accountKey: mutableKey,
+        devicePublicId: device,
+        keyVersion: 1,
+        userPublicId,
+      },
+      authEpoch: 1,
+      credentialGeneration: 1,
+      devicePublicId: device,
+      status: "active",
+      userPublicId,
+    });
+    const innerState = new MemoryCloudAttentionNotificationReconciliation();
+    const bound = bindCloudAttentionNotificationReconciliationState(
+      emptyCloudAttentionNotificationReconciliationState(),
+      userPublicId,
+      device,
+    );
+    expect(await innerState.compareAndSwap(null, bound)).not.toBeNull();
+    let rolled = false;
+    const state: CloudAttentionNotificationReconciliationPort = {
+      async read() {
+        const observed = await innerState.read();
+        if (!rolled) {
+          const firstByte = mutableKey[0];
+          if (firstByte === undefined) throw new Error("account key fixture is empty");
+          mutableKey[0] = firstByte ^ 0xff;
+          rolled = true;
+        }
+        return observed;
+      },
+      compareAndSwap: (generation, value) =>
+        innerState.compareAndSwap(generation, value),
+    };
+    const world = attentionWorld({ device, state });
+    world.authority = {
+      consentLeaseUntil: fixedNow + 120_000,
+      globalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      reconciliationSequence: 1,
+    };
+    const daemon = bridge({
+      attentionNotificationState: state,
+      cloud: world.cloud,
+      device,
+      identity,
+      local: world.local,
+      transport: world.transport,
+    });
+
+    await expect(daemon.invalidateAttentionNotificationAuthority({
+      localNotificationPolicyRevision: 1,
+      signal: new AbortController().signal,
+    })).rejects.toThrow("Cloud identity changed during attention reconciliation.");
+    expect(rolled).toBe(true);
+    expect(world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile")).toEqual([]);
+    expect(await innerState.read()).toEqual({ generation: 0, state: bound });
+  });
+
+  test("fences same-user device and key rollovers after the pending custody CAS", async () => {
+    for (const rollover of ["device", "key"] as const) {
+      const device = "device_attention_cas_race_12345678";
+      const identity = new MutableIdentity(activeIdentity({ devicePublicId: device }));
+      const innerState = new MemoryCloudAttentionNotificationReconciliation();
+      let rolled = false;
+      const state: CloudAttentionNotificationReconciliationPort = {
+        read: () => innerState.read(),
+        async compareAndSwap(generation, value) {
+          const committed = await innerState.compareAndSwap(generation, value);
+          if (committed !== null && !rolled) {
+            rolled = true;
+            rollAttentionIdentity(identity, rollover, device);
+          }
+          return committed;
+        },
+      };
+      const world = attentionWorld({ device, state });
+      const result = await bridge({
+        attentionNotificationState: state,
+        cloud: world.cloud,
+        device,
+        identity,
+        local: world.local,
+        transport: world.transport,
+      }).cycle(new AbortController().signal);
+
+      expect(rolled, rollover).toBe(true);
+      expect(result.errors, rollover).toContain(
+        "attention notifications: reconciliation unavailable.",
+      );
+      expect(world.calls.filter((call) =>
+        call.name === "attentionNotifications:reconcile"), rollover).toEqual([]);
+      expect((await innerState.read()).state, rollover).toMatchObject({
+        lastReceipt: null,
+        pending: { candidateCount: 0, mode: "complete" },
+      });
+    }
+  });
+
+  test("retains pending ambiguity when identity rolls during the hosted effect", async () => {
+    const cases = [
+      { mode: "complete", rollover: "device" },
+      { mode: "complete", rollover: "key" },
+      { mode: "invalidate", rollover: "device" },
+      { mode: "invalidate", rollover: "key" },
+    ] as const;
+    for (const fixture of cases) {
+      const device = "device_attention_effect_race_12345678";
+      const identity = new MutableIdentity(activeIdentity({ devicePublicId: device }));
+      const state = new MemoryCloudAttentionNotificationReconciliation();
+      const bound = bindCloudAttentionNotificationReconciliationState(
+        emptyCloudAttentionNotificationReconciliationState(),
+        userPublicId,
+        device,
+      );
+      expect(await state.compareAndSwap(null, bound)).not.toBeNull();
+      const world = attentionWorld({ device, state });
+      if (fixture.mode === "invalidate") {
+        world.authority = {
+          consentLeaseUntil: fixedNow + 120_000,
+          globalNotificationGeneration: 1,
+          localNotificationPolicyRevision: 1,
+          reconciliationSequence: 1,
+        };
+      }
+      let rolled = false;
+      const transport: CloudTransport = {
+        action: (name, args) => world.transport.action(name, args),
+        mutation: async (name, args) => {
+          const result = await world.transport.mutation(name, args);
+          if (name === "attentionNotifications:reconcile" && !rolled) {
+            rolled = true;
+            rollAttentionIdentity(identity, fixture.rollover, device);
+          }
+          return result;
+        },
+        query: (name, args) => world.transport.query(name, args),
+      };
+      const daemon = bridge({
+        attentionNotificationState: state,
+        cloud: world.cloud,
+        device,
+        identity,
+        local: world.local,
+        transport,
+      });
+
+      if (fixture.mode === "invalidate") {
+        await expect(daemon.invalidateAttentionNotificationAuthority({
+          localNotificationPolicyRevision: 1,
+          signal: new AbortController().signal,
+        }), JSON.stringify(fixture)).rejects.toThrow(
+          "Cloud identity changed during attention reconciliation.",
+        );
+      } else {
+        const result = await daemon.cycle(new AbortController().signal);
+        expect(result.errors, JSON.stringify(fixture)).toContain(
+          "attention notifications: reconciliation unavailable.",
+        );
+      }
+      expect(rolled, JSON.stringify(fixture)).toBe(true);
+      const reconciles = world.calls.filter((call) =>
+        call.name === "attentionNotifications:reconcile");
+      expect(reconciles.map((call) => call.args.mode), JSON.stringify(fixture))
+        .toEqual([fixture.mode]);
+      expect((await state.read()).state, JSON.stringify(fixture)).toMatchObject({
+        lastReceipt: null,
+        pending: fixture.mode === "complete"
+          ? { candidateCount: 0, mode: "complete" }
+          : { mode: "invalidate" },
+      });
+      expect(world.authority, JSON.stringify(fixture)).not.toBeNull();
+    }
+  });
+
+  test("fails closed against foreign complete evidence at the reserved final sequence", async () => {
+    const complete = {
+      allowedWindowEnd: fixedNow + 120_000,
+      candidateCount: 0,
+      expectedGlobalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      mode: "complete" as const,
+      reconciliationSequence: Number.MAX_SAFE_INTEGER,
+    };
+    const settledReceipt = {
+      acknowledgedAt: fixedNow,
+      candidateCount: 0,
+      consentLeaseUntil: fixedNow + 120_000,
+      globalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      reconciliationSequence: Number.MAX_SAFE_INTEGER,
+      state: "complete" as const,
+    };
+    const bound = bindCloudAttentionNotificationReconciliationState(
+      emptyCloudAttentionNotificationReconciliationState(),
+      userPublicId,
+      "device_attention_12345678",
+    );
+    const foreignStates = [
+      { kind: "pending", state: { ...bound, pending: complete } },
+      {
+        kind: "settled",
+        state: { ...bound, lastReceipt: { receipt: settledReceipt, request: complete } },
+      },
+    ] as const;
+
+    for (const foreign of foreignStates) {
+      const custody = new DeploymentCustody();
+      custody.values.set("cloud-attention-notification-reconciliation", {
+        generation: 0,
+        value: JSON.stringify(foreign.state),
+      });
+      const state = new CustodyCloudAttentionNotificationReconciliation(custody);
+      await expect(state.read(), foreign.kind).rejects.toThrow("is corrupt");
+      const world = attentionWorld({ state });
+      world.authority = {
+        consentLeaseUntil: fixedNow + 120_000,
+        globalNotificationGeneration: 1,
+        localNotificationPolicyRevision: 1,
+        reconciliationSequence: 7,
+      };
+      const daemon = world.daemon();
+
+      expect(await daemon.invalidateAttentionNotificationAuthority({
+        localNotificationPolicyRevision: 1,
+        signal: new AbortController().signal,
+      }), foreign.kind).toEqual({
+        expiresNoLaterThan: fixedNow + 120_000,
+        state: "revocation_pending",
+      });
+      expect(world.calls.filter((call) =>
+        call.name === "attentionNotifications:reconcile"), foreign.kind).toEqual([]);
+
+      world.authority = {
+        consentLeaseUntil: fixedNow,
+        globalNotificationGeneration: 1,
+        localNotificationPolicyRevision: 1,
+        reconciliationSequence: 7,
+      };
+      expect(await daemon.invalidateAttentionNotificationAuthority({
+        localNotificationPolicyRevision: 1,
+        signal: new AbortController().signal,
+      }), foreign.kind).toEqual({ state: "not_observed" });
+      expect(world.calls.filter((call) =>
+        call.name === "attentionNotifications:reconcile"), foreign.kind).toEqual([]);
+    }
+  });
+
+  test("reserves the final sequence only for invalidation and never wraps", async () => {
+    const state = new MemoryCloudAttentionNotificationReconciliation();
+    const bound = bindCloudAttentionNotificationReconciliationState(
+      emptyCloudAttentionNotificationReconciliationState(),
+      userPublicId,
+      "device_attention_12345678",
+    );
+    const request = {
+      allowedWindowEnd: fixedNow + 120_000,
+      candidateCount: 0,
+      expectedGlobalNotificationGeneration: 1,
+      localNotificationPolicyRevision: 1,
+      mode: "complete" as const,
+      reconciliationSequence: Number.MAX_SAFE_INTEGER - 1,
+    };
+    const pending = setCloudAttentionNotificationPending(bound, request);
+    await state.compareAndSwap(null, settleCloudAttentionNotificationReconciliation(
+      pending,
+      request,
+      {
+        acknowledgedAt: fixedNow,
+        candidateCount: 0,
+        consentLeaseUntil: fixedNow + 120_000,
+        globalNotificationGeneration: 1,
+        localNotificationPolicyRevision: 1,
+        reconciliationSequence: Number.MAX_SAFE_INTEGER - 1,
+        state: "complete",
+      },
+    ));
+    const world = attentionWorld({ state });
+    await world.daemon().cycle(new AbortController().signal);
+    const reconciles = world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile");
+    expect(reconciles).toHaveLength(1);
+    expect(reconciles[0]?.args).toMatchObject({
+      mode: "invalidate",
+      reconciliationSequence: Number.MAX_SAFE_INTEGER,
+    });
+
+    world.cloud.now += 60_000;
+    world.local.snapshot = {
+      ...world.local.snapshot,
+      candidates: [{ ...attentionCandidates[0]!, interactionRevision: 9 }],
+    };
+    await world.daemon().cycle(new AbortController().signal);
+    expect(world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile")).toHaveLength(1);
+  });
+
+  test("serializes an in-flight complete before direct disable and lets the higher invalidation win", async () => {
+    const world = attentionWorld({ candidates: attentionCandidates });
+    let release!: () => void;
+    world.completeGate = new Promise<void>((resolve) => { release = resolve; });
+    const daemon = world.daemon();
+    const cycle = daemon.cycle(new AbortController().signal);
+    while (!world.calls.some((call) =>
+      call.name === "attentionNotifications:reconcile" && call.args.mode === "complete")) {
+      await Bun.sleep(1);
+    }
+    let disabled = false;
+    const disable = daemon.invalidateAttentionNotificationAuthority({
+      localNotificationPolicyRevision: 1,
+      signal: new AbortController().signal,
+    }).then((result) => {
+      disabled = true;
+      return result;
+    });
+    await Bun.sleep(1);
+    expect(disabled).toBe(false);
+    expect(world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile")).toHaveLength(1);
+    release();
+    await cycle;
+    expect(await disable).toMatchObject({ state: "acknowledged" });
+    expect(world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile").map((call) => [
+        call.args.mode,
+        call.args.reconciliationSequence,
+      ])).toEqual([["complete", 1], ["invalidate", 2]]);
+    expect(world.authority).toMatchObject({
+      consentLeaseUntil: fixedNow,
+      reconciliationSequence: 2,
+    });
+  });
+
+  test("propagates an attention custody fence loss before optional projection work", async () => {
+    const innerState = new MemoryCloudAttentionNotificationReconciliation();
+    let stale = false;
+    const state: CloudAttentionNotificationReconciliationPort = {
+      async read() {
+        const value = await innerState.read();
+        stale = true;
+        return value;
+      },
+      compareAndSwap: (generation, value) => innerState.compareAndSwap(generation, value),
+    };
+    const world = attentionWorld({ state });
+    let listSessions = 0;
+    world.local.listSessions = async () => {
+      listSessions += 1;
+      return doneLocalSessionPage([]);
+    };
+    const daemon = bridge({
+      attentionNotificationState: state,
+      cloud: world.cloud,
+      daemonAuthorityFence: {
+        assertCurrent: () => stale
+          ? Promise.reject(new Error("daemon fence changed"))
+          : Promise.resolve(),
+      },
+      device: world.device,
+      local: world.local,
+      transport: world.transport,
+    });
+    const result = await daemon.cycle(new AbortController().signal);
+    expect(result.online).toBe(false);
+    expect(listSessions).toBe(0);
+    expect(result.errors).toContain("daemon fence changed");
+  });
+
+  test("maps strict hosted status without exposing its reconciliation sequence", async () => {
+    const world = attentionWorld();
+    world.fault = "latched";
+    const result = await world.daemon().observeAttentionNotificationAuthority(
+      new AbortController().signal,
+    );
+    expect(result).toEqual({
+      deviceAuthority: null,
+      globalNotificationGeneration: 1,
+      globalState: "safety_latched",
+      observedAt: fixedNow,
+      state: "observed",
+    });
+    expect(JSON.stringify(result)).not.toContain("reconciliationSequence");
+  });
+
+  test("throttles unchanged snapshots, reconciles changes immediately, and renews at sixty seconds", async () => {
+    const world = attentionWorld({ candidates: attentionCandidates });
+    const daemon = world.daemon();
+    const signal = new AbortController().signal;
+    await daemon.cycle(signal);
+    const count = () => world.calls.filter((call) =>
+      call.name === "attentionNotifications:reconcile").length;
+    expect(count()).toBe(1);
+    world.cloud.now += 14_999;
+    await daemon.cycle(signal);
+    expect(count()).toBe(1);
+    world.local.snapshot = {
+      ...world.local.snapshot,
+      candidates: [{ ...attentionCandidates[0]!, interactionRevision: 3 }],
+    };
+    await daemon.cycle(signal);
+    expect(count()).toBe(2);
+    world.cloud.now += 59_999;
+    await daemon.cycle(signal);
+    expect(count()).toBe(2);
+    world.cloud.now += 1;
+    await daemon.cycle(signal);
+    expect(count()).toBe(3);
   });
 });
