@@ -4642,7 +4642,7 @@ async function deviceCommandFixture() {
           login: {
             loginId: "login_incomplete",
             status: "pending",
-            verificationUrl: "https://auth.example.test/device",
+            verificationUrl: "https://auth.openai.com/codex/device",
           },
         });
       }
@@ -4815,7 +4815,7 @@ describe("device command execution", () => {
             loginId: "login_1",
             status: "pending",
             userCode: "ABCD-EFGH",
-            verificationUrl: "https://auth.example.test/device",
+            verificationUrl: "https://auth.openai.com/codex/device",
           },
         });
       },
@@ -4840,7 +4840,7 @@ describe("device command execution", () => {
         expiresAt: 1_760_000_000_000 + 5 * 60 * 1_000,
         handoffVersion: 2,
         kind: "account_login_start",
-        loginUrl: "https://auth.example.test/device",
+        loginUrl: "https://auth.openai.com/codex/device",
         userCode: "ABCD-EFGH",
       });
       expect(executed[0]).toMatchObject({
@@ -4854,7 +4854,7 @@ describe("device command execution", () => {
     }
   });
 
-  test("keeps the legacy URL-only browser handoff for an unversioned requester", async () => {
+  test("refuses a legacy URL-only requester before starting a browser login", async () => {
     const world = await deviceCommandFixture();
     try {
       world.value.store.setAccountLinkingAllowed(true);
@@ -4864,21 +4864,8 @@ describe("device command execution", () => {
         requestingDevicePublicId: "device_browser1",
         signal: new AbortController().signal,
       });
-      expect(outcome).toEqual({
-        code: "APPLIED",
-        result: {
-          expiresAt: 1_760_000_000_000 + 5 * 60 * 1_000,
-          kind: "account_login_start",
-          loginUrl: "https://auth.example.test/device",
-        },
-        singleUseResult: true,
-        state: "applied",
-      });
-      expect(world.executed[0]).toMatchObject({
-        account: world.loginAccount.id,
-        deviceCode: false,
-        kind: "account.login",
-      });
+      expect(outcome).toEqual({ code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" });
+      expect(world.executed).toEqual([]);
     } finally {
       world.adapter.close();
       world.value.store.close();

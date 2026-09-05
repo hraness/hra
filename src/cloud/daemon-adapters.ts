@@ -3766,31 +3766,20 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     idempotencyKey: string,
     signal: AbortSignal,
   ): Promise<CloudDeviceCommandExecutionResult> {
-    const currentHandoff = payload.handoffVersion === 2;
+    // A legacy requester cannot carry Codex's device code. Refuse it before
+    // starting the distinct browser flow, whose localhost callback cannot be
+    // completed safely from another device.
+    if (payload.handoffVersion !== 2) {
+      return { code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" };
+    }
     const response = await this.#executeLocal({
       account: payload.accountPublicId,
       // A browser on another device cannot complete Codex's loopback browser
       // login. The web lane is therefore always the managed device-code flow.
-      deviceCode: currentHandoff,
+      deviceCode: true,
       idempotencyKey: deriveDeviceEffectKey(idempotencyKey, "account-login"),
       kind: "account.login",
     }, { signal });
-    if (!currentHandoff) {
-      const loginUrl = relayedLoginUrlFrom(response);
-      if (loginUrl === null) {
-        return { code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" };
-      }
-      return {
-        code: "APPLIED",
-        result: {
-          expiresAt: this.#registryNow() + deviceCommandLoginResultLifetimeMs,
-          kind: "account_login_start",
-          loginUrl,
-        },
-        singleUseResult: true,
-        state: "applied",
-      };
-    }
     const handoff = relayedLoginHandoffFrom(response);
     // Both values are required to complete Codex device authorization. Refuse
     // an incomplete or unsafe handoff rather than spending the single-use read
@@ -3871,15 +3860,6 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       state: "applied",
     };
   }
-}
-
-/** Legacy URL-only relay used only for an unversioned pre-update requester. */
-function relayedLoginUrlFrom(value: unknown): string | null {
-  if (!isRecord(value) || !isRecord(value.login)) return null;
-  const loginUrl: unknown = value.login.verificationUrl;
-  return value.login.status === "pending" && isRelayedLoginUrl(loginUrl)
-    ? loginUrl
-    : null;
 }
 
 /**

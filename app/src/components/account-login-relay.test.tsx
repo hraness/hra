@@ -8,13 +8,13 @@ describe("account login relay", () => {
     const markup = renderToStaticMarkup(
       <AccountLoginRelay
         expiresAt={2}
-        loginUrl="https://auth.example.test/device"
+        loginUrl="https://auth.openai.com/codex/device"
         now={1}
         userCode="ABCD-EFGH"
       />,
     );
     const codeAt = markup.indexOf("ABCD-EFGH");
-    const linkAt = markup.indexOf("https://auth.example.test/device");
+    const linkAt = markup.indexOf("https://auth.openai.com/codex/device");
     expect(codeAt).toBeGreaterThan(-1);
     expect(linkAt).toBeGreaterThan(codeAt);
     expect(markup).not.toContain("Copy code");
@@ -31,7 +31,7 @@ describe("account login relay", () => {
     expect(renderToStaticMarkup(
       <AccountLoginRelay
         expiresAt={2}
-        loginUrl="https://auth.example.test/device"
+        loginUrl="https://auth.openai.com/codex/device"
         now={2}
         userCode="ABCD-EFGH"
       />,
