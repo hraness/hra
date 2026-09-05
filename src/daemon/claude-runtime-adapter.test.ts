@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import type { ClaudeProcess, PinnedClaudeRuntime } from "../claude/index";
-import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
+import {
+  CLAUDE_PIN,
+  CLAUDE_PIN_EFFORT,
+  CLAUDE_PIN_MODEL,
+  CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+} from "../claude/pin";
 import { PresetProviderMismatchError } from "../domain/presets";
 import { effectiveClaudeRuntimeProfileSchema } from "../domain/runtime-profile";
 import {
@@ -69,6 +74,7 @@ const runtime: PinnedClaudeRuntime = {
   effort: CLAUDE_PIN_EFFORT,
   executablePath: "/usr/local/bin/claude",
   model: CLAUDE_PIN_MODEL,
+  nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
   version: CLAUDE_PIN,
 };
 
@@ -151,6 +157,7 @@ describe("pinned Claude runtime manager", () => {
       inputFormat: "stream-json",
       isolatedConfigDir: true,
       model: CLAUDE_PIN_MODEL,
+      nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
       observedAt: 1_700_000_000_000,
       outputFormat: "stream-json",
       permissionMode: "default",

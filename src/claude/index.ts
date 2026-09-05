@@ -9,10 +9,14 @@ export { ClaudeJsonLineDecoder } from "./jsonl.ts";
 export {
   CLAUDE_PIN,
   CLAUDE_PIN_EFFORT,
+  CLAUDE_PIN_FALLBACK_MODEL,
   CLAUDE_PIN_MODEL,
+  CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+  CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
   CLAUDE_PIN_REFUSED_EFFORTS,
   CLAUDE_PIN_SUPPORTED_EFFORTS,
   PINNED_CLAUDE_MATRIX_DIGESTS,
+  type ClaudeNativeFallbackCapability,
   type ClaudePinVersion,
 } from "./pin.ts";
 export {
@@ -48,6 +52,7 @@ export {
   type ClaudeUsage,
 } from "./protocol.ts";
 export {
+  buildPinnedClaudeRuntimeArgv,
   locateClaudeExecutable,
   resolvePinnedClaudeRuntime,
   spawnClaudeVersionProbe,

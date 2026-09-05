@@ -86,6 +86,18 @@ export const effectiveClaudeRuntimeProfileSchema = z.object({
   isolatedConfigDir: z.literal(true),
   outputFormat: z.literal("stream-json"),
   inputFormat: z.literal("stream-json"),
+  nativeFallback: z.discriminatedUnion("status", [
+    z.object({
+      evidenceDigest: z.string().regex(/^[0-9a-f]{64}$/u),
+      model: z.literal("claude-opus-5"),
+      status: z.literal("armed"),
+    }).strict(),
+    z.object({
+      model: z.literal("claude-opus-5"),
+      reason: z.literal("live_acceptance_required"),
+      status: z.literal("unavailable"),
+    }).strict(),
+  ]).optional(),
 }).strict().superRefine((value, context) => {
   if (value.model !== presetRequirements[value.preset].model) {
     context.addIssue({ code: "custom", message: "The effective model must match the exact HRA preset." });

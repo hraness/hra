@@ -14,4 +14,6 @@
 - Parse every foreign value from `unknown` with explicit bounds. An unrecognised event becomes a bounded protocol notice, never a silent accept and never a thrown fault on a live session.
 - Answer a `can_use_tool` request only by echoing its own `input`. Never send `permission_suggestions`, so HRA can grant nothing beyond `once`.
 - Never read, copy, or forward a Claude credential. The isolated `CLAUDE_CONFIG_DIR` is the whole authentication boundary.
+- Keep the pinned Fable-to-Opus native fallback unavailable until one sanitized authenticated acceptance record proves the exact pinned version, both model ids, max effort, and combined argv. Help output, binary strings, a global Claude login, and unauthenticated output are not acceptance evidence.
+- Never rotate a Claude account automatically or restart, resume, or replay a turn to simulate model fallback. Only an admitted pinned runtime may add the provider-native fallback argument before process start.
 - Sanitize every provider string that can reach a display, projection, or log: absolute paths reduced, credential-shaped runs replaced, unsafe terminal scalars folded.

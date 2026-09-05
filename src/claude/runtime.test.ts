@@ -4,9 +4,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ClaudeError } from "./errors";
-import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./pin";
+import {
+  CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
+  CLAUDE_PIN,
+  CLAUDE_PIN_EFFORT,
+  CLAUDE_PIN_FALLBACK_MODEL,
+  CLAUDE_PIN_MODEL,
+  CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+  type ClaudeNativeFallbackCapability,
+} from "./pin";
 import { presetRequirements } from "../domain/presets";
-import { locateClaudeExecutable, resolvePinnedClaudeRuntime } from "./runtime";
+import {
+  buildPinnedClaudeRuntimeArgv,
+  locateClaudeExecutable,
+  resolvePinnedClaudeRuntime,
+} from "./runtime";
 
 const roots: string[] = [];
 
@@ -38,6 +50,11 @@ describe("pinned Claude runtime", () => {
     expect(runtime.version).toBe(CLAUDE_PIN);
     expect(runtime.model).toBe(CLAUDE_PIN_MODEL);
     expect(runtime.effort).toBe(CLAUDE_PIN_EFFORT);
+    expect(runtime.nativeFallback).toEqual({
+      model: CLAUDE_PIN_FALLBACK_MODEL,
+      reason: CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
+      status: "unavailable",
+    });
     expect([...runtime.argv].slice(1)).toEqual([
       "--print",
       "--output-format",
@@ -56,6 +73,94 @@ describe("pinned Claude runtime", () => {
     // "max without ultracode".
     expect(runtime.argv).not.toContain("ultracode");
     expect(runtime.argv).not.toContain("--dangerously-skip-permissions");
+  });
+
+  test("builds exact disabled and admitted native-fallback argv without starting Claude", () => {
+    const executablePath = "/opt/hra/bin/claude";
+    expect(buildPinnedClaudeRuntimeArgv({
+      executablePath,
+      nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+    })).toEqual([
+      executablePath,
+      "--print",
+      "--output-format",
+      "stream-json",
+      "--input-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--permission-mode",
+      "default",
+      "--model",
+      CLAUDE_PIN_MODEL,
+      "--effort",
+      CLAUDE_PIN_EFFORT,
+    ]);
+
+    expect(buildPinnedClaudeRuntimeArgv({
+      executablePath,
+      nativeFallback: {
+        evidenceDigest: "a".repeat(64),
+        model: CLAUDE_PIN_FALLBACK_MODEL,
+        status: "armed",
+      },
+    })).toEqual([
+      executablePath,
+      "--print",
+      "--output-format",
+      "stream-json",
+      "--input-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--permission-mode",
+      "default",
+      "--model",
+      CLAUDE_PIN_MODEL,
+      "--fallback-model",
+      CLAUDE_PIN_FALLBACK_MODEL,
+      "--effort",
+      CLAUDE_PIN_EFFORT,
+    ]);
+  });
+
+  test("refuses to arm native fallback without a sanitized evidence digest", () => {
+    expect(() => buildPinnedClaudeRuntimeArgv({
+      executablePath: "/opt/hra/bin/claude",
+      nativeFallback: {
+        evidenceDigest: "not-a-digest",
+        model: CLAUDE_PIN_FALLBACK_MODEL,
+        status: "armed",
+      },
+    })).toThrow("sanitized acceptance evidence digest");
+  });
+
+  test("refuses any fallback model or unavailable reason outside the reviewed pin", () => {
+    expect(() => buildPinnedClaudeRuntimeArgv({
+      executablePath: "/opt/hra/bin/claude",
+      nativeFallback: {
+        evidenceDigest: "a".repeat(64),
+        model: "claude-sonnet-5",
+        status: "armed",
+      } as unknown as ClaudeNativeFallbackCapability,
+    })).toThrow("exact pinned fallback model");
+    expect(() => buildPinnedClaudeRuntimeArgv({
+      executablePath: "/opt/hra/bin/claude",
+      nativeFallback: {
+        extra: true,
+        model: CLAUDE_PIN_FALLBACK_MODEL,
+        reason: CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
+        status: "unavailable",
+      } as unknown as ClaudeNativeFallbackCapability,
+    })).toThrow("reviewed reason");
+    expect(() => buildPinnedClaudeRuntimeArgv({
+      executablePath: "/opt/hra/bin/claude",
+      nativeFallback: {
+        model: CLAUDE_PIN_FALLBACK_MODEL,
+        reason: "operator_override",
+        status: "unavailable",
+      } as unknown as ClaudeNativeFallbackCapability,
+    })).toThrow("reviewed reason");
   });
 
   test("refuses an unpinned build instead of parsing it hopefully", async () => {

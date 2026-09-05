@@ -23,7 +23,7 @@
 - Record every mutation before dispatch, bind it to an idempotency key and exact authority generation, and reconcile an uncertain result without speculative replay.
 - Keep provider credentials, raw reasoning, environment values, arbitrary tool output, approval secrets, and unbounded paths out of cloud sync, logs, JSON output, and receipts.
 - Treat one machine as the fenced execution custodian for a session. Other devices may read or submit durable commands; they may not create a second provider writer.
-- Account selection is user-directed. Never rotate subscriptions to bypass a provider limit or replay a failed turn under another account automatically.
+- Explicit account selection and work-task routing are user-directed. Automatic account movement is limited to managed Codex sessions after reset handling, under fresh exact source and target authority and durable crash-safe evidence. Never move an explicit session, rotate a Claude account, act from stale or unknown state, or replay a failed or ambiguous turn under another account.
 - Keep `--json` stable and machine-readable. Write data to stdout and diagnostics to stderr. Use closed exit codes and bound every input, output, timeout, page, queue, and retry.
 - Colocate deterministic examples with each failure mode and property tests with parsers, reducers, ordering, state transitions, and round trips.
 - Give each owned source boundary an `AGENTS.md` with exactly `# Contents` and `# Guidelines`.

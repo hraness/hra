@@ -1189,6 +1189,11 @@ describe("StateStore", () => {
       inputFormat: "stream-json" as const,
       isolatedConfigDir: true as const,
       model: "claude-fable-5-1",
+      nativeFallback: {
+        model: "claude-opus-5",
+        reason: "live_acceptance_required" as const,
+        status: "unavailable" as const,
+      },
       observedAt: 2_100,
       outputFormat: "stream-json" as const,
       permissionMode: "default" as const,

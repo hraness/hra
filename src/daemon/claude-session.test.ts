@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ClaudeProcess, PinnedClaudeRuntime } from "../claude/index";
-import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
+import {
+  CLAUDE_PIN,
+  CLAUDE_PIN_EFFORT,
+  CLAUDE_PIN_MODEL,
+  CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+} from "../claude/pin";
 import { LiveBatcher } from "../cloud/live-uploader";
 import type { SessionEvent } from "../domain/session-events";
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
@@ -127,6 +132,7 @@ const pinnedRuntime: PinnedClaudeRuntime = {
   effort: CLAUDE_PIN_EFFORT,
   executablePath: "/opt/hra/bin/claude",
   model: CLAUDE_PIN_MODEL,
+  nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
   version: CLAUDE_PIN,
 };
 
@@ -356,6 +362,7 @@ describe("Claude sessions on the local authority", () => {
       inputFormat: "stream-json",
       isolatedConfigDir: true,
       model: CLAUDE_PIN_MODEL,
+      nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
       outputFormat: "stream-json",
       permissionMode: "default",
       preset: "fable-max",

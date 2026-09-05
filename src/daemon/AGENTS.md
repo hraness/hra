@@ -14,5 +14,6 @@
 - Validate owner, mode, type, link count, containment, and canonical path before using an endpoint.
 - Use absolute wall-clock deadlines, close admission before shutdown, abort in-flight reads, and join every owned task before storage closes.
 - Serialize mutations by their authority key. Allow bounded independent reads that cannot observe torn state.
+- Keep explicit sessions and work routes pinned. A managed Codex session may follow a durable automatic account decision only after exact reset handling, fresh source and target rereads, complete switch recovery, and revision revalidation. Never rotate Claude accounts or derive a replay from provider failure, classifier text, stale observations, or ambiguous effects.
 - Never trust a responder's text. Autorespond sends one fixed approval sentence, or a literal proven byte-exact inside the assistant's own message, and every attempt leaves an evidence row with no message text, literal, or credential in it.
 - Reconcile facts-memory creation, accepted-head ancestry, historical exact-head fork, and whole-directory cleanup by immutable owner/session/epoch binding. Fence parent cleanup behind unresolved child forks, admit live TTL from current host time, and clean every terminal commit immediately plus restart-safe isolated scans. Do not expose semantic-store selection or purge through commands or tools.

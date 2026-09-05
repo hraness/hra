@@ -105,6 +105,7 @@ describe("Claude stream-json fixtures", () => {
     expect(result.isError).toBe(false);
     expect(result.stopReason).toBe("end_turn");
     expect(result.terminalReason).toBe("completed");
+    expect(result.model).toBeNull();
     expect(result.usage.inputTokens).toBe(2);
     expect(result.usage.outputTokens).toBe(4);
     expect(result.usage.cachedInputTokens).toBe(11_059 + 10_123);
@@ -116,6 +117,7 @@ describe("Claude stream-json fixtures", () => {
     expect(authenticated.isError).toBe(false);
     expect(authenticated.terminalReason).toBe("completed");
     expect(authenticated.resultText).toBe("ok");
+    expect(authenticated.model).toBeNull();
 
     const [unauthenticated] = await parseFixture("output-json-unauthenticated");
     if (unauthenticated?.type !== "result") throw new Error("expected result");

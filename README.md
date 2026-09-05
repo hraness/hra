@@ -103,6 +103,8 @@ If the first pending-login handoff is lost or the daemon restarts before complet
 
 HRA automatically spends one available earned Codex rate-limit reset when a fresh read shows the exact seven-day Codex window at 99 percent used or higher. It records a private idempotency key before dispatch, retries only that key after an uncertain response, and rereads limits after every closed outcome. A successful redemption is latched to that weekly window, so a stale usage snapshot cannot spend another credit. Rate-limit notifications wake a coalesced authoritative read; the staggered 50-to-70-second poll remains the fallback. `hra account usage` reports the most recent local reset attempt with its source weekly-window boundary and suppresses a prior identity's snapshot after an account change. Credit IDs, descriptions, private keys, and account fingerprints never enter that reset status or its cloud projection.
 
+Automatic account movement is not exposed yet. The adopted provider-usage boundary permits only a managed Codex session to follow a durable account decision after reset handling and fresh exact source and target reads. Explicit sessions and work tasks stay pinned to the account you selected. Claude accounts never rotate automatically, and HRA never replays a failed or ambiguous turn under another account.
+
 HRA cloud identity is separate from every Codex account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured.
 
 ## First session
@@ -324,7 +326,7 @@ Pinned Codex 0.153.2 has no safely separated install, enablement, and OAuth life
 
 A switch requires a signed-in target with a verified provider email, takes one machine-global lock, rejects multiple exact app processes, and refuses an unsettled earlier switch. It journals the target generation, gracefully quits the exact process, waits for exit, relaunches once with the target's isolated Codex and desktop-data roots, and binds read-only account verification to that launched PID, executable, CDHash, and environment.
 
-HRA never copies `auth.json`, swaps one token, changes Keychain blindly, rotates accounts to evade a provider limit, or retries an uncertain switch. An uncertain quit, transition, or relaunch becomes `recovery_required` and preserves both profiles. Run `hra account switch-recover` to reconcile only the current attempt. Recovery performs bounded read-only bundle, process, environment, and account observations; it never quits or launches the app. It releases the switch authority only when those observations prove the target account is active or prove that no target instance remains.
+The experimental desktop switch never copies `auth.json`, swaps one token, changes Keychain blindly, responds to a provider limit, or retries an uncertain switch. An uncertain quit, transition, or relaunch becomes `recovery_required` and preserves both profiles. Run `hra account switch-recover` to reconcile only the current attempt. Recovery performs bounded read-only bundle, process, environment, and account observations; it never quits or launches the app. It releases the switch authority only when those observations prove the target account is active or prove that no target instance remains.
 
 ## Sessions across machines
 
@@ -493,7 +495,7 @@ The beta does not expose destructive local profile or project deletion. `account
 
 Codex app-server remains authoritative for provider login, transcripts, turns, tools, approvals, models, plugins, and usage. HRA owns isolated profiles, durable commands, process generations, local projections, optional encrypted sync, and recovery records. The frozen work contract assigns local coordination records to HRA rather than Codex app-server.
 
-Cloud service availability is not required for local login, local execution, local work coordination, local recovery, or reading local sessions. Multiple Codex accounts remain independent subscriptions. HRA does not pool quota or replay a limited turn under another account. SQLite remains the local work execution authority; Turso is deferred and non-authoritative.
+Cloud service availability is not required for local login, local execution, local work coordination, local recovery, or reading local sessions. Multiple Codex accounts remain independent subscriptions. HRA does not pool quota or replay a limited turn under another account. The separately adopted provider-usage contract permits bounded managed Codex movement only under fresh local authority; explicit sessions, work tasks, Claude accounts, and cross-machine execution remain outside that boundary. SQLite remains the local work execution authority; Turso is deferred and non-authoritative.
 
 ## Project
 

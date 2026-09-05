@@ -11,7 +11,10 @@ import {
   presetsForProvider,
   providerSchema,
 } from "./presets";
-import { effectiveRuntimeProfileSchema } from "./runtime-profile";
+import {
+  effectiveClaudeRuntimeProfileSchema,
+  effectiveRuntimeProfileSchema,
+} from "./runtime-profile";
 
 describe("model presets and providers", () => {
   test("names exactly the four presets and two providers", () => {
@@ -67,5 +70,49 @@ describe("model presets and providers", () => {
       preset: "fable-max",
       reasoningEffort: "max",
     }).success).toBe(false);
+  });
+
+  test("keeps the reviewed native fallback state inside new Claude runtime profiles", () => {
+    const profile = {
+      claudeVersion: "2.1.260",
+      inputFormat: "stream-json",
+      isolatedConfigDir: true,
+      model: "claude-fable-5-1",
+      nativeFallback: {
+        model: "claude-opus-5",
+        reason: "live_acceptance_required",
+        status: "unavailable",
+      },
+      observedAt: 1_700_000_000_000,
+      outputFormat: "stream-json",
+      permissionMode: "default",
+      preset: "fable-max",
+      processGeneration: 1,
+      profileId: "acct_00000000000000000000000000000000",
+      reasoningEffort: "max",
+    };
+    expect(effectiveClaudeRuntimeProfileSchema.safeParse(profile).success).toBe(true);
+    expect(effectiveClaudeRuntimeProfileSchema.safeParse({
+      ...profile,
+      nativeFallback: {
+        evidenceDigest: "not-a-digest",
+        model: "claude-opus-5",
+        status: "armed",
+      },
+    }).success).toBe(false);
+    expect(effectiveClaudeRuntimeProfileSchema.safeParse({
+      ...profile,
+      nativeFallback: {
+        evidenceDigest: "a".repeat(64),
+        model: "claude-sonnet-5",
+        status: "armed",
+      },
+    }).success).toBe(false);
+    // Profiles recorded before the capability field was added remain readable
+    // and keep their exact JSON and digest authority.
+    expect(effectiveClaudeRuntimeProfileSchema.safeParse({
+      ...profile,
+      nativeFallback: undefined,
+    }).success).toBe(true);
   });
 });

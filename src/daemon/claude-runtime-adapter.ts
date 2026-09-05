@@ -613,6 +613,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       inputFormat: "stream-json",
       isolatedConfigDir: true,
       model: runtime.model,
+      nativeFallback: runtime.nativeFallback,
       observedAt: this.#now(),
       outputFormat: "stream-json",
       permissionMode: "default",

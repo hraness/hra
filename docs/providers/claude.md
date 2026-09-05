@@ -4,7 +4,7 @@ Status: the notes below are the W1 spike that the W3-C adapter was built from. T
 
 ## Shape
 
-A Claude profile is one isolated home exported as `CLAUDE_CONFIG_DIR`. The user signs in with `claude auth login` inside that home. HRA spawns the unmodified Claude Code runtime bundled with the pinned Agent SDK through HRA's environment-allowlisted spawner, and never reads, copies, or forwards the credential. Account selection stays user-directed. Claude profiles default to a per-account cap of two concurrent sessions; swarm-scale traffic may be judged non-ordinary by the provider, and users raise the cap knowingly.
+A Claude profile is one isolated home exported as `CLAUDE_CONFIG_DIR`. The user signs in with `claude auth login` inside that home. HRA spawns the unmodified Claude Code runtime bundled with the pinned Agent SDK through HRA's environment-allowlisted spawner, and never reads, copies, or forwards the credential. Claude account selection stays user-directed, and HRA never rotates a Claude account automatically. Claude profiles default to a per-account cap of two concurrent sessions; swarm-scale traffic may be judged non-ordinary by the provider, and users raise the cap knowingly.
 
 ## macOS Keychain probe (plan item D2)
 
@@ -32,6 +32,7 @@ Relevant flags, verbatim from `claude --help` on `2.1.260`:
 
 - `--effort <level>` - "Effort level for the current session (low, medium, high, xhigh, max)". This is the flag list of common values, not the full legal set: `ultracode` is a real, separate `reasoningEffort` value returned by the protocol's model listing for reasoning-capable models (see below) and is not shown in `--help`; "max without ultracode" means passing `--effort max` specifically.
 - `--model <model>` - "Model for the current session. Provide an alias for the latest model (e.g. 'fable', 'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')." The help text's own example (`claude-fable-5`) is already one version behind what this machine accepts (see below).
+- `--fallback-model <model>` - "Enable automatic fallback to specified model(s) when the default model is overloaded or not available." It accepts an ordered comma-separated list and works only with `--print`. The flag's presence proves only an argv surface. It does not prove that a particular fallback model and effort combination is accepted for an authenticated account.
 - `--output-format <format>` - "(only works with --print): 'text' (default), 'json' (single result), or 'stream-json' (realtime streaming)".
 - `--input-format <format>` - "(only works with --print): 'text' (default), or 'stream-json' (realtime streaming input)".
 - `--resume [value]` / `-r` - "Resume a conversation by session ID, or open interactive picker with optional search term".
@@ -45,6 +46,16 @@ Relevant flags, verbatim from `claude --help` on `2.1.260`:
 - **The model id itself has drifted between builds.** A `model/list` capture from `get-bb/bb`'s recordings (Claude Code `2.1.238`, 2026-08-21) lists the Fable entry as id `claude-fable-5` ("Fable 5"), with `supportedReasoningEfforts` = `low | medium | high | xhigh | ultracode | max` (each as `{reasoningEffort, description}`) and `defaultReasoningEffort: "high"`. By `2.1.260` (this machine, 2026-09-03) the accepted id is `claude-fable-5-1`. This capture did not re-run `model/list` on this machine (only the `-p` path above), so the full `supportedReasoningEfforts` set for `claude-fable-5-1` specifically is inferred from the `claude-fable-5` capture, not independently reconfirmed; only `max` was directly confirmed to work for `claude-fable-5-1` here. Pin the exact id per deployed `claude_code_version` and re-verify on every Codex/Claude bump, the same way the plan already requires for Codex.
 - Unauthenticated behavior (fresh, empty `CLAUDE_CONFIG_DIR`, `--output-format json`): `is_error: true`, `subtype: "success"` (the CLI's own outer envelope, despite the failure), `result: "Not logged in · Please run /login"`, `terminal_reason: "api_error"`, all usage/cost fields zeroed, `session_id` still issued. See `claude-fixtures/output-json-unauthenticated.jsonl.txt`.
 - Authenticated, single short turn (this machine's existing login, minimal real spend, owner-approved): `is_error: false`, `stop_reason: "end_turn"`, `terminal_reason: "completed"`, `result: "ok"`, real `usage` (`input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`), `total_cost_usd`, and a `modelUsage` map keyed by canonical model id. See `claude-fixtures/output-json-authenticated.jsonl.txt`.
+
+### Native Fable-to-Opus fallback
+
+The reviewed ladder for Claude Code 2.1.260 is Fable `claude-fable-5-1`, native fallback `claude-opus-5`, and effort `max`. HRA's pure argument builder covers both exact forms. The disabled form omits `--fallback-model`; the admitted form places `--fallback-model claude-opus-5` between the primary model and `--effort max`.
+
+The live capability is `unavailable: live_acceptance_required`. No signed-in isolated HRA Claude profile was available for an authenticated acceptance run. HRA did not use the global Claude configuration or copy credentials into an isolated profile. Every new runtime profile records the reviewed fallback model and this unavailable reason, and production runtime resolution always chooses the disabled argv form. Older runtime profiles remain readable without that newly added field.
+
+Enabling the capability requires a sanitized record from the exact pinned build and an already signed-in isolated HRA profile. The record must prove an ordinary terminal result for Opus with max effort and an ordinary terminal result when the process starts with Fable, Opus fallback, and max effort. It may record only the exact version, model ids, effort, argv shape, terminal classification, and evidence digest. It must not retain a prompt, response text, configuration path, credential, account identity, or raw provider payload. The acceptance does not need to force or claim that a fallback occurred.
+
+HRA does not restart, resume, or replay a Claude turn to simulate fallback. A future admitted native fallback may continue only inside the provider's own in-flight process. A missing terminal model identity stays unknown and is not inferred from quota or the requested model.
 
 ### stream-json event shapes
 
