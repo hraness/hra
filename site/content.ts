@@ -343,7 +343,7 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-      betaTag: "release-ready",
+    betaTag: "release-ready",
     githubRepository: "live",
     hostedSync: "live",
     website: "live",
@@ -448,8 +448,8 @@ export const publicContent: PublicContent = {
       answer: [text("No. Install the CLI, add a Codex profile or sign into Claude Code inside its isolated directory, and start a session. An HRA cloud identity is only needed for optional sync between machines.")],
     },
     {
-      question: "What does the published release include?",
-      answer: [text(`The immutable v${releaseVersion} local CLI is live for macOS and Linux and is Codex-only. The current source adds end-to-end Claude Code and provider switching; this page claims no later immutable CLI release. Hosted sync is live as an ${hostedBetaLabel}.`)],
+      question: "What does the release candidate include?",
+      answer: [text(`The v${releaseVersion} local CLI release candidate runs Codex on macOS and Linux and Claude Code on Linux. It becomes public only after immutable GitHub and npm release admission. Hosted sync is live as an ${hostedBetaLabel}.`)],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -606,7 +606,7 @@ export const publicContent: PublicContent = {
         paragraph(
           text("Account login is always a dedicated one-shot invocation, including while the persistent shell is running. For Codex, use "),
           code("hra account login personal --provider codex --device-code"),
-          text(" in a foreground TTY for app-server's device-code path. That terminal displays the code and verification URL directly. An opted-in registered machine can also receive a versioned web request that always selects device-code mode; HRA validates the HTTPS URL and separate code, encrypts them to the account key, and lets only the requesting browser read the handoff once before its five-minute hosted expiry. HRA keeps the resulting provider state inside that profile's isolated "),
+          text(" in a foreground TTY for app-server's device-code path. That terminal displays the code and verification URL directly. An opted-in registered machine can also receive a versioned web request that always selects device-code mode; HRA accepts only the pinned Codex device URL and a separate closed code, encrypts them to the account key, and lets only the requesting browser read the handoff once before its five-minute hosted expiry. HRA keeps the resulting provider state inside that profile's isolated "),
           code("CODEX_HOME"),
           text(" without copying "),
           code("auth.json"),

@@ -23,6 +23,8 @@ const distributionRoot = join(appRoot, "dist");
  * origin and needs review.
  */
 const reviewedVendorOrigins = new Set([
+  // The exact device-code verification link rendered for a Codex account login.
+  "https://auth.openai.com",
   // XML namespace constants in React DOM.
   "http://www.w3.org",
   // Documentation links inside Convex client error messages.
