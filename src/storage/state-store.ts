@@ -2299,7 +2299,7 @@ export const AUTORESPOND_EVIDENCE_PER_SESSION_CAP = 500;
 // forward as `protocol` evidence. The message-source table records which
 // dispatched turns HRA authored, so the compact projection can mark their
 // `user_message` events with `actor: "autorespond"`.
-const schemaVersion31 = `
+const schemaVersion31Statements = [`
 CREATE TABLE IF NOT EXISTS autorespond_evidence_next (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -2320,14 +2320,16 @@ CREATE TABLE IF NOT EXISTS autorespond_evidence_next (
   occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0),
   CHECK((path = 'protocol') = (interaction_id IS NOT NULL)),
   CHECK((path = 'prose') = (kind = 'prose_approval'))
-) STRICT;
+) STRICT
+`, `
 INSERT INTO autorespond_evidence_next(
   id,session_id,path,interaction_id,kind,class,rule,model,decision,mode,outcome,latency_ms,subagent,occurred_at)
 SELECT id,session_id,'protocol',interaction_id,kind,class,NULL,NULL,decision,mode,outcome,latency_ms,subagent,occurred_at
-FROM autorespond_evidence;
-DROP TABLE autorespond_evidence;
-ALTER TABLE autorespond_evidence_next RENAME TO autorespond_evidence;
-`;
+FROM autorespond_evidence
+`,
+  "DROP TABLE autorespond_evidence",
+  "ALTER TABLE autorespond_evidence_next RENAME TO autorespond_evidence",
+] as const;
 const schemaVersion31Objects = `
 CREATE INDEX IF NOT EXISTS autorespond_evidence_session ON autorespond_evidence(session_id, occurred_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS autorespond_evidence_recent ON autorespond_evidence(occurred_at DESC, id DESC);
@@ -3085,6 +3087,10 @@ const hasTableColumn = (database: Database, table: string, column: string): bool
   const columnSchema = z.object({ name: z.string() }).passthrough();
   if (!/^[a-z_]+$/u.test(table)) throw new Error("Unsafe SQLite table identifier.");
   return database.query(`PRAGMA table_info(${table})`).all().some((row) => columnSchema.parse(row).name === column);
+};
+
+const applySchemaVersion31 = (database: Database): void => {
+  for (const statement of schemaVersion31Statements) database.query(statement).run();
 };
 
 const ensureSessionEventProjectionVersion = (database: Database): void => {
@@ -4025,7 +4031,10 @@ const migrateWritableDatabase = (
 
     if (version < 31) {
       if (!hasTableColumn(database, "autorespond_evidence", "path")) {
-        database.exec(schemaVersion31);
+        applySchemaVersion31(database);
+      }
+      if (!hasTableColumn(database, "autorespond_evidence", "path")) {
+        throw new Error("STATE_SCHEMA_V31_AUTORESPOND_EVIDENCE_INVALID");
       }
       database.exec(schemaVersion31Objects);
       applySchemaVersion31Archive(database);
