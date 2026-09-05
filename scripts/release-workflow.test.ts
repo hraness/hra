@@ -418,6 +418,8 @@ describe("release workflow", () => {
     expect(releaseNotes).toContain("# HRA v0.6.0 local CLI beta");
     expect(thirdPartyNotices).toContain("exact tarball plus `SHA256SUMS`");
     expect(thirdPartyNotices).toContain("immutable `v0.6.0` release source tag");
+    expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.4.0");
+    expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.3.0");
     expect(thirdPartyNotices).not.toContain("SPDX");
     expect(changelog).toContain("## v0.6.0");
     expect(security).toContain("| `v0.6.0` | Release candidate. Supported once the release workflow admits it. |");
