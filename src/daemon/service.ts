@@ -8605,8 +8605,24 @@ export class HraService {
       );
     }
     if (claimedIdentity === undefined) {
+      if (claimFailure?.error instanceof ClaudeProcessExitUnprovenError) {
+        throw claimFailure.error;
+      }
+      if (claimFailure !== undefined) {
+        try {
+          this.#cancelClaudeProcessLaunchIntent(launchIntent);
+        } catch (cancelError: unknown) {
+          if (cancelError instanceof DaemonAuthoritySafetyError) throw cancelError;
+          this.#quarantineSession(session.id);
+          throw new IndeterminateLocalCommitError(
+            "Claude rejected exact-process resume, but its launch intent could not be retired.",
+            new AggregateError([claimFailure.error, cancelError]),
+          );
+        }
+        throw claimFailure.error;
+      }
       throw new ClaudeProcessExitUnprovenError({
-        cause: claimFailure?.error ?? new Error("CLAUDE_PROCESS_IDENTITY_NOT_ADMITTED"),
+        cause: new Error("CLAUDE_PROCESS_IDENTITY_NOT_ADMITTED"),
       });
     }
     if (claimFailure !== undefined) {
@@ -11754,7 +11770,9 @@ export class HraService {
     ) {
       return {
         session,
-        effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null,
+        effectiveRuntimeProfile: publicRuntimeProfile(
+          this.#store.latestSessionRuntimeProfile(session.id)?.profile,
+        ),
         providerObservation: this.#claudePlatformUnavailableObservation(profile),
       };
     }

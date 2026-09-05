@@ -2164,6 +2164,105 @@ describe("HraService personal-session adoption", () => {
     await value.service.close();
   });
 
+  test("retires an exact Claude resume launch intent after an ordinary pre-admission claim failure", async () => {
+    const value = await nativeClaudeFixture(
+      "Native Claude rejected resume",
+      "native-claude-rejected-resume",
+      {
+        pid: 62_995,
+        pidDomain: "darwin",
+        procStart: "managed-claude-rejected-resume",
+      },
+    );
+    const claimFailure = new Error("replacement claim rejected before process admission");
+    value.managedClaude.disconnectOnObserveRequest = value.managedClaude.observeRequests.length + 1;
+    value.managedClaude.claimSessionError = claimFailure;
+
+    const failure = await value.service.execute({
+      kind: "session.status",
+      session: value.session.id,
+    }, { signal }).catch((error: unknown) => error);
+
+    expect(failure).toBe(claimFailure);
+    expect(value.managedClaude.claimRequests).toHaveLength(1);
+    expect(value.store.readClaudeProcessLaunchIntent({
+      providerThreadId: value.providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toBeNull();
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: value.providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })?.state).toBe("released");
+    expect(value.store.requireSession(value.session.id).state).toBe("idle");
+    await value.service.close();
+  });
+
+  test("quarantines an exact Claude resume when its ordinary-failure launch intent cannot be retired", async () => {
+    const value = await nativeClaudeFixture(
+      "Native Claude conflicted resume cleanup",
+      "native-claude-conflicted-resume-cleanup",
+      {
+        pid: 62_996,
+        pidDomain: "darwin",
+        procStart: "managed-claude-conflicted-resume-cleanup",
+      },
+    );
+    const claimFailure = new Error("replacement claim rejected before process admission");
+    let replacementIntentId: string | undefined;
+    value.managedClaude.disconnectOnObserveRequest = value.managedClaude.observeRequests.length + 1;
+    value.managedClaude.beforeClaimSessionAdmission = () => {
+      const original = value.store.readClaudeProcessLaunchIntent({
+        providerThreadId: value.providerThreadId,
+        profileId: value.accountId,
+        runtimeScope: "managed",
+      });
+      if (original === null || original.providerAccountKey === null) {
+        throw new Error("Expected the account-bound exact Claude resume launch intent.");
+      }
+      value.store.cancelClaudeProcessLaunchIntent({
+        providerThreadId: original.providerThreadId,
+        profileId: original.profileId,
+        profileGeneration: original.profileGeneration,
+        runtimeScope: original.runtimeScope,
+        intentId: original.intentId,
+        expectedRevision: original.revision,
+      });
+      replacementIntentId = value.store.stageClaudeProcessLaunchIntent({
+        providerThreadId: original.providerThreadId,
+        profileId: original.profileId,
+        profileGeneration: original.profileGeneration,
+        runtimeScope: original.runtimeScope,
+        providerAccountKey: original.providerAccountKey,
+        sessionId: value.session.id,
+      }).intentId;
+    };
+    value.managedClaude.claimSessionError = claimFailure;
+
+    const failure = await value.service.execute({
+      kind: "session.status",
+      session: value.session.id,
+    }, { signal }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "IndeterminateLocalCommitError",
+      message: "Claude rejected exact-process resume, but its launch intent could not be retired.",
+    });
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    expect(value.store.readClaudeProcessLaunchIntent({
+      providerThreadId: value.providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })?.intentId).toBe(replacementIntentId);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: value.providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })?.state).toBe("released");
+    await value.service.close();
+  });
+
   test("keeps native Claude config-home provenance private across start, show, and send", async () => {
     const managedClaude = new FakeClaude("isolated", {
       pid: 63_000,
@@ -2233,6 +2332,80 @@ describe("HraService personal-session adoption", () => {
       .toMatchObject({ configHome: "isolated" });
     await value.service.close();
   });
+
+  test.each(["current", "legacy"] as const)(
+    "keeps a stored %s Claude config-home private when managed control is platform-unavailable",
+    async (profileShape) => {
+      const value = await fixture(
+        undefined,
+        new FakeCloud(),
+        () => undefined,
+        () => personalAdoptionNow,
+        undefined,
+        {},
+        "darwin",
+      );
+      const added = await value.service.execute(
+        { kind: "account.add", label: `Darwin ${profileShape} Claude profile` },
+        { signal },
+      ) as { account: { id: `acct_${string}` } };
+      const profile = value.store.requireProfileById(added.account.id);
+      const session = value.store.upsertProviderSession({
+        profileId: profile.id,
+        provider: "claude",
+        providerThreadId: `darwin-${profileShape}-claude-profile`,
+        title: `Darwin ${profileShape} Claude profile`,
+        preset: "fable-max",
+        fastEnabled: false,
+        state: "idle",
+        providerAccountKey: claudeProviderAccountKey(),
+      });
+      const authority: ProfileAuthority = {
+        id: profile.id,
+        generation: profile.processGeneration,
+        codexHome: "unused",
+        desktopUserData: "unused",
+      };
+      const currentProfile = claudeRuntimeProfile(authority, "isolated");
+      const storedProfile: EffectiveClaudeRuntimeProfile = profileShape === "current"
+        ? currentProfile
+        : {
+            profileId: currentProfile.profileId,
+            processGeneration: currentProfile.processGeneration,
+            observedAt: currentProfile.observedAt,
+            preset: currentProfile.preset,
+            model: currentProfile.model,
+            reasoningEffort: currentProfile.reasoningEffort,
+            claudeVersion: currentProfile.claudeVersion,
+            permissionMode: currentProfile.permissionMode,
+            isolatedConfigDir: true,
+            outputFormat: currentProfile.outputFormat,
+            inputFormat: currentProfile.inputFormat,
+          };
+      value.store.recordSessionRuntimeProfile({
+        sessionId: session.id,
+        sourceKind: "session_start",
+        sourceId: `darwin-${profileShape}-stored-profile`,
+        profile: storedProfile,
+      });
+
+      const shown = await value.service.execute({
+        kind: "session.show",
+        session: session.id,
+        detail: false,
+      }, { signal }) as {
+        effectiveRuntimeProfile: Record<string, unknown>;
+        providerObservation: { state: string };
+      };
+
+      expect(value.store.latestSessionRuntimeProfile(session.id)?.profile)
+        .toHaveProperty(profileShape === "current" ? "configHome" : "isolatedConfigDir");
+      expect(shown.providerObservation.state).toBe("unavailable");
+      expect(shown.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+      expect(shown.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
+      await value.service.close();
+    },
+  );
 
   test("releases and resumes a native Claude child lost at its first post-commit observation", async () => {
     const initialIdentity: ClaudeProcessIdentity = {

@@ -63,7 +63,7 @@ export type ReadCodexAutomationsInput = Readonly<{
  * intentionally kept out of `CodexAutomation`, which is cloud projected.
  */
 export type CodexAutomationAuthorityEntry = Readonly<{
-  automation: CodexAutomation;
+  automation: Readonly<Pick<CodexAutomation, "kind" | "status" | "targetThreadId">>;
   sourceDirectoryName: string;
 }>;
 
@@ -157,12 +157,29 @@ type AutomationParseOutcome =
   | Readonly<{ ok: true; automation: CodexAutomation }>
   | Readonly<{ ok: false; reason: "invalid_toml" | "invalid_fields" }>;
 
+type AutomationAuthorityParseOutcome =
+  | Readonly<{
+      ok: true;
+      automation: CodexAutomationAuthorityEntry["automation"];
+    }>
+  | Readonly<{ ok: false; reason: "invalid_toml" | "invalid_fields" }>;
+
 const INVALID_TOML: AutomationParseOutcome = Object.freeze({
   ok: false,
   reason: "invalid_toml",
 } as const);
 
 const INVALID_FIELDS: AutomationParseOutcome = Object.freeze({
+  ok: false,
+  reason: "invalid_fields",
+} as const);
+
+const INVALID_AUTHORITY_TOML: AutomationAuthorityParseOutcome = Object.freeze({
+  ok: false,
+  reason: "invalid_toml",
+} as const);
+
+const INVALID_AUTHORITY_FIELDS: AutomationAuthorityParseOutcome = Object.freeze({
   ok: false,
   reason: "invalid_fields",
 } as const);
@@ -593,7 +610,7 @@ async function readAutomationAuthorityEntries(
       if (!read.missing) diagnostics.push(diagnostic(name, "unreadable"));
       continue;
     }
-    const outcome = parseAutomationDocument(read.text, name);
+    const outcome = parseAutomationAuthorityDocument(read.text);
     if (outcome.ok) {
       entries.push(Object.freeze({
         automation: outcome.automation,
@@ -697,6 +714,53 @@ function parseAutomationDocument(text: string, fallbackId: string): AutomationPa
       status,
       targetThreadId,
       updatedAt,
+    }),
+  } as const);
+}
+
+/**
+ * Parse only the fields that can grant scheduled-target adoption authority.
+ * Display and projection fields are deliberately not read: an unsafe name or
+ * unusable id/rrule must not revoke an otherwise exact Desktop-owned binding,
+ * and none of that free text belongs in the private authority result.
+ */
+function parseAutomationAuthorityDocument(text: string): AutomationAuthorityParseOutcome {
+  let parsed: unknown;
+  try {
+    parsed = Bun.TOML.parse(text);
+  } catch {
+    return INVALID_AUTHORITY_TOML;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return INVALID_AUTHORITY_TOML;
+  }
+  const document = parsed as Record<string, unknown>;
+
+  if (document.kind !== "heartbeat") return INVALID_AUTHORITY_FIELDS;
+
+  const targetThreadId = safeExactField(
+    document.target_thread_id,
+    MAX_TARGET_THREAD_ID_LENGTH,
+  );
+  if (targetThreadId === null || targetThreadId.length === 0) {
+    return INVALID_AUTHORITY_FIELDS;
+  }
+
+  const rawStatus = document.status;
+  let status: "active" | "paused" = "active";
+  if (rawStatus !== undefined) {
+    if (typeof rawStatus !== "string") return INVALID_AUTHORITY_FIELDS;
+    if (rawStatus.trim().length === 0 || rawStatus === "ACTIVE") status = "active";
+    else if (rawStatus === "PAUSED") status = "paused";
+    else return INVALID_AUTHORITY_FIELDS;
+  }
+
+  return Object.freeze({
+    ok: true,
+    automation: Object.freeze({
+      kind: "heartbeat",
+      status,
+      targetThreadId,
     }),
   } as const);
 }

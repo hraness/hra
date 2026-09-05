@@ -664,6 +664,166 @@ describe("readCodexAutomationAuthority", () => {
     expect(exact.entries[0]?.automation.targetThreadId).toBe("thread-retargeted");
   });
 
+  test("derives minimal authority independently of rejected display fields", async () => {
+    const directory = await automationsRoot();
+    await writeAutomation(
+      directory,
+      "path-bearing-name",
+      [
+        'id = "path-bearing-name"',
+        'kind = "heartbeat"',
+        'name = "Sweep /srv/private\\u202e"',
+        'rrule = "FREQ=HOURLY"',
+        'status = "PAUSED"',
+        'target_thread_id = "thread-path-name"',
+        "updated_at = 10",
+        "",
+      ].join("\n"),
+    );
+    await writeAutomation(
+      directory,
+      "sanitized-display-field",
+      [
+        'id = "sanitized-display-field"',
+        'kind = "heartbeat"',
+        'name = "Safe display label"',
+        'status = "ACTIVE"',
+        'target_thread_id = "thread-sanitized-display"',
+        "updated_at = -1",
+        "",
+      ].join("\n"),
+    );
+    await writeAutomation(
+      directory,
+      "unusable-display-fields",
+      [
+        "id = 42",
+        'kind = "heartbeat"',
+        'name = ["not", "display text"]',
+        "rrule = 17",
+        'target_thread_id = "thread-unusable-display"',
+        'updated_at = "not-a-timestamp"',
+        "",
+      ].join("\n"),
+    );
+
+    const projection = await readCodexAutomations({ automationsDirectory: directory });
+    expect(projection.automations).toEqual([
+      {
+        cadence: "",
+        id: "sanitized-display-field",
+        kind: "heartbeat",
+        label: "Safe display label",
+        status: "active",
+        targetThreadId: "thread-sanitized-display",
+        updatedAt: null,
+      },
+    ]);
+    expect(projection.diagnostics).toEqual([
+      { automationId: "path-bearing-name", reason: "invalid_fields" },
+      { automationId: "unusable-display-fields", reason: "invalid_fields" },
+    ]);
+
+    const authority = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "sources",
+      sourceDirectoryNames: [
+        "path-bearing-name",
+        "sanitized-display-field",
+        "unusable-display-fields",
+      ],
+    });
+    expect(authority).toMatchObject({ complete: true, diagnostics: [], nextCursor: null });
+    expect(authority.entries).toEqual([
+      {
+        automation: {
+          kind: "heartbeat",
+          status: "paused",
+          targetThreadId: "thread-path-name",
+        },
+        sourceDirectoryName: "path-bearing-name",
+      },
+      {
+        automation: {
+          kind: "heartbeat",
+          status: "active",
+          targetThreadId: "thread-sanitized-display",
+        },
+        sourceDirectoryName: "sanitized-display-field",
+      },
+      {
+        automation: {
+          kind: "heartbeat",
+          status: "active",
+          targetThreadId: "thread-unusable-display",
+        },
+        sourceDirectoryName: "unusable-display-fields",
+      },
+    ]);
+    expect(Object.keys(authority.entries[0]?.automation ?? {})).toEqual([
+      "kind",
+      "status",
+      "targetThreadId",
+    ]);
+    const serialized = JSON.stringify(authority.entries);
+    expect(serialized).not.toContain("/srv/private");
+    expect(serialized).not.toContain("FREQ=HOURLY");
+    expect(serialized).not.toContain("not-a-timestamp");
+    expect(serialized).not.toContain("display text");
+    expect(serialized).not.toContain("Safe display label");
+  });
+
+  test("accepts only exact authority fields and documented status forms", async () => {
+    const directory = await automationsRoot();
+    const records = new Map<string, readonly string[]>([
+      ["accepted-active", ['kind = "heartbeat"', 'status = "ACTIVE"', 'target_thread_id = "thread-active"']],
+      ["accepted-blank", ['kind = "heartbeat"', 'status = "   "', 'target_thread_id = "thread-blank"']],
+      ["accepted-missing", ['kind = "heartbeat"', 'target_thread_id = "thread-missing"']],
+      ["accepted-paused", ['kind = "heartbeat"', 'status = "PAUSED"', 'target_thread_id = "thread-paused"']],
+      ["drift-kind", ['kind = "Heartbeat"', 'status = "ACTIVE"', 'target_thread_id = "thread-kind"']],
+      ["drift-status-case", ['kind = "heartbeat"', 'status = "active"', 'target_thread_id = "thread-status-case"']],
+      ["drift-status-padding", ['kind = "heartbeat"', 'status = " ACTIVE "', 'target_thread_id = "thread-status-padding"']],
+      ["drift-status-type", ['kind = "heartbeat"', "status = 1", 'target_thread_id = "thread-status-type"']],
+      ["drift-target-blank", ['kind = "heartbeat"', 'status = "ACTIVE"', 'target_thread_id = ""']],
+      ["drift-target-padding", ['kind = "heartbeat"', 'status = "ACTIVE"', 'target_thread_id = " thread-target "']],
+    ]);
+    for (const [name, lines] of records) {
+      await writeAutomation(directory, name, [...lines, ""].join("\n"));
+    }
+
+    const authority = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "sources",
+      sourceDirectoryNames: [...records.keys()],
+    });
+    expect(authority.entries).toEqual([
+      {
+        automation: { kind: "heartbeat", status: "active", targetThreadId: "thread-active" },
+        sourceDirectoryName: "accepted-active",
+      },
+      {
+        automation: { kind: "heartbeat", status: "active", targetThreadId: "thread-blank" },
+        sourceDirectoryName: "accepted-blank",
+      },
+      {
+        automation: { kind: "heartbeat", status: "active", targetThreadId: "thread-missing" },
+        sourceDirectoryName: "accepted-missing",
+      },
+      {
+        automation: { kind: "heartbeat", status: "paused", targetThreadId: "thread-paused" },
+        sourceDirectoryName: "accepted-paused",
+      },
+    ]);
+    expect(authority.diagnostics).toEqual([
+      { automationId: "drift-kind", reason: "invalid_fields" },
+      { automationId: "drift-status-case", reason: "invalid_fields" },
+      { automationId: "drift-status-padding", reason: "invalid_fields" },
+      { automationId: "drift-status-type", reason: "invalid_fields" },
+      { automationId: "drift-target-blank", reason: "invalid_fields" },
+      { automationId: "drift-target-padding", reason: "invalid_fields" },
+    ]);
+  });
+
   test("refuses unsafe exact source identities", async () => {
     const directory = await automationsRoot();
     const scan = await readCodexAutomationAuthority({

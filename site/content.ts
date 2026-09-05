@@ -461,7 +461,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "What if the terminal closes?",
-      answer: [text("The local daemon keeps the session alive. Reopen the shell, select the account and session, and continue. Claude Code sessions cannot be resumed after the daemon that started them exits.")],
+      answer: [text("The local daemon keeps the session alive. Reopen the shell, select the account and session, and continue. If the daemon restarts or loses a Claude controller, HRA can recover the exact conversation with "), code("--resume"), text(" only after prior-process exit or an already-completed exact process release is proven. Ambiguous custody stays fenced in recovery without launching another process.")],
     },
     {
       question: "Which platforms are supported?",
@@ -711,7 +711,9 @@ export const publicContent: PublicContent = {
         ),
         { kind: "subheading", text: "Claude Code and provider switching" },
         paragraph(
-          text("Start directly with Claude Code by selecting its provider and reviewed preset, or move an idle session between providers. A switch preserves HRA's provider-neutral conversation record but starts a fresh provider-native runtime; it refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to the other provider. Claude Code sessions cannot be resumed after the daemon that started them exits."),
+          text("Start directly with Claude Code by selecting its provider and reviewed preset, or move an idle session between providers. A switch preserves HRA's provider-neutral conversation record but starts a fresh provider-native runtime; it refuses an active turn, an unsettled provider effect, an unsigned target profile, or a preset that belongs to the other provider. If a Claude controller is no longer available, HRA can recover the exact conversation with "),
+          code("--resume"),
+          text(" only after prior-process exit or an already-completed exact process release is proven. Ambiguous custody stays fenced in recovery without launching another process."),
         ),
         {
           kind: "commands",
@@ -962,12 +964,12 @@ export const publicContent: PublicContent = {
             text("Compact sessions: list sessions, read user and final assistant messages, inspect elapsed time plus bounded observed file and Git actions, then open one turn for full provider-visible detail."),
           ],
           [
-            text("Personal-home adoption: opt in to discover recent Codex and Claude Code sessions, plus older Codex threads targeted by present Desktop heartbeat automations, then admit them after bounded account, project, liveness, and exact-resume checks. Active and paused automation records both count until deletion or retargeting; HRA reads no automation prompt. Account-filtered session lists include admitted rows, which use the same public commands, autorespond policy, and approval authority as every HRA session. Provider APIs do not supply a global lease against every later external resume. Read "),
+            text("Personal-home adoption: opt in to discover recent Codex and Claude Code sessions, plus older Codex threads targeted by present Desktop heartbeat automations, then admit them after bounded account, project, liveness, and exact-resume checks. Active and paused automation records both count until deletion or retargeting; HRA reads no automation prompt. Account-filtered session lists include admitted rows, which use the same provider-supported public commands, autorespond policy, and approval authority as every HRA session. Provider-specific limits are identical for native and adopted sessions, and provider APIs do not supply a global lease against every later external resume. Read "),
             link("the session-adoption guide", "https://github.com/hraness/hra/blob/main/docs/session-adoption.md"),
             text("."),
           ],
           [
-            text("Durable controls: send, queue, steer, stop, rename, and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing."),
+            text("Durable controls: send, queue, steer, and stop through either provider; rename Codex sessions; and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing."),
           ],
           [
             text("Named projects: a project is a canonical directory that may contain several repositories. Changing it affects future turns only."),
@@ -1009,7 +1011,9 @@ export const publicContent: PublicContent = {
         { kind: "subheading", text: "Session observation" },
         paragraph(
           code("hra session status <session> --json"),
-          text(" returns status version 2. HRA produces one typed provider-observation result, attempting the bound provider's reviewed observation path only when the current local state makes one applicable, then reads the session, event cut, interactions, and queue from one local SQLite transaction. Codex supports a native app-server observation read; Claude Code status uses HRA's live provider-neutral projection because provider-side session listing and resume are not implemented. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret."),
+          text(" returns status version 2. HRA produces one typed provider-observation result, attempting the bound provider's reviewed observation path only when the current local state makes one applicable, then reads the session, event cut, interactions, and queue from one local SQLite transaction. Codex supports a native app-server observation read. Claude Code exposes no admitted provider-side session listing or read-only observation, so HRA uses its live provider-neutral projection while the exact Claude controller is present. If that controller is absent, HRA may establish "),
+          code("--resume"),
+          text(" for the exact conversation only after prior-process exit or an already-completed exact process release is proven; ambiguous custody fails closed as recovery required. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret."),
         ),
         paragraph(
           code("hra session state <session> --json"),

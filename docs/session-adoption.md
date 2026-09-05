@@ -1,6 +1,6 @@
 # Adopt sessions from personal provider homes
 
-HRA can discover recent Codex and Claude Code sessions in your personal provider homes and bring them into the local daemon. A personal Codex thread targeted by a present Codex Desktop scheduled task is also discoverable even when the thread is older. Adoption is opt-in for each provider. After provider-specific admission succeeds, the conversation is an ordinary HRA session with the same public session commands, autorespond policy, and approval authority as every other HRA session.
+HRA can discover recent Codex and Claude Code sessions in your personal provider homes and bring them into the local daemon. A personal Codex thread targeted by a present Codex Desktop scheduled task is also discoverable even when the thread is older. Adoption is opt-in for each provider. After provider-specific admission succeeds, the conversation is an ordinary HRA session with the same provider-supported public commands, autorespond policy, and approval authority as every other HRA session.
 
 Discovery does not create a public or reduced-capability session tier. Candidates stay in private local state until HRA can claim them. The session list and normal session interface expose no separate source badge or mode.
 
@@ -81,11 +81,13 @@ HRA resumes a Claude candidate only after the old process probe reports not live
 
 This prevents HRA from attaching to the exact old Claude process. It is a bounded liveness inference, not a provider-wide lease: another user process can still start a separate resume after HRA's check. Choose one controller for subsequent writes and avoid resuming the same Claude conversation elsewhere while HRA controls it.
 
+The same fence applies after adoption. A clean HRA shutdown records release of the exact Claude process authority before a later daemon launches `--resume`. After an unclean loss, recovery resumes only after the stored process identity is proven not live and the exact authority is durably released. If exit or release cannot be proven, HRA leaves the session in recovery and starts no replacement controller.
+
 ## After adoption
 
-An admitted session uses the ordinary HRA session surface. You can send, queue, steer, stop, rename, inspect, watch, schedule work, and apply the normal preset and autorespond controls. The same default `auto:all` approval mode and per-session autorespond overrides apply. Provider approval callbacks arrive on HRA's resumed connection or process, and HRA answers them with the same authority and evidence rules used for every HRA session.
+An admitted session uses the same provider-supported HRA session commands as an HRA-created session. This includes send, queue, steer, stop, show, status, state, watch, session notes, scheduled work, and normal provider-compatible preset and autorespond controls. Provider-specific limits are also identical: `hra session rename` and protected turn inspection are Codex-only because Claude exposes neither provider operation. The same default `auto:all` approval mode and per-session autorespond overrides apply. Provider approval callbacks arrive on HRA's resumed connection or process, and HRA answers them with the same authority and evidence rules used for every HRA session.
 
-HRA cannot answer an approval that was delivered only to a prior controller, and it does not backfill a complete local event history from before adoption. Existing provider history remains in the provider home and can appear through ordinary bounded provider reads.
+HRA cannot answer an approval that was delivered only to a prior controller, and it does not backfill a complete local event history from before adoption. Existing Codex history remains in the provider home and can appear through ordinary bounded app-server reads. Claude Code exposes no admitted provider-side listing or read-only session observation, so HRA's Claude projection begins with the events it observes while controlling the resumed process.
 
 One pinned Codex protocol limitation is narrower than the public session surface: `thread/resume` can replace approval, reviewer, model, and workspace policy, but it cannot add a thread-creation-only dynamic tool to a conversation that never had it. CLI and app scheduling still work, and HRA enables its automation handler if the resumed thread already knows that tool, but the model in an arbitrary pre-existing Codex thread may be unable to originate an automation change itself. A Codex Desktop scheduled task remains owned by Codex Desktop; HRA adopts its target conversation as an ordinary session rather than converting that task into a separate HRA conversation task.
 
