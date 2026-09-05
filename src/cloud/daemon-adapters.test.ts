@@ -1947,6 +1947,12 @@ describe("state-backed cloud daemon adapter", () => {
 
   test("waits for an exact in-flight turn profile, then ingests it without freezing unknown metadata", async () => {
     const value = await fixture();
+    const initial = value.store.requireSession(value.sessionId);
+    value.store.updateSessionMetadata({
+      expectedRevision: initial.revision,
+      preset: "ultra",
+      sessionId: initial.id,
+    });
     const binding = beginTurnProfileBinding(value, { fast: true, preset: "ultra" });
     value.codex.projection = {
       ...value.codex.projection,
