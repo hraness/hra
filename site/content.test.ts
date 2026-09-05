@@ -838,11 +838,9 @@ describe("public content contract", () => {
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
       expect(footer).toContain('data-slot="hraness-site-footer"');
       expect(footer?.match(/data-slot="hraness-mark"/gu)).toHaveLength(1);
-      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(
-        hranessSocialLinks.length,
-      );
+      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(11);
       expect(footer).toContain('data-mailing-list="none"');
-      expect(footer).not.toContain("substack.com");
+      expect(footer).toContain('href="https://substack.com/@hraness"');
       expect(
         [...(footer?.matchAll(/<a\b[^>]*\shref="([^"]+)"/gu) ?? [])]
           .map((match) => match[1]),
@@ -879,7 +877,7 @@ describe("public content contract", () => {
     expect(footer).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
-    expect(footer).not.toContain("substack.com");
+    expect(footer).toContain('href="https://substack.com/@hraness"');
   });
 
   test("fails production closed on missing or malformed Turnstile configuration", () => {
