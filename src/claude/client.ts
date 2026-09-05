@@ -211,8 +211,22 @@ export class ClaudeStreamClient {
   }
 
   async close(): Promise<void> {
-    if (this.#closeTask === null) this.#closeTask = this.#close();
-    await this.#closeTask;
+    if (this.#closeTask !== null) {
+      await this.#closeTask;
+      return;
+    }
+    const closeTask = this.#close();
+    this.#closeTask = closeTask;
+    try {
+      await closeTask;
+    } catch (error: unknown) {
+      // A bounded close can fail before the exact child or its output drains
+      // settle. Keep the client closed to new writes, but let its owner retry
+      // the same exact process rather than turning the first timeout into a
+      // permanently cached observation that can never prove later reaping.
+      if (this.#closeTask === closeTask) this.#closeTask = null;
+      throw error;
+    }
   }
 
   async #close(): Promise<void> {

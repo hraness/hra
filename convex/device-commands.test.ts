@@ -30,6 +30,12 @@ const settle = makeFunctionReference<"mutation", Args, unknown>("deviceCommands:
 const recoverEffectStarted = makeFunctionReference<"mutation", Args, unknown>(
   "deviceCommands:recoverEffectStarted",
 );
+const confirmRevokedTerminal = makeFunctionReference<"mutation", Args, unknown>(
+  "deviceCommands:confirmRevokedTerminal",
+);
+const confirmTerminalRecovery = makeFunctionReference<"mutation", Args, unknown>(
+  "deviceCommands:confirmTerminalRecovery",
+);
 const cancelPending = makeFunctionReference<"mutation", Args, unknown>(
   "deviceCommands:cancelPending",
 );
@@ -61,6 +67,7 @@ const wrappedKeyEnvelope = {
 };
 const daemonAuthority: Authority = { bootGeneration: 1, bootId: "boot_00000001", fence: 1 };
 const laterAuthority: Authority = { bootGeneration: 2, bootId: "boot_00000002", fence: 1 };
+const latestAuthority: Authority = { bootGeneration: 3, bootId: "boot_00000003", fence: 1 };
 
 function uuidV7(now: number, suffix: string): string {
   const timestamp = now.toString(16).padStart(12, "0").slice(-12);
@@ -326,6 +333,90 @@ describe("device commands", () => {
     })).toMatchObject({ rebound: true, state: "prepared" });
   });
 
+  test("a later boot fails a pending command when local prepared evidence proves no effect", async () => {
+    const world = await deviceCommandWorld();
+    await world.enqueueFrom(world.browser, { publicId: world.uuid("39") });
+
+    expect(await world.daemon.mutation(recoverEffectStarted, {
+      commandPublicId: world.uuid("39"),
+      localPhase: "prepared_no_effect",
+      recoveryAuthority: laterAuthority,
+      resultCode: "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT",
+      resultDigest: "9".repeat(64),
+      staleAuthority: daemonAuthority,
+      state: "failed",
+    })).toMatchObject({ replay: false, state: "failed" });
+    expect(await world.daemon.mutation(recoverEffectStarted, {
+      commandPublicId: world.uuid("39"),
+      localPhase: "prepared_no_effect",
+      recoveryAuthority: laterAuthority,
+      resultCode: "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT",
+      resultDigest: "9".repeat(64),
+      staleAuthority: daemonAuthority,
+      state: "failed",
+    })).toMatchObject({ replay: true, state: "failed" });
+  });
+
+  for (const localPhase of ["prepared_no_effect", "effect_started"] as const) {
+    test(`replays an exact ${localPhase} recovery through a second daemon restart`, async () => {
+      const world = await deviceCommandWorld();
+      const commandPublicId = world.uuid(localPhase === "prepared_no_effect" ? "3a" : "3b");
+      const state = localPhase === "prepared_no_effect" ? "failed" as const : "ambiguous" as const;
+      const resultCode = localPhase === "prepared_no_effect"
+        ? "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT"
+        : "LOCAL_EFFECT_RECOVERY_REQUIRED";
+      const resultDigest = (localPhase === "prepared_no_effect" ? "a" : "b").repeat(64);
+      await world.enqueueFrom(world.browser, { publicId: commandPublicId });
+      await world.daemon.mutation(prepare, {
+        authority: daemonAuthority,
+        commandPublicId,
+        localPhase: "prepared_no_effect",
+      });
+      if (localPhase === "effect_started") {
+        await world.daemon.mutation(markEffectStarted, {
+          authority: daemonAuthority,
+          commandPublicId,
+        });
+      }
+      expect(await world.daemon.mutation(recoverEffectStarted, {
+        commandPublicId,
+        localPhase,
+        recoveryAuthority: laterAuthority,
+        resultCode,
+        resultDigest,
+        staleAuthority: daemonAuthority,
+        state,
+      })).toMatchObject({ replay: false, state });
+
+      // Boot 2 committed the terminal recovery but lost its response. Boot 3
+      // still owns boot 1's local journal and may prove, but never rewrite, the
+      // exact intervening recovery terminal.
+      expect(await world.daemon.mutation(recoverEffectStarted, {
+        commandPublicId,
+        localPhase,
+        recoveryAuthority: latestAuthority,
+        resultCode,
+        resultDigest,
+        staleAuthority: daemonAuthority,
+        state,
+      })).toMatchObject({ replay: true, state });
+      await expectPromiseToReject(world.daemon.mutation(recoverEffectStarted, {
+        commandPublicId,
+        localPhase,
+        recoveryAuthority: daemonAuthority,
+        resultCode,
+        resultDigest,
+        staleAuthority: daemonAuthority,
+        state,
+      }));
+      expect(await world.browser.query(getCommand, { commandPublicId })).toMatchObject({
+        boundAuthority: laterAuthority,
+        resultCode,
+        state,
+      });
+    });
+  }
+
   test("expires a command whose deadline passed before the daemon claimed it", async () => {
     const world = await deviceCommandWorld();
     await world.enqueueFrom(world.browser, {
@@ -343,6 +434,15 @@ describe("device commands", () => {
       commandPublicId: world.uuid("27"),
       localPhase: "prepared_no_effect",
     })).toMatchObject({ state: "expired" });
+    expect(await world.daemon.mutation(confirmTerminalRecovery, {
+      commandPublicId: world.uuid("27"),
+      localPhase: "prepared_no_effect",
+      staleAuthority: daemonAuthority,
+    })).toEqual({
+      publicId: world.uuid("27"),
+      replay: true,
+      state: "expired",
+    });
   });
 
   test("releases a single-use result exactly once, to the requester only", async () => {
@@ -360,6 +460,17 @@ describe("device commands", () => {
       authority: daemonAuthority,
       commandPublicId: world.uuid("28"),
     });
+    // An applied login cannot omit the ciphertext even if it carries the
+    // single-use marker: otherwise a crash could publish success with no
+    // handoff for the requester to consume.
+    await expectPromiseToReject(world.daemon.mutation(settle, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("28"),
+      resultCode: "APPLIED",
+      resultDigest: "a".repeat(64),
+      singleUseResult: true,
+      state: "applied",
+    }));
     // A login handoff that is not marked single use is refused outright.
     await expectPromiseToReject(world.daemon.mutation(settle, {
       authority: daemonAuthority,
@@ -378,6 +489,15 @@ describe("device commands", () => {
       singleUseResult: true,
       state: "applied",
     });
+    // A v4 terminal journal did not retain ciphertext. Its result-less replay
+    // is accepted only because the hosted row already owns the exact relay.
+    expect(await world.daemon.mutation(settle, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("28"),
+      resultCode: "APPLIED",
+      resultDigest: "a".repeat(64),
+      state: "applied",
+    })).toMatchObject({ replay: true, state: "applied" });
 
     // An ordinary read never carries the ciphertext.
     const beforeRead = await world.browser.query(getCommand, {
@@ -394,6 +514,13 @@ describe("device commands", () => {
       });
     expect(await world.browser.mutation(consumeResult, { commandPublicId: world.uuid("28") }))
       .toMatchObject({ status: "spent" });
+    expect(await world.daemon.mutation(settle, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("28"),
+      resultCode: "APPLIED",
+      resultDigest: "a".repeat(64),
+      state: "applied",
+    })).toMatchObject({ replay: true, state: "applied" });
     // The target device is not the requester and may never exchange the relay.
     await expectPromiseToReject(
       world.daemon.mutation(consumeResult, { commandPublicId: world.uuid("28") }),
@@ -466,6 +593,23 @@ describe("device commands", () => {
     })).toMatchObject({ replay: false });
     expect(await world.browser.mutation(cancelPending, { commandPublicId: world.uuid("29") }))
       .toMatchObject({ replay: false, state: "cancelled" });
+    expect(await world.daemon.mutation(confirmTerminalRecovery, {
+      commandPublicId: world.uuid("29"),
+      localPhase: "prepared_no_effect",
+      staleAuthority: daemonAuthority,
+    })).toEqual({
+      publicId: world.uuid("29"),
+      replay: true,
+      state: "cancelled",
+    });
+    await expectPromiseToReject(
+      world.browser.mutation(confirmTerminalRecovery, {
+        commandPublicId: world.uuid("29"),
+        localPhase: "prepared_no_effect",
+        staleAuthority: daemonAuthority,
+      }),
+      "BROWSER_DEVICE_CANNOT_EXECUTE",
+    );
   });
 
   test("device revocation drains device commands the revoked device owns", async () => {
@@ -501,5 +645,40 @@ describe("device commands", () => {
     expect(states[world.uuid("2a")]).toBe("cancelled");
     // An effect that may have begun is quarantined, never cancelled.
     expect(states[world.uuid("2b")]).toBe("ambiguous");
+    expect(await world.daemon.mutation(confirmRevokedTerminal, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("2b"),
+    })).toEqual({
+      publicId: world.uuid("2b"),
+      replay: true,
+      state: "ambiguous",
+    });
+    expect(await world.daemon.mutation(confirmTerminalRecovery, {
+      commandPublicId: world.uuid("2b"),
+      localPhase: "effect_started",
+      staleAuthority: daemonAuthority,
+    })).toEqual({
+      publicId: world.uuid("2b"),
+      replay: true,
+      state: "ambiguous",
+    });
+    await expectPromiseToReject(world.daemon.mutation(confirmTerminalRecovery, {
+      commandPublicId: world.uuid("2b"),
+      localPhase: "prepared_no_effect",
+      staleAuthority: daemonAuthority,
+    }));
+    await expectPromiseToReject(world.daemon.mutation(confirmTerminalRecovery, {
+      commandPublicId: world.uuid("2b"),
+      localPhase: "effect_started",
+      staleAuthority: laterAuthority,
+    }));
+    await expectPromiseToReject(world.daemon.mutation(confirmRevokedTerminal, {
+      authority: laterAuthority,
+      commandPublicId: world.uuid("2b"),
+    }));
+    await expectPromiseToReject(world.daemon.mutation(confirmRevokedTerminal, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("2a"),
+    }));
   });
 });

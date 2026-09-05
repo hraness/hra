@@ -95,7 +95,7 @@ No envelope version bump. `requestId`, `command` on `init` and `doctor --offline
 
 ### D8. Docs are generated from one content source, the README is short, and positioning is provider-neutral
 
-`site/content.ts` stays the single source and grows `readme`, `docs`, and `site` targets. HRA is positioned as a control plane for coding-agent subscriptions, Codex today and Claude next, in every description, card, and badge, so the brand does not churn when the second provider lands.
+`site/content.ts` stays the single source and grows `readme`, `docs`, and `site` targets. HRA is positioned as a control plane for coding-agent subscriptions, with Codex on macOS and Linux and Claude Code on Linux, in every description, card, and badge.
 
 ## Workstreams
 
@@ -194,7 +194,7 @@ Current platform decision: D3 admits Claude effects only on Linux. macOS fails c
 
 | # | Tier | Item | Effort | Depends | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| G1 | P0 | README order and thesis: H1, one-sentence thesis, status line, install, hero steps (`site/content.ts:1102`); positioning "control plane for coding-agent subscriptions, Codex today, Claude next" in `package.json` description, JSON-LD, and social card; one sentence on the name and one on the maintainer; em-dash check added to `scripts/public-text-policy.ts` (WRITING.md and STYLE.md already ban them). day-one | S | - | First English sentence is line 3 of the README. |
+| G1 | P0 | README order and thesis: H1, one-sentence thesis, status line, install, hero steps (`site/content.ts:1102`); positioning "control plane for coding-agent subscriptions, Codex on macOS and Linux, Claude Code on Linux" in `package.json` description, JSON-LD, and social card; one sentence on the name and one on the maintainer; em-dash check added to `scripts/public-text-policy.ts` (WRITING.md and STYLE.md already ban them). day-one | S | - | First English sentence is line 3 of the README. |
 | G2 | P0 | Install surface: `bun add -g @hraness/hra@<v>` primary, documented with `--ignore-scripts` or Bun's verified default plus a post-install `hra doctor --offline` that checks the package manifest and empty `scripts`; `bunx @hraness/hra@<v> doctor --offline` to try; verified installer hosted at `hra.sh/install.ts` and documented in `docs/install.md` under "verify this release" with `SHA256SUMS` and the sigstore attestation link. day-one for the docs half | M | - | README install block is one readable line; `llms.txt` no longer starts with an 871-character command. |
 | G3 | P0 | Trust signals: npm version, provenance, CI, license, Bun, and supported-runtimes badges; `CHANGELOG.md` fed by one entry per wave; `docs/roadmap.md`; SECURITY.md supported-versions table; issue templates; CONTRIBUTING.md note on how agent-authored PRs are reviewed; `.well-known/hra.json` version drift fixed. day-one, same owner as G4 | S | - | Present on GitHub and hra.sh. |
 | G4 | P0 | Social card as 1200x630 PNG rendered at build time with `og:image:width/height`; text "HRA · control plane for coding-agent subscriptions · hra.sh". day-one | S | - | Unfurls on X, LinkedIn, Slack, iMessage, Discord. |
@@ -334,7 +334,7 @@ Wave-0 deviations from the plan text: the transport idle timeout is 10 s; the A1
 
 Taken on 2026-09-03: hosted sync goes live (F0) as soon as its two external inputs exist; `release`-class work needs one independent review and no human gate while HRA is a beta; browser key custody is per-tab, memory-only, opt-in persistence, never approver, never first device (F2).
 
-1. Positioning: adopt "control plane for coding-agent subscriptions, Codex today, Claude next" now, so wave 0 copy does not churn at the Claude release.
+1. Positioning: use "control plane for coding-agent subscriptions, Codex on macOS and Linux, Claude Code on Linux" now that the second provider has landed.
 2. Hosted sync operation (F0): switch it on for the owner now, at what cost, run by whom. Without it the web app has no live evidence.
 3. Release-class authority: decided on 2026-09-04. One independent review plus required repository gates and an exact workload identity are sufficient under the standing authority in [Hraness delivery autonomy](delivery-autonomy.md); a second conversational or mutable-variable gate is not required.
 4. Owner dogfood commitment from wave 2b.

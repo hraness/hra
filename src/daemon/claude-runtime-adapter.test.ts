@@ -87,8 +87,10 @@ const settle = async (): Promise<void> => {
 };
 
 const harness = (options: {
+  clientShutdownSettlementMs?: number;
+  clientShutdownTermGraceMs?: number;
   configDirFor?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["configDirFor"];
-  isCurrent?: () => boolean;
+  isCurrent?: (authority: ProfileAuthority) => boolean;
   processFactory?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["processFactory"];
   readAuthStatus?: ClaudeAuthStatusReader;
   resolveRuntime?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["resolveRuntime"];
@@ -97,6 +99,12 @@ const harness = (options: {
   const processes: FakeClaudeProcess[] = [];
   const manager = new PinnedClaudeRuntimeManager({
     configDirFor: options.configDirFor ?? (() => CONFIG_DIR),
+    ...(options.clientShutdownSettlementMs === undefined
+      ? {}
+      : { clientShutdownSettlementMs: options.clientShutdownSettlementMs }),
+    ...(options.clientShutdownTermGraceMs === undefined
+      ? {}
+      : { clientShutdownTermGraceMs: options.clientShutdownTermGraceMs }),
     isCurrent: options.isCurrent ?? (() => true),
     now: () => 1_700_000_000_000,
     observer: { fact: (_authority, fact) => { facts.push(fact); } },
@@ -408,6 +416,214 @@ describe("pinned Claude runtime manager", () => {
     if (child === undefined) throw new Error("Claude child was not launched.");
     await expect(child.exited).resolves.toBe(0);
     await manager.close();
+  });
+
+  test("retains a post-launch authority failure until the exact child can be joined", async () => {
+    const alternateAuthority: ProfileAuthority = {
+      ...authority,
+      codexHome: "/var/hra/profiles/alternate/codex",
+      desktopUserData: "/var/hra/profiles/alternate/desktop",
+      generation: 1,
+      id: "acct_11111111111111111111111111111111",
+    };
+    let current = true;
+    let launches = 0;
+    let forceAttempts = 0;
+    const terminations: string[] = [];
+    let child: FakeClaudeProcess | undefined;
+    const { manager } = harness({
+      clientShutdownSettlementMs: 5,
+      clientShutdownTermGraceMs: 1,
+      isCurrent: (candidate) => candidate.id === alternateAuthority.id || current,
+      processFactory: () => {
+        launches += 1;
+        const process = new FakeClaudeProcess();
+        const exit = process.terminate.bind(process);
+        process.terminate = () => { terminations.push("terminate"); };
+        process.forceTerminate = () => {
+          terminations.push("force");
+          forceAttempts += 1;
+          if (forceAttempts === 2) exit();
+        };
+        child = process;
+        current = false;
+        return process;
+      },
+    });
+    const alternateReview = await manager.reviewSessionStart({
+      authority: alternateAuthority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    const review = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+
+    await expect(manager.startSession({ authority, review, signal: signal() }))
+      .rejects.toThrow("child cleanup was incomplete");
+    expect(launches).toBe(1);
+    expect(terminations).toEqual(["terminate", "force"]);
+
+    await expect(manager.reviewSessionStart({
+      authority: alternateAuthority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toThrow("still unjoined");
+    await expect(manager.startSession({
+      authority: alternateAuthority,
+      review: alternateReview,
+      signal: signal(),
+    })).rejects.toThrow("still unjoined");
+    expect(launches).toBe(1);
+
+    await manager.close();
+    expect(terminations).toEqual(["terminate", "force", "terminate", "force"]);
+    expect(launches).toBe(1);
+    expect(child).toBeDefined();
+    if (child === undefined) throw new Error("Claude child was not launched.");
+    await expect(child.exited).resolves.toBe(0);
+
+    // Once the exact child is joined, close is idempotent and cannot launch or
+    // signal anything new on behalf of the failed session start.
+    await manager.close();
+    expect(terminations).toEqual(["terminate", "force", "terminate", "force"]);
+    expect(launches).toBe(1);
+  });
+
+  test("retains an unjoined session child and retries its exact close before forgetting it", async () => {
+    const terminations: string[] = [];
+    let forceAttempts = 0;
+    const { manager } = harness({
+      clientShutdownSettlementMs: 5,
+      clientShutdownTermGraceMs: 1,
+      processFactory: () => {
+        const process = new FakeClaudeProcess();
+        const exit = process.terminate.bind(process);
+        process.terminate = () => { terminations.push("terminate"); };
+        process.forceTerminate = () => {
+          terminations.push("force");
+          forceAttempts += 1;
+          if (forceAttempts === 2) exit();
+        };
+        return process;
+      },
+    });
+    const providerThreadId = await startSession(manager);
+
+    await expect(manager.endSession({ authority, providerThreadId, signal: signal() }))
+      .rejects.toThrow("could not be joined");
+    await expect(manager.readSession({
+      authority,
+      detail: false,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("cleanup is unresolved");
+
+    await manager.endSession({ authority, providerThreadId, signal: signal() });
+    expect(terminations).toEqual(["terminate", "force", "terminate", "force"]);
+    await expect(manager.readSession({
+      authority,
+      detail: false,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("not running");
+    await manager.close();
+  });
+
+  test("refuses invalid child cleanup bounds before any process can launch", () => {
+    let launches = 0;
+    expect(() => harness({
+      clientShutdownSettlementMs: 0,
+      processFactory: () => {
+        launches += 1;
+        return new FakeClaudeProcess();
+      },
+    })).toThrow("between 1 and 30000 milliseconds");
+    expect(launches).toBe(0);
+  });
+
+  test("retains failed child ownership across manager close and retries it exactly", async () => {
+    const terminations: string[] = [];
+    let forceAttempts = 0;
+    const { manager } = harness({
+      clientShutdownSettlementMs: 5,
+      clientShutdownTermGraceMs: 1,
+      processFactory: () => {
+        const process = new FakeClaudeProcess();
+        const exit = process.terminate.bind(process);
+        process.terminate = () => { terminations.push("terminate"); };
+        process.forceTerminate = () => {
+          terminations.push("force");
+          forceAttempts += 1;
+          if (forceAttempts === 2) exit();
+        };
+        return process;
+      },
+    });
+    await startSession(manager);
+
+    await expect(manager.close()).rejects.toThrow(
+      "One or more Claude session children could not be joined",
+    );
+    await manager.close();
+    expect(terminations).toEqual(["terminate", "force", "terminate", "force"]);
+    await manager.close();
+  });
+
+  test("refuses stale generation authority for exact session cleanup", async () => {
+    const { manager } = harness();
+    const providerThreadId = await startSession(manager);
+
+    await expect(manager.endSession({
+      authority: { ...authority, generation: authority.generation - 1 },
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("another authority");
+    await manager.endSession({ authority, providerThreadId, signal: signal() });
+    await manager.close();
+  });
+
+  test("replays only an exact same-manager close proof and fails closed after restart", async () => {
+    const { manager } = harness();
+
+    await expect(manager.endSession({
+      authority,
+      providerThreadId: "unknown-claude-thread",
+      signal: signal(),
+    })).rejects.toMatchObject({
+      code: "PROCESS_EXITED",
+      message: expect.stringContaining("cleanup cannot be proven"),
+    });
+
+    const providerThreadId = await startSession(manager);
+    await manager.endSession({ authority, providerThreadId, signal: signal() });
+    await manager.endSession({ authority, providerThreadId, signal: signal() });
+    await expect(manager.endSession({
+      authority: { ...authority, generation: authority.generation + 1 },
+      providerThreadId,
+      signal: signal(),
+    }))
+      .rejects.toMatchObject({
+        code: "PROCESS_EXITED",
+        message: expect.stringContaining("cleanup cannot be proven"),
+      });
+    await manager.close();
+
+    const { manager: restarted } = harness();
+    await expect(restarted.endSession({ authority, providerThreadId, signal: signal() }))
+      .rejects.toMatchObject({
+        code: "PROCESS_EXITED",
+        message: expect.stringContaining("cleanup cannot be proven"),
+      });
+    await restarted.close();
   });
 
   test("rechecks account authority after the status subprocess settles", async () => {

@@ -2893,7 +2893,7 @@ export function parseBrokeredCodexServerRequest(input: {
   if (mode === "url") {
     throw new CodexError(
       "UNSUPPORTED_CAPABILITY",
-      "MCP URL elicitation requires a protected browser handoff that HRA 0.5.0 does not expose.",
+      "MCP URL elicitation requires a protected browser handoff that HRA 0.6.0 does not expose.",
     );
   }
   if (mode === "openai/form") throw unsupportedMcpForm();

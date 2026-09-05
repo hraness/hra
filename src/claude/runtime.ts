@@ -48,7 +48,11 @@ export interface ResolvePinnedClaudeRuntimeOptions {
   readonly versionProbeProcessFactory?: ClaudeVersionProbeProcessFactory;
 }
 
-const versionPattern = /\b(\d{1,5}\.\d{1,5}\.\d{1,5})\b/u;
+// Claude Code currently reports either `x.y.z` or `x.y.z (Claude Code)`, with
+// an optional final line ending. The whole output is the attestation: accepting
+// a matching substring would let a wrapper, prerelease, or multi-version line
+// masquerade as the pinned executable.
+const versionOutputPattern = /^(\d{1,5}\.\d{1,5}\.\d{1,5})(?: \(Claude Code\))?\r?\n?$/u;
 const VERSION_PROBE_DEADLINE_MS = 5_000;
 const VERSION_PROBE_STDOUT_MAX_BYTES = 512;
 const VERSION_PROBE_STDERR_MAX_BYTES = 4 * 1024;
@@ -257,7 +261,7 @@ export async function resolvePinnedClaudeRuntime(
       processFactory: options.versionProbeProcessFactory,
     }),
   });
-  const version = versionPattern.exec(reported)?.[1];
+  const version = versionOutputPattern.exec(reported)?.[1];
   if (version === undefined) {
     throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable reported no exact version");
   }

@@ -38,7 +38,12 @@ import {
   accountLoginStartCommand,
   accountLoginStatusCommand,
   admitHostedLoginHandoff,
+  beginAccountLoginAction,
+  completeAccountLoginSubmission,
   deviceCommandNotice,
+  finishAccountLoginHandoff,
+  initialAccountLoginActionState,
+  type AccountLoginActionState,
 } from "../model/device-commands";
 import {
   approvalModeCommand,
@@ -374,7 +379,10 @@ function AccountRow({
   const [commandPublicId, setCommandPublicId] = useState<string | null>(null);
   const [relay, setRelay] = useState<AccountLoginRelayResult | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [loginAction, setLoginAction] = useState<AccountLoginActionState>(
+    initialAccountLoginActionState,
+  );
+  const loginActionRef = useRef<AccountLoginActionState>(initialAccountLoginActionState);
   const consumedCommand = useRef<string | null>(null);
   const readStatusCommand = useRef<string | null>(null);
   const activeCommand = useRef<string | null>(null);
@@ -384,6 +392,18 @@ function AccountRow({
   const localLoginCommand = account.provider === "claude"
     ? `hra account login ${account.publicId} --provider claude`
     : `hra account login ${account.publicId}`;
+  const busy = loginAction.phase !== "idle";
+
+  const updateLoginAction = useCallback((next: AccountLoginActionState) => {
+    loginActionRef.current = next;
+    setLoginAction(next);
+  }, []);
+
+  const releaseLoginHandoff = useCallback((publicId: string) => {
+    const current = loginActionRef.current;
+    const next = finishAccountLoginHandoff(current, publicId);
+    if (next !== current) updateLoginAction(next);
+  }, [updateLoginAction]);
 
   useEffect(() => {
     mounted.current = true;
@@ -413,6 +433,7 @@ function AccountRow({
     consumedCommand.current = command.publicId;
     if (admission.status === "expired_or_invalid") {
       setStatus("This login handoff expired. Start a new login.");
+      releaseLoginHandoff(command.publicId);
       return;
     }
     void consumeResult(
@@ -438,8 +459,32 @@ function AccountRow({
         if (mounted.current && activeCommand.current === command.publicId) {
           setStatus("The machine returned an incompatible login handoff. Update HRA on the machine before trying again.");
         }
+      })
+      .finally(() => {
+        if (mounted.current && activeCommand.current === command.publicId) {
+          releaseLoginHandoff(command.publicId);
+        }
       });
-  }, [command, consumeResult, now, serverClockReady]);
+  }, [command, consumeResult, now, releaseLoginHandoff, serverClockReady]);
+
+  // Failed, cancelled, ambiguous, and hosted-expired starts have no relay to
+  // consume. An applied result consumed by another tab also releases the row,
+  // while this tab's own in-progress exchange retains it through decryption.
+  useEffect(() => {
+    if (
+      command === null
+      || command.kind !== "account_login_start"
+      || !terminalCommandStates.has(command.state)
+    ) return;
+    if (command.state === "applied") {
+      if (command.resultSingleUse && !command.resultConsumed) return;
+      if (consumedCommand.current === command.publicId) return;
+      setStatus(command.resultSingleUse
+        ? "No login handoff was available. It expired or was already read. Start a new login after checking the machine."
+        : "The machine returned a legacy login handoff. Update HRA on the machine before trying again.");
+    }
+    releaseLoginHandoff(command.publicId);
+  }, [command, releaseLoginHandoff]);
 
   // The provider code is short lived. Server-corrected `now` handles clock
   // skew, while the timer removes it from memory at the deadline between ticks.
@@ -480,9 +525,12 @@ function AccountRow({
   }, [command, readResult]);
 
   const run = (payload: Parameters<typeof submitDeviceCommand>[0]["payload"]) => {
-    if (busy) return;
-    setBusy(true);
-    // A later start or status check supersedes any earlier one-time handoff.
+    if (payload.kind !== "account_login_start" && payload.kind !== "account_login_status") return;
+    const next = beginAccountLoginAction(loginActionRef.current, payload.kind);
+    if (next === null) return;
+    updateLoginAction(next);
+    // A new action may replace a completed result, but never an outstanding
+    // one-time handoff: the action gate above holds that command through read.
     activeCommand.current = null;
     setRelay(null);
     setStatus(null);
@@ -491,13 +539,14 @@ function AccountRow({
         if (!mounted.current) return;
         activeCommand.current = publicId;
         setCommandPublicId(publicId);
+        updateLoginAction(completeAccountLoginSubmission(loginActionRef.current, publicId));
       })
       .catch((failure: unknown) => {
         if (mounted.current) {
           setStatus(failure instanceof Error ? failure.message : "The request was not accepted.");
+          updateLoginAction(initialAccountLoginActionState);
         }
-      })
-      .finally(() => { if (mounted.current) setBusy(false); });
+      });
   };
 
   return (
@@ -515,14 +564,16 @@ function AccountRow({
     >
       {account.provider === "codex" && account.accountLinkingAllowed ? (
         <div className="flex flex-wrap items-center gap-2">
-          <Button
-            disabled={busy}
-            onClick={() => { run(accountLoginStartCommand(account.publicId)); }}
-            size="small"
-            variant="secondary"
-          >
-            Link here
-          </Button>
+          {account.status === "signed_out" ? (
+            <Button
+              disabled={busy}
+              onClick={() => { run(accountLoginStartCommand(account.publicId)); }}
+              size="small"
+              variant="secondary"
+            >
+              Link here
+            </Button>
+          ) : null}
           <Button
             disabled={busy}
             onClick={() => { run(accountLoginStatusCommand(account.publicId)); }}

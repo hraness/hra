@@ -58,7 +58,7 @@ export const socialCardLines = (content: PublicContent = publicContent): SocialC
   return {
     commands: [`$ ${start.command}`, `$ ${direct.command}`],
     comment: `# Current source: ${content.providerRoadmap}`,
-    tagline: `Published v${content.releaseVersion}: Codex-only · hra.sh`,
+    tagline: `Release candidate v${content.releaseVersion} · hra.sh`,
     title: content.productName,
   };
 };

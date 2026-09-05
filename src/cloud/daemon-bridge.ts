@@ -1374,6 +1374,9 @@ type CloudDeviceCommand = Readonly<{
   payload: EncryptedEnvelope;
   publicId: string;
   requestingDevicePublicId: string;
+  resultCode?: string;
+  resultConsumed?: boolean;
+  resultSingleUse?: true;
   state: CommandState;
 }>;
 
@@ -1385,10 +1388,12 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
     if (!isRecord(entry)) throw new Error("Cloud device command response is invalid.");
     const optional = [
       "boundAuthority",
+      "requestDigest",
       "result",
       "resultCode",
       "resultConsumed",
       "resultSingleUse",
+      "targetDevicePublicId",
     ].filter((key) => Object.hasOwn(entry, key));
     const boundAuthority = entry.boundAuthority === undefined
       ? undefined
@@ -1414,6 +1419,16 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
       || payload === null
       || !isUuidV7(entry.publicId)
       || !isOpaqueIdentifier(entry.requestingDevicePublicId)
+      || (entry.requestDigest !== undefined && !isDigest(entry.requestDigest))
+      || (entry.result !== undefined && parseEncryptedEnvelope(entry.result) === null)
+      || (entry.resultCode !== undefined
+        && (typeof entry.resultCode !== "string"
+          || !/^[A-Z][A-Z0-9_]{0,63}$/u.test(entry.resultCode)))
+      || (entry.resultConsumed !== undefined && typeof entry.resultConsumed !== "boolean")
+      || (entry.resultSingleUse !== undefined && entry.resultSingleUse !== true)
+      || (entry.resultConsumed !== undefined && entry.resultSingleUse !== true)
+      || (entry.targetDevicePublicId !== undefined
+        && !isOpaqueIdentifier(entry.targetDevicePublicId))
       || state === null
     ) throw new Error("Cloud device command response is invalid.");
     return {
@@ -1424,6 +1439,11 @@ function parseCloudDeviceCommands(value: unknown): readonly CloudDeviceCommand[]
       payload,
       publicId: entry.publicId,
       requestingDevicePublicId: entry.requestingDevicePublicId,
+      ...(typeof entry.resultCode === "string" ? { resultCode: entry.resultCode } : {}),
+      ...(typeof entry.resultConsumed === "boolean"
+        ? { resultConsumed: entry.resultConsumed }
+        : {}),
+      ...(entry.resultSingleUse === true ? { resultSingleUse: true as const } : {}),
       state,
     };
   });
@@ -3887,13 +3907,21 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       abortBeforeEffect(signal);
       try {
         if (entry.phase === "terminal") {
-          await this.#settleDeviceCommand(entry);
+          if (
+            entry.kind === "account_login_start"
+            && entry.terminalState === "applied"
+            && entry.legacyResultMissing === true
+          ) {
+            await this.#quarantineLegacyLoginTerminal(entry, identity);
+          } else {
+            await this.#settleOrConfirmRevokedDeviceCommand(entry);
+          }
           await this.#mutateJournal((state) =>
             removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
           continue;
         }
         if (sameAuthority(entry.authority, this.#deviceCommandAuthority())) continue;
-        await this.#quarantineDeviceCommand(entry);
+        await this.#quarantineDeviceCommand(entry, identity);
       } catch (error: unknown) {
         errors.push(`device command ${entry.commandPublicId}: ${normalizeError(error)}`);
       }
@@ -3964,33 +3992,57 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             throw new Error("Cloud device command kind is inconsistent.");
           }
           await this.#assertDaemonCurrent(signal);
-          outcome = await executor.executeDeviceCommand({
-            idempotencyKey: command.publicId,
-            payload,
-            requestingDevicePublicId: command.requestingDevicePublicId,
-            signal,
-          });
+          outcome = await this.#requestingDeviceActive(command.requestingDevicePublicId)
+            ? await executor.executeDeviceCommand({
+                idempotencyKey: command.publicId,
+                payload,
+                requestingDevicePublicId: command.requestingDevicePublicId,
+                signal,
+              })
+            : { code: "REQUESTING_DEVICE_INACTIVE", state: "failed" };
           if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(outcome.code)) {
             throw new Error("Local device command executor returned an invalid result.");
           }
+          if (
+            (outcome.result !== undefined && outcome.result.kind !== command.kind)
+            || (outcome.singleUseResult === true
+              && (command.kind !== "account_login_start" || outcome.result === undefined))
+            || (command.kind === "account_login_start"
+              && outcome.state === "applied"
+              && (outcome.result === undefined || outcome.singleUseResult !== true))
+          ) throw new Error("Local device command executor returned an invalid result.");
         } catch {
           outcome = { code: "LOCAL_EFFECT_INDETERMINATE", state: "ambiguous" };
         }
-        const resultDigest = await sha256Hex(JSON.stringify({
-          code: outcome.code,
-          result: outcome.result ?? null,
-          state: outcome.state,
-        }));
+        const resultDigest = await hmacSha256Hex(
+          identity.accountKey,
+          "device-command-result",
+          JSON.stringify({
+            code: outcome.code,
+            result: outcome.result ?? null,
+            state: outcome.state,
+          }),
+        );
+        const encryptedResult = outcome.result === undefined
+          ? undefined
+          : await encryptDeviceCommandResult(outcome.result, identity.accountKey, {
+              entityPublicId: command.publicId,
+              keyVersion: identity.keyVersion,
+              kind: "device_command_result",
+              userPublicId: identity.userPublicId,
+            });
         const terminal: CloudDeviceCommandJournalEntry = {
           ...started,
           phase: "terminal",
+          ...(encryptedResult === undefined ? {} : { result: encryptedResult }),
           resultCode: outcome.code,
           resultDigest,
+          ...(outcome.singleUseResult === true ? { singleUseResult: true } : {}),
           terminalState: outcome.state,
         };
         await this.#mutateJournal((state) =>
           transitionCloudDeviceCommandJournalEntry(state, terminal));
-        await this.#settleDeviceCommand(terminal, identity, outcome);
+        await this.#settleOrConfirmRevokedDeviceCommand(terminal);
         await this.#mutateJournal((state) =>
           removeCloudDeviceCommandJournalEntry(state, command.publicId));
         if (outcome.state === "applied") applied += 1;
@@ -4015,30 +4067,50 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
 
   async #settleDeviceCommand(
     entry: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }>,
-    identity?: ActiveCloudIdentity,
-    outcome?: CloudDeviceCommandExecutionResult,
   ): Promise<void> {
-    const encrypted = identity === undefined || outcome?.result === undefined
-      ? undefined
-      : await encryptDeviceCommandResult(outcome.result, identity.accountKey, {
-          entityPublicId: entry.commandPublicId,
-          keyVersion: identity.keyVersion,
-          kind: "device_command_result",
-          userPublicId: identity.userPublicId,
-        });
     await this.#mutation("deviceCommands:settle", {
       authority: entry.authority,
       commandPublicId: entry.commandPublicId,
-      ...(encrypted === undefined ? {} : { result: encrypted }),
+      ...(entry.result === undefined ? {} : { result: entry.result }),
       resultCode: entry.resultCode,
       resultDigest: entry.resultDigest,
-      ...(outcome?.singleUseResult === true ? { singleUseResult: true } : {}),
+      ...(entry.singleUseResult === true ? { singleUseResult: true } : {}),
       state: entry.terminalState,
     });
   }
 
+  async #settleOrConfirmRevokedDeviceCommand(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }>,
+  ): Promise<void> {
+    try {
+      await this.#settleDeviceCommand(entry);
+      return;
+    } catch (settleError: unknown) {
+      try {
+        const confirmed = await this.#mutation("deviceCommands:confirmRevokedTerminal", {
+          authority: entry.authority,
+          commandPublicId: entry.commandPublicId,
+        });
+        if (
+          !isRecord(confirmed)
+          || confirmed.publicId !== entry.commandPublicId
+          || confirmed.replay !== true
+          || confirmed.state !== "ambiguous"
+        ) throw new Error("Cloud device command revocation confirmation is invalid.");
+        return;
+      } catch {
+        // Settlement remains the authoritative error unless the server proves
+        // the exact result-less revocation terminal. Network failure, a
+        // different terminal result, or an authority mismatch all retain the
+        // local journal for a later exact replay.
+        throw settleError;
+      }
+    }
+  }
+
   async #quarantineDeviceCommand(
     entry: Extract<CloudDeviceCommandJournalEntry, { phase: "prepared" | "effect_started" }>,
+    identity: ActiveCloudIdentity,
   ): Promise<void> {
     // `prepared` never began an effect, so it is honestly a failure. An
     // `effect_started` entry may have created a session; the only truthful
@@ -4047,21 +4119,107 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     const resultCode = entry.phase === "prepared"
       ? "LOCAL_AUTHORITY_CHANGED_BEFORE_EFFECT"
       : "LOCAL_EFFECT_RECOVERY_REQUIRED";
-    const resultDigest = await sha256Hex(JSON.stringify({
-      code: resultCode,
-      result: null,
-      state: terminalState,
-    }));
+    const resultDigest = await hmacSha256Hex(
+      identity.accountKey,
+      "device-command-result",
+      JSON.stringify({ code: resultCode, result: null, state: terminalState }),
+    );
+    const localPhase = entry.phase === "prepared" ? "prepared_no_effect" as const : "effect_started" as const;
+    try {
+      const recovered = await this.#mutation("deviceCommands:recoverEffectStarted", {
+        commandPublicId: entry.commandPublicId,
+        localPhase,
+        recoveryAuthority: this.#deviceCommandAuthority(),
+        resultCode,
+        resultDigest,
+        staleAuthority: entry.authority,
+        state: terminalState,
+      });
+      if (
+        !isRecord(recovered)
+        || recovered.publicId !== entry.commandPublicId
+        || typeof recovered.replay !== "boolean"
+        || recovered.state !== terminalState
+      ) throw new Error("Cloud device command recovery response is invalid.");
+    } catch (recoveryError: unknown) {
+      try {
+        const confirmed = await this.#mutation("deviceCommands:confirmTerminalRecovery", {
+          commandPublicId: entry.commandPublicId,
+          localPhase,
+          staleAuthority: entry.authority,
+        });
+        const confirmedState = isRecord(confirmed) ? confirmed.state : undefined;
+        const stateMatches = confirmedState === "cancelled"
+          || confirmedState === "expired"
+          || (localPhase === "effect_started" && confirmedState === "ambiguous");
+        if (
+          !isRecord(confirmed)
+          || confirmed.publicId !== entry.commandPublicId
+          || confirmed.replay !== true
+          || !stateMatches
+        ) throw new Error("Cloud device command terminal recovery confirmation is invalid.");
+      } catch {
+        // A query result is not enough to retire durable effect evidence. If the
+        // server cannot prove the exact result-less terminal, preserve the
+        // journal and the original recovery error for another cycle.
+        throw recoveryError;
+      }
+    }
+    await this.#mutateJournal((state) =>
+      removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
+  }
+
+  async #quarantineLegacyLoginTerminal(
+    entry: Extract<CloudDeviceCommandJournalEntry, { phase: "terminal" }>,
+    identity: ActiveCloudIdentity,
+  ): Promise<void> {
+    const remoteValue = await this.#transport.query("deviceCommands:get", {
+      commandPublicId: entry.commandPublicId,
+    });
+    const remote = parseCloudDeviceCommands(remoteValue === null ? [] : [remoteValue])[0];
+    if (
+      remote === undefined
+      || remote.publicId !== entry.commandPublicId
+      || remote.kind !== "account_login_start"
+    ) throw new Error("Cloud device command recovery response is invalid.");
+    if (remote.state === "applied") {
+      if (
+        remote.resultCode !== entry.resultCode
+        || remote.resultSingleUse !== true
+        || remote.resultConsumed === undefined
+      ) throw new Error("Cloud device command legacy result is unavailable.");
+      await this.#settleDeviceCommand(entry);
+      return;
+    }
+    if (remote.state === "ambiguous") {
+      const confirmed = await this.#mutation("deviceCommands:confirmRevokedTerminal", {
+        authority: entry.authority,
+        commandPublicId: entry.commandPublicId,
+      });
+      if (
+        !isRecord(confirmed)
+        || confirmed.publicId !== entry.commandPublicId
+        || confirmed.replay !== true
+        || confirmed.state !== "ambiguous"
+      ) throw new Error("Cloud device command revocation confirmation is invalid.");
+      return;
+    }
+    const resultCode = "LOCAL_RESULT_RECOVERY_REQUIRED";
+    const terminalState = "ambiguous" as const;
+    const resultDigest = await hmacSha256Hex(
+      identity.accountKey,
+      "device-command-result",
+      JSON.stringify({ code: resultCode, result: null, state: terminalState }),
+    );
     await this.#mutation("deviceCommands:recoverEffectStarted", {
       commandPublicId: entry.commandPublicId,
+      localPhase: "effect_started",
       recoveryAuthority: this.#deviceCommandAuthority(),
       resultCode,
       resultDigest,
       staleAuthority: entry.authority,
       state: terminalState,
     });
-    await this.#mutateJournal((state) =>
-      removeCloudDeviceCommandJournalEntry(state, entry.commandPublicId));
   }
 
   async #processCommands(

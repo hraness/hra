@@ -405,6 +405,11 @@ describe("device command payloads", () => {
   test("a relayed device-code handoff has a safe URL and a closed user code", () => {
     expect(isRelayedLoginUrl("https://auth.example.test/device")).toBe(true);
     expect(isRelayedLoginUrl("http://localhost:1455/callback")).toBe(false);
+    expect(isRelayedLoginUrl("https://localhost/callback")).toBe(false);
+    expect(isRelayedLoginUrl("https://localhost./callback")).toBe(false);
+    expect(isRelayedLoginUrl("https://127.0.0.2/callback")).toBe(false);
+    expect(isRelayedLoginUrl("https://[::1]/callback")).toBe(false);
+    expect(isRelayedLoginUrl("https://[::ffff:127.0.0.1]/callback")).toBe(false);
     expect(isRelayedLoginUrl("https://user:pass@auth.example.test/")).toBe(false);
     expect(isRelayedLoginUrl("javascript:alert(1)")).toBe(false);
     expect(isRelayedLoginUrl(

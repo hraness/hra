@@ -26,11 +26,11 @@ import { finished } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 
 export const HRA_INSTALL_BUN_VERSION = "1.3.14";
-export const HRA_INSTALL_CLI_SHA256 = "b9666bf2b8eea6e1d877ea74a79b30c5a2921f79542353943f839b528c410077";
+export const HRA_INSTALL_CLI_SHA256 = "73330d576ee456dddcae0e2e5f72e4fd5ee09cc7e21f20e5f1c531a81aa309fb";
 
 const expectedPackageName = "@hraness/hra";
-const expectedPackageVersion = "0.5.0";
-const expectedArchiveUrl = "https://github.com/hraness/hra/releases/download/v0.5.0/hraness-hra-0.5.0.tgz";
+const expectedPackageVersion = "0.6.0";
+const expectedArchiveUrl = "https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz";
 const cliRelativePath = join("src", "cli.ts");
 const cliMaximumBytes = 512 * 1024;
 const manifestMaximumBytes = 64 * 1024;
@@ -1136,7 +1136,7 @@ type ArchiveIdentityBase = Readonly<{
 type OfficialArchiveIdentity = ArchiveIdentityBase & Readonly<{
   archiveAssetId: number;
   archiveReleaseId: number;
-  archiveReleaseTag: "v0.5.0";
+  archiveReleaseTag: "v0.6.0";
   archiveRepositoryId: 1_343_008_607;
   archiveSource: "official";
 }>;
@@ -1169,7 +1169,7 @@ type InstallCompleteReceipt = InstallArchiveIdentity & Readonly<{
   id: string;
   normalizerSha256: string;
   packageName: "@hraness/hra";
-  packageVersion: "0.5.0";
+  packageVersion: "0.6.0";
   totalBytes: number;
   treeSha256: string;
   version: 2;
@@ -1222,14 +1222,14 @@ const parseArchiveIdentity = (value: Record<string, unknown>): InstallArchiveIde
       || typeof value.archiveReleaseId !== "number"
       || !Number.isSafeInteger(value.archiveReleaseId)
       || value.archiveReleaseId < 1
-      || value.archiveReleaseTag !== "v0.5.0"
+      || value.archiveReleaseTag !== "v0.6.0"
       || value.archiveRepositoryId !== 1_343_008_607
     ) throw new InstallNormalizationError("The durable HRA official archive identity is invalid.");
     return {
       archiveAssetId: value.archiveAssetId,
       archiveBytes: value.archiveBytes,
       archiveReleaseId: value.archiveReleaseId,
-      archiveReleaseTag: "v0.5.0",
+      archiveReleaseTag: "v0.6.0",
       archiveRepositoryId: 1_343_008_607,
       archiveSha256: value.archiveSha256,
       archiveSource: "official",
@@ -1963,7 +1963,7 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
     throw new InstallNormalizationError("The staged HRA normalizer identity is invalid.");
   }
   const expectedVersionName = [
-    "v0.5.0",
+    "v0.6.0",
     archiveIdentity.archiveSource,
     archiveIdentity.archiveSha256,
     input.normalizerSha256,
@@ -2026,7 +2026,7 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
       id: input.intentId,
       normalizerSha256: input.normalizerSha256,
       packageName: "@hraness/hra",
-      packageVersion: "0.5.0",
+      packageVersion: "0.6.0",
       totalBytes: normalizedTree.totalBytes,
       treeSha256: normalizedTree.treeSha256,
       version: 2,

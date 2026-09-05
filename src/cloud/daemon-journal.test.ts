@@ -38,6 +38,7 @@ import {
   type CloudProjectionRecoveryTerminalReceipt,
   type LegacyCloudDaemonJournalState,
   type LegacyCloudDaemonJournalV2State,
+  type LegacyCloudDaemonJournalV4State,
   type LegacyCloudProjectionRecoveryJournalEntry,
   type PendingCloudUsageAccount,
 } from "./daemon-journal";
@@ -151,7 +152,7 @@ function stateWith(
     projectionRecoveries,
     projectionRecoveryReceipts,
     usageAccounts: [],
-    version: 4,
+    version: 5,
   };
 }
 
@@ -266,7 +267,7 @@ function legacyJournalAtCanonicalBytes(targetBytes: number): LegacyCloudDaemonJo
     projectionRecoveries: [],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   const metadataCharacters = metadataCiphertextCharactersForTarget(targetBytes, canonical);
   const state = canonical(metadataCharacters);
@@ -294,7 +295,7 @@ function journalAtBytesWithProviderThread(
     projectionRecoveries: [adjusted],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   return build(metadataCiphertextCharactersForTarget(targetBytes, build));
 }
@@ -308,7 +309,7 @@ function journalAtBytesWithReceipt(targetBytes: number): CloudDaemonJournalState
     projectionRecoveries: [],
     projectionRecoveryReceipts: [completed],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   return build(metadataCiphertextCharactersForTarget(targetBytes, build));
 }
@@ -344,7 +345,7 @@ function journalBeforeRecoveryAtAppliedBytes(
     projectionRecoveries: [applied],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   const metadataCharacters = metadataCiphertextCharactersForTarget(
     targetBytes,
@@ -386,7 +387,7 @@ function journalBeforeCommandAtTerminalBytes(
     projectionRecoveries: [],
     projectionRecoveryReceipts: [],
     usageAccounts: [],
-    version: 4,
+    version: 5,
   });
   const metadataCharacters = metadataCiphertextCharactersForTarget(
     targetBytes,
@@ -482,8 +483,48 @@ describe("cloud daemon journal", () => {
       projectionRecoveries: [],
       projectionRecoveryReceipts: [],
       usageAccounts: legacy.usageAccounts,
-      version: 4,
+      version: 5,
     });
+  });
+
+  test("marks a v4 applied login without ciphertext for exact remote reconciliation", () => {
+    const legacy: LegacyCloudDaemonJournalV4State = {
+      commands: [],
+      deviceCommands: [{
+        authority: { bootGeneration: 2, bootId: "boot_12345678", fence: 1 },
+        commandPublicId: uuidV7(102),
+        kind: "account_login_start",
+        payloadDigest: digest("a"),
+        phase: "terminal",
+        requestingDevicePublicId: "device_browser1",
+        resultCode: "APPLIED",
+        resultDigest: digest("b"),
+        terminalState: "applied",
+      }],
+      pendingUsageAccount: null,
+      projectionRecoveries: [],
+      projectionRecoveryReceipts: [],
+      usageAccounts: [],
+      version: 4,
+    };
+
+    const migrated = parseCloudDaemonJournal(legacy);
+    expect(migrated.version).toBe(5);
+    expect(migrated.deviceCommands).toEqual([{
+      authority: { bootGeneration: 2, bootId: "boot_12345678", fence: 1 },
+      commandPublicId: uuidV7(102),
+      kind: "account_login_start",
+      legacyResultMissing: true,
+      payloadDigest: digest("a"),
+      phase: "terminal",
+      requestingDevicePublicId: "device_browser1",
+      resultCode: "APPLIED",
+      resultDigest: digest("b"),
+      terminalState: "applied",
+    }]);
+    expect(() => parseCloudDaemonJournal({ ...legacy, version: 5 })).toThrow(
+      "Cloud daemon journal is corrupt.",
+    );
   });
 
   test("round-trips every active recovery phase and bounded baseline length", () => {
@@ -710,7 +751,7 @@ describe("cloud daemon journal", () => {
     fc.assert(fc.property(fc.jsonValue(), (value) => {
       try {
         const parsed = parseCloudDaemonJournal(value);
-        expect(parsed.version).toBe(4);
+        expect(parsed.version).toBe(5);
         expect(parseCloudDaemonJournal(jsonClone(parsed))).toEqual(parsed);
       } catch (error: unknown) {
         expect(error).toBeInstanceOf(Error);
@@ -742,7 +783,7 @@ describe("cloud daemon journal", () => {
     };
 
     const migrated = parseCloudDaemonJournal(legacy);
-    expect(migrated.version).toBe(4);
+    expect(migrated.version).toBe(5);
     expect(migrated.projectionRecoveries).toHaveLength(2);
     expect(migrated.projectionRecoveryReceipts).toHaveLength(2);
     expect(migrated.projectionRecoveries.every((entry) =>
@@ -1159,7 +1200,7 @@ describe("cloud daemon journal", () => {
     const atLimitCanonical = parseCloudDaemonJournal(atLimitLegacy);
 
     expect(atLimitLegacy.version).toBe(1);
-    expect(atLimitCanonical.version).toBe(4);
+    expect(atLimitCanonical.version).toBe(5);
     expect(serializedUtf8Bytes(atLimitCanonical)).toBe(productionCustodyMaximumBytes);
 
     const committed = await journal.compareAndSwap(null, atLimitLegacy);
@@ -1189,7 +1230,7 @@ describe("cloud daemon journal", () => {
     );
     const observed = await journal.read();
     expect(observed.generation).toBe(11);
-    expect(observed.state.version).toBe(4);
+    expect(observed.state.version).toBe(5);
     expect(serializedUtf8Bytes(observed.state)).toBeGreaterThan(
       productionCustodyMaximumBytes,
     );
@@ -1210,7 +1251,7 @@ describe("cloud daemon journal", () => {
     const migrated = JSON.parse(
       (await custody.read("cloud-daemon-journal"))?.value ?? "null",
     ) as { version?: unknown };
-    expect(migrated.version).toBe(4);
+    expect(migrated.version).toBe(5);
 
     const oversizedRaw = JSON.stringify(
       legacyJournalAtRawBytes(productionCustodyMaximumBytes + 1),
@@ -1232,7 +1273,7 @@ describe("cloud daemon journal", () => {
     const journal = new CustodyCloudDaemonJournal(custody);
 
     const observed = await journal.read();
-    expect(observed.state.version).toBe(4);
+    expect(observed.state.version).toBe(5);
     expect(observed.state.projectionRecoveries).toHaveLength(1);
     expect(serializedUtf8Bytes(observed.state)).toBeGreaterThan(
       productionCustodyMaximumBytes,

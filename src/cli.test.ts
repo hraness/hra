@@ -110,11 +110,22 @@ class CliClaudeLoginSignalSource implements ClaudeLoginSignalSource {
 
 // An install written by an older HRA build: the newest migration row is gone and
 // `user_version` still names the schema that build stamped. The migration code
-// still supports 33, so a writable open must carry it forward to 34.
+// still supports 34, so a writable open must carry it forward to 35.
 const downgradeStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("DELETE FROM migrations WHERE version=34; PRAGMA user_version=33");
+    database.exec(`
+      PRAGMA foreign_keys=OFF;
+      DROP TABLE session_provider_switch_source_releases;
+      DROP TABLE session_provider_switch_seed_results;
+      DROP TABLE session_provider_switch_seed_intents;
+      DROP TABLE session_provider_switch_target_releases;
+      DROP TABLE session_provider_switch_targets;
+      DROP TABLE session_mutation_authority_rebinds;
+      DELETE FROM migrations WHERE version=35;
+      PRAGMA user_version=34;
+      PRAGMA foreign_keys=ON;
+    `);
   } finally {
     database.close(false);
   }
@@ -125,7 +136,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=35");
+    database.exec("PRAGMA user_version=36");
   } finally {
     database.close(false);
   }
@@ -1500,7 +1511,7 @@ describe("CLI entry point", () => {
         ok: true,
         version: 1,
         command: "version",
-        data: { version: "0.5.0" },
+        data: { version: "0.6.0" },
       });
       expect(version.read().stderr).toBe("");
     }
@@ -2199,7 +2210,7 @@ describe("CLI entry point", () => {
   test("version is sourced from package metadata", async () => {
     const captured = capture();
     expect(await main(["--version"], captured.output)).toBe(0);
-    expect(captured.read()).toEqual({ stdout: "hra 0.5.0\n", stderr: "" });
+    expect(captured.read()).toEqual({ stdout: "hra 0.6.0\n", stderr: "" });
   });
 
   test("completes protected interaction input outside argv and never renders its value", async () => {
@@ -3204,7 +3215,7 @@ describe("CLI entry point", () => {
         },
       ]);
       expect(loginConfigDir).toBe(join(installation.paths.profiles, accountId, "claude-config"));
-      expect(preflights).toBe(1);
+      expect(preflights).toBe(2);
       expect((await lstat(loginConfigDir)).mode & 0o077).toBe(0);
       expect(captured.read()).toEqual({
         stderr: "",
@@ -3212,6 +3223,101 @@ describe("CLI entry point", () => {
       });
     } finally {
       await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects incoherent Claude authentication and login response states", async () => {
+    const cases = [
+      { phase: "prepare", loginStatus: "signed_in", signedIn: false },
+      { phase: "prepare", loginStatus: "launch_granted", signedIn: true },
+      { phase: "complete", loginStatus: "signed_in", signedIn: false },
+      { phase: "complete", loginStatus: "signed_out", signedIn: true },
+    ] as const;
+    for (const [index, scenario] of cases.entries()) {
+      const { installation, runRoot } = await upgradeFixture(`claude-login-incoherent-${index}`);
+      const accountId = `acct_${String(index + 3).repeat(32)}` as const;
+      const attemptId = `attempt_${String(index + 3).repeat(32)}` as const;
+      const idempotencyKey = `00000000-0000-4000-8000-00000000030${index + 2}`;
+      const captured = capture();
+      let foregroundCalls = 0;
+      try {
+        expect(await main([
+          "account", "login", accountId, "--provider", "claude", "--idempotency-key", idempotencyKey,
+        ], captured.output, {
+          installation,
+          interactive: true,
+          isTerminalDescriptor: () => true,
+          resolveClaudeRuntime: async () => cliClaudeRuntime,
+          runClaudeForegroundLogin: async () => {
+            foregroundCalls += 1;
+            return { state: "joined", exitCode: 0, interruptedBy: null };
+          },
+          callDaemon: async (command) => {
+            if (command.kind === "account.show") return {
+              data: {
+                account: { id: accountId, label: "Incoherent" },
+                authentication: { provider: "claude", signedIn: false },
+                nextCommand: `hra account login ${accountId} --provider claude`,
+                providerGeneration: 7,
+              },
+              ok: true as const,
+              requestId: crypto.randomUUID(),
+              version: 1 as const,
+            };
+            if (command.kind === "account.claude-login.prepare") {
+              if (scenario.phase === "prepare") return {
+                data: {
+                  account: { id: accountId, label: "Incoherent" },
+                  authentication: { provider: "claude", signedIn: scenario.signedIn },
+                  login: scenario.loginStatus === "signed_in"
+                    ? { status: "signed_in" as const }
+                    : {
+                        status: "launch_granted" as const,
+                        attemptId,
+                        idempotencyKey,
+                        providerGeneration: 7,
+                      },
+                },
+                ok: true as const,
+                requestId: crypto.randomUUID(),
+                version: 1 as const,
+              };
+              return {
+                data: {
+                  account: { id: accountId, label: "Incoherent" },
+                  authentication: { provider: "claude", signedIn: false },
+                  login: { status: "launch_granted", attemptId, idempotencyKey, providerGeneration: 7 },
+                },
+                ok: true as const,
+                requestId: crypto.randomUUID(),
+                version: 1 as const,
+              };
+            }
+            if (scenario.phase !== "complete" || command.kind !== "account.claude-login.complete") {
+              throw new Error("Unexpected command.");
+            }
+            return {
+              data: {
+                account: { id: accountId, label: "Incoherent" },
+                authentication: { provider: "claude", signedIn: scenario.signedIn },
+                login: {
+                  status: scenario.loginStatus,
+                  attemptId,
+                  idempotencyKey,
+                  providerGeneration: 7,
+                },
+              },
+              ok: true as const,
+              requestId: crypto.randomUUID(),
+              version: 1 as const,
+            };
+          },
+        })).toBe(7);
+        expect(foregroundCalls).toBe(scenario.phase === "complete" ? 1 : 0);
+        expect(captured.read().stderr).toContain("sameKeyReplayCommand");
+      } finally {
+        await rm(runRoot, { force: true, recursive: true });
+      }
     }
   });
 
@@ -3486,6 +3592,89 @@ describe("CLI entry point", () => {
           };
         },
       })).toBe(6);
+      expect(foregroundCalls).toBe(0);
+      expect(commands.at(-1)).toMatchObject({
+        kind: "account.claude-login.complete",
+        outcome: { state: "not_started", reason: "preflight_stale" },
+      });
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("revalidates the exact Claude executable after the launch grant before spawn", async () => {
+    const { installation, runRoot } = await upgradeFixture("claude-post-grant-runtime-swap");
+    const accountId = `acct_${"e".repeat(32)}` as const;
+    const attemptId = `attempt_${"f".repeat(32)}` as const;
+    const key = "00000000-0000-4000-8000-000000000319";
+    const commands: LocalCommand[] = [];
+    let runtimeChecks = 0;
+    let foregroundCalls = 0;
+    const captured = capture();
+    try {
+      expect(await main([
+        "account", "login", accountId, "--provider", "claude", "--idempotency-key", key,
+      ], captured.output, {
+        installation,
+        interactive: true,
+        isTerminalDescriptor: () => true,
+        resolveClaudeRuntime: async () => {
+          runtimeChecks += 1;
+          if (runtimeChecks === 2) {
+            throw new ClaudeError("RUNTIME_MISMATCH", "Claude executable changed");
+          }
+          return cliClaudeRuntime;
+        },
+        runClaudeForegroundLogin: async () => {
+          foregroundCalls += 1;
+          return { state: "joined", exitCode: 0, interruptedBy: null };
+        },
+        callDaemon: async (command) => {
+          commands.push(command);
+          if (command.kind === "account.show") return {
+            data: {
+              account: { id: accountId, label: "Runtime swap" },
+              authentication: { provider: "claude", signedIn: false },
+              nextCommand: `hra account login ${accountId} --provider claude`,
+              providerGeneration: 4,
+            },
+            ok: true as const,
+            requestId: crypto.randomUUID(),
+            version: 1 as const,
+          };
+          if (command.kind === "account.claude-login.prepare") return {
+            data: {
+              account: { id: accountId, label: "Runtime swap" },
+              authentication: { provider: "claude", signedIn: false },
+              login: {
+                status: "launch_granted",
+                attemptId,
+                idempotencyKey: key,
+                providerGeneration: 4,
+              },
+            },
+            ok: true as const,
+            requestId: crypto.randomUUID(),
+            version: 1 as const,
+          };
+          return {
+            data: {
+              account: { id: accountId, label: "Runtime swap" },
+              authentication: { provider: "claude", signedIn: false },
+              login: {
+                status: "signed_out",
+                attemptId,
+                idempotencyKey: key,
+                providerGeneration: 4,
+              },
+            },
+            ok: true as const,
+            requestId: crypto.randomUUID(),
+            version: 1 as const,
+          };
+        },
+      })).toBe(6);
+      expect(runtimeChecks).toBe(2);
       expect(foregroundCalls).toBe(0);
       expect(commands.at(-1)).toMatchObject({
         kind: "account.claude-login.complete",
@@ -5341,7 +5530,7 @@ describe("CLI entry point", () => {
       const initialized = capture();
       expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
       downgradeStateSchema(installation.paths.database);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(33);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(34);
 
       const started = capture();
       expect(await main(["daemon", "start", "--json"], started.output, input)).toBe(0);
@@ -5353,7 +5542,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(34);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(35);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5377,13 +5566,13 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (33 to 34); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (34 to 35); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
-      expect(stateSchemaVersion(installation.paths.database)).toBe(33);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(34);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5409,14 +5598,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (35 vs 34); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (36 vs 35); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(35);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(36);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5438,7 +5627,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (33 to 34). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (34 to 35). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -5465,7 +5654,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (35 vs 34). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (36 vs 35). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });

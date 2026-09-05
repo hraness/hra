@@ -5,7 +5,6 @@ import {
   readClaudeAuthStatus,
   runClaudeForegroundLogin,
   type ClaudeAuthStatusProcess,
-  type ClaudeForegroundLoginProcess,
   type ClaudeLoginSignal,
   type ClaudeLoginSignalSource,
 } from "./auth";
