@@ -14232,7 +14232,7 @@ describe("StateStore", () => {
     expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
       expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
         id: 7,
         path: "protocol",
