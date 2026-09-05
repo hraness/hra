@@ -371,6 +371,9 @@ export default defineSchema({
     // stamps this, so a second read can prove the result is spent rather than
     // absent.
     resultConsumedAt: v.optional(v.number()),
+    // Server-owned hosted deadline for an unread single-use login handoff.
+    // Consumption or maintenance clears it together with `result`.
+    resultExpiresAt: v.optional(v.number()),
     result: v.optional(encryptedEnvelope),
     resultCode: v.optional(v.string()),
     resultDigest: v.optional(v.string()),
@@ -388,6 +391,11 @@ export default defineSchema({
     .index("by_requesting_device_and_nonterminal", ["requestingDeviceId", "nonterminal", "createdAt"])
     .index("by_state_and_deadline", ["state", "deadline"])
     .index("by_state_and_cleanup_after", ["state", "terminalCleanupAfter"])
+    .index("by_single_use_result_expiry", [
+      "resultSingleUse",
+      "resultConsumedAt",
+      "resultExpiresAt",
+    ])
     .index("by_idempotency", [
       "userId",
       "targetDeviceId",

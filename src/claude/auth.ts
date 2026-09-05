@@ -370,7 +370,7 @@ export function parseClaudeAuthStatus(input: Readonly<{
   return { signedIn: coherentSignedIn };
 }
 
-/** Runs the exact pinned CLI status command inside one isolated Claude home. */
+/** Runs the version-admitted CLI status command inside one isolated Claude home. */
 export async function readClaudeAuthStatus(
   options: ReadClaudeAuthStatusOptions,
 ): Promise<ClaudeAuthAccountProjection> {

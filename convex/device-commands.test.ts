@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import { makeFunctionReference } from "convex/server";
 import type { Value } from "convex/values";
 import { convexTest } from "convex-test";
@@ -7,6 +7,7 @@ import { expectPromiseToReject } from "../src/cloud/testAssertions";
 import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
 import {
   initializeUserQuotaAuthority,
+  logicalDocumentBytes,
   reserveQuotaForStoredIdentity,
 } from "./quota";
 import schema from "./schema";
@@ -41,6 +42,9 @@ const cancelPending = makeFunctionReference<"mutation", Args, unknown>(
 );
 const consumeResult = makeFunctionReference<"mutation", Args, unknown>(
   "deviceCommands:consumeResult",
+);
+const expireLoginResult = makeFunctionReference<"mutation", Args, unknown>(
+  "maintenance:expireDeviceCommandLoginResult",
 );
 const getCommand = makeFunctionReference<"query", Args, unknown>("deviceCommands:get");
 const listPending = makeFunctionReference<"query", Args, unknown>(
@@ -480,6 +484,17 @@ describe("device commands", () => {
       resultDigest: "a".repeat(64),
       state: "applied",
     }));
+    // A ciphertext-bearing handoff is never valid evidence for a failed or
+    // ambiguous login terminal.
+    await expectPromiseToReject(world.daemon.mutation(settle, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("28"),
+      result: resultEnvelope,
+      resultCode: "FAILED",
+      resultDigest: "a".repeat(64),
+      singleUseResult: true,
+      state: "failed",
+    }));
     await world.daemon.mutation(settle, {
       authority: daemonAuthority,
       commandPublicId: world.uuid("28"),
@@ -560,7 +575,7 @@ describe("device commands", () => {
         .unique());
       if (row === null) throw new Error("missing device command fixture");
       await ctx.db.patch(row._id, {
-        updatedAt: Date.now() - deviceCommandLoginResultLifetimeMs,
+        resultExpiresAt: Date.now() - 1,
       });
     });
 
@@ -570,6 +585,116 @@ describe("device commands", () => {
       .toMatchObject({ status: "spent" });
     expect(await world.browser.query(getCommand, { commandPublicId: world.uuid("38") }))
       .toMatchObject({ resultConsumed: true, resultSingleUse: true });
+  });
+
+  test("scheduled expiry erases an unattended login handoff exactly once", async () => {
+    const world = await deviceCommandWorld();
+    await world.enqueueFrom(world.browser, {
+      kind: "account_login_start",
+      publicId: world.uuid("39"),
+    });
+    await world.daemon.mutation(prepare, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("39"),
+      localPhase: "prepared_no_effect",
+    });
+    await world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("39"),
+    });
+
+    const accounting = async () => await world.testRuntime.run(async (ctx) => {
+      const rows = await ctx.db.query("deviceCommands")
+        .withIndex("by_user", (builder) => builder.eq("userId", world.ids.userId))
+        .collect();
+      const row = rows.find((candidate) => candidate.publicId === world.uuid("39"));
+      const commandQuota = await ctx.db.query("storageUsageByUser")
+        .withIndex("by_user_and_category", (builder) => builder
+          .eq("userId", world.ids.userId)
+          .eq("category", "command"))
+        .unique();
+      const service = await ctx.db.query("storageUsageService")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .unique();
+      if (row === undefined || commandQuota === null || service === null) {
+        throw new Error("missing login-result accounting fixture");
+      }
+      const chargedRows = rows.map((document) => Object.fromEntries(
+        Object.entries(document).filter(([key]) => key !== "_creationTime" && key !== "_id"),
+      ) as Readonly<Record<string, Value>>);
+      return {
+        commandBytes: commandQuota.logicalBytes,
+        expectedCommandBytes: chargedRows.reduce(
+          (total, document) => total + logicalDocumentBytes(document),
+          0,
+        ),
+        result: row.result,
+        resultConsumedAt: row.resultConsumedAt,
+        resultExpiresAt: row.resultExpiresAt,
+        rowBytes: logicalDocumentBytes(chargedRows.find(
+          (document) => document.publicId === world.uuid("39"),
+        ) ?? {}),
+        serviceUserBytes: service.userLogicalBytes,
+      };
+    });
+
+    jest.useFakeTimers();
+    try {
+      const settledAt = Date.now();
+      await world.daemon.mutation(settle, {
+        authority: daemonAuthority,
+        commandPublicId: world.uuid("39"),
+        result: resultEnvelope,
+        resultCode: "APPLIED",
+        resultDigest: "f".repeat(64),
+        singleUseResult: true,
+        state: "applied",
+      });
+      const before = await accounting();
+      expect(before.result).toEqual(resultEnvelope);
+      expect(before.resultConsumedAt).toBeUndefined();
+      expect(before.resultExpiresAt).toBe(settledAt + deviceCommandLoginResultLifetimeMs);
+      expect(before.commandBytes).toBe(before.expectedCommandBytes);
+
+      // A stale job for the right row but a different deadline has no authority.
+      expect(await world.testRuntime.mutation(expireLoginResult, {
+        commandPublicId: world.uuid("39"),
+        resultExpiresAt: (before.resultExpiresAt as number) + 1,
+      })).toEqual({ status: "retired" });
+      expect((await accounting()).result).toEqual(resultEnvelope);
+
+      await world.testRuntime.finishAllScheduledFunctions(() => { jest.runAllTimers(); }, 10);
+      const erased = await accounting();
+      expect(erased.result).toBeUndefined();
+      expect(erased.resultConsumedAt).toBeNumber();
+      expect(erased.resultExpiresAt).toBeUndefined();
+      expect(erased.commandBytes).toBe(erased.expectedCommandBytes);
+      const releasedBytes = before.rowBytes - erased.rowBytes;
+      expect(releasedBytes).toBeGreaterThan(0);
+      expect(before.commandBytes - erased.commandBytes).toBe(releasedBytes);
+      expect(before.serviceUserBytes - erased.serviceUserBytes).toBe(releasedBytes);
+
+      expect(await world.browser.mutation(consumeResult, { commandPublicId: world.uuid("39") }))
+        .toEqual({ publicId: world.uuid("39"), status: "spent" });
+      expect(await world.daemon.mutation(settle, {
+        authority: daemonAuthority,
+        commandPublicId: world.uuid("39"),
+        result: resultEnvelope,
+        resultCode: "APPLIED",
+        resultDigest: "f".repeat(64),
+        singleUseResult: true,
+        state: "applied",
+      })).toMatchObject({ replay: true, state: "applied" });
+      expect(await world.testRuntime.mutation(expireLoginResult, {
+        commandPublicId: world.uuid("39"),
+        resultExpiresAt: before.resultExpiresAt as number,
+      })).toEqual({ status: "retired" });
+      const stable = await accounting();
+      expect(stable.commandBytes).toBe(erased.commandBytes);
+      expect(stable.serviceUserBytes).toBe(erased.serviceUserBytes);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test("only the requester acknowledges or cancels", async () => {

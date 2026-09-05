@@ -28,6 +28,7 @@ const cleanupExpired = makeFunctionReference<"mutation", Args, Readonly<{
   authAttempts: number;
   authInvites: number;
   bindChallenges: number;
+  deviceCommandLoginResults: number;
   devicePresence: number;
   deviceRevocationJobs: number;
   expiredPendingCommands: number;
@@ -523,6 +524,52 @@ describe("bounded cloud retention", () => {
         "sessionCommands",
         unacknowledgedTerminal,
       );
+      const expiredLoginResult = {
+        createdAt: now - 10 * 60 * 1_000,
+        deadline: now - 9 * 60 * 1_000,
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000006",
+        kind: "account_login_start" as const,
+        nonterminal: false,
+        payload: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "C".repeat(32),
+          keyVersion: 1,
+          nonce: "C".repeat(16),
+        },
+        publicId: "018bcfe5-6800-7000-8000-000000000007",
+        requestDigest: "e".repeat(64),
+        requestingDeviceId: deviceId,
+        result: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "R".repeat(48),
+          keyVersion: 1,
+          nonce: "R".repeat(16),
+        },
+        resultCode: "APPLIED",
+        resultDigest: "f".repeat(64),
+        resultExpiresAt: now - 1,
+        resultSingleUse: true,
+        state: "applied" as const,
+        targetDeviceId: deviceId,
+        updatedAt: now - 5 * 60 * 1_000,
+        userId,
+      };
+      await reserveQuotaForInsert(ctx, userId, "command", expiredLoginResult);
+      const expiredLoginResultId = await ctx.db.insert("deviceCommands", expiredLoginResult);
+      const { resultExpiresAt: removedLegacyExpiry, ...legacyLoginResultBase } =
+        expiredLoginResult;
+      if (removedLegacyExpiry !== now - 1) throw new Error("invalid legacy expiry fixture");
+      const legacyExpiredLoginResult = {
+        ...legacyLoginResultBase,
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000008",
+        publicId: "018bcfe5-6800-7000-8000-000000000009",
+        resultDigest: "0".repeat(64),
+      };
+      await reserveQuotaForInsert(ctx, userId, "command", legacyExpiredLoginResult);
+      const legacyExpiredLoginResultId = await ctx.db.insert(
+        "deviceCommands",
+        legacyExpiredLoginResult,
+      );
       const oldSecurity = {
         createdAt: now - 91 * 24 * 60 * 60 * 1_000,
         entityId: "fixture_retention",
@@ -531,25 +578,64 @@ describe("bounded cloud retention", () => {
       } as const;
       await reserveQuotaForInsert(ctx, userId, "security", oldSecurity);
       const oldSecurityId = await ctx.db.insert("securityEvents", oldSecurity);
-      return { oldSecurityId, oldTerminalId, pendingId, recentTerminalId, unacknowledgedTerminalId };
+      return {
+        expiredLoginResultId,
+        legacyExpiredLoginResultId,
+        oldSecurityId,
+        oldTerminalId,
+        pendingId,
+        recentTerminalId,
+        unacknowledgedTerminalId,
+        userId,
+      };
     });
 
     const result = await runtime.mutation(cleanupExpired, { limit: 10 });
     expect(result).toMatchObject({
+      deviceCommandLoginResults: 2,
       expiredPendingCommands: 1,
       securityEvents: 1,
       terminalCommands: 1,
     });
-    expect(await runtime.run(async (ctx) => ({
-      oldSecurity: await ctx.db.get(ids.oldSecurityId),
-      oldTerminal: await ctx.db.get(ids.oldTerminalId),
-      pending: await ctx.db.get(ids.pendingId),
-      recentTerminal: await ctx.db.get(ids.recentTerminalId),
-      unacknowledgedTerminal: await ctx.db.get(ids.unacknowledgedTerminalId),
-    }))).toMatchObject({
+    expect(await runtime.run(async (ctx) => {
+      const loginResult = await ctx.db.get(ids.expiredLoginResultId);
+      const legacyLoginResult = await ctx.db.get(ids.legacyExpiredLoginResultId);
+      const projectLoginResult = (record: typeof loginResult) => record === null
+        ? null
+        : {
+            hasResult: "result" in record,
+            hasResultExpiresAt: "resultExpiresAt" in record,
+            resultConsumedAt: record.resultConsumedAt,
+            resultSingleUse: record.resultSingleUse,
+            state: record.state,
+          };
+      return {
+        oldSecurity: await ctx.db.get(ids.oldSecurityId),
+        oldTerminal: await ctx.db.get(ids.oldTerminalId),
+        pending: await ctx.db.get(ids.pendingId),
+        loginResult: projectLoginResult(loginResult),
+        legacyLoginResult: projectLoginResult(legacyLoginResult),
+        recentTerminal: await ctx.db.get(ids.recentTerminalId),
+        unacknowledgedTerminal: await ctx.db.get(ids.unacknowledgedTerminalId),
+      };
+    })).toMatchObject({
       oldSecurity: null,
       oldTerminal: null,
       pending: { state: "expired" },
+      loginResult: {
+        hasResult: false,
+        hasResultExpiresAt: false,
+        resultConsumedAt: expect.any(Number),
+        resultSingleUse: true,
+        state: "applied",
+      },
+      legacyLoginResult: {
+        hasResult: false,
+        hasResultExpiresAt: false,
+        resultConsumedAt: expect.any(Number),
+        resultSingleUse: true,
+        state: "applied",
+      },
       recentTerminal: { state: "applied" },
       unacknowledgedTerminal: { state: "applied" },
     });
@@ -557,6 +643,36 @@ describe("bounded cloud retention", () => {
       const record = await ctx.db.get(ids.unacknowledgedTerminalId);
       return record !== null && "requesterAcknowledgedAt" in record;
     })).toBe(false);
+    const accounting = async () => await runtime.run(async (ctx) => {
+      const [sessionCommands, deviceCommands, quota, service] = await Promise.all([
+        ctx.db.query("sessionCommands").collect(),
+        ctx.db.query("deviceCommands").collect(),
+        ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (builder) => builder
+            .eq("userId", ids.userId)
+            .eq("category", "command"))
+          .unique(),
+        ctx.db.query("storageUsageService")
+          .withIndex("by_key", (builder) => builder.eq("key", "global"))
+          .unique(),
+      ]);
+      const chargedBytes = [...sessionCommands, ...deviceCommands].reduce((total, document) => {
+        const stored = Object.fromEntries(Object.entries(document).filter(
+          ([key]) => key !== "_creationTime" && key !== "_id",
+        )) as Readonly<Record<string, Value>>;
+        return total + logicalDocumentBytes(stored);
+      }, 0);
+      return {
+        chargedBytes,
+        quotaBytes: quota?.logicalBytes,
+        serviceUserBytes: service?.userLogicalBytes,
+      };
+    });
+    const afterFirstSweep = await accounting();
+    expect(afterFirstSweep.quotaBytes).toBe(afterFirstSweep.chargedBytes);
+    expect(await runtime.mutation(cleanupExpired, { limit: 10 }))
+      .toMatchObject({ deviceCommandLoginResults: 0 });
+    expect(await accounting()).toEqual(afterFirstSweep);
   });
 
   test("gives every eligible category one bounded quantum in a full rotation", async () => {
@@ -860,7 +976,7 @@ describe("bounded cloud retention", () => {
       terminalDeviceCommands: 1,
       usageSnapshots: 1,
       processed: 15,
-      visitedCategories: 16,
+      visitedCategories: 17,
     });
     expect(await runtime.run(async (ctx) => {
       const service = await ctx.db.query("storageUsageService")

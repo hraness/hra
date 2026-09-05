@@ -87,9 +87,9 @@ hra account usage personal --refresh
 hra account usage-history personal --limit 50 --json
 ```
 
-Account login is always a dedicated one-shot invocation, including while the persistent shell is running. For Codex, use `hra account login personal --provider codex --device-code` in a foreground TTY for app-server's device-code path. The code and verification URL are shown only on that protected foreground terminal. HRA keeps the resulting provider state inside that profile's isolated `CODEX_HOME` without copying `auth.json`.
+Account login is always a dedicated one-shot invocation, including while the persistent shell is running. For Codex, use `hra account login personal --provider codex --device-code` in a foreground TTY for app-server's device-code path. That terminal displays the code and verification URL directly. An opted-in registered machine can also receive a versioned web request that always selects device-code mode; HRA validates the HTTPS URL and separate code, encrypts them to the account key, and lets only the requesting browser read the handoff once before its five-minute hosted expiry. HRA keeps the resulting provider state inside that profile's isolated `CODEX_HOME` without copying `auth.json`.
 
-On Linux, `hra account login personal --provider claude` launches the exact pinned Claude Code CLI in the foreground inside that profile's isolated `CLAUDE_CONFIG_DIR`. Claude owns its prompts and browser handoff. HRA gives it the terminal, joins the exact child, and reports only whether Claude says it is signed in; HRA never opens or copies a Claude credential. Claude exposes no HRA device-code, handoff-file, or web-linking protocol. New Claude effects are refused on macOS pending authenticated isolated-Keychain and detached-read acceptance.
+On Linux, `hra account login personal --provider claude` launches a realpath-resolved Claude Code executable only after its exact self-reported version matches HRA's pin, in the foreground inside that profile's isolated `CLAUDE_CONFIG_DIR`. Claude owns its prompts and browser handoff. HRA gives it the terminal, joins the exact child, and reports only whether Claude says it is signed in; HRA never opens or copies a Claude credential. Claude exposes no HRA device-code, handoff-file, or web-linking protocol. New Claude effects are refused on macOS pending authenticated isolated-Keychain and detached-read acceptance.
 
 For a Codex login, JSON and noninteractive callers must create an empty mode-0600 file under a canonical current-user-owned mode-0700 directory, then pass its absolute canonical path:
 
@@ -99,7 +99,7 @@ hra account login personal --device-code --handoff-file /absolute/private/login.
 
 HRA opens and holds the parent and file, resolves the account selector to one exact local account ID, and dispatches login only for that authority. It validates the returned account, state, cancellation command, URL, and device-code shape, writes one versioned login document through the held descriptor, verifies it with fsync and readback, and closes both descriptors before returning only the path and cleanup disposition on stdout. The caller reads the file through its protected boundary and removes it after login. A same-key replay never claims or rewrites a handoff. While login is pending it reports that one-time instructions are unavailable; after completion or cancellation it reports the terminal account state.
 
-If the first pending-login handoff is lost or the daemon restarts before completion, `hra account show personal --provider codex` reports the pending attempt. Then run `hra account login-cancel personal --provider codex`. A caller that retained the idempotency key may retry it without redispatching. A still-pending replay cannot recover the one-time code or URL; a completed or canceled replay returns terminal signed-in or signed-out evidence instead of stale pending state. HRA cancels only that profile's exact current-generation provider login before allowing a fresh login. Verification URLs and device codes never enter HRA state, logs, or ordinary output; only the caller-owned protected handoff file retains them for completion.
+If the first pending-login handoff is lost or the daemon restarts before completion, `hra account show personal --provider codex` reports the pending attempt. Then run `hra account login-cancel personal --provider codex`. A caller that retained the idempotency key may retry it without redispatching. A still-pending local replay cannot recover the one-time code or URL; a completed or canceled replay returns terminal signed-in or signed-out evidence instead of stale pending state. HRA cancels only that profile's exact current-generation provider login before allowing a fresh login. Verification URLs and user codes never enter local durable HRA state, logs, or ordinary command output. A protected handoff file may retain them for its local caller; the web path instead retains only an account-key-encrypted, one-read hosted result until consumption or five-minute expiry.
 
 If a Claude foreground parent or daemon fails after launch, `hra account show personal --provider claude` retains the one-child fence even if Claude reports signed in. After confirming that original child has exited, use the exact attempt, generation, and idempotency key in the reported acknowledged `hra account login-cancel` command to release only the local fence. That recovery does not stop Claude or read, change, or delete a credential.
 
@@ -385,21 +385,24 @@ Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code 
 
 - User messages and final assistant display text.
 - Session names, notes, queued messages, and steering input.
-- Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not currently projected because its bounded local status path exposes only signedIn and HRA reads no Claude credential, identity, or usage data.
+- Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields; it never opens or parses a Claude credential file.
 - Turn timing, observed model and tier, and provider usage summaries.
 - Bounded observed file and Git metadata, without unbounded filesystem paths.
 - Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.
 - Remote-command input and results that fit the closed command protocol.
+- For an explicitly requested Codex web login, the provider HTTPS verification URL and separate one-time user code. HRA encrypts both to the account key before upload, lets only the requesting browser read them once, and deletes the hosted handoff on that read or after five minutes.
 
 ### Never uploaded
 
-- Codex or Claude Code credentials, provider profile or configuration files, plugin credentials, or OAuth material.
+- Codex or Claude Code credentials, provider profile or configuration files, plugin credentials, OAuth access or refresh tokens, authorization codes, PKCE verifiers, provider cookies, or the private device code.
 - Raw Codex app-server or Claude Code stream requests or responses.
 - Raw reasoning, hidden chain of thought, or approval secrets.
-- Provider login and request IDs, permission values, MCP field contracts, protected answers, or response digests.
+- Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.
 - Environment variables, arbitrary command output, or unbounded filesystem paths.
 
 The sync service necessarily sees the verified HRA email address, device identifiers, record types, revisions, ciphertext sizes, timestamps, and execution-lease or command lifecycle metadata. It cannot decrypt session content without a paired device key. Email access alone does not recover that key.
+
+A browser device holds the account key and decrypted projection only in that tab's memory by default. HRA does not programmatically write decrypted provider or session text to the clipboard, but browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text.
 
 HRA uses Convex to authenticate the HRA identity and store server-visible metadata plus encrypted projections. Convex receives the verified email address and the service metadata described above, but not the keys required to decrypt session content.
 

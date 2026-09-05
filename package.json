@@ -35,6 +35,7 @@
     "hosted:configure": "bun ./scripts/configure-hosted-sync.ts",
     "hosted:deploy": "bun ./scripts/deploy-hosted-sync.ts",
     "hosted:invites": "bun ./scripts/manage-hosted-invites.ts",
+    "hosted:migrate-reply-to": "bun ./scripts/migrate-hosted-reply-to.ts",
     "hosted:replace-target": "bun ./scripts/replace-hosted-convex-target.ts",
     "hosted:status": "bun ./scripts/hosted-status.ts",
     "install-pins:update": "bun ./scripts/check-install-pins.ts --update",

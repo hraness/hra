@@ -17,6 +17,7 @@ const cleanupExpired = makeFunctionReference<
   Readonly<{
     authAttempts: number;
     bindChallenges: number;
+    deviceCommandLoginResults: number;
     expiredPendingCommands: number;
     idempotencyReceipts: number;
     otpChallenges: number;
