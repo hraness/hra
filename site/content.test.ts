@@ -379,7 +379,9 @@ describe("public content contract", () => {
       expect(surface).toContain("hra account show personal");
       expect(surface).toContain("hra account login-cancel");
       expect(surface).toContain("exact current-generation provider login");
-      expect(surface).toContain("Verification URLs and device codes never enter HRA state, logs, or ordinary output");
+      expect(surface).toContain("Verification URLs and user codes never enter local durable HRA state, logs, or ordinary command output");
+      expect(surface).toContain("account-key-encrypted, one-read hosted result");
+      expect(surface).toContain("always selects device-code mode");
       expect(surface).toContain("--handoff-file /absolute/private/login.json --json");
       expect(surface).toContain("A same-key replay never claims or rewrites a handoff");
       expect(surface).toContain("after completion or cancellation it reports the terminal account state");
@@ -533,10 +535,18 @@ describe("public content contract", () => {
   test("keeps the full privacy boundary on the readme, site, and policy page", () => {
     const sentinelClaims = [
       "Codex account labels and observed provider email and plan metadata when cloud sync is enabled.",
-      "Codex or Claude Code credentials, provider profile or configuration files, plugin credentials, or OAuth material.",
+      "Claude Code account identity and usage are not projected.",
+      "validates one bounded Claude Code authentication-status response transiently",
+      "never retains, returns, projects, or uploads the identity or usage fields",
+      "For an explicitly requested Codex web login, the provider HTTPS verification URL and separate one-time user code.",
+      "encrypts both to the account key before upload",
+      "deletes the hosted handoff on that read or after five minutes",
+      "OAuth access or refresh tokens, authorization codes, PKCE verifiers, provider cookies, or the private device code.",
       "Raw reasoning, hidden chain of thought, or approval secrets.",
       "Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.",
-      "Provider login and request IDs, permission values, MCP field contracts, protected answers, or response digests.",
+      "Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.",
+      "does not programmatically write decrypted provider or session text to the clipboard",
+      "browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text",
       "Email access alone does not recover that key.",
       "an uncontested, unrevoked copy can impersonate that device",
       "HRA uses Convex to authenticate the HRA identity",
@@ -740,7 +750,9 @@ describe("public content contract", () => {
       "$HOME/Library/Application Support/HRA Control Plane v1",
       "$HOME/.local/state/hra-control-plane-v1",
       "explicitly accepts permanent loss",
-      "Claude Code configuration and credential state",
+      "Claude Code configuration directories",
+      "provider-managed system credential storage",
+      "sign out through Claude Code before deletion",
       "move only the exact platform directory to Trash",
       "Do not move or remove the state directory's parent.",
       "obtain explicit destructive approval",
@@ -826,9 +838,11 @@ describe("public content contract", () => {
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
       expect(footer).toContain('data-slot="hraness-site-footer"');
       expect(footer?.match(/data-slot="hraness-mark"/gu)).toHaveLength(1);
-      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(11);
+      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(
+        hranessSocialLinks.length,
+      );
       expect(footer).toContain('data-mailing-list="none"');
-      expect(footer).toContain('href="https://substack.com/@hraness"');
+      expect(footer).not.toContain("substack.com");
       expect(
         [...(footer?.matchAll(/<a\b[^>]*\shref="([^"]+)"/gu) ?? [])]
           .map((match) => match[1]),
@@ -865,7 +879,7 @@ describe("public content contract", () => {
     expect(footer).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
-    expect(footer).toContain('href="https://substack.com/@hraness"');
+    expect(footer).not.toContain("substack.com");
   });
 
   test("fails production closed on missing or malformed Turnstile configuration", () => {

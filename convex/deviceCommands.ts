@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { paginationOptsValidator } from "convex/server";
+import { makeFunctionReference, paginationOptsValidator } from "convex/server";
 
 import {
   cloudLimits,
@@ -71,6 +71,11 @@ const terminalStates: readonly CommandState[] = [
 
 // Only `account_login_start` returns a handoff a second reader must never see.
 const singleUseResultKinds: readonly DeviceCommandKind[] = ["account_login_start"];
+const expireLoginResult = makeFunctionReference<
+  "mutation",
+  Readonly<{ commandPublicId: string; resultExpiresAt: number }>,
+  unknown
+>("maintenance:expireDeviceCommandLoginResult");
 
 function terminalCleanupFields(
   command: Readonly<{ requesterAcknowledgedAt?: number }>,
@@ -394,14 +399,23 @@ export const consumeResult = mutation({
       return { publicId: command.publicId, status: "spent" as const };
     }
     const now = Date.now();
-    const commandPatch = { result: undefined, resultConsumedAt: now, updatedAt: now };
+    // Current rows carry a server-owned settlement deadline. The fallback keeps
+    // already-settled rows from an older schema fail-closed on first exchange.
+    const expiresAt = command.resultExpiresAt
+      ?? command.updatedAt + deviceCommandLoginResultLifetimeMs;
+    const commandPatch = {
+      result: undefined,
+      resultConsumedAt: now,
+      resultExpiresAt: undefined,
+      updatedAt: now,
+    };
     await adjustCommandQuotaForPatch(ctx, authority.userId, command, commandPatch);
     await ctx.db.patch(command._id, commandPatch);
-    if (now >= command.updatedAt + deviceCommandLoginResultLifetimeMs) {
+    if (now >= expiresAt) {
       return { publicId: command.publicId, status: "expired" as const };
     }
     return {
-      expiresAt: command.updatedAt + deviceCommandLoginResultLifetimeMs,
+      expiresAt,
       publicId: command.publicId,
       result: command.result,
       status: "released" as const,
@@ -569,6 +583,7 @@ export const settle = mutation({
       || (args.singleUseResult === true && !singleUseResultKinds.includes(command.kind))
       || args.singleUseResult === false
       || (args.singleUseResult === true && args.result === undefined)
+      || (args.singleUseResult === true && args.state !== "applied")
       || (args.result !== undefined
         && singleUseResultKinds.includes(command.kind)
         && args.singleUseResult !== true)
@@ -598,9 +613,17 @@ export const settle = mutation({
     const transition = commandTransitionDisposition(command.state, args.state);
     if (transition.kind !== "applied") throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
     const now = Date.now();
+    const resultExpiresAt = args.singleUseResult === true
+      ? now + deviceCommandLoginResultLifetimeMs
+      : undefined;
     const commandPatch = {
       ...(args.result === undefined ? {} : { result: args.result }),
-      ...(args.singleUseResult === true ? { resultSingleUse: true } : {}),
+      ...(resultExpiresAt === undefined
+        ? {}
+        : {
+            resultExpiresAt,
+            resultSingleUse: true,
+          }),
       nonterminal: false,
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
@@ -610,6 +633,12 @@ export const settle = mutation({
     };
     await adjustCommandQuotaForPatch(ctx, current.authority.userId, command, commandPatch);
     await ctx.db.patch(command._id, commandPatch);
+    if (resultExpiresAt !== undefined) {
+      await ctx.scheduler.runAt(resultExpiresAt, expireLoginResult, {
+        commandPublicId: command.publicId,
+        resultExpiresAt,
+      });
+    }
     const securityDocument = {
       actorDeviceId: current.authority.deviceId,
       createdAt: now,
@@ -650,6 +679,7 @@ export const confirmRevokedTerminal = mutation({
       || command.result !== undefined
       || command.resultCode !== undefined
       || command.resultConsumedAt !== undefined
+      || command.resultExpiresAt !== undefined
       || command.resultDigest !== undefined
       || command.resultSingleUse !== undefined
     ) throw new Error("DEVICE_COMMAND_REVOCATION_TERMINAL_CONFLICT");
@@ -697,6 +727,7 @@ export const confirmTerminalRecovery = mutation({
       || command.result !== undefined
       || command.resultCode !== undefined
       || command.resultConsumedAt !== undefined
+      || command.resultExpiresAt !== undefined
       || command.resultDigest !== undefined
       || command.resultSingleUse !== undefined
     ) throw new Error("DEVICE_COMMAND_TERMINAL_RECOVERY_CONFLICT");

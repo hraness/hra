@@ -49,7 +49,7 @@ export interface ResolvePinnedClaudeRuntimeOptions {
 }
 
 // Claude Code currently reports either `x.y.z` or `x.y.z (Claude Code)`, with
-// an optional final line ending. The whole output is the attestation: accepting
+// an optional final line ending. The whole output is the version assertion: accepting
 // a matching substring would let a wrapper, prerelease, or multi-version line
 // masquerade as the pinned executable.
 const versionOutputPattern = /^(\d{1,5}\.\d{1,5}\.\d{1,5})(?: \(Claude Code\))?\r?\n?$/u;
@@ -219,10 +219,10 @@ export async function locateClaudeExecutable(
 }
 
 /**
- * Resolves and admits the pinned Claude Code executable. HRA refuses to run
- * any other build: the stream-json surface is not a published contract, so a
- * version other than `CLAUDE_PIN` fails closed here rather than being parsed
- * hopefully.
+ * Resolves the Claude Code executable and admits only the pinned self-reported
+ * version. This is a compatibility assertion, not executable provenance: the
+ * stream-json surface is not a published contract, so any other reported
+ * version fails closed here rather than being parsed hopefully.
  */
 export async function resolvePinnedClaudeRuntime(
   options: ResolvePinnedClaudeRuntimeOptions,

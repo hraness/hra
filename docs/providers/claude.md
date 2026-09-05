@@ -12,7 +12,7 @@ On Linux, sign in from an interactive terminal:
 hra account login <profile> --provider claude
 ```
 
-This is a Linux-only foreground, TTY-only command. It refuses `--json` and launches the exact admitted, pinned Claude Code CLI with `auth login --claudeai`, the isolated `CLAUDE_CONFIG_DIR`, and HRA's allowlisted environment. The Claude CLI owns its prompts and browser handoff. HRA explicitly supplies the terminal descriptors but never reads, copies, stores, or forwards the credential. A terminal Ctrl-C reaches the foreground process group; HRA observes it, joins the exact child, and bounds cleanup if the child does not exit. An internal caller abort sends that child `SIGTERM` and applies the same bounded join. On macOS, HRA refuses before launching Claude.
+This is a Linux-only foreground, TTY-only command. It refuses `--json`, resolves the installed Claude executable to a regular-file path, requires its exact self-reported version to match HRA's compatibility pin, and launches that path with `auth login --claudeai`, the isolated `CLAUDE_CONFIG_DIR`, and HRA's allowlisted environment. That version assertion does not authenticate the executable's package bytes and does not defend against a malicious same-user PATH substitution. The Claude CLI owns its prompts and browser handoff. HRA explicitly supplies the terminal descriptors but never reads, copies, stores, or forwards the credential. A terminal Ctrl-C reaches the foreground process group; HRA observes it, joins the exact child, and bounds cleanup if the child does not exit. An internal caller abort sends that child `SIGTERM` and applies the same bounded join. On macOS, HRA refuses before launching Claude.
 
 Claude has no HRA device-code, handoff-file, web-linking, or ordinary background cancellation flow. Do not pass `--device-code` or `--handoff-file`. Before launching Claude, HRA durably consumes a one-child grant. Another login cannot start under that grant. When the profile is signed out, preparation may locally release and terminalize only Claude sessions that are quiescent and idle under the same profile. That release stops HRA's local runtime hold but does not delete the provider thread. An active turn, queued work, a pending interaction, recovery, or any other unsettled provider authority refuses login without releasing the session. New Claude provider effects are likewise refused while a login grant is unsettled.
 
@@ -34,7 +34,7 @@ On Linux, check the provider-specific state without starting a login:
 hra account show <profile> --provider claude
 ```
 
-The status path runs the exact pinned CLI with `auth status --json` inside the isolated home. HRA bounds the command's deadline and output, validates its exit code and response together, and projects only whether Claude reports the account as signed in. `--json` is supported for this status command. HRA does not open or parse any Claude credential file. When a launch is unresolved, status returns the exact same-key, completion-status, and acknowledged-abandon guidance without requiring a provider status probe and without treating credential presence as process-exit proof. This recovery-only read remains available when the provider probe cannot run.
+The status path runs the same version-admitted executable path with `auth status --json` inside the isolated home. HRA bounds the command's deadline and output, validates its exit code and response together, transiently validates the complete status document, discards its identity and usage fields, and projects only whether Claude reports the account as signed in. `--json` is supported for this status command. HRA does not open or parse any Claude credential file. When a launch is unresolved, status returns the exact same-key, completion-status, and acknowledged-abandon guidance without requiring a provider status probe and without treating credential presence as process-exit proof. This recovery-only read remains available when the provider probe cannot run.
 
 Account selection stays user-directed. Claude profiles default to a per-account cap of two concurrent sessions; swarm-scale traffic may be judged non-ordinary by the provider, and users raise the cap knowingly.
 
@@ -49,7 +49,7 @@ Recorded so far (2026-09-02, Claude Code 2.1.258, macOS):
 - A fresh, empty, mode-0700 `CLAUDE_CONFIG_DIR` fully isolates configuration. `claude auth status` runs non-interactively inside it, reports `loggedIn: false`, creates only `.claude.json`, a lock directory, and `backups/`, and does not touch or prompt for the Keychain.
 - The machine's login keychain holds one item for the default configuration, service `Claude Code-credentials`.
 
-Pending, requires the owner to sign in interactively inside two distinct isolated profile homes with the exact pinned Claude Code release:
+Pending, requires the owner to sign in interactively inside two distinct isolated profile homes with a Claude Code executable whose exact self-reported version matches HRA's compatibility pin:
 
 - Whether each sign-in stores a distinct directory-keyed Keychain item or a file inside its own profile home.
 - Whether each detached process with no window server session reads only its own identity without a prompt.

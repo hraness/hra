@@ -1,6 +1,8 @@
+import { makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 
-import { isSafePositiveInteger } from "../src/cloud/contracts";
+import { isSafePositiveInteger, isUuidV7 } from "../src/cloud/contracts";
+import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
 import { maximumLiveOtpChallenges } from "./authPolicy";
 import { commandTerminalRetentionMs } from "./commands";
 import { CLOUD_USAGE_SNAPSHOT_RETENTION_MS } from "./lifecyclePolicy";
@@ -23,6 +25,11 @@ import { beginDetailRetentionEpoch } from "./sessions";
 
 const maximumCleanupBatch = 200;
 const categoryQuantum = 20;
+const expireLoginResult = makeFunctionReference<
+  "mutation",
+  Readonly<{ commandPublicId: string; resultExpiresAt: number }>,
+  unknown
+>("maintenance:expireDeviceCommandLoginResult");
 const maintenanceCategories = [
   "auth_attempts",
   "otp_challenges",
@@ -34,6 +41,7 @@ const maintenanceCategories = [
   "pending_commands",
   "terminal_commands",
   "pending_device_commands",
+  "device_command_login_results",
   "terminal_device_commands",
   "security_events",
   "usage_snapshots",
@@ -64,6 +72,7 @@ type CleanupCounts = {
   bindChallenges: number;
   devicePresence: number;
   deviceRevocationJobs: number;
+  deviceCommandLoginResults: number;
   expiredPendingCommands: number;
   expiredPendingDeviceCommands: number;
   idempotencyReceipts: number;
@@ -87,6 +96,7 @@ const countField = {
   pending_commands: "expiredPendingCommands",
   terminal_commands: "terminalCommands",
   pending_device_commands: "expiredPendingDeviceCommands",
+  device_command_login_results: "deviceCommandLoginResults",
   terminal_device_commands: "terminalDeviceCommands",
   security_events: "securityEvents",
   usage_snapshots: "usageSnapshots",
@@ -309,11 +319,10 @@ async function deleteTerminalCommands(ctx: MutationCtx, now: number, limit: numb
 }
 
 /*
- * Device commands share the session-command lifecycle, so they share its two
- * sweeps: a pending row past its deadline expires, and a terminal row the
- * requester has acknowledged is deleted after the same retention. They get
- * their own maintenance categories rather than being folded into the session
- * sweeps so one table's backlog can never starve the other's.
+ * Device commands share the session-command lifecycle, so a pending row past
+ * its deadline expires and an acknowledged terminal row is later deleted.
+ * Their login handoffs additionally have an independent short-lived result
+ * sweep. Separate categories keep one table or lifecycle from starving another.
  */
 async function expirePendingDeviceCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   const records = await ctx.db.query("deviceCommands")
@@ -334,6 +343,129 @@ async function expirePendingDeviceCommands(ctx: MutationCtx, now: number, limit:
     await ctx.db.patch(record._id, commandPatch);
   }
   return records.length;
+}
+
+/*
+ * An account-login result is ciphertext, but it is still a short-lived provider
+ * handoff. Its server-owned settlement deadline is independent of command
+ * acknowledgement and terminal-row retention, so an abandoned browser cannot
+ * leave the handoff stored indefinitely.
+ */
+export const expireDeviceCommandLoginResult = internalMutation({
+  args: {
+    commandPublicId: v.string(),
+    resultExpiresAt: v.number(),
+  },
+  handler: async (ctx, args) => {
+    await requireHardQuotaAuthority(ctx);
+    if (
+      !isUuidV7(args.commandPublicId)
+      || !Number.isSafeInteger(args.resultExpiresAt)
+      || args.resultExpiresAt < 1
+    ) throw new Error("Invalid device-command login-result expiry.");
+    const matches = await ctx.db.query("deviceCommands")
+      .withIndex("by_public_id", (builder) => builder.eq("publicId", args.commandPublicId))
+      .take(2);
+    if (matches.length > 1) throw new Error("Maintenance authority is corrupt.");
+    const record = matches[0];
+    if (record === undefined || record.resultExpiresAt !== args.resultExpiresAt) {
+      return { status: "retired" as const };
+    }
+    const now = Date.now();
+    if (now < args.resultExpiresAt) {
+      await ctx.scheduler.runAt(args.resultExpiresAt, expireLoginResult, args);
+      return { status: "pending" as const };
+    }
+    if (
+      record.kind !== "account_login_start"
+      || record.nonterminal
+      || record.state !== "applied"
+      || record.resultSingleUse !== true
+      || record.result === undefined
+      || record.resultConsumedAt !== undefined
+    ) throw new Error("Maintenance authority is corrupt.");
+    const commandPatch = {
+      result: undefined,
+      resultConsumedAt: now,
+      resultExpiresAt: undefined,
+      updatedAt: now,
+    };
+    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
+    await ctx.db.patch(record._id, commandPatch);
+    return { status: "erased" as const };
+  },
+});
+
+async function expireDeviceCommandLoginResults(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+): Promise<number> {
+  const expired = await ctx.db.query("deviceCommands")
+    .withIndex("by_single_use_result_expiry", (builder) => builder
+      .eq("resultSingleUse", true)
+      .eq("resultConsumedAt", undefined)
+      .gt("resultExpiresAt", 0)
+      .lte("resultExpiresAt", now))
+    .take(limit);
+  for (const record of expired) {
+    if (
+      record.kind !== "account_login_start"
+      || record.nonterminal
+      || record.state !== "applied"
+      || record.result === undefined
+      || record.resultExpiresAt === undefined
+    ) throw new Error("Maintenance authority is corrupt.");
+    const commandPatch = {
+      result: undefined,
+      resultConsumedAt: now,
+      resultExpiresAt: undefined,
+      updatedAt: now,
+    };
+    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
+    await ctx.db.patch(record._id, commandPatch);
+  }
+  const remaining = limit - expired.length;
+  if (remaining === 0) return limit;
+
+  // Rows settled before `resultExpiresAt` existed are backfilled once. An
+  // already-expired row is erased immediately; a still-live row receives both
+  // the server deadline and the same exact scheduled erasure as a new settle.
+  const legacy = await ctx.db.query("deviceCommands")
+    .withIndex("by_single_use_result_expiry", (builder) => builder
+      .eq("resultSingleUse", true)
+      .eq("resultConsumedAt", undefined)
+      .eq("resultExpiresAt", undefined))
+    .take(remaining);
+  for (const record of legacy) {
+    if (
+      record.kind !== "account_login_start"
+      || record.nonterminal
+      || record.result === undefined
+    ) throw new Error("Maintenance authority is corrupt.");
+    const resultExpiresAt = record.updatedAt + deviceCommandLoginResultLifetimeMs;
+    if (!Number.isSafeInteger(resultExpiresAt)) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    const erase = record.state !== "applied" || resultExpiresAt <= now;
+    const commandPatch = erase
+      ? {
+          result: undefined,
+          resultConsumedAt: now,
+          resultExpiresAt: undefined,
+          updatedAt: now,
+        }
+      : { resultExpiresAt };
+    await adjustCommandQuotaForPatch(ctx, record.userId, record, commandPatch);
+    await ctx.db.patch(record._id, commandPatch);
+    if (!erase) {
+      await ctx.scheduler.runAt(resultExpiresAt, expireLoginResult, {
+        commandPublicId: record.publicId,
+        resultExpiresAt,
+      });
+    }
+  }
+  return expired.length + legacy.length;
 }
 
 async function deleteTerminalDeviceCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
@@ -520,6 +652,7 @@ const handlers = {
   pending_commands: expirePendingCommands,
   terminal_commands: deleteTerminalCommands,
   pending_device_commands: expirePendingDeviceCommands,
+  device_command_login_results: expireDeviceCommandLoginResults,
   terminal_device_commands: deleteTerminalDeviceCommands,
   security_events: deleteExpiredSecurityEvents,
   usage_snapshots: deleteExpiredUsage,
@@ -538,6 +671,7 @@ const emptyCounts = (): CleanupCounts => ({
   bindChallenges: 0,
   devicePresence: 0,
   deviceRevocationJobs: 0,
+  deviceCommandLoginResults: 0,
   expiredPendingCommands: 0,
   expiredPendingDeviceCommands: 0,
   idempotencyReceipts: 0,

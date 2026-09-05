@@ -4,7 +4,7 @@ This page summarizes the active HRA plans for readers who want the provider and 
 
 ## Direction
 
-HRA is a control plane for Codex and Claude Code. Both providers run through their pinned, unmodified runtimes under user-selected isolated profiles. HRA owns the provider-neutral conversation and control record while each provider owns authentication, native sessions, execution, tools, approvals, and hidden state. Codex is supported on macOS and Linux; Claude Code is supported on Linux while authenticated isolated-Keychain and detached-read acceptance remains pending on macOS. Humans get a terminal shell and a keyboard-first web surface; agents get the same machine-readable CLI and work protocol.
+HRA is a control plane for Codex and Claude Code. Codex runs through HRA's exact packaged pin. Claude runs through a realpath-resolved installed executable whose exact self-reported version must match HRA's compatibility pin; HRA does not authenticate those executable bytes against an upstream package digest. Both use user-selected isolated profiles. HRA owns the provider-neutral conversation and control record while each provider owns authentication, native sessions, execution, tools, approvals, and hidden state. Codex is supported on macOS and Linux; Claude Code is supported on Linux while authenticated isolated-Keychain and detached-read acceptance remains pending on macOS. Humans get a terminal shell and a keyboard-first web surface; agents get the same machine-readable CLI and work protocol.
 
 ## Waves
 

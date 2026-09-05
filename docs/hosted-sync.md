@@ -200,6 +200,66 @@ The helper reads at most 8 KiB, rejects a terminal descriptor, and ignores inher
 
 If any target name already exists, the names response is ambiguous, Convex refuses the batch, or the final names readback is incomplete, the helper closes with a generic error. A failure after the batch may have left a complete or partial provider write. Do not retry or overwrite. Inspect names only, then replace the still-unused deployment if the result is uncertain.
 
+### Migrate the Reply-To name on an existing deployment
+
+Deployments configured before `HRA_AUTH_EMAIL_REPLY_TO` became required continue
+to send with the source-pinned `ben@substrate.run` fallback, but hosted preflight
+requires the replacement name to be present explicitly. Run this checkout-only
+package entry from the exact clean candidate commit, after its attested candidate
+deploy and before hosted status:
+
+```sh
+bun run hosted:migrate-reply-to -- \
+  --source-commit <N_COMMIT> \
+  --deploy-evidence /protected/release/candidate-deploy.json \
+  --evidence-path /protected/release/reply-to-migration.json \
+  --deployment <CURRENT_DEFAULT_DEPLOYMENT_NAME> \
+  --team-id <CURRENT_TEAM_ID> \
+  --project-id <CURRENT_PROJECT_ID> \
+  --deployment-id <CURRENT_DEFAULT_DEPLOYMENT_ID> \
+  --deployment-url <CURRENT_DEFAULT_DEPLOYMENT_URL>
+```
+
+The operator requires `HEAD` to equal `N_COMMIT` and the complete checkout to be
+clean. It reads a protected, candidate-phase deploy receipt whose source and
+target match, then proves the live release attestation equals that receipt. It
+repeats the source, target, receipt, and runtime proof before mutation and before
+publishing its own protected receipt. Keep the candidate deploy, this migration,
+and then `hosted:status --require-passed` in that order.
+
+The ordinary write preflight requires the exact predecessor name set:
+`SITE_URL`, `JWT_PRIVATE_KEY`, `JWKS`, `HRA_AUTH_HMAC_SECRET`,
+`HRA_RESEND_API_KEY`, and the retired `HRA_AUTH_EMAIL_FROM`; it also requires
+`HRA_AUTH_EMAIL_REPLY_TO` to be absent. A missing old From name signals drift
+from the known predecessor configuration and refuses before an intent or effect.
+The migration never reads, sets, or removes the old value, so it remains
+available to the predecessor runtime for immediate rollback. Unrelated provider
+names are also left alone. This migration is additive and preserves that known
+rollback configuration; it does not establish rollback readiness for any other
+source or manually altered environment.
+
+Before the only permitted write, HRA publishes a mode-`0600`, single-link intent
+beside the requested receipt path. It then sends only the source-pinned default
+as one in-memory dotenv line to `convex env set` through standard input. It never
+puts the mailbox in argv, the child environment, or output, and it never reads or
+replaces JWT, JWKS, HMAC, or Resend values. Whether the set command returns zero,
+nonzero, or loses its ordinary response after cleanup and target identity remain
+proved, HRA does not set again: it reads `HRA_AUTH_EMAIL_REPLY_TO` from the exact
+target and requires byte-exact `ben@substrate.run` plus one newline, then reads
+names and requires all seven names: the six-name predecessor set plus the new
+Reply-To name. Only that proof, a fresh matching
+release attestation, and unchanged protected intent permit the final receipt.
+
+A restart with the same exact arguments is read-only. A matching intent can be
+completed without another set only when the exact value and all seven names are
+already present, including the retained old From name. A matching receipt is
+replayed only after the same remote
+proofs. A replacement name that predates the intent, a conflicting or missing
+value, changed source, target, deploy receipt, runtime attestation, evidence
+custody, authority containment, or unproven process cleanup fails closed. Keep
+both the receipt and its `.intent`; do not delete or rewrite either to force a
+retry.
+
 ## Read hosted preflight status
 
 Before a controlled live-acceptance run, an operator can read one bounded,
@@ -561,8 +621,9 @@ five minutes after hosted settlement and `deviceCommands:consumeResult`
 releases it only to the requesting browser, exactly once, while erasing the
 ciphertext in the same transaction. Convex returns that server-owned deadline
 with the release, so machine or browser clock skew cannot extend the readable
-window. Settings displays the code before the link, offers a copy control with
-manual selection as the fallback, and keeps both account-row actions locked
+window. Settings displays the code before the link for manual selection; it
+does not offer a clipboard control or programmatically write the clipboard. It
+keeps both account-row actions locked
 while a login-start handoff is outstanding. The exact row unlocks only after
 this tab consumes the single-use result, hosted expiry makes it unavailable, or
 the command terminalizes without a handoff; a later start or status check cannot
