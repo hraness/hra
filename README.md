@@ -1,6 +1,6 @@
 # HRA
 [![npm version](https://img.shields.io/npm/v/%40hraness%2Fhra)](https://www.npmjs.com/package/@hraness/hra) [![provenance: sigstore](https://img.shields.io/badge/provenance-sigstore-2e7d32)](https://www.npmjs.com/package/@hraness/hra#provenance) [![CI](https://img.shields.io/github/actions/workflow/status/hraness/hra/ci.yml?branch=main&label=CI)](https://github.com/hraness/hra/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/npm/l/%40hraness%2Fhra)](https://github.com/hraness/hra/blob/main/LICENSE) [![Bun 1.3.14](https://img.shields.io/badge/Bun-1.3.14-14151a)](https://bun.sh) [![runtimes: Codex 0.153.2](https://img.shields.io/badge/runtimes-Codex%200.153.2-0b5fa5)](https://www.npmjs.com/package/@openai/codex/v/0.153.2)\
-HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.
+HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex and Claude Code sessions are supported today.
 
 Status: public beta. The local CLI v0.5.0 is release-ready for macOS and Linux; hosted sync is live as an open beta.
 
@@ -206,7 +206,7 @@ hra sync status
 
 Each login reads exactly one JSON document. Request a code for an existing identity with `{"email":"you@example.com"}`, create a new identity with `{"email":"you@example.com","invite":"<identity-invite>"}`, or verify a requested code with `{"email":"you@example.com","code":"12345678"}`. No other keys or combinations are accepted. A TTY prompt hides the document; agents should pass a private descriptor with `--input-fd <fd>`. The document is never an argument.
 
-The CLI stores HRA's revocable device credential, workspace encryption key, and local signing authority as immutable generations below its private state root. Custody directories are current-user-owned mode-0700 directories, values are single-link mode-0600 files, and reads use bounded no-follow descriptors. The detached Bun daemon never opens a Keychain prompt. HRA forces both pinned Codex credential stores to file mode and verifies their effective settings, so Codex credentials remain separately owned by each profile's isolated `CODEX_HOME`.
+The CLI stores HRA's revocable device credential, workspace encryption key, and local signing authority as immutable generations below its private state root. Custody directories are current-user-owned mode-0700 directories, values are single-link mode-0600 files, and reads use bounded no-follow descriptors. The detached Bun daemon never opens a Keychain prompt. HRA forces both pinned Codex credential stores to file mode and verifies their effective settings. Managed accounts keep credentials in each profile's isolated `CODEX_HOME`; explicitly adopted personal sessions use the credentials already owned by the user's personal provider home without copying or parsing them.
 
 After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority.
 
@@ -236,6 +236,7 @@ Cloud-account erasure is an explicit and irreversible fallback, not the default 
 - Isolated accounts: each named profile has its own user-only `CODEX_HOME`. Codex app-server owns login and token refresh; HRA does not copy or parse provider credentials.
 - Usage with provenance: account identity, quota, rate-limit, and token snapshots include their provider source time and freshness. A bounded source-ordered 24-hour ledger supports safe human and JSON pagination without returning raw provider payloads.
 - Compact sessions: list sessions, read user and final assistant messages, inspect elapsed time plus bounded observed file and Git actions, then open one turn for full provider-visible detail.
+- Personal-home adoption: opt in to discover recent Codex and Claude Code sessions, then admit them after bounded liveness checks and an exact provider resume. Account-filtered session lists include admitted rows, which use the same public commands, autorespond policy, and approval authority as every HRA session. Provider APIs do not supply a global lease against every later external resume. Read [the session-adoption guide](https://github.com/hraness/hra/blob/main/docs/session-adoption.md).
 - Durable controls: send, queue, steer, stop, rename, and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing.
 - Named projects: a project is a canonical directory that may contain several repositories. Changing it affects future turns only.
 - Agent work coordination: the frozen beta contract specifies bounded local task graphs, fenced attempts, structured submissions, independent reviews, signals, and a resumable work event stream for exact existing sessions.
@@ -426,6 +427,10 @@ hra project add --path <directory> [--name <name>]
 hra project list
 hra project use <project>
 hra session list [--account <profile>] [--archived] [--limit <1-100>] [--cursor <cursor>]
+hra session adoption status [--provider <codex|claude>]
+hra session adoption enable <account> --provider <codex|claude>
+hra session adoption disable --provider <codex|claude>
+hra session discover [--provider <codex|claude>]
 hra session show <session> [--detail]
 hra session status <session> [--json]
 hra session watch <session> [--cursor <cursor>] [--jsonl]

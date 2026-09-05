@@ -28,6 +28,7 @@
 - Never persist plaintext projection text, an authentication token, or an unwrapped account key. Tokens live in the in-memory storage adapter and the account key lives in the custody context only.
 - Keep local storage to the one key `app/src/data/card-order.ts` owns, holding a bounded list of opaque session public ids for the reader's own grid arrangement. `app/src/auth/no-persistent-storage.test.ts` allowlists that module by name; a second entry needs the same argument, and nothing else in the app may name `localStorage`, `sessionStorage`, or `document.cookie`.
 - Show a schedule; never offer to change one. The scheduled-task badge and the settings list read the projected device registries and expose no create, edit, or delete anywhere.
+- Show personal-session adoption only as per-machine provider aggregates with exact local CLI hints. Never add an adopted-session badge or let the browser grant access to a personal provider home.
 - Persist only non-extractable `CryptoKey` objects, and only in IndexedDB. A private key must never be exportable.
 - Drop the account key on idle, on `Ctrl+L`, and on the first authority error from Convex.
 - A browser device is never the first device on an account and never approves another device.

@@ -14,9 +14,11 @@ import {
   HUMAN_SESSION_WATCH_BOOTSTRAP_MAXIMUM_BYTES,
   initialize,
   main,
+  personalClaudeConfigHomeForInstallation,
   protectedTerminalControlLibrariesForPlatform,
   protectedTerminalInputQueueForPlatform,
   readHiddenProtectedLineFromTerminal,
+  releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration,
   renderRemoteSuccess,
   resolveDaemonCloudStartup,
   resolveSessionEventCursorCodec,
@@ -25,6 +27,9 @@ import {
   withProtectedTerminalLifecycle,
   type DaemonStopDependencies,
 } from "./cli";
+import { readClaudeAccountProjection } from "./claude/account";
+import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./claude/pin";
+import { spawnBunClaudeProcess } from "./claude/process";
 import { allowlistedEnvironment, SAFE_ENVIRONMENT_KEYS } from "./codex/index";
 import { ShellTerminalCoordinator } from "./cli/shell-terminal";
 import {
@@ -61,6 +66,7 @@ import {
   LocalDaemonUnavailableError,
 } from "./daemon/local-transport";
 import { createAcceptanceInstallation } from "../scripts/live-acceptance-installation";
+import { createProductionInstallation } from "./installation";
 import { initializeStatePaths, resolveStatePaths } from "./storage/paths";
 import { FileSecretBackend, GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
@@ -123,6 +129,101 @@ const upgradeFixture = async (
     }),
     runRoot,
   };
+};
+
+const stagedClaudeStartupRecoveryFixture = async (
+  name: string,
+  pid: number,
+) => {
+  const runRoot = await realpath(await mkdtemp(join(tmpdir(), `hra-claude-startup-${name}-`)));
+  const paths = resolveStatePaths({ homeDirectory: runRoot, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const store = new StateStore(paths, { now: (() => {
+    let value = 1_000;
+    return () => value++;
+  })() });
+  try {
+    const created = store.createProfile(`Claude startup ${name}`);
+    const generation = store.nextProfileGeneration(created.id);
+    if (!store.setProfileState(
+      generation.id,
+      generation.processGeneration,
+      "signed_in",
+      { email: `claude-startup-${name}@example.com`, plan: "Plus" },
+    )) throw new Error("Expected the startup recovery profile to sign in.");
+    const profile = store.requireProfileById(generation.id);
+    const claimed = store.recordClaimedClaudeProcessAuthority({
+      providerThreadId: `claude-startup-${name}`,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      identity: {
+        pid,
+        pidDomain: "darwin",
+        procStart: `claude-startup-process-${name}`,
+      },
+    });
+    const authority = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: claimed.providerThreadId,
+      profileId: claimed.profileId,
+      runtimeScope: claimed.runtimeScope,
+      expectedRevision: claimed.revision,
+      identity: claimed.identity,
+    });
+    const revocation = store.stageProfilePersonalAuthorityRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+    });
+    if (!store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "recovery_required",
+      { email: `claude-startup-${name}@example.com`, plan: "Plus" },
+    )) throw new Error("Expected the startup recovery profile to enter recovery.");
+    return {
+      authority,
+      profile: store.requireProfileById(profile.id),
+      revocation,
+      runRoot,
+      store,
+    };
+  } catch (error: unknown) {
+    store.close();
+    await rm(runRoot, { force: true, recursive: true });
+    throw error;
+  }
+};
+
+const stagedClaudeLaunchIntentStartupFixture = async (name: string) => {
+  const runRoot = await realpath(await mkdtemp(join(tmpdir(), `hra-claude-launch-${name}-`)));
+  const paths = resolveStatePaths({ homeDirectory: runRoot, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const store = new StateStore(paths, { now: (() => {
+    let value = 2_000;
+    return () => value++;
+  })() });
+  try {
+    const created = store.createProfile(`Claude launch ${name}`);
+    const generation = store.nextProfileGeneration(created.id);
+    if (!store.setProfileState(
+      generation.id,
+      generation.processGeneration,
+      "signed_in",
+      { email: `claude-launch-${name}@example.com`, plan: "Plus" },
+    )) throw new Error("Expected the launch-intent profile to sign in.");
+    const profile = store.requireProfileById(generation.id);
+    const intent = store.stageClaudeProcessLaunchIntent({
+      providerThreadId: `claude-launch-${name}`,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+    });
+    return { intent, profile, runRoot, store };
+  } catch (error: unknown) {
+    store.close();
+    await rm(runRoot, { force: true, recursive: true });
+    throw error;
+  }
 };
 
 const cursorWireSignature = "A".repeat(43);
@@ -316,6 +417,318 @@ const exactStopDependencies = (
 });
 
 describe("CLI entry point", () => {
+  test("redirects acceptance personal Claude account reads and processes into fixture custody", async () => {
+    const value = await upgradeFixture("personal-claude-home");
+    try {
+      const configDir = value.installation.personalProviderHomes.claudeConfigDir;
+      const configHome = personalClaudeConfigHomeForInstallation(value.installation);
+      expect(configHome).toBe("isolated");
+      expect(personalClaudeConfigHomeForInstallation(createProductionInstallation()))
+        .toBe("personal");
+
+      const runtime = Object.freeze({
+        argv: [process.execPath] as const,
+        effort: CLAUDE_PIN_EFFORT,
+        executablePath: process.execPath,
+        model: CLAUDE_PIN_MODEL,
+        version: CLAUDE_PIN,
+      });
+      const metadataPaths: string[] = [];
+      const account = await readClaudeAccountProjection({
+        configDir,
+        configHome,
+        runtime,
+        signal: new AbortController().signal,
+        readMetadata: (path) => {
+          metadataPaths.push(path);
+          return Promise.resolve({
+            oauthAccount: {
+              accountUuid: "acceptance-account",
+              emailAddress: "acceptance@example.test",
+              organizationUuid: "acceptance-organization",
+            },
+          });
+        },
+        probeAuthStatus: (input) => {
+          expect(input.configDir).toBe(configDir);
+          expect(input.configHome).toBe("isolated");
+          return Promise.resolve({ loggedIn: true });
+        },
+      });
+      expect(account).toMatchObject({
+        accountId: "acceptance-account",
+        email: "acceptance@example.test",
+        signedIn: true,
+      });
+      expect(metadataPaths).toEqual([
+        join(configDir, ".claude.json"),
+        join(configDir, ".claude.json"),
+      ]);
+
+      const child = spawnBunClaudeProcess({
+        argv: [
+          process.execPath,
+          "-e",
+          "process.stdout.write(process.env.CLAUDE_CONFIG_DIR ?? 'missing')",
+        ],
+        configDir,
+        configHome,
+        inspectIdentity: (pid) => Promise.resolve({
+          pid,
+          pidDomain: "darwin",
+          procStart: "Fri Sep  4 12:00:00 2026",
+        }),
+      });
+      const output: Uint8Array[] = [];
+      for await (const chunk of child.stdout) output.push(chunk);
+      expect(await child.exited).toBe(0);
+      expect(new TextDecoder().decode(Buffer.concat(output))).toBe(configDir);
+    } finally {
+      await rm(value.runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("startup preserves live or unknown Claude launch intent authority and generation", async () => {
+    for (const [index, liveness] of (["live", "unknown"] as const).entries()) {
+      const value = await stagedClaudeLaunchIntentStartupFixture(liveness);
+      const deadlineAt = 34_567 + index;
+      const controller = new AbortController();
+      let probes = 0;
+      try {
+        await expect(releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(
+          value.store,
+          {
+            deadlineAt,
+            signal: controller.signal,
+            launchIntentProbe: {
+              probe: (providerThreadId, input) => {
+                probes += 1;
+                expect(providerThreadId).toBe(value.intent.providerThreadId);
+                expect(input.deadlineAt).toBe(deadlineAt);
+                expect(input.signal).toBe(controller.signal);
+                return Promise.resolve(liveness);
+              },
+            },
+            probe: () => {
+              throw new Error("Exact process liveness must not run for a launch intent.");
+            },
+          },
+        )).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(probes).toBe(1);
+        expect(value.store.readClaudeProcessLaunchIntent({
+          providerThreadId: value.intent.providerThreadId,
+          profileId: value.intent.profileId,
+          runtimeScope: value.intent.runtimeScope,
+        })).toEqual(value.intent);
+        expect(value.store.requireProfileById(value.profile.id)).toEqual(value.profile);
+
+        expect(() => value.store.nextDaemonGeneration(
+          `boot_${index === 0 ? "d".repeat(32) : "e".repeat(32)}`,
+        )).toThrow("live session controllers must release before account generation changes");
+        expect(value.store.readClaudeProcessLaunchIntent({
+          providerThreadId: value.intent.providerThreadId,
+          profileId: value.intent.profileId,
+          runtimeScope: value.intent.runtimeScope,
+        })).toEqual(value.intent);
+        expect(value.store.requireProfileById(value.profile.id)).toEqual(value.profile);
+      } finally {
+        value.store.close();
+        await rm(value.runRoot, { force: true, recursive: true });
+      }
+    }
+  });
+
+  test("startup cancels a proven-dead Claude launch intent before generation advance", async () => {
+    const value = await stagedClaudeLaunchIntentStartupFixture("not-live");
+    const deadlineAt = 45_678;
+    const controller = new AbortController();
+    let probes = 0;
+    try {
+      await releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(
+        value.store,
+        {
+          deadlineAt,
+          signal: controller.signal,
+          launchIntentProbe: {
+            probe: (providerThreadId, input) => {
+              probes += 1;
+              expect(providerThreadId).toBe(value.intent.providerThreadId);
+              expect(input.deadlineAt).toBe(deadlineAt);
+              expect(input.signal).toBe(controller.signal);
+              return Promise.resolve("not_live");
+            },
+          },
+          probe: () => {
+            throw new Error("Exact process liveness must not run for a launch intent.");
+          },
+        },
+      );
+      expect(probes).toBe(1);
+      expect(value.store.readClaudeProcessLaunchIntent({
+        providerThreadId: value.intent.providerThreadId,
+        profileId: value.intent.profileId,
+        runtimeScope: value.intent.runtimeScope,
+      })).toBeNull();
+      expect(value.store.requireProfileById(value.profile.id)).toEqual(value.profile);
+
+      expect(value.store.nextDaemonGeneration(`boot_${"f".repeat(32)}`)).toBe(1);
+      expect(value.store.requireProfileById(value.profile.id)).toMatchObject({
+        processGeneration: value.profile.processGeneration + 1,
+        state: "signed_in",
+      });
+    } finally {
+      value.store.close();
+      await rm(value.runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("startup cannot cancel a restaged Claude launch intent through ABA", async () => {
+    const value = await stagedClaudeLaunchIntentStartupFixture("aba");
+    let replacement: typeof value.intent | undefined;
+    try {
+      await expect(releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(
+        value.store,
+        {
+          launchIntentProbe: {
+            probe: () => {
+              value.store.cancelClaudeProcessLaunchIntent({
+                providerThreadId: value.intent.providerThreadId,
+                profileId: value.intent.profileId,
+                profileGeneration: value.intent.profileGeneration,
+                runtimeScope: value.intent.runtimeScope,
+                intentId: value.intent.intentId,
+                expectedRevision: value.intent.revision,
+              });
+              replacement = value.store.stageClaudeProcessLaunchIntent({
+                providerThreadId: value.intent.providerThreadId,
+                profileId: value.intent.profileId,
+                profileGeneration: value.intent.profileGeneration,
+                runtimeScope: value.intent.runtimeScope,
+              });
+              return Promise.resolve("not_live");
+            },
+          },
+        },
+      )).rejects.toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
+      if (replacement === undefined) throw new Error("Expected the launch intent to be restaged.");
+      expect(replacement.intentId).not.toBe(value.intent.intentId);
+      expect(replacement.revision).toBe(value.intent.revision);
+      expect(value.store.readClaudeProcessLaunchIntent({
+        providerThreadId: value.intent.providerThreadId,
+        profileId: value.intent.profileId,
+        runtimeScope: value.intent.runtimeScope,
+      })).toEqual(replacement);
+      expect(value.store.requireProfileById(value.profile.id)).toEqual(value.profile);
+    } finally {
+      value.store.close();
+      await rm(value.runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("startup refuses live or unknown Claude custody during a staged revocation", async () => {
+    for (const [index, liveness] of (["live", "unknown"] as const).entries()) {
+      const value = await stagedClaudeStartupRecoveryFixture(
+        liveness,
+        61_001 + index,
+      );
+      const deadlineAt = 12_345;
+      const controller = new AbortController();
+      let probes = 0;
+      try {
+        await expect(releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(
+          value.store,
+          {
+            deadlineAt,
+            signal: controller.signal,
+            probe: (identity, input) => {
+              probes += 1;
+              expect(identity).toEqual(value.authority.identity);
+              expect(input.deadlineAt).toBe(deadlineAt);
+              expect(input.signal).toBe(controller.signal);
+              return Promise.resolve(liveness);
+            },
+          },
+        )).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(probes).toBe(1);
+        expect(value.store.requireProfileById(value.profile.id)).toEqual(value.profile);
+        expect(value.store.readClaudeProcessAuthority({
+          providerThreadId: value.authority.providerThreadId,
+          profileId: value.authority.profileId,
+          runtimeScope: value.authority.runtimeScope,
+        })).toEqual(value.authority);
+        expect(value.store.readProfilePersonalAuthorityRevocation(value.profile.id))
+          .toEqual(value.revocation);
+
+        expect(() => value.store.nextDaemonGeneration(
+          `boot_${index === 0 ? "a".repeat(32) : "b".repeat(32)}`,
+        )).toThrow("live session controllers must release before account generation changes");
+        expect(value.store.requireProfileById(value.profile.id)).toEqual(value.profile);
+        expect(value.store.readClaudeProcessAuthority({
+          providerThreadId: value.authority.providerThreadId,
+          profileId: value.authority.profileId,
+          runtimeScope: value.authority.runtimeScope,
+        })).toEqual(value.authority);
+        expect(value.store.readProfilePersonalAuthorityRevocation(value.profile.id))
+          .toEqual(value.revocation);
+      } finally {
+        value.store.close();
+        await rm(value.runRoot, { force: true, recursive: true });
+      }
+    }
+  });
+
+  test("startup releases proven-dead Claude custody before advancing daemon generation", async () => {
+    const value = await stagedClaudeStartupRecoveryFixture("not-live", 61_003);
+    const deadlineAt = 23_456;
+    const controller = new AbortController();
+    let probes = 0;
+    try {
+      await releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(
+        value.store,
+        {
+          deadlineAt,
+          signal: controller.signal,
+          probe: (identity, input) => {
+            probes += 1;
+            expect(identity).toEqual(value.authority.identity);
+            expect(input.deadlineAt).toBe(deadlineAt);
+            expect(input.signal).toBe(controller.signal);
+            return Promise.resolve("not_live");
+          },
+        },
+      );
+      expect(probes).toBe(1);
+      const released = value.store.readClaudeProcessAuthority({
+        providerThreadId: value.authority.providerThreadId,
+        profileId: value.authority.profileId,
+        runtimeScope: value.authority.runtimeScope,
+      });
+      expect(released).toMatchObject({
+        identity: value.authority.identity,
+        profileGeneration: value.profile.processGeneration,
+        revision: value.authority.revision + 1,
+        state: "released",
+      });
+      expect(value.store.requireProfileById(value.profile.id)).toEqual(value.profile);
+      expect(value.store.readProfilePersonalAuthorityRevocation(value.profile.id))
+        .toEqual(value.revocation);
+
+      expect(value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(1);
+      expect(value.store.requireProfileById(value.profile.id)).toMatchObject({
+        processGeneration: value.profile.processGeneration + 1,
+        state: "recovery_required",
+      });
+      expect(value.store.readClaudeProcessAuthority({
+        providerThreadId: value.authority.providerThreadId,
+        profileId: value.authority.profileId,
+        runtimeScope: value.authority.runtimeScope,
+      })).toEqual(released);
+    } finally {
+      value.store.close();
+      await rm(value.runRoot, { force: true, recursive: true });
+    }
+  });
+
   test("reads root status locally without daemon autostart or transport", async () => {
     const captured = capture();
     let daemonCalls = 0;

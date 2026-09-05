@@ -150,8 +150,14 @@ import {
 } from "./daemon/daemon-startup";
 import { PinnedClaudeRuntimeManager } from "./daemon/claude-runtime-adapter";
 import { PinnedCodexRuntimeManager } from "./daemon/codex-runtime-adapter";
+import {
+  BoundedPersonalSessionDiscovery,
+  createLocalClaudeProcessLivenessProbe,
+  createPersonalClaudeDiscoveryAdapters,
+  type ClaudeProcessLivenessProbe,
+} from "./daemon/personal-session-discovery";
 import { HraFactsMemoryLifecycle } from "./daemon/facts-memory-lifecycle";
-import { UnavailableCloudControl, type ClaudeRuntimePort, type CloudControlPort, type CodexRuntimePort, type CompactProjectionRecoveryBlocker } from "./daemon/ports";
+import { UnavailableCloudControl, type CloudControlPort, type CompactProjectionRecoveryBlocker } from "./daemon/ports";
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { CommandFailure, HraService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
@@ -177,6 +183,8 @@ import type { GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
 import { WorkCapabilityCodec } from "./storage/work-capability";
 import { HRA_VERSION } from "./version";
+import { CLAUDE_PIN } from "./claude/pin";
+import { ClaudeLaunchIntentLivenessProbe } from "./claude/process";
 
 const writeProcessStdoutAsync = (value: string, signal: AbortSignal): Promise<void> =>
   new Promise<void>((resolve, reject) => {
@@ -3096,6 +3104,87 @@ async function joinBeforeDeadline<T>(operation: string, promise: Promise<T>, dea
   }
 }
 
+/**
+ * Live acceptance redirects its synthetic "personal" provider home under the
+ * fixture root. Claude must therefore select that directory explicitly even
+ * though service authority still classifies the controller as personal.
+ * Production preserves Claude's real default-home semantics.
+ */
+export function personalClaudeConfigHomeForInstallation(
+  installation: Pick<HraInstallation, "kind">,
+): "isolated" | "personal" {
+  return installation.kind === "live_acceptance" ? "isolated" : "personal";
+}
+
+export async function releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(
+  store: StateStore,
+  options: Readonly<{
+    probe?: ClaudeProcessLivenessProbe;
+    launchIntentProbe?: Pick<ClaudeLaunchIntentLivenessProbe, "probe">;
+    deadlineAt?: number;
+    signal?: AbortSignal;
+  }> = {},
+): Promise<void> {
+  const probe = options.probe ?? createLocalClaudeProcessLivenessProbe();
+  const launchIntentProbe = options.launchIntentProbe
+    ?? new ClaudeLaunchIntentLivenessProbe();
+  const signal = options.signal ?? new AbortController().signal;
+  const deadlineAt = options.deadlineAt ?? Date.now() + 3_000;
+  for (;;) {
+    const intents = store.listClaudeProcessLaunchIntents();
+    if (intents.length === 0) break;
+    for (const intent of intents) {
+      const liveness = await launchIntentProbe.probe(intent.providerThreadId, {
+        deadlineAt,
+        signal,
+      });
+      if (liveness !== "not_live") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "A prior Claude launch did not finish recording exact process custody. Exit any Claude process for that session, then retry `hra daemon start`; HRA will not advance account authority around it.",
+        );
+      }
+      store.cancelClaudeProcessLaunchIntent({
+        providerThreadId: intent.providerThreadId,
+        profileId: intent.profileId,
+        profileGeneration: intent.profileGeneration,
+        runtimeScope: intent.runtimeScope,
+        intentId: intent.intentId,
+        expectedRevision: intent.revision,
+      });
+    }
+  }
+  for (;;) {
+    const authorities = store.listUnreleasedClaudeProcessAuthorities();
+    if (authorities.length === 0) return;
+    for (const authority of authorities) {
+      const liveness = await probe(authority.identity, { deadlineAt, signal });
+      if (liveness !== "not_live") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "A prior HRA-owned Claude controller is still live or cannot be proven stopped. Exit it, then retry `hra daemon start`; HRA will not advance account authority around it.",
+        );
+      }
+      const releasing = authority.state === "releasing"
+        ? authority
+        : store.beginClaudeProcessAuthorityRelease({
+            providerThreadId: authority.providerThreadId,
+            profileId: authority.profileId,
+            runtimeScope: authority.runtimeScope,
+            expectedRevision: authority.revision,
+            identity: authority.identity,
+          });
+      store.completeClaudeProcessAuthorityRelease({
+        providerThreadId: releasing.providerThreadId,
+        profileId: releasing.profileId,
+        runtimeScope: releasing.runtimeScope,
+        expectedRevision: releasing.revision,
+        identity: releasing.identity,
+      });
+    }
+  }
+}
+
 export async function runDaemon(
   installation: HraInstallation = createProductionInstallation(),
 ): Promise<number> {
@@ -3109,12 +3198,16 @@ export async function runDaemon(
   let factsMemoryControl: FactsMemoryControlStore | undefined;
   let codex: PinnedCodexRuntimeManager | undefined;
   let claude: PinnedClaudeRuntimeManager | undefined;
+  let personalCodex: PinnedCodexRuntimeManager | undefined;
+  let personalClaude: PinnedClaudeRuntimeManager | undefined;
   let service: HraService | undefined;
   let server: LocalDaemonServer | undefined;
   let cloudAdapter: StateBackedCloudDaemonAdapter | undefined;
   let cloudLifecycle: CloudDaemonLifecycle | undefined;
   let usagePoller: AccountUsagePoller | undefined;
   let usagePollerShutdown: Promise<void> | undefined;
+  let adoptionPoller: AccountUsagePoller | undefined;
+  let adoptionPollerShutdown: Promise<void> | undefined;
   let cloudRequestController: AbortController | undefined;
   let daemonAuthority: DaemonAuthorityFence | undefined;
   let serviceShutdown: Promise<void> | undefined;
@@ -3127,6 +3220,7 @@ export async function runDaemon(
     if (stopRequested) return;
     stopRequested = true;
     if (usagePoller !== undefined) usagePollerShutdown ??= usagePoller.close();
+    if (adoptionPoller !== undefined) adoptionPollerShutdown ??= adoptionPoller.close();
     if (service !== undefined) serviceShutdown = service.close();
     else daemonAuthority?.close();
     server?.beginShutdown(new Error("Daemon shutdown was requested."));
@@ -3172,6 +3266,7 @@ export async function runDaemon(
     activeStore.configurePublicProviderIdentifierProjector(
       (value) => eventCursors.projectPublicProviderIdentifier(value),
     );
+    await releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(activeStore);
     bootId = `boot_${randomUUID().replaceAll("-", "")}`;
     generation = activeStore.nextDaemonGeneration(bootId);
     await daemonLock.publish({ state: "booting", generation, bootId });
@@ -3180,6 +3275,7 @@ export async function runDaemon(
     checkpointBoot();
     const serviceReference: { current?: HraService } = {};
     codex = new PinnedCodexRuntimeManager({
+      allowSameGenerationRelaunchAfterProviderDisconnect: true,
       ...(installation.kind === "live_acceptance"
         ? {
             codexEnvironment: installation.codexEnvironment,
@@ -3220,6 +3316,7 @@ export async function runDaemon(
     // so a machine without it pays nothing and is refused with one exact,
     // actionable message at `session start --provider claude`.
     claude = new PinnedClaudeRuntimeManager({
+      configHome: "isolated",
       configDirFor: (authority) => {
         const dir = profilePaths(paths, authority.id).claudeConfigDir;
         mkdirSync(dir, { mode: 0o700, recursive: true });
@@ -3238,6 +3335,95 @@ export async function runDaemon(
           await serviceReference.current?.observeClaudeFact(authority, fact);
         },
       },
+    });
+    const personalHomes = installation.personalProviderHomes;
+    personalCodex = new PinnedCodexRuntimeManager({
+      allowSameGenerationRelaunchAfterProviderDisconnect: true,
+      ...(installation.kind === "live_acceptance"
+        ? { codexEnvironment: installation.codexEnvironment }
+        : {}),
+      credentialStorePreflight: {
+        ...installation.credentialStorePreflight,
+        // Bootstrap against an HRA-owned neutral directory. Project-scoped
+        // operations perform their own effective-config preflight later.
+        cwd: installation.paths.root,
+      },
+      isCurrent: (authority) => {
+        try {
+          const profile = activeStore.requireProfile(authority.id);
+          return profile.processGeneration === authority.generation && profile.state !== "removed";
+        } catch {
+          return false;
+        }
+      },
+      observer: {
+        // Personal-home identity never mutates the selected isolated login;
+        // the service compares it and durably revokes controllers on drift.
+        account: async (authority, account) => {
+          await serviceReference.current?.observePersonalCodexAccount(authority, account);
+        },
+        conversationAutomation: async (authority, call) => {
+          const current = serviceReference.current;
+          if (current === undefined) {
+            throw new Error("The HRA service is unavailable during conversation automation.");
+          }
+          return await current.handleConversationAutomationToolCall(authority, call, "personal");
+        },
+        conversationAutomationResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyConversationAutomationToolResponseWritten(
+            authority,
+            call,
+            "personal",
+          );
+        },
+        fact: async (authority, fact) => {
+          await serviceReference.current?.observePersonalCodexFact(authority, fact);
+        },
+      },
+    });
+    personalClaude = new PinnedClaudeRuntimeManager({
+      configHome: personalClaudeConfigHomeForInstallation(installation),
+      configDirFor: () => personalHomes.claudeConfigDir,
+      isCurrent: (authority) => {
+        try {
+          const profile = activeStore.requireProfile(authority.id);
+          return profile.processGeneration === authority.generation && profile.state !== "removed";
+        } catch {
+          return false;
+        }
+      },
+      observer: {
+        fact: async (authority, fact) => {
+          await serviceReference.current?.observePersonalClaudeFact(authority, fact);
+        },
+      },
+    });
+    const activePersonalCodex = personalCodex;
+    const personalClaudeDiscovery = createPersonalClaudeDiscoveryAdapters({
+      configDir: personalHomes.claudeConfigDir,
+      pinnedVersion: CLAUDE_PIN,
+    });
+    const personalDiscovery = new BoundedPersonalSessionDiscovery({
+      codexListPage: async ({ cursor, limit, signal }) => {
+        const policy = activeStore.readSessionAdoptionPolicy("codex");
+        if (policy === null || !policy.enabled || policy.profileId === null) {
+          return { sessions: [], nextCursor: null };
+        }
+        const profile = activeStore.requireProfileById(policy.profileId);
+        const isolated = profilePaths(paths, profile.id);
+        return await activePersonalCodex.listSessions({
+          authority: {
+            id: profile.id,
+            generation: profile.processGeneration,
+            codexHome: personalHomes.codexHome,
+            desktopUserData: isolated.desktopUserData,
+          },
+          limit,
+          ...(cursor === undefined ? {} : { cursor }),
+          signal,
+        });
+      },
+      ...personalClaudeDiscovery,
     });
     const cloudEnvironment = installation.cloudEnvironment;
     const cloudStartup = await resolveDaemonCloudStartup({
@@ -3288,42 +3474,14 @@ export async function runDaemon(
             "Cloud deployment authority changed during daemon startup.",
           );
         }
-        const cloudCodex = new Proxy(codex, {
-          get(target, property) {
-            const value = Reflect.get(target, property, target) as unknown;
-            if (typeof value !== "function") return value;
-            if (property === "close") {
-              return (...args: unknown[]): unknown => Reflect.apply(value, target, args) as unknown;
-            }
-            return async (...args: unknown[]) => {
-              await activeDaemonAuthority.assertCurrent();
-              const result = await Reflect.apply(value, target, args) as unknown;
-              await activeDaemonAuthority.assertCurrent();
-              return result;
-            };
-          },
-        }) as CodexRuntimePort;
-        // The same authority fence around the Claude seam: cloud projection
-        // reads a Claude session through its own port.
-        const cloudClaude = new Proxy(claude, {
-          get(target, property) {
-            const value = Reflect.get(target, property, target) as unknown;
-            if (typeof value !== "function") return value;
-            if (property === "close" || property === "interactionAuthority"
-              || property === "pinnedVersion") {
-              return (...args: unknown[]): unknown => Reflect.apply(value, target, args) as unknown;
-            }
-            return async (...args: unknown[]) => {
-              await activeDaemonAuthority.assertCurrent();
-              const result = await Reflect.apply(value, target, args) as unknown;
-              await activeDaemonAuthority.assertCurrent();
-              return result;
-            };
-          },
-        }) as ClaudeRuntimePort;
         candidateAdapter = new StateBackedCloudDaemonAdapter({
-          claude: cloudClaude,
-          codex: cloudCodex,
+          readSessionProjectionForCloud: async (sessionId, signal) => {
+            const current = serviceReference.current;
+            if (current === undefined) {
+              throw new Error("The local command service is not ready for a cloud projection read.");
+            }
+            return await current.readSessionProjectionForCloud(sessionId, signal);
+          },
           // Device commands run ordinary local commands, so they go through the
           // same admitted service path a person's CLI uses, with the same
           // idempotency, quarantine, and authority checks.
@@ -3426,6 +3584,11 @@ export async function runDaemon(
       paths,
       codex,
       claude,
+      personalCodex,
+      personalClaude,
+      personalCodexHome: personalHomes.codexHome,
+      personalDiscovery,
+      claudeProcessLiveness: personalClaudeDiscovery.claudeProcessLiveness,
       cloud,
       daemonAuthority: activeDaemonAuthority,
       daemonGeneration: generation,
@@ -3470,6 +3633,21 @@ export async function runDaemon(
       },
     });
     usagePoller.start();
+    adoptionPoller = new AccountUsagePoller({
+      listAccountIds: () => activeStore.listSessionAdoptionPolicies()
+        .filter((policy) => policy.enabled)
+        .map((policy) => policy.provider),
+      poll: async (provider, signal) => {
+        await activeService.discoverPersonalSessions(providerSchema.parse(provider), signal);
+      },
+      onFailure: (_provider, error) => {
+        activeService.recordBackgroundDiagnostic("session_adoption_failed", error);
+      },
+      onTickFailure: (error) => {
+        activeService.recordBackgroundDiagnostic("session_adoption_failed", error);
+      },
+    });
+    adoptionPoller.start();
     cloudLifecycle?.start();
     server = await LocalDaemonServer.start({
       paths,
@@ -3503,6 +3681,7 @@ export async function runDaemon(
   } finally {
     runError ??= unhandledRejectionError;
     if (usagePoller !== undefined) usagePollerShutdown ??= usagePoller.close();
+    if (adoptionPoller !== undefined) adoptionPollerShutdown ??= adoptionPoller.close();
     if (service !== undefined) serviceShutdown ??= service.close();
     else daemonAuthority?.close();
     server?.beginShutdown(new Error("Daemon lifetime ended."));
@@ -3525,6 +3704,12 @@ export async function runDaemon(
         else cleanupErrors.push(error);
       }
     }
+    if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && adoptionPollerShutdown !== undefined) {
+      try { await joinBeforeDeadline("Session adoption poller shutdown", adoptionPollerShutdown); } catch (error: unknown) {
+        if (error instanceof DaemonJoinDeadlineError) runError = error;
+        else cleanupErrors.push(error);
+      }
+    }
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudLifecycle !== undefined) {
       try { await joinBeforeDeadline("Cloud daemon shutdown", cloudLifecycle.close()); } catch (error: unknown) {
         if (error instanceof DaemonJoinDeadlineError) runError = error;
@@ -3537,8 +3722,28 @@ export async function runDaemon(
     }
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError)) {
       try {
-        if (serviceShutdown !== undefined) await joinBeforeDeadline("Codex service shutdown", serviceShutdown);
-        else if (codex !== undefined) await joinBeforeDeadline("Codex runtime shutdown", codex.close());
+        if (serviceShutdown !== undefined) await joinBeforeDeadline("Provider service shutdown", serviceShutdown);
+        else {
+          const runtimes = [codex, claude, personalCodex, personalClaude]
+            .filter((runtime): runtime is PinnedCodexRuntimeManager | PinnedClaudeRuntimeManager => runtime !== undefined);
+          await joinBeforeDeadline(
+            "Provider runtime shutdown",
+            Promise.allSettled(runtimes.map(async (runtime) => await runtime.close()))
+              .then((outcomes) => {
+                const failures: unknown[] = [];
+                for (const outcome of outcomes) {
+                  if (outcome.status === "rejected") failures.push(outcome.reason as unknown);
+                }
+                if (failures.length === 1) throw failures[0];
+                if (failures.length > 1) {
+                  throw new AggregateError(
+                    failures,
+                    "Multiple provider runtimes failed during shutdown.",
+                  );
+                }
+              }),
+          );
+        }
       } catch (error: unknown) {
         if (error instanceof DaemonJoinDeadlineError) runError = error;
         else cleanupErrors.push(error);

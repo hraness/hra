@@ -91,6 +91,8 @@ export {
   type DeviceRegistryPayload,
   type DeviceRegistryProject,
   type DeviceRegistryScheduledTask,
+  type DeviceRegistrySessionAdoption,
+  type DeviceRegistrySessionAdoptionStatus,
   type RemoteCommandPayload,
   type SessionMetadataPayload,
 } from "../../../src/cloud/payloads";

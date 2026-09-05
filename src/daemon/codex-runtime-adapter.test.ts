@@ -53,8 +53,12 @@ function createRuntimeManager(input: TestRuntimeManagerOptions): PinnedCodexRunt
           launchClient: async (options) => {
             const client = await launchClient(options);
             const mutable = client as unknown as {
+              assertCredentialStores?: CodexAppServerClient["assertCredentialStores"];
               connectionId?: string;
+              discoverCapabilities?: CodexAppServerClient["discoverCapabilities"];
               resumeThread?: CodexAppServerClient["resumeThread"];
+              resumeThreadWithPolicy?: CodexAppServerClient["resumeThreadWithPolicy"];
+              resolvePreset?: CodexAppServerClient["resolvePreset"];
             };
             if (typeof mutable.connectionId !== "string") {
               fakeConnectionSequence += 1;
@@ -70,6 +74,50 @@ function createRuntimeManager(input: TestRuntimeManagerOptions): PinnedCodexRunt
               },
               value: makeThread([], threadId),
             });
+            mutable.assertCredentialStores ??= async () => undefined;
+            mutable.discoverCapabilities ??= async () => ({
+              authority: {
+                profileId: options.authority.profileId,
+                processGeneration: options.authority.processGeneration,
+              },
+              value: makeCapabilitySnapshot(),
+            });
+            mutable.resolvePreset ??= (_capabilities, alias, fast) => ({
+              alias,
+              model: "gpt-5.6-sol",
+              effort: "max",
+              serviceTier: fast ? "priority" : null,
+              fast,
+            });
+            mutable.resumeThreadWithPolicy ??= async (reviewed) => {
+              const resumed = await mutable.resumeThread?.(reviewed.threadId);
+              if (resumed === undefined) throw new Error("missing fake resume implementation");
+              return {
+                authority: resumed.authority,
+                value: {
+                  thread: resumed.value,
+                  cwd: reviewed.cwd,
+                  model: reviewed.preset.model,
+                  modelProvider: "openai",
+                  reasoningEffort: reviewed.preset.effort,
+                  serviceTier: reviewed.preset.serviceTier,
+                  approvalPolicy: "on-request",
+                  approvalsReviewer: reviewed.policy.review,
+                  sandbox: {
+                    type: "workspaceWrite",
+                    writableRoots: [...reviewed.policy.writableRoots],
+                    networkAccess: false,
+                    excludeTmpdirEnvVar: false,
+                    excludeSlashTmp: false,
+                  },
+                  activePermissionProfile: {
+                    id: reviewed.policy.permissionProfile,
+                    extends: null,
+                  },
+                  runtimeWorkspaceRoots: [...reviewed.policy.writableRoots],
+                },
+              };
+            };
             return client;
           },
         }),
@@ -103,6 +151,29 @@ const makeThread = (turns: readonly CodexTurn[], id = "thread-1"): CodexThread =
   name: "Projection test",
   turns,
 });
+
+function makeCapabilitySnapshot(): CodexCapabilitySnapshot {
+  return {
+    models: [{
+      id: "gpt-5.6-sol",
+      model: "gpt-5.6-sol",
+      displayName: "GPT-5.6 Sol",
+      hidden: false,
+      supportedReasoningEfforts: ["max", "ultra"],
+      defaultReasoningEffort: "max",
+      serviceTiers: [{ id: "priority", name: "Fast", description: "Faster" }],
+      defaultServiceTier: null,
+      isDefault: true,
+    }],
+    features: [
+      { name: "computer_use", stage: "stable", enabled: true, defaultEnabled: true },
+      { name: "plugins", stage: "stable", enabled: true, defaultEnabled: true },
+    ],
+    permissionProfiles: [{ id: ":workspace", description: null, allowed: true }],
+    apps: [],
+    pluginLifecycle: "unsupported-under-development",
+  };
+}
 
 describe("PinnedCodexRuntimeManager", () => {
   test("single-flights an exact resumed thread observation by generation and connection", async () => {
@@ -283,7 +354,7 @@ describe("PinnedCodexRuntimeManager", () => {
     await manager.close();
   });
 
-  test("retires an indeterminate resume without retrying it under the same generation", async () => {
+  test("keeps an indeterminate resume retired under the same generation even when deterministic relaunch is enabled", async () => {
     let resumeCalls = 0;
     let closeCalls = 0;
     const fake = {
@@ -296,6 +367,7 @@ describe("PinnedCodexRuntimeManager", () => {
       close: async () => { closeCalls += 1; },
     } as unknown as CodexAppServerClient;
     const manager = createRuntimeManager({
+      allowSameGenerationRelaunchAfterProviderDisconnect: true,
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -381,6 +453,474 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(closeCalls).toBe(0);
     await manager.close();
     expect(closeCalls).toBe(1);
+  });
+
+  test("claim retries one retained determinate resume rejection on the same connection", async () => {
+    let resumeCalls = 0;
+    let policyfulResumeCalls = 0;
+    let readCalls = 0;
+    const connectionId = "71000000-0000-4000-8000-000000000006";
+    const providerThreadId = "thread-personal-claim";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const fake = {
+      state: "ready",
+      connectionId,
+      resumeThread: async (threadId: string) => {
+        resumeCalls += 1;
+        expect(threadId).toBe(providerThreadId);
+        if (resumeCalls === 1) {
+          throw new CodexError("REMOTE_ERROR", "Codex temporarily rejected thread/resume.");
+        }
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      resumeThreadWithPolicy: async () => {
+        policyfulResumeCalls += 1;
+        throw new Error("claim must not mutate provider policy before durable adoption");
+      },
+      readThread: async (threadId: string, includeTurns: boolean) => {
+        readCalls += 1;
+        expect(threadId).toBe(providerThreadId);
+        expect(includeTurns).toBe(false);
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(manager.observeSession({
+        authority,
+        providerThreadId,
+        signal: new AbortController().signal,
+      })).rejects.toMatchObject({
+        name: "CodexSessionObservationError",
+        reason: "resume_unavailable",
+      });
+    }
+    expect(resumeCalls).toBe(1);
+
+    const claims = await Promise.all([
+      manager.claimSession({
+        authority,
+        providerThreadId,
+        projectRoot: "/workspace/project",
+        preset: "high",
+        fast: false,
+        signal: new AbortController().signal,
+      }),
+      manager.claimSession({
+        authority,
+        providerThreadId,
+        projectRoot: "/workspace/project",
+        preset: "high",
+        fast: false,
+        signal: new AbortController().signal,
+      }),
+    ]);
+    expect(claims).toHaveLength(2);
+    for (const claim of claims) {
+      expect(claim).toMatchObject({
+        connectionId,
+        projection: { providerThreadId, status: "idle" },
+        resumed: true,
+      });
+    }
+    expect({ policyfulResumeCalls, readCalls, resumeCalls }).toEqual({
+      policyfulResumeCalls: 0,
+      readCalls: 2,
+      resumeCalls: 2,
+    });
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ connectionId, projection: { providerThreadId } });
+    expect(resumeCalls).toBe(2);
+    await manager.close();
+  });
+
+  test("claim rejects a resumed thread mismatch instead of accepting foreign custody", async () => {
+    const requestedThreadId = "thread-personal-requested";
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000007",
+      resumeThread: async () => ({
+        authority: { profileId: authority.id, processGeneration: authority.generation },
+        value: makeThread([], "thread-personal-other"),
+      }),
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await expect(manager.claimSession({
+      authority,
+      providerThreadId: requestedThreadId,
+      projectRoot: "/workspace/project",
+      preset: "high",
+      fast: false,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({
+      name: "CodexSessionObservationError",
+      reason: "thread_mismatch",
+    });
+    await manager.close();
+  });
+
+  test("endSession unsubscribes the exact thread and clears its observation proof", async () => {
+    let resumeCalls = 0;
+    const unsubscribeCalls: string[] = [];
+    const providerThreadId = "thread-personal-release";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000008",
+      resumeThread: async (threadId: string) => {
+        resumeCalls += 1;
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      readThread: async (threadId: string) => ({
+        authority: providerAuthority,
+        value: makeThread([], threadId),
+      }),
+      unsubscribeThread: async (threadId: string) => {
+        unsubscribeCalls.push(threadId);
+        return { authority: providerAuthority, value: { status: "unsubscribed" as const } };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+    await manager.endSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+    await manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+    expect(unsubscribeCalls).toEqual([providerThreadId]);
+    expect(resumeCalls).toBe(2);
+    await manager.close();
+  });
+
+  test("endSession waits for an in-flight resume before releasing custody", async () => {
+    let releaseResume!: () => void;
+    let markResumeEntered!: () => void;
+    const resumeGate = new Promise<void>((resolve) => { releaseResume = resolve; });
+    const resumeEntered = new Promise<void>((resolve) => { markResumeEntered = resolve; });
+    const events: string[] = [];
+    const providerThreadId = "thread-personal-release-race";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000009",
+      resumeThread: async (threadId: string) => {
+        events.push("resume-start");
+        markResumeEntered();
+        await resumeGate;
+        events.push("resume-finish");
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      readThread: async (threadId: string) => ({
+        authority: providerAuthority,
+        value: makeThread([], threadId),
+      }),
+      unsubscribeThread: async () => {
+        events.push("unsubscribe");
+        return { authority: providerAuthority, value: { status: "unsubscribed" as const } };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    const observing = manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+    await resumeEntered;
+    const ending = manager.endSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+    await Promise.resolve();
+    expect(events).toEqual(["resume-start"]);
+    releaseResume();
+    await Promise.all([observing, ending]);
+    expect(events).toEqual(["resume-start", "resume-finish", "unsubscribe"]);
+    await manager.close();
+  });
+
+  test("endSession clears stale custody proof after an indeterminate release", async () => {
+    let resumeCalls = 0;
+    const providerThreadId = "thread-personal-release-unknown";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000010",
+      resumeThread: async (threadId: string) => {
+        resumeCalls += 1;
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      readThread: async (threadId: string) => ({
+        authority: providerAuthority,
+        value: makeThread([], threadId),
+      }),
+      unsubscribeThread: async () => {
+        throw new IndeterminateCodexEffectError("thread/unsubscribe", 29);
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+    await expect(manager.endSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({
+      code: "INDETERMINATE_EFFECT",
+      operation: "thread/unsubscribe",
+    });
+    await manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+    expect(resumeCalls).toBe(2);
+    await manager.close();
+  });
+
+  test("releases only an existing exact account generation without thread RPCs or relaunch", async () => {
+    let launches = 0;
+    let closeCalls = 0;
+    let accountReads = 0;
+    let threadCalls = 0;
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const fake = {
+      state: "ready",
+      accountRead: async () => {
+        accountReads += 1;
+        return {
+          authority: providerAuthority,
+          value: { account: null, requiresOpenaiAuth: true },
+        };
+      },
+      resumeThread: async () => {
+        threadCalls += 1;
+        throw new Error("release must not resume a thread");
+      },
+      unsubscribeThread: async () => {
+        threadCalls += 1;
+        throw new Error("release must not unsubscribe a thread");
+      },
+      close: async () => { closeCalls += 1; },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => {
+        launches += 1;
+        return fake;
+      },
+    });
+    const signal = new AbortController().signal;
+
+    await manager.releaseOwnedAuthority({ authority, signal });
+    expect(launches).toBe(0);
+    await manager.readAccount({ authority, signal });
+    expect(launches).toBe(1);
+    await manager.releaseOwnedAuthority({
+      authority: { ...authority, generation: authority.generation + 1 },
+      signal,
+    });
+    expect(closeCalls).toBe(0);
+    await manager.releaseOwnedAuthority({ authority, signal });
+    await manager.releaseOwnedAuthority({ authority, signal });
+
+    expect({ accountReads, closeCalls, launches, threadCalls }).toEqual({
+      accountReads: 1,
+      closeCalls: 1,
+      launches: 1,
+      threadCalls: 0,
+    });
+    await expect(manager.readAccount({ authority, signal }))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(launches).toBe(1);
+    await manager.close();
+    expect(closeCalls).toBe(1);
+  });
+
+  test("retains a failed exact authority close and retries it without relaunch", async () => {
+    let launches = 0;
+    let closeCalls = 0;
+    const closeFailure = new CodexError(
+      "PROCESS_EXITED",
+      "Codex process exit could not be proven after force termination",
+    );
+    const fake = {
+      state: "ready",
+      accountRead: async () => ({
+        authority: { profileId: authority.id, processGeneration: authority.generation },
+        value: { account: null, requiresOpenaiAuth: true },
+      }),
+      close: async () => {
+        closeCalls += 1;
+        if (closeCalls === 1) throw closeFailure;
+      },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => {
+        launches += 1;
+        return fake;
+      },
+    });
+    const signal = new AbortController().signal;
+
+    await manager.readAccount({ authority, signal });
+    await expect(manager.releaseOwnedAuthority({ authority, signal })).rejects.toBe(closeFailure);
+    await expect(manager.readAccount({ authority, signal }))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    await expect(manager.releaseOwnedAuthority({ authority, signal })).resolves.toBeUndefined();
+
+    expect({ closeCalls, launches }).toEqual({ closeCalls: 2, launches: 1 });
+    await manager.close();
+  });
+
+  test("propagates exact process-close failure from manager shutdown and permits a retry", async () => {
+    let closeCalls = 0;
+    const closeFailure = new CodexError(
+      "PROCESS_EXITED",
+      "Codex process exit could not be proven after force termination",
+    );
+    const fake = {
+      state: "ready",
+      accountRead: async () => ({
+        authority: { profileId: authority.id, processGeneration: authority.generation },
+        value: { account: null, requiresOpenaiAuth: true },
+      }),
+      close: async () => {
+        closeCalls += 1;
+        if (closeCalls === 1) throw closeFailure;
+      },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+    const signal = new AbortController().signal;
+
+    await manager.readAccount({ authority, signal });
+    await expect(manager.close()).rejects.toBe(closeFailure);
+    await expect(manager.close()).resolves.toBeUndefined();
+    expect(closeCalls).toBe(2);
+  });
+
+  test("queues a nonlaunching authority release behind an in-flight first launch", async () => {
+    let launches = 0;
+    let closeCalls = 0;
+    let threadCalls = 0;
+    let releaseLaunch!: () => void;
+    let markLaunchStarted!: () => void;
+    const launchGate = new Promise<void>((resolve) => { releaseLaunch = resolve; });
+    const launchStarted = new Promise<void>((resolve) => { markLaunchStarted = resolve; });
+    const fake = {
+      state: "ready",
+      accountRead: async () => ({
+        authority: { profileId: authority.id, processGeneration: authority.generation },
+        value: { account: null, requiresOpenaiAuth: true },
+      }),
+      resumeThread: async () => {
+        threadCalls += 1;
+        throw new Error("release must not resume a thread");
+      },
+      unsubscribeThread: async () => {
+        threadCalls += 1;
+        throw new Error("release must not unsubscribe a thread");
+      },
+      close: async () => { closeCalls += 1; },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => {
+        launches += 1;
+        markLaunchStarted();
+        await launchGate;
+        return fake;
+      },
+    });
+    const signal = new AbortController().signal;
+    const firstUse = manager.readAccount({ authority, signal }).catch((error: unknown) => error);
+    await launchStarted;
+    let released = false;
+    const release = manager.releaseOwnedAuthority({ authority, signal })
+      .then(() => { released = true; });
+    await Promise.resolve();
+    expect(released).toBe(false);
+
+    releaseLaunch();
+    await release;
+    await firstUse;
+    expect({ closeCalls, launches, threadCalls }).toEqual({
+      closeCalls: 1,
+      launches: 1,
+      threadCalls: 0,
+    });
+    await expect(manager.readAccount({ authority, signal }))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(launches).toBe(1);
+    await manager.close();
   });
 
   test("forwards Codex thread-list cursors and preserves the provider continuation", async () => {
@@ -621,8 +1161,10 @@ describe("PinnedCodexRuntimeManager", () => {
     let launches = 0;
     let launched: LaunchPinnedCodexOptions | undefined;
     const facts: CodexFact[] = [];
+    const connectionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
     const fake = {
       get state() { return state; },
+      connectionId,
       accountRead: async () => ({
         authority: { profileId: authority.id, processGeneration: authority.generation },
         value: {
@@ -657,13 +1199,13 @@ describe("PinnedCodexRuntimeManager", () => {
       authority: { profileId: authority.id, processGeneration: authority.generation },
       value: {
         type: "providerDisconnected",
-        connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+        connectionId,
         reason: "process_exit",
       },
     });
     expect(facts).toEqual([{
       type: "providerDisconnected",
-      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      connectionId,
       reason: "process_exit",
     }]);
     await expect(manager.readAccount({
@@ -672,6 +1214,103 @@ describe("PinnedCodexRuntimeManager", () => {
     })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     expect(launches).toBe(1);
     await manager.close();
+  });
+
+  test("single-flights a managed reconnect when its generation remains current after an exact disconnect", async () => {
+    const firstConnectionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd31";
+    const secondConnectionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd32";
+    const providerThreadId = "thread-managed-reconnect";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    let firstState: CodexAppServerClient["state"] = "ready";
+    let firstCloseCalls = 0;
+    let secondCloseCalls = 0;
+    let launches = 0;
+    const launchGenerations: number[] = [];
+    const resumeCalls = [0, 0];
+    let firstOnFact: LaunchPinnedCodexOptions["onFact"];
+    const clients = [
+      {
+        get state() { return firstState; },
+        connectionId: firstConnectionId,
+        resumeThread: async (threadId: string) => {
+          resumeCalls[0] = (resumeCalls[0] ?? 0) + 1;
+          return { authority: providerAuthority, value: makeThread([], threadId) };
+        },
+        readThread: async (threadId: string) => ({
+          authority: providerAuthority,
+          value: makeThread([], threadId),
+        }),
+        close: async () => {
+          firstCloseCalls += 1;
+          firstState = "closed";
+        },
+      },
+      {
+        state: "ready",
+        connectionId: secondConnectionId,
+        resumeThread: async (threadId: string) => {
+          resumeCalls[1] = (resumeCalls[1] ?? 0) + 1;
+          return { authority: providerAuthority, value: makeThread([], threadId) };
+        },
+        readThread: async (threadId: string) => ({
+          authority: providerAuthority,
+          value: makeThread([], threadId),
+        }),
+        close: async () => { secondCloseCalls += 1; },
+      },
+    ] as unknown as CodexAppServerClient[];
+    const manager = createRuntimeManager({
+      allowSameGenerationRelaunchAfterProviderDisconnect: true,
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async (options) => {
+        launchGenerations.push(options.authority.processGeneration);
+        const index = launches;
+        launches += 1;
+        if (index === 0) firstOnFact = options.onFact;
+        if (index === 1) expect(firstCloseCalls).toBe(1);
+        const client = clients[index];
+        if (client === undefined) throw new Error("Unexpected extra Codex launch.");
+        return client;
+      },
+    });
+
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ connectionId: firstConnectionId, resumed: true });
+    expect(resumeCalls).toEqual([1, 0]);
+    firstState = "failed";
+    if (firstOnFact === undefined) throw new Error("Missing first connection fact observer.");
+    await firstOnFact({
+      authority: providerAuthority,
+      value: {
+        type: "providerDisconnected",
+        connectionId: firstConnectionId,
+        reason: "process_exit",
+      },
+    });
+
+    const reconnect = () => manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+    const observations = await Promise.all([reconnect(), reconnect()]);
+    expect(observations).toHaveLength(2);
+    expect(observations[0]).toMatchObject({ connectionId: secondConnectionId, resumed: true });
+    expect(observations[1]).toMatchObject({ connectionId: secondConnectionId, resumed: true });
+    expect(secondConnectionId).not.toBe(firstConnectionId);
+    expect(launches).toBe(2);
+    expect(launchGenerations).toEqual([authority.generation, authority.generation]);
+    expect(firstCloseCalls).toBe(1);
+    expect(resumeCalls).toEqual([1, 1]);
+    await manager.close();
+    expect(secondCloseCalls).toBe(1);
   });
 
   test("routes interaction responses only to the exact live connection and generation", async () => {
@@ -2219,13 +2858,331 @@ describe("PinnedCodexRuntimeManager", () => {
     await manager.close();
   });
 
-  test("performs a trailing account refresh after overlapping notifications and consumes refresh failure", async () => {
+  test("blocks later facts, provider calls, interactions, and dynamic tools on account re-attestation", async () => {
+    const connectionId = "70000000-0000-4000-8000-000000000778";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    let onAccountAuthoritySignal: LaunchPinnedCodexOptions["onAccountAuthoritySignal"];
+    let onFact: LaunchPinnedCodexOptions["onFact"];
+    let onConversationAutomationToolCall:
+      | LaunchPinnedCodexOptions["onConversationAutomationToolCall"]
+      | undefined;
+    let releaseRead!: () => void;
+    let markReadStarted!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const readStarted = new Promise<void>((resolve) => { markReadStarted = resolve; });
+    let releaseObserver!: () => void;
+    let markObserverStarted!: () => void;
+    const observerGate = new Promise<void>((resolve) => { releaseObserver = resolve; });
+    const observerStarted = new Promise<void>((resolve) => { markObserverStarted = resolve; });
+    const steps: string[] = [];
+    const fake = {
+      state: "ready",
+      connectionId,
+      accountRead: async (refreshToken = false) => {
+        if (refreshToken) {
+          steps.push("account:read");
+          markReadStarted();
+          await readGate;
+        }
+        return {
+          authority: providerAuthority,
+          value: {
+            account: { type: "chatgpt", email: "person@example.com", planType: "pro" },
+            requiresOpenaiAuth: true,
+          },
+        };
+      },
+      refreshAccountAuthority: async () => {
+        steps.push("account:read");
+        markReadStarted();
+        await readGate;
+        return {
+          authority: providerAuthority,
+          value: {
+            account: { type: "chatgpt", email: "person@example.com", planType: "pro" },
+            requiresOpenaiAuth: true,
+          },
+        };
+      },
+      listThreads: async () => {
+        steps.push("provider:list");
+        return {
+          authority: providerAuthority,
+          value: { data: [], nextCursor: null, backwardsCursor: null },
+        };
+      },
+      inspectInteractionAuthority: async () => {
+        steps.push("interaction:inspect");
+        return {
+          kind: "command_approval" as const,
+          command: "git status",
+          reason: null,
+          availableDecisions: ["accept", "decline", "cancel"],
+          workingDirectory: "/workspace",
+          environmentId: null,
+          commandActions: [],
+          networkApprovalContext: null,
+          additionalPermissions: null,
+          proposedExecpolicyAmendment: null,
+          proposedNetworkPolicyAmendments: null,
+        };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: {
+        account: async () => {
+          steps.push("account:observer");
+          markObserverStarted();
+          await observerGate;
+        },
+        conversationAutomation: () => {
+          steps.push("dynamic:call");
+          return { scope: "conversation", task: { id: "stask_barrier" } };
+        },
+        fact: (_authority, fact) => {
+          steps.push(`fact:${fact.type}`);
+        },
+      },
+      launchClient: async (options) => {
+        onAccountAuthoritySignal = options.onAccountAuthoritySignal;
+        onFact = options.onFact;
+        onConversationAutomationToolCall = options.onConversationAutomationToolCall;
+        return fake;
+      },
+    });
+    await manager.readAccount({ authority, signal: new AbortController().signal });
+    const provider = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+      connectionId,
+      requestId: { type: "number" as const, value: 73 },
+      method: "item/commandExecution/requestApproval",
+      requestDigest: "a".repeat(64),
+      threadId: "thread-barrier",
+      turnId: "turn-barrier",
+      itemId: "item-barrier",
+      approvalId: null,
+    };
+    const call = {
+      authority: providerAuthority,
+      connectionId,
+      requestId: { type: "string" as const, value: "tool-barrier" },
+      requestDigest: "b".repeat(64),
+      threadId: "thread-barrier",
+      turnId: "turn-barrier",
+      callId: "call-barrier",
+      operation: {
+        mode: "create" as const,
+        name: "Continue review",
+        prompt: "Continue in this conversation.",
+        schedule: { kind: "interval_minutes" as const, minutes: 60 },
+      },
+    } satisfies ConversationAutomationToolCall;
+    if (
+      onAccountAuthoritySignal === undefined
+      || onFact === undefined
+      || onConversationAutomationToolCall === undefined
+    ) throw new Error("Missing account-barrier launch callbacks.");
+
+    void onAccountAuthoritySignal(providerAuthority);
+    const accountFact = onFact({
+      authority: providerAuthority,
+      value: { type: "accountUpdated", authMode: "chatgpt", planType: "pro" },
+    });
+    const laterFact = onFact({
+      authority: providerAuthority,
+      value: {
+        type: "interactionRequested",
+        provider,
+        kind: "command_approval",
+        blocking: true,
+        display: {
+          kind: "command_approval",
+          summary: "Command approval",
+          reason: null,
+          commandClass: "git status",
+          workingDirectory: "/workspace",
+          availableDecisions: ["once", "decline", "cancel"],
+        },
+      },
+    });
+    const list = manager.listSessions({
+      authority,
+      limit: 1,
+      signal: new AbortController().signal,
+    });
+    const inspection = manager.inspectInteractionAuthority({
+      authority,
+      provider,
+      kind: "command_approval",
+      signal: new AbortController().signal,
+    });
+    const dynamic = onConversationAutomationToolCall(call);
+
+    await readStarted;
+    expect(steps).toEqual(["account:read"]);
+    releaseRead();
+    await observerStarted;
+    expect(steps).toEqual(["account:read", "account:observer"]);
+    releaseObserver();
+    await Promise.all([accountFact, laterFact, list, inspection, dynamic]);
+    const observerIndex = steps.indexOf("account:observer");
+    for (const step of [
+      "fact:accountUpdated",
+      "fact:interactionRequested",
+      "provider:list",
+      "interaction:inspect",
+      "dynamic:call",
+    ]) expect(steps.indexOf(step)).toBeGreaterThan(observerIndex);
+    await manager.close();
+  });
+
+  test("does not lose an account signal raised after refresh settlement but before cleanup", async () => {
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    let onAccountAuthoritySignal: LaunchPinnedCodexOptions["onAccountAuthoritySignal"];
+    let refreshCalls = 0;
+    let observerCalls = 0;
+    const fake = {
+      state: "ready",
+      accountRead: async () => ({
+        authority: providerAuthority,
+        value: { account: null, requiresOpenaiAuth: true },
+      }),
+      refreshAccountAuthority: async () => {
+        refreshCalls += 1;
+        return {
+          authority: providerAuthority,
+          value: {
+            account: { type: "chatgpt", email: "person@example.com", planType: "pro" },
+            requiresOpenaiAuth: true,
+          },
+        };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: {
+        account: () => { observerCalls += 1; },
+        fact: () => undefined,
+      },
+      launchClient: async (options) => {
+        onAccountAuthoritySignal = options.onAccountAuthoritySignal;
+        return fake;
+      },
+    });
+    await manager.readAccount({ authority, signal: new AbortController().signal });
+    if (onAccountAuthoritySignal === undefined) throw new Error("Missing account signal callback.");
+
+    const first = onAccountAuthoritySignal(providerAuthority);
+    if (first === undefined) throw new Error("Missing first account barrier.");
+    let second: Promise<void> | void = undefined;
+    await first.then(() => {
+      // The adapter's tracked cleanup is already queued, but has not run yet.
+      // This is the exact settlement/cleanup window that used to drop a signal.
+      second = onAccountAuthoritySignal?.(providerAuthority);
+    });
+    await second;
+    expect({ observerCalls, refreshCalls }).toEqual({
+      observerCalls: 2,
+      refreshCalls: 2,
+    });
+    await manager.close();
+  });
+
+  test("retires a published client and rejects its barrier when an account signal finds stale authority", async () => {
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    let current = true;
+    let launches = 0;
+    let closeCalls = 0;
+    let onAccountAuthoritySignal: LaunchPinnedCodexOptions["onAccountAuthoritySignal"];
+    const fake = {
+      state: "ready",
+      accountRead: async () => ({
+        authority: providerAuthority,
+        value: { account: null, requiresOpenaiAuth: true },
+      }),
+      close: async () => { closeCalls += 1; },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => current,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async (options) => {
+        launches += 1;
+        onAccountAuthoritySignal = options.onAccountAuthoritySignal;
+        return fake;
+      },
+    });
+    const signal = new AbortController().signal;
+    await manager.readAccount({ authority, signal });
+    if (onAccountAuthoritySignal === undefined) throw new Error("Missing account signal callback.");
+
+    current = false;
+    const barrier = onAccountAuthoritySignal(providerAuthority);
+    if (barrier === undefined) throw new Error("Stale signal did not return a rejected barrier.");
+    await expect(barrier).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(closeCalls).toBe(1);
+    current = true;
+    await expect(manager.readAccount({ authority, signal }))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(launches).toBe(1);
+    await manager.close();
+  });
+
+  test("discards launch-time facts when the client never becomes the owned generation", async () => {
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const observed: CodexFact[] = [];
+    let launchFact: Promise<void> | void = undefined;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: {
+        account: () => undefined,
+        fact: (_authority, fact) => { observed.push(fact); },
+      },
+      launchClient: async (options) => {
+        launchFact = options.onFact?.({
+          authority: providerAuthority,
+          value: { type: "protocolNotice", method: "launch/will-fail" },
+        });
+        throw new Error("launch failed after emitting a fact");
+      },
+    });
+
+    await expect(manager.readAccount({
+      authority,
+      signal: new AbortController().signal,
+    })).rejects.toThrow("launch failed after emitting a fact");
+    await launchFact;
+    expect(observed).toEqual([]);
+    await manager.close();
+  });
+
+  test("retires an exact generation when its account observer rejects refreshed authority", async () => {
+    let onAccountAuthoritySignal: LaunchPinnedCodexOptions["onAccountAuthoritySignal"];
     let onFact: LaunchPinnedCodexOptions["onFact"];
     let refreshCalls = 0;
     let releaseFirst!: () => void;
     const firstRefreshGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    let signalTrailing!: () => void;
-    const trailingStarted = new Promise<void>((resolve) => { signalTrailing = resolve; });
+    let markRefreshStarted!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => { markRefreshStarted = resolve; });
+    let closeCalls = 0;
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+    let listCalls = 0;
     const observed: CodexAccountProjection[] = [];
     const fake = {
       state: "ready",
@@ -2234,34 +3191,81 @@ describe("PinnedCodexRuntimeManager", () => {
           return { authority: { profileId: authority.id, processGeneration: 1 }, value: { account: { type: "chatgpt", email: "initial@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
         }
         refreshCalls += 1;
-        if (refreshCalls === 1) {
-          await firstRefreshGate;
-          throw new Error("transient refresh failure");
-        }
-        signalTrailing();
-        return { authority: { profileId: authority.id, processGeneration: 1 }, value: { account: { type: "chatgpt", email: "fresh@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
+        markRefreshStarted();
+        await firstRefreshGate;
+        return { authority: { profileId: authority.id, processGeneration: 1 }, value: { account: { type: "chatgpt", email: "replacement@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
       },
-      close: async () => undefined,
+      refreshAccountAuthority: async () => {
+        refreshCalls += 1;
+        markRefreshStarted();
+        await firstRefreshGate;
+        return { authority: { profileId: authority.id, processGeneration: 1 }, value: { account: { type: "chatgpt", email: "replacement@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
+      },
+      listThreads: async () => {
+        listCalls += 1;
+        return { authority: { profileId: authority.id, processGeneration: 1 }, value: { data: [], nextCursor: null, backwardsCursor: null } };
+      },
+      close: async () => {
+        closeCalls += 1;
+        await closeGate;
+      },
     } as unknown as CodexAppServerClient;
+    let launches = 0;
     const manager = createRuntimeManager({
       isCurrent: () => true,
-      observer: { account: (_authority, account) => { observed.push(account); }, fact: () => undefined },
+      observer: {
+        account: (_authority, account) => {
+          observed.push(account);
+          throw new Error("account observer rejected replacement authority");
+        },
+        fact: () => undefined,
+      },
       launchClient: async (options) => {
+        launches += 1;
+        onAccountAuthoritySignal = options.onAccountAuthoritySignal;
         onFact = options.onFact;
         return fake;
       },
     });
     await manager.readAccount({ authority, signal: new AbortController().signal });
     const providerAuthority = { profileId: authority.id, processGeneration: 1 };
-    await onFact?.({ authority: providerAuthority, value: { type: "accountUpdated", authMode: "chatgpt", planType: "pro" } });
-    await Promise.resolve();
+    void onAccountAuthoritySignal?.(providerAuthority);
+    const accountFact = onFact?.({ authority: providerAuthority, value: { type: "accountUpdated", authMode: "chatgpt", planType: "pro" } });
+    const accountFactError = accountFact?.catch((error: unknown) => error);
+    const laterRead = manager.listSessions({
+      authority,
+      limit: 1,
+      signal: new AbortController().signal,
+    });
+    const laterReadError = laterRead.catch((error: unknown) => error);
+    await refreshStarted;
     expect(refreshCalls).toBe(1);
-    await onFact?.({ authority: providerAuthority, value: { type: "loginCompleted", loginId: "login", success: true } });
     releaseFirst();
-    await trailingStarted;
+    expect(await accountFactError).toMatchObject({
+      message: "account observer rejected replacement authority",
+    });
+    expect(await laterReadError).toMatchObject({
+      message: "account observer rejected replacement authority",
+    });
+    let releaseSettled = false;
+    const authorityRelease = manager.releaseOwnedAuthority({
+      authority,
+      signal: new AbortController().signal,
+    }).then(() => { releaseSettled = true; });
+    await Promise.resolve();
+    expect(releaseSettled).toBe(false);
+    releaseClose();
+    await authorityRelease;
+    await expect(manager.readAccount({
+      authority,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     await manager.close();
-    expect(refreshCalls).toBe(2);
-    expect(observed).toEqual([]);
+    expect(refreshCalls).toBe(1);
+    expect(launches).toBe(1);
+    expect(listCalls).toBe(0);
+    expect(closeCalls).toBe(1);
+    expect(observed).toEqual([{ signedIn: true, email: "replacement@example.com", plan: "pro" }]);
   });
 
   test("forwards failed login completion without scheduling an account refresh", async () => {
@@ -2363,6 +3367,7 @@ describe("PinnedCodexRuntimeManager", () => {
   });
 
   test("joins an owned account refresh that was scheduled before close", async () => {
+    let onAccountAuthoritySignal: LaunchPinnedCodexOptions["onAccountAuthoritySignal"];
     let onFact: LaunchPinnedCodexOptions["onFact"];
     let releaseRefresh!: () => void;
     let signalRefreshStarted!: () => void;
@@ -2380,18 +3385,25 @@ describe("PinnedCodexRuntimeManager", () => {
         }
         return { authority: providerAuthority, value: { account: { type: "chatgpt", email: "ready@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
       },
+      refreshAccountAuthority: async () => {
+        signalRefreshStarted();
+        await refreshGate;
+        return { authority: providerAuthority, value: { account: { type: "chatgpt", email: "ready@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
+      },
       close: async () => { closeCalls += 1; },
     } as unknown as CodexAppServerClient;
     const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: (_authority, account) => { observed.push(account); }, fact: () => undefined },
       launchClient: async (options) => {
+        onAccountAuthoritySignal = options.onAccountAuthoritySignal;
         onFact = options.onFact;
         return fake;
       },
     });
     await manager.readAccount({ authority, signal: new AbortController().signal });
-    await onFact?.({ authority: providerAuthority, value: { type: "accountUpdated", authMode: "chatgpt", planType: "pro" } });
+    void onAccountAuthoritySignal?.(providerAuthority);
+    const accountFact = onFact?.({ authority: providerAuthority, value: { type: "accountUpdated", authMode: "chatgpt", planType: "pro" } });
     await refreshStarted;
 
     let closeSettled = false;
@@ -2400,6 +3412,7 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(closeSettled).toBe(false);
     expect(closeCalls).toBe(0);
     releaseRefresh();
+    await accountFact;
     await closing;
     expect(closeCalls).toBe(1);
     expect(observed).toEqual([]);

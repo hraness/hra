@@ -55,6 +55,7 @@ import {
   parseThreadItemsPage,
   parseThreadPage,
   parseThreadRead,
+  parseThreadUnsubscribe,
   parseThreadTurnsPage,
   parseTurnStart,
   providerRequestIdKey,
@@ -88,6 +89,7 @@ import {
   type ResolvedPreset,
   type ThreadPage,
   type ThreadStartResult,
+  type ThreadUnsubscribeResult,
   type ThreadItemPage,
   type TurnPage,
   type TurnStartResult,
@@ -116,12 +118,14 @@ const CAPABILITY_DISCOVERY_MAX_DEADLINE_MS = 40_000;
 interface PendingRequest {
   readonly id: number;
   readonly descriptor: CodexOperationDescriptor;
+  readonly bypassAccountAuthorityBarrier: boolean;
   readonly parseAndResolve: (value: unknown, authority: CodexAuthority) => void;
   readonly reject: (reason: unknown) => void;
   readonly timeout: ReturnType<typeof setTimeout>;
   readonly signal?: AbortSignal;
   readonly onAbort?: () => void;
   dispatched: boolean;
+  responseReceived: boolean;
 }
 
 type ServerRequestState = "pending" | "writing" | "responded" | "resolved" | "resolution_unknown";
@@ -137,6 +141,19 @@ interface PendingServerRequest {
     { id: number | string; result: unknown }
     | { id: number | string; error: Readonly<{ code: number; message: string }> }
   >;
+}
+
+interface PendingFrameWrite {
+  readonly bytes: Uint8Array;
+  readonly bypassAccountAuthorityBarrier: boolean;
+  readonly beforeWrite?: () => void;
+  readonly beforeWriteAsync?: () => Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (reason?: unknown) => void;
+}
+
+interface AccountAuthorityWriteBarrier {
+  readonly task: Promise<void>;
 }
 
 class CodexFrameRejectedBeforeWriteError extends Error {
@@ -157,6 +174,14 @@ export interface CodexAppServerClientOptions {
   }>;
   readonly experimentalApi?: boolean;
   readonly isAuthorityCurrent: (authority: CodexAuthority) => boolean | Promise<boolean>;
+  /**
+   * Synchronous edge raised before an account-change notification enters the
+   * asynchronous fact tail. Runtime owners use it to close admission until an
+   * authoritative account read has settled.
+   */
+  readonly onAccountAuthoritySignal?: (
+    authority: CodexAuthority,
+  ) => void | Promise<void>;
   readonly onFact?: (fact: FencedCodexValue<CodexFact>) => void | Promise<void>;
   /** Local-only host service for the one conversation-bound dynamic tool. */
   readonly onConversationAutomationToolCall?: (
@@ -220,6 +245,10 @@ export interface StartThreadInput {
   readonly policy: ThreadPolicy;
 }
 
+export interface ResumeThreadInput extends StartThreadInput {
+  readonly threadId: string;
+}
+
 export interface StartTurnInput {
   readonly threadId: string;
   readonly clientMessageId: string;
@@ -260,6 +289,9 @@ export class CodexAppServerClient {
   readonly #credentialStorePreflight: CodexAppServerClientOptions["credentialStorePreflight"];
   readonly #experimentalApi: boolean;
   readonly #isAuthorityCurrent: CodexAppServerClientOptions["isAuthorityCurrent"];
+  readonly #onAccountAuthoritySignal:
+    | CodexAppServerClientOptions["onAccountAuthoritySignal"]
+    | undefined;
   readonly #onFact: NonNullable<CodexAppServerClientOptions["onFact"]>;
   readonly #onConversationAutomationToolCall:
     | CodexAppServerClientOptions["onConversationAutomationToolCall"]
@@ -279,8 +311,14 @@ export class CodexAppServerClient {
   readonly #serverRequests = new Map<string, PendingServerRequest>();
   readonly #dynamicRequestDigests = new Map<string, string>();
   readonly #inboundDynamicRequests = new Set<Promise<void>>();
+  readonly #inboundServerRequests = new Set<Promise<void>>();
+  readonly #inboundResponseSettlements = new Set<Promise<void>>();
   #factTail: Promise<void> = Promise.resolve();
   #writeTail: Promise<void> = Promise.resolve();
+  readonly #writeQueue: PendingFrameWrite[] = [];
+  #writeDrainActive = false;
+  #writeBarrierWake: (() => void) | null = null;
+  #accountAuthorityWriteBarrier: AccountAuthorityWriteBarrier | null = null;
   #disconnectEmitted = false;
   #connectionAnnounced = false;
   #preReadyFactBytes = 0;
@@ -310,6 +348,7 @@ export class CodexAppServerClient {
     };
     this.#experimentalApi = options.experimentalApi ?? false;
     this.#isAuthorityCurrent = options.isAuthorityCurrent;
+    this.#onAccountAuthoritySignal = options.onAccountAuthoritySignal;
     this.#onFact = options.onFact ?? (() => undefined);
     if (
       (options.onConversationAutomationToolCall === undefined)
@@ -425,6 +464,7 @@ export class CodexAppServerClient {
       this.#preReadyFacts.length = 0;
       this.#preReadyFactBytes = 0;
       this.#state = "failed";
+      this.#wakeWriteBarrier();
       try {
         this.#process.terminate();
       } catch (cleanupError: unknown) {
@@ -440,6 +480,17 @@ export class CodexAppServerClient {
 
   async accountRead(refreshToken = false): Promise<FencedCodexValue<AccountReadResult>> {
     return this.#closedRequest("account/read", { refreshToken }, parseAccountRead);
+  }
+
+  /** Runtime-owner-only read used to settle an account-authority barrier. */
+  async refreshAccountAuthority(): Promise<FencedCodexValue<AccountReadResult>> {
+    return this.#closedRequest(
+      "account/read",
+      { refreshToken: true },
+      parseAccountRead,
+      undefined,
+      true,
+    );
   }
 
   /** Rechecks project-layer effective custody before a project-scoped effect. */
@@ -733,6 +784,48 @@ export class CodexAppServerClient {
       "thread/resume",
       { threadId: boundedIdentifier(threadId, "thread id") },
       parseThreadMutation,
+    );
+  }
+
+  /**
+   * Resume an existing thread while replacing its next-turn policy with the
+   * same reviewed authority HRA applies at native thread creation. The pinned
+   * resume contract cannot add dynamic tools retroactively, so this method
+   * deliberately sends only fields the provider documents for resume.
+   */
+  async resumeThreadWithPolicy(
+    input: ResumeThreadInput,
+  ): Promise<FencedCodexValue<ThreadStartResult>> {
+    const cwd = canonicalAbsolute(input.cwd, "cwd");
+    const policy = compileThreadPolicy(input.policy);
+    return this.#closedRequest(
+      "thread/resume",
+      {
+        threadId: boundedIdentifier(input.threadId, "thread id"),
+        model: input.preset.model,
+        serviceTier: input.preset.serviceTier,
+        cwd,
+        permissions: input.policy.permissionProfile,
+        runtimeWorkspaceRoots: policy.runtimeWorkspaceRoots,
+        approvalPolicy: "on-request",
+        approvalsReviewer: input.policy.review,
+        config: { model_reasoning_effort: input.preset.effort },
+        excludeTurns: true,
+      },
+      (value) => validateThreadStartResult(
+        parseThreadStart(value),
+        input,
+        policy.runtimeWorkspaceRoots,
+        cwd,
+      ),
+    );
+  }
+
+  async unsubscribeThread(threadId: string): Promise<FencedCodexValue<ThreadUnsubscribeResult>> {
+    return this.#closedRequest(
+      "thread/unsubscribe",
+      { threadId: boundedIdentifier(threadId, "thread id") },
+      parseThreadUnsubscribe,
     );
   }
 
@@ -1061,13 +1154,26 @@ export class CodexAppServerClient {
   }
 
   async close(): Promise<void> {
-    if (this.#closeTask === null) this.#closeTask = this.#close();
+    if (this.#closeTask === null) {
+      const task = this.#close();
+      this.#closeTask = task;
+      try {
+        await task;
+      } catch (error: unknown) {
+        // A failed close retains process custody. Let the exact owner retry the
+        // TERM/KILL/exit proof instead of caching a falsely completed release.
+        if (this.#closeTask === task) this.#closeTask = null;
+        throw error;
+      }
+      return;
+    }
     await this.#closeTask;
   }
 
   async #close(): Promise<void> {
     if (this.#state === "closed") return;
     this.#state = "closing";
+    this.#wakeWriteBarrier();
     this.#failPending(new CodexError("PROCESS_EXITED", "Codex is shutting down"));
     this.#emitDisconnected("closed");
 
@@ -1087,7 +1193,17 @@ export class CodexAppServerClient {
     }
 
     const inboundDynamicRequests = Promise.all([...this.#inboundDynamicRequests]);
-    const [exitSettled, readSettled, factsSettled, writesSettled, inboundSettled] = await Promise.all([
+    const inboundServerRequests = Promise.all([...this.#inboundServerRequests]);
+    const inboundResponseSettlements = Promise.all([...this.#inboundResponseSettlements]);
+    const [
+      exitSettled,
+      readSettled,
+      factsSettled,
+      writesSettled,
+      inboundSettled,
+      serverRequestsSettled,
+      responsesSettled,
+    ] = await Promise.all([
       resolvesWithin(this.#process.exited, this.#shutdownSettlementMs),
       this.#readTask === null
         ? Promise.resolve(true)
@@ -1095,6 +1211,8 @@ export class CodexAppServerClient {
       settlesWithin(this.#factTail, this.#shutdownSettlementMs),
       settlesWithin(this.#writeTail, this.#shutdownSettlementMs),
       settlesWithin(inboundDynamicRequests, this.#shutdownSettlementMs),
+      settlesWithin(inboundServerRequests, this.#shutdownSettlementMs),
+      settlesWithin(inboundResponseSettlements, this.#shutdownSettlementMs),
     ]);
     if (!exitSettled) this.#onSafeDiagnostic("Codex process exit did not settle after termination");
     if (!readSettled) this.#onSafeDiagnostic("Codex stdout did not settle after termination");
@@ -1102,6 +1220,18 @@ export class CodexAppServerClient {
     if (!writesSettled) this.#onSafeDiagnostic("Codex writes did not settle after termination");
     if (!inboundSettled) {
       this.#onSafeDiagnostic("HRA dynamic-tool handling did not settle after Codex termination");
+    }
+    if (!serverRequestsSettled) {
+      this.#onSafeDiagnostic("Codex server-request handling did not settle after termination");
+    }
+    if (!responsesSettled) {
+      this.#onSafeDiagnostic("Codex response settlement did not finish after termination");
+    }
+    if (!exitSettled) {
+      throw new CodexError(
+        "PROCESS_EXITED",
+        "Codex process exit could not be proven after force termination",
+      );
     }
     this.#state = "closed";
   }
@@ -1111,6 +1241,7 @@ export class CodexAppServerClient {
     params: unknown,
     parse: (value: unknown) => T,
     signal?: AbortSignal,
+    bypassAccountAuthorityBarrier = false,
   ): Promise<FencedCodexValue<T>> {
     if (this.#state !== "ready") {
       throw new CodexError("PROTOCOL_ERROR", "Codex app-server is not ready");
@@ -1122,7 +1253,14 @@ export class CodexAppServerClient {
         `${method} requires the pinned experimental API capability`,
       );
     }
-    return this.#request(descriptor, params, parse, "ready", signal);
+    return this.#request(
+      descriptor,
+      params,
+      parse,
+      "ready",
+      signal,
+      bypassAccountAuthorityBarrier,
+    );
   }
 
   async #request<T>(
@@ -1131,6 +1269,7 @@ export class CodexAppServerClient {
     parse: (value: unknown) => T,
     requestState: "initializing" | "preflighting" | "ready",
     signal?: AbortSignal,
+    bypassAccountAuthorityBarrier = false,
   ): Promise<FencedCodexValue<T>> {
     if (this.#state !== requestState) {
       throw new CodexError(
@@ -1173,6 +1312,7 @@ export class CodexAppServerClient {
       exactPending = {
         id,
         descriptor,
+        bypassAccountAuthorityBarrier,
         parseAndResolve: (value, authority) => {
           resolvePromise({ authority, value: parse(value) });
         },
@@ -1181,6 +1321,7 @@ export class CodexAppServerClient {
         ...(signal === undefined ? {} : { signal }),
         ...(onAbort === undefined ? {} : { onAbort }),
         dispatched: false,
+        responseReceived: false,
       };
       this.#pending.set(id, exactPending);
       if (signal !== undefined && onAbort !== undefined) {
@@ -1193,6 +1334,10 @@ export class CodexAppServerClient {
       const write = this.#writeFrame(
         { id, method: descriptor.method, params },
         {
+          // The authoritative read is what resolves an account-change
+          // barrier. It must be able to pass queued writes that the same
+          // barrier is holding, or the read and write tails deadlock.
+          bypassAccountAuthorityBarrier,
           beforeWrite: () => {
             throwIfAborted(signal);
             if (exactPending === undefined || this.#pending.get(id) !== exactPending) {
@@ -1312,12 +1457,16 @@ export class CodexAppServerClient {
   }
 
   async #handleParsedFact(fact: CodexFact): Promise<void> {
+    const accountAuthoritySignaled = this.#signalAccountAuthority(fact);
     if (!(await this.#authorityIsCurrent())) return;
     if (fact.type === "serverRequestResolved") {
       await this.#handleServerRequestResolved(fact);
       return;
     }
-    void this.#enqueueFact({ ...fact, connectionId: this.#connectionId });
+    void this.#enqueueFact(
+      { ...fact, connectionId: this.#connectionId },
+      accountAuthoritySignaled,
+    );
   }
 
   async #readLoop(): Promise<void> {
@@ -1329,6 +1478,7 @@ export class CodexAppServerClient {
       if (this.#state !== "closing" && this.#state !== "closed") {
         const error = new CodexError("PROCESS_EXITED", "Codex stdout reached EOF");
         this.#state = "failed";
+        this.#wakeWriteBarrier();
         this.#failPending(error);
         this.#emitDisconnected("eof");
       }
@@ -1336,6 +1486,7 @@ export class CodexAppServerClient {
       this.#failPending(error);
       if (this.#state !== "closing" && this.#state !== "closed") {
         this.#state = "failed";
+        this.#wakeWriteBarrier();
         this.#emitDisconnected("protocol_fault");
       }
     }
@@ -1355,6 +1506,7 @@ export class CodexAppServerClient {
     const exitCode = await this.#process.exited.catch(() => -1);
     if (this.#state === "closing" || this.#state === "closed") return;
     this.#state = "failed";
+    this.#wakeWriteBarrier();
     this.#failPending(
       new CodexError("PROCESS_EXITED", `Codex exited with status ${String(exitCode)}`),
     );
@@ -1389,7 +1541,13 @@ export class CodexAppServerClient {
         );
         return;
       }
-      await this.#handleServerRequest(message.id, method, message.params ?? {});
+      if (this.#inboundServerRequests.size >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
+        this.#quarantineConnection("Codex exceeded the bounded server-request handling limit");
+        return;
+      }
+      this.#trackInboundServerRequest(
+        this.#handleServerRequest(message.id, method, message.params ?? {}),
+      );
       return;
     }
     const fact = parseFact(method, message.params ?? {});
@@ -1425,14 +1583,47 @@ export class CodexAppServerClient {
       this.#quarantineConnection("Codex emitted a response before HRA dispatched its request");
       return;
     }
-    this.#takePending(id);
-    if (!(await this.#authorityIsCurrent())) {
-      const stale = new CodexError("AUTHORITY_STALE", "Codex response belongs to a stale generation");
-      pending.reject(pending.descriptor.lostResponse === "reconcile"
-        ? new IndeterminateCodexEffectError(pending.descriptor.method, id, stale)
-        : stale);
+    if (pending.responseReceived) return;
+    pending.responseReceived = true;
+    const deferForAccountAuthority = !pending.bypassAccountAuthorityBarrier
+      && this.#accountAuthorityWriteBarrier !== null;
+    const settlement = this.#settleResponse(message, pending, id);
+    if (deferForAccountAuthority) {
+      this.#trackInboundResponseSettlement(settlement);
       return;
     }
+    await settlement;
+  }
+
+  async #settleResponse(
+    message: Record<string, unknown>,
+    pending: PendingRequest,
+    id: number,
+  ): Promise<void> {
+    if (!pending.bypassAccountAuthorityBarrier) {
+      while (this.#accountAuthorityWriteBarrier !== null) {
+        const accepted = await this.#awaitAccountAuthorityForResponse(pending, id);
+        if (!accepted) return;
+      }
+    }
+    let authorityIsCurrent = false;
+    try {
+      authorityIsCurrent = await this.#authorityIsCurrent();
+    } catch (error: unknown) {
+      this.#rejectResponseForAuthority(pending, id, error);
+      return;
+    }
+    if (!authorityIsCurrent) {
+      this.#rejectResponseForAuthority(pending, id);
+      return;
+    }
+    if (!pending.bypassAccountAuthorityBarrier) {
+      while (this.#accountAuthorityWriteBarrier !== null) {
+        const accepted = await this.#awaitAccountAuthorityForResponse(pending, id);
+        if (!accepted) return;
+      }
+    }
+    if (this.#takePending(id) !== pending) return;
     if (message.error !== undefined) {
       const remote = record(message.error, "JSON-RPC error");
       pending.reject(new CodexRemoteError(safeInteger(remote.code, "JSON-RPC error code"), "request failed"));
@@ -1452,6 +1643,66 @@ export class CodexAppServerClient {
         ? new IndeterminateCodexEffectError(pending.descriptor.method, id, error)
         : error);
     }
+  }
+
+  async #awaitAccountAuthorityForResponse(
+    pending: PendingRequest,
+    id: number,
+  ): Promise<boolean> {
+    for (;;) {
+      const barrier = this.#accountAuthorityWriteBarrier;
+      if (barrier === null) return true;
+      try {
+        await barrier.task;
+      } catch (error: unknown) {
+        this.#rejectResponseForAuthority(pending, id, error);
+        return false;
+      }
+      if (this.#accountAuthorityWriteBarrier === barrier) {
+        this.#accountAuthorityWriteBarrier = null;
+      }
+    }
+  }
+
+  #rejectResponseForAuthority(
+    pending: PendingRequest,
+    id: number,
+    cause?: unknown,
+  ): void {
+    if (this.#takePending(id) !== pending) return;
+    const stale = cause === undefined
+      ? new CodexError(
+          "AUTHORITY_STALE",
+          "Codex response was not admitted under refreshed account authority",
+        )
+      : new CodexError(
+          "AUTHORITY_STALE",
+          "Codex response was not admitted under refreshed account authority",
+          { cause },
+        );
+    pending.reject(
+      pending.descriptor.lostResponse === "reconcile" && pending.dispatched
+        ? new IndeterminateCodexEffectError(pending.descriptor.method, id, stale)
+        : stale,
+    );
+  }
+
+  #trackInboundResponseSettlement(task: Promise<void>): void {
+    const tracked = task.then(
+      () => undefined,
+      (error: unknown) => {
+        if (this.#state !== "ready") return;
+        this.#onSafeDiagnostic(
+          error instanceof Error
+            ? `Codex response settlement failed: ${error.name}`
+            : "Codex response settlement failed",
+        );
+      },
+    );
+    this.#inboundResponseSettlements.add(tracked);
+    void tracked.then(() => {
+      this.#inboundResponseSettlements.delete(tracked);
+    });
   }
 
   async #handleConversationAutomationToolCall(
@@ -1581,6 +1832,24 @@ export class CodexAppServerClient {
     });
   }
 
+  #trackInboundServerRequest(task: Promise<void>): void {
+    const tracked = task.then(
+      () => undefined,
+      () => {
+        if (this.#state !== "ready") return;
+        try {
+          this.#quarantineConnection("Codex server-request handling failed");
+        } catch {
+          this.#onSafeDiagnostic("HRA could not terminate a failed server-request connection");
+        }
+      },
+    );
+    this.#inboundServerRequests.add(tracked);
+    void tracked.then(() => {
+      this.#inboundServerRequests.delete(tracked);
+    });
+  }
+
   async #conversationAutomationAuthorityIsCurrent(): Promise<boolean> {
     let current = false;
     try {
@@ -1676,7 +1945,30 @@ export class CodexAppServerClient {
         return;
       }
       if (existing.state === "responded" && existing.responseFrame !== undefined) {
-        await this.#writeFrame(existing.responseFrame);
+        const responseFrame = existing.responseFrame;
+        try {
+          await this.#writeFrame(responseFrame, {
+            beforeWrite: () => {
+              if (
+                this.#state !== "ready"
+                || this.#serverRequests.get(key) !== existing
+                || existing.state !== "responded"
+                || existing.responseFrame !== responseFrame
+              ) {
+                throw new CodexError(
+                  "AUTHORITY_STALE",
+                  "the cached interaction response became stale before replay",
+                );
+              }
+            },
+          });
+        } catch (error: unknown) {
+          if (
+            error instanceof CodexFrameRejectedBeforeWriteError
+            && error.rejection.code === "AUTHORITY_STALE"
+          ) return;
+          throw error;
+        }
       } else if (existing.state === "resolved") {
         await this.#writeFrame({
           id: rawProviderRequestId(requestId),
@@ -1758,7 +2050,8 @@ export class CodexAppServerClient {
     else void pending.admissionTask.then(emitResolved, () => undefined);
   }
 
-  #enqueueFact(fact: CodexFact): Promise<void> {
+  #enqueueFact(fact: CodexFact, accountAuthoritySignaled = false): Promise<void> {
+    if (!accountAuthoritySignaled) this.#signalAccountAuthority(fact);
     const task = this.#factTail.then(async () => {
       if (!(await this.#authorityIsCurrent())) return;
       await this.#onFact({ authority: this.#authority, value: fact });
@@ -1771,6 +2064,29 @@ export class CodexAppServerClient {
       );
     });
     return task;
+  }
+
+  #signalAccountAuthority(fact: CodexFact): boolean {
+    if (
+      fact.type !== "accountUpdated"
+      && (fact.type !== "loginCompleted" || !fact.success)
+    ) return false;
+    // This callback is deliberately invoked in the same run-to-completion
+    // turn that parses a ready notification, before any authority lookup or
+    // fact-tail await. Runtime owners can therefore close both external
+    // admission and this client's outbound write boundary immediately.
+    const task = this.#onAccountAuthoritySignal?.(this.#authority);
+    if (task !== undefined) {
+      const barrier: AccountAuthorityWriteBarrier = {
+        task: Promise.resolve(task),
+      };
+      // The adapter also observes this rejection. The local handler prevents
+      // an unhandled-rejection report when no outbound write is waiting yet.
+      void barrier.task.catch(() => undefined);
+      this.#accountAuthorityWriteBarrier = barrier;
+      this.#wakeWriteBarrier();
+    }
+    return true;
   }
 
   #emitDisconnected(reason: "eof" | "process_exit" | "closed" | "protocol_fault"): void {
@@ -1786,6 +2102,7 @@ export class CodexAppServerClient {
   #quarantineConnection(message: string): void {
     if (this.#state === "closing" || this.#state === "closed" || this.#state === "failed") return;
     this.#state = "failed";
+    this.#wakeWriteBarrier();
     this.#onSafeDiagnostic(message);
     this.#failPending(new CodexError("PROTOCOL_ERROR", "Codex provider connection was quarantined"));
     this.#emitDisconnected("protocol_fault");
@@ -1795,6 +2112,7 @@ export class CodexAppServerClient {
   async #writeFrame(
     value: unknown,
     options: Readonly<{
+      bypassAccountAuthorityBarrier?: boolean;
       beforeWrite?: () => void;
       beforeWriteAsync?: () => Promise<void>;
     }> = {},
@@ -1804,24 +2122,160 @@ export class CodexAppServerClient {
       throw new CodexError("PROTOCOL_LIMIT", "outbound Codex frame exceeded its byte limit");
     }
     const bytes = this.#encoder.encode(`${serialized}\n`);
-    const write = this.#writeTail.then(async () => {
-      if (options.beforeWriteAsync !== undefined || options.beforeWrite !== undefined) {
+    let resolveWrite!: () => void;
+    let rejectWrite!: (reason?: unknown) => void;
+    const write = new Promise<void>((resolve, reject) => {
+      resolveWrite = resolve;
+      rejectWrite = reject;
+    });
+    const settled = write.catch(() => undefined);
+    this.#writeTail = Promise.all([this.#writeTail, settled]).then(() => undefined);
+    this.#writeQueue.push({
+      bytes,
+      bypassAccountAuthorityBarrier:
+        options.bypassAccountAuthorityBarrier ?? false,
+      ...(options.beforeWrite === undefined ? {} : { beforeWrite: options.beforeWrite }),
+      ...(options.beforeWriteAsync === undefined
+        ? {}
+        : { beforeWriteAsync: options.beforeWriteAsync }),
+      resolve: resolveWrite,
+      reject: rejectWrite,
+    });
+    this.#wakeWriteBarrier();
+    this.#startWriteDrain();
+    await write;
+  }
+
+  #startWriteDrain(): void {
+    if (this.#writeDrainActive) return;
+    this.#writeDrainActive = true;
+    void this.#drainWriteQueue();
+  }
+
+  async #drainWriteQueue(): Promise<void> {
+    try {
+      while (this.#writeQueue.length > 0) {
+        let index = 0;
+        let rejectedBarrier: AccountAuthorityWriteBarrier | null = null;
+        if (
+          !this.#writeStateIsTerminal()
+          && this.#accountAuthorityWriteBarrier !== null
+          && this.#writeQueue[0]?.bypassAccountAuthorityBarrier !== true
+        ) {
+          index = this.#writeQueue.findIndex(
+            (entry) => entry.bypassAccountAuthorityBarrier,
+          );
+          if (index < 0) {
+            rejectedBarrier = await this.#waitForAccountAuthorityOrPriorityWrite();
+            if (rejectedBarrier === null) continue;
+            index = 0;
+          }
+        }
+        const entry = this.#writeQueue.splice(index, 1)[0];
+        if (entry === undefined) continue;
         try {
-          if (options.beforeWriteAsync !== undefined) {
-            await options.beforeWriteAsync();
+          const written = await this.#performFrameWrite(entry, rejectedBarrier);
+          if (!written) {
+            this.#writeQueue.unshift(entry);
+            continue;
           }
-          options.beforeWrite?.();
+          entry.resolve();
         } catch (error: unknown) {
-          if (error instanceof CodexError) {
-            throw new CodexFrameRejectedBeforeWriteError(error);
-          }
-          throw error;
+          entry.reject(error);
         }
       }
-      await this.#process.write(bytes);
-    });
-    this.#writeTail = write.catch(() => undefined);
-    await write;
+    } finally {
+      this.#writeDrainActive = false;
+      if (this.#writeQueue.length > 0) this.#startWriteDrain();
+    }
+  }
+
+  async #waitForAccountAuthorityOrPriorityWrite(): Promise<AccountAuthorityWriteBarrier | null> {
+    const barrier = this.#accountAuthorityWriteBarrier;
+    if (barrier === null) return null;
+    let wake!: () => void;
+    const priorityWrite = new Promise<void>((resolve) => { wake = resolve; });
+    this.#writeBarrierWake = wake;
+    let winner: "barrier" | "priority";
+    try {
+      winner = await Promise.race([
+        barrier.task.then(
+          () => "barrier" as const,
+          () => "barrier" as const,
+        ),
+        priorityWrite.then(() => "priority" as const),
+      ]);
+    } finally {
+      if (this.#writeBarrierWake === wake) this.#writeBarrierWake = null;
+    }
+    if (winner === "priority") return null;
+    if (this.#accountAuthorityWriteBarrier === barrier) {
+      try {
+        await barrier.task;
+        if (this.#accountAuthorityWriteBarrier === barrier) {
+          this.#accountAuthorityWriteBarrier = null;
+        }
+      } catch {
+        // Keep a rejected barrier installed. Each non-bypass write will be
+        // rejected before dispatch while the owning runtime retires the
+        // client; an account/read remains available only to break a refresh
+        // deadlock.
+        return barrier;
+      }
+    }
+    return null;
+  }
+
+  async #performFrameWrite(
+    entry: PendingFrameWrite,
+    rejectedBarrier: AccountAuthorityWriteBarrier | null,
+  ): Promise<boolean> {
+    try {
+      if (this.#writeStateIsTerminal()) {
+        throw new CodexError("PROCESS_EXITED", "Codex is shutting down");
+      }
+      if (rejectedBarrier !== null && !entry.bypassAccountAuthorityBarrier) {
+        try {
+          await rejectedBarrier.task;
+        } catch (error: unknown) {
+          throw new CodexError(
+            "AUTHORITY_STALE",
+            "Codex account authority refresh failed before the provider write",
+            { cause: error },
+          );
+        }
+      }
+      if (entry.beforeWriteAsync !== undefined) await entry.beforeWriteAsync();
+      if (this.#writeStateIsTerminal()) {
+        throw new CodexError("PROCESS_EXITED", "Codex is shutting down");
+      }
+      if (!entry.bypassAccountAuthorityBarrier) {
+        // A signal can arrive while an asynchronous pre-write authority check
+        // is pending. Yield this normal frame back to the queue instead of
+        // waiting in-place, so the barrier's refresh read can leapfrog it.
+        if (this.#accountAuthorityWriteBarrier !== null) return false;
+      }
+      entry.beforeWrite?.();
+    } catch (error: unknown) {
+      if (error instanceof CodexError) {
+        throw new CodexFrameRejectedBeforeWriteError(error);
+      }
+      throw error;
+    }
+    await this.#process.write(entry.bytes);
+    return true;
+  }
+
+  #writeStateIsTerminal(): boolean {
+    return this.#state === "closing"
+      || this.#state === "closed"
+      || this.#state === "failed";
+  }
+
+  #wakeWriteBarrier(): void {
+    const wake = this.#writeBarrierWake;
+    this.#writeBarrierWake = null;
+    wake?.();
   }
 
   #allocateRequestId(): number {
@@ -1991,7 +2445,7 @@ function validateThreadStartResult(
   ) {
     throw new CodexError(
       "PROTOCOL_ERROR",
-      "Codex did not apply the requested model, permissions, or workspace policy to the new thread",
+      "Codex did not apply the requested model, permissions, or workspace policy to the thread",
     );
   }
   return value;

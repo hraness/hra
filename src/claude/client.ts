@@ -24,7 +24,7 @@ export type ClaudeInteractionDecision =
 
 export interface ClaudeStreamClientOptions {
   readonly process: ClaudeProcess;
-  /** Absolute isolated home the process was spawned with. Fences every write. */
+  /** Absolute reviewed logical home that owns this process. Fences every write. */
   readonly configDir: string;
   readonly onFact: (fact: ClaudeFact) => void | Promise<void>;
   readonly onSafeDiagnostic?: (message: string) => void;
@@ -32,6 +32,13 @@ export interface ClaudeStreamClientOptions {
   readonly shutdownTermGraceMs?: number;
   readonly shutdownSettlementMs?: number;
 }
+
+export type ClaudeStreamInitialization = Readonly<{
+  providerSessionId: string;
+  model: string;
+  permissionMode: string;
+  claudeVersion: string;
+}>;
 
 type PendingInteraction = {
   readonly requestId: string;
@@ -57,8 +64,18 @@ export class ClaudeStreamClient {
   readonly #encoder = new TextEncoder();
   readonly #readTask: Promise<void>;
   readonly #stderrTask: Promise<void>;
-  #state: "open" | "closing" | "closed" = "open";
+  readonly #exitTask: Promise<void>;
+  readonly #initialization: Promise<ClaudeStreamInitialization>;
+  readonly #resolveInitialization: (value: ClaudeStreamInitialization) => void;
+  readonly #rejectInitialization: (reason: unknown) => void;
+  readonly #shutdownTermGraceMs: number;
+  readonly #shutdownSettlementMs: number;
+  #initializationSettled = false;
+  #initializationValue: ClaudeStreamInitialization | undefined;
+  #state: "open" | "closing" | "closed" | "failed" = "open";
+  #disconnectEmitted = false;
   #writeChain: Promise<void> = Promise.resolve();
+  #closeTask: Promise<void> | null = null;
 
   constructor(options: ClaudeStreamClientOptions) {
     if (!options.configDir.startsWith("/")) {
@@ -68,11 +85,33 @@ export class ClaudeStreamClient {
     this.#configDir = options.configDir;
     this.#onFact = options.onFact;
     this.#onSafeDiagnostic = options.onSafeDiagnostic;
+    this.#shutdownTermGraceMs = boundedShutdownDuration(
+      options.shutdownTermGraceMs ?? 2_000,
+      "Claude TERM grace",
+    );
+    this.#shutdownSettlementMs = boundedShutdownDuration(
+      options.shutdownSettlementMs ?? 1_000,
+      "Claude shutdown settlement",
+    );
     this.#decoder = new ClaudeJsonLineDecoder(
       options.maxJsonLineBytes === undefined ? {} : { maxLineBytes: options.maxJsonLineBytes },
     );
+    let resolveInitialization!: (value: ClaudeStreamInitialization) => void;
+    let rejectInitialization!: (reason: unknown) => void;
+    this.#initialization = new Promise<ClaudeStreamInitialization>((resolve, reject) => {
+      resolveInitialization = resolve;
+      rejectInitialization = reject;
+    });
+    this.#resolveInitialization = resolveInitialization;
+    this.#rejectInitialization = rejectInitialization;
+    // A process can fail before its owner reaches the wait call. Keep that
+    // deterministic rejection owned while preserving it for the later await.
+    void this.#initialization.catch(() => undefined);
     this.#readTask = this.#readStdout();
+    void this.#readTask.catch(() => undefined);
     this.#stderrTask = this.#drainStderr();
+    this.#exitTask = this.#watchProcessExit();
+    void this.#exitTask.catch(() => undefined);
   }
 
   get configDir(): string {
@@ -85,6 +124,42 @@ export class ClaudeStreamClient {
 
   get activeTurnId(): string | null {
     return this.#assembler.activeTurnId;
+  }
+
+  get state(): "open" | "closing" | "closed" | "failed" {
+    return this.#state;
+  }
+
+  /**
+   * Waits for the one `system/init` identity that makes this process usable.
+   * The caller supplies both an abort fence and a bounded deadline; neither a
+   * silent binary nor a dead stream can hold session admission indefinitely.
+   */
+  async waitForInitialization(input: Readonly<{
+    signal: AbortSignal;
+    timeoutMs: number;
+  }>): Promise<ClaudeStreamInitialization> {
+    if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 60_000) {
+      throw new ClaudeError("INVALID_INPUT", "Claude initialization timeout must be 1 to 60000 ms.");
+    }
+    input.signal.throwIfAborted();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let removeAbort = (): void => undefined;
+    const boundary = new Promise<never>((_resolve, reject) => {
+      const onAbort = (): void => { reject(input.signal.reason); };
+      input.signal.addEventListener("abort", onAbort, { once: true });
+      removeAbort = (): void => { input.signal.removeEventListener("abort", onAbort); };
+      timer = setTimeout(() => {
+        reject(new ClaudeError("TIMEOUT", "Claude did not publish its initialization identity in time."));
+      }, input.timeoutMs);
+      timer.unref();
+    });
+    try {
+      return await Promise.race([this.#initialization, boundary]);
+    } finally {
+      removeAbort();
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /** Starts a turn: HRA mints the turn id, then writes the turn's `user` line. */
@@ -148,18 +223,73 @@ export class ClaudeStreamClient {
   }
 
   async close(): Promise<void> {
+    if (this.#closeTask === null) {
+      const task = this.#close();
+      this.#closeTask = task;
+      try {
+        await task;
+      } catch (error: unknown) {
+        // A failed close retains custody. Permit the exact owner to retry the
+        // TERM/KILL/exit proof instead of caching an ambiguous release.
+        if (this.#closeTask === task) this.#closeTask = null;
+        throw error;
+      }
+      return;
+    }
+    await this.#closeTask;
+  }
+
+  async #close(): Promise<void> {
     if (this.#state === "closed") return;
     this.#state = "closing";
+    this.#failInitialization(
+      new ClaudeError("PROCESS_EXITED", "The Claude runtime closed before initialization."),
+    );
+    this.#pending.clear();
+
+    let terminated = false;
     try {
       this.#process.terminate();
+      terminated = await resolvesWithin(this.#process.exited, this.#shutdownTermGraceMs);
     } catch {
-      // The process may already be gone; the join below is the authority.
+      this.#onSafeDiagnostic?.("Claude TERM failed; forcing process termination");
     }
-    await Promise.allSettled([this.#readTask, this.#stderrTask, this.#process.exited]);
-    for (const fact of this.#assembler.abandonTurn("the Claude runtime was closed")) {
-      await this.#onFact(fact);
+    if (!terminated) {
+      try {
+        this.#process.forceTerminate();
+      } catch {
+        this.#onSafeDiagnostic?.("Claude force termination failed");
+      }
     }
-    this.#pending.clear();
+
+    const abandonment = (async (): Promise<void> => {
+      for (const fact of this.#assembler.abandonTurn("the Claude runtime was closed")) {
+        await this.#onFact(fact);
+      }
+    })();
+    const [exitSettled, stdoutSettled, stderrSettled, writesSettled, factsSettled] =
+      await Promise.all([
+        resolvesWithin(this.#process.exited, this.#shutdownSettlementMs),
+        settlesWithin(this.#readTask, this.#shutdownSettlementMs),
+        settlesWithin(this.#stderrTask, this.#shutdownSettlementMs),
+        settlesWithin(this.#writeChain, this.#shutdownSettlementMs),
+        settlesWithin(abandonment, this.#shutdownSettlementMs),
+      ]);
+    if (!exitSettled) {
+      this.#onSafeDiagnostic?.("Claude process exit did not settle after termination");
+    }
+    if (!stdoutSettled) this.#onSafeDiagnostic?.("Claude stdout did not settle after termination");
+    if (!stderrSettled) this.#onSafeDiagnostic?.("Claude stderr did not settle after termination");
+    if (!writesSettled) this.#onSafeDiagnostic?.("Claude writes did not settle after termination");
+    if (!factsSettled) {
+      this.#onSafeDiagnostic?.("HRA fact delivery did not settle after Claude termination");
+    }
+    if (!exitSettled) {
+      throw new ClaudeError(
+        "PROCESS_EXITED",
+        "Claude process exit could not be proven after force termination.",
+      );
+    }
     this.#state = "closed";
   }
 
@@ -171,29 +301,109 @@ export class ClaudeStreamClient {
 
   #write(line: string): Promise<void> {
     const bytes = this.#encoder.encode(line);
-    const chained = this.#writeChain.then(() => this.#process.write(bytes));
+    const chained = this.#writeChain.then(async () => {
+      // Admission can change while this frame waits behind an earlier write.
+      // Recheck at the actual provider boundary so close, disconnect, and
+      // account revocation fence every frame that has not begun writing yet.
+      this.#assertOpen();
+      await this.#process.write(bytes);
+    });
     this.#writeChain = chained.catch(() => undefined);
     return chained;
   }
 
   async #readStdout(): Promise<void> {
+    let disconnectReason: "eof" | "protocol_fault" = "eof";
     try {
       for await (const chunk of this.#process.stdout) {
         for (const value of this.#decoder.push(chunk)) await this.#dispatch(value);
       }
       for (const value of this.#decoder.finish()) await this.#dispatch(value);
     } catch (error: unknown) {
+      disconnectReason = "protocol_fault";
+      this.#failInitialization(
+        error instanceof ClaudeError
+          ? error
+          : new ClaudeError("PROTOCOL_ERROR", "Claude initialization could not be parsed."),
+      );
       this.#onSafeDiagnostic?.(
         error instanceof ClaudeError
           ? `claude stream fault: ${error.code}`
           : "claude stream fault: unknown",
       );
     }
-    if (this.#state === "open") {
-      for (const fact of this.#assembler.abandonTurn("the Claude stream ended")) {
+    await this.#handleUnexpectedDisconnect(disconnectReason);
+  }
+
+  async #watchProcessExit(): Promise<void> {
+    try {
+      await this.#process.exited;
+    } catch {
+      // A rejected exit promise is not proof of termination. The manager
+      // retains the failed client so an exact close can be retried, but no
+      // further write may cross this now-ambiguous process boundary.
+      await this.#fenceAmbiguousProcessExit();
+      return;
+    }
+    await this.#handleUnexpectedDisconnect("process_exit");
+  }
+
+  async #fenceAmbiguousProcessExit(): Promise<void> {
+    if (this.#state !== "open") return;
+    this.#state = "failed";
+    this.#pending.clear();
+    this.#failInitialization(
+      new ClaudeError("PROCESS_EXITED", "Claude process settlement became indeterminate."),
+    );
+    this.#onSafeDiagnostic?.("Claude process exit settlement was indeterminate");
+    try {
+      this.#process.forceTerminate();
+    } catch {
+      this.#onSafeDiagnostic?.("Claude force termination failed after indeterminate exit");
+    }
+    for (const fact of this.#assembler.abandonTurn("the Claude runtime became indeterminate")) {
+      try {
         await this.#onFact(fact);
+      } catch {
+        this.#onSafeDiagnostic?.("HRA fact delivery failed during Claude disconnection");
       }
     }
+  }
+
+  async #handleUnexpectedDisconnect(
+    reason: "eof" | "process_exit" | "protocol_fault",
+  ): Promise<void> {
+    if (this.#state !== "open" || this.#disconnectEmitted) return;
+    // Fence writes synchronously before any observer callback can re-enter.
+    this.#state = "failed";
+    this.#pending.clear();
+    this.#failInitialization(
+      new ClaudeError("PROCESS_EXITED", "The Claude runtime ended before admission completed."),
+    );
+    for (const fact of this.#assembler.abandonTurn("the Claude runtime disconnected")) {
+      try {
+        await this.#onFact(fact);
+      } catch {
+        this.#onSafeDiagnostic?.("HRA fact delivery failed during Claude disconnection");
+      }
+    }
+    if (reason !== "process_exit") {
+      try {
+        this.#process.forceTerminate();
+      } catch {
+        this.#onSafeDiagnostic?.("Claude force termination failed after stream loss");
+      }
+      const exitSettled = await resolvesWithin(
+        this.#process.exited,
+        this.#shutdownSettlementMs,
+      );
+      if (!exitSettled) {
+        this.#onSafeDiagnostic?.("Claude process exit did not settle after stream loss");
+        return;
+      }
+    }
+    this.#disconnectEmitted = true;
+    await this.#onFact({ type: "providerDisconnected", reason });
   }
 
   async #dispatch(value: unknown): Promise<void> {
@@ -208,7 +418,42 @@ export class ClaudeStreamClient {
       }
       if (fact.type === "interactionCanceled") this.#pending.delete(fact.requestId);
       await this.#onFact(fact);
+      if (fact.type === "sessionBootstrapped") {
+        this.#settleInitialization({
+          claudeVersion: fact.claudeVersion,
+          model: fact.model,
+          permissionMode: fact.permissionMode,
+          providerSessionId: fact.providerSessionId,
+        });
+      }
     }
+  }
+
+  #settleInitialization(initialization: ClaudeStreamInitialization): void {
+    if (this.#initializationValue !== undefined) {
+      if (
+        initialization.providerSessionId !== this.#initializationValue.providerSessionId
+        || initialization.claudeVersion !== this.#initializationValue.claudeVersion
+        || initialization.model !== this.#initializationValue.model
+        || initialization.permissionMode !== this.#initializationValue.permissionMode
+      ) {
+        throw new ClaudeError(
+          "PROTOCOL_ERROR",
+          "Claude published conflicting initialization identities on one stream.",
+        );
+      }
+      return;
+    }
+    if (this.#initializationSettled) return;
+    this.#initializationSettled = true;
+    this.#initializationValue = initialization;
+    this.#resolveInitialization(initialization);
+  }
+
+  #failInitialization(error: unknown): void {
+    if (this.#initializationSettled) return;
+    this.#initializationSettled = true;
+    this.#rejectInitialization(error);
   }
 
   async #drainStderr(): Promise<void> {
@@ -222,5 +467,48 @@ export class ClaudeStreamClient {
       // Diagnostics are advisory; provider stderr never becomes HRA data.
     }
     if (observed > 0) this.#onSafeDiagnostic?.(`claude stderr bytes: ${String(observed)}`);
+  }
+}
+
+function boundedShutdownDuration(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 30_000) {
+    throw new ClaudeError("INVALID_INPUT", `${label} must be between 1 and 30000 milliseconds`);
+  }
+  return value;
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout(false), timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true as const,
+        () => true as const,
+      ),
+      timeout,
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function resolvesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout(false), timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true as const,
+        () => false as const,
+      ),
+      timeout,
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }

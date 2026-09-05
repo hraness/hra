@@ -55,6 +55,7 @@ import {
   allScheduledTasks,
   commandTargetForMachine,
   machineLabelsByDevice,
+  personalSessionAdoptionCommand,
   shortSessionId,
   type AccountRowView,
   type ArchivedSessionView,
@@ -147,6 +148,11 @@ function Notice({ children }: Readonly<{ children: string | null }>) {
 function openSession(sessionPublicId: string): void {
   location.hash = `#/session/${sessionPublicId}`;
 }
+
+const personalSessionProviders = Object.freeze([
+  { label: "Codex", provider: "codex" },
+  { label: "Claude Code", provider: "claude" },
+] as const);
 
 /**
  * The gateway key entry.
@@ -285,6 +291,35 @@ function MachineCard({
           title={`Projects (${machine.projects.length})`}
         />
       )}
+
+      {machine.sessionAdoption === null ? (
+        <SettingsRow
+          control={<Badge tone="neutral">unavailable</Badge>}
+          description="Update HRA on this machine to publish its local adoption status."
+          title="Personal sessions"
+        />
+      ) : personalSessionProviders.map(({ label, provider }) => {
+        const adoption = machine.sessionAdoption?.[provider];
+        if (adoption === undefined) return null;
+        const command = personalSessionAdoptionCommand(provider, adoption.enabled);
+        return (
+          <SettingsRow
+            control={(
+              <Badge tone={adoption.enabled ? "accent" : "neutral"}>
+                {adoption.enabled ? "enabled" : "off"}
+              </Badge>
+            )}
+            description={`${adoption.pending} pending, ${adoption.adopted} adopted, and ${adoption.fenced} fenced. ${adoption.enabled ? "New discovery is enabled." : "New discovery is off; existing adopted sessions stay connected."}`}
+            key={provider}
+            title={`${label} personal sessions`}
+          >
+            <p className="text-xs text-ink-muted">
+              Personal-home access can be changed only from this machine.
+            </p>
+            <CommandHint>{command}</CommandHint>
+          </SettingsRow>
+        );
+      })}
 
       <SettingsRow
         control={(

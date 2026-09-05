@@ -399,6 +399,23 @@ export type DeviceRegistryScheduledTask = Readonly<{
 }>;
 
 /**
+ * Provider-level personal-home adoption state. Candidate identity, content,
+ * liveness, project paths, and runtime provenance remain local; only these
+ * exact aggregates enter the encrypted device registry.
+ */
+export type DeviceRegistrySessionAdoptionStatus = Readonly<{
+  adopted: number;
+  enabled: boolean;
+  fenced: number;
+  pending: number;
+}>;
+
+export type DeviceRegistrySessionAdoption = Readonly<{
+  claude: DeviceRegistrySessionAdoptionStatus;
+  codex: DeviceRegistrySessionAdoptionStatus;
+}>;
+
+/**
  * One device's settings projection: what the web settings screen needs to
  * render machines, accounts, projects, scheduled tasks, and the daemon's
  * current defaults without decrypting any session. Every human-readable
@@ -421,6 +438,9 @@ export type DeviceRegistryPayload = Readonly<{
   projects: readonly DeviceRegistryProject[];
   proseAutorespondConfigured: boolean;
   scheduledTasks: readonly DeviceRegistryScheduledTask[];
+  // Additive and optional so a registry published by an older daemon remains
+  // readable. Absence means unsupported/unknown, never disabled.
+  sessionAdoption?: DeviceRegistrySessionAdoption;
   showThinkingDefault: boolean;
   version: 1;
 }>;
@@ -630,6 +650,10 @@ function isRegistryTimestamp(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
+function isRegistryCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
 function parseRegistryAccounts(value: unknown): readonly DeviceRegistryAccount[] | null {
   if (!Array.isArray(value) || value.length > deviceRegistryLimits.accounts) return null;
   const accounts: DeviceRegistryAccount[] = [];
@@ -698,13 +722,44 @@ function parseRegistryScheduledTasks(
   return tasks;
 }
 
+function parseRegistrySessionAdoptionStatus(
+  value: unknown,
+): DeviceRegistrySessionAdoptionStatus | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["adopted", "enabled", "fenced", "pending"])
+    || !isRegistryCount(value.adopted)
+    || typeof value.enabled !== "boolean"
+    || !isRegistryCount(value.fenced)
+    || !isRegistryCount(value.pending)
+  ) return null;
+  return {
+    adopted: value.adopted,
+    enabled: value.enabled,
+    fenced: value.fenced,
+    pending: value.pending,
+  };
+}
+
+function parseRegistrySessionAdoption(value: unknown): DeviceRegistrySessionAdoption | null {
+  if (!isRecord(value) || !hasExactKeys(value, ["claude", "codex"])) return null;
+  const claude = parseRegistrySessionAdoptionStatus(value.claude);
+  const codex = parseRegistrySessionAdoptionStatus(value.codex);
+  return claude === null || codex === null ? null : { claude, codex };
+}
+
 export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayload | null {
   if (!isRecord(value)) return null;
   const hasAccountLinking = Object.hasOwn(value, "accountLinkingAllowed");
   const hasDeviceCommands = Object.hasOwn(value, "deviceCommandsAllowed");
+  const hasSessionAdoption = Object.hasOwn(value, "sessionAdoption");
+  const sessionAdoption = hasSessionAdoption
+    ? parseRegistrySessionAdoption(value.sessionAdoption)
+    : null;
   if (
     (hasAccountLinking && typeof value.accountLinkingAllowed !== "boolean")
     || (hasDeviceCommands && typeof value.deviceCommandsAllowed !== "boolean")
+    || (hasSessionAdoption && sessionAdoption === null)
   ) return null;
   if (
     !hasExactKeys(value, [
@@ -719,6 +774,7 @@ export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayloa
       "projects",
       "proseAutorespondConfigured",
       "scheduledTasks",
+      ...(hasSessionAdoption ? ["sessionAdoption"] : []),
       "showThinkingDefault",
       "version",
     ])
@@ -753,6 +809,9 @@ export function parseDeviceRegistryPayload(value: unknown): DeviceRegistryPayloa
     projects,
     proseAutorespondConfigured: value.proseAutorespondConfigured,
     scheduledTasks,
+    ...(hasSessionAdoption
+      ? { sessionAdoption: sessionAdoption as DeviceRegistrySessionAdoption }
+      : {}),
     showThinkingDefault: value.showThinkingDefault,
     version: 1,
   };

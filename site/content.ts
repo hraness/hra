@@ -230,7 +230,7 @@ const betaInstallCommand = buildHraGlobalInstallCommand(
 
 const productName = "HRA";
 const tagline = "Control plane for coding-agent subscriptions";
-const providerRoadmap = "Codex today, Claude next.";
+const providerRoadmap = "Codex and Claude Code sessions today.";
 const releaseVersion = "0.5.0";
 
 /** Toolchain and runtime pins come from `package.json`, so badges cannot drift from the manifest. */
@@ -282,7 +282,7 @@ export const publicContent: PublicContent = {
   tagline,
   providerRoadmap,
   releaseVersion,
-  thesis: `${productName} runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.`,
+  thesis: `${productName} runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex and Claude Code sessions are supported today.`,
   description: `${tagline}: run several accounts side by side, keep their sessions alive in a local daemon, and drive them from a shell or JSON. ${providerRoadmap}`,
   statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready for macOS and Linux; hosted sync is live as an ${hostedBetaLabel}.`,
   badges,
@@ -738,9 +738,9 @@ export const publicContent: PublicContent = {
           text(". The document is never an argument."),
         ),
         paragraph(
-          text("The CLI stores HRA's revocable device credential, workspace encryption key, and local signing authority as immutable generations below its private state root. Custody directories are current-user-owned mode-0700 directories, values are single-link mode-0600 files, and reads use bounded no-follow descriptors. The detached Bun daemon never opens a Keychain prompt. HRA forces both pinned Codex credential stores to file mode and verifies their effective settings, so Codex credentials remain separately owned by each profile's isolated "),
+          text("The CLI stores HRA's revocable device credential, workspace encryption key, and local signing authority as immutable generations below its private state root. Custody directories are current-user-owned mode-0700 directories, values are single-link mode-0600 files, and reads use bounded no-follow descriptors. The detached Bun daemon never opens a Keychain prompt. HRA forces both pinned Codex credential stores to file mode and verifies their effective settings. Managed accounts keep credentials in each profile's isolated "),
           code("CODEX_HOME"),
-          text("."),
+          text("; explicitly adopted personal sessions use the credentials already owned by the user's personal provider home without copying or parsing them."),
         ),
         paragraph(
           text("After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority."),
@@ -816,6 +816,11 @@ export const publicContent: PublicContent = {
           ],
           [
             text("Compact sessions: list sessions, read user and final assistant messages, inspect elapsed time plus bounded observed file and Git actions, then open one turn for full provider-visible detail."),
+          ],
+          [
+            text("Personal-home adoption: opt in to discover recent Codex and Claude Code sessions, then admit them after bounded liveness checks and an exact provider resume. Account-filtered session lists include admitted rows, which use the same public commands, autorespond policy, and approval authority as every HRA session. Provider APIs do not supply a global lease against every later external resume. Read "),
+            link("the session-adoption guide", "https://github.com/hraness/hra/blob/main/docs/session-adoption.md"),
+            text("."),
           ],
           [
             text("Durable controls: send, queue, steer, stop, rename, and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing."),
@@ -1136,6 +1141,10 @@ export const publicContent: PublicContent = {
             "hra project list",
             "hra project use <project>",
             "hra session list [--account <profile>] [--archived] [--limit <1-100>] [--cursor <cursor>]",
+            "hra session adoption status [--provider <codex|claude>]",
+            "hra session adoption enable <account> --provider <codex|claude>",
+            "hra session adoption disable --provider <codex|claude>",
+            "hra session discover [--provider <codex|claude>]",
             "hra session show <session> [--detail]",
             "hra session status <session> [--json]",
             "hra session watch <session> [--cursor <cursor>] [--jsonl]",

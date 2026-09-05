@@ -29,6 +29,10 @@ import {
   type SessionEventPage,
 } from "../domain/session-events";
 import {
+  projectPublicReviewedRuntimeProfile,
+  reviewedRuntimeProfileSchema,
+} from "../domain/runtime-profile";
+import {
   accountUsageHistoryPageSchema,
   automaticRateLimitResetStatusSchema,
 } from "../domain/usage-metrics";
@@ -280,9 +284,9 @@ const renderEffectiveRuntimeProfile = (value: unknown): readonly string[] => {
   const profile = object(value);
   if (profile === null) return [];
   // The two providers review different documents. Claude Code owns its own
-  // permission engine, so its profile names the pinned CLI version, the
-  // interactive permission mode, and the isolated runtime home instead of the
-  // Codex approval, review, and app capabilities.
+  // permission engine, so its public profile names the pinned CLI version and
+  // interactive permission mode instead of Codex approval/review capability.
+  // Private config-home provenance is intentionally never rendered.
   if (typeof profile.claudeVersion === "string") {
     return [
       "Runtime",
@@ -292,7 +296,6 @@ const renderEffectiveRuntimeProfile = (value: unknown): readonly string[] => {
       `  model: ${line(profile.model)}`,
       `  reasoning effort: ${line(profile.reasoningEffort)}`,
       `  permission mode: ${line(profile.permissionMode)}`,
-      `  isolated profile: ${profile.isolatedConfigDir === true ? "enabled" : "unavailable"}`,
       `  stream: ${line(profile.inputFormat)} in, ${line(profile.outputFormat)} out`,
       `  observed at: ${line(profile.observedAt)}`,
     ];
@@ -1065,6 +1068,21 @@ const publicInteractionData = (command: LocalCommand, data: unknown): unknown =>
     return {
       ...parsed.data,
       nextCursor: parsed.data.nextCursor === null ? null : nextCursor ?? null,
+    };
+  }
+  if (
+    command.kind === "session.show"
+    || command.kind === "session.start"
+    || command.kind === "session.send"
+  ) {
+    const root = object(data);
+    if (root === null || root.effectiveRuntimeProfile === null) return data;
+    const profile = reviewedRuntimeProfileSchema.safeParse(root.effectiveRuntimeProfile);
+    return {
+      ...root,
+      effectiveRuntimeProfile: profile.success
+        ? projectPublicReviewedRuntimeProfile(profile.data)
+        : null,
     };
   }
   if (command.kind === "interaction.show") {
@@ -2273,7 +2291,11 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     })}\n`);
     return;
   }
-  const publicData = command.kind === "account.login" || command.kind === "session.list"
+  const publicData = command.kind === "account.login"
+      || command.kind === "session.list"
+      || command.kind === "session.show"
+      || command.kind === "session.start"
+      || command.kind === "session.send"
     ? publicInteractionData(command, data)
     : data;
   const value = publicData as Record<string, unknown>;
@@ -2319,7 +2341,7 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       `Deleted conversation task ${line(deleted.taskId)} from ${line(deleted.sessionId)} at ${instant(deleted.deletedAt)} (revision ${String(deleted.revision)}).\n`,
     );
   } else if (command.kind === "session.show") {
-    output.writeStdout(`${renderSession(data)}\n`);
+    output.writeStdout(`${renderSession(publicData)}\n`);
   } else if (command.kind === "session.status") {
     output.writeStdout(`${renderSessionStatus(data)}\n`);
   } else if (command.kind === "session.state") {
@@ -2439,7 +2461,7 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
   } else if (command.kind === "sync.status") {
     output.writeStdout(`${renderSyncStatus(data)}\n`);
   } else {
-    output.writeStdout(`${safeJson(data, 2)}\n`);
+    output.writeStdout(`${safeJson(publicData, 2)}\n`);
   }
 }
 

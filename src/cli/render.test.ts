@@ -69,8 +69,8 @@ describe("CLI rendering", () => {
       {
         effectiveRuntimeProfile: {
           claudeVersion: "2.1.260",
+          configHome: "isolated",
           inputFormat: "stream-json",
-          isolatedConfigDir: true,
           model: "claude-fable-5-1",
           observedAt: 2_000,
           outputFormat: "stream-json",
@@ -98,13 +98,47 @@ describe("CLI rendering", () => {
     expect(rendered).toContain("preset: fable-max");
     expect(rendered).toContain("model: claude-fable-5-1");
     expect(rendered).toContain("permission mode: default");
-    expect(rendered).toContain("isolated profile: enabled");
+    expect(rendered).not.toContain("config home");
+    expect(rendered).not.toContain("isolatedConfigDir");
     expect(rendered).toContain("stream: stream-json in, stream-json out");
     // No Codex-only row is invented for a provider that has none of them.
     expect(rendered).not.toContain("service tier");
     expect(rendered).not.toContain("Fast:");
     expect(rendered).not.toContain("plugin capability");
     expect(rendered).not.toContain("enabled apps");
+
+    const json = capture();
+    renderSuccess(
+      { detail: false, kind: "session.show", session: "claude-session" },
+      {
+        effectiveRuntimeProfile: {
+          claudeVersion: "2.1.260",
+          configHome: "personal",
+          inputFormat: "stream-json",
+          model: "claude-fable-5-1",
+          observedAt: 2_000,
+          outputFormat: "stream-json",
+          permissionMode: "default",
+          preset: "fable-max",
+          processGeneration: 3,
+          profileId: "acct_00000000000000000000000000000000",
+          reasoningEffort: "max",
+        },
+        projection: {
+          providerThreadId: "thread-claude",
+          status: "idle",
+          title: "Claude work",
+        },
+        session: { id: "sess-claude", state: "idle", title: "Claude work" },
+      },
+      true,
+      json.output,
+    );
+    const document = JSON.parse(json.stdout.join("")) as {
+      data: { effectiveRuntimeProfile: Record<string, unknown> };
+    };
+    expect(document.data.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+    expect(document.data.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
   });
 
   test("renders bounded local root status with closed recovery commands", () => {

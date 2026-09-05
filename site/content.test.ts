@@ -70,7 +70,7 @@ describe("public content contract", () => {
     expect(lines[6]).toBe("```sh");
     expect(lines[7]).toBe(publicContent.installCommand);
     expect(publicContent.thesis).toBe(
-      "HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.",
+      "HRA runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex and Claude Code sessions are supported today.",
     );
     expect(publicContent.statusLine).toContain(`v${publicContent.releaseVersion}`);
     expect(publicContent.statusLine).toContain("hosted sync is live as an open beta");
@@ -111,7 +111,7 @@ describe("public content contract", () => {
     const structured = JSON.parse(jsonLd ?? "{}") as Record<string, unknown>;
 
     expect(publicContent.tagline).toBe("Control plane for coding-agent subscriptions");
-    expect(publicContent.providerRoadmap).toBe("Codex today, Claude next.");
+    expect(publicContent.providerRoadmap).toBe("Codex and Claude Code sessions today.");
     expect(packageJson.description).toBe(publicContent.description);
     expect(publicContent.description).toStartWith(`${publicContent.tagline}:`);
     expect(publicContent.description).toEndWith(publicContent.providerRoadmap);

@@ -3,7 +3,11 @@ import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { ClaudeProcess, PinnedClaudeRuntime } from "../claude/index";
+import type {
+  ClaudeProcess,
+  ClaudeProcessIdentity,
+  PinnedClaudeRuntime,
+} from "../claude/index";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { LiveBatcher } from "../cloud/live-uploader";
 import type { SessionEvent } from "../domain/session-events";
@@ -131,6 +135,11 @@ const pinnedRuntime: PinnedClaudeRuntime = {
 };
 
 class FakeClaudeProcess implements ClaudeProcess {
+  readonly identity: Promise<ClaudeProcessIdentity> = Promise.resolve(Object.freeze({
+    pid: 8_123,
+    pidDomain: "darwin",
+    procStart: "Fri Sep  4 12:00:00 2026",
+  }));
   readonly written: string[] = [];
   readonly exited: Promise<number>;
   readonly stdout: AsyncIterable<Uint8Array>;
@@ -260,6 +269,7 @@ async function claudeFixture(
   const processes: FakeClaudeProcess[] = [];
   const reference: { current?: HraService } = {};
   const claude = new PinnedClaudeRuntimeManager({
+    configHome: "isolated",
     configDirFor: () => join(home, "claude-config"),
     isCurrent: (authority) => {
       try {
@@ -274,9 +284,12 @@ async function claudeFixture(
         await reference.current?.observeClaudeFact(authority, fact);
       },
     },
-    processFactory: () => {
+    processFactory: (launch) => {
       const process = new FakeClaudeProcess();
       processes.push(process);
+      const providerThreadId = launch.argv.at(-1);
+      if (providerThreadId === undefined) throw new Error("Expected a session-bound Claude argv.");
+      queueMicrotask(() => { process.emit({ ...initLine, session_id: providerThreadId }); });
       return process;
     },
     resolveRuntime: options.resolveRuntime ?? (async () => pinnedRuntime),
@@ -353,8 +366,8 @@ describe("Claude sessions on the local authority", () => {
     // The durable session-start evidence carries the Claude document.
     expect(started.effectiveRuntimeProfile).toMatchObject({
       claudeVersion: CLAUDE_PIN,
+      configHome: "isolated",
       inputFormat: "stream-json",
-      isolatedConfigDir: true,
       model: CLAUDE_PIN_MODEL,
       outputFormat: "stream-json",
       permissionMode: "default",
@@ -369,9 +382,6 @@ describe("Claude sessions on the local authority", () => {
 
     const process = value.processes[0];
     if (process === undefined) throw new Error("Expected one pinned Claude process.");
-    process.emit(initLine);
-    await settle();
-
     const sent = await value.service.execute({
       idempotencyKey: crypto.randomUUID(),
       kind: "session.send",
@@ -497,8 +507,6 @@ describe("Claude sessions on the local authority", () => {
     const sessionId = started.session.id;
     const process = value.processes[0];
     if (process === undefined) throw new Error("Expected one pinned Claude process.");
-    process.emit(initLine);
-    await settle();
     await value.service.execute({
       idempotencyKey: crypto.randomUUID(),
       kind: "session.send",
@@ -556,9 +564,6 @@ describe("Claude sessions on the local authority", () => {
     }, { signal }) as { session: { id: `sess_${string}` } };
     const process = value.processes[0];
     if (process === undefined) throw new Error("Expected one pinned Claude process.");
-    process.emit(initLine);
-    await settle();
-
     await value.service.execute({
       idempotencyKey: crypto.randomUUID(),
       kind: "session.send",
@@ -632,8 +637,6 @@ describe("Claude sessions on the local authority", () => {
     }, { signal }) as { session: { id: `sess_${string}` } };
     const process = value.processes[0];
     if (process === undefined) throw new Error("Expected one pinned Claude process.");
-    process.emit(initLine);
-    await settle();
     const sent = await value.service.execute({
       idempotencyKey: crypto.randomUUID(),
       kind: "session.send",

@@ -46,18 +46,15 @@ import { providerUsagePayload } from "../domain/usage-metrics";
 import type { SessionEvent } from "../domain/session-events";
 import { queueIdSchema, sessionIdSchema } from "../domain/values";
 import type {
-  ClaudeRuntimePort,
-  CodexRuntimePort,
   CodexSessionProjection,
   CloudControlPort,
-  ProfileAuthority,
 } from "../daemon/ports";
 import {
   isAttachmentImageMediaType,
   type AttachmentReference,
 } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
-import { profilePaths, type StatePaths } from "../storage/paths";
+import type { StatePaths } from "../storage/paths";
 import { HRA_VERSION } from "../version";
 import type {
   InteractionListPosition,
@@ -598,16 +595,6 @@ export async function materializeRemoteAttachments(
     });
   }
   return { kind: "materialized", values };
-}
-
-function authorityFor(paths: StatePaths, profileId: Parameters<typeof profilePaths>[1], generation: number): ProfileAuthority {
-  const owned = profilePaths(paths, profileId);
-  return {
-    id: profileId,
-    generation,
-    codexHome: owned.codexHome,
-    desktopUserData: owned.desktopUserData,
-  };
 }
 
 function sha256(value: string): string {
@@ -2438,13 +2425,16 @@ export type CloudGatewayKeyCustody = Readonly<{
 
 export type StateBackedCloudDaemonAdapterOptions = Readonly<{
   cloudIdentityNamespace?: string | null;
-  codex: CodexRuntimePort;
   /**
-   * The Claude seam, when this daemon composes one. Cloud projection reads a
-   * session through the port its own provider binds, so a Claude session
-   * projects exactly like a Codex one.
+   * Service-owned exact session reader. It serializes against session/account
+   * authority and performs the same fresh provider-account check before and
+   * after every provider read. The cloud adapter deliberately owns no runtime
+   * port, provider-home path, or account-key derivation.
    */
-  claude?: ClaudeRuntimePort;
+  readSessionProjectionForCloud(
+    sessionPublicId: SessionRecord["id"],
+    signal: AbortSignal,
+  ): Promise<CodexSessionProjection>;
   /** Local custody for the responder gateway key (default: none; `set_gateway_key` is refused). */
   gatewayKeyCustody?: CloudGatewayKeyCustody;
   executeRemote: LocalExecuteRemote;
@@ -2508,8 +2498,9 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   readonly #cachePath: string;
   readonly #cacheFileName: string;
   #cacheStatus: CloudProjectionCacheStatus;
-  readonly #codex: CodexRuntimePort;
-  readonly #claude: ClaudeRuntimePort | undefined;
+  readonly #readSessionProjectionForCloud: StateBackedCloudDaemonAdapterOptions[
+    "readSessionProjectionForCloud"
+  ];
   readonly #executeRemote: LocalExecuteRemote;
   readonly #executeLocal: LocalExecuteCommand;
   readonly #notifyOperator: (input: Readonly<{ body: string; title: string }>) => Promise<void>;
@@ -2567,8 +2558,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       this.#cache = null;
       this.#cacheStatus = projectionCacheFailure(error);
     }
-    this.#codex = options.codex;
-    this.#claude = options.claude;
+    this.#readSessionProjectionForCloud = options.readSessionProjectionForCloud;
     this.#executeRemote = options.executeRemote;
     // Without an injected local executor no device command can reach the
     // provider, so the adapter refuses every one of them rather than pretending
@@ -2584,18 +2574,6 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     this.#paths = options.paths;
     this.#store = options.store;
     this.#attachmentBlobStore = AttachmentBlobStore.forStatePaths(options.paths);
-  }
-
-  /** The provider port that owns one session's live projection reads. */
-  #sessionRuntime(session: SessionRecord): {
-    readSession: CodexRuntimePort["readSession"];
-  } {
-    if (session.provider !== "claude") return this.#codex;
-    const claude = this.#claude;
-    if (claude === undefined) {
-      throw new Error("This daemon composes no Claude Code runtime for that session.");
-    }
-    return claude;
   }
 
   close(): void {
@@ -2661,12 +2639,10 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         || entry.state === "dispatching"
         || entry.state === "ambiguous")
     ) throw new Error("Cloud projection recovery requires settled local session effects.");
-    const projection = await this.#sessionRuntime(session).readSession({
-      authority: authorityFor(this.#paths, profile.id, profile.processGeneration),
-      providerThreadId: session.providerThreadId,
-      detail: false,
-      signal: input.signal,
-    });
+    const projection = await this.#readSessionProjectionForCloud(
+      session.id,
+      input.signal,
+    );
     throwIfAborted(input.signal);
     const current = this.#requireRecoverySession(input.sessionPublicId, {
       profileGeneration: profile.processGeneration,
@@ -3076,12 +3052,10 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         } else {
           let projectionError: Error | undefined;
           try {
-            const projection = await this.#sessionRuntime(session).readSession({
-              authority: authorityFor(this.#paths, profile.id, profile.processGeneration),
-              providerThreadId: session.providerThreadId,
-              detail: false,
-              signal: input.signal,
-            });
+            const projection = await this.#readSessionProjectionForCloud(
+              session.id,
+              input.signal,
+            );
             throwIfAborted(input.signal);
             if (projection.providerThreadId !== session.providerThreadId) {
               throw new Error("The provider runtime returned a session under different authority.");
@@ -3237,10 +3211,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
 
   /**
    * The device settings projection: machine, daemon defaults, accounts,
-   * projects, and scheduled tasks, as labels only. Codex Desktop automations
-   * are read from disk read-only; a malformed automation is skipped rather
-   * than failing the whole registry, and a Codex thread that is not one of
-   * this daemon's sessions projects a null session id.
+   * projects, scheduled tasks, and provider-level personal-session adoption
+   * aggregates. Codex Desktop automations are read from disk read-only; a
+   * malformed automation is skipped rather than failing the whole registry,
+   * and a Codex thread that is not one of this daemon's sessions projects a
+   * null session id. Candidate detail and runtime provenance never enter this
+   * projection.
    */
   async readDeviceRegistry(input: Readonly<{ signal: AbortSignal }>): Promise<DeviceRegistryPayload> {
     if (input.signal.aborted) throw input.signal.reason;
@@ -3301,6 +3277,18 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       });
     }
     const deviceCommandPolicy = this.#store.readDeviceCommandPolicy();
+    const codexAdoption = this.#store.readSessionAdoptionCounts("codex");
+    const claudeAdoption = this.#store.readSessionAdoptionCounts("claude");
+    const sessionAdoption = {
+      claude: {
+        ...claudeAdoption,
+        enabled: this.#store.readSessionAdoptionPolicy("claude")?.enabled ?? false,
+      },
+      codex: {
+        ...codexAdoption,
+        enabled: this.#store.readSessionAdoptionPolicy("codex")?.enabled ?? false,
+      },
+    } as const;
     return {
       accountLinkingAllowed: deviceCommandPolicy.accountLinkingAllowed,
       accounts,
@@ -3313,6 +3301,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       projects,
       proseAutorespondConfigured: await this.#gatewayKeyCustody.hasKey(),
       scheduledTasks,
+      sessionAdoption,
       showThinkingDefault: this.#store.readDefaultShowThinking(),
       version: 1,
     };

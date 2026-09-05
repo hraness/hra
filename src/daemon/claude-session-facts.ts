@@ -137,6 +137,14 @@ export class ClaudeSessionFactTranslator {
       // of that, so nothing is projected.
       case "sessionBootstrapped":
         return null;
+      case "providerDisconnected":
+        this.forgetSession(threadId);
+        this.#openItems.delete(threadId);
+        return {
+          connectionId,
+          reason: fact.reason,
+          type: "providerDisconnected",
+        };
       case "turnStarted":
         return {
           connectionId,

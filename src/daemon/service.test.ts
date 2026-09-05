@@ -14,7 +14,7 @@ import {
   type CodexPluginCatalog,
 } from "../codex";
 import { parseFact } from "../codex/protocol";
-import { CLAUDE_PIN } from "../claude/pin";
+import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import { AccountKeyLossPreconditionError } from "../cloud/local-control";
 import {
@@ -33,6 +33,7 @@ import {
   publicInteractionSchema,
   type InteractionRecord,
   type InteractionResolution,
+  type ProviderInteractionAuthority,
   type PublicInteraction,
 } from "../domain/interactions";
 import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
@@ -40,7 +41,10 @@ import type { PreparedAttachment } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
 import type { Preset } from "../domain/presets";
-import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
+import type {
+  EffectiveClaudeRuntimeProfile,
+  EffectiveRuntimeProfile,
+} from "../domain/runtime-profile";
 import {
   SESSION_EVENT_RETAIN_AGE_MS,
   sessionEventPageSchema,
@@ -54,7 +58,7 @@ import {
   InMemoryGatewayKeyStore,
   type GatewayKeyPort,
 } from "../storage/gateway-key-custody";
-import { StateStore } from "../storage/state-store";
+import { StateStore, type SessionRecord } from "../storage/state-store";
 import {
   DeterministicProseResponder,
   PROSE_APPROVAL_REPLY,
@@ -65,12 +69,20 @@ import type {
   HraFactsMemoryLifecyclePort,
   HraFactsMemoryLifecycleReceipt,
 } from "./facts-memory-lifecycle";
-import { CodexSessionObservationError, UnavailableCloudControl, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
+import { ClaudeProcessExitUnprovenError, ClaudeSessionObservationError, CodexSessionObservationError, UnavailableCloudControl, type ClaudeProcessIdentity, type ClaudeRuntimePort, type ClaudeRuntimeStartReview, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionObservation, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
+import {
+  CLAUDE_REGISTRY_MAX_RECORDS,
+  type ClaudeProcessLivenessProbe,
+  type DiscoveredPersonalSession,
+  type PersonalSessionDiscoveryPort,
+} from "./personal-session-discovery";
 import { SessionEventCursorCodec } from "./session-event-cursor";
 import { CommandFailure, FACTS_MEMORY_SESSION_TTL_MS, HraService } from "./service";
 import { USAGE_HISTORY_CURSOR_TTL_MS } from "./usage-history-cursor";
 
 const privatePathRoot = ["", "Users", "private"].join("/");
+const codexProviderAccountKey = (email = "person@example.com"): string =>
+  `v1:codex:${createHash("sha256").update(email.trim().toLowerCase()).digest("hex")}`;
 
 const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile => ({
   profileId: authority.id,
@@ -92,6 +104,8 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
 class FakeCodex implements CodexRuntimePort {
   readonly provider = "codex" as const;
   readonly calls: string[] = [];
+  readonly releasedAuthorities: ProfileAuthority[] = [];
+  readonly retiredAuthorityKeys = new Set<string>();
   readonly observedThreads: string[] = [];
   readonly freshThreads = new Set<string>();
   readonly turnEffectTrace: string[] = [];
@@ -113,6 +127,7 @@ class FakeCodex implements CodexRuntimePort {
   reviewTurnErrorOnce?: Error;
   beforeLogoutReturn?: () => Promise<void>;
   logoutError?: Error;
+  beforeReleaseOwnedAuthorityReturn?: () => Promise<void>;
   startSessionError?: Error;
   startTurnError?: Error;
   startTurnErrorOnce?: Error;
@@ -130,6 +145,7 @@ class FakeCodex implements CodexRuntimePort {
   closeCalls = 0;
   resolveInteractionError?: Error;
   beforeResolveInteractionReturn?: () => Promise<void>;
+  beforeTimeoutInteractionReturn?: () => Promise<void>;
   validateInteractionResolutionError?: Error;
   beforeValidateInteractionResolutionReturn?: () => Promise<void>;
   validateInteractionTimeoutError?: Error;
@@ -200,15 +216,49 @@ class FakeCodex implements CodexRuntimePort {
   listedProjections: readonly CodexSessionProjection[] = [];
   listedNextCursor: string | null = null;
   readonly sessionListRequests: Array<Parameters<CodexRuntimePort["listSessions"]>[0]> = [];
+  beforeListSessionsReturn?: () => Promise<void> | void;
+  claimError?: Error;
+  readonly claimRequests: Array<
+    Parameters<NonNullable<CodexRuntimePort["claimSession"]>>[0]
+  > = [];
+  beforeClaimSessionReturnOnce?: () => Promise<void>;
   loginResult: CodexLoginOutcome = { status: "signed_in", account: { signedIn: true, email: "person@example.com", plan: "Plus" } };
   cancelLoginResult: { status: "canceled" | "not_found" } = { status: "canceled" };
   beforeLoginReturn?: (input: { authority: ProfileAuthority; method: "browser" | "device_code" }) => Promise<void>;
   beforeCancelLoginReturn: (() => Promise<void>) | undefined = undefined;
   beforeReadAccountReturn?: () => Promise<void>;
+  #authorityKey(authority: ProfileAuthority): string {
+    return `${authority.id}:${String(authority.generation)}`;
+  }
+  retireAuthority(authority: ProfileAuthority): void {
+    this.retiredAuthorityKeys.add(this.#authorityKey(authority));
+  }
   async login(input: { authority: ProfileAuthority; method: "browser" | "device_code" }): Promise<CodexLoginOutcome> { this.calls.push(`login:${input.authority.id}:${input.authority.generation}:${input.method}`); await this.beforeLoginReturn?.(input); return this.loginResult; }
   async cancelLogin(input: { authority: ProfileAuthority; loginId: string }): Promise<{ status: "canceled" | "not_found" }> { this.calls.push(`login-cancel:${input.authority.id}:${input.authority.generation}:${input.loginId}`); await this.beforeCancelLoginReturn?.(); return this.cancelLoginResult; }
   async logout(): Promise<void> { this.calls.push("logout"); await this.beforeLogoutReturn?.(); if (this.logoutError !== undefined) throw this.logoutError; }
-  async readAccount(): Promise<CodexAccountProjection> { this.calls.push("readAccount"); await this.beforeReadAccountReturn?.(); return this.accountProjection; }
+  async releaseOwnedAuthority(input: {
+    authority: ProfileAuthority;
+    signal: AbortSignal;
+  }): Promise<void> {
+    input.signal.throwIfAborted();
+    this.releasedAuthorities.push(input.authority);
+    this.retireAuthority(input.authority);
+    await this.beforeReleaseOwnedAuthorityReturn?.();
+    input.signal.throwIfAborted();
+  }
+  async readAccount(input: {
+    authority: ProfileAuthority;
+    signal: AbortSignal;
+  }): Promise<CodexAccountProjection> {
+    input.signal.throwIfAborted();
+    this.calls.push("readAccount");
+    if (this.retiredAuthorityKeys.has(this.#authorityKey(input.authority))) {
+      throw new Error("AUTHORITY_STALE");
+    }
+    const observed = this.accountProjection;
+    await this.beforeReadAccountReturn?.();
+    return observed;
+  }
   async listPlugins(input: Parameters<CodexRuntimePort["listPlugins"]>[0]): Promise<CodexPluginCatalog> {
     this.calls.push("plugins");
     this.pluginRequests.push(input);
@@ -232,7 +282,35 @@ class FakeCodex implements CodexRuntimePort {
   async listSessions(input: Parameters<CodexRuntimePort["listSessions"]>[0]): ReturnType<CodexRuntimePort["listSessions"]> {
     this.calls.push("list");
     this.sessionListRequests.push(input);
+    await this.beforeListSessionsReturn?.();
     return { sessions: this.listedProjections, nextCursor: this.listedNextCursor };
+  }
+  async claimSession(
+    input: Parameters<NonNullable<CodexRuntimePort["claimSession"]>>[0],
+  ): ReturnType<NonNullable<CodexRuntimePort["claimSession"]>> {
+    this.calls.push("claim");
+    this.claimRequests.push(input);
+    if (this.claimError !== undefined) throw this.claimError;
+    const beforeReturn = this.beforeClaimSessionReturnOnce;
+    delete this.beforeClaimSessionReturnOnce;
+    await beforeReturn?.();
+    const base = runtimeProfile(input.authority);
+    return {
+      connectionId: this.observationConnectionId,
+      effectiveRuntimeProfile: {
+        ...base,
+        preset: input.preset,
+        fast: input.fast,
+        serviceTier: input.fast ? "priority" : null,
+        model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
+        reasoningEffort: input.preset === "ultra" ? "ultra" : "max",
+      },
+      projection: {
+        ...this.readProjection,
+        providerThreadId: input.providerThreadId,
+      },
+      resumed: true,
+    };
   }
   async reviewSessionStart(input: { authority: ProfileAuthority; preset: Preset; fast: boolean }): Promise<RuntimeStartReview> {
     this.calls.push("review-session");
@@ -398,10 +476,300 @@ class FakeCodex implements CodexRuntimePort {
     input: Parameters<CodexRuntimePort["timeoutInteraction"]>[0],
   ): Promise<{ responseWritten: true }> {
     this.timedOutInteractions.push(input);
+    await this.beforeTimeoutInteractionReturn?.();
     if (this.timeoutInteractionError !== undefined) throw this.timeoutInteractionError;
     return { responseWritten: true };
   }
   async close(): Promise<void> { this.closeCalls += 1; }
+}
+
+const claudeRuntimeProfile = (
+  authority: ProfileAuthority,
+  configHome: "isolated" | "personal",
+): EffectiveClaudeRuntimeProfile => ({
+  profileId: authority.id,
+  processGeneration: authority.generation,
+  observedAt: personalAdoptionNow,
+  preset: "fable-max",
+  model: CLAUDE_PIN_MODEL,
+  reasoningEffort: "max",
+  claudeVersion: CLAUDE_PIN,
+  permissionMode: "default",
+  configHome,
+  outputFormat: "stream-json",
+  inputFormat: "stream-json",
+});
+
+/** Minimal Claude seam that preserves which provider home received each effect. */
+class FakeClaude implements ClaudeRuntimePort {
+  readonly provider = "claude" as const;
+  readonly calls: string[] = [];
+  readonly claimRequests: Array<Parameters<ClaudeRuntimePort["claimSession"]>[0]> = [];
+  readonly endRequests: Array<Parameters<ClaudeRuntimePort["endSession"]>[0]> = [];
+  readonly endedProcessIdentities: ClaudeProcessIdentity[] = [];
+  readonly identityRequests: Array<
+    Parameters<ClaudeRuntimePort["readSessionProcessIdentity"]>[0]
+  > = [];
+  readonly observeRequests: Array<Parameters<ClaudeRuntimePort["observeSession"]>[0]> = [];
+  readonly startSessionRequests: Array<Parameters<ClaudeRuntimePort["startSession"]>[0]> = [];
+  readonly resolvedInteractions: Array<
+    Parameters<ClaudeRuntimePort["resolveInteraction"]>[0]
+  > = [];
+  readonly turnRequests: Array<Parameters<ClaudeRuntimePort["startTurn"]>[0]> = [];
+  readonly validatedInteractions: Array<
+    Parameters<ClaudeRuntimePort["validateInteractionResolution"]>[0]
+  > = [];
+  beforeEndSessionReturn?: () => Promise<void>;
+  beforeClaimSessionAdmission?: (
+    input: Parameters<ClaudeRuntimePort["claimSession"]>[0],
+  ) => Promise<void> | void;
+  beforeStartSessionAdmission?: (
+    input: Parameters<ClaudeRuntimePort["startSession"]>[0],
+  ) => Promise<void> | void;
+  closeError?: Error;
+  closeCalls = 0;
+  claimProjectionTitle?: string;
+  claimSessionError?: Error;
+  disconnectOnObserveRequest?: number;
+  observationConnectionId = "30000000-0000-4000-8000-0000000000c1";
+  observationConnectionIdOnClaim?: string;
+  observePause?: Promise<void>;
+  observePauseStarted?: () => void;
+  pauseOnObserveRequest?: number;
+  observeErrorOnce?: Error;
+  readIdentityErrorOnce?: Error;
+  processIdentity: ClaudeProcessIdentity;
+  processIdentityOnClaim?: ClaudeProcessIdentity;
+  startSessionError?: Error;
+  startTurnError?: Error;
+  controllerLive = true;
+  accountProjection: CodexAccountProjection = {
+    signedIn: true,
+    accountId: "claude-account",
+    organizationId: "claude-organization",
+    email: "claude@example.com",
+  };
+  projection: CodexSessionProjection = {
+    providerThreadId: "personal-claude-thread",
+    title: "Personal Claude session",
+    status: "idle",
+    providerUpdatedAt: personalAdoptionNow - 1_000,
+  };
+
+  constructor(
+    readonly configHome: "isolated" | "personal",
+    identity: ClaudeProcessIdentity,
+  ) {
+    this.processIdentity = identity;
+  }
+
+  pinnedVersion(): string { return CLAUDE_PIN; }
+
+  async readAccount(): Promise<CodexAccountProjection> {
+    return this.accountProjection;
+  }
+
+  async claimSession(
+    input: Parameters<ClaudeRuntimePort["claimSession"]>[0],
+  ): ReturnType<ClaudeRuntimePort["claimSession"]> {
+    this.calls.push("claim");
+    this.claimRequests.push(input);
+    this.controllerLive = true;
+    if (this.processIdentityOnClaim !== undefined) {
+      this.processIdentity = this.processIdentityOnClaim;
+      delete this.processIdentityOnClaim;
+    }
+    if (this.observationConnectionIdOnClaim !== undefined) {
+      this.observationConnectionId = this.observationConnectionIdOnClaim;
+      delete this.observationConnectionIdOnClaim;
+    }
+    await this.beforeClaimSessionAdmission?.(input);
+    if (this.claimSessionError !== undefined) throw this.claimSessionError;
+    await input.admitProcessIdentity?.(this.processIdentity);
+    this.projection = {
+      ...this.projection,
+      providerThreadId: input.providerThreadId,
+      projectRoot: input.projectRoot,
+      status: "idle",
+      title: this.claimProjectionTitle ?? input.title,
+    };
+    delete (this.projection as { activeTurnId?: string }).activeTurnId;
+    return {
+      ...this.projection,
+      effectiveRuntimeProfile: claudeRuntimeProfile(input.authority, this.configHome),
+    };
+  }
+
+  async readSessionProcessIdentity(
+    input: Parameters<ClaudeRuntimePort["readSessionProcessIdentity"]>[0],
+  ): ReturnType<ClaudeRuntimePort["readSessionProcessIdentity"]> {
+    this.calls.push("identity");
+    this.identityRequests.push(input);
+    const error = this.readIdentityErrorOnce;
+    delete this.readIdentityErrorOnce;
+    if (error !== undefined) throw error;
+    return this.processIdentity;
+  }
+
+  async reviewSessionStart(
+    input: Parameters<ClaudeRuntimePort["reviewSessionStart"]>[0],
+  ): Promise<ClaudeRuntimeStartReview> {
+    this.calls.push("review-session");
+    return {
+      reviewId: crypto.randomUUID(),
+      kind: "session_start",
+      effectiveRuntimeProfile: claudeRuntimeProfile(input.authority, this.configHome),
+    };
+  }
+
+  async startSession(
+    input: Parameters<ClaudeRuntimePort["startSession"]>[0],
+  ): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveClaudeRuntimeProfile }> {
+    this.calls.push("start-session");
+    this.startSessionRequests.push(input);
+    this.controllerLive = true;
+    if (input.providerThreadId !== undefined) {
+      this.projection = { ...this.projection, providerThreadId: input.providerThreadId };
+    }
+    await this.beforeStartSessionAdmission?.(input);
+    if (this.startSessionError !== undefined) throw this.startSessionError;
+    await input.admitProcessIdentity?.(this.processIdentity);
+    return { ...this.projection, effectiveRuntimeProfile: input.review.effectiveRuntimeProfile };
+  }
+
+  async observeSession(
+    input: Parameters<ClaudeRuntimePort["observeSession"]>[0],
+  ): Promise<CodexSessionObservation> {
+    this.calls.push("observe");
+    this.observeRequests.push(input);
+    if (this.disconnectOnObserveRequest === this.observeRequests.length) {
+      this.controllerLive = false;
+      throw new ClaudeSessionObservationError();
+    }
+    if (!this.controllerLive) throw new ClaudeSessionObservationError();
+    if (this.pauseOnObserveRequest === this.observeRequests.length) {
+      this.observePauseStarted?.();
+      if (this.observePause !== undefined) await this.observePause;
+    }
+    const error = this.observeErrorOnce;
+    delete this.observeErrorOnce;
+    if (error !== undefined) throw error;
+    return {
+      connectionId: this.observationConnectionId,
+      projection: { ...this.projection, providerThreadId: input.providerThreadId },
+      resumed: true,
+    };
+  }
+
+  async readSession(
+    input: Parameters<ClaudeRuntimePort["readSession"]>[0],
+  ): Promise<CodexSessionProjection> {
+    this.calls.push("read");
+    return { ...this.projection, providerThreadId: input.providerThreadId };
+  }
+
+  async endSession(
+    input: Parameters<ClaudeRuntimePort["endSession"]>[0],
+  ): Promise<void> {
+    this.calls.push("end");
+    this.endRequests.push(input);
+    this.endedProcessIdentities.push(this.processIdentity);
+    await this.beforeEndSessionReturn?.();
+    this.controllerLive = false;
+  }
+
+  async reviewTurnStart(
+    input: Parameters<ClaudeRuntimePort["reviewTurnStart"]>[0],
+  ): Promise<ClaudeRuntimeStartReview> {
+    this.calls.push("review-turn");
+    return {
+      reviewId: crypto.randomUUID(),
+      kind: "turn_start",
+      effectiveRuntimeProfile: claudeRuntimeProfile(input.authority, this.configHome),
+    };
+  }
+
+  async startTurn(
+    input: Parameters<ClaudeRuntimePort["startTurn"]>[0],
+  ): Promise<{
+    turnId: string;
+    status: "completed";
+    effectiveRuntimeProfile: EffectiveClaudeRuntimeProfile;
+  }> {
+    this.calls.push("send");
+    this.turnRequests.push(input);
+    const turnId = `claude-turn-${String(this.turnRequests.length)}`;
+    this.projection = {
+      ...this.projection,
+      status: "idle",
+      providerUpdatedAt: (this.projection.providerUpdatedAt ?? 0) + 1,
+      messages: [
+        ...(this.projection.messages ?? []),
+        {
+          role: "user",
+          text: input.message,
+          turnId,
+          clientId: input.clientMessageId,
+        },
+      ],
+    };
+    if (this.startTurnError !== undefined) throw this.startTurnError;
+    return {
+      turnId,
+      status: "completed",
+      effectiveRuntimeProfile: input.review.effectiveRuntimeProfile,
+    };
+  }
+
+  async steer(): Promise<void> { this.calls.push("steer"); }
+  async interrupt(): Promise<void> { this.calls.push("interrupt"); }
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+    if (this.closeError !== undefined) throw this.closeError;
+  }
+
+  #unsupported(): never {
+    throw new Error("This fake does not drive that Claude capability.");
+  }
+
+  interactionAuthority(
+    providerThreadId: string,
+    requestId: string,
+  ): ProviderInteractionAuthority {
+    const authority = this.claimRequests.at(-1)?.authority;
+    if (authority === undefined) return this.#unsupported();
+    return {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+      connectionId: this.observationConnectionId,
+      requestId: { type: "string", value: requestId },
+      method: "claude/control_request/can_use_tool",
+      requestDigest: createHash("sha256").update(requestId).digest("hex"),
+      threadId: providerThreadId,
+      turnId: "claude-turn-approval",
+      itemId: "claude-item-approval",
+      approvalId: null,
+    };
+  }
+  inspectInteractionAuthority(): Promise<never> { return Promise.reject(this.#unsupported()); }
+  async validateInteractionResolution(
+    input: Parameters<ClaudeRuntimePort["validateInteractionResolution"]>[0],
+  ): Promise<{ responseDigest: string }> {
+    this.validatedInteractions.push(input);
+    return {
+      responseDigest: createHash("sha256")
+        .update(JSON.stringify(input.resolution))
+        .digest("hex"),
+    };
+  }
+  async resolveInteraction(
+    input: Parameters<ClaudeRuntimePort["resolveInteraction"]>[0],
+  ): Promise<{ responseWritten: true }> {
+    this.resolvedInteractions.push(input);
+    return { responseWritten: true };
+  }
+  validateInteractionTimeout(): Promise<never> { return Promise.reject(this.#unsupported()); }
+  timeoutInteraction(): Promise<never> { return Promise.reject(this.#unsupported()); }
 }
 
 class FakeDaemonAuthority {
@@ -700,6 +1068,14 @@ async function fixture(
     gatewayKeys?: GatewayKeyPort;
     proseResponder?: ProseResponder;
   }> = {},
+  adoption: Readonly<{
+    managedClaude?: ClaudeRuntimePort;
+    personalCodex?: CodexRuntimePort;
+    personalClaude?: ClaudeRuntimePort;
+    personalDiscovery?: PersonalSessionDiscoveryPort;
+    personalCodexHome?: string;
+    claudeProcessLiveness?: ClaudeProcessLivenessProbe;
+  }> = {},
 ): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
   serviceRoots.push(home);
@@ -715,7 +1091,240 @@ async function fixture(
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), ...(adoption.managedClaude === undefined ? {} : { claude: adoption.managedClaude }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), ...(adoption.personalCodex === undefined ? {} : { personalCodex: adoption.personalCodex }), ...(adoption.personalClaude === undefined ? {} : { personalClaude: adoption.personalClaude }), ...(adoption.personalDiscovery === undefined ? {} : { personalDiscovery: adoption.personalDiscovery }), ...(adoption.personalCodexHome === undefined ? {} : { personalCodexHome: adoption.personalCodexHome }), ...(adoption.claudeProcessLiveness === undefined ? {} : { claudeProcessLiveness: adoption.claudeProcessLiveness }), now, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+}
+
+const personalAdoptionNow = 1_900_000_000_000;
+const personalCodexHome = join(privatePathRoot, "personal-codex-home");
+
+class FakePersonalSessionDiscovery implements PersonalSessionDiscoveryPort {
+  candidates: readonly DiscoveredPersonalSession[] = [];
+  readonly requests: Array<
+    Parameters<PersonalSessionDiscoveryPort["discover"]>[0]
+  > = [];
+
+  discover(
+    input: Parameters<PersonalSessionDiscoveryPort["discover"]>[0],
+  ): Promise<readonly DiscoveredPersonalSession[]> {
+    input.signal?.throwIfAborted();
+    this.requests.push(input);
+    return Promise.resolve(
+      this.candidates
+        .filter((candidate) => candidate.provider === input.provider)
+        .slice(0, input.limit),
+    );
+  }
+}
+
+async function adoptedCodexFixture(
+  label: string,
+  providerThreadId: string,
+  factsMemory?: HraFactsMemoryLifecyclePort,
+) {
+  const personalCodex = new FakeCodex();
+  const discovery = new FakePersonalSessionDiscovery();
+  const value = await fixture(
+    undefined,
+    new FakeCloud(),
+    () => undefined,
+    () => personalAdoptionNow,
+    factsMemory,
+    {},
+    {
+      personalCodex,
+      personalCodexHome,
+      personalDiscovery: discovery,
+    },
+  );
+  const added = await value.service.execute(
+    { kind: "account.add", label },
+    { signal },
+  ) as { account: { id: `acct_${string}` } };
+  await value.service.execute(
+    { kind: "account.login", account: added.account.id, deviceCode: false },
+    { signal },
+  );
+  await value.service.execute(
+    { kind: "project.add", label: `${label} project`, path: value.documents },
+    { signal },
+  );
+  personalCodex.readProjection = {
+    providerThreadId,
+    title: `${label} personal thread`,
+    status: "idle",
+    projectRoot: value.documents,
+    providerUpdatedAt: personalAdoptionNow - 11 * 60_000,
+    messages: [{ role: "user", text: "Started outside HRA" }],
+  };
+  discovery.candidates = [{
+    provider: "codex",
+    providerThreadId,
+    title: `${label} personal thread`,
+    projectRoot: value.documents,
+    updatedAt: personalAdoptionNow - 11 * 60_000,
+    liveness: "not_live",
+  }];
+  const enabled = await value.service.execute({
+    kind: "session.adoption.set",
+    provider: "codex",
+    enabled: true,
+    account: added.account.id,
+  }, { signal });
+  const session = value.store.findSessionByProviderThread(
+    added.account.id,
+    providerThreadId,
+  );
+  if (session === null) throw new Error("Expected the personal Codex session to be adopted.");
+  return {
+    ...value,
+    accountId: added.account.id,
+    discovery,
+    enabled,
+    personalCodex,
+    session,
+  };
+}
+
+async function adoptedClaudeFixture(
+  label: string,
+  providerThreadId: string,
+  configure?: (runtime: FakeClaude) => void,
+  title = `${label} personal thread`,
+) {
+  const personalIdentity: ClaudeProcessIdentity = {
+    pid: 63_001,
+    pidDomain: "darwin",
+    procStart: "personal-claude-initial",
+  };
+  const managedClaude = new FakeClaude("isolated", {
+    pid: 63_002,
+    pidDomain: "darwin",
+    procStart: "managed-claude",
+  });
+  const personalClaude = new FakeClaude("personal", personalIdentity);
+  const discovery = new FakePersonalSessionDiscovery();
+  const value = await fixture(
+    undefined,
+    new FakeCloud(),
+    () => undefined,
+    () => personalAdoptionNow,
+    undefined,
+    {},
+    {
+      managedClaude,
+      personalClaude,
+      personalCodexHome,
+      personalDiscovery: discovery,
+    },
+  );
+  const added = await value.service.execute(
+    { kind: "account.add", label },
+    { signal },
+  ) as { account: { id: `acct_${string}` } };
+  await value.service.execute(
+    { kind: "account.login", account: added.account.id, deviceCode: false },
+    { signal },
+  );
+  await value.service.execute(
+    { kind: "project.add", label: `${label} project`, path: value.documents },
+    { signal },
+  );
+  personalClaude.projection = {
+    providerThreadId,
+    title,
+    status: "idle",
+    projectRoot: value.documents,
+    providerUpdatedAt: personalAdoptionNow - 1_000,
+  };
+  configure?.(personalClaude);
+  discovery.candidates = [{
+    provider: "claude",
+    providerThreadId,
+    title,
+    projectRoot: value.documents,
+    updatedAt: personalAdoptionNow - 1_000,
+    liveness: "not_live",
+  }];
+  const enabled = await value.service.execute({
+    kind: "session.adoption.set",
+    provider: "claude",
+    enabled: true,
+    account: added.account.id,
+  }, { signal });
+  const session = value.store.findSessionByProviderThread(
+    added.account.id,
+    providerThreadId,
+  );
+  if (session === null) throw new Error("Expected the personal Claude session to be adopted.");
+  return {
+    ...value,
+    accountId: added.account.id,
+    discovery,
+    enabled,
+    managedClaude,
+    personalClaude,
+    personalIdentity,
+    session,
+  };
+}
+
+async function nativeClaudeFixture(
+  label: string,
+  providerThreadId: string,
+  identity: ClaudeProcessIdentity,
+  loginIdempotencyKey?: string,
+) {
+  const managedClaude = new FakeClaude("isolated", identity);
+  const value = await fixture(
+    undefined,
+    new FakeCloud(),
+    () => undefined,
+    () => personalAdoptionNow,
+    undefined,
+    {},
+    { managedClaude },
+  );
+  const added = await value.service.execute(
+    { kind: "account.add", label },
+    { signal },
+  ) as { account: { id: `acct_${string}` } };
+  await value.service.execute({
+    kind: "account.login",
+    account: added.account.id,
+    deviceCode: false,
+    ...(loginIdempotencyKey === undefined ? {} : { idempotencyKey: loginIdempotencyKey }),
+  }, { signal });
+  await value.service.execute({
+    kind: "project.add",
+    label: `${label} project`,
+    path: value.documents,
+  }, { signal });
+  managedClaude.projection = {
+    providerThreadId,
+    title: `${label} session`,
+    status: "idle",
+    projectRoot: value.documents,
+    providerUpdatedAt: personalAdoptionNow - 1_000,
+  };
+  const started = await value.service.execute({
+    kind: "session.start",
+    account: added.account.id,
+    provider: "claude",
+    preset: "fable-max",
+    fast: false,
+  }, { signal }) as { session: { id: `sess_${string}`; providerThreadId?: string } };
+  const reservedProviderThreadId = started.session.providerThreadId;
+  if (reservedProviderThreadId === undefined) {
+    throw new Error("Expected the native Claude session to receive a reserved provider identity.");
+  }
+  return {
+    ...value,
+    accountId: added.account.id,
+    identity,
+    managedClaude,
+    providerThreadId: reservedProviderThreadId,
+    session: value.store.requireSession(started.session.id),
+  };
 }
 
 async function createIdleSession(
@@ -785,9 +1394,10 @@ function seedUnsettledInteractionStates(
 
 async function seedResolvableInteraction(
   value: Awaited<ReturnType<typeof fixture>>,
-  sessionId: `sess_${string}`,
+  sessionId: SessionRecord["id"],
   requestId: string,
   timing?: Readonly<{ requestedAt: number; deadlineAt: number }>,
+  source: "managed" | "personal" = "managed",
 ): Promise<Readonly<{
   authority: ProfileAuthority;
   interaction: InteractionRecord;
@@ -795,14 +1405,14 @@ async function seedResolvableInteraction(
   const session = value.store.requireSession(sessionId);
   const profile = value.store.requireProfileById(session.profileId);
   if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-  const connectionId = crypto.randomUUID();
+  const connectionId = value.codex.observationConnectionId;
   const authority: ProfileAuthority = {
     id: profile.id,
     generation: profile.processGeneration,
     codexHome: "unused",
     desktopUserData: "unused",
   };
-  await value.service.observeCodexFact(authority, {
+  const fact: CodexFact = {
     type: "interactionRequested",
     connectionId,
     provider: {
@@ -828,7 +1438,12 @@ async function seedResolvableInteraction(
       availableDecisions: ["once", "decline", "cancel"],
     },
     ...(timing === undefined ? {} : timing),
-  });
+  };
+  if (source === "personal") {
+    await value.service.observePersonalCodexFact(authority, fact);
+  } else {
+    await value.service.observeCodexFact(authority, fact);
+  }
   const interaction = value.store.listInteractions({
     sessionId,
     pendingOnly: true,
@@ -864,6 +1479,3163 @@ const renderJson = (command: LocalCommand, data: unknown): string => {
   });
   return stdout;
 };
+
+describe("HraService personal-session adoption", () => {
+  const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
+    const startedAt = Date.now();
+    while (!predicate()) {
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error("Timed out waiting for adopted-session autorespond.");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+
+  test("persists a native Claude launch intent before admission and consumes it into exact custody", async () => {
+    const managedClaude = new FakeClaude("isolated", {
+      pid: 62_990,
+      pidDomain: "darwin",
+      procStart: "managed-claude-pre-admission",
+    });
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      { managedClaude },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Native Claude launch intent" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Native Claude launch intent project",
+      path: value.documents,
+    }, { signal });
+    let stagedProviderThreadId: string | undefined;
+    let stagedSessionId: string | undefined;
+    managedClaude.beforeStartSessionAdmission = (input) => {
+      stagedProviderThreadId = input.providerThreadId;
+      if (stagedProviderThreadId === undefined) {
+        throw new Error("Expected a reserved Claude provider identity.");
+      }
+      const intent = value.store.readClaudeProcessLaunchIntent({
+        providerThreadId: stagedProviderThreadId,
+        profileId: added.account.id,
+        runtimeScope: "managed",
+      });
+      if (intent?.sessionId === null || intent === null) {
+        throw new Error("Expected a session-bound Claude launch intent.");
+      }
+      stagedSessionId = intent.sessionId;
+      expect(intent.profileGeneration).toBe(
+        value.store.requireProfileById(added.account.id).processGeneration,
+      );
+      expect(value.store.readClaudeProcessAuthority({
+        providerThreadId: stagedProviderThreadId,
+        profileId: added.account.id,
+        runtimeScope: "managed",
+      })).toBeNull();
+    };
+
+    const started = await value.service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+    }, { signal }) as { session: { id: `sess_${string}`; providerThreadId?: string } };
+    if (stagedProviderThreadId === undefined || stagedSessionId === undefined) {
+      throw new Error("Expected the pre-admission hook to observe launch authority.");
+    }
+    expect(started.session).toMatchObject({
+      id: stagedSessionId,
+      providerThreadId: stagedProviderThreadId,
+    });
+    expect(value.store.readClaudeProcessLaunchIntent({
+      providerThreadId: stagedProviderThreadId,
+      profileId: added.account.id,
+      runtimeScope: "managed",
+    })).toBeNull();
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: stagedProviderThreadId,
+      profileId: added.account.id,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity: managedClaude.processIdentity,
+      sessionId: started.session.id,
+      state: "bound",
+    });
+    await value.service.close();
+  });
+
+  test("retains native Claude launch authority and suppresses replay when child exit is unproven", async () => {
+    const managedClaude = new FakeClaude("isolated", {
+      pid: 62_991,
+      pidDomain: "darwin",
+      procStart: "managed-claude-unproven-start",
+    });
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      { managedClaude },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Native Claude unproven launch" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Native Claude unproven launch project",
+      path: value.documents,
+    }, { signal });
+    managedClaude.startSessionError = new ClaudeProcessExitUnprovenError();
+    const idempotencyKey = crypto.randomUUID();
+
+    const failure = await value.service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+      idempotencyKey,
+    }, { signal }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(CommandFailure);
+    expect((failure as CommandFailure).code).toBe("RECOVERY_REQUIRED");
+    expect(managedClaude.startSessionRequests).toHaveLength(1);
+    const providerThreadId = managedClaude.startSessionRequests[0]?.providerThreadId;
+    if (providerThreadId === undefined) throw new Error("Expected a reserved Claude identity.");
+    const intent = value.store.readClaudeProcessLaunchIntent({
+      providerThreadId,
+      profileId: added.account.id,
+      runtimeScope: "managed",
+    });
+    if (intent?.sessionId === null || intent === null) {
+      throw new Error("Expected retained session-bound launch authority.");
+    }
+    expect(value.store.requireSession(intent.sessionId).state).toBe("recovery_required");
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: added.account.id,
+      runtimeScope: "managed",
+    })).toBeNull();
+
+    const replay = await value.service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+      idempotencyKey,
+    }, { signal }).catch((error: unknown) => error);
+    expect(replay).toBeInstanceOf(CommandFailure);
+    expect((replay as CommandFailure).code).toBe("RECOVERY_REQUIRED");
+    expect(managedClaude.startSessionRequests).toHaveLength(1);
+    await value.service.close();
+  });
+
+  test("retains adopted Claude launch authority and never reclaims after an unproven child exit", async () => {
+    const managedClaude = new FakeClaude("isolated", {
+      pid: 62_993,
+      pidDomain: "darwin",
+      procStart: "managed-claude-adoption-control",
+    });
+    const personalClaude = new FakeClaude("personal", {
+      pid: 62_994,
+      pidDomain: "darwin",
+      procStart: "personal-claude-unproven-adoption",
+    });
+    personalClaude.claimSessionError = new ClaudeProcessExitUnprovenError();
+    const discovery = new FakePersonalSessionDiscovery();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      {
+        managedClaude,
+        personalClaude,
+        personalCodexHome,
+        personalDiscovery: discovery,
+      },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Adopted Claude unproven launch" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Adopted Claude unproven launch project",
+      path: value.documents,
+    }, { signal });
+    const providerThreadId = "personal-claude-unproven-adoption";
+    discovery.candidates = [{
+      provider: "claude",
+      providerThreadId,
+      title: "Personal Claude unproven adoption",
+      projectRoot: value.documents,
+      updatedAt: personalAdoptionNow - 1_000,
+      liveness: "not_live",
+    }];
+
+    await expect(value.service.execute({
+      kind: "session.adoption.set",
+      provider: "claude",
+      enabled: true,
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      discovery: { state: "ready", adopted: 0, failed: 1 },
+      providers: [{ pending: 1 }],
+    });
+    expect(personalClaude.claimRequests).toHaveLength(1);
+    expect(value.store.findSessionByProviderThread(added.account.id, providerThreadId))
+      .toBeNull();
+    expect(value.store.listSessionAdoptionCandidates({ provider: "claude" })[0])
+      .toMatchObject({ providerThreadId, status: "claiming" });
+    expect(value.store.readClaudeProcessLaunchIntent({
+      providerThreadId,
+      profileId: added.account.id,
+      runtimeScope: "personal",
+    })).toMatchObject({
+      profileId: added.account.id,
+      runtimeScope: "personal",
+      sessionId: null,
+    });
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: added.account.id,
+      runtimeScope: "personal",
+    })).toBeNull();
+
+    await expect(value.service.execute({
+      kind: "session.adoption.discover",
+      provider: "claude",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ adopted: 0, pending: 1 }],
+    });
+    expect(personalClaude.claimRequests).toHaveLength(1);
+    expect(value.store.readClaudeProcessLaunchIntent({
+      providerThreadId,
+      profileId: added.account.id,
+      runtimeScope: "personal",
+    })).not.toBeNull();
+    await value.service.close();
+  });
+
+  test("quarantines Claude resume when the replacement child exit is unproven", async () => {
+    const value = await nativeClaudeFixture(
+      "Native Claude unproven resume",
+      "native-claude-unproven-resume",
+      {
+        pid: 62_992,
+        pidDomain: "darwin",
+        procStart: "managed-claude-unproven-resume",
+      },
+    );
+    const failedObservation = value.managedClaude.observeRequests.length + 1;
+    value.managedClaude.disconnectOnObserveRequest = failedObservation;
+    value.managedClaude.claimSessionError = new ClaudeProcessExitUnprovenError();
+
+    const failure = await value.service.execute({
+      kind: "session.status",
+      session: value.session.id,
+    }, { signal }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(CommandFailure);
+    expect((failure as CommandFailure).code).toBe("RECOVERY_REQUIRED");
+    expect(value.managedClaude.claimRequests).toHaveLength(1);
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    expect(value.store.readClaudeProcessLaunchIntent({
+      providerThreadId: value.providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      sessionId: value.session.id,
+    });
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: value.providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })?.state).toBe("released");
+
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: value.session.id,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: { state: "recovery_required" },
+    });
+    expect(value.managedClaude.claimRequests).toHaveLength(1);
+    await value.service.close();
+  });
+
+  test("keeps native Claude config-home provenance private across start, show, and send", async () => {
+    const managedClaude = new FakeClaude("isolated", {
+      pid: 63_000,
+      pidDomain: "darwin",
+      procStart: "managed-claude-public-profile",
+    });
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      { managedClaude },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Native Claude profile" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Native Claude project",
+      path: value.documents,
+    }, { signal });
+
+    const started = await value.service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+    }, { signal }) as {
+      effectiveRuntimeProfile: Record<string, unknown>;
+      session: { id: `sess_${string}` };
+    };
+    expect(started.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+    expect(started.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
+    expect(value.store.latestSessionRuntimeProfile(started.session.id))
+      .toMatchObject({ profile: { configHome: "isolated" } });
+
+    const shown = await value.service.execute({
+      kind: "session.show",
+      session: started.session.id,
+      detail: false,
+    }, { signal }) as {
+      effectiveRuntimeProfile: Record<string, unknown>;
+    };
+    expect(shown.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+    expect(shown.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
+
+    const sent = await value.service.execute({
+      kind: "session.send",
+      session: started.session.id,
+      message: "Continue native Claude work",
+    }, { signal }) as {
+      effectiveRuntimeProfile: Record<string, unknown>;
+      turnId: string;
+    };
+    expect(sent.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+    expect(sent.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
+    expect(value.store.runtimeProfileForTurn(started.session.id, sent.turnId))
+      .toMatchObject({ configHome: "isolated" });
+    await value.service.close();
+  });
+
+  test("releases and resumes a native Claude child lost at its first post-commit observation", async () => {
+    const initialIdentity: ClaudeProcessIdentity = {
+      pid: 63_010,
+      pidDomain: "darwin",
+      procStart: "native-claude-observation-gap-initial",
+    };
+    const replacementIdentity: ClaudeProcessIdentity = {
+      pid: 63_011,
+      pidDomain: "darwin",
+      procStart: "native-claude-observation-gap-replacement",
+    };
+    const replacementConnectionId = "30000000-0000-4000-8000-0000000000c2";
+    const managedClaude = new FakeClaude("isolated", initialIdentity);
+    managedClaude.disconnectOnObserveRequest = 1;
+    managedClaude.processIdentityOnClaim = replacementIdentity;
+    managedClaude.observationConnectionIdOnClaim = replacementConnectionId;
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      { managedClaude },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Native Claude observation gap" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Native Claude observation gap project",
+      path: value.documents,
+    }, { signal });
+    managedClaude.projection = {
+      providerThreadId: "native-claude-observation-gap",
+      title: "Native Claude observation gap",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 1_000,
+    };
+
+    const started = await value.service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+    }, { signal }) as { session: { id: `sess_${string}`; providerThreadId?: string } };
+
+    const providerThreadId = started.session.providerThreadId;
+    if (providerThreadId === undefined) throw new Error("Expected a bound native Claude session.");
+    expect(providerThreadId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(managedClaude.endRequests).toHaveLength(1);
+    expect(managedClaude.endRequests[0]?.providerThreadId)
+      .toBe(providerThreadId);
+    expect(managedClaude.endedProcessIdentities).toEqual([initialIdentity]);
+    expect(managedClaude.claimRequests).toHaveLength(1);
+    expect(managedClaude.claimRequests[0]).toMatchObject({
+      providerThreadId,
+      sourceLiveness: "not_live",
+      title: "Untitled session",
+    });
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: added.account.id,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity: replacementIdentity,
+      sessionId: started.session.id,
+      state: "bound",
+    });
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: started.session.id,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: {
+        connectionId: replacementConnectionId,
+        state: "live",
+      },
+    });
+    expect(managedClaude.endRequests).toHaveLength(1);
+    expect(managedClaude.claimRequests).toHaveLength(1);
+    await value.service.close();
+  });
+
+  test("retains an adopted Claude replacement when its old disconnect arrives before connection remapping", async () => {
+    const value = await adoptedClaudeFixture(
+      "Adopted Claude delayed disconnect",
+      "personal-claude-delayed-disconnect",
+    );
+    await value.service.settled();
+    const initialIdentity = value.personalClaude.processIdentity;
+    const replacementIdentity: ClaudeProcessIdentity = {
+      pid: 63_013,
+      pidDomain: "darwin",
+      procStart: "personal-claude-delayed-disconnect-replacement",
+    };
+    const initialConnectionId = value.personalClaude.observationConnectionId;
+    const replacementConnectionId = "30000000-0000-4000-8000-0000000000c4";
+
+    let markReplacementObservationStarted!: () => void;
+    const replacementObservationStarted = new Promise<void>((resolve) => {
+      markReplacementObservationStarted = resolve;
+    });
+    let releaseReplacementObservation!: () => void;
+    const replacementObservationPause = new Promise<void>((resolve) => {
+      releaseReplacementObservation = resolve;
+    });
+    const claimsBeforeRecovery = value.personalClaude.claimRequests.length;
+    const failedObservationRequest = value.personalClaude.observeRequests.length + 1;
+    value.personalClaude.disconnectOnObserveRequest = failedObservationRequest;
+    value.personalClaude.processIdentityOnClaim = replacementIdentity;
+    value.personalClaude.observationConnectionIdOnClaim = replacementConnectionId;
+    value.personalClaude.pauseOnObserveRequest = failedObservationRequest + 1;
+    value.personalClaude.observePauseStarted = markReplacementObservationStarted;
+    value.personalClaude.observePause = replacementObservationPause;
+
+    const foregroundRecovery = value.service.execute({
+      kind: "session.status",
+      session: value.session.id,
+    }, { signal });
+    await replacementObservationStarted;
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: "personal-claude-delayed-disconnect",
+      profileId: value.accountId,
+      runtimeScope: "personal",
+    })).toMatchObject({
+      identity: replacementIdentity,
+      sessionId: value.session.id,
+      state: "bound",
+    });
+    expect(value.personalClaude.claimRequests).toHaveLength(claimsBeforeRecovery + 1);
+    const replacementAuthority = value.personalClaude.claimRequests.at(-1)?.authority;
+    if (replacementAuthority === undefined) {
+      throw new Error("Expected the replacement Claude claim authority.");
+    }
+    await value.service.observePersonalClaudeFact(replacementAuthority, {
+      type: "providerDisconnected",
+      connectionId: initialConnectionId,
+      providerThreadId: "personal-claude-delayed-disconnect",
+      reason: "process_exit",
+    });
+    expect(value.personalClaude.endRequests).toHaveLength(1);
+
+    releaseReplacementObservation();
+    await expect(foregroundRecovery).resolves.toMatchObject({
+      providerObservation: {
+        connectionId: replacementConnectionId,
+        state: "live",
+      },
+    });
+    await value.service.settled();
+    expect(value.personalClaude.observeRequests)
+      .toHaveLength(failedObservationRequest + 2);
+    expect(value.personalClaude.endRequests).toHaveLength(1);
+    expect(value.personalClaude.endedProcessIdentities).toEqual([initialIdentity]);
+    expect(value.personalClaude.claimRequests).toHaveLength(claimsBeforeRecovery + 1);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: "personal-claude-delayed-disconnect",
+      profileId: value.accountId,
+      runtimeScope: "personal",
+    })).toMatchObject({
+      identity: replacementIdentity,
+      sessionId: value.session.id,
+      state: "bound",
+    });
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id))
+      .toMatchObject({ state: "active" });
+
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: value.session.id,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: {
+        connectionId: replacementConnectionId,
+        state: "live",
+      },
+    });
+
+    await expect(value.service.execute({
+      kind: "session.send",
+      session: value.session.id,
+      message: "Continue on the replacement controller",
+      idempotencyKey: "00000000-0000-4000-8000-00000000c004",
+    }, { signal })).resolves.toMatchObject({
+      session: { id: value.session.id, state: "idle" },
+    });
+    expect(value.personalClaude.turnRequests).toHaveLength(1);
+    expect(value.managedClaude.turnRequests).toHaveLength(0);
+    await value.service.close();
+  });
+
+  test("holds account authority across a personal Codex adoption claim and managed disconnect", async () => {
+    const personalCodex = new FakeCodex();
+    const discovery = new FakePersonalSessionDiscovery();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      { personalCodex, personalCodexHome, personalDiscovery: discovery },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Codex adoption account lock" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Codex adoption account lock project",
+      path: value.documents,
+    }, { signal });
+
+    const providerThreadId = "personal-thread-account-lock";
+    personalCodex.readProjection = {
+      providerThreadId,
+      title: "Personal thread protected by the account lock",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 11 * 60_000,
+    };
+    discovery.candidates = [{
+      provider: "codex",
+      providerThreadId,
+      title: "Personal thread protected by the account lock",
+      projectRoot: value.documents,
+      updatedAt: personalAdoptionNow - 11 * 60_000,
+      liveness: "not_live",
+    }];
+
+    let markClaimStarted!: () => void;
+    let releaseClaim!: () => void;
+    const claimStarted = new Promise<void>((resolve) => {
+      markClaimStarted = resolve;
+    });
+    const claimGate = new Promise<void>((resolve) => {
+      releaseClaim = resolve;
+    });
+    personalCodex.beforeClaimSessionReturnOnce = async () => {
+      markClaimStarted();
+      await claimGate;
+    };
+
+    const adoption = value.service.execute({
+      kind: "session.adoption.set",
+      provider: "codex",
+      enabled: true,
+      account: added.account.id,
+    }, { signal });
+    await claimStarted;
+    const authority = personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected a paused personal Codex claim.");
+    const generationDuringClaim = value.store
+      .requireProfileById(added.account.id).processGeneration;
+    expect(authority.generation).toBe(generationDuringClaim);
+    expect(value.store.listSessionAdoptionCandidates({ provider: "codex" })[0])
+      .toMatchObject({ providerThreadId, status: "claiming" });
+
+    await value.service.observeCodexFact(authority, {
+      type: "providerDisconnected",
+      connectionId: value.codex.observationConnectionId,
+      reason: "process_exit",
+    });
+    const generationAfterDisconnectDuringClaim = value.store
+      .requireProfileById(added.account.id).processGeneration;
+    releaseClaim();
+    const adoptionResult = await adoption;
+    await value.service.settled();
+
+    expect(generationAfterDisconnectDuringClaim).toBe(generationDuringClaim);
+    expect(adoptionResult).toMatchObject({
+      discovery: { provider: "codex", state: "ready", adopted: 1, failed: 0 },
+    });
+
+    expect(value.store.requireProfileById(added.account.id).processGeneration)
+      .toBe(generationDuringClaim);
+    expect(value.store.listSessionAdoptionCandidates({ provider: "codex" })[0])
+      .toMatchObject({ providerThreadId, status: "adopted" });
+    const session = value.store.findSessionByProviderThread(added.account.id, providerThreadId);
+    if (session === null) throw new Error("Expected the claimed Codex thread to stay adopted.");
+    expect(session).toMatchObject({
+      profileId: added.account.id,
+      provider: "codex",
+      providerThreadId,
+      state: "idle",
+    });
+    expect(session.archivedAt).toBeUndefined();
+    expect(value.store.readSessionPersonalRuntimeBinding(session.id)).toMatchObject({
+      provider: "codex",
+      providerThreadId,
+      state: "active",
+    });
+    expect(personalCodex.calls.filter((call) => call === "end")).toHaveLength(0);
+  });
+
+  test("starts a causally fresh account read when a post-claim fence overlaps an older check", async () => {
+    const value = await adoptedCodexFixture(
+      "Fresh post-claim identity",
+      "personal-thread-before-fresh-post-claim",
+    );
+    const providerThreadId = "personal-thread-fresh-post-claim";
+    value.personalCodex.readProjection = {
+      providerThreadId,
+      title: "Fresh post-claim personal thread",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 11 * 60_000,
+    };
+    value.discovery.candidates = [{
+      provider: "codex",
+      providerThreadId,
+      title: "Fresh post-claim personal thread",
+      projectRoot: value.documents,
+      updatedAt: personalAdoptionNow - 11 * 60_000,
+      liveness: "not_live",
+    }];
+    const seeded = await seedResolvableInteraction(
+      value,
+      value.session.id,
+      "fresh-post-claim-overlap",
+      undefined,
+      "personal",
+    );
+
+    let releaseClaim!: () => void;
+    let claimReturned!: () => void;
+    const claimGate = new Promise<void>((resolve) => {
+      releaseClaim = resolve;
+    });
+    const claimApplied = new Promise<void>((resolve) => {
+      claimReturned = resolve;
+    });
+    value.personalCodex.beforeClaimSessionReturnOnce = async () => {
+      claimReturned();
+      await claimGate;
+    };
+    value.personalCodex.validateInteractionResolutionError = new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      "Stop after the account precheck.",
+    );
+    // Admit an older account read before discovery takes the account tail.
+    // Once it finishes, discovery must perform its own pre-claim read and a
+    // distinct causally fresh post-claim read rather than reusing either one.
+    let releaseOlderRead!: () => void;
+    let olderReadStarted!: () => void;
+    const olderReadGate = new Promise<void>((resolve) => {
+      releaseOlderRead = resolve;
+    });
+    const olderReadAdmitted = new Promise<void>((resolve) => {
+      olderReadStarted = resolve;
+    });
+    value.personalCodex.beforeReadAccountReturn = async () => {
+      delete value.personalCodex.beforeReadAccountReturn;
+      olderReadStarted();
+      await olderReadGate;
+    };
+    const resolving = value.service.execute({
+      kind: "interaction.resolve",
+      interaction: seeded.interaction.publicId,
+      expectedRevision: seeded.interaction.revision,
+      resolution: { kind: "approval_decision", decision: "once" },
+    }, { signal });
+    await olderReadAdmitted;
+    const claimsBeforeDiscovery = value.personalCodex.claimRequests.length;
+    const discovery = value.service.discoverPersonalSessions("codex", signal);
+    await Bun.sleep(0);
+    expect(value.personalCodex.claimRequests).toHaveLength(claimsBeforeDiscovery);
+    releaseOlderRead();
+    await expect(resolving).rejects.toMatchObject({ code: "CONFLICT" });
+    const admission = await Promise.race([
+      claimApplied.then(() => ({ kind: "claim" as const })),
+      discovery.then(
+        (result) => ({ kind: "settled" as const, result }),
+        (error: unknown) => ({ error, kind: "failed" as const }),
+      ),
+    ]);
+    if (admission.kind !== "claim") {
+      throw new Error("Expected personal Codex discovery to pause inside the claim.", {
+        cause: admission.kind === "failed" ? admission.error : admission.result,
+      });
+    }
+    const claimAuthority = value.personalCodex.claimRequests.at(-1)?.authority;
+    if (claimAuthority === undefined) throw new Error("Expected a paused personal Codex claim.");
+    expect(claimAuthority).toMatchObject({
+      id: seeded.authority.id,
+      generation: seeded.authority.generation,
+    });
+    const readsBeforeSwap = value.personalCodex.calls
+      .filter((call) => call === "readAccount").length;
+
+    value.personalCodex.accountProjection = {
+      signedIn: true,
+      email: "replacement@example.com",
+      plan: "Plus",
+    };
+    releaseClaim();
+    await expect(discovery).resolves.toMatchObject({
+      providers: [{
+        adopted: 0,
+        failed: 1,
+        provider: "codex",
+        state: "ready",
+      }],
+    });
+    expect(value.personalCodex.calls.filter((call) => call === "readAccount").length)
+      .toBeGreaterThan(readsBeforeSwap);
+    expect(value.store.findSessionByProviderThread(value.accountId, providerThreadId))
+      .toBeNull();
+    expect(value.store.readSessionAdoptionPolicy("codex")).toMatchObject({
+      enabled: false,
+      profileId: null,
+    });
+    await value.service.settled();
+  });
+
+  test("completes personal Codex account revocation after the observer already retired its generation", async () => {
+    const value = await adoptedCodexFixture(
+      "Retired personal Codex account authority",
+      "personal-thread-retired-account-authority",
+    );
+    const authority = value.personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal Codex claim authority.");
+    const readsBeforeMismatch = value.personalCodex.calls
+      .filter((call) => call === "readAccount").length;
+    let releaseStarted!: () => void;
+    const releaseAdmission = new Promise<void>((resolve) => {
+      releaseStarted = resolve;
+    });
+    let finishRelease!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    value.personalCodex.beforeReleaseOwnedAuthorityReturn = async () => {
+      releaseStarted();
+      await releaseGate;
+    };
+
+    // CodexRuntimeAdapter retires and removes the exact client before it
+    // delivers the observer callback. Ordinary reads at this generation are
+    // therefore impossible, while releaseOwnedAuthority can still await its
+    // retained close task without launching anything.
+    value.personalCodex.retireAuthority(authority);
+    await expect(value.personalCodex.readAccount({ authority, signal }))
+      .rejects.toThrow("AUTHORITY_STALE");
+
+    const replacementB: CodexAccountProjection = {
+      signedIn: true,
+      email: "replacement-retired-b@example.com",
+      plan: "Plus",
+    };
+    await expect(value.service.observePersonalCodexAccount(authority, replacementB))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await releaseAdmission;
+
+    const replacementC: CodexAccountProjection = {
+      signedIn: true,
+      email: "replacement-retired-c@example.com",
+      plan: "Plus",
+    };
+    await expect(value.service.observePersonalCodexAccount(authority, replacementC))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    finishRelease();
+    await value.service.settled();
+
+    expect(value.personalCodex.calls.filter((call) => call === "readAccount"))
+      .toHaveLength(readsBeforeMismatch + 1);
+    expect(value.personalCodex.releasedAuthorities).toEqual([authority]);
+    expect(value.store.readProviderRuntimeAccountRevocation({
+      profileId: value.accountId,
+      provider: "codex",
+      runtimeScope: "personal",
+    })).toMatchObject({
+      currentAccountKey: codexProviderAccountKey("replacement-retired-c@example.com"),
+      profileGeneration: authority.generation,
+      state: "completed",
+    });
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id, true))
+      .toMatchObject({ state: "detached" });
+    expect(value.store.requireSession(value.session.id).archivedAt).toBeUndefined();
+    await expect(value.service.execute({
+      kind: "session.adoption.status",
+      provider: "codex",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ provider: "codex", restartRequired: true }],
+    });
+  });
+
+  test("adopts a recent registered-project Codex thread as an ordinary session and routes its turns to personal custody", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted routing",
+      "personal-thread-routing",
+    );
+
+    expect(value.enabled).toMatchObject({
+      providers: [{ provider: "codex", enabled: true, adopted: 1 }],
+      discovery: { provider: "codex", state: "ready", discovered: 1, adopted: 1 },
+    });
+    expect(value.personalCodex.claimRequests).toHaveLength(1);
+    expect(value.personalCodex.claimRequests[0]).toMatchObject({
+      authority: {
+        id: value.accountId,
+        codexHome: personalCodexHome,
+      },
+      providerThreadId: "personal-thread-routing",
+      projectRoot: value.documents,
+      preset: "ultra",
+      fast: false,
+    });
+    expect(value.store.latestSessionRuntimeProfile(value.session.id)).toMatchObject({
+      sourceKind: "session_start",
+      profile: {
+        preset: "ultra",
+        approvalPolicy: "on-request",
+        reviewMode: "auto_review",
+        permissionProfile: ":workspace",
+      },
+    });
+    expect(value.store.isConversationAutomationEnabled(
+      value.session.id,
+      "personal-thread-routing",
+    )).toBe(true);
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id)).toMatchObject({
+      provider: "codex",
+      providerThreadId: "personal-thread-routing",
+      state: "active",
+    });
+
+    const listed = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      limit: 100,
+    }, { signal }) as { sessions: readonly Record<string, unknown>[] };
+    const publicSession = listed.sessions.find((session) => session.id === value.session.id);
+    expect(publicSession).toMatchObject({
+      id: value.session.id,
+      profileId: value.accountId,
+      provider: "codex",
+      providerThreadId: "personal-thread-routing",
+      state: "idle",
+    });
+    expect(publicSession).not.toHaveProperty("origin");
+    expect(publicSession).not.toHaveProperty("adopted");
+    expect(publicSession).not.toHaveProperty("observationTier");
+
+    const accountListed = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: value.accountId,
+      limit: 1,
+    }, { signal }) as {
+      sessions: readonly { id: string; providerThreadId?: string }[];
+      nextCursor: string | null;
+    };
+    expect(accountListed.sessions).toEqual([expect.objectContaining({
+      id: value.session.id,
+      providerThreadId: "personal-thread-routing",
+    })]);
+    expect(accountListed.nextCursor).not.toBeNull();
+
+    // A managed projection may expose the same opaque provider thread id. The
+    // source/session identity must keep this row from being emitted twice.
+    value.codex.listedProjections = [{
+      providerThreadId: "personal-thread-routing",
+      title: "Managed collision",
+      status: "active",
+      activeTurnId: "managed-collision-turn",
+      providerUpdatedAt: personalAdoptionNow + 1_000,
+    }];
+    const collisionListed = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: value.accountId,
+      limit: 2,
+    }, { signal }) as { sessions: readonly { id: string }[]; nextCursor: string | null };
+    expect(collisionListed.sessions.map((session) => session.id)).toEqual([value.session.id]);
+    expect(collisionListed.nextCursor).not.toBeNull();
+    await expect(value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: value.accountId,
+      limit: 2,
+      cursor: collisionListed.nextCursor ?? undefined,
+    }, { signal })).resolves.toMatchObject({ sessions: [], nextCursor: null });
+    expect(value.store.requireSession(value.session.id)).toMatchObject({
+      title: "Adopted routing personal thread",
+      state: "idle",
+    });
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id))
+      .toMatchObject({ state: "active" });
+
+    const foreign = await value.service.execute(
+      { kind: "account.add", label: "Foreign collision account" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: foreign.account.id,
+      deviceCode: false,
+    }, { signal });
+    const foreignCollision = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: foreign.account.id,
+      limit: 2,
+    }, { signal }) as { sessions: readonly { id: string }[] };
+    expect(foreignCollision.sessions).toEqual([]);
+    expect(value.store.findSessionByProviderThread(
+      foreign.account.id,
+      "personal-thread-routing",
+    )).toBeNull();
+    expect(value.store.requireSession(value.session.id)).toMatchObject({
+      profileId: value.accountId,
+      title: "Adopted routing personal thread",
+      state: "idle",
+    });
+
+    const nativeSendsBefore = value.codex.calls.filter((call) => call === "send").length;
+    const personalSendsBefore = value.personalCodex.calls
+      .filter((call) => call === "send").length;
+    await expect(value.service.execute({
+      kind: "session.send",
+      session: value.session.id,
+      message: "Continue under HRA",
+      idempotencyKey: "00000000-0000-4000-8000-00000000a001",
+    }, { signal })).resolves.toMatchObject({
+      session: { id: value.session.id, state: "active" },
+    });
+    expect(value.personalCodex.calls.filter((call) => call === "send")).toHaveLength(
+      personalSendsBefore + 1,
+    );
+    expect(value.codex.calls.filter((call) => call === "send")).toHaveLength(
+      nativeSendsBefore,
+    );
+  });
+
+  test("releases a Codex claim whose fresh projection revoked the quiet-window inference", async () => {
+    const personalCodex = new FakeCodex();
+    const discovery = new FakePersonalSessionDiscovery();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      { personalCodex, personalCodexHome, personalDiscovery: discovery },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Codex liveness race" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Codex liveness race project",
+      path: value.documents,
+    }, { signal });
+    const providerThreadId = "personal-thread-liveness-race";
+    personalCodex.readProjection = {
+      providerThreadId,
+      title: "Freshly active elsewhere",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 1_000,
+    };
+    discovery.candidates = [{
+      provider: "codex",
+      providerThreadId,
+      title: "Previously quiet",
+      projectRoot: value.documents,
+      updatedAt: personalAdoptionNow - 11 * 60_000,
+      liveness: "not_live",
+    }];
+
+    await expect(value.service.execute({
+      kind: "session.adoption.set",
+      provider: "codex",
+      enabled: true,
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      discovery: { adopted: 0, failed: 1 },
+    });
+    expect(personalCodex.claimRequests).toHaveLength(1);
+    expect(personalCodex.calls.filter((call) => call === "end")).toHaveLength(1);
+    expect(value.store.findSessionByProviderThread(added.account.id, providerThreadId)).toBeNull();
+    expect(value.store.listSessionAdoptionCandidates({ provider: "codex" })[0])
+      .toMatchObject({ status: "pending" });
+  });
+
+  test("paginates native and adopted sessions together before unknown provider discovery", async () => {
+    const personalCodex = new FakeCodex();
+    const managedClaude = new FakeClaude("isolated", {
+      pid: 63_100,
+      pidDomain: "darwin",
+      procStart: "managed-claude-pagination",
+    });
+    const discovery = new FakePersonalSessionDiscovery();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      { managedClaude, personalCodex, personalCodexHome, personalDiscovery: discovery },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Adopted pagination" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    await value.service.execute(
+      { kind: "project.add", label: "Adopted pagination project", path: value.documents },
+      { signal },
+    );
+    managedClaude.projection = {
+      providerThreadId: "managed-claude-pagination",
+      title: "Managed Claude pagination",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 500,
+    };
+    const nativeClaude = await value.service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+    }, { signal }) as { session: { id: string; providerThreadId?: string } };
+    expect(nativeClaude.session.providerThreadId).toMatch(/^[0-9a-f-]{36}$/u);
+    personalCodex.readProjection = {
+      providerThreadId: "adopted-pagination-template",
+      title: "Adopted pagination thread",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 11 * 60_000,
+    };
+    discovery.candidates = [1, 2, 3].map((index) => ({
+      provider: "codex" as const,
+      providerThreadId: `adopted-pagination-${String(index)}`,
+      title: `Adopted pagination ${String(index)}`,
+      projectRoot: value.documents,
+      updatedAt: personalAdoptionNow - 11 * 60_000 - index,
+      liveness: "not_live" as const,
+    }));
+    await expect(value.service.execute({
+      kind: "session.adoption.set",
+      provider: "codex",
+      enabled: true,
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      discovery: { adopted: 3, failed: 0 },
+    });
+    const adoptedIds = new Set(value.store.listSessionPersonalRuntimeBindings()
+      .map((binding) => binding.sessionId));
+    expect(adoptedIds.size).toBe(3);
+    const expectedLocalIds = new Set([...adoptedIds, nativeClaude.session.id]);
+
+    value.codex.listedProjections = [{
+      providerThreadId: "managed-pagination-1",
+      title: "Managed first page",
+      status: "idle",
+    }];
+    value.codex.listedNextCursor = "provider-page-2";
+    const first = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 2,
+    }, { signal }) as {
+      sessions: readonly { id: string; providerThreadId?: string }[];
+      nextCursor: string | null;
+    };
+    expect(first.sessions).toHaveLength(2);
+    expect(first.sessions.every((session) => expectedLocalIds.has(session.id))).toBe(true);
+    expect(first.nextCursor).not.toBeNull();
+
+    const second = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 2,
+      cursor: first.nextCursor ?? undefined,
+    }, { signal }) as {
+      sessions: readonly { id: string; providerThreadId?: string }[];
+      nextCursor: string | null;
+    };
+    expect(second.sessions).toHaveLength(2);
+    expect(second.nextCursor).not.toBeNull();
+
+    const third = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 2,
+      cursor: second.nextCursor ?? undefined,
+    }, { signal }) as {
+      sessions: readonly { id: string; providerThreadId?: string }[];
+      nextCursor: string | null;
+    };
+    expect(third.sessions.map((session) => session.providerThreadId))
+      .toEqual(["managed-pagination-1"]);
+    expect(third.nextCursor).not.toBeNull();
+
+    const replayedThird = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 2,
+      cursor: second.nextCursor ?? undefined,
+    }, { signal }) as {
+      sessions: readonly { id: string; providerThreadId?: string }[];
+      nextCursor: string | null;
+    };
+    expect(replayedThird.sessions.map((session) => session.id))
+      .toEqual(third.sessions.map((session) => session.id));
+    expect(replayedThird.sessions.map((session) => session.providerThreadId))
+      .toEqual(["managed-pagination-1"]);
+    expect(replayedThird.nextCursor).toBe(third.nextCursor);
+
+    value.codex.listedProjections = [{
+      providerThreadId: "managed-pagination-2",
+      title: "Managed terminal page",
+      status: "idle",
+    }];
+    value.codex.listedNextCursor = null;
+    const fourth = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 2,
+      cursor: third.nextCursor ?? undefined,
+    }, { signal }) as {
+      sessions: readonly { id: string; providerThreadId?: string }[];
+      nextCursor: string | null;
+    };
+    expect(fourth.sessions.map((session) => session.providerThreadId))
+      .toEqual(["managed-pagination-2"]);
+    expect(fourth.nextCursor).toBeNull();
+    const replayedFourth = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 2,
+      cursor: third.nextCursor ?? undefined,
+    }, { signal }) as {
+      sessions: readonly { id: string; providerThreadId?: string }[];
+      nextCursor: string | null;
+    };
+    expect(replayedFourth.sessions.map((session) => session.id))
+      .toEqual(fourth.sessions.map((session) => session.id));
+    expect(replayedFourth.sessions.map((session) => session.providerThreadId))
+      .toEqual(["managed-pagination-2"]);
+    expect(replayedFourth.nextCursor).toBeNull();
+    const localSessions = [...first.sessions, ...second.sessions];
+    expect(new Set(localSessions.map((session) => session.id))).toEqual(expectedLocalIds);
+    const listedNativeClaude = localSessions.find(
+      (session) => session.id === nativeClaude.session.id,
+    );
+    expect(listedNativeClaude?.providerThreadId).toBe(nativeClaude.session.providerThreadId);
+    const allIds = [...first.sessions, ...second.sessions, ...third.sessions, ...fourth.sessions]
+      .map((session) => session.id);
+    expect(new Set(allIds).size).toBe(allIds.length);
+    expect(value.codex.sessionListRequests.map((request) => request.cursor ?? null))
+      .toEqual([null, null, "provider-page-2", "provider-page-2"]);
+  });
+
+  test("re-proves the managed account identity before importing a provider list page", async () => {
+    const value = await fixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "List identity race" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    value.codex.listedProjections = [{
+      providerThreadId: "replacement-account-thread",
+      title: "Must not cross the account fence",
+      status: "idle",
+    }];
+    value.codex.beforeListSessionsReturn = () => {
+      value.codex.accountProjection = {
+        signedIn: true,
+        email: "replacement-list-owner@example.com",
+        plan: "Plus",
+      };
+    };
+
+    await expect(value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 10,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.codex.sessionListRequests).toHaveLength(1);
+    expect(value.store.findSessionByProviderThread(
+      added.account.id,
+      "replacement-account-thread",
+    )).toBeNull();
+    await value.service.settled();
+  });
+
+  test("denies provider discovery for a signed-in runtime without an identifiable account", async () => {
+    const value = await fixture();
+    value.codex.loginResult = {
+      status: "signed_in",
+      account: { signedIn: true },
+    };
+    value.codex.accountProjection = { signedIn: true };
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Unidentifiable list account" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    value.codex.listedProjections = [{
+      providerThreadId: "unidentifiable-provider-thread",
+      title: "Must not import",
+      status: "idle",
+    }];
+
+    await expect(value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 10,
+    }, { signal })).rejects.toMatchObject({ code: "UNAVAILABLE" });
+    expect(value.codex.sessionListRequests).toEqual([]);
+    expect(value.store.findSessionByProviderThread(
+      added.account.id,
+      "unidentifiable-provider-thread",
+    )).toBeNull();
+  });
+
+  test("pages every authorized local session while provider listing is recovery-blocked", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud);
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Recovery local pagination" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const expectedIds = new Set(Array.from({ length: 3 }, (_, index) => {
+      const session = value.store.upsertProviderSession({
+        profileId: added.account.id,
+        provider: "codex",
+        providerThreadId: `recovery-local-${String(index)}`,
+        title: `Recovery local ${String(index)}`,
+        preset: "high",
+        fastEnabled: false,
+        state: "idle",
+        providerAccountKey: codexProviderAccountKey(),
+      });
+      return session.id;
+    }));
+    cloud.unsettledProjectionProfiles.add(added.account.id);
+    value.codex.listedProjections = [{
+      providerThreadId: "recovery-blocked-provider-thread",
+      title: "Must remain undiscovered",
+      status: "idle",
+    }];
+
+    const listedIds: string[] = [];
+    let cursor: string | undefined;
+    for (let pageIndex = 0; pageIndex < 3; pageIndex += 1) {
+      const page = await value.service.execute({
+        kind: "session.list",
+        archived: false,
+        account: added.account.id,
+        limit: 1,
+        ...(cursor === undefined ? {} : { cursor }),
+      }, { signal }) as {
+        sessions: readonly { id: string }[];
+        nextCursor: string | null;
+        recovery: { required: boolean };
+      };
+      expect(page.sessions).toHaveLength(1);
+      expect(page.recovery.required).toBe(true);
+      listedIds.push(page.sessions[0]?.id ?? "missing-session");
+      if (pageIndex < 2) {
+        expect(page.nextCursor).not.toBeNull();
+        cursor = page.nextCursor ?? undefined;
+      } else {
+        expect(page.nextCursor).toBeNull();
+      }
+    }
+
+    expect(new Set(listedIds)).toEqual(expectedIds);
+    expect(listedIds).toHaveLength(expectedIds.size);
+    expect(value.codex.sessionListRequests).toEqual([]);
+    expect(value.store.findSessionByProviderThread(
+      added.account.id,
+      "recovery-blocked-provider-thread",
+    )).toBeNull();
+  });
+
+  test("does not let a managed Codex projection mutate a native Claude collision", async () => {
+    const managedClaude = new FakeClaude("isolated", {
+      pid: 63_101,
+      pidDomain: "darwin",
+      procStart: "managed-claude-provider-collision",
+    });
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      { managedClaude },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Provider collision" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute(
+      { kind: "account.login", account: added.account.id, deviceCode: false },
+      { signal },
+    );
+    await value.service.execute(
+      { kind: "project.add", label: "Provider collision project", path: value.documents },
+      { signal },
+    );
+    managedClaude.projection = {
+      providerThreadId: "cross-provider-thread-collision",
+      title: "Native Claude collision",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 1_000,
+    };
+    const started = await value.service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "claude",
+      preset: "fable-max",
+      fast: false,
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const before = value.store.requireSession(started.session.id);
+    if (before.providerThreadId === undefined) throw new Error("Expected a bound Claude session.");
+
+    value.codex.listedProjections = [{
+      providerThreadId: before.providerThreadId,
+      title: "Codex must not overwrite this row",
+      status: "active",
+      activeTurnId: "wrong-provider-turn",
+      providerUpdatedAt: personalAdoptionNow + 1_000,
+    }];
+    value.codex.listedNextCursor = null;
+    const listed = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 10,
+    }, { signal }) as {
+      sessions: readonly { id: string; provider: string }[];
+      nextCursor: string | null;
+    };
+
+    const collisions = listed.sessions.filter((session) => session.id === started.session.id);
+    expect(collisions).toHaveLength(1);
+    expect(collisions[0]?.provider).toBe("claude");
+    expect(listed.nextCursor).not.toBeNull();
+    await expect(value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 10,
+      cursor: listed.nextCursor ?? undefined,
+    }, { signal })).resolves.toMatchObject({ sessions: [], nextCursor: null });
+    expect(value.store.requireSession(started.session.id)).toEqual(before);
+  });
+
+  test("adopts a retained Claude candidate after its live registry row disappears", async () => {
+    const sourceProcessIdentity: ClaudeProcessIdentity = {
+      pid: 62_901,
+      pidDomain: "darwin",
+      procStart: "retained-source-process",
+    };
+    const livenessChecks: Array<Parameters<ClaudeProcessLivenessProbe>[0]> = [];
+    const managedClaude = new FakeClaude("isolated", {
+      pid: 62_902,
+      pidDomain: "darwin",
+      procStart: "retained-managed-process",
+    });
+    const personalClaude = new FakeClaude("personal", {
+      pid: 62_903,
+      pidDomain: "darwin",
+      procStart: "retained-adopted-process",
+    });
+    const discovery = new FakePersonalSessionDiscovery();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      {
+        managedClaude,
+        personalClaude,
+        personalCodexHome,
+        personalDiscovery: discovery,
+        claudeProcessLiveness: (identity) => {
+          livenessChecks.push(identity);
+          return Promise.resolve("not_live");
+        },
+      },
+    );
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Retained Claude adoption" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const project = await value.service.execute({
+      kind: "project.add",
+      label: "Retained Claude project",
+      path: value.documents,
+    }, { signal }) as { project: { id: `proj_${string}` } };
+    personalClaude.projection = {
+      providerThreadId: "retained-claude-thread",
+      title: "Retained Claude thread",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 1_000,
+    };
+    discovery.candidates = [{
+      provider: "claude",
+      providerThreadId: "retained-claude-thread",
+      title: "Retained Claude thread",
+      projectRoot: value.documents,
+      updatedAt: personalAdoptionNow - 1_000,
+      liveness: "live",
+      sourceProcessIdentity,
+    }];
+
+    await expect(value.service.execute({
+      kind: "session.adoption.set",
+      provider: "claude",
+      enabled: true,
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      discovery: { provider: "claude", discovered: 1, adopted: 0, pending: 1 },
+    });
+    expect(livenessChecks).toHaveLength(0);
+    expect(value.store.listSessionAdoptionCandidates({ provider: "claude" })[0])
+      .toMatchObject({
+        projectId: project.project.id,
+        liveness: "live",
+        status: "pending",
+        sourceProcessIdentity,
+      });
+    expect(value.store.findSessionByProviderThread(
+      added.account.id,
+      "retained-claude-thread",
+    )).toBeNull();
+
+    // Every structurally observed Claude id must fence retained reprobes,
+    // even when the target sorts outside the ordinary admission bound and
+    // its current row is ineligible (for example, a wrong pinned version).
+    discovery.candidates = [
+      ...Array.from({ length: 50 }, (_, index) => ({
+        provider: "claude" as const,
+        providerThreadId: `newer-ineligible-claude-${String(index)}`,
+        title: `Newer ineligible Claude ${String(index)}`,
+        updatedAt: personalAdoptionNow - index,
+        liveness: "unknown" as const,
+        sourceProcessIdentity: null,
+        admissionEligible: false,
+      })),
+      {
+        provider: "claude",
+        providerThreadId: "retained-claude-thread",
+        title: "Current incompatible Claude row",
+        updatedAt: personalAdoptionNow - 100,
+        liveness: "live",
+        sourceProcessIdentity: null,
+        admissionEligible: false,
+      },
+    ];
+    await expect(value.service.execute({
+      kind: "session.adoption.discover",
+      provider: "claude",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ discovered: 0, adopted: 0 }],
+    });
+    expect(discovery.requests.at(-1)?.limit).toBe(CLAUDE_REGISTRY_MAX_RECORDS);
+    expect(livenessChecks).toHaveLength(0);
+    expect(personalClaude.claimRequests).toHaveLength(0);
+    expect(value.store.listSessionAdoptionCandidates({ provider: "claude" })[0])
+      .toMatchObject({ liveness: "live", status: "pending", sourceProcessIdentity });
+
+    // Once a later proven-complete snapshot contains no row for the id, HRA
+    // can prove the retained PID/start tuple is gone and admit the candidate.
+    discovery.candidates = [];
+    await expect(value.service.execute({
+      kind: "session.adoption.discover",
+      provider: "claude",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{
+        provider: "claude",
+        state: "ready",
+        discovered: 0,
+        adopted: 1,
+        failed: 0,
+      }],
+    });
+    expect(livenessChecks).toEqual([sourceProcessIdentity]);
+    expect(personalClaude.claimRequests).toHaveLength(1);
+    expect(value.store.findSessionByProviderThread(
+      added.account.id,
+      "retained-claude-thread",
+    )).toMatchObject({
+      profileId: added.account.id,
+      projectId: project.project.id,
+      provider: "claude",
+    });
+  });
+
+  test("does not adopt a retained Claude candidate on unknown liveness or a stale exact probe", async () => {
+    const sourceProcessIdentity: ClaudeProcessIdentity = {
+      pid: 62_911,
+      pidDomain: "darwin",
+      procStart: "retained-fenced-source",
+    };
+    const replacementIdentity: ClaudeProcessIdentity = {
+      pid: 62_912,
+      pidDomain: "darwin",
+      procStart: "retained-fenced-replacement",
+    };
+    let probeResult: "not_live" | "unknown" = "unknown";
+    const raceContext: { store?: StateStore } = {};
+    const personalClaude = new FakeClaude("personal", {
+      pid: 62_913,
+      pidDomain: "darwin",
+      procStart: "retained-fenced-adopted",
+    });
+    const discovery = new FakePersonalSessionDiscovery();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      {
+        managedClaude: new FakeClaude("isolated", {
+          pid: 62_914,
+          pidDomain: "darwin",
+          procStart: "retained-fenced-managed",
+        }),
+        personalClaude,
+        personalCodexHome,
+        personalDiscovery: discovery,
+        claudeProcessLiveness: () => {
+          if (probeResult === "not_live") {
+            const store = raceContext.store;
+            if (store === undefined) throw new Error("Expected the race store.");
+            const current = store.listSessionAdoptionCandidates({ provider: "claude" })[0];
+            if (current === undefined) throw new Error("Expected the retained candidate.");
+            store.upsertSessionAdoptionCandidate({
+              provider: "claude",
+              providerThreadId: current.providerThreadId,
+              ...(current.projectId === null ? {} : { projectId: current.projectId }),
+              title: current.title,
+              state: "active",
+              ...(current.providerUpdatedAt === null
+                ? {}
+                : { providerUpdatedAt: current.providerUpdatedAt }),
+              liveness: "live",
+              sourceProcessIdentity: replacementIdentity,
+            });
+          }
+          return Promise.resolve(probeResult);
+        },
+      },
+    );
+    raceContext.store = value.store;
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Retained Claude fence" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Retained Claude fence project",
+      path: value.documents,
+    }, { signal });
+    personalClaude.projection = {
+      providerThreadId: "retained-claude-fenced-thread",
+      title: "Retained Claude fenced thread",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 1_000,
+    };
+    discovery.candidates = [{
+      provider: "claude",
+      providerThreadId: "retained-claude-fenced-thread",
+      title: "Retained Claude fenced thread",
+      projectRoot: value.documents,
+      updatedAt: personalAdoptionNow - 1_000,
+      liveness: "live",
+      sourceProcessIdentity,
+    }];
+    await value.service.execute({
+      kind: "session.adoption.set",
+      provider: "claude",
+      enabled: true,
+      account: added.account.id,
+    }, { signal });
+
+    discovery.candidates = [];
+    await expect(value.service.execute({
+      kind: "session.adoption.discover",
+      provider: "claude",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ discovered: 0, adopted: 0, pending: 1 }],
+    });
+    expect(personalClaude.claimRequests).toHaveLength(0);
+    expect(value.store.listSessionAdoptionCandidates({ provider: "claude" })[0])
+      .toMatchObject({ liveness: "unknown", status: "pending", sourceProcessIdentity });
+
+    probeResult = "not_live";
+    await expect(value.service.execute({
+      kind: "session.adoption.discover",
+      provider: "claude",
+    }, { signal })).resolves.toMatchObject({
+      providers: [{ discovered: 0, adopted: 0 }],
+    });
+    expect(personalClaude.claimRequests).toHaveLength(0);
+    expect(value.store.findSessionByProviderThread(
+      added.account.id,
+      "retained-claude-fenced-thread",
+    )).toBeNull();
+    expect(value.store.listSessionAdoptionCandidates({ provider: "claude" })[0])
+      .toMatchObject({
+        liveness: "live",
+        status: "pending",
+        sourceProcessIdentity: replacementIdentity,
+      });
+  });
+
+  test("preserves an adopted Claude title beyond the bounded runtime projection", async () => {
+    const durableTitle = `Personal Claude ${"界".repeat(80)}`;
+    const boundedProjectionTitle = `Personal Claude ${"界".repeat(34)}`;
+    expect(new TextEncoder().encode(durableTitle).byteLength).toBeGreaterThan(120);
+    expect(new TextEncoder().encode(boundedProjectionTitle).byteLength)
+      .toBeLessThanOrEqual(120);
+    const value = await adoptedClaudeFixture(
+      "Adopted Claude long title",
+      "personal-claude-long-title",
+      (runtime) => {
+        runtime.claimProjectionTitle = boundedProjectionTitle;
+      },
+      durableTitle,
+    );
+    await value.service.settled();
+
+    expect(value.personalClaude.claimRequests[0]?.title).toBe(durableTitle);
+    expect(value.personalClaude.projection.title).toBe(boundedProjectionTitle);
+    expect(value.store.requireSession(value.session.id).title).toBe(durableTitle);
+    expect(value.store.listSessionAdoptionCandidates({ provider: "claude" })[0]?.title)
+      .toBe(durableTitle);
+    await expect(value.service.execute({
+      kind: "session.show",
+      session: value.session.id,
+      detail: false,
+    }, { signal })).resolves.toMatchObject({
+      projection: { title: boundedProjectionTitle },
+      session: { title: durableTitle },
+    });
+    expect(value.store.requireSession(value.session.id).title).toBe(durableTitle);
+  });
+
+  test("preserves an adopted Claude title across controller restart observation", async () => {
+    const durableTitle = `Restarted Claude ${"界".repeat(80)}`;
+    const boundedProjectionTitle = `Restarted Claude ${"界".repeat(33)}`;
+    expect(new TextEncoder().encode(durableTitle).byteLength).toBeGreaterThan(120);
+    expect(new TextEncoder().encode(boundedProjectionTitle).byteLength)
+      .toBeLessThanOrEqual(120);
+    const value = await adoptedClaudeFixture(
+      "Adopted Claude restart title",
+      "personal-claude-restart-title",
+      (runtime) => {
+        runtime.claimProjectionTitle = boundedProjectionTitle;
+      },
+      durableTitle,
+    );
+    await value.service.settled();
+    const initialIdentity = value.personalClaude.processIdentity;
+    const replacementIdentity: ClaudeProcessIdentity = {
+      pid: 63_024,
+      pidDomain: "darwin",
+      procStart: "personal-claude-restart-title-replacement",
+    };
+    const replacementConnectionId = "30000000-0000-4000-8000-0000000000c5";
+    value.personalClaude.disconnectOnObserveRequest =
+      value.personalClaude.observeRequests.length + 1;
+    value.personalClaude.processIdentityOnClaim = replacementIdentity;
+    value.personalClaude.observationConnectionIdOnClaim = replacementConnectionId;
+
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: value.session.id,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: {
+        connectionId: replacementConnectionId,
+        state: "live",
+      },
+    });
+
+    expect(value.personalClaude.endedProcessIdentities).toEqual([initialIdentity]);
+    expect(value.personalClaude.claimRequests).toHaveLength(2);
+    expect(value.personalClaude.claimRequests[1]?.title).toBe(durableTitle);
+    expect(value.personalClaude.projection.title).toBe(boundedProjectionTitle);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: "personal-claude-restart-title",
+      profileId: value.accountId,
+      runtimeScope: "personal",
+    })).toMatchObject({
+      identity: replacementIdentity,
+      sessionId: value.session.id,
+      state: "bound",
+    });
+    expect(value.store.requireSession(value.session.id).title).toBe(durableTitle);
+    await expect(value.service.execute({
+      kind: "session.show",
+      session: value.session.id,
+      detail: false,
+    }, { signal })).resolves.toMatchObject({
+      projection: { title: boundedProjectionTitle },
+      session: { title: durableTitle },
+    });
+    expect(value.store.requireSession(value.session.id).title).toBe(durableTitle);
+  });
+
+  test("preserves an adopted Claude title across status, mutation, and queue recovery", async () => {
+    const durableTitle = `Recovered Claude ${"界".repeat(80)}`;
+    const boundedProjectionTitle = `Recovered Claude ${"界".repeat(33)}`;
+    expect(new TextEncoder().encode(durableTitle).byteLength).toBeGreaterThan(120);
+    expect(new TextEncoder().encode(boundedProjectionTitle).byteLength)
+      .toBeLessThanOrEqual(120);
+    const value = await adoptedClaudeFixture(
+      "Adopted Claude recovered title",
+      "personal-claude-recovered-title",
+      (runtime) => {
+        runtime.claimProjectionTitle = boundedProjectionTitle;
+      },
+      durableTitle,
+    );
+    await value.service.settled();
+
+    expect(value.store.quarantineSession(value.session.id))
+      .toMatchObject({ state: "recovery_required", title: durableTitle });
+    await expect(value.service.execute({
+      kind: "session.recover",
+      session: value.session.id,
+    }, { signal })).resolves.toMatchObject({
+      session: { state: "idle", title: durableTitle },
+      projection: { title: boundedProjectionTitle },
+      recovery: { resolution: "provider_state_reconciled" },
+    });
+
+    const mutationKey = "00000000-0000-4000-8000-00000000c101";
+    value.personalClaude.startTurnError = new IndeterminateCodexEffectError(
+      "claude/turn",
+      48,
+    );
+    await expect(value.service.execute({
+      kind: "session.send",
+      session: value.session.id,
+      message: "Recover this exact mutation",
+      idempotencyKey: mutationKey,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.store.readMutation(mutationKey)).toMatchObject({ state: "ambiguous" });
+    delete value.personalClaude.startTurnError;
+    await expect(value.service.execute({
+      kind: "session.recover",
+      session: value.session.id,
+    }, { signal })).resolves.toMatchObject({
+      session: { title: durableTitle },
+      projection: { title: boundedProjectionTitle },
+      recovery: { resolution: "proven_applied", providerEffectRetried: false },
+    });
+    expect(value.store.requireSession(value.session.id).title).toBe(durableTitle);
+
+    value.personalClaude.startTurnError = new IndeterminateCodexEffectError(
+      "claude/turn",
+      49,
+    );
+    const queued = await value.service.execute({
+      kind: "session.queue",
+      session: value.session.id,
+      message: "Recover this exact queue effect",
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    await value.service.settled();
+    expect(value.store.requireQueue(queued.queued.id)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(value.session.id))
+      .toMatchObject({ state: "recovery_required", title: durableTitle });
+    delete value.personalClaude.startTurnError;
+    await expect(value.service.execute({
+      kind: "session.recover",
+      session: value.session.id,
+    }, { signal })).resolves.toMatchObject({
+      queueId: queued.queued.id,
+      session: { title: durableTitle },
+      projection: { title: boundedProjectionTitle },
+      recovery: { resolution: "proven_applied", providerEffectRetried: false },
+    });
+    expect(value.store.requireSession(value.session.id).title).toBe(durableTitle);
+  });
+
+  test("routes an adopted Claude session and its exact process release only through personal custody", async () => {
+    const value = await adoptedClaudeFixture(
+      "Adopted Claude routing",
+      "same-opaque-claude-thread",
+    );
+
+    expect(value.enabled).toMatchObject({
+      providers: [{ provider: "claude", enabled: true, adopted: 1 }],
+      discovery: { provider: "claude", state: "ready", adopted: 1 },
+    });
+    expect(value.personalClaude.claimRequests[0]).toMatchObject({
+      authority: { id: value.accountId, codexHome: personalCodexHome },
+      providerThreadId: "same-opaque-claude-thread",
+      preset: "fable-max",
+      fast: false,
+      sourceLiveness: "not_live",
+      title: "Adopted Claude routing personal thread",
+    });
+    expect(value.store.latestSessionRuntimeProfile(value.session.id)).toMatchObject({
+      profile: {
+        configHome: "personal",
+        preset: "fable-max",
+      },
+    });
+    const shown = await value.service.execute({
+      kind: "session.show",
+      session: value.session.id,
+      detail: false,
+    }, { signal }) as {
+      effectiveRuntimeProfile: Record<string, unknown>;
+      projection: { title: string };
+      session: { title: string };
+    };
+    expect(shown).toMatchObject({
+      projection: { title: "Adopted Claude routing personal thread" },
+      session: { title: "Adopted Claude routing personal thread" },
+    });
+    expect(shown.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+    expect(shown.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: "same-opaque-claude-thread",
+      profileId: value.accountId,
+      runtimeScope: "personal",
+    })).toMatchObject({
+      sessionId: value.session.id,
+      state: "bound",
+      identity: value.personalIdentity,
+    });
+
+    const listed = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: value.accountId,
+      limit: 1,
+    }, { signal }) as { sessions: readonly Record<string, unknown>[] };
+    expect(listed.sessions).toEqual([expect.objectContaining({
+      id: value.session.id,
+      provider: "claude",
+      providerThreadId: "same-opaque-claude-thread",
+    })]);
+    expect(listed.sessions[0]).not.toHaveProperty("adopted");
+    expect(listed.sessions[0]).not.toHaveProperty("origin");
+
+    value.store.recordClaimedClaudeProcessAuthority({
+      providerThreadId: "same-opaque-claude-thread",
+      profileId: value.accountId,
+      profileGeneration: value.store.requireProfileById(value.accountId).processGeneration,
+      runtimeScope: "managed",
+      identity: value.managedClaude.processIdentity,
+    });
+    const sent = await value.service.execute({
+      kind: "session.send",
+      session: value.session.id,
+      message: "Continue the adopted Claude conversation",
+      idempotencyKey: "00000000-0000-4000-8000-00000000c001",
+    }, { signal }) as {
+      effectiveRuntimeProfile: Record<string, unknown>;
+      session: { id: string; state: string; title: string };
+    };
+    expect(sent).toMatchObject({
+      session: { id: value.session.id, state: "idle" },
+    });
+    expect(sent.session.title).toBe("Adopted Claude routing personal thread");
+    expect(sent.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+    expect(sent.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
+    expect(value.personalClaude.turnRequests).toHaveLength(1);
+    expect(value.personalClaude.turnRequests[0]?.authority.codexHome).toBe(personalCodexHome);
+    expect(value.managedClaude.turnRequests).toHaveLength(0);
+
+  });
+
+  test("autoresponds to adopted Claude approval authority through its personal controller", async () => {
+    const value = await adoptedClaudeFixture(
+      "Adopted Claude approval",
+      "personal-claude-approval",
+    );
+    value.store.setDefaultApprovalMode("auto:all");
+    const authority = value.personalClaude.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal Claude authority.");
+    const requestId = "adopted-claude-approval-request";
+
+    await value.service.observePersonalClaudeFact(authority, {
+      providerThreadId: "personal-claude-approval",
+      connectionId: value.personalClaude.observationConnectionId,
+      type: "interactionRequested",
+      requestId,
+      turnId: "claude-turn-approval",
+      itemId: "claude-item-approval",
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Run the adopted Claude test",
+        reason: null,
+        commandClass: "bun test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+      request: {
+        blockedPath: null,
+        decisionReasonType: null,
+        description: "Run the adopted Claude test",
+        displayName: "Bash",
+        input: { command: "bun test" },
+        permissionSuggestionCount: 0,
+        questions: null,
+        requiresUserInteraction: false,
+        subtype: "can_use_tool",
+        toolName: "Bash",
+        toolUseId: "claude-item-approval",
+      },
+    });
+
+    await waitFor(() => value.personalClaude.resolvedInteractions.length === 1);
+    expect(value.personalClaude.validatedInteractions).toHaveLength(1);
+    expect(value.personalClaude.resolvedInteractions[0]).toMatchObject({
+      authority: { id: value.accountId, codexHome: personalCodexHome },
+      kind: "command_approval",
+      resolution: { kind: "approval_decision", decision: "once" },
+    });
+    expect(value.managedClaude.validatedInteractions).toHaveLength(0);
+    expect(value.managedClaude.resolvedInteractions).toHaveLength(0);
+    const interaction = value.store.listInteractions({
+      sessionId: value.session.id,
+      limit: 10,
+    }).find((candidate) => candidate.authority.requestId.value === requestId);
+    expect(interaction).toMatchObject({
+      resolvedBy: "autorespond",
+      sessionId: value.session.id,
+    });
+    expect(interaction?.state).not.toBe("pending");
+  });
+
+  test("recovers an adopted Claude session after clean restart from released process custody", async () => {
+    const value = await adoptedClaudeFixture(
+      "Adopted Claude restart",
+      "personal-claude-restart",
+    );
+    const oldAuthority = value.store.readClaudeProcessAuthority({
+      providerThreadId: "personal-claude-restart",
+      profileId: value.accountId,
+      runtimeScope: "personal",
+    });
+    if (oldAuthority === null) throw new Error("Expected initial Claude process authority.");
+    const oldGeneration = value.store.requireProfileById(value.accountId).processGeneration;
+    await value.service.close();
+    expect(value.store.requireProfileById(value.accountId).processGeneration)
+      .toBe(oldGeneration + 1);
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id))
+      .toMatchObject({ state: "active" });
+
+    const restartedPersonal = new FakeClaude("personal", {
+      pid: 63_003,
+      pidDomain: "darwin",
+      procStart: "personal-claude-restarted",
+    });
+    restartedPersonal.projection = {
+      ...value.personalClaude.projection,
+      providerThreadId: "personal-claude-restart",
+      status: "idle",
+    };
+    restartedPersonal.readIdentityErrorOnce = new Error("prior child is gone");
+    restartedPersonal.observeErrorOnce = new ClaudeSessionObservationError();
+    const restartedManaged = new FakeClaude("isolated", {
+      pid: 63_004,
+      pidDomain: "darwin",
+      procStart: "managed-claude-restarted",
+    });
+    const livenessChecks: Array<Parameters<ClaudeProcessLivenessProbe>[0]> = [];
+    const restarted = new HraService({
+      store: value.store,
+      paths: value.paths,
+      codex: new FakeCodex(),
+      claude: restartedManaged,
+      personalClaude: restartedPersonal,
+      personalCodexHome,
+      claudeProcessLiveness: (identity) => {
+        livenessChecks.push(identity);
+        return Promise.resolve("not_live");
+      },
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      eventCursors: value.eventCursors,
+      now: () => personalAdoptionNow,
+      requestStop: () => undefined,
+    });
+    await expect(restarted.recover()).resolves.toBeUndefined();
+    await restarted.settled();
+
+    // The prior service closed the exact child successfully and durably
+    // released its process row before generation rollover. Restart therefore
+    // needs no second OS liveness inference for that already-proven exit.
+    expect(livenessChecks).toEqual([]);
+    expect(restartedPersonal.endRequests).toHaveLength(0);
+    expect(restartedManaged.calls).toEqual([]);
+    expect(restartedPersonal.claimRequests).toHaveLength(1);
+    expect(restartedPersonal.claimRequests[0]).toMatchObject({
+      authority: {
+        id: value.accountId,
+        generation: oldGeneration + 1,
+        codexHome: personalCodexHome,
+      },
+      providerThreadId: "personal-claude-restart",
+      sourceLiveness: "not_live",
+      title: "Adopted Claude restart personal thread",
+    });
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: "personal-claude-restart",
+      profileId: value.accountId,
+      runtimeScope: "personal",
+    })).toMatchObject({
+      identity: restartedPersonal.processIdentity,
+      profileGeneration: oldGeneration + 1,
+      sessionId: value.session.id,
+      state: "bound",
+    });
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id))
+      .toMatchObject({ state: "active" });
+    const shownAfterRestart = await restarted.execute({
+      kind: "session.show",
+      session: value.session.id,
+      detail: false,
+    }, { signal }) as {
+      effectiveRuntimeProfile: Record<string, unknown>;
+      projection: { title: string };
+      session: { title: string };
+    };
+    expect(shownAfterRestart).toMatchObject({
+      projection: { title: "Adopted Claude restart personal thread" },
+      session: { title: "Adopted Claude restart personal thread" },
+    });
+    expect(shownAfterRestart.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+
+    await expect(restarted.execute({
+      kind: "session.send",
+      session: value.session.id,
+      message: "Continue after restart",
+      idempotencyKey: "00000000-0000-4000-8000-00000000c002",
+    }, { signal })).resolves.toMatchObject({
+      session: { id: value.session.id, state: "idle" },
+    });
+    expect(restartedPersonal.turnRequests).toHaveLength(1);
+    expect(restartedManaged.turnRequests).toHaveLength(0);
+    await restarted.close();
+  });
+
+  test("releases and resumes an adopted Claude controller lost between claim and commit", async () => {
+    const value = await adoptedClaudeFixture(
+      "Adopted Claude admission race",
+      "personal-claude-admission-race",
+      (runtime) => { runtime.disconnectOnObserveRequest = 2; },
+    );
+    await value.service.settled();
+
+    expect(value.personalClaude.endRequests).toHaveLength(1);
+    expect(value.personalClaude.claimRequests).toHaveLength(2);
+    expect(value.personalClaude.claimRequests[1]).toMatchObject({
+      providerThreadId: "personal-claude-admission-race",
+      sourceLiveness: "not_live",
+      title: "Adopted Claude admission race personal thread",
+    });
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: "personal-claude-admission-race",
+      profileId: value.accountId,
+      runtimeScope: "personal",
+    })).toMatchObject({
+      sessionId: value.session.id,
+      state: "bound",
+    });
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id))
+      .toMatchObject({ state: "active" });
+
+    await expect(value.service.execute({
+      kind: "session.send",
+      session: value.session.id,
+      message: "Continue after admission recovery",
+      idempotencyKey: "00000000-0000-4000-8000-00000000c003",
+    }, { signal })).resolves.toMatchObject({
+      session: {
+        id: value.session.id,
+        state: "idle",
+        title: "Adopted Claude admission race personal thread",
+      },
+    });
+    await value.service.close();
+  });
+
+  test("retires a daemon generation without detaching adopted sessions", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted restart",
+      "personal-thread-restart",
+    );
+    const before = value.store.requireProfileById(value.accountId).processGeneration;
+
+    await expect(value.service.close()).resolves.toBeUndefined();
+
+    expect(value.store.requireProfileById(value.accountId).processGeneration).toBe(before + 1);
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id)).toMatchObject({
+      state: "active",
+    });
+  });
+
+  test("keeps committed adoption authority and retries failed memory initialization", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    factsMemory.ensureErrorOnce = new Error("lost adoption memory receipt");
+    const value = await adoptedCodexFixture(
+      "Adopted initialization retry",
+      "personal-thread-initialization-retry",
+      factsMemory,
+    );
+
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id)).toMatchObject({
+      state: "active",
+    });
+    expect(value.store.latestSessionRuntimeProfile(value.session.id)).toMatchObject({
+      sourceKind: "session_start",
+      profile: { profileId: value.accountId, preset: "ultra" },
+    });
+    await waitFor(() => factsMemory.ensures.filter(
+      ({ sessionId }) => sessionId === value.session.id,
+    ).length >= 2);
+    expect(factsMemory.states.get(value.session.id)).toBe("active");
+    expect(value.personalCodex.calls.filter((call) => call === "end")).toHaveLength(0);
+  });
+
+  test("admits and autoresponds to an adopted session approval through personal custody", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted approval",
+      "personal-thread-approval",
+    );
+    value.store.setDefaultApprovalMode("auto:all");
+    const authority = value.personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal claim authority.");
+    const requestId = "adopted-approval-request";
+    const connectionId = value.personalCodex.observationConnectionId;
+
+    await value.service.observePersonalCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId,
+      provider: {
+        profileId: value.session.profileId,
+        processGeneration: authority.generation,
+        connectionId,
+        requestId: { type: "string", value: requestId },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: createHash("sha256").update(requestId).digest("hex"),
+        threadId: "personal-thread-approval",
+        turnId: "turn-adopted-approval",
+        itemId: "item-adopted-approval",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Run the adopted session test",
+        reason: null,
+        commandClass: "bun test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+    });
+
+    await waitFor(() => value.personalCodex.resolvedInteractions.length === 1);
+    expect(value.personalCodex.resolvedInteractions[0]).toMatchObject({
+      kind: "command_approval",
+      resolution: { kind: "approval_decision", decision: "once" },
+    });
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+    await waitFor(() => value.store.listInteractions({
+      sessionId: value.session.id,
+      limit: 10,
+    }).some((candidate) =>
+      candidate.authority.requestId.value === requestId
+      && candidate.resolvedBy === "autorespond"));
+    const interaction = value.store.listInteractions({
+      sessionId: value.session.id,
+      limit: 10,
+    }).find((candidate) => candidate.authority.requestId.value === requestId);
+    expect(interaction).toMatchObject({
+      resolvedBy: "autorespond",
+      sessionId: value.session.id,
+    });
+    expect(interaction?.state).not.toBe("pending");
+    await waitFor(() => value.store.listAutorespondEvidence({
+      sessionId: value.session.id,
+    }).length === 1);
+    expect(value.store.listAutorespondEvidence({ sessionId: value.session.id })[0])
+      .toMatchObject({
+        decision: "once",
+        kind: "command_approval",
+        mode: "auto:all",
+        outcome: "accepted",
+      });
+  });
+
+  test("replaying an applied account login leaves a newer managed Claude controller untouched", async () => {
+    let providerThreadId = "native-claude-login-replay";
+    const loginIdempotencyKey = "00000000-0000-4000-8000-00000000c100";
+    const identity: ClaudeProcessIdentity = {
+      pid: 63_019,
+      pidDomain: "darwin",
+      procStart: "native-claude-login-replay-process",
+    };
+    const value = await nativeClaudeFixture(
+      "Native Claude login replay",
+      providerThreadId,
+      identity,
+      loginIdempotencyKey,
+    );
+    providerThreadId = value.providerThreadId;
+    const profile = value.store.requireProfileById(value.accountId);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity,
+      profileGeneration: profile.processGeneration,
+      sessionId: value.session.id,
+      state: "bound",
+    });
+
+    await expect(value.service.execute({
+      kind: "account.login",
+      account: value.accountId,
+      deviceCode: false,
+      idempotencyKey: loginIdempotencyKey,
+    }, { signal })).resolves.toMatchObject({
+      account: {
+        id: value.accountId,
+        processGeneration: profile.processGeneration,
+        state: "signed_in",
+      },
+      login: { status: "signed_in" },
+    });
+
+    expect(value.codex.calls.filter((call) => call.startsWith("login:")))
+      .toHaveLength(1);
+    expect(value.managedClaude.endRequests).toEqual([]);
+    expect(value.managedClaude.endedProcessIdentities).toEqual([]);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity,
+      profileGeneration: profile.processGeneration,
+      sessionId: value.session.id,
+      state: "bound",
+    });
+    expect(value.store.requireProfileById(value.accountId)).toMatchObject({
+      processGeneration: profile.processGeneration,
+      state: "signed_in",
+    });
+  });
+
+  test("releases exact native Claude process authority before explicit account logout completes", async () => {
+    let providerThreadId = "native-claude-explicit-logout";
+    const identity: ClaudeProcessIdentity = {
+      pid: 63_020,
+      pidDomain: "darwin",
+      procStart: "native-claude-explicit-logout-process",
+    };
+    const value = await nativeClaudeFixture(
+      "Native Claude explicit logout",
+      providerThreadId,
+      identity,
+    );
+    providerThreadId = value.providerThreadId;
+    const profile = value.store.requireProfileById(value.accountId);
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    expect(value.store.listSessionPersonalRuntimeBindings()).toEqual([]);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity,
+      profileGeneration: profile.processGeneration,
+      sessionId: value.session.id,
+      state: "bound",
+    });
+
+    let markReleaseStarted!: () => void;
+    const releaseStarted = new Promise<void>((resolve) => {
+      markReleaseStarted = resolve;
+    });
+    let finishRelease!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    value.managedClaude.beforeEndSessionReturn = async () => {
+      markReleaseStarted();
+      await releaseGate;
+    };
+    let logoutSettled = false;
+    const logout = value.service.execute({
+      kind: "account.logout",
+      account: value.accountId,
+      idempotencyKey: "00000000-0000-4000-8000-00000000c101",
+    }, { signal }).finally(() => {
+      logoutSettled = true;
+    });
+    await releaseStarted;
+    try {
+      expect(logoutSettled).toBe(false);
+      expect(value.codex.calls.filter((call) => call === "logout")).toEqual([]);
+      expect(value.store.requireProfileById(value.accountId).state).toBe("signed_in");
+      expect(value.store.readClaudeProcessAuthority({
+        providerThreadId,
+        profileId: value.accountId,
+        runtimeScope: "managed",
+      })).toMatchObject({
+        identity,
+        profileGeneration: profile.processGeneration,
+        sessionId: value.session.id,
+        state: "releasing",
+      });
+    } finally {
+      finishRelease();
+    }
+    await expect(logout).resolves.toMatchObject({
+      account: { id: value.accountId, state: "signed_out" },
+    });
+
+    expect(value.codex.calls.filter((call) => call === "logout")).toHaveLength(1);
+    expect(value.managedClaude.endRequests).toHaveLength(1);
+    const release = value.managedClaude.endRequests[0];
+    if (release === undefined) throw new Error("Expected the native Claude process release.");
+    expect(release.authority).toMatchObject({
+      id: value.accountId,
+      generation: profile.processGeneration,
+    });
+    expect(release.providerThreadId).toBe(providerThreadId);
+    expect(value.managedClaude.endedProcessIdentities).toEqual([identity]);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity,
+      profileGeneration: profile.processGeneration,
+      sessionId: value.session.id,
+      state: "released",
+    });
+    expect(value.store.requireProfileById(value.accountId).state).toBe("signed_out");
+
+    const eventsBeforeLateFact = value.store.listSessionEvents({
+      sessionId: value.session.id,
+      afterSequence: 0,
+      limit: 100,
+    }).events;
+    const sessionBeforeLateFact = value.store.requireSession(value.session.id);
+    await value.service.observeClaudeFact(authority, {
+      type: "turnStarted",
+      connectionId: value.managedClaude.observationConnectionId,
+      providerThreadId,
+      turnId: "late-native-claude-turn",
+    });
+    expect(value.store.requireSession(value.session.id)).toEqual(sessionBeforeLateFact);
+    expect(value.store.listSessionEvents({
+      sessionId: value.session.id,
+      afterSequence: 0,
+      limit: 100,
+    }).events).toEqual(eventsBeforeLateFact);
+  });
+
+  test("durably revokes native Claude process authority after provider-observed signout", async () => {
+    let providerThreadId = "native-claude-observed-signout";
+    const identity: ClaudeProcessIdentity = {
+      pid: 63_021,
+      pidDomain: "darwin",
+      procStart: "native-claude-observed-signout-process",
+    };
+    const value = await nativeClaudeFixture(
+      "Native Claude observed signout",
+      providerThreadId,
+      identity,
+    );
+    providerThreadId = value.providerThreadId;
+    const profile = value.store.requireProfileById(value.accountId);
+    let markReleaseStarted!: () => void;
+    const releaseStarted = new Promise<void>((resolve) => {
+      markReleaseStarted = resolve;
+    });
+    let finishRelease!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    value.managedClaude.beforeEndSessionReturn = async () => {
+      markReleaseStarted();
+      await releaseGate;
+    };
+
+    await expect(value.service.observeCodexAccount({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, { signedIn: false })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await releaseStarted;
+    try {
+      expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+        .toMatchObject({
+          profileGeneration: profile.processGeneration,
+          state: "releasing",
+        });
+      expect(value.store.requireProfileById(value.accountId).state)
+        .toBe("recovery_required");
+      expect(value.store.readClaudeProcessAuthority({
+        providerThreadId,
+        profileId: value.accountId,
+        runtimeScope: "managed",
+      })).toMatchObject({
+        identity,
+        profileGeneration: profile.processGeneration,
+        sessionId: value.session.id,
+        state: "releasing",
+      });
+      expect(value.store.listSessionPersonalRuntimeBindings()).toEqual([]);
+    } finally {
+      finishRelease();
+    }
+    await value.service.settled();
+
+    expect(value.managedClaude.endRequests).toHaveLength(1);
+    expect(value.managedClaude.endedProcessIdentities).toEqual([identity]);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity,
+      profileGeneration: profile.processGeneration,
+      sessionId: value.session.id,
+      state: "released",
+    });
+    expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+      .toMatchObject({
+        profileGeneration: profile.processGeneration,
+        state: "completed",
+      });
+    expect(value.store.requireProfileById(value.accountId).state).toBe("signed_out");
+  });
+
+  test("revokes managed Claude authority before accepting replaced or missing account identity", async () => {
+    const observations: readonly CodexAccountProjection[] = [
+      { signedIn: true, email: "replacement@example.com", plan: "Plus" },
+      { signedIn: true, plan: "Plus" },
+    ];
+    for (const [index, observation] of observations.entries()) {
+      let providerThreadId = `native-claude-account-identity-${String(index)}`;
+      const identity: ClaudeProcessIdentity = {
+        pid: 63_030 + index,
+        pidDomain: "darwin",
+        procStart: `native-claude-account-identity-${String(index)}`,
+      };
+      const value = await nativeClaudeFixture(
+        `Native Claude account identity ${String(index)}`,
+        providerThreadId,
+        identity,
+      );
+      providerThreadId = value.providerThreadId;
+      const profile = value.store.requireProfileById(value.accountId);
+      expect(profile.providerEmail).toBe("person@example.com");
+      let markReleaseStarted!: () => void;
+      const releaseStarted = new Promise<void>((resolve) => {
+        markReleaseStarted = resolve;
+      });
+      let finishRelease!: () => void;
+      const releaseGate = new Promise<void>((resolve) => {
+        finishRelease = resolve;
+      });
+      value.managedClaude.beforeEndSessionReturn = async () => {
+        markReleaseStarted();
+        await releaseGate;
+      };
+
+      await expect(value.service.observeCodexAccount({
+        id: profile.id,
+        generation: profile.processGeneration,
+        codexHome: "unused",
+        desktopUserData: "unused",
+      }, observation)).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await releaseStarted;
+      try {
+        expect(value.store.requireProfileById(value.accountId)).toMatchObject({
+          providerEmail: "person@example.com",
+          state: "recovery_required",
+        });
+        expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+          .toMatchObject({
+            profileGeneration: profile.processGeneration,
+            state: "releasing",
+          });
+        expect(value.store.readClaudeProcessAuthority({
+          providerThreadId,
+          profileId: value.accountId,
+          runtimeScope: "managed",
+        })).toMatchObject({
+          identity,
+          state: "releasing",
+        });
+      } finally {
+        finishRelease();
+      }
+      await value.service.settled();
+
+      const retired = value.store.requireProfileById(value.accountId);
+      expect(retired.state).toBe("signed_out");
+      expect(retired.providerEmail).toBeUndefined();
+      expect(value.store.readClaudeProcessAuthority({
+        providerThreadId,
+        profileId: value.accountId,
+        runtimeScope: "managed",
+      })?.state).toBe("released");
+      await value.service.close();
+    }
+  });
+
+  test("keeps a dormant native session bound to its original account across replacement", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Native account identity fence");
+    const session = value.store.requireSession(sessionId);
+    const original = value.store.requireProfileById(session.profileId);
+    expect(value.store.sessionAccountAuthorityMatches(session.id, original.id)).toBe(true);
+
+    value.codex.accountProjection = {
+      signedIn: true,
+      email: "replacement-native-owner@example.com",
+      plan: "Plus",
+    };
+    await expect(value.service.execute({
+      kind: "account.show",
+      account: original.id,
+    }, { signal })).resolves.toMatchObject({
+      account: { providerEmail: "person@example.com", state: "signed_in" },
+      providerProjection: { email: "replacement-native-owner@example.com", signedIn: true },
+      recovery: { required: true },
+    });
+    await value.service.settled();
+
+    expect(value.store.requireProfileById(original.id)).toMatchObject({
+      processGeneration: original.processGeneration + 1,
+      state: "signed_out",
+    });
+    expect(value.store.requireSession(session.id)).toMatchObject({
+      providerThreadId: session.providerThreadId,
+      state: "recovery_required",
+    });
+    expect(value.store.sessionAccountAuthorityMatches(session.id, original.id)).toBe(false);
+
+    value.codex.loginResult = {
+      status: "signed_in",
+      account: {
+        signedIn: true,
+        email: "replacement-native-owner@example.com",
+        plan: "Plus",
+      },
+    };
+    await value.service.execute({
+      kind: "account.login",
+      account: original.id,
+      deviceCode: false,
+    }, { signal });
+    expect(value.store.sessionAccountAuthorityMatches(session.id, original.id)).toBe(false);
+    await expect(value.service.execute({
+      kind: "session.list",
+      account: original.id,
+      archived: false,
+      limit: 10,
+    }, { signal })).resolves.toMatchObject({ sessions: [], nextCursor: null });
+    await expect(value.service.execute({
+      kind: "session.note.set",
+      session: session.id,
+      note: "replacement must not change original metadata",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({
+      kind: "autorespond.set",
+      session: session.id,
+      mode: "auto:all",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({
+      kind: "session.archive",
+      session: session.id,
+      archived: true,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    const turnsBefore = value.codex.committedStartTurns;
+    await expect(value.service.execute({
+      kind: "session.send",
+      session: session.id,
+      message: "must stay with the original identity",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.codex.committedStartTurns).toBe(turnsBefore);
+  });
+
+  test("account read revokes an adopted controller before exposing a replacement identity", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted account replacement",
+      "personal-thread-account-replacement",
+    );
+    value.codex.accountProjection = {
+      signedIn: true,
+      email: "replacement@example.com",
+      plan: "Plus",
+    };
+
+    const shown = await value.service.execute({
+      kind: "account.show",
+      account: value.accountId,
+    }, { signal }) as {
+      account: { providerEmail?: string; state: string };
+      providerProjection: CodexAccountProjection;
+      recovery: { required: boolean };
+    };
+    expect(shown).toMatchObject({
+      account: {
+        providerEmail: "person@example.com",
+        state: "signed_in",
+      },
+      providerProjection: { signedIn: true, email: "replacement@example.com" },
+      recovery: { required: true },
+    });
+    await value.service.settled();
+
+    const retired = value.store.requireProfileById(value.accountId);
+    expect(retired.state).toBe("signed_out");
+    expect(retired.providerEmail).toBeUndefined();
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id, true))
+      .toMatchObject({ state: "detached" });
+    expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+      .toMatchObject({ state: "completed" });
+    await value.service.close();
+  });
+
+  test("account read requires explicit login before binding a controller-free replacement identity", async () => {
+    const value = await fixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Controller-free account replacement" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    expect(value.store.requireProfileById(added.account.id).providerEmail)
+      .toBe("person@example.com");
+    value.codex.accountProjection = {
+      signedIn: true,
+      email: "replacement@example.com",
+      plan: "Plus",
+    };
+
+    await expect(value.service.execute({
+      kind: "account.show",
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      account: {
+        providerEmail: "person@example.com",
+        state: "signed_in",
+      },
+      providerProjection: { email: "replacement@example.com", signedIn: true },
+      recovery: { required: true },
+    });
+    await value.service.settled();
+    expect(value.store.requireProfileById(added.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "signed_out",
+    });
+    expect(value.store.readProfilePersonalAuthorityRevocation(added.account.id))
+      .toMatchObject({ profileGeneration: 1, state: "completed" });
+    await value.service.close();
+  });
+
+  test("failed managed Claude shutdown preserves the live generation and exact process authority", async () => {
+    let providerThreadId = "native-claude-failed-shutdown";
+    const identity: ClaudeProcessIdentity = {
+      pid: 63_022,
+      pidDomain: "darwin",
+      procStart: "native-claude-failed-shutdown-process",
+    };
+    const value = await nativeClaudeFixture(
+      "Native Claude failed shutdown",
+      providerThreadId,
+      identity,
+    );
+    providerThreadId = value.providerThreadId;
+    const profileBefore = value.store.requireProfileById(value.accountId);
+    const processBefore = value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    });
+    if (processBefore === null) throw new Error("Expected native Claude process authority.");
+    expect(processBefore).toMatchObject({
+      identity,
+      profileGeneration: profileBefore.processGeneration,
+      sessionId: value.session.id,
+      state: "bound",
+    });
+    value.managedClaude.closeError = new Error(
+      "managed Claude child exit could not be proved",
+    );
+
+    await expect(value.service.close()).rejects.toBeInstanceOf(Error);
+
+    expect(value.codex.closeCalls).toBe(1);
+    expect(value.managedClaude.closeCalls).toBe(1);
+    expect(value.store.requireProfileById(value.accountId)).toMatchObject({
+      processGeneration: profileBefore.processGeneration,
+      state: profileBefore.state,
+    });
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toEqual(processBefore);
+  });
+
+  test("successful managed Claude shutdown releases exact process authority before generation retirement", async () => {
+    let providerThreadId = "native-claude-clean-shutdown";
+    const identity: ClaudeProcessIdentity = {
+      pid: 63_023,
+      pidDomain: "darwin",
+      procStart: "native-claude-clean-shutdown-process",
+    };
+    const value = await nativeClaudeFixture(
+      "Native Claude clean shutdown",
+      providerThreadId,
+      identity,
+    );
+    providerThreadId = value.providerThreadId;
+    const profileBefore = value.store.requireProfileById(value.accountId);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity,
+      profileGeneration: profileBefore.processGeneration,
+      sessionId: value.session.id,
+      state: "bound",
+    });
+
+    await expect(value.service.close()).resolves.toBeUndefined();
+
+    expect(value.codex.closeCalls).toBe(1);
+    expect(value.managedClaude.closeCalls).toBe(1);
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity,
+      profileGeneration: profileBefore.processGeneration,
+      sessionId: value.session.id,
+      state: "released",
+    });
+    expect(value.store.requireProfileById(value.accountId)).toMatchObject({
+      processGeneration: profileBefore.processGeneration + 1,
+      state: profileBefore.state,
+    });
+  });
+
+  test("releases adopted controllers before authoritative account sign-out completes", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted sign-out",
+      "personal-thread-sign-out",
+    );
+    const authority = value.personalCodex.claimRequests[0]?.authority;
+    if (authority === undefined) throw new Error("Expected personal claim authority.");
+    const requestId = "adopted-sign-out-approval";
+    await value.service.observePersonalCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId: value.personalCodex.observationConnectionId,
+      provider: {
+        profileId: value.accountId,
+        processGeneration: authority.generation,
+        connectionId: value.personalCodex.observationConnectionId,
+        requestId: { type: "string", value: requestId },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: createHash("sha256").update(requestId).digest("hex"),
+        threadId: value.session.providerThreadId ?? null,
+        turnId: "turn-adopted-sign-out",
+        itemId: "item-adopted-sign-out",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Do not answer after sign-out",
+        reason: null,
+        commandClass: "bun test",
+        workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    });
+    const interaction = value.store.listInteractions({
+      sessionId: value.session.id,
+      pendingOnly: true,
+      limit: 10,
+    })[0];
+    if (interaction === undefined) throw new Error("Expected pending interaction.");
+    const releasesBefore = value.personalCodex.releasedAuthorities.length;
+
+    await expect(value.service.observeCodexAccount(authority, { signedIn: false }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+
+    expect(value.personalCodex.releasedAuthorities).toHaveLength(releasesBefore + 1);
+    expect(value.personalCodex.releasedAuthorities.at(-1)).toEqual(authority);
+    expect(value.store.requireProfileById(value.accountId).state).toBe("signed_out");
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id)).toBeNull();
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id, true))
+      .toMatchObject({ state: "detached" });
+    expect(value.store.requireSession(value.session.id)).toMatchObject({
+      state: "recovery_required",
+      archivedAt: expect.any(Number),
+    });
+    expect(value.store.requireInteraction(interaction.publicId).state).toBe("expired");
+    expect(value.personalCodex.resolvedInteractions).toHaveLength(0);
+    expect(value.store.readSessionAdoptionPolicy("codex")).toMatchObject({
+      enabled: false,
+      profileId: null,
+    });
+    expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+      .toMatchObject({ state: "completed" });
+  });
+
+  test("recovers a durably staged personal-controller revocation after daemon loss", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted sign-out recovery",
+      "personal-thread-sign-out-recovery",
+    );
+    const profile = value.store.requireProfileById(value.accountId);
+    value.store.stageProfilePersonalAuthorityRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+    });
+    const restartedGeneration = profile.processGeneration + 1;
+    value.store.nextDaemonGeneration(crypto.randomUUID());
+    expect(value.store.requireProfileById(value.accountId).processGeneration)
+      .toBe(restartedGeneration);
+    expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+      .toMatchObject({
+        profileGeneration: restartedGeneration,
+        state: "releasing",
+      });
+    const releasesBefore = value.personalCodex.releasedAuthorities.length;
+
+    // Simulate process loss after the sign-out fact was staged but before the
+    // asynchronous controller release began. Recovery must finish from the
+    // durable revocation row before it admits any session resubscriptions.
+    const restarted = new HraService({
+      store: value.store,
+      paths: value.paths,
+      codex: new FakeCodex(),
+      personalCodex: value.personalCodex,
+      personalCodexHome,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      eventCursors: value.eventCursors,
+      now: () => personalAdoptionNow,
+      requestStop: () => undefined,
+    });
+    await expect(restarted.recover()).resolves.toBeUndefined();
+
+    expect(value.personalCodex.releasedAuthorities).toHaveLength(releasesBefore + 1);
+    expect(value.personalCodex.releasedAuthorities.at(-1)).toMatchObject({
+      id: value.accountId,
+      generation: restartedGeneration,
+    });
+    expect(value.store.requireProfileById(value.accountId).state).toBe("signed_out");
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id)).toBeNull();
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id, true))
+      .toMatchObject({ state: "detached" });
+    expect(value.store.requireSession(value.session.id)).toMatchObject({
+      state: "recovery_required",
+      archivedAt: expect.any(Number),
+    });
+    expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+      .toMatchObject({ state: "completed" });
+    await restarted.close();
+  });
+
+  test("releases a claimed personal thread when durable adoption collides", async () => {
+    const personalCodex = new FakeCodex();
+    const discovery = new FakePersonalSessionDiscovery();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => personalAdoptionNow,
+      undefined,
+      {},
+      {
+        personalCodex,
+        personalCodexHome,
+        personalDiscovery: discovery,
+      },
+    );
+    const existingOwner = await value.service.execute(
+      { kind: "account.add", label: "Existing thread owner" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: existingOwner.account.id,
+      deviceCode: false,
+    }, { signal });
+    await value.service.execute({
+      kind: "project.add",
+      label: "Adoption collision project",
+      path: value.documents,
+    }, { signal });
+    const existing = await value.service.execute({
+      kind: "session.start",
+      account: existingOwner.account.id,
+      preset: "high",
+      fast: false,
+    }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const adoptingOwner = await value.service.execute(
+      { kind: "account.add", label: "Adopting thread owner" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: adoptingOwner.account.id,
+      deviceCode: false,
+    }, { signal });
+    personalCodex.readProjection = {
+      providerThreadId: existing.session.providerThreadId,
+      title: "Colliding personal thread",
+      status: "idle",
+      projectRoot: value.documents,
+      providerUpdatedAt: personalAdoptionNow - 1_000,
+    };
+    discovery.candidates = [{
+      provider: "codex",
+      providerThreadId: existing.session.providerThreadId,
+      title: "Colliding personal thread",
+      projectRoot: value.documents,
+      updatedAt: personalAdoptionNow - 1_000,
+      liveness: "not_live",
+    }];
+
+    await expect(value.service.execute({
+      kind: "session.adoption.set",
+      provider: "codex",
+      enabled: true,
+      account: adoptingOwner.account.id,
+    }, { signal })).resolves.toMatchObject({
+      discovery: { provider: "codex", state: "ready", adopted: 0, failed: 1 },
+    });
+    expect(personalCodex.calls.filter((call) => call === "claim")).toHaveLength(1);
+    expect(personalCodex.calls.filter((call) => call === "end")).toHaveLength(1);
+    expect(value.store.findSessionByProviderThread(
+      adoptingOwner.account.id,
+      existing.session.providerThreadId,
+    )).toBeNull();
+    expect(value.store.listSessionPersonalRuntimeBindings()).toHaveLength(0);
+    expect(value.store.listSessionAdoptionCandidates({ provider: "codex" })[0])
+      .toMatchObject({ status: "pending" });
+  });
+
+  test("finishes a crash-left detach fence before skipping a quarantined session", async () => {
+    const value = await adoptedCodexFixture(
+      "Adopted detach restart",
+      "personal-thread-detach-restart",
+    );
+    expect(value.store.quarantineSession(value.session.id))
+      .toMatchObject({ state: "recovery_required" });
+    value.store.beginPersonalSessionDetach({ sessionId: value.session.id });
+    await value.service.close();
+
+    const personalCodex = new FakeCodex();
+    const restarted = new HraService({
+      store: value.store,
+      paths: value.paths,
+      codex: new FakeCodex(),
+      personalCodex,
+      personalCodexHome,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      eventCursors: value.eventCursors,
+      now: () => personalAdoptionNow,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    await restarted.settled();
+
+    expect(personalCodex.claimRequests).toHaveLength(0);
+    expect(personalCodex.releasedAuthorities).toHaveLength(1);
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id, true))
+      .toMatchObject({ state: "detached" });
+    await restarted.close();
+  });
+});
 
 describe("HraService", () => {
   test("sets the two device-command switches locally and reports them", async () => {
@@ -1478,7 +5250,10 @@ describe("HraService", () => {
       { kind: "account.add", label: "Project custody" },
       { signal },
     ) as { account: { id: `acct_${string}` } };
-    expect(store.setProfileState(added.account.id, 0, "signed_in")).toBe(true);
+    expect(store.setProfileState(added.account.id, 0, "signed_in", {
+      email: "project-custody@example.com",
+      plan: "Plus",
+    })).toBe(true);
     await service.execute({
       kind: "project.add",
       label: "Custody docs",
@@ -2105,11 +5880,19 @@ describe("HraService", () => {
       status: "terminal",
       title: "List terminal memory",
     }];
+    const localPage = await value.service.execute({
+      account: session.profileId,
+      kind: "session.list",
+      archived: false,
+      limit: 20,
+    }, { signal }) as { nextCursor: string | null };
+    if (localPage.nextCursor === null) throw new Error("Expected a provider-discovery continuation.");
     await value.service.execute({
       account: session.profileId,
       kind: "session.list",
       archived: false,
       limit: 20,
+      cursor: localPage.nextCursor,
     }, { signal });
     expect(value.store.requireSession(sessionId).state).toBe("terminal");
     expect(factsMemory.cleanups).toContainEqual({
@@ -2121,16 +5904,24 @@ describe("HraService", () => {
     const crashFactsMemory = new FakeFactsMemoryLifecycle();
     const otherSession = value.store.upsertProviderSession({
       profileId: session.profileId,
+      provider: "codex",
       providerThreadId: "provider-thread-crash-terminal",
+      preset: "high",
+      fastEnabled: false,
       providerUpdatedAt: 1,
+      providerAccountKey: codexProviderAccountKey(),
       state: "idle",
       title: "Crash terminal memory",
     });
     if (otherSession.providerThreadId === undefined) throw new Error("Expected provider binding.");
     value.store.upsertProviderSession({
       profileId: otherSession.profileId,
+      provider: "codex",
       providerThreadId: otherSession.providerThreadId,
+      preset: "high",
+      fastEnabled: false,
       providerUpdatedAt: (otherSession.providerUpdatedAt ?? 0) + 1,
+      providerAccountKey: codexProviderAccountKey(),
       state: "terminal",
       title: otherSession.title,
     });
@@ -2254,11 +6045,19 @@ describe("HraService", () => {
       status: "idle",
       title: session.title,
     }];
+    const localPage = await value.service.execute({
+      account: profile.id,
+      kind: "session.list",
+      archived: false,
+      limit: 20,
+    }, { signal }) as { nextCursor: string | null };
+    if (localPage.nextCursor === null) throw new Error("Expected a provider-discovery continuation.");
     await value.service.execute({
       account: profile.id,
       kind: "session.list",
       archived: false,
       limit: 20,
+      cursor: localPage.nextCursor,
     }, { signal });
     expect(factsMemory.ensures.at(-1)).toEqual({
       expiresAt: now + FACTS_MEMORY_SESSION_TTL_MS,
@@ -2310,15 +6109,23 @@ describe("HraService", () => {
 
     const poisoned = value.store.upsertProviderSession({
       profileId: profile.id,
+      provider: "codex",
       providerThreadId: "provider-terminal-poisoned",
+      preset: "high",
+      fastEnabled: false,
       providerUpdatedAt: 1,
+      providerAccountKey: codexProviderAccountKey(),
       state: "terminal",
       title: "Poisoned terminal memory",
     });
     const healthy = value.store.upsertProviderSession({
       profileId: profile.id,
+      provider: "codex",
       providerThreadId: "provider-terminal-healthy",
+      preset: "high",
+      fastEnabled: false,
       providerUpdatedAt: 1,
+      providerAccountKey: codexProviderAccountKey(),
       state: "terminal",
       title: "Healthy terminal memory",
     });
@@ -2426,7 +6233,7 @@ describe("HraService", () => {
     expect(after).toMatchObject({ usage: [{ snapshot: { payload: { primary: { usedPercent: 25 } } } }] });
   });
 
-  test("reconciles a changed provider identity before reading below-threshold usage", async () => {
+  test("revokes a changed provider identity before reading below-threshold usage", async () => {
     const { service, codex, store } = await fixture();
     const added = await service.execute({
       kind: "account.add",
@@ -2452,7 +6259,8 @@ describe("HraService", () => {
       kind: "account.usage",
       account: added.account.id,
       refresh: true,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await service.settled();
     expect(codex.calls.slice(callsBefore)).toEqual(["readAccount"]);
     expect(store.latestUsage(added.account.id)).toBeNull();
     expect(codex.resetIdempotencyKeys).toEqual([]);
@@ -2467,7 +6275,7 @@ describe("HraService", () => {
       refresh: false,
     }, { signal })).resolves.toMatchObject({
       usage: [{
-        account: { providerEmail: "other@example.com" },
+        account: { processGeneration: 2, state: "signed_out" },
         automaticReset: { policy: { state: "reconciliation_required" } },
         poll: { state: "never_observed" },
         snapshot: null,
@@ -2502,7 +6310,8 @@ describe("HraService", () => {
       kind: "account.usage",
       account: added.account.id,
       refresh: true,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await service.settled();
     expect(codex.calls.slice(-3)).toEqual(["readAccount", "usage", "readAccount"]);
     expect(store.latestUsage(added.account.id)).toBeNull();
     expect(codex.resetIdempotencyKeys).toEqual([]);
@@ -2679,7 +6488,8 @@ describe("HraService", () => {
       kind: "account.usage",
       account: added.account.id,
       refresh: true,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await service.settled();
     expect(identityChanged).toBe(true);
     expect(codex.calls.slice(callsBefore)).toEqual([
       "readAccount",
@@ -2689,7 +6499,8 @@ describe("HraService", () => {
     ]);
     expect(codex.resetIdempotencyKeys).toEqual([]);
     expect(store.requireProfileById(added.account.id)).toMatchObject({
-      providerEmail: "replacement@example.com",
+      processGeneration: 2,
+      state: "signed_out",
     });
     expect(store.requireAccountRateLimitResetPolicy(added.account.id)).toMatchObject({
       state: "reconciliation_required",
@@ -2706,6 +6517,19 @@ describe("HraService", () => {
       }],
     });
 
+    codex.loginResult = {
+      status: "signed_in",
+      account: {
+        signedIn: true,
+        email: "replacement@example.com",
+        plan: "Plus",
+      },
+    };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
     await expect(service.execute({
       kind: "account.usage",
       account: added.account.id,
@@ -2965,10 +6789,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }]);
     } finally {
       inspector.close(false);
     }
@@ -3811,12 +7635,12 @@ describe("HraService", () => {
       kind: "account.usage",
       account: added.account.id,
       refresh: true,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await service.settled();
     expect(codex.resetIdempotencyKeys).toHaveLength(1);
     expect(store.requireProfileById(added.account.id)).toMatchObject({
-      state: "signed_in",
-      providerEmail: "someone-else@example.com",
-      providerPlan: "Plus",
+      processGeneration: 2,
+      state: "signed_out",
     });
     expect(store.requireAccountRateLimitResetPolicy(added.account.id)).toMatchObject({
       state: "reconciliation_required",
@@ -3833,7 +7657,7 @@ describe("HraService", () => {
       refresh: false,
     }, { signal })).resolves.toMatchObject({
       usage: [{
-        account: { providerEmail: "someone-else@example.com" },
+        account: { processGeneration: 2, state: "signed_out" },
         automaticReset: {
           lastAttempt: null,
           observation: {
@@ -3845,6 +7669,19 @@ describe("HraService", () => {
       }],
     });
 
+    codex.loginResult = {
+      status: "signed_in",
+      account: {
+        signedIn: true,
+        email: "someone-else@example.com",
+        plan: "Plus",
+      },
+    };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
     await expect(service.execute({
       kind: "account.usage",
       account: added.account.id,
@@ -4500,19 +8337,44 @@ describe("HraService", () => {
     expect(store.latestSessionRuntimeProfile(started.session.id)).toMatchObject({ revision: 2, sourceKind: "turn_start" });
   });
 
-  test("holds send and metadata behind the full projection recovery fence without a provider mutation", async () => {
+  test("lets the cloud projection reader reacquire authority while the in-flight fence rejects concurrent mutations", async () => {
     const cloud = new FakeCloud();
     const value = await fixture(undefined, cloud);
     const { sessionId } = await createIdleSession(value, "Projection serialization");
     const recoverySession = value.store.requireSession(sessionId);
     const recoveryProfile = value.store.requireProfileById(recoverySession.profileId);
     if (recoverySession.providerThreadId === undefined) throw new Error("Expected a bound recovery session.");
+    const peerCreated = value.store.createSession({
+      profileId: recoveryProfile.id,
+      title: "Same-account recovery peer",
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const peer = value.store.bindSession({
+      sessionId: peerCreated.id,
+      expectedRevision: peerCreated.revision,
+      providerThreadId: "same-account-recovery-peer",
+      state: "idle",
+    });
+    value.store.bindSessionProviderAccountAuthority({
+      sessionId: peer.id,
+      provider: "codex",
+      runtimeScope: "managed",
+      accountKey: codexProviderAccountKey(),
+    });
     const providerWritesBefore = providerMutationCalls(value.codex);
     let entered!: () => void;
     const recoveryEntered = new Promise<void>((resolve) => { entered = resolve; });
     let release!: () => void;
     const recoveryGate = new Promise<void>((resolve) => { release = resolve; });
     cloud.beforeProjectionRecoveryReturn = async () => {
+      await expect(value.service.readSessionProjectionForCloud(
+        sessionId,
+        signal,
+      )).resolves.toMatchObject({
+        providerThreadId: recoverySession.providerThreadId,
+      });
       await value.service.observeCodexFact({
         codexHome: "unused",
         desktopUserData: "unused",
@@ -4523,12 +8385,6 @@ describe("HraService", () => {
         threadId: recoverySession.providerThreadId as string,
         type: "threadNameUpdated",
       });
-      await value.service.observeCodexAccount({
-        codexHome: "unused",
-        desktopUserData: "unused",
-        generation: recoveryProfile.processGeneration,
-        id: recoveryProfile.id,
-      }, { signedIn: false });
       entered();
       await recoveryGate;
     };
@@ -4541,24 +8397,30 @@ describe("HraService", () => {
     }, { signal });
     await recoveryEntered;
 
-    let sendSettled = false;
-    const send = value.service.execute({
+    await expect(value.service.execute({
+      acknowledgeGap: true,
+      idempotencyKey: "00000000-0000-4000-8000-000000000804",
+      kind: "sync.projection-recover",
+      session: peer.id,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({
+      kind: "session.note.set",
+      note: "must remain fenced with its account peer",
+      session: peer.id,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({
       idempotencyKey: "00000000-0000-4000-8000-000000000802",
       kind: "session.send",
       message: "after recovery",
       session: sessionId,
-    }, { signal }).finally(() => { sendSettled = true; });
-    let metadataSettled = false;
-    const metadata = value.service.execute({
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({
       idempotencyKey: "00000000-0000-4000-8000-000000000803",
       kind: "session.note.set",
       note: "after recovery",
       session: sessionId,
-    }, { signal }).finally(() => { metadataSettled = true; });
-    await Bun.sleep(5);
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
 
-    expect(sendSettled).toBe(false);
-    expect(metadataSettled).toBe(false);
     expect(value.store.requireSession(sessionId)).toMatchObject({
       note: "",
       title: recoverySession.title,
@@ -4574,9 +8436,105 @@ describe("HraService", () => {
 
     release();
     await expect(recovery).resolves.toBe(cloud.projectionRecoveryResult);
-    await Promise.all([send, metadata]);
+    await expect(value.service.execute({
+      idempotencyKey: "00000000-0000-4000-8000-000000000802",
+      kind: "session.send",
+      message: "after recovery",
+      session: sessionId,
+    }, { signal })).resolves.toBeDefined();
+    await expect(value.service.execute({
+      idempotencyKey: "00000000-0000-4000-8000-000000000803",
+      kind: "session.note.set",
+      note: "after recovery",
+      session: sessionId,
+    }, { signal })).resolves.toBeDefined();
     expect(value.store.requireSession(sessionId).note).toBe("after recovery");
     expect(value.codex.calls.filter((call) => call === "send")).toHaveLength(1);
+  });
+
+  test("fences manual, autorespond, and deadline interaction effects during projection recovery", async () => {
+    let now = 125_000;
+    const cloud = new FakeCloud();
+    const value = await fixture(
+      undefined,
+      cloud,
+      () => undefined,
+      () => now,
+    );
+    const { sessionId } = await createIdleSession(value, "Projection interaction fence");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    const manual = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "projection-manual-fence",
+      { requestedAt: now, deadlineAt: now + 10_000 },
+    );
+    let entered!: () => void;
+    const recoveryEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const recoveryGate = new Promise<void>((resolve) => { release = resolve; });
+    cloud.beforeProjectionRecoveryReturn = async () => {
+      entered();
+      await recoveryGate;
+    };
+    const recovery = value.service.execute({
+      acknowledgeGap: true,
+      idempotencyKey: "00000000-0000-4000-8000-000000000805",
+      kind: "sync.projection-recover",
+      session: sessionId,
+    }, { signal });
+    await recoveryEntered;
+
+    await expect(value.service.execute({
+      kind: "interaction.resolve",
+      interaction: manual.interaction.publicId,
+      expectedRevision: manual.interaction.revision,
+      resolution: { kind: "approval_decision", decision: "once" },
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+
+    const deadline = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "projection-deadline-fence",
+      { requestedAt: now, deadlineAt: now + 1 },
+    );
+    now += 1;
+    await expect(value.service.maintainInteractionDeadlines()).resolves.toEqual({
+      examined: 1,
+      failed: 1,
+    });
+
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const automatic = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "projection-autorespond-fence",
+      { requestedAt: now, deadlineAt: now + 10_000 },
+    );
+    const evidenceDeadline = Date.now() + 2_000;
+    while (value.store.listAutorespondEvidence({ sessionId }).length === 0) {
+      if (Date.now() >= evidenceDeadline) {
+        throw new Error("Timed out waiting for fenced autorespond evidence.");
+      }
+      await Bun.sleep(5);
+    }
+
+    expect(value.codex.validatedInteractions).toEqual([]);
+    expect(value.codex.resolvedInteractions).toEqual([]);
+    expect(value.codex.validatedInteractionTimeouts).toEqual([]);
+    expect(value.codex.timedOutInteractions).toEqual([]);
+    expect(value.store.requireInteraction(manual.interaction.publicId).state).toBe("pending");
+    expect(value.store.requireInteraction(deadline.interaction.publicId).state).toBe("pending");
+    expect(value.store.requireInteraction(automatic.interaction.publicId).state).toBe("pending");
+    expect(value.store.listAutorespondEvidence({ sessionId })).toMatchObject([{
+      interactionId: automatic.interaction.publicId,
+      outcome: "refused",
+    }]);
+    expect(value.store.requireProfileById(profile.id).state).toBe("signed_in");
+
+    release();
+    await expect(recovery).resolves.toBe(cloud.projectionRecoveryResult);
   });
 
   test("routes same-key projection recovery replay through the same closed cloud seam", async () => {
@@ -4667,11 +8625,6 @@ describe("HraService", () => {
       idempotencyKey: "00000000-0000-4000-8000-000000000812",
       kind: "account.logout",
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    value.codex.accountProjection = { signedIn: false };
-    await expect(value.service.execute({
-      account: profile.id,
-      kind: "account.show",
-    }, { signal })).resolves.toMatchObject({ recovery: { cleared: false, required: true } });
     expect(value.store.requireProfileById(profile.id).state).toBe("signed_in");
     value.codex.listedProjections = [{
       providerThreadId: sessionBefore.providerThreadId as string,
@@ -4704,9 +8657,6 @@ describe("HraService", () => {
       generation: profile.processGeneration,
       id: profile.id,
     } as const;
-    await value.service.observeCodexAccount(observerAuthority, {
-      signedIn: false,
-    });
     value.codex.readProjection = {
       ...value.codex.readProjection,
       activeTurnId: "foreign-active-turn",
@@ -4714,16 +8664,12 @@ describe("HraService", () => {
       status: "active",
     };
     const beforeBlockedShow = value.store.requireSession(sessionId);
-    const blockedShow = await value.service.execute({
+    await expect(value.service.execute({
       detail: false,
       kind: "session.show",
       session: sessionId,
-    }, { signal });
-    expect(blockedShow).toMatchObject({
-      recovery: { cleared: false, required: true },
-      session: beforeBlockedShow,
-    });
-    expect(blockedShow).not.toHaveProperty("projection");
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.store.requireSession(sessionId)).toEqual(beforeBlockedShow);
     await value.service.observeCodexFact(observerAuthority, {
       status: { type: "systemError" },
       threadId: sessionBefore.providerThreadId as string,
@@ -4889,7 +8835,7 @@ describe("HraService", () => {
       generation: profile.processGeneration,
       id: profile.id,
     };
-    const connectionId = "32000000-0000-4000-8000-000000000099";
+    const connectionId = value.codex.observationConnectionId;
     let entered!: () => void;
     const recoveryEntered = new Promise<void>((resolve) => { entered = resolve; });
     let release!: () => void;
@@ -5446,10 +9392,14 @@ describe("HraService", () => {
     const project = await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal }) as { project: { id: string } };
     const imported = store.upsertProviderSession({
       profileId: added.account.id,
+      provider: "codex",
       providerThreadId: "provider-thread",
+      preset: "high",
+      fastEnabled: false,
       title: "Imported without project",
       state: "idle",
       providerUpdatedAt: 10,
+      providerAccountKey: codexProviderAccountKey(),
     });
     const queued = await service.execute({ kind: "session.queue", session: imported.id, message: "run after project" }, { signal }) as { queued: { id: `queue_${string}` } };
     await service.settled();
@@ -6505,11 +10455,19 @@ describe("HraService", () => {
       status: "terminal",
       providerUpdatedAt: (session.providerUpdatedAt ?? 0) + 1,
     }];
+    const localPage = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: profile.id,
+      limit: 100,
+    }, { signal }) as { nextCursor: string | null };
+    if (localPage.nextCursor === null) throw new Error("Expected a provider-discovery continuation.");
     await value.service.execute({
       kind: "session.list",
       archived: false,
       account: profile.id,
       limit: 100,
+      cursor: localPage.nextCursor,
     }, { signal });
     expect(value.store.requireSession(sessionId).state).toBe("terminal");
 
@@ -7064,25 +11022,21 @@ describe("HraService", () => {
       path: documents,
     }, { signal }) as { project: { id: `proj_${string}` } };
     const created = Array.from({ length: 103 }, (_, index) => {
-      const session = store.createSession({
+      const active = index >= 100;
+      const session = store.upsertProviderSession({
         profileId: added.account.id,
         projectId: project.project.id,
+        provider: "codex",
+        providerThreadId: `provider-recovery-${String(index)}`,
         title: `Recovery ${String(index)}`,
         preset: "high",
         fastEnabled: false,
+        state: active ? "active" : "idle",
+        ...(active ? { activeTurnId: `turn-${String(index)}` } : {}),
+        providerAccountKey: codexProviderAccountKey(),
       });
-      return { index, session };
+      return { active, index, session };
     }).toSorted((left, right) => left.session.id.localeCompare(right.session.id));
-    const active = new Set(created.slice(-3).map(({ session }) => session.id));
-    for (const { index, session } of created) {
-      store.bindSession({
-        sessionId: session.id,
-        expectedRevision: session.revision,
-        providerThreadId: `provider-recovery-${String(index)}`,
-        state: active.has(session.id) ? "active" : "idle",
-        ...(active.has(session.id) ? { activeTurnId: `turn-${String(index)}` } : {}),
-      });
-    }
     codex.beforeObserveReturn = async () => await Bun.sleep(2);
 
     const readiness = await Promise.race([
@@ -7091,9 +11045,9 @@ describe("HraService", () => {
     ]);
     expect(readiness).toBe("ready");
     await service.settled();
-    for (const { index, session } of created.slice(-3)) {
+    for (const { active, index } of created.filter((entry) => entry.active)) {
       expect(codex.observedThreads).toContain(`provider-recovery-${String(index)}`);
-      expect(active.has(session.id)).toBe(true);
+      expect(active).toBe(true);
     }
     expect(codex.maximumConcurrentObservations).toBe(1);
   });
@@ -7339,10 +11293,10 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "logout")).toHaveLength(1);
 
     delete codex.logoutError;
-    codex.accountProjection = { signedIn: true, email: "reconciled@example.com", plan: "Pro" };
+    codex.accountProjection = { signedIn: true, email: "person@example.com", plan: "Pro" };
     expect(await service.execute({ kind: "account.show", account: added.account.id }, { signal })).toMatchObject({
-      account: { state: "signed_in", processGeneration: 1, providerEmail: "reconciled@example.com" },
-      providerProjection: { signedIn: true, email: "reconciled@example.com" },
+      account: { state: "signed_in", processGeneration: 1, providerEmail: "person@example.com" },
+      providerProjection: { signedIn: true, email: "person@example.com" },
       recovery: { required: false, cleared: true, resolution: "provider_state_reconciled" },
     });
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
@@ -7399,8 +11353,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "3a000000-0000-4000-8000-000000000001";
-    value.codex.observationConnectionId = connectionId;
+    const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact(authority, {
       type: "turnStarted",
       connectionId,
@@ -7477,8 +11430,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "30000000-0000-4000-8000-000000000001";
-    value.codex.observationConnectionId = connectionId;
+    const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact(authority, {
       type: "itemStarted",
       connectionId,
@@ -7864,9 +11816,13 @@ describe("HraService", () => {
 
     const terminalSession = value.store.upsertProviderSession({
       profileId: profile.id,
+      provider: "codex",
       providerThreadId: "provider-terminal-observation",
+      preset: "high",
+      fastEnabled: false,
       title: "Terminal provider observation",
       state: "terminal",
+      providerAccountKey: codexProviderAccountKey(),
     });
     const terminal = sessionStatusSchema.parse(await value.service.execute({
       kind: "session.status",
@@ -7929,7 +11885,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "30000000-0000-4000-8000-000000000002";
+    const connectionId = value.codex.observationConnectionId;
     const providerArgumentsSecret = "MCP-ARGUMENT-SECRET-MUST-NOT-PERSIST";
     const providerResultSecret = "MCP-RESULT-SECRET-MUST-NOT-PERSIST";
     const providerItem = {
@@ -8054,7 +12010,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "32000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     factsMemory.ensures.length = 0;
     await value.service.observeCodexFact(authority, {
       type: "turnStarted",
@@ -8177,7 +12133,7 @@ describe("HraService", () => {
     });
     await value.service.observeCodexFact(authority, {
       ...parsed,
-      connectionId: "31000000-0000-4000-8000-000000000001",
+      connectionId: value.codex.observationConnectionId,
     });
     const command = {
       kind: "session.events",
@@ -8211,7 +12167,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "32000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     const observe = async (fact: CodexFact): Promise<void> =>
       await value.service.observeCodexFact(authority, { ...fact, connectionId });
 
@@ -8359,7 +12315,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "33000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     await expect(value.service.observeCodexFact(authority, {
       type: "interactionRequested",
       connectionId,
@@ -8666,7 +12622,7 @@ describe("HraService", () => {
     const provider = {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
-      connectionId: "40000000-0000-4000-8000-000000000001",
+      connectionId: value.codex.observationConnectionId,
       requestId: { type: "string" as const, value: "approval-request-1" },
       method: "item/commandExecution/requestApproval",
       requestDigest: "a".repeat(64),
@@ -9401,7 +13357,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "42000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     const requests = [
       {
         kind: "command_approval" as const,
@@ -9526,7 +13482,7 @@ describe("HraService", () => {
       desktopUserData: "unused",
     };
     const providerThreadId = session.providerThreadId;
-    const connectionId = "43000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     const cases = [
       {
         kind: "command_approval" as const,
@@ -9713,7 +13669,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "44000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
       connectionId,
@@ -9774,14 +13730,14 @@ describe("HraService", () => {
     const now = () => {
       if (postValidationRead === null) return baseNow;
       postValidationRead += 1;
-      return postValidationRead === 1 ? 90_999 : 91_000;
+      return postValidationRead <= 2 ? 90_999 : 91_000;
     };
     const value = await fixture(undefined, new FakeCloud(), () => undefined, now);
     const { sessionId } = await createIdleSession(value, "Deadline prepare edge");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const connectionId = "45000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact({
       id: profile.id,
       generation: profile.processGeneration,
@@ -9821,14 +13777,19 @@ describe("HraService", () => {
     value.codex.beforeValidateInteractionResolutionReturn = async () => {
       postValidationRead = 0;
     };
-    await expect(value.service.execute({
+    const deadlineFailure = await value.service.execute({
       kind: "interaction.resolve",
       interaction: interaction.publicId,
       expectedRevision: interaction.revision,
       resolution: { kind: "approval_decision", decision: "once" },
-    }, { signal })).rejects.toMatchObject({
-      code: "CONFLICT",
-      details: { interaction: { state: "expired", revision: 5 } },
+    }, { signal }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(deadlineFailure).toBeInstanceOf(CommandFailure);
+    expect(deadlineFailure).toMatchObject({ code: "CONFLICT" });
+    expect((deadlineFailure as CommandFailure).details).toMatchObject({
+      interaction: { state: "expired", revision: 5 },
     });
     expect(value.codex.validatedInteractions).toHaveLength(1);
     expect(value.codex.validatedInteractionTimeouts).toHaveLength(1);
@@ -9840,6 +13801,154 @@ describe("HraService", () => {
       revision: 5,
       deadlineAt: 91_000,
     });
+    await value.service.close();
+  });
+
+  test("settles a manual response unknown when account authority changes after the provider write", async () => {
+    const now = 95_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Interaction post-write account fence");
+    const seeded = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "interaction-post-write-account-fence",
+      { requestedAt: now, deadlineAt: now + 1_000 },
+    );
+    const queued = value.store.enqueue(sessionId, "must fence with the account callback");
+    let callbackFence: {
+      interactionState: string;
+      profileState: string;
+      queueState: string;
+      sessionState: string;
+    } | undefined;
+    let finishRelease!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    value.codex.beforeReleaseOwnedAuthorityReturn = async () => await releaseGate;
+    value.codex.beforeResolveInteractionReturn = async () => {
+      value.codex.accountProjection = {
+        signedIn: true,
+        email: "replacement-after-response@example.com",
+        plan: "Plus",
+      };
+      await expect(value.service.observeCodexAccount(
+        seeded.authority,
+        value.codex.accountProjection,
+      )).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      callbackFence = {
+        interactionState: value.store.requireInteraction(seeded.interaction.publicId).state,
+        profileState: value.store.requireProfileById(seeded.authority.id).state,
+        queueState: value.store.requireQueue(queued.id).state,
+        sessionState: value.store.requireSession(sessionId).state,
+      };
+    };
+
+    await expect(value.service.execute({
+      kind: "interaction.resolve",
+      interaction: seeded.interaction.publicId,
+      expectedRevision: seeded.interaction.revision,
+      resolution: { kind: "approval_decision", decision: "once" },
+    }, { signal })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      details: {
+        interaction: {
+          id: seeded.interaction.publicId,
+          state: "resolution_unknown",
+        },
+      },
+    });
+    expect(value.codex.resolvedInteractions).toHaveLength(1);
+    expect(value.store.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+      state: "resolution_unknown",
+      intendedTerminalState: "resolved",
+    });
+    finishRelease();
+    expect(callbackFence).toEqual({
+      interactionState: "resolution_unknown",
+      profileState: "recovery_required",
+      queueState: "cancelled",
+      sessionState: "recovery_required",
+    });
+    await value.service.settled();
+    await value.service.close();
+  });
+
+  test("settles a deadline timeout unknown when account authority changes after its provider write", async () => {
+    let now = 96_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Deadline timeout post-write account fence");
+    const seeded = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "deadline-timeout-post-write-account-fence",
+      { requestedAt: now, deadlineAt: now + 1_000 },
+    );
+    value.codex.beforeResolveInteractionReturn = async () => {
+      now = 97_000;
+    };
+    value.codex.resolveInteractionError = new CodexError(
+      "DEADLINE_EXPIRED",
+      "the final manual write reached its deadline",
+    );
+    value.codex.beforeTimeoutInteractionReturn = async () => {
+      value.codex.accountProjection = {
+        signedIn: true,
+        email: "replacement-after-deadline-timeout@example.com",
+        plan: "Plus",
+      };
+    };
+
+    await expect(value.service.execute({
+      kind: "interaction.resolve",
+      interaction: seeded.interaction.publicId,
+      expectedRevision: seeded.interaction.revision,
+      resolution: { kind: "approval_decision", decision: "once" },
+    }, { signal })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      details: {
+        interaction: {
+          id: seeded.interaction.publicId,
+          state: "resolution_unknown",
+        },
+      },
+    });
+    expect(value.codex.timedOutInteractions).toHaveLength(1);
+    expect(value.store.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+      state: "resolution_unknown",
+      intendedTerminalState: "expired",
+    });
+    await value.service.settled();
+    await value.service.close();
+  });
+
+  test("settles maintenance timeout unknown when account authority changes after its provider write", async () => {
+    let now = 98_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Maintenance timeout post-write account fence");
+    const seeded = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "maintenance-timeout-post-write-account-fence",
+      { requestedAt: now, deadlineAt: now + 1_000 },
+    );
+    value.codex.beforeTimeoutInteractionReturn = async () => {
+      value.codex.accountProjection = {
+        signedIn: true,
+        email: "replacement-after-maintenance-timeout@example.com",
+        plan: "Plus",
+      };
+    };
+    now = 99_000;
+
+    await expect(value.service.maintainInteractionDeadlines())
+      .resolves.toEqual({ examined: 1, failed: 0 });
+    expect(value.codex.timedOutInteractions).toHaveLength(1);
+    expect(value.store.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+      state: "resolution_unknown",
+      intendedTerminalState: "expired",
+    });
+    await value.service.settled();
     await value.service.close();
   });
 
@@ -9856,7 +13965,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "46000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     const admit = async (requestId: string, requestedAt: number, deadlineAt: number) => {
       await value.service.observeCodexFact(authority, {
         type: "interactionRequested",
@@ -10189,7 +14298,7 @@ describe("HraService", () => {
       "AUTHORITY_STALE",
       "injected stale provider",
     );
-    const connectionId = "43000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
       connectionId,
@@ -10239,7 +14348,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "45000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     const request = async (requestId: string) => {
       const provider = {
         profileId: profile.id,
@@ -10365,7 +14474,7 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "50000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     const request = async (requestId: string) => {
       const provider = {
         profileId: profile.id,
@@ -10432,6 +14541,7 @@ describe("HraService", () => {
       generation: authority.generation + 1,
     };
     const replacementConnectionId = "50000000-0000-4000-8000-000000000099";
+    value.codex.observationConnectionId = replacementConnectionId;
     await value.service.observeCodexFact(replacementAuthority, {
       type: "itemStarted",
       connectionId: replacementConnectionId,
@@ -10493,7 +14603,7 @@ describe("HraService", () => {
   test("clean shutdown retires every live provider generation when runtime close emits no disconnect fact", async () => {
     const value = await fixture();
     const { sessionId } = await createIdleSession(value, "Clean interaction shutdown");
-    const connectionId = "51000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     const seeded = seedUnsettledInteractionStates(
       value,
       sessionId,
@@ -10565,6 +14675,7 @@ describe("HraService", () => {
     expect(restartedCodex.resolvedInteractions).toHaveLength(0);
 
     const replacementConnectionId = "51000000-0000-4000-8000-000000000099";
+    restartedCodex.observationConnectionId = replacementConnectionId;
     const replacementAuthority = {
       ...authority,
       generation: originalGeneration + 1,
@@ -10784,7 +14895,7 @@ describe("HraService autorespond", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
-    const connectionId = "46000000-0000-4000-8000-000000000001";
+    const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
       connectionId,

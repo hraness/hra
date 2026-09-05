@@ -21,7 +21,10 @@ import {
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { StateStore } from "../storage/state-store";
 import {
+  ClaudeProcessExitUnprovenError,
+  ClaudeSessionObservationError,
   UnavailableCloudControl,
+  type ClaudeProcessIdentity,
   type ClaudeRuntimePort,
   type ClaudeRuntimeStartReview,
   type CodexAccountProjection,
@@ -76,6 +79,8 @@ class SwitchFakeCodex implements CodexRuntimePort {
   readonly provider = "codex" as const;
   readonly calls: string[] = [];
   readonly endedThreads: string[] = [];
+  beforeEndSessionReturn?: () => Promise<void> | void;
+  beforeLogoutReturn?: () => Promise<void> | void;
   turnStatus: "completed" | "inProgress" = "completed";
   #turns = 0;
   projection: CodexSessionProjection = {
@@ -91,7 +96,10 @@ class SwitchFakeCodex implements CodexRuntimePort {
   async readAccount(): Promise<CodexAccountProjection> {
     return { signedIn: true, email: "person@example.com" };
   }
-  async logout(): Promise<void> {}
+  async logout(): Promise<void> {
+    this.calls.push("logout");
+    await this.beforeLogoutReturn?.();
+  }
   async close(): Promise<void> {}
   async reviewSessionStart(
     input: Parameters<CodexRuntimePort["reviewSessionStart"]>[0],
@@ -126,6 +134,7 @@ class SwitchFakeCodex implements CodexRuntimePort {
   async endSession(input: Parameters<CodexRuntimePort["endSession"]>[0]): Promise<void> {
     this.calls.push("end-session");
     this.endedThreads.push(input.providerThreadId);
+    await this.beforeEndSessionReturn?.();
   }
   async reviewTurnStart(
     input: Parameters<CodexRuntimePort["reviewTurnStart"]>[0],
@@ -184,7 +193,30 @@ class SwitchFakeCodex implements CodexRuntimePort {
 class SwitchFakeClaude implements ClaudeRuntimePort {
   readonly provider = "claude" as const;
   readonly calls: string[] = [];
+  readonly claimRequests: Array<Parameters<ClaudeRuntimePort["claimSession"]>[0]> = [];
+  readonly endRequests: Array<Parameters<ClaudeRuntimePort["endSession"]>[0]> = [];
+  readonly endedProcessIdentities: ClaudeProcessIdentity[] = [];
+  readonly identityRequests: Array<
+    Parameters<ClaudeRuntimePort["readSessionProcessIdentity"]>[0]
+  > = [];
+  readonly observeRequests: Array<Parameters<ClaudeRuntimePort["observeSession"]>[0]> = [];
+  readonly startSessionRequests: Array<Parameters<ClaudeRuntimePort["startSession"]>[0]> = [];
   readonly seededMessages: string[] = [];
+  beforeStartSessionAdmission?: (
+    input: Parameters<ClaudeRuntimePort["startSession"]>[0],
+  ) => Promise<void> | void;
+  beforeStartSessionReturn?: () => Promise<void> | void;
+  beforeStartTurnReturn?: () => Promise<void> | void;
+  connectionId = "30000000-0000-4000-8000-000000000002";
+  connectionIdOnClaim?: string;
+  controllerLive = true;
+  disconnectOnObserveRequest?: number;
+  processIdentity: ClaudeProcessIdentity = {
+    pid: 64_001,
+    pidDomain: "darwin",
+    procStart: "switch-claude-initial",
+  };
+  processIdentityOnClaim?: ClaudeProcessIdentity;
   startSessionError?: Error;
   #turns = 0;
   projection: CodexSessionProjection = {
@@ -213,15 +245,64 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
     input: Parameters<ClaudeRuntimePort["startSession"]>[0],
   ): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveClaudeRuntimeProfile }> {
     this.calls.push("start-session");
+    this.startSessionRequests.push(input);
     if (this.startSessionError !== undefined) throw this.startSessionError;
+    if (input.providerThreadId !== undefined) {
+      this.projection = { ...this.projection, providerThreadId: input.providerThreadId };
+    }
+    await this.beforeStartSessionAdmission?.(input);
+    await input.admitProcessIdentity?.(this.processIdentity);
+    await this.beforeStartSessionReturn?.();
+    this.controllerLive = true;
     return { ...this.projection, effectiveRuntimeProfile: input.review.effectiveRuntimeProfile };
+  }
+  async claimSession(
+    input: Parameters<ClaudeRuntimePort["claimSession"]>[0],
+  ): ReturnType<ClaudeRuntimePort["claimSession"]> {
+    this.calls.push("claim-session");
+    this.claimRequests.push(input);
+    this.controllerLive = true;
+    if (this.processIdentityOnClaim !== undefined) {
+      this.processIdentity = this.processIdentityOnClaim;
+      delete this.processIdentityOnClaim;
+    }
+    if (this.connectionIdOnClaim !== undefined) {
+      this.connectionId = this.connectionIdOnClaim;
+      delete this.connectionIdOnClaim;
+    }
+    await input.admitProcessIdentity?.(this.processIdentity);
+    this.projection = {
+      ...this.projection,
+      providerThreadId: input.providerThreadId,
+      projectRoot: input.projectRoot,
+      status: "idle",
+      title: input.title,
+    };
+    delete (this.projection as { activeTurnId?: string }).activeTurnId;
+    return {
+      ...this.projection,
+      effectiveRuntimeProfile: claudeProfile(input.authority),
+    };
+  }
+  async readSessionProcessIdentity(
+    input: Parameters<ClaudeRuntimePort["readSessionProcessIdentity"]>[0],
+  ): ReturnType<ClaudeRuntimePort["readSessionProcessIdentity"]> {
+    this.calls.push("read-identity");
+    this.identityRequests.push(input);
+    return this.processIdentity;
   }
   async observeSession(
     input: Parameters<ClaudeRuntimePort["observeSession"]>[0],
   ): Promise<CodexSessionObservation> {
     this.calls.push("observe");
+    this.observeRequests.push(input);
+    if (this.disconnectOnObserveRequest === this.observeRequests.length) {
+      this.controllerLive = false;
+      throw new ClaudeSessionObservationError();
+    }
+    if (!this.controllerLive) throw new ClaudeSessionObservationError();
     return {
-      connectionId: "30000000-0000-4000-8000-000000000002",
+      connectionId: this.connectionId,
       projection: { ...this.projection, providerThreadId: input.providerThreadId },
       resumed: false,
     };
@@ -230,7 +311,14 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
     this.calls.push("read");
     return this.projection;
   }
-  async endSession(): Promise<void> { this.calls.push("end-session"); }
+  async endSession(
+    input: Parameters<ClaudeRuntimePort["endSession"]>[0],
+  ): Promise<void> {
+    this.calls.push("end-session");
+    this.endRequests.push(input);
+    this.endedProcessIdentities.push(this.processIdentity);
+    this.controllerLive = false;
+  }
   async reviewTurnStart(
     input: Parameters<ClaudeRuntimePort["reviewTurnStart"]>[0],
   ): Promise<ClaudeRuntimeStartReview> {
@@ -249,6 +337,7 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
     effectiveRuntimeProfile: EffectiveClaudeRuntimeProfile;
   }> {
     this.calls.push("start-turn");
+    await this.beforeStartTurnReturn?.();
     this.seededMessages.push(input.message);
     this.#turns += 1;
     return {
@@ -415,6 +504,7 @@ describe("provider portability", () => {
       status: "completed",
       type: "itemCompleted",
     });
+    await value.service.settled();
 
     const transcript = await transcriptOf(value, sessionId);
     const kinds = transcript.records.map((record) => record.kind);
@@ -463,7 +553,7 @@ describe("provider portability", () => {
     const session = value.store.requireSession(sessionId);
     expect(session.provider).toBe("claude");
     expect(session.preset).toBe("fable-max");
-    expect(session.providerThreadId).toBe("claude-thread-1");
+    expect(session.providerThreadId).toMatch(/^[0-9a-f-]{36}$/u);
     // The outgoing provider was released, and its thread was not deleted.
     expect(value.codex.endedThreads).toEqual(["codex-thread-1"]);
 
@@ -496,6 +586,164 @@ describe("provider portability", () => {
       { signal },
     );
     expect(value.claude.seededMessages.at(-1)).toBe("carry on");
+  });
+
+  test("holds the destination account lock through a cross-account provider switch", async () => {
+    const value = await fixture();
+    const { sessionId } = await codexSession(value);
+    const target = await value.service.execute(
+      { kind: "account.add", label: "Target" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute(
+      { account: target.account.id, deviceCode: false, kind: "account.login" },
+      { signal },
+    );
+    const targetGeneration = value.store
+      .requireProfileById(target.account.id).processGeneration;
+
+    const events: string[] = [];
+    let targetStartEntered!: () => void;
+    const targetStarted = new Promise<void>((resolve) => { targetStartEntered = resolve; });
+    let releaseTargetStart!: () => void;
+    const targetStartGate = new Promise<void>((resolve) => { releaseTargetStart = resolve; });
+    value.claude.beforeStartSessionReturn = async () => {
+      events.push("target-start");
+      targetStartEntered();
+      await targetStartGate;
+    };
+    value.codex.beforeEndSessionReturn = () => { events.push("source-release"); };
+    value.claude.beforeStartTurnReturn = () => { events.push("seed"); };
+    value.codex.beforeLogoutReturn = () => { events.push("logout"); };
+
+    let switching: Promise<unknown> | undefined;
+    let logout: Promise<unknown> | undefined;
+    try {
+      switching = value.service.execute({
+        account: target.account.id,
+        idempotencyKey: crypto.randomUUID(),
+        kind: "session.switch",
+        provider: "claude",
+        session: sessionId,
+      }, { signal });
+      await targetStarted;
+
+      let logoutSettled = false;
+      logout = value.service.execute({
+        account: target.account.id,
+        idempotencyKey: crypto.randomUUID(),
+        kind: "account.logout",
+      }, { signal }).finally(() => { logoutSettled = true; });
+      await Bun.sleep(0);
+
+      expect(logoutSettled).toBe(false);
+      expect(value.codex.calls.filter((call) => call === "logout")).toHaveLength(0);
+      expect(value.store.requireProfileById(target.account.id)).toMatchObject({
+        processGeneration: targetGeneration,
+        state: "signed_in",
+      });
+
+      releaseTargetStart();
+      const switched = await switching as {
+        to: { account: `acct_${string}`; preset: string; provider: string };
+      };
+      await logout;
+
+      expect(switched.to).toEqual({
+        account: target.account.id,
+        preset: "fable-max",
+        provider: "claude",
+      });
+      expect(events).toEqual(["target-start", "source-release", "seed", "logout"]);
+      expect(value.codex.endedThreads).toEqual(["codex-thread-1"]);
+      const switchedSession = value.store.requireSession(sessionId);
+      expect(switchedSession).toMatchObject({
+        profileId: target.account.id,
+        provider: "claude",
+      });
+      expect(switchedSession.providerThreadId).toMatch(/^[0-9a-f-]{36}$/u);
+      expect(value.store.latestSessionRuntimeProfile(sessionId)?.profile).toMatchObject({
+        processGeneration: targetGeneration,
+        profileId: target.account.id,
+      });
+    } finally {
+      releaseTargetStart();
+      await Promise.allSettled([
+        ...(switching === undefined ? [] : [switching]),
+        ...(logout === undefined ? [] : [logout]),
+      ]);
+    }
+  });
+
+  test("releases and resumes a switched-in Claude child lost before seeding", async () => {
+    const value = await fixture();
+    const { accountId, sessionId } = await codexSession(value);
+    await value.service.execute(
+      {
+        idempotencyKey: crypto.randomUUID(),
+        kind: "session.send",
+        message: "preserve this context",
+        session: sessionId,
+      },
+      { signal },
+    );
+    const initialIdentity = value.claude.processIdentity;
+    const replacementIdentity: ClaudeProcessIdentity = {
+      pid: 64_002,
+      pidDomain: "darwin",
+      procStart: "switch-claude-replacement",
+    };
+    const replacementConnectionId = "30000000-0000-4000-8000-000000000003";
+    value.claude.disconnectOnObserveRequest = 1;
+    value.claude.processIdentityOnClaim = replacementIdentity;
+    value.claude.connectionIdOnClaim = replacementConnectionId;
+
+    const switched = await value.service.execute(
+      {
+        idempotencyKey: crypto.randomUUID(),
+        kind: "session.switch",
+        provider: "claude",
+        session: sessionId,
+      },
+      { signal },
+    ) as { seed: { delivered: boolean } };
+
+    const switchedSession = value.store.requireSession(sessionId);
+    const claudeThreadId = switchedSession.providerThreadId;
+    if (claudeThreadId === undefined) throw new Error("Expected a bound Claude session.");
+    expect(claudeThreadId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(switched.seed.delivered).toBe(true);
+    expect(value.claude.endRequests).toHaveLength(1);
+    expect(value.claude.endRequests[0]?.providerThreadId).toBe(claudeThreadId);
+    expect(value.claude.endedProcessIdentities).toEqual([initialIdentity]);
+    expect(value.claude.claimRequests).toHaveLength(1);
+    expect(value.claude.claimRequests[0]).toMatchObject({
+      providerThreadId: claudeThreadId,
+      sourceLiveness: "not_live",
+      title: "New session",
+    });
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: claudeThreadId,
+      profileId: accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity: replacementIdentity,
+      sessionId,
+      state: "bound",
+    });
+
+    const firstObservation = value.claude.calls.indexOf("observe");
+    const release = value.claude.calls.indexOf("end-session", firstObservation + 1);
+    const claim = value.claude.calls.indexOf("claim-session", release + 1);
+    const replacementObservation = value.claude.calls.indexOf("observe", claim + 1);
+    const seedDelivery = value.claude.calls.indexOf("start-turn", replacementObservation + 1);
+    expect(firstObservation).toBeGreaterThanOrEqual(0);
+    expect(release).toBeGreaterThan(firstObservation);
+    expect(claim).toBeGreaterThan(release);
+    expect(replacementObservation).toBeGreaterThan(claim);
+    expect(seedDelivery).toBeGreaterThan(replacementObservation);
+    expect(value.claude.seededMessages).toHaveLength(1);
+    expect(value.claude.seededMessages[0]).toContain("[HRA provider handoff]");
   });
 
   test("refuses a switch during an active turn and a preset the target cannot run", async () => {
@@ -545,6 +793,131 @@ describe("provider portability", () => {
     );
     expect(value.store.requireSession(sessionId).provider).toBe("claude");
     expect(value.codex.endedThreads).toEqual(["codex-thread-1"]);
+  });
+
+  test("stages target Claude launch authority before admission and binds it atomically", async () => {
+    const value = await fixture();
+    const { accountId, sessionId } = await codexSession(value);
+    let stagedProviderThreadId: string | undefined;
+    let stagedIntentId: string | undefined;
+    value.claude.beforeStartSessionAdmission = (input) => {
+      stagedProviderThreadId = input.providerThreadId;
+      if (stagedProviderThreadId === undefined) {
+        throw new Error("Expected HRA to reserve the Claude provider identity before launch.");
+      }
+      const intent = value.store.readClaudeProcessLaunchIntent({
+        providerThreadId: stagedProviderThreadId,
+        profileId: accountId,
+        runtimeScope: "managed",
+      });
+      if (intent === null) throw new Error("Expected durable pre-admission launch authority.");
+      stagedIntentId = intent.intentId;
+      expect(intent).toMatchObject({
+        profileId: accountId,
+        runtimeScope: "managed",
+        sessionId,
+      });
+      expect(value.store.readClaudeProcessAuthority({
+        providerThreadId: stagedProviderThreadId,
+        profileId: accountId,
+        runtimeScope: "managed",
+      })).toBeNull();
+    };
+
+    await expect(value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.switch",
+      provider: "claude",
+      session: sessionId,
+    }, { signal })).resolves.toMatchObject({
+      to: { provider: "claude" },
+    });
+
+    if (stagedProviderThreadId === undefined || stagedIntentId === undefined) {
+      throw new Error("Expected the Claude launch-intent callback to run.");
+    }
+    expect(stagedProviderThreadId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(value.store.readClaudeProcessLaunchIntent({
+      providerThreadId: stagedProviderThreadId,
+      profileId: accountId,
+      runtimeScope: "managed",
+    })).toBeNull();
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId: stagedProviderThreadId,
+      profileId: accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      identity: value.claude.processIdentity,
+      sessionId,
+      state: "bound",
+    });
+    expect(value.store.requireSession(sessionId)).toMatchObject({
+      provider: "claude",
+      providerThreadId: stagedProviderThreadId,
+    });
+  });
+
+  test("preserves the source session when a Claude child exit is unproven and never respawns it", async () => {
+    const value = await fixture();
+    const { accountId, sessionId } = await codexSession(value);
+    const idempotencyKey = crypto.randomUUID();
+    value.claude.startSessionError = new ClaudeProcessExitUnprovenError();
+
+    const first = await value.service.execute({
+      idempotencyKey,
+      kind: "session.switch",
+      provider: "claude",
+      session: sessionId,
+    }, { signal }).catch((error: unknown) => error);
+    expect(first).toBeInstanceOf(CommandFailure);
+    expect((first as CommandFailure).code).toBe("RECOVERY_REQUIRED");
+    expect(value.claude.startSessionRequests).toHaveLength(1);
+    const providerThreadId = value.claude.startSessionRequests[0]?.providerThreadId;
+    if (providerThreadId === undefined) throw new Error("Expected a reserved Claude identity.");
+    expect(value.store.readClaudeProcessLaunchIntent({
+      providerThreadId,
+      profileId: accountId,
+      runtimeScope: "managed",
+    })).toMatchObject({
+      profileId: accountId,
+      runtimeScope: "managed",
+      sessionId,
+    });
+    expect(value.store.readClaudeProcessAuthority({
+      providerThreadId,
+      profileId: accountId,
+      runtimeScope: "managed",
+    })).toBeNull();
+    expect(value.store.requireSession(sessionId)).toMatchObject({
+      provider: "codex",
+      providerThreadId: "codex-thread-1",
+      state: "idle",
+    });
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "failed" });
+
+    const replay = await value.service.execute({
+      idempotencyKey,
+      kind: "session.switch",
+      provider: "claude",
+      session: sessionId,
+    }, { signal }).catch((error: unknown) => error);
+    expect(replay).toBeInstanceOf(CommandFailure);
+    expect((replay as CommandFailure).code).toBe("RECOVERY_REQUIRED");
+    const freshAttempt = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.switch",
+      provider: "claude",
+      session: sessionId,
+    }, { signal }).catch((error: unknown) => error);
+    expect(freshAttempt).toBeInstanceOf(CommandFailure);
+    expect((freshAttempt as CommandFailure).code).toBe("RECOVERY_REQUIRED");
+    expect(value.claude.startSessionRequests).toHaveLength(1);
+    expect(value.codex.endedThreads).toEqual([]);
+    expect(value.store.requireSession(sessionId)).toMatchObject({
+      provider: "codex",
+      providerThreadId: "codex-thread-1",
+      state: "idle",
+    });
   });
 
   test("refuses a switch to the provider the session already runs", async () => {

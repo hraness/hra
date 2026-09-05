@@ -420,17 +420,24 @@ describe("SessionEventCursorCodec", () => {
 
   test("round trips bounded account-scoped session-list continuations", () => {
     const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const traversalId = "00000000-0000-4000-8000-000000000041";
     const filter = {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 7,
       limit: 37,
+      includeArchived: false,
     };
-    const first = codec.advanceSessionList({ ...filter, providerCursor: "provider-page-2" });
+    const first = codec.advanceSessionList({
+      ...filter,
+      traversalId,
+      providerCursor: "provider-page-2",
+    });
     const decodedFirst = codec.decodeSessionList(first, filter);
     expect(decodedFirst).toMatchObject({
       version: 1,
       type: "session_list",
       ...filter,
+      traversalId,
       providerCursor: "provider-page-2",
       power: 1,
       span: 0,
@@ -445,12 +452,22 @@ describe("SessionEventCursorCodec", () => {
     });
     const decodedSecond = codec.decodeSessionList(second, filter);
     expect(decodedSecond).toMatchObject({
+      traversalId,
       providerCursor: "provider-page-3",
       power: 2,
       span: 0,
       pageCount: 2,
     });
     expect(Buffer.byteLength(second, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+    expectCursorRejection(
+      () => codec.advanceSessionList({
+        ...filter,
+        traversalId: "00000000-0000-4000-8000-000000000042",
+        providerCursor: "provider-page-4",
+        prior: decodedSecond,
+      }),
+      "filter_mismatch",
+    );
   });
 
   test("binds session-list cursors to the immutable account generation and exact limit", () => {
@@ -459,12 +476,14 @@ describe("SessionEventCursorCodec", () => {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 3,
       limit: 50,
+      includeArchived: false,
     };
     const cursor = codec.advanceSessionList({ ...filter, providerCursor: "provider-next" });
     for (const mismatch of [
       { ...filter, accountId: "acct_11111111111111111111111111111111" as const },
       { ...filter, providerGeneration: 4 },
       { ...filter, limit: 49 },
+      { ...filter, includeArchived: true },
     ]) {
       expectCursorRejection(() => codec.decodeSessionList(cursor, mismatch), "filter_mismatch");
     }
@@ -476,6 +495,7 @@ describe("SessionEventCursorCodec", () => {
       accountId: "acct_00000000000000000000000000000000" as const,
       accountGeneration: 0,
       limit: 37,
+      includeArchived: false,
     };
     const cursor = codec.encodeLocalSessionList({
       ...filter,
@@ -495,6 +515,7 @@ describe("SessionEventCursorCodec", () => {
       { ...filter, accountId: "acct_22222222222222222222222222222222" as const },
       { ...filter, accountGeneration: 1 },
       { ...filter, limit: 36 },
+      { ...filter, includeArchived: true },
     ]) {
       expectCursorRejection(
         () => codec.decodeLocalSessionList(cursor, mismatch),
@@ -517,11 +538,76 @@ describe("SessionEventCursorCodec", () => {
     );
   });
 
+  test("round trips source-neutral account-local continuations disjoint from provider cursors", () => {
+    const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const traversalId = "00000000-0000-4000-8000-000000000043";
+    const filter = {
+      accountId: "acct_00000000000000000000000000000000" as const,
+      providerGeneration: 7,
+      limit: 2,
+      includeArchived: false,
+    };
+    const initial = codec.encodeAccountSessionLocal({
+      ...filter,
+      traversalId,
+      afterCreatedAt: null,
+      afterSessionId: null,
+    });
+    expect(codec.decodeAccountSessionLocal(initial, filter)).toEqual({
+      version: 1,
+      type: "session_list_account_local",
+      ...filter,
+      traversalId,
+      afterCreatedAt: null,
+      afterSessionId: null,
+    });
+    const encodedPayload = initial.split(".")[1];
+    if (encodedPayload === undefined) throw new Error("Expected an account-tail payload.");
+    expect(Buffer.from(encodedPayload, "base64url").toString("utf8"))
+      .not.toContain("adopted");
+    const continuation = codec.encodeAccountSessionLocal({
+      ...filter,
+      traversalId,
+      afterCreatedAt: 12_345,
+      afterSessionId: "sess_11111111111111111111111111111111",
+    });
+    expect(codec.decodeAccountSessionLocal(continuation, filter)).toMatchObject({
+      afterCreatedAt: 12_345,
+      afterSessionId: "sess_11111111111111111111111111111111",
+    });
+    expectCursorRejection(
+      () => codec.decodeSessionList(initial, filter),
+      "type_mismatch",
+    );
+    expectCursorRejection(
+      () => codec.decodeAccountSessionLocal(continuation, { ...filter, limit: 1 }),
+      "filter_mismatch",
+    );
+    expectCursorRejection(
+      () => codec.decodeAccountSessionLocal(continuation, {
+        ...filter,
+        includeArchived: true,
+      }),
+      "filter_mismatch",
+    );
+    const legacyAdopted = signedCursor(JSON.stringify({
+      version: 1,
+      type: "session_list_adopted",
+      ...filter,
+      afterCreatedAt: null,
+      afterSessionId: null,
+    }));
+    expectCursorRejection(
+      () => codec.decodeAccountSessionLocal(legacyAdopted, filter),
+      "type_mismatch",
+    );
+  });
+
   test("keeps provider and local session-list cursor authorities disjoint", () => {
     const codec = new SessionEventCursorCodec(FIXED_KEY);
     const accountId = "acct_00000000000000000000000000000000" as const;
-    const localFilter = { accountId, accountGeneration: 2, limit: 10 };
-    const providerFilter = { accountId, providerGeneration: 2, limit: 10 };
+    const localFilter = { accountId, accountGeneration: 2, limit: 10, includeArchived: false };
+    const providerFilter = { accountId, providerGeneration: 2, limit: 10, includeArchived: false };
     const local = codec.encodeLocalSessionList({
       ...localFilter,
       afterCreatedAt: 1,
@@ -547,6 +633,7 @@ describe("SessionEventCursorCodec", () => {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 1,
       limit: 100,
+      includeArchived: false,
     };
     const initialCursor = codec.advanceSessionList({
       ...filter,
@@ -581,6 +668,7 @@ describe("SessionEventCursorCodec", () => {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 1,
       limit: 100,
+      includeArchived: false,
     };
     const first = codec.decodeSessionList(
       codec.advanceSessionList({ ...filter, providerCursor: "a" }),
@@ -625,6 +713,7 @@ describe("SessionEventCursorCodec", () => {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 1,
       limit: 100,
+      includeArchived: false,
     };
     const prefix = Array.from({ length: 73 }, (_, index) => `prefix-${String(index)}`);
     const cycle = Array.from({ length: 257 }, (_, index) => `cycle-${String(index)}`);
@@ -659,6 +748,7 @@ describe("SessionEventCursorCodec", () => {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 5,
       limit: 23,
+      includeArchived: false,
     };
     fc.assert(fc.property(
       fc.uniqueArray(fc.integer(), { minLength: 33, maxLength: 256 }),
@@ -707,6 +797,7 @@ describe("SessionEventCursorCodec", () => {
       accountId: "acct_00000000000000000000000000000000" as const,
       providerGeneration: 2,
       limit: 10,
+      includeArchived: false,
     };
     const eventCursor = codec.encode({
       version: 1,

@@ -14,6 +14,15 @@ HRA Web v1 wave 5: session portability. HRA owns a provider-neutral transcript, 
 - A session's account is no longer fixed for life, so session-event continuity follows the account across a switch instead of failing closed on it. One event page still never mixes two account identities.
 - `docs/providers/portability.md` states what a switch preserves, what it cannot (the provider's hidden state, its native thread, cached context), and the seeding rule.
 
+Personal-home session adoption:
+
+- `hra session adoption enable <account> --provider codex|claude` opts one signed-in HRA account into bounded discovery from the user's ordinary provider home. Policy is off by default, candidates and provenance remain private local authority, and disabling discovery never silently detaches an already admitted session.
+- Codex admission reads a bounded app-server session page and uses the accepted inactivity inference: active or recently updated rows remain pending, while an idle row older than ten minutes but no older than fifteen minutes may be resumed and rechecked. Resume proves the exact thread and HRA connection, not a provider-wide exclusive lease.
+- Claude admission reads only bounded, allowlisted registry scalars for the exact pinned version and retains the exact PID domain, PID, and process-start identity privately. The old process must be proven dead before HRA launches `--resume` for that exact session ID; incomplete discovery or uncertain liveness stays pending.
+- Once admitted, a conversation is an ordinary HRA session. It has the same public shape, send/queue/steer/stop surface, scheduled work, autorespond defaults and overrides, and one-shot approval authority as an HRA-created session. There is no adopted badge or reduced-capability tier in the CLI, encrypted session projection, or browser grid.
+- Personal Codex and Claude runtimes are separate from managed account runtimes and use the current user's canonical provider homes without copying or parsing credentials. Live acceptance injects fixture-owned personal homes, so validation cannot read or mutate the operator's real provider state. Account-generation, sign-out, provider-account replacement, provider-switch, delayed-disconnect, and daemon-restart fences retain exact controller authority and durably recover incomplete release. Account loss moves affected HRA-created and adopted sessions through the same visible fail-closed recovery; no origin-specific session command is required for login, logout, or replacement.
+- A completed personal-home Codex account revocation remains fenced until daemon restart creates a fresh runtime generation; status reports that requirement and re-enable fails closed instead of relaunching through an ordinary account read. `docs/session-adoption.md` documents the liveness limits, restart fence, and residual external-resume race.
+
 ## v0.5.0
 
 HRA Web v1 wave 3: interaction detail, wider remote decisions, subagent activity, the Claude Code provider seam, and device commands. Release candidate until the release workflow admits the tag.

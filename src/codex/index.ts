@@ -9,6 +9,7 @@ export { CodexAppServerClient } from "./client.ts";
 export type {
   CodexAppServerClientOptions,
   DiscoverCapabilitiesOptions,
+  ResumeThreadInput,
   StartThreadInput,
   StartTurnInput,
   ThreadListOptions,
@@ -88,6 +89,7 @@ export type {
   ResolvedPreset,
   ThreadPage,
   ThreadStartResult,
+  ThreadUnsubscribeResult,
   ThreadItemPage,
   TurnPage,
   TurnStartResult,

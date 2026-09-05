@@ -99,7 +99,7 @@ describe("social card", () => {
     const lines = socialCardLines();
     expect(lines.tagline).toBe("HRA · control plane for coding-agent subscriptions · hra.sh");
     expect(lines.title).toBe("HRA");
-    expect(lines.comment).toBe("# Codex today, Claude next.");
+    expect(lines.comment).toBe("# Codex and Claude Code sessions today.");
     expect(lines.commands).toEqual([
       `$ ${publicContent.hero.steps[0]!.command}`,
       `$ ${publicContent.hero.steps[3]!.command}`,

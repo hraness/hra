@@ -116,6 +116,7 @@ class FakeProcess implements CodexProcess {
     readonly onWrite: (message: Record<string, unknown>, process: FakeProcess) => void,
     readonly shutdown: {
       readonly autoCredentialStorePreflight?: boolean;
+      readonly ignoreKill?: boolean;
       readonly ignoreTerm?: boolean;
       readonly leaveStreamsOpenAfterKill?: boolean;
     } = {},
@@ -171,11 +172,16 @@ class FakeProcess implements CodexProcess {
 
   forceTerminate(): void {
     this.signals.push("SIGKILL");
+    if (this.shutdown.ignoreKill === true) return;
     if (this.shutdown.leaveStreamsOpenAfterKill !== true) {
       this.stdoutQueue.close();
       this.stderrQueue.close();
     }
     this.#resolveExit(137);
+  }
+
+  settleExit(code = 137): void {
+    this.#resolveExit(code);
   }
 }
 
@@ -624,6 +630,262 @@ describe("CodexAppServerClient", () => {
       },
     ]);
     await client.close();
+  });
+
+  test("raises account authority before its first await and lets only the refresh read pass blocked frames", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const barrier = deferred<undefined>();
+    const events: string[] = [];
+    let signaled = false;
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => {
+        if (signaled) events.push("authority-check");
+        return true;
+      },
+      connectionId: CONNECTION_ID,
+      onAccountAuthoritySignal: () => {
+        events.push("signal");
+        signaled = true;
+        return barrier.promise;
+      },
+    });
+    await client.initialize();
+    const writesBeforeSignal = process.writes.length;
+
+    process.stdoutQueue.push([
+      JSON.stringify({
+        method: "account/updated",
+        params: { authMode: "chatgpt", planType: "pro" },
+      }),
+      JSON.stringify({ id: 91, method: "unsupported/request", params: {} }),
+      "",
+    ].join("\n"));
+    await waitFor(() => events.includes("authority-check"));
+    expect(events.slice(0, 2)).toEqual(["signal", "authority-check"]);
+
+    const ordinaryRead = client.accountRead();
+    const refreshRead = client.refreshAccountAuthority();
+    await refreshRead;
+    expect(process.writes.slice(writesBeforeSignal)).toContainEqual({
+      id: expect.any(Number),
+      method: "account/read",
+      params: { refreshToken: true },
+    });
+    expect(process.writes.slice(writesBeforeSignal)).not.toContainEqual({
+      id: expect.any(Number),
+      method: "account/read",
+      params: { refreshToken: false },
+    });
+    expect(process.writes.slice(writesBeforeSignal)).not.toContainEqual({
+      id: 91,
+      error: expect.any(Object),
+    });
+
+    barrier.resolve(undefined);
+    await ordinaryRead;
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as Record<string, unknown>).id === 91));
+    expect(process.writes.slice(writesBeforeSignal)).toContainEqual({
+      id: expect.any(Number),
+      method: "account/read",
+      params: { refreshToken: false },
+    });
+    await client.close();
+  });
+
+  test("holds a pre-admitted queued provider write behind a later account signal", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const firstWriteGate = deferred<undefined>();
+    const accountBarrier = deferred<undefined>();
+    let signaled = false;
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onAccountAuthoritySignal: () => {
+        signaled = true;
+        return accountBarrier.promise;
+      },
+    });
+    await client.initialize();
+    const writesBeforeReads = process.writes.length;
+    process.writeSettlementGate = firstWriteGate.promise;
+    const first = client.accountRead();
+    await waitFor(() => process.writes.slice(writesBeforeReads).some((frame) =>
+      (frame as Record<string, unknown>).method === "account/read"));
+    const second = client.accountRead();
+
+    process.respond({
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "pro" },
+    });
+    await waitFor(() => signaled);
+    const refresh = client.refreshAccountAuthority();
+    firstWriteGate.resolve(undefined);
+    await Promise.all([first, refresh]);
+    expect(process.writes.slice(writesBeforeReads).filter((frame) =>
+      (frame as Record<string, unknown>).method === "account/read"))
+      .toEqual([
+        expect.objectContaining({ params: { refreshToken: false } }),
+        expect.objectContaining({ params: { refreshToken: true } }),
+      ]);
+
+    accountBarrier.resolve(undefined);
+    await second;
+    expect(process.writes.slice(writesBeforeReads).filter((frame) =>
+      (frame as Record<string, unknown>).method === "account/read"))
+      .toEqual([
+        expect.objectContaining({ params: { refreshToken: false } }),
+        expect.objectContaining({ params: { refreshToken: true } }),
+        expect.objectContaining({ params: { refreshToken: false } }),
+      ]);
+    await client.close();
+  });
+
+  test("defers an already-dispatched response without blocking the refresh response read", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const accountBarrier = deferred<undefined>();
+    let ordinaryRequestId: number | undefined;
+    let signaled = false;
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.153.2",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "account/read") {
+        const params = message.params as { refreshToken?: boolean };
+        if (params.refreshToken === true) {
+          runtime.respond({
+            id: message.id,
+            result: {
+              account: { type: "chatgpt", email: "person@example.com", planType: "pro" },
+              requiresOpenaiAuth: true,
+            },
+          });
+        } else {
+          ordinaryRequestId = message.id as number;
+        }
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onAccountAuthoritySignal: () => {
+        signaled = true;
+        return accountBarrier.promise;
+      },
+    });
+    await client.initialize();
+    const ordinary = client.accountRead();
+    await waitFor(() => ordinaryRequestId !== undefined);
+    process.stdoutQueue.push([
+      JSON.stringify({
+        method: "account/updated",
+        params: { authMode: "chatgpt", planType: "pro" },
+      }),
+      JSON.stringify({
+        id: ordinaryRequestId,
+        result: {
+          account: { type: "chatgpt", email: "old@example.com", planType: "pro" },
+          requiresOpenaiAuth: true,
+        },
+      }),
+      JSON.stringify({ id: 92, method: "unsupported/request", params: {} }),
+      "",
+    ].join("\n"));
+    await waitFor(() => signaled);
+    let ordinarySettled = false;
+    void ordinary.then(() => { ordinarySettled = true; });
+
+    await client.refreshAccountAuthority();
+    await Promise.resolve();
+    expect(ordinarySettled).toBe(false);
+    expect(process.writes).not.toContainEqual({ id: 92, error: expect.any(Object) });
+
+    accountBarrier.resolve(undefined);
+    await ordinary;
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as Record<string, unknown>).id === 92));
+    expect(ordinarySettled).toBe(true);
+    await client.close();
+  });
+
+  test("close rejects a barrier-deferred response and permanently cancels queued frames", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const accountBarrier = deferred<undefined>();
+    let ordinaryRequestId: number | undefined;
+    let signaled = false;
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.153.2",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "account/read") {
+        ordinaryRequestId = message.id as number;
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      shutdownSettlementMs: 5,
+      onAccountAuthoritySignal: () => {
+        signaled = true;
+        return accountBarrier.promise;
+      },
+    });
+    await client.initialize();
+    const ordinary = client.accountRead();
+    const ordinaryError = ordinary.catch((error: unknown) => error);
+    await waitFor(() => ordinaryRequestId !== undefined);
+    process.stdoutQueue.push([
+      JSON.stringify({
+        method: "account/updated",
+        params: { authMode: "chatgpt", planType: "pro" },
+      }),
+      JSON.stringify({
+        id: ordinaryRequestId,
+        result: {
+          account: { type: "chatgpt", email: "old@example.com", planType: "pro" },
+          requiresOpenaiAuth: true,
+        },
+      }),
+      JSON.stringify({ id: 93, method: "unsupported/request", params: {} }),
+      "",
+    ].join("\n"));
+    await waitFor(() => signaled);
+    await client.close();
+    expect(await ordinaryError).toMatchObject({ code: "PROCESS_EXITED" });
+    const writesAtClose = process.writes.length;
+
+    accountBarrier.resolve(undefined);
+    await Bun.sleep(2);
+    expect(process.writes).toHaveLength(writesAtClose);
+    expect(process.writes).not.toContainEqual({ id: 93, error: expect.any(Object) });
   });
 
   test("emits no connection facts when authority becomes stale at the activation commit", async () => {
@@ -1332,6 +1594,75 @@ describe("CodexAppServerClient", () => {
     expect(process.writes.some((frame) =>
       (frame as { id?: unknown }).id === "tool-queued")).toBe(false);
     expect(postWriteCalls).toBe(0);
+    await client.close();
+  });
+
+  test("lets an account refresh leapfrog a dynamic response paused in its async pre-write check", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const preWriteGate = deferred<boolean>();
+    const accountBarrier = deferred<undefined>();
+    let markPreWriteStarted!: () => void;
+    const preWriteStarted = new Promise<void>((resolve) => { markPreWriteStarted = resolve; });
+    let authorityPhase = 0;
+    let providerConnected = false;
+    let accountSignaled = false;
+    let postWriteCalls = 0;
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      experimentalApi: true,
+      isAuthorityCurrent: () => {
+        if (authorityPhase === 1) {
+          authorityPhase = 2;
+          return true;
+        }
+        if (authorityPhase === 2) {
+          authorityPhase = 3;
+          markPreWriteStarted();
+          return preWriteGate.promise;
+        }
+        return true;
+      },
+      connectionId: CONNECTION_ID,
+      onAccountAuthoritySignal: () => {
+        accountSignaled = true;
+        return accountBarrier.promise;
+      },
+      onConversationAutomationToolCall: () => {
+        authorityPhase = 1;
+        return { scope: "conversation" };
+      },
+      onConversationAutomationToolResponseWritten: () => { postWriteCalls += 1; },
+      onFact: ({ value }) => {
+        if (value.type === "providerConnected") providerConnected = true;
+      },
+    });
+    await client.initialize();
+    await waitFor(() => providerConnected);
+    process.respond({
+      id: "tool-account-race",
+      method: "item/tool/call",
+      params: conversationAutomationParams(),
+    });
+    await preWriteStarted;
+
+    process.respond({
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "pro" },
+    });
+    await waitFor(() => accountSignaled);
+    const refresh = client.refreshAccountAuthority();
+    preWriteGate.resolve(true);
+    await refresh;
+    expect(process.writes.some((frame) =>
+      (frame as Record<string, unknown>).id === "tool-account-race")).toBe(false);
+
+    accountBarrier.resolve(undefined);
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as Record<string, unknown>).id === "tool-account-race"));
+    expect(postWriteCalls).toBe(1);
     await client.close();
   });
 
@@ -2307,6 +2638,59 @@ describe("CodexAppServerClient", () => {
       error: { code: -32_609, message: "Conflicting server request replay" },
     });
     expect(process.signals).toContain("SIGTERM");
+    await client.close();
+  });
+
+  test("does not replay a barrier-blocked approval after the provider resolves it", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const barrier = deferred<undefined>();
+    const facts: CodexFact[] = [];
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onAccountAuthoritySignal: () => barrier.promise,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+    await client.initialize();
+    const params = commandApprovalParams();
+    process.respond({ id: 70, method: "item/commandExecution/requestApproval", params });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested") throw new Error("Missing interaction.");
+    await client.resolveInteraction({
+      provider: requested.provider,
+      kind: requested.kind,
+      deadlineAt: requested.deadlineAt ?? Number.NaN,
+      resolution: { kind: "approval_decision", decision: "once" },
+    });
+    expect(process.writes.filter((frame) =>
+      (frame as Record<string, unknown>).id === 70)).toHaveLength(1);
+
+    process.stdoutQueue.push([
+      JSON.stringify({
+        method: "account/updated",
+        params: { authMode: "chatgpt", planType: "pro" },
+      }),
+      JSON.stringify({
+        id: 70,
+        method: "item/commandExecution/requestApproval",
+        params,
+      }),
+      JSON.stringify({
+        method: "serverRequest/resolved",
+        params: { threadId: "thread-1", requestId: 70 },
+      }),
+      "",
+    ].join("\n"));
+    await waitFor(() => facts.some((fact) => fact.type === "interactionResolved"));
+    barrier.resolve(undefined);
+    await Bun.sleep(2);
+    expect(process.writes.filter((frame) =>
+      (frame as Record<string, unknown>).id === 70)).toHaveLength(1);
+    expect(client.state).toBe("ready");
     await client.close();
   });
 
@@ -3331,6 +3715,138 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
+  test("applies and verifies native approval authority when claiming a resumed thread", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const thread = {
+      id: "thread-adopted",
+      sessionId: "thread-adopted",
+      preview: "",
+      ephemeral: false,
+      historyMode: "paginated",
+      modelProvider: "openai",
+      createdAt: 1,
+      updatedAt: 1,
+      status: { type: "idle" },
+      cwd: "/workspace/project",
+      name: null,
+      turns: [],
+    };
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.153.2",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "thread/resume") {
+        target.respond({
+          id: message.id,
+          result: {
+            thread,
+            cwd: "/workspace/project",
+            model: "gpt-5.6-sol",
+            modelProvider: "openai",
+            reasoningEffort: "max",
+            serviceTier: "default",
+            approvalPolicy: "on-request",
+            approvalsReviewer: "auto_review",
+            sandbox: {
+              type: "workspaceWrite",
+              writableRoots: ["/workspace/project"],
+              networkAccess: false,
+              excludeTmpdirEnvVar: false,
+              excludeSlashTmp: false,
+            },
+            activePermissionProfile: { id: ":workspace", extends: null },
+            runtimeWorkspaceRoots: ["/workspace/project"],
+          },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    await client.resumeThreadWithPolicy({
+      threadId: "thread-adopted",
+      cwd: "/workspace/project",
+      preset: {
+        alias: "high",
+        model: "gpt-5.6-sol",
+        effort: "max",
+        serviceTier: null,
+        fast: false,
+      },
+      policy: {
+        review: "auto_review",
+        permissionProfile: ":workspace",
+        writableRoots: ["/workspace/project"],
+      },
+    });
+    expect(process.writes.at(-1)).toEqual({
+      id: 3,
+      method: "thread/resume",
+      params: {
+        threadId: "thread-adopted",
+        model: "gpt-5.6-sol",
+        serviceTier: null,
+        cwd: "/workspace/project",
+        permissions: ":workspace",
+        runtimeWorkspaceRoots: ["/workspace/project"],
+        approvalPolicy: "on-request",
+        approvalsReviewer: "auto_review",
+        config: { model_reasoning_effort: "max" },
+        excludeTurns: true,
+      },
+    });
+    expect(JSON.stringify(process.writes.at(-1))).not.toContain("dynamicTools");
+    await client.close();
+  });
+
+  test("sends the exact pinned thread unsubscribe request and returns its closed status", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.153.2",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "thread/unsubscribe") {
+        target.respond({ id: message.id, result: { status: "unsubscribed" } });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    await expect(client.unsubscribeThread("thread-adopted")).resolves.toMatchObject({
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      value: { status: "unsubscribed" },
+    });
+    expect(process.writes.at(-1)).toEqual({
+      id: 3,
+      method: "thread/unsubscribe",
+      params: { threadId: "thread-adopted" },
+    });
+    await client.close();
+  });
+
   test("bounds shutdown when TERM and stdout settlement are ignored", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess(
@@ -3380,5 +3896,48 @@ describe("CodexAppServerClient", () => {
       operation: "thread/name/set",
     });
     expect(diagnostics).toContain("Codex stdout did not settle after termination");
+  });
+
+  test("requires exact process-exit settlement and permits the exact close owner to retry", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = new FakeProcess(
+      (message, target) => {
+        if (message.method === "initialize") {
+          target.respond({
+            id: message.id,
+            result: {
+              userAgent: "codex-cli/0.153.2",
+              codexHome,
+              platformFamily: "unix",
+              platformOs: "macos",
+            },
+          });
+        }
+      },
+      { ignoreKill: true, ignoreTerm: true, leaveStreamsOpenAfterKill: true },
+    );
+    const diagnostics: string[] = [];
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 3 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+      onSafeDiagnostic: (message) => diagnostics.push(message),
+      shutdownTermGraceMs: 5,
+      shutdownSettlementMs: 5,
+    });
+    await client.initialize();
+
+    await expect(Promise.all([client.close(), client.close()])).rejects.toMatchObject({
+      code: "PROCESS_EXITED",
+    });
+    expect(client.state).toBe("closing");
+    expect(process.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(diagnostics).toContain("Codex process exit did not settle after termination");
+
+    process.settleExit();
+    await expect(client.close()).resolves.toBeUndefined();
+    expect(client.state).toBe("closed");
+    expect(process.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM"]);
   });
 });
