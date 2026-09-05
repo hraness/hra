@@ -48,6 +48,7 @@ describe("static-site build", () => {
   test("keeps documentation code roles separate from inverse marketing roles", async () => {
     const styles = await readFile(join(import.meta.dir, "styles.css"), "utf8");
     expect(styles).toContain(".hra-inline-code {");
+    expect(styles).toContain("overflow-wrap: anywhere;");
     expect(styles).not.toMatch(/(?:^|\n)code\s*\{/u);
     expect(styles).toContain("--hraness-marketing-inverse: var(--inverse-background)");
     expect(styles).toContain("--hraness-marketing-inverse-ink: var(--inverse-foreground)");

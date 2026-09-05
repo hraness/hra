@@ -199,6 +199,7 @@ pre:focus-visible {
 .hra-inline-code {
   background: color-mix(in srgb, var(--surface), transparent 16%);
   border-radius: 0.2rem;
+  overflow-wrap: anywhere;
   padding: 0.08em 0.24em;
 }
 
