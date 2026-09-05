@@ -18,7 +18,12 @@ import { useCardOrder } from "../data/card-order";
 import { useSubmitCommand } from "../data/commands";
 import { useComposerAttachments } from "../data/composer-attachments";
 import { holdSentAttachment } from "../data/sent-attachments";
-import { useDeviceCommandState, useSubmitDeviceCommand } from "../data/device-commands";
+import {
+  deviceCommandCommittedRowUnavailableMessage,
+  DeviceCommandResponseInvalidError,
+  useDeviceCommandTracker,
+  useSubmitDeviceCommand,
+} from "../data/device-commands";
 import { useDeviceRegistries } from "../data/registry";
 import { useSessionHeads } from "../data/session-heads";
 import { useCustody } from "../custody/custody-context";
@@ -110,14 +115,20 @@ export function GridScreen({
   const [message, setMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [startCommandId, setStartCommandId] = useState<string | null>(null);
   const [targetKey, setTargetKey] = useState<string | null>(null);
   const [projectPublicId, setProjectPublicId] = useState<string | null>(null);
   const [preset, setPreset] = useState<PresetChoice>(defaultSessionStartPreset);
   const attach = useComposerAttachments();
   const pickerRef = useRef<HTMLInputElement>(null);
 
-  const startCommand = useDeviceCommandState(startCommandId);
+  const handleUnavailable = useCallback(() => {
+    setNotice(deviceCommandCommittedRowUnavailableMessage);
+  }, []);
+  const {
+    observation: startObservation,
+    setHandle: setStartCommandHandle,
+  } = useDeviceCommandTracker(handleUnavailable);
+  const startCommand = startObservation.record;
   const startNotice = deviceCommandNotice(startCommand);
 
   const reportSummary = useCallback((summary: SessionCardSummary) => {
@@ -178,7 +189,7 @@ export function GridScreen({
   // its job and the composer goes quiet again.
   useEffect(() => {
     if (startCommand?.state === "applied" && heads.length > 0) {
-      const timer = setTimeout(() => { setStartCommandId(null); }, 15_000);
+      const timer = setTimeout(() => { setStartCommandHandle(null); }, 15_000);
       return () => { clearTimeout(timer); };
     }
     return undefined;
@@ -228,7 +239,7 @@ export function GridScreen({
           }),
           targetDevicePublicId: startTarget.targetDevicePublicId,
         }).then((commandPublicId) => {
-          setStartCommandId(commandPublicId);
+          setStartCommandHandle({ publicId: commandPublicId, responseValidated: true });
           setMessage("");
         })
       : (() => {
@@ -255,6 +266,18 @@ export function GridScreen({
         })();
     void run
       .catch((failure: unknown) => {
+        if (failure instanceof DeviceCommandResponseInvalidError) {
+          // The mutation resolved, so the generated command may already run
+          // even though its response violated the client protocol. Track that
+          // committed identity and clear the prompt rather than offering an
+          // accidental duplicate submission.
+          setStartCommandHandle({
+            publicId: failure.commandPublicId,
+            responseValidated: false,
+          });
+          setMessage("");
+          return;
+        }
         setNotice(failure instanceof Error ? failure.message : "The command was not accepted.");
       })
       .finally(() => { setSending(false); });
@@ -467,6 +490,11 @@ export function GridScreen({
             role="status"
           >
             {startNotice.text}
+          </p>
+        )}
+        {startObservation.protocolWarning === null ? null : (
+          <p className="text-xs text-danger" role="status">
+            {startObservation.protocolWarning}
           </p>
         )}
         {notice === null ? null : (

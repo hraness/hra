@@ -187,6 +187,11 @@ export const enqueue = mutation({
       publicId: args.publicId,
       requestDigest: args.requestDigest,
       requestingDeviceId: authority.deviceId,
+      // The Convex sync client resolves only after this insert is committed and
+      // visible to queries. Stamping acknowledgement here removes the
+      // enqueue-success/tab-close gap that could otherwise retain a terminal
+      // row forever when the browser never got to a second mutation.
+      requesterAcknowledgedAt: now,
       state: "pending",
       targetDeviceId: target._id,
       updatedAt: now,

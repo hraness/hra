@@ -103,6 +103,7 @@
     "convex-test": "0.0.56",
     "eslint": "9.34.0",
     "fast-check": "4.3.0",
+    "linkedom": "0.18.12",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-markdown": "10.1.0",

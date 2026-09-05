@@ -470,6 +470,31 @@ async function expireDeviceCommandLoginResults(
 
 async function deleteTerminalDeviceCommands(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   let remaining = limit;
+  let processed = 0;
+  const legacyRetentionCutoff = now - cloudRetentionMs.terminalCommand;
+
+  // Old web clients could close between enqueue and their separate receipt
+  // acknowledgement, leaving terminal rows without a cleanup deadline. Drain
+  // only rows already older than the ordinary retention window. Direct delete
+  // both avoids quota-growing patches at the hard ceiling and keeps every row
+  // counted against this category's strict budget.
+  for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
+    if (remaining === 0) break;
+    const legacy = await ctx.db.query("deviceCommands")
+      .withIndex("by_state_cleanup_after_updated_at", (builder) => builder
+        .eq("state", state)
+        .eq("terminalCleanupAfter", undefined)
+        .lt("updatedAt", legacyRetentionCutoff))
+      .take(remaining);
+    for (const record of legacy) {
+      if (record.nonterminal) throw new Error("Maintenance authority is corrupt.");
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+    }
+    processed += legacy.length;
+    remaining -= legacy.length;
+  }
+
   for (const state of ["applied", "failed", "ambiguous", "cancelled", "expired"] as const) {
     if (remaining === 0) break;
     const records = await ctx.db.query("deviceCommands")
@@ -482,9 +507,10 @@ async function deleteTerminalDeviceCommands(ctx: MutationCtx, now: number, limit
       await releaseCommandQuotaForDelete(ctx, record.userId, record);
       await ctx.db.delete(record._id);
     }
+    processed += records.length;
     remaining -= records.length;
   }
-  return limit - remaining;
+  return processed;
 }
 
 async function deleteExpiredSecurityEvents(ctx: MutationCtx, now: number, limit: number): Promise<number> {

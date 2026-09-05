@@ -6,6 +6,7 @@ import { convexTest } from "convex-test";
 import { expectPromiseToReject } from "../src/cloud/testAssertions";
 import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
 import {
+  adjustCommandQuotaForPatch,
   initializeUserQuotaAuthority,
   logicalDocumentBytes,
   reserveQuotaForStoredIdentity,
@@ -168,6 +169,30 @@ async function deviceCommandWorld() {
   return { browser, daemon, enqueueFrom, ids, now, testRuntime, uuid: (s: string) => uuidV7(now, s) };
 }
 
+async function expectTerminalCleanup(
+  world: Awaited<ReturnType<typeof deviceCommandWorld>>,
+  commandPublicId: string,
+  state: "applied" | "failed" | "ambiguous" | "cancelled" | "expired",
+): Promise<void> {
+  const receipt = await world.testRuntime.run(async (ctx) => {
+    const row = (await ctx.db.query("deviceCommands").collect())
+      .find((entry) => entry.publicId === commandPublicId);
+    return row === undefined
+      ? null
+      : {
+          requesterAcknowledgedAt: row.requesterAcknowledgedAt,
+          state: row.state,
+          terminalCleanupAfter: row.terminalCleanupAfter,
+        };
+  });
+  if (
+    typeof receipt?.requesterAcknowledgedAt !== "number"
+    || typeof receipt.terminalCleanupAfter !== "number"
+  ) throw new Error(`missing terminal device-command cleanup custody: ${JSON.stringify(receipt)}`);
+  expect(receipt.state).toBe(state);
+  expect(receipt.terminalCleanupAfter).toBeGreaterThan(receipt.requesterAcknowledgedAt);
+}
+
 describe("device commands", () => {
   test("runs the full lifecycle from a browser device to a daemon target", async () => {
     const world = await deviceCommandWorld();
@@ -220,6 +245,7 @@ describe("device commands", () => {
     }) as Readonly<{ result?: unknown; resultCode: string; state: string }>;
     expect(settled).toMatchObject({ resultCode: "APPLIED", state: "applied" });
     expect(settled.result).toEqual(resultEnvelope);
+    await expectTerminalCleanup(world, world.uuid("21"), "applied");
   });
 
   test("a browser device is never a device command target", async () => {
@@ -270,6 +296,64 @@ describe("device commands", () => {
     );
   });
 
+  test("atomically acknowledges a new enqueue while every replay stays byte-stable", async () => {
+    const world = await deviceCommandWorld();
+    const request = {
+      deadline: Date.now() + 60_000,
+      expectedTargetDevicePublicId: "device_daemon01",
+      idempotencyKey: world.uuid("1a"),
+      kind: "usage_refresh",
+      payload: envelope,
+      publicId: world.uuid("4a"),
+      requestDigest: "a".repeat(64),
+    };
+    expect(await world.browser.mutation(enqueue, request)).toMatchObject({ replay: false });
+    const inserted = await world.testRuntime.run(async (ctx) => {
+      const rows = await ctx.db.query("deviceCommands").collect();
+      return rows.find((entry) => entry.publicId === request.publicId) ?? null;
+    });
+    expect(typeof inserted?.requesterAcknowledgedAt).toBe("number");
+    expect(inserted?.terminalCleanupAfter).toBeUndefined();
+
+    expect(await world.browser.mutation(enqueue, request)).toMatchObject({ replay: true });
+    expect(await world.testRuntime.run(async (ctx) => {
+      const rows = await ctx.db.query("deviceCommands").collect();
+      const row = rows.find((entry) => entry.publicId === request.publicId);
+      return {
+        acknowledgedAt: row?.requesterAcknowledgedAt,
+        matchingRows: rows.filter((entry) => entry.publicId === request.publicId).length,
+      };
+    })).toEqual({
+      acknowledgedAt: inserted?.requesterAcknowledgedAt,
+      matchingRows: 1,
+    });
+
+    // A pre-upgrade row may lack acknowledgement. Replaying it must remain a
+    // read-only response: adding metadata here could fail at the hard byte
+    // ceiling and misreport a known committed row as an enqueue abort.
+    await world.testRuntime.run(async (ctx) => {
+      const rows = await ctx.db.query("deviceCommands").collect();
+      const row = rows.find((entry) => entry.publicId === request.publicId);
+      if (row === undefined) throw new Error("missing command fixture");
+      const patch = { requesterAcknowledgedAt: undefined };
+      await adjustCommandQuotaForPatch(ctx, row.userId, row, patch);
+      await ctx.db.patch(row._id, patch);
+    });
+    const legacyBeforeReplay = await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db.query("deviceCommands").collect())
+        .find((entry) => entry.publicId === request.publicId);
+      if (row === undefined) throw new Error("missing legacy command fixture");
+      return row;
+    });
+    expect(await world.browser.mutation(enqueue, request)).toMatchObject({ replay: true });
+    const legacyAfterReplay = await world.testRuntime.run(async (ctx) => {
+      const rows = await ctx.db.query("deviceCommands").collect();
+      return rows.find((entry) => entry.publicId === request.publicId) ?? null;
+    });
+    expect(legacyAfterReplay).toEqual(legacyBeforeReplay);
+    expect(legacyAfterReplay?.requesterAcknowledgedAt).toBeUndefined();
+  });
+
   test("quarantines an effect that may have begun as ambiguous under a later boot", async () => {
     const world = await deviceCommandWorld();
     await world.enqueueFrom(world.browser, {
@@ -314,6 +398,7 @@ describe("device commands", () => {
     })).toMatchObject({ replay: false, state: "ambiguous" });
     expect(await world.browser.query(getCommand, { commandPublicId: world.uuid("25") }))
       .toMatchObject({ resultCode: "LOCAL_EFFECT_RECOVERY_REQUIRED", state: "ambiguous" });
+    await expectTerminalCleanup(world, world.uuid("25"), "ambiguous");
   });
 
   test("an earlier boot can never take a prepared command from a later one", async () => {
@@ -359,6 +444,7 @@ describe("device commands", () => {
       staleAuthority: daemonAuthority,
       state: "failed",
     })).toMatchObject({ replay: true, state: "failed" });
+    await expectTerminalCleanup(world, world.uuid("39"), "failed");
   });
 
   for (const localPhase of ["prepared_no_effect", "effect_started"] as const) {
@@ -418,6 +504,7 @@ describe("device commands", () => {
         resultCode,
         state,
       });
+      await expectTerminalCleanup(world, commandPublicId, state);
     });
   }
 
@@ -438,6 +525,7 @@ describe("device commands", () => {
       commandPublicId: world.uuid("27"),
       localPhase: "prepared_no_effect",
     })).toMatchObject({ state: "expired" });
+    await expectTerminalCleanup(world, world.uuid("27"), "expired");
     expect(await world.daemon.mutation(confirmTerminalRecovery, {
       commandPublicId: world.uuid("27"),
       localPhase: "prepared_no_effect",
@@ -447,6 +535,28 @@ describe("device commands", () => {
       replay: true,
       state: "expired",
     });
+  });
+
+  test("an acknowledged prepared command gains cleanup when it expires before effect", async () => {
+    const world = await deviceCommandWorld();
+    const commandPublicId = world.uuid("47");
+    await world.enqueueFrom(world.browser, { publicId: commandPublicId });
+    await world.daemon.mutation(prepare, {
+      authority: daemonAuthority,
+      commandPublicId,
+      localPhase: "prepared_no_effect",
+    });
+    await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db.query("deviceCommands").collect())
+        .find((entry) => entry.publicId === commandPublicId);
+      if (row === undefined) throw new Error("missing prepared command fixture");
+      await ctx.db.patch(row._id, { deadline: Date.now() - 1 });
+    });
+    expect(await world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId,
+    })).toMatchObject({ state: "expired" });
+    await expectTerminalCleanup(world, commandPublicId, "expired");
   });
 
   test("releases a single-use result exactly once, to the requester only", async () => {
@@ -697,7 +807,7 @@ describe("device commands", () => {
     }
   });
 
-  test("only the requester acknowledges or cancels", async () => {
+  test("only the requester replays acknowledgement or cancels", async () => {
     const world = await deviceCommandWorld();
     await world.browser.mutation(enqueue, {
       deadline: Date.now() + 60_000,
@@ -711,13 +821,49 @@ describe("device commands", () => {
     await expectPromiseToReject(world.daemon.mutation(cancelPending, {
       commandPublicId: world.uuid("29"),
     }));
+    await expectPromiseToReject(world.daemon.mutation(acknowledge, {
+      commandPublicId: world.uuid("29"),
+      idempotencyKey: world.uuid("14"),
+      requestDigest: "5".repeat(64),
+    }));
     expect(await world.browser.mutation(acknowledge, {
       commandPublicId: world.uuid("29"),
       idempotencyKey: world.uuid("14"),
       requestDigest: "5".repeat(64),
-    })).toMatchObject({ replay: false });
+    })).toMatchObject({ replay: true });
+    expect(await world.testRuntime.run(async (ctx) => {
+      const rows = await ctx.db.query("deviceCommands").collect();
+      const row = rows.find((entry) => entry.publicId === world.uuid("29"));
+      return row === undefined
+        ? null
+        : {
+            requesterAcknowledgedAt: row.requesterAcknowledgedAt,
+            terminalCleanupAfter: row.terminalCleanupAfter,
+          };
+    })).toEqual({
+      requesterAcknowledgedAt: expect.any(Number),
+      terminalCleanupAfter: undefined,
+    });
     expect(await world.browser.mutation(cancelPending, { commandPublicId: world.uuid("29") }))
       .toMatchObject({ replay: false, state: "cancelled" });
+    const terminalReceipt = await world.testRuntime.run(async (ctx) => {
+      const rows = await ctx.db.query("deviceCommands").collect();
+      const row = rows.find((entry) => entry.publicId === world.uuid("29"));
+      return row === undefined
+        ? null
+        : {
+            requesterAcknowledgedAt: row.requesterAcknowledgedAt,
+            terminalCleanupAfter: row.terminalCleanupAfter,
+          };
+    });
+    if (
+      typeof terminalReceipt?.terminalCleanupAfter !== "number"
+      || typeof terminalReceipt.requesterAcknowledgedAt !== "number"
+    ) throw new Error(
+      `invalid terminal receipt cleanup: ${typeof terminalReceipt?.terminalCleanupAfter}/${typeof terminalReceipt?.requesterAcknowledgedAt} ${JSON.stringify(terminalReceipt)}`,
+    );
+    expect(terminalReceipt.terminalCleanupAfter)
+      .toBeGreaterThan(terminalReceipt.requesterAcknowledgedAt);
     expect(await world.daemon.mutation(confirmTerminalRecovery, {
       commandPublicId: world.uuid("29"),
       localPhase: "prepared_no_effect",
@@ -765,11 +911,23 @@ describe("device commands", () => {
     }
     const states = await world.testRuntime.run(async (ctx) => {
       const rows = await ctx.db.query("deviceCommands").collect();
-      return Object.fromEntries(rows.map((row) => [row.publicId, row.state]));
+      return Object.fromEntries(rows.map((row) => [row.publicId, {
+        requesterAcknowledgedAt: row.requesterAcknowledgedAt,
+        state: row.state,
+        terminalCleanupAfter: row.terminalCleanupAfter,
+      }]));
     });
-    expect(states[world.uuid("2a")]).toBe("cancelled");
+    expect(states[world.uuid("2a")]).toMatchObject({
+      requesterAcknowledgedAt: expect.any(Number),
+      state: "cancelled",
+      terminalCleanupAfter: expect.any(Number),
+    });
     // An effect that may have begun is quarantined, never cancelled.
-    expect(states[world.uuid("2b")]).toBe("ambiguous");
+    expect(states[world.uuid("2b")]).toMatchObject({
+      requesterAcknowledgedAt: expect.any(Number),
+      state: "ambiguous",
+      terminalCleanupAfter: expect.any(Number),
+    });
     expect(await world.daemon.mutation(confirmRevokedTerminal, {
       authority: daemonAuthority,
       commandPublicId: world.uuid("2b"),

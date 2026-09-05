@@ -19,8 +19,12 @@ import { useCustody } from "../custody/custody-context";
 import { useArchivedSessions } from "../data/archived-sessions";
 import { useCommandState, useSubmitCommand } from "../data/commands";
 import {
+  deviceCommandCommittedRowUnavailableMessage,
+  DeviceCommandConsumedResultUnreadableError,
+  DeviceCommandConsumePrecommitError,
+  DeviceCommandResponseInvalidError,
   useConsumeDeviceCommandResult,
-  useDeviceCommandState,
+  useDeviceCommandTracker,
   useReadDeviceCommandResult,
   useSubmitDeviceCommand,
 } from "../data/device-commands";
@@ -62,6 +66,7 @@ import {
   type PresetChoice,
 } from "../model/settings-commands";
 import {
+  accountBrowserLoginAllowed,
   accountRows,
   accountStatusLabels,
   allScheduledTasks,
@@ -357,16 +362,52 @@ function ArchivedSessionRow({
   );
 }
 
+/** Browser login actions, admitted only by both machine-side switches. */
+export function AccountBrowserLoginControls({
+  account,
+  busy,
+  onStart,
+  onStatus,
+}: Readonly<{
+  account: AccountRowView;
+  busy: boolean;
+  onStart: () => void;
+  onStatus: () => void;
+}>) {
+  if (!accountBrowserLoginAllowed(account)) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {account.status === "signed_out" ? (
+        <Button
+          disabled={busy}
+          onClick={onStart}
+          size="small"
+          variant="secondary"
+        >
+          Link here
+        </Button>
+      ) : null}
+      <Button
+        disabled={busy}
+        onClick={onStatus}
+        size="small"
+        variant="ghost"
+      >
+        Check status
+      </Button>
+    </div>
+  );
+}
+
 /**
  * One account, with the browser linking flow behind the machine's local opt-in.
  *
- * With the opt-in off the row shows the CLI instruction and nothing else: the
- * button is absent rather than disabled, because a machine that has not opted in
- * would refuse the command anyway. With it on, "Link here" relays the complete
- * provider device-code handoff. The URL and one-time code are account-key
- * encrypted, single use, and short lived; the hosted row erases their shared
- * ciphertext on the first read. Poll names this row's account and returns only
- * its status and a bounded local instruction.
+ * With either device commands or account linking off, the row shows the CLI
+ * instruction and no browser action. With both on, "Link here" relays the
+ * complete provider device-code handoff. The URL and one-time code are
+ * account-key encrypted, single use, and short lived; the hosted row erases
+ * their shared ciphertext on the first read. Poll names this row's account and
+ * returns only its status and a bounded local instruction.
  */
 function AccountRow({
   account,
@@ -376,9 +417,10 @@ function AccountRow({
   const submitDeviceCommand = useSubmitDeviceCommand();
   const consumeResult = useConsumeDeviceCommandResult();
   const readResult = useReadDeviceCommandResult();
-  const [commandPublicId, setCommandPublicId] = useState<string | null>(null);
   const [relay, setRelay] = useState<AccountLoginRelayResult | null>(null);
   const [status, setStatus] = useState<string | null>(null);
+  const [consumeRetryCommand, setConsumeRetryCommand] = useState<string | null>(null);
+  const [consumeAttempt, setConsumeAttempt] = useState(0);
   const [loginAction, setLoginAction] = useState<AccountLoginActionState>(
     initialAccountLoginActionState,
   );
@@ -387,8 +429,6 @@ function AccountRow({
   const readStatusCommand = useRef<string | null>(null);
   const activeCommand = useRef<string | null>(null);
   const mounted = useRef(true);
-  const command = useDeviceCommandState(commandPublicId);
-  const notice = deviceCommandNotice(command);
   const localLoginCommand = account.provider === "claude"
     ? `hra account login ${account.publicId} --provider claude`
     : `hra account login ${account.publicId}`;
@@ -404,6 +444,17 @@ function AccountRow({
     const next = finishAccountLoginHandoff(current, publicId);
     if (next !== current) updateLoginAction(next);
   }, [updateLoginAction]);
+
+  const handleUnavailable = useCallback((commandPublicId: string) => {
+    activeCommand.current = null;
+    setStatus(deviceCommandCommittedRowUnavailableMessage);
+    releaseLoginHandoff(commandPublicId);
+  }, [releaseLoginHandoff]);
+  const { observation, setHandle: setCommandHandle } = useDeviceCommandTracker(
+    handleUnavailable,
+  );
+  const command = observation.record;
+  const notice = deviceCommandNotice(command);
 
   useEffect(() => {
     mounted.current = true;
@@ -431,6 +482,7 @@ function AccountRow({
     // Fence by public id only after hosted time is ready, before the mutation,
     // so neither clock skew nor a relay-driven render can lose the one read.
     consumedCommand.current = command.publicId;
+    setConsumeRetryCommand(null);
     if (admission.status === "expired_or_invalid") {
       setStatus("This login handoff expired. Start a new login.");
       releaseLoginHandoff(command.publicId);
@@ -444,6 +496,7 @@ function AccountRow({
         if (!mounted.current || activeCommand.current !== command.publicId) return;
         if (result === null) {
           setStatus("No login handoff was available. It expired, was already read, or requires an HRA update on the machine. Start a new login after checking the machine.");
+          releaseLoginHandoff(command.publicId);
           return;
         }
         if (
@@ -454,18 +507,27 @@ function AccountRow({
         } else if (result.kind === "account_login_start") {
           setStatus("The machine returned a legacy login handoff. Update HRA on the machine before trying again.");
         }
+        releaseLoginHandoff(command.publicId);
       })
-      .catch(() => {
-        if (mounted.current && activeCommand.current === command.publicId) {
+      .catch((failure: unknown) => {
+        if (!mounted.current || activeCommand.current !== command.publicId) return;
+        if (failure instanceof DeviceCommandConsumePrecommitError) {
+          // The hosted transaction definitely aborted, so retain custody of
+          // this exact handoff and let the reader explicitly retry it.
+          setConsumeRetryCommand(command.publicId);
+          setStatus(failure.message);
+          return;
+        }
+        if (failure instanceof DeviceCommandConsumedResultUnreadableError) {
+          setStatus(
+            "The one-time login handoff was consumed but could not be read. Unlock this browser again, check the machine, then start a new login.",
+          );
+        } else {
           setStatus("The machine returned an incompatible login handoff. Update HRA on the machine before trying again.");
         }
-      })
-      .finally(() => {
-        if (mounted.current && activeCommand.current === command.publicId) {
-          releaseLoginHandoff(command.publicId);
-        }
+        releaseLoginHandoff(command.publicId);
       });
-  }, [command, consumeResult, now, releaseLoginHandoff, serverClockReady]);
+  }, [command, consumeAttempt, consumeResult, now, releaseLoginHandoff, serverClockReady]);
 
   // Failed, cancelled, ambiguous, and hosted-expired starts have no relay to
   // consume. An applied result consumed by another tab also releases the row,
@@ -532,17 +594,31 @@ function AccountRow({
     // A new action may replace a completed result, but never an outstanding
     // one-time handoff: the action gate above holds that command through read.
     activeCommand.current = null;
+    setCommandHandle(null);
+    setConsumeRetryCommand(null);
     setRelay(null);
     setStatus(null);
     void submitDeviceCommand({ payload, targetDevicePublicId: account.targetDevicePublicId })
       .then((publicId) => {
         if (!mounted.current) return;
         activeCommand.current = publicId;
-        setCommandPublicId(publicId);
+        setCommandHandle({ publicId, responseValidated: true });
         updateLoginAction(completeAccountLoginSubmission(loginActionRef.current, publicId));
       })
       .catch((failure: unknown) => {
         if (mounted.current) {
+          if (failure instanceof DeviceCommandResponseInvalidError) {
+            activeCommand.current = failure.commandPublicId;
+            setCommandHandle({
+              publicId: failure.commandPublicId,
+              responseValidated: false,
+            });
+            updateLoginAction(completeAccountLoginSubmission(
+              loginActionRef.current,
+              failure.commandPublicId,
+            ));
+            return;
+          }
           setStatus(failure instanceof Error ? failure.message : "The request was not accepted.");
           updateLoginAction(initialAccountLoginActionState);
         }
@@ -562,27 +638,13 @@ function AccountRow({
       description={account.machineLabel}
       title={account.label}
     >
-      {account.provider === "codex" && account.accountLinkingAllowed ? (
-        <div className="flex flex-wrap items-center gap-2">
-          {account.status === "signed_out" ? (
-            <Button
-              disabled={busy}
-              onClick={() => { run(accountLoginStartCommand(account.publicId)); }}
-              size="small"
-              variant="secondary"
-            >
-              Link here
-            </Button>
-          ) : null}
-          <Button
-            disabled={busy}
-            onClick={() => { run(accountLoginStatusCommand(account.publicId)); }}
-            size="small"
-            variant="ghost"
-          >
-            Check status
-          </Button>
-        </div>
+      {accountBrowserLoginAllowed(account) ? (
+        <AccountBrowserLoginControls
+          account={account}
+          busy={busy}
+          onStart={() => { run(accountLoginStartCommand(account.publicId)); }}
+          onStatus={() => { run(accountLoginStatusCommand(account.publicId)); }}
+        />
       ) : (
         <>
           <CommandHint>{localLoginCommand}</CommandHint>
@@ -603,6 +665,25 @@ function AccountRow({
           userCode={relay.userCode}
         />
       )}
+      {observation.protocolWarning === null ? null : (
+        <p className="text-xs text-danger" role="status">
+          {observation.protocolWarning}
+        </p>
+      )}
+      {consumeRetryCommand === command?.publicId ? (
+        <Button
+          onClick={() => {
+            consumedCommand.current = null;
+            setConsumeRetryCommand(null);
+            setStatus(null);
+            setConsumeAttempt((attempt) => attempt + 1);
+          }}
+          size="small"
+          variant="secondary"
+        >
+          Try reading again
+        </Button>
+      ) : null}
       {notice === null ? null : (
         <p
           className={notice.tone === "error" ? "text-xs text-danger" : "text-xs text-ink-muted"}

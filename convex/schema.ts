@@ -391,6 +391,7 @@ export default defineSchema({
     .index("by_requesting_device_and_nonterminal", ["requestingDeviceId", "nonterminal", "createdAt"])
     .index("by_state_and_deadline", ["state", "deadline"])
     .index("by_state_and_cleanup_after", ["state", "terminalCleanupAfter"])
+    .index("by_state_cleanup_after_updated_at", ["state", "terminalCleanupAfter", "updatedAt"])
     .index("by_single_use_result_expiry", [
       "resultSingleUse",
       "resultConsumedAt",
