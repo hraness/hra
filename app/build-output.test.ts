@@ -174,6 +174,7 @@ describe("bundle invariants", () => {
 
 type ProjectConfiguration = Readonly<{
   headers: { headers: { key: string; value: string }[]; source: string }[];
+  ignoreCommand: string;
   outputDirectory: string;
 }>;
 
@@ -194,6 +195,9 @@ describe("vercel project headers", () => {
     const find = headerFinder(configuration);
 
     expect(configuration.outputDirectory).toBe("dist");
+    // Vercel skips a build on exit 0. This exact inequality therefore keeps
+    // production builds running while ignoring preview deployments.
+    expect(configuration.ignoreCommand).toBe('test "$VERCEL_ENV" != "production"');
     expect(find("/(.*)", "Content-Security-Policy")).toBe(
       "default-src 'none'; script-src 'self'; "
       + "connect-src https://qualified-hummingbird-537.convex.cloud "

@@ -4,6 +4,7 @@ import type { Value } from "convex/values";
 import { convexTest } from "convex-test";
 
 import { expectPromiseToReject } from "../src/cloud/testAssertions";
+import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
 import {
   initializeUserQuotaAuthority,
   reserveQuotaForStoredIdentity,
@@ -386,7 +387,11 @@ describe("device commands", () => {
     expect(beforeRead).toMatchObject({ resultConsumed: false, resultSingleUse: true });
 
     expect(await world.browser.mutation(consumeResult, { commandPublicId: world.uuid("28") }))
-      .toMatchObject({ result: resultEnvelope, status: "released" });
+      .toMatchObject({
+        expiresAt: expect.any(Number),
+        result: resultEnvelope,
+        status: "released",
+      });
     expect(await world.browser.mutation(consumeResult, { commandPublicId: world.uuid("28") }))
       .toMatchObject({ status: "spent" });
     // The target device is not the requester and may never exchange the relay.
@@ -394,6 +399,49 @@ describe("device commands", () => {
       world.daemon.mutation(consumeResult, { commandPublicId: world.uuid("28") }),
     );
     expect(await world.browser.query(getCommand, { commandPublicId: world.uuid("28") }))
+      .toMatchObject({ resultConsumed: true, resultSingleUse: true });
+  });
+
+  test("erases an expired login handoff without releasing its ciphertext", async () => {
+    const world = await deviceCommandWorld();
+    await world.enqueueFrom(world.browser, {
+      kind: "account_login_start",
+      publicId: world.uuid("38"),
+    });
+    await world.daemon.mutation(prepare, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("38"),
+      localPhase: "prepared_no_effect",
+    });
+    await world.daemon.mutation(markEffectStarted, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("38"),
+    });
+    await world.daemon.mutation(settle, {
+      authority: daemonAuthority,
+      commandPublicId: world.uuid("38"),
+      result: resultEnvelope,
+      resultCode: "APPLIED",
+      resultDigest: "e".repeat(64),
+      singleUseResult: true,
+      state: "applied",
+    });
+    await world.testRuntime.run(async (ctx) => {
+      const row = (await ctx.db
+        .query("deviceCommands")
+        .withIndex("by_public_id", (builder) => builder.eq("publicId", world.uuid("38")))
+        .unique());
+      if (row === null) throw new Error("missing device command fixture");
+      await ctx.db.patch(row._id, {
+        updatedAt: Date.now() - deviceCommandLoginResultLifetimeMs,
+      });
+    });
+
+    expect(await world.browser.mutation(consumeResult, { commandPublicId: world.uuid("38") }))
+      .toMatchObject({ status: "expired" });
+    expect(await world.browser.mutation(consumeResult, { commandPublicId: world.uuid("38") }))
+      .toMatchObject({ status: "spent" });
+    expect(await world.browser.query(getCommand, { commandPublicId: world.uuid("38") }))
       .toMatchObject({ resultConsumed: true, resultSingleUse: true });
   });
 

@@ -197,6 +197,35 @@ function signInProfile(store: StateStore, label: string, email: string) {
   return store.requireProfile(current.id);
 }
 
+async function prepareSignedOutSessionStart(
+  store: StateStore,
+  home: string,
+  input: Readonly<{
+    idempotencyKey: string;
+    label: string;
+    preset: "high" | "fable-max";
+    provider: "codex" | "claude";
+  }>,
+) {
+  const profile = store.createProfile(input.label);
+  const projectRoot = join(home, `${input.label.toLowerCase().replaceAll(" ", "-")}-project`);
+  await mkdir(projectRoot);
+  const project = await store.createProject(`${input.label} project`, projectRoot, true);
+  const attempt = store.prepareMutation({
+    authorityGeneration: profile.processGeneration,
+    authorityId: profile.id,
+    idempotencyKey: input.idempotencyKey,
+    kind: "session.start",
+    request: {
+      fast: false,
+      preset: input.preset,
+      projectId: project.id,
+      provider: input.provider,
+    },
+  });
+  return { attempt, profile, project };
+}
+
 const usageFingerprint = "a".repeat(64);
 const resetAccountFingerprint = (email: string): string =>
   createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
@@ -952,6 +981,249 @@ describe("StateStore", () => {
     expect(store.prepareMutation(input)).toMatchObject({ id: attempt.id, state: "prepared", replay: true });
   });
 
+  test("fences one-shot Claude login grants and settles the exact joined outcome", async () => {
+    const { store } = await fixture();
+    const created = store.createProfile("Claude auth");
+    const profile = store.nextProfileGeneration(created.id);
+    const key = "00000000-0000-4000-8000-000000000611";
+    const attempt = store.prepareMutation({
+      kind: "account.claude-login",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+      request: { provider: "claude" },
+      idempotencyKey: key,
+    });
+    store.beginClaudeLoginMutationEffect({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      evidence: { kind: "account.claude-login", provider: "claude", baselineSignedIn: false },
+    });
+    expect(store.readMutation(key)).toMatchObject({
+      id: attempt.id,
+      state: "effect_started",
+      evidence: { evidence: { kind: "account.claude-login", provider: "claude" } },
+    });
+    expect(store.providerAuthorityAdvanceBlocker(profile.id, "claude"))
+      .toBe("unsettled_authority");
+    expect(() => store.nextProfileGeneration(profile.id))
+      .toThrow("CLAUDE_LOGIN_AUTHORITY_UNSETTLED");
+    expect(() => store.advanceProfileGeneration(profile.id, profile.processGeneration))
+      .toThrow("CLAUDE_LOGIN_AUTHORITY_UNSETTLED");
+    expect(() => store.prepareMutation({
+      kind: "account.claude-login",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+      request: { provider: "claude" },
+      idempotencyKey: "00000000-0000-4000-8000-000000000612",
+    })).toThrow("UNSETTLED_MUTATION_AUTHORITY");
+
+    expect(() => store.settleClaudeLoginMutation({
+      attemptId: attempt.id,
+      idempotencyKey: key,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      signedIn: true,
+      outcome: { state: "joined", exitCode: 0, interruptedBy: null },
+    })).not.toThrow();
+    expect(store.readMutation(key)).toMatchObject({ state: "applied" });
+    expect(store.providerAuthorityAdvanceBlocker(profile.id, "claude")).toBeNull();
+  });
+
+  test("restart advances a generation-zero Claude child launch and keeps it recovery-required", async () => {
+    const { store, home } = await fixture();
+    const profile = store.createProfile("Claude crash");
+    const pristine = store.createProfile("Pristine signed out");
+    const key = "00000000-0000-4000-8000-000000000613";
+    const attempt = store.prepareMutation({
+      kind: "account.claude-login",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+      request: { provider: "claude" },
+      idempotencyKey: key,
+    });
+    store.beginClaudeLoginMutationEffect({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      evidence: { kind: "account.claude-login", provider: "claude", baselineSignedIn: false },
+    });
+    store.close();
+
+    const restarted = new StateStore(
+      resolveStatePaths({ homeDirectory: home, platform: "darwin" }),
+      { now: () => 2_000 },
+    );
+    stores.push(restarted);
+    expect(restarted.nextDaemonGeneration(`boot_${"0".repeat(32)}`)).toBe(1);
+    expect(restarted.requireProfile(profile.id)).toMatchObject({
+      state: "signed_out",
+      processGeneration: 1,
+    });
+    expect(restarted.requireProfile(pristine.id)).toMatchObject({
+      state: "signed_out",
+      processGeneration: 0,
+    });
+    expect(restarted.recoverEffectStartedMutations()).toEqual({ recovered: [attempt.id], unresolved: [] });
+    expect(restarted.readMutation(key)).toMatchObject({ state: "ambiguous" });
+    expect(restarted.providerAuthorityAdvanceBlocker(profile.id, "claude"))
+      .toBe("unsettled_authority");
+    expect(restarted.settleClaudeLoginMutation({
+      attemptId: attempt.id,
+      idempotencyKey: key,
+      profileId: profile.id,
+      profileGeneration: 0,
+      signedIn: false,
+      outcome: { state: "joined", exitCode: 1, interruptedBy: null },
+    })).toMatchObject({ providerGeneration: 0, signedIn: false });
+    expect(restarted.providerAuthorityAdvanceBlocker(profile.id, "claude")).toBeNull();
+  });
+
+  test("reopens across daemon generation advance and resolves the exact historical Claude launch", async () => {
+    const { store, home } = await fixture();
+    const created = store.createProfile("Claude historical child");
+    const profile = store.nextProfileGeneration(created.id);
+    const key = "00000000-0000-4000-8000-000000000614";
+    const attempt = store.prepareMutation({
+      kind: "account.claude-login",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+      request: { provider: "claude" },
+      idempotencyKey: key,
+    });
+    store.beginClaudeLoginMutationEffect({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      evidence: { kind: "account.claude-login", provider: "claude", baselineSignedIn: false },
+    });
+    store.close();
+
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    const firstRestart = new StateStore(paths, { now: () => 2_000 });
+    stores.push(firstRestart);
+    expect(firstRestart.nextDaemonGeneration(`boot_${"e".repeat(32)}`)).toBe(1);
+    expect(firstRestart.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    expect(firstRestart.recoverEffectStartedMutations()).toEqual({
+      recovered: [attempt.id],
+      unresolved: [],
+    });
+    expect(firstRestart.readMutation(key)).toMatchObject({ state: "ambiguous" });
+    firstRestart.close();
+
+    const restarted = new StateStore(paths, { now: () => 3_000 });
+    stores.push(restarted);
+    expect(restarted.nextDaemonGeneration(`boot_${"f".repeat(32)}`)).toBe(2);
+    expect(restarted.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 2);
+    expect(restarted.recoverEffectStartedMutations()).toEqual({ recovered: [], unresolved: [] });
+    expect(restarted.readMutation(key)).toMatchObject({ state: "ambiguous" });
+    expect(restarted.providerAuthorityAdvanceBlocker(profile.id, "claude"))
+      .toBe("unsettled_authority");
+    const completion = {
+      attemptId: attempt.id,
+      idempotencyKey: key,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      signedIn: true,
+      outcome: { state: "joined" as const, exitCode: 0, interruptedBy: null },
+    };
+    expect(restarted.settleClaudeLoginMutation(completion)).toMatchObject({
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      signedIn: true,
+    });
+    expect(restarted.readMutation(key)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "proven_applied" },
+    });
+    expect(restarted.settleClaudeLoginMutation(completion)).toMatchObject({
+      signedIn: true,
+    });
+    expect(restarted.providerAuthorityAdvanceBlocker(profile.id, "claude")).toBeNull();
+  });
+
+  test("requires exact live Claude authority for idempotent acknowledged local abandon", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Claude local abandon");
+    const key = "00000000-0000-4000-8000-000000000615";
+    const attempt = store.prepareMutation({
+      kind: "account.claude-login",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+      request: { provider: "claude" },
+      idempotencyKey: key,
+    });
+    store.beginClaudeLoginMutationEffect({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      evidence: { kind: "account.claude-login", provider: "claude", baselineSignedIn: false },
+    });
+    const abandon = {
+      attemptId: attempt.id,
+      idempotencyKey: key,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      acknowledgeChildExited: true as const,
+    };
+    expect(() => store.abandonClaudeLoginMutation({
+      ...abandon,
+      profileGeneration: profile.processGeneration + 1,
+    })).toThrow("CLAUDE_LOGIN_AUTHORITY_MISMATCH");
+    expect(store.abandonClaudeLoginMutation(abandon)).toMatchObject({
+      acknowledgedChildExited: true,
+      accountId: profile.id,
+    });
+    expect(store.abandonClaudeLoginMutation(abandon)).toMatchObject({
+      acknowledgedChildExited: true,
+    });
+    expect(store.readMutation(key)).toMatchObject({
+      state: "reconciled",
+      resolution: { kind: "abandoned" },
+    });
+    expect(() => store.settleClaudeLoginMutation({
+      attemptId: attempt.id,
+      idempotencyKey: key,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      signedIn: false,
+      outcome: { state: "joined", exitCode: 1, interruptedBy: null },
+    })).toThrow("CLAUDE_LOGIN_TERMINAL_OUTCOME_CONFLICT");
+
+    const settledKey = "00000000-0000-4000-8000-000000000616";
+    const settled = store.prepareMutation({
+      kind: "account.claude-login",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+      request: { provider: "claude" },
+      idempotencyKey: settledKey,
+    });
+    store.beginClaudeLoginMutationEffect({
+      attemptId: settled.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      evidence: { kind: "account.claude-login", provider: "claude", baselineSignedIn: false },
+    });
+    store.settleClaudeLoginMutation({
+      attemptId: settled.id,
+      idempotencyKey: settledKey,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      signedIn: false,
+      outcome: { state: "not_started", reason: "spawn_failed" },
+    });
+    expect(() => store.abandonClaudeLoginMutation({
+      attemptId: settled.id,
+      idempotencyKey: settledKey,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      acknowledgeChildExited: true,
+    })).toThrow("CLAUDE_LOGIN_NOT_UNSETTLED");
+  });
+
   test("classifies effect-started authorities at restart and rejects new keys", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Restart recovery", "restart@example.com");
@@ -987,6 +1259,73 @@ describe("StateStore", () => {
     expect(store.recoverEffectStartedMutations()).toEqual({ recovered: [send.id], unresolved: [] });
     expect(store.readMutation("00000000-0000-4000-8000-000000000601")).toMatchObject({ state: "ambiguous" });
     expect(store.requireSession(session.id)).toMatchObject({ state: "recovery_required" });
+  });
+
+  test("terminalizes only exact quiescent idle Claude authority for account login", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Claude relink");
+    const created = store.createSession({
+      fastEnabled: false,
+      preset: "fable-max",
+      profileId: profile.id,
+      provider: "claude",
+    });
+    let session = store.bindSession({
+      expectedRevision: created.revision,
+      providerThreadId: "claude-thread-relink",
+      sessionId: created.id,
+      state: "idle",
+    });
+    const input = {
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    } as const;
+
+    expect(store.canReleaseIdleClaudeSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toBe(true);
+    session = store.setSessionTurnState({
+      activeTurnId: "claude-turn-relink",
+      expectedRevision: session.revision,
+      sessionId: session.id,
+      state: "active",
+    });
+    expect(store.canReleaseIdleClaudeSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toBe(false);
+    expect(() => store.terminalizeIdleClaudeSessionForAccountLogin(input))
+      .toThrow("CLAUDE_LOGIN_SESSION_NOT_QUIESCENT");
+    session = store.setSessionTurnState({
+      expectedRevision: session.revision,
+      sessionId: session.id,
+      state: "idle",
+    });
+    const queued = store.enqueue(session.id, "preserve this queued send");
+    expect(store.canReleaseIdleClaudeSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toBe(false);
+    expect(() => store.terminalizeIdleClaudeSessionForAccountLogin(input))
+      .toThrow("CLAUDE_LOGIN_SESSION_NOT_QUIESCENT");
+    expect(store.requireSession(session.id)).toMatchObject({ state: "idle" });
+    expect(store.requireQueue(queued.id)).toMatchObject({ state: "pending" });
+
+    expect(store.transitionQueue(queued.id, "pending", "cancelled")).toBe(true);
+    expect(store.terminalizeIdleClaudeSessionForAccountLogin(input)).toMatchObject({
+      changed: true,
+      event: {
+        body: { activeTurnId: null, status: "terminal", type: "session_status" },
+      },
+      interactions: [],
+      session: { provider: "claude", state: "terminal" },
+    });
   });
 
   test("provider deletion atomically terminalizes pending and in-flight session authority", async () => {
@@ -1160,6 +1499,139 @@ describe("StateStore", () => {
     expect(store.requireSession(session.id).providerThreadId).toBeUndefined();
   });
 
+  test("admits a signed-out Claude session start with an exact provider authentication proof", async () => {
+    const { store, home } = await fixture();
+    const { attempt, profile, project } = await prepareSignedOutSessionStart(
+      store,
+      home,
+      {
+        idempotencyKey: "00000000-0000-4000-8000-0000000006a3",
+        label: "Claude proof",
+        preset: "fable-max",
+        provider: "claude",
+      },
+    );
+
+    const session = store.beginSessionStartEffect({
+      attemptId: attempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        projectId: project.id,
+      },
+      fastEnabled: false,
+      preset: "fable-max",
+      profileGeneration: profile.processGeneration,
+      profileId: profile.id,
+      projectId: project.id,
+      provider: "claude",
+      providerAuthentication: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        provider: "claude",
+        signedIn: true,
+      },
+    });
+
+    expect(session).toMatchObject({
+      profileId: profile.id,
+      provider: "claude",
+      state: "starting",
+    });
+    expect(store.requireProfileById(profile.id).state).toBe("signed_out");
+  });
+
+  test("refuses missing or mismatched Claude session-start authentication proof", async () => {
+    const { store, home } = await fixture();
+    const { attempt, profile, project } = await prepareSignedOutSessionStart(
+      store,
+      home,
+      {
+        idempotencyKey: "00000000-0000-4000-8000-0000000006a4",
+        label: "Claude proof refusal",
+        preset: "fable-max",
+        provider: "claude",
+      },
+    );
+    const start = (providerAuthentication?: Readonly<{
+      profileId: typeof profile.id;
+      processGeneration: number;
+      provider: "codex" | "claude";
+      signedIn: true;
+    }>) => store.beginSessionStartEffect({
+      attemptId: attempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start" as const,
+        messageDigest: null,
+        projectId: project.id,
+      },
+      fastEnabled: false,
+      preset: "fable-max",
+      profileGeneration: profile.processGeneration,
+      profileId: profile.id,
+      projectId: project.id,
+      provider: "claude",
+      ...(providerAuthentication === undefined ? {} : { providerAuthentication }),
+    });
+
+    expect(() => start()).toThrow("SESSION_START_PROVIDER_AUTHENTICATION_REQUIRED");
+    expect(() => start({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      provider: "codex",
+      signedIn: true,
+    }))
+      .toThrow("SESSION_START_PROVIDER_AUTHENTICATION_MISMATCH");
+    expect(() => start({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration + 1,
+      provider: "claude",
+      signedIn: true,
+    })).toThrow("SESSION_START_PROVIDER_AUTHENTICATION_MISMATCH");
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006a4"))
+      .toMatchObject({ state: "prepared" });
+  });
+
+  test("does not let provider authentication proof bypass the Codex profile-state gate", async () => {
+    const { store, home } = await fixture();
+    const { attempt, profile, project } = await prepareSignedOutSessionStart(
+      store,
+      home,
+      {
+        idempotencyKey: "00000000-0000-4000-8000-0000000006a5",
+        label: "Codex proof refusal",
+        preset: "high",
+        provider: "codex",
+      },
+    );
+
+    expect(() => store.beginSessionStartEffect({
+      attemptId: attempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        projectId: project.id,
+      },
+      fastEnabled: false,
+      preset: "high",
+      profileGeneration: profile.processGeneration,
+      profileId: profile.id,
+      projectId: project.id,
+      provider: "codex",
+      providerAuthentication: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        provider: "codex",
+        signedIn: true,
+      },
+    })).toThrow("MUTATION_EFFECT_AUTHORITY_CHANGED");
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006a5"))
+      .toMatchObject({ state: "prepared" });
+  });
+
   test("carries either provider's reviewed runtime profile through one session-start evidence row", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Both providers", "both-providers@example.com");
@@ -1226,6 +1698,16 @@ describe("StateStore", () => {
         profileId: profile.id,
         projectId: project.id,
         provider,
+        ...(provider === "claude"
+          ? {
+              providerAuthentication: {
+                profileId: profile.id,
+                processGeneration: profile.processGeneration,
+                provider,
+                signedIn: true as const,
+              },
+            }
+          : {}),
       });
       store.completeSessionStartEffect({
         attemptId: attempt.id,
@@ -1458,6 +1940,12 @@ describe("StateStore", () => {
       profileId: profile.id,
       projectId: project.id,
       provider: "claude",
+      providerAuthentication: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        provider: "claude",
+        signedIn: true,
+      },
     })).toThrow("MUTATION_EFFECT_RUNTIME_PROFILE_MISMATCH");
   });
 

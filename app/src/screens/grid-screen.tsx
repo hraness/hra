@@ -28,6 +28,8 @@ import {
   defaultSessionStartPreset,
   deviceCommandNotice,
   sessionStartCommand,
+  sessionStartTargetHint,
+  sessionStartTargetLabel,
   sessionStartTargets,
   type PresetChoice,
 } from "../model/device-commands";
@@ -350,7 +352,7 @@ export function GridScreen({
   const hint = starting
     ? startTarget === null || project === null
       ? "No machine here can start a session yet. Sign an account in on a machine, add a project, and leave `hra remote allow device-commands` set."
-      : `Starts on ${startTarget.machineLabel}${startTarget.machineOnline ? "" : " (offline; it will run when the machine wakes)"}.`
+      : sessionStartTargetHint(startTarget)
     : steerTarget === null
       ? "Nothing to send to yet."
       : `Steers ${steerTarget.title}. Clear the selection to start a new session.`;
@@ -431,7 +433,7 @@ export function GridScreen({
                     key={`${entry.targetDevicePublicId}:${entry.accountPublicId}`}
                     value={`${entry.targetDevicePublicId}:${entry.accountPublicId}`}
                   >
-                    {`${entry.accountLabel} — ${entry.machineLabel}`}
+                    {sessionStartTargetLabel(entry)}
                   </option>
                 ))}
               </select>
