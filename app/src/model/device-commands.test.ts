@@ -10,6 +10,7 @@ import {
   admitHostedLoginHandoff,
   bindHostedLoginResultExpiry,
   defaultSessionStartPreset,
+  defaultSessionStartPresetForProvider,
   deviceCommandNotice,
   hostedLoginHandoffDeadline,
   initialAccountLoginActionState,
@@ -39,7 +40,7 @@ function machine(overrides: Partial<Readonly<{
   accountLinkingAllowed: boolean;
   accounts: readonly Readonly<{
     label: string;
-    provider: "codex" | "claude";
+    provider: "codex" | "claude" | "devin";
     publicId: string;
     status: "login_pending" | "recovery_required" | "signed_in" | "signed_out";
   }>[];
@@ -84,6 +85,9 @@ function machine(overrides: Partial<Readonly<{
 describe("device command builders", () => {
   test("the composer default is Astra Ultra", () => {
     expect(defaultSessionStartPreset).toBe("ultra");
+    expect(defaultSessionStartPresetForProvider("codex")).toBe("ultra");
+    expect(defaultSessionStartPresetForProvider("claude")).toBe("fable-max");
+    expect(defaultSessionStartPresetForProvider("devin")).toBe("astra");
   });
 
   test("builds a session start that the daemon parser accepts", () => {
@@ -101,6 +105,37 @@ describe("device command builders", () => {
       prompt: "continue the migration",
       provider: "codex",
     });
+  });
+
+  test("builds each provider only with its own preset", () => {
+    const providerPresets = [
+      ["codex", "high"],
+      ["claude", "fable-max"],
+      ["devin", "astra"],
+    ] as const;
+    for (const [provider, preset] of providerPresets) {
+      expect(accepted(sessionStartCommand({
+        accountPublicId: `acct_${provider}00001`,
+        preset,
+        projectPublicId: "proj_alpha000001",
+        prompt: "continue",
+        provider,
+      }))).toMatchObject({ kind: "session_start", preset, provider });
+    }
+
+    for (const [provider, preset] of [
+      ["codex", "astra"],
+      ["claude", "ultra"],
+      ["devin", "fable-max"],
+    ] as const) {
+      expect(() => sessionStartCommand({
+        accountPublicId: `acct_${provider}00001`,
+        preset,
+        projectPublicId: "proj_alpha000001",
+        prompt: "continue",
+        provider,
+      })).toThrow("The device command payload is not valid.");
+    }
   });
 
   test("refuses an empty prompt and a prompt carrying a filesystem path", () => {
@@ -330,6 +365,15 @@ describe("session start targets", () => {
     if (codex === undefined) throw new Error("expected Codex target");
     expect(sessionStartTargetLabel(codex)).toBe("Work — Studio — Codex");
     expect(sessionStartTargetHint(codex)).not.toContain("Linux custodian");
+
+    const devin = sessionStartTargets([machine({
+      accounts: [
+        { label: "Build", provider: "devin", publicId: "acct_devin000001", status: "signed_in" },
+      ],
+    })])[0];
+    if (devin === undefined) throw new Error("expected Devin target");
+    expect(sessionStartTargetLabel(devin)).toBe("Build — Studio — Devin");
+    expect(sessionStartTargetHint(devin)).not.toContain("Linux custodian");
   });
 });
 

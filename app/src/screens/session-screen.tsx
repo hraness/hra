@@ -23,17 +23,16 @@ import {
   defaultMessageForAttachments,
 } from "../model/attachments";
 import {
-  buildSetProviderPayload,
+  buildDefaultSetProviderPayload,
   providerSwitchDisabledReason,
   providerSwitchNote,
   providerSwitchNotice,
   providerSwitchOptions,
   providerSwitchSupported,
+  sessionPresetOptionsForProvider,
   type SessionProvider,
 } from "../model/provider-switch";
 import {
-  presetChoices,
-  presetLabels,
   sessionFastCommand,
   sessionFastCommandNotice,
 } from "../model/settings-commands";
@@ -187,6 +186,7 @@ export function SessionScreen({
     fastCommand,
     fastRequestForSession?.enabled ?? null,
   );
+  const presetOptions = sessionPresetOptionsForProvider(provider);
   const providerDisabledReason = providerSwitchDisabledReason({
     sending,
     supported: providerSwitchSupported(),
@@ -362,10 +362,10 @@ export function SessionScreen({
           does not infer or highlight it.
         </p>
         <div className="mt-2 flex flex-col gap-2">
-          {presetChoices.map((value) => (
+          {presetOptions.map(({ label, value }) => (
             <ChoiceRow
               key={value}
-              label={presetLabels[value]}
+              label={label}
               onSelect={() => {
                 setMenuOpen(false);
                 void run({ kind: "set_model", preset: value });
@@ -377,8 +377,9 @@ export function SessionScreen({
 
         <h2 className="mt-4 text-base font-semibold">Fast (Codex only)</h2>
         <p className="mt-1 text-xs text-ink-muted">
-          Applies to future turns; Claude Code has no Fast mode. The daemon holds the
-          current value, so this browser highlights only a change the machine confirmed.
+          Applies to future turns; Claude Code and Devin have no Fast mode. The daemon
+          holds the current value, so this browser highlights only a change the machine
+          confirmed.
         </p>
         <div className="mt-2 flex flex-col gap-2">
           {([true, false] as const).map((enabled) => (
@@ -436,7 +437,7 @@ export function SessionScreen({
               label={option.label}
               onSelect={() => {
                 setProvider(option.provider);
-                void run(buildSetProviderPayload({ provider: option.provider }))
+                void run(buildDefaultSetProviderPayload(option.provider))
                   .then((commandPublicId) => { setProviderCommandId(commandPublicId); });
               }}
               selected={provider === option.provider}

@@ -46,20 +46,23 @@ import {
   isRelayedLoginUrl,
   type DeviceCommandLoginStatus,
   type DeviceCommandPayload,
+  type DeviceRegistryAccount,
   type DeviceRegistryPayload,
   type DeviceRegistryScheduledTask,
   type RemoteCommandPayload,
 } from "./payloads";
+import type { Provider } from "../domain/presets";
 import { isCodexRuntimeProfile } from "../domain/runtime-profile";
 import type { NotificationHoursPolicy } from "../domain/notification-hours";
 import { providerUsagePayload } from "../domain/usage-metrics";
 import type { SessionEvent } from "../domain/session-events";
-import { queueIdSchema, sessionIdSchema } from "../domain/values";
+import { profileIdSchema, queueIdSchema, sessionIdSchema, type ProfileId } from "../domain/values";
 import type {
   ClaudeRuntimePort,
   CodexRuntimePort,
   CodexSessionProjection,
   CloudControlPort,
+  DevinRuntimePort,
   ProfileAuthority,
 } from "../daemon/ports";
 import {
@@ -625,6 +628,49 @@ function authorityFor(paths: StatePaths, profileId: Parameters<typeof profilePat
   };
 }
 
+export type DeviceRegistryAccountAddress = Readonly<{
+  profileId: ProfileId;
+  provider: Provider;
+  publicId: string;
+}>;
+
+/**
+ * The one reversible account-addressing boundary shared by registry writes and
+ * device-command reads. Codex keeps its historical raw profile id because the
+ * browser login flow already addresses it. Sibling provider identities are
+ * qualified, so one isolated local profile can never collide across providers.
+ * Both directions enforce the cloud protocol's bounded opaque-id grammar.
+ */
+export function deviceRegistryAccountAddress(input:
+  | Readonly<{ kind: "local"; profileId: string; provider: Provider }>
+  | Readonly<{ kind: "public"; publicId: string }>): DeviceRegistryAccountAddress | null {
+  if (input.kind === "local") {
+    const profileId = profileIdSchema.safeParse(input.profileId);
+    if (!profileId.success) return null;
+    const publicId = input.provider === "codex"
+      ? profileId.data
+      : `${input.provider}_${profileId.data}`;
+    return isOpaqueIdentifier(publicId)
+      ? { profileId: profileId.data, provider: input.provider, publicId }
+      : null;
+  }
+
+  if (!isOpaqueIdentifier(input.publicId)) return null;
+  const legacyCodex = profileIdSchema.safeParse(input.publicId);
+  if (legacyCodex.success) {
+    return { profileId: legacyCodex.data, provider: "codex", publicId: input.publicId };
+  }
+  for (const provider of ["claude", "devin"] as const) {
+    const prefix = `${provider}_`;
+    if (!input.publicId.startsWith(prefix)) continue;
+    const profileId = profileIdSchema.safeParse(input.publicId.slice(prefix.length));
+    if (profileId.success) {
+      return { profileId: profileId.data, provider, publicId: input.publicId };
+    }
+  }
+  return null;
+}
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -642,6 +688,18 @@ function rethrowWhenAborted(signal: AbortSignal, error: unknown): void {
 
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw signal.reason;
+}
+
+function providerObservationCleanupFailed(error: unknown): boolean {
+  // Provider probes currently use their ordinary timeout/process codes for
+  // these closed custody failures. Admission wrappers preserve them as causes.
+  // Inspect only a bounded cause chain and retain no provider diagnostic text.
+  let current = error;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth += 1) {
+    if (/could not be (?:joined|drained)/u.test(current.message)) return true;
+    current = current.cause;
+  }
+  return false;
 }
 
 function boundedProjectionRecoveryError(error: unknown): Error {
@@ -969,20 +1027,22 @@ function terminalSessionState(session: SessionRecord): "active" | "idle" | "term
 }
 
 /**
- * A profile's durable state is Codex authentication state. Claude owns its
- * authentication in the isolated runtime home, so an already-established
- * Claude session remains authoritative while that Codex projection is signed
- * out (including generation zero).
+ * A profile's durable state is Codex authentication state. Provider-owned
+ * runtimes keep authentication in their isolated homes, so an established
+ * Claude or Devin session remains authoritative while that Codex projection
+ * is signed out (including generation zero).
  */
 function profileAllowsEstablishedSession(
   profile: ProfileRecord,
   session: SessionRecord,
   platform: NodeJS.Platform,
 ): boolean {
-  return profile.state !== "removed"
-    && (session.provider === "claude"
-      ? platform === "linux"
-      : profile.state === "signed_in" && profile.processGeneration >= 1);
+  if (profile.state === "removed") return false;
+  switch (session.provider) {
+    case "codex": return profile.state === "signed_in" && profile.processGeneration >= 1;
+    case "claude": return platform === "linux";
+    case "devin": return true;
+  }
 }
 
 function parseStoredEvents(value: string): readonly CompactSessionEvent[] {
@@ -2476,6 +2536,8 @@ export type StateBackedCloudDaemonAdapterOptions = Readonly<{
    * projects exactly like a Codex one.
    */
   claude?: ClaudeRuntimePort;
+  /** Optional Devin ACP seam for projecting Devin-owned sessions. */
+  devin?: DevinRuntimePort;
   /** Local custody for the responder gateway key (default: none; `set_gateway_key` is refused). */
   gatewayKeyCustody?: CloudGatewayKeyCustody;
   executeRemote: LocalExecuteRemote;
@@ -2536,12 +2598,27 @@ function projectionCacheFailure(error: unknown): Exclude<CloudProjectionCacheSta
 
 export class StateBackedCloudDaemonAdapter
 implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceCommandExecutorPort {
+  readonly #accountObservations = new Map<string, {
+    generation: number;
+    observedAt: number;
+    signedIn: boolean | null;
+  }>();
+  readonly #accountObservationTasks = new Map<"claude" | "devin", {
+    controller: AbortController;
+    key: string;
+    task: Promise<void>;
+  }>();
+  readonly #accountObservationCursors = new Map<"claude" | "devin", ProfileId>();
+  readonly #accountObservationCleanupFailures = new Set<"claude" | "devin">();
+  #accountObservationsClosed = false;
+  #closeTask: Promise<void> | null = null;
   #cache: CloudProjectionCache | null;
   readonly #cachePath: string;
   readonly #cacheFileName: string;
   #cacheStatus: CloudProjectionCacheStatus;
   readonly #codex: CodexRuntimePort;
   readonly #claude: ClaudeRuntimePort | undefined;
+  readonly #devin: DevinRuntimePort | undefined;
   readonly #executeRemote: LocalExecuteRemote;
   readonly #executeLocal: LocalExecuteCommand;
   readonly #notifyOperator: (input: Readonly<{ body: string; title: string }>) => Promise<void>;
@@ -2603,6 +2680,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     }
     this.#codex = options.codex;
     this.#claude = options.claude;
+    this.#devin = options.devin;
     this.#executeRemote = options.executeRemote;
     // Without an injected local executor no device command can reach the
     // provider, so the adapter refuses every one of them rather than pretending
@@ -2624,16 +2702,47 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   #sessionRuntime(session: SessionRecord): {
     readSession: CodexRuntimePort["readSession"];
   } {
-    if (session.provider !== "claude") return this.#codex;
-    const claude = this.#claude;
-    if (claude === undefined) {
-      throw new Error("This daemon composes no Claude Code runtime for that session.");
+    switch (session.provider) {
+      case "codex": return this.#codex;
+      case "claude": {
+        const claude = this.#claude;
+        if (claude === undefined) {
+          throw new Error("This daemon composes no Claude Code runtime for that session.");
+        }
+        return claude;
+      }
+      case "devin": {
+        const devin = this.#devin;
+        if (devin === undefined) {
+          throw new Error("This daemon composes no Devin runtime for that session.");
+        }
+        return devin;
+      }
     }
-    return claude;
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.#closeTask !== null) return this.#closeTask;
+    this.#accountObservationsClosed = true;
+    for (const pending of this.#accountObservationTasks.values()) {
+      pending.controller.abort(new Error("Provider account observations are closed."));
+    }
+    this.#accountObservations.clear();
     this.#cache?.close();
+    const tasks = [...this.#accountObservationTasks.values()].map((pending) => pending.task);
+    let timer: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Provider account observations did not join after cancellation.")), 5_000);
+      timer.unref();
+    });
+    this.#closeTask = Promise.race([Promise.all(tasks).then(() => {
+      if (this.#accountObservationCleanupFailures.size > 0) {
+        throw new Error("Provider account observation process cleanup could not be proven.");
+      }
+    }), deadline])
+      .finally(() => clearTimeout(timer));
+    void this.#closeTask.catch(() => undefined);
+    return this.#closeTask;
   }
 
   projectionCacheStatus(): CloudProjectionCacheStatus {
@@ -3281,6 +3390,167 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
    * than failing the whole registry, and a Codex thread that is not one of
    * this daemon's sessions projects a null session id.
    */
+  #startAccountObservation(
+    profile: ProfileRecord,
+    provider: "claude" | "devin",
+    runtime: ClaudeRuntimePort | DevinRuntimePort,
+    signal: AbortSignal,
+  ): void {
+    if (
+      this.#accountObservationsClosed
+      || this.#accountObservationTasks.has(provider)
+      || this.#accountObservationCleanupFailures.has(provider)
+    ) return;
+    const key = `${provider}_${profile.id}`;
+    const observation = {
+      generation: profile.processGeneration,
+      observedAt: this.#registryNow(),
+      signedIn: null as boolean | null,
+    };
+    this.#accountObservations.set(key, observation);
+    const controller = new AbortController();
+    const abort = () => controller.abort(new Error("Provider account observation was canceled."));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    const timer = setTimeout(() => {
+      controller.abort(new Error("Provider account observation exceeded its deadline."));
+    }, 10_000);
+    timer.unref();
+    const task = Promise.resolve().then(async () => {
+      throwIfAborted(controller.signal);
+      const projection = await runtime.readAccount({
+        authority: authorityFor(this.#paths, profile.id, profile.processGeneration),
+        signal: controller.signal,
+      });
+      if (this.#accountObservationsClosed || controller.signal.aborted) return;
+      if (this.#accountObservations.get(key) !== observation) return;
+      const current = this.#store.requireProfileById(profile.id);
+      if (current.state === "removed" || current.processGeneration !== observation.generation) return;
+      const signedIn: unknown = projection.signedIn;
+      if (typeof signedIn !== "boolean") return;
+      observation.signedIn = signedIn;
+      observation.observedAt = this.#registryNow();
+    }).catch((error: unknown) => {
+      if (providerObservationCleanupFailed(error)) {
+        this.#accountObservationCleanupFailures.add(provider);
+      }
+      // Unknown is omitted. Keep the attempt timestamp as bounded backoff,
+      // including failures, rather than respawning a CLI on each bridge tick.
+    }).finally(() => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      if (this.#accountObservationTasks.get(provider)?.task === task) {
+        this.#accountObservationTasks.delete(provider);
+      }
+    });
+    this.#accountObservationTasks.set(provider, { controller, key, task });
+    this.#accountObservationCursors.set(provider, profile.id);
+  }
+
+  #deviceRegistryAccounts(
+    signal: AbortSignal,
+    refresh = true,
+  ): readonly DeviceRegistryAccount[] {
+    throwIfAborted(signal);
+    if (this.#accountObservationsClosed) throw new Error("The cloud adapter is closed.");
+    const profiles = this.#store.listProfiles()
+      .filter((profile) => profile.state !== "removed")
+      .slice(0, deviceRegistryLimits.accounts);
+    const accounts: DeviceRegistryAccount[] = [];
+    const providers = [
+      { provider: "claude" as const, runtime: this.#claude },
+      { provider: "devin" as const, runtime: this.#devin },
+    ];
+    const currentKeys = new Set(profiles.flatMap((profile) =>
+      providers.map(({ provider }) => `${provider}_${profile.id}`)));
+    for (const key of this.#accountObservations.keys()) {
+      if (!currentKeys.has(key)) this.#accountObservations.delete(key);
+    }
+    for (const pending of this.#accountObservationTasks.values()) {
+      if (!currentKeys.has(pending.key)) {
+        pending.controller.abort(new Error("The observed provider account was removed."));
+      }
+    }
+
+    // Selection is an ordered prefix of complete profile groups. A selected
+    // profile retains Codex's historical raw id and every sibling-provider row
+    // whose runtime proves an auth state; the 100-row protocol cap never leaves
+    // a selected profile with only Codex because an earlier provider tier filled
+    // the array. At most two slots remain unused when the next complete group
+    // would cross the bound.
+    for (const profile of profiles) {
+      if (profile.state === "removed") continue;
+      if (accounts.length >= deviceRegistryLimits.accounts) break;
+      const label = registryLabel(profile.label, "Account");
+      const codexAddress = deviceRegistryAccountAddress({
+        kind: "local",
+        profileId: profile.id,
+        provider: "codex",
+      });
+      if (codexAddress === null) continue;
+      const profileAccounts: DeviceRegistryAccount[] = [{
+        label,
+        provider: codexAddress.provider,
+        publicId: codexAddress.publicId,
+        status: profile.state,
+      }];
+      for (const entry of providers) {
+        if (entry.runtime === undefined) continue;
+        const key = `${entry.provider}_${profile.id}`;
+        const observed = this.#accountObservations.get(key);
+        if (
+          observed === undefined
+          || observed.generation !== profile.processGeneration
+          || this.#registryNow() - observed.observedAt >= 60_000
+        ) {
+          this.#accountObservations.delete(key);
+          const pending = this.#accountObservationTasks.get(entry.provider);
+          if (pending?.key === key && observed?.generation !== profile.processGeneration) {
+            pending.controller.abort(new Error("The observed provider authority changed."));
+          }
+          continue;
+        }
+        if (observed.signedIn === null) continue;
+        const address = deviceRegistryAccountAddress({
+          kind: "local",
+          profileId: profile.id,
+          provider: entry.provider,
+        });
+        if (address === null) continue;
+        profileAccounts.push({
+          label,
+          provider: address.provider,
+          publicId: address.publicId,
+          status: observed.signedIn ? "signed_in" : "signed_out",
+        });
+      }
+      if (accounts.length + profileAccounts.length > deviceRegistryLimits.accounts) break;
+      accounts.push(...profileAccounts);
+    }
+    if (refresh && profiles.length > 0) {
+      for (const { provider, runtime } of providers) {
+        if (runtime === undefined || this.#accountObservationTasks.has(provider)) continue;
+        const cursor = this.#accountObservationCursors.get(provider);
+        const start = (profiles.findIndex((profile) => profile.id === cursor) + 1) % profiles.length;
+        // A bounded round robin gives later profiles a turn even when earlier
+        // observations expire before the registry's next bridge cycle.
+        for (let offset = 0; offset < profiles.length; offset += 1) {
+          const profile = profiles[(start + offset) % profiles.length];
+          if (profile === undefined) continue;
+          const observed = this.#accountObservations.get(`${provider}_${profile.id}`);
+          if (
+            observed !== undefined
+            && observed.generation === profile.processGeneration
+            && this.#registryNow() - observed.observedAt < 60_000
+          ) continue;
+          this.#startAccountObservation(profile, provider, runtime, signal);
+          break;
+        }
+      }
+    }
+    return accounts;
+  }
+
   async #buildDeviceRegistryProjection(
     input: Readonly<{ signal: AbortSignal }>,
   ): Promise<CloudDeviceRegistryProjection> {
@@ -3292,16 +3562,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         sessionByProviderThread.set(session.providerThreadId, session.id);
       }
     }
-    const accounts = this.#store.listProfiles()
-      .flatMap((profile) => profile.state === "removed"
-        ? []
-        : [{
-            label: registryLabel(profile.label, "Account"),
-            provider: "codex" as const,
-            publicId: profile.id,
-            status: profile.state,
-          }])
-      .slice(0, deviceRegistryLimits.accounts);
+    const accounts = this.#deviceRegistryAccounts(input.signal);
     const projects = this.#store.listProjects()
       .slice(0, deviceRegistryLimits.projects)
       .map((project) => ({
@@ -3744,9 +4005,35 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   }>): Promise<CloudDeviceCommandExecutionResult> {
     if (input.signal.aborted) throw input.signal.reason;
     const policy = this.#store.readDeviceCommandPolicy();
-    const accounts = this.#store.listProfiles().flatMap((profile) => profile.state === "removed"
-      ? []
-      : [{ provider: "codex" as const, publicId: profile.id, status: profile.state }]);
+    if (!policy.deviceCommandsAllowed) {
+      return { code: "DEVICE_COMMANDS_DENIED", state: "failed" };
+    }
+    if (
+      (input.payload.kind === "account_login_start"
+        || input.payload.kind === "account_login_status")
+      && !policy.accountLinkingAllowed
+    ) return { code: "ACCOUNT_LINKING_DENIED", state: "failed" };
+    const loginAccountAddress = (
+      (input.payload.kind === "account_login_start" || input.payload.kind === "account_login_status")
+      && "accountPublicId" in input.payload
+    ) ? deviceRegistryAccountAddress({ kind: "public", publicId: input.payload.accountPublicId }) : null;
+    if (loginAccountAddress !== null && loginAccountAddress.provider !== "codex") {
+      return { code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", state: "failed" };
+    }
+    if (input.payload.kind === "session_start") {
+      const address = deviceRegistryAccountAddress({ kind: "public", publicId: input.payload.accountPublicId });
+      if (address !== null && address.provider !== input.payload.provider) {
+        return { code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", state: "failed" };
+      }
+    }
+    // Registry observations are auxiliary. Command admission never starts a
+    // sweep: Codex uses durable local facts; optional-provider starts require
+    // a fresh observed row and the service rechecks auth before its effect.
+    const accounts = input.payload.kind === "session_start"
+      || input.payload.kind === "account_login_start"
+      || (input.payload.kind === "account_login_status" && "accountPublicId" in input.payload)
+      ? this.#deviceRegistryAccounts(input.signal, false)
+      : [];
     const decision = deviceCommandGuardDecision({
       accountLinkingAllowed: policy.accountLinkingAllowed,
       accounts,
@@ -3758,6 +4045,13 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       requestingDeviceActive: true,
     });
     if (decision.kind === "refused") return { code: decision.code, state: "failed" };
+    const sessionStartAccount = input.payload.kind === "session_start"
+      ? deviceRegistryAccountAddress({ kind: "public", publicId: input.payload.accountPublicId })
+      : null;
+    if (
+      input.payload.kind === "session_start"
+      && (sessionStartAccount === null || sessionStartAccount.provider !== input.payload.provider)
+    ) return { code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", state: "failed" };
     this.#store.recordDeviceCommandAdmission({
       dayCount: decision.dayCount,
       dayKey: decision.dayKey,
@@ -3773,7 +4067,15 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     try {
       switch (input.payload.kind) {
         case "session_start":
-          return await this.#startSessionForDevice(input.payload, input.idempotencyKey, input.signal);
+          if (sessionStartAccount === null) {
+            return { code: "DEVICE_COMMAND_ACCOUNT_UNKNOWN", state: "failed" };
+          }
+          return await this.#startSessionForDevice(
+            input.payload,
+            sessionStartAccount.profileId,
+            input.idempotencyKey,
+            input.signal,
+          );
         case "account_login_start":
           return await this.#startAccountLoginRelay(
             input.payload,
@@ -3828,6 +4130,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
    */
   async #startSessionForDevice(
     payload: Extract<DeviceCommandPayload, { kind: "session_start" }>,
+    profileId: ProfileId,
     idempotencyKey: string,
     signal: AbortSignal,
   ): Promise<CloudDeviceCommandExecutionResult> {
@@ -3836,12 +4139,13 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     let sessionPublicId: string;
     try {
       const started = await this.#executeLocal({
-        account: payload.accountPublicId,
+        account: profileId,
         fast: false,
         idempotencyKey: startKey,
         kind: "session.start",
         preset: payload.preset,
         project: payload.projectPublicId,
+        provider: payload.provider,
       }, { signal });
       sessionPublicId = requireStartedSessionId(started);
     } catch (error: unknown) {

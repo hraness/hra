@@ -1,13 +1,13 @@
 # HRA v0.6.0 local CLI beta
 
-HRA is a persistent multi-provider CLI for isolated accounts and live local session control. Codex runs on macOS and Linux; Claude Code runs on Linux. Optional hosted encrypted sync has been live since 2026-09-03 and is now an open beta.
+HRA is a persistent multi-provider CLI for isolated accounts and live local session control. Codex and Devin run on macOS and Linux; Claude Code runs on Linux. Optional hosted encrypted sync has been live since 2026-09-03 and is now an open beta.
 
 ## Install
 
 Install the immutable beta tag with Bun 1.3.14:
 
 ```sh
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 53a13acc4c60baf19da95f469229e3d5269cb9cbe099962480e164fe7cc98731)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.6.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz 61dcd716e2272c4c3d94d565ac1a9aab3dc99780813316a822f594938cf456e2)" = hra-install-safe
 hra --version
 hra doctor --offline
 hra init --yes
@@ -19,6 +19,8 @@ The local CLI is public. Hosted sync is an open beta: sign-up no longer needs an
 
 ## Included
 
+- The official local Devin CLI is now a full provider through ACP v1. HRA admits exact CLI `3000.6.14`, launches `devin acp --model gpt-6-astra`, supports new and capability-gated resumed sessions, turns, stop, one-time permission decisions, provider switching, and provider-supplied context and optional cumulative-cost facts. Each account receives five private HOME/XDG roots; Devin owns its credential, and HRA reduces `devin auth status` to `signedIn` only. ACP thought chunks are dropped as raw reasoning. Devin exposes no machine-readable account allowance or reset operation, so HRA reports that allowance as unknown and never applies a Codex reset credit.
+- Codex `high` and the default `ultra` preset now use exact `gpt-6-astra` at `max` and `ultra` reasoning. Durable preset contracts keep existing and provider-imported Sol sessions on their established route while new sessions and explicit selections use Astra.
 - HRA now owns a bounded provider-neutral transcript. It records accepted user messages and safe tool-call summaries without raw arguments or output, keeps the conversation readable when a provider thread is unavailable, and exports it as HRA JSON or a letta-ai trajectory v1 document.
 - `hra session switch` moves a quiescent session between Codex and Claude Code on Linux. An evidence-first crash protocol fences both account generations and the daemon generation, starts and seeds the target once, releases the source, and commits the new provider binding atomically. Recovery advances only from durable evidence and complete provider projections; it never repeats an unproven target-start or seed effect. If a daemon restart leaves an unreleased process-local Claude side, automatic recovery refuses without provider effects. Explicit abandonment terminalizes with provider-state-unknown evidence and touches only addressable non-Claude sides; a seeded Claude target is never declared live from durable rows alone.
 - Codex account linking from the web always requests app-server device-code mode. HRA accepts only the pinned app-server's exact `https://auth.openai.com/codex/device` verification URL and a separate closed user code, encrypts the complete handoff to the requesting account key, exposes it once, and expires it against hosted time after five minutes. Browser-mode loopback callbacks and unversioned requests are refused before a local login effect.
@@ -31,7 +33,8 @@ The local CLI is public. Hosted sync is an open beta: sign-up no longer needs an
 
 - Hosted sync, identity enrollment, device pairing, and remote commands are an open beta. The hosted service can change while the beta runs.
 - Claude login, status, session, and switch effects are supported on Linux only. HRA refuses new Claude provider effects on macOS pending authenticated isolated-Keychain custody and detached-daemon read acceptance. Real authenticated acceptance for the exact Claude Code 2.1.260 pin remains pending because the available qualification host has 2.1.261.
-- Web account linking is Codex-only and requires local account-linking opt-in on the target machine. Claude login stays on that machine's foreground terminal; Claude Code exposes no HRA device-code or web-linking protocol.
+- Web account linking is Codex-only and requires local account-linking opt-in on the target machine. Claude and Devin login stay on that machine's foreground terminal; neither CLI exposes an HRA device-code or web-linking protocol.
+- Devin ACP exposes session context and optional cumulative cost, not a machine-readable account allowance, balance, reset time, or credit mutation. A zero-token compatibility smoke does not claim live turn, tool, permission, cancellation, or usage-update acceptance; that proof still requires a bounded paid turn.
 - Provider-native threads do not move between providers. A switch creates one target thread and seeds it from HRA's bounded transcript. Claude exposes no admitted provider-side session listing or resume path, so a Claude session remains tied to the daemon process that started it.
 - Plugin and connector discovery is read-only. HRA does not install, enable, authorize, or open OAuth flows.
 - Desktop account switching is macOS-only in this release.

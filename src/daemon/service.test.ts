@@ -15,6 +15,7 @@ import {
 } from "../codex";
 import { parseFact } from "../codex/protocol";
 import { CLAUDE_PIN } from "../claude/pin";
+import { DEVIN_PIN } from "../devin/pin";
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import { AccountKeyLossPreconditionError } from "../cloud/local-control";
 import {
@@ -68,7 +69,7 @@ import type {
   HraFactsMemoryLifecyclePort,
   HraFactsMemoryLifecycleReceipt,
 } from "./facts-memory-lifecycle";
-import { CodexSessionObservationError, UnavailableCloudControl, type ClaudeRuntimePort, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
+import { CodexSessionObservationError, UnavailableCloudControl, type ClaudeRuntimePort, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type DevinRuntimePort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import { SessionEventCursorCodec } from "./session-event-cursor";
 import { CommandFailure, FACTS_MEMORY_SESSION_TTL_MS, HraService } from "./service";
 import { USAGE_HISTORY_CURSOR_TTL_MS } from "./usage-history-cursor";
@@ -243,6 +244,7 @@ class FakeCodex implements CodexRuntimePort {
   async reviewSessionStart(input: Parameters<CodexRuntimePort["reviewSessionStart"]>[0]): Promise<RuntimeStartReview> {
     this.calls.push("review-session");
     this.sessionReviewRequests.push(input);
+    if (input.requirement.effort === "provider-default") throw new Error("not a Codex requirement");
     const base = runtimeProfile(input.authority);
     const effectiveRuntimeProfile = this.runtimeProfileOverride ?? {
       ...base,
@@ -312,6 +314,7 @@ class FakeCodex implements CodexRuntimePort {
     const error = this.reviewTurnErrorOnce;
     delete this.reviewTurnErrorOnce;
     if (error !== undefined) throw error;
+    if (input.requirement.effort === "provider-default") throw new Error("not a Codex requirement");
     const base = runtimeProfile(input.authority);
     const effectiveRuntimeProfile = this.runtimeProfileOverride ?? {
       ...base,
@@ -731,6 +734,7 @@ async function fixture(
   factsMemory?: HraFactsMemoryLifecyclePort,
   autorespond: Readonly<{
     claude?: ClaudeRuntimePort;
+    devin?: DevinRuntimePort;
     gatewayKeys?: GatewayKeyPort;
     proseResponder?: ProseResponder;
   }> = {},
@@ -750,7 +754,7 @@ async function fixture(
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.claude === undefined ? {} : { claude: autorespond.claude }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, platform, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.claude === undefined ? {} : { claude: autorespond.claude }), ...(autorespond.devin === undefined ? {} : { devin: autorespond.devin }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, platform, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
 }
 
 async function claudeAccountFixture(
@@ -824,6 +828,76 @@ async function claudeAccountFixture(
     providerSessionCalls,
     setClaudeReadError: (value: Error | undefined) => { readError = value; },
     setClaudeSignedIn: (value: boolean) => { signedIn = value; },
+  };
+}
+
+async function devinAccountFixture(initiallySignedIn = false) {
+  let signedIn = initiallySignedIn;
+  let readError: Error | undefined;
+  let readCalls = 0;
+  const providerSessionCalls: string[] = [];
+  const devin = {
+    provider: "devin" as const,
+    readAccount: async () => {
+      readCalls += 1;
+      if (readError !== undefined) throw readError;
+      return { signedIn };
+    },
+    observeSession: async () => {
+      providerSessionCalls.push("observe-session");
+      throw new Error("Devin session observation was not expected.");
+    },
+    readSession: async () => {
+      providerSessionCalls.push("read-session");
+      throw new Error("Devin session read was not expected.");
+    },
+    reviewSessionStart: async () => {
+      providerSessionCalls.push("review-session-start");
+      throw new Error("Devin session start review was not expected.");
+    },
+    reviewTurnStart: async () => {
+      providerSessionCalls.push("review-turn-start");
+      throw new Error("Devin turn review was not expected.");
+    },
+    startSession: async () => {
+      providerSessionCalls.push("start-session");
+      throw new Error("Devin session start was not expected.");
+    },
+    startTurn: async () => {
+      providerSessionCalls.push("start-turn");
+      throw new Error("Devin turn start was not expected.");
+    },
+    steer: async () => {
+      providerSessionCalls.push("steer");
+      throw new Error("Devin steer was not expected.");
+    },
+    interrupt: async () => {
+      providerSessionCalls.push("interrupt");
+      throw new Error("Devin interrupt was not expected.");
+    },
+    endSession: async () => {
+      providerSessionCalls.push("end-session");
+      throw new Error("Devin session end was not expected.");
+    },
+    interactionAuthority: () => { throw new Error("No Devin session interaction expected."); },
+    rebindProfileAuthority: () => undefined,
+    pinnedVersion: () => DEVIN_PIN,
+    close: async () => undefined,
+  } as unknown as DevinRuntimePort;
+  const value = await fixture(
+    undefined,
+    new FakeCloud(),
+    () => undefined,
+    Date.now,
+    undefined,
+    { devin },
+  );
+  return {
+    ...value,
+    devinReadCalls: () => readCalls,
+    providerSessionCalls,
+    setDevinReadError: (value: Error | undefined) => { readError = value; },
+    setDevinSignedIn: (value: boolean) => { signedIn = value; },
   };
 }
 
@@ -1504,6 +1578,83 @@ describe("HraService", () => {
       },
     });
     expect(codex.calls).toEqual([]);
+  });
+
+  test("reports Devin auth separately, preserves unknown allowance, and settles one foreground login", async () => {
+    const value = await devinAccountFixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Devin private" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+
+    await expect(value.service.execute({
+      kind: "account.show",
+      account: added.account.id,
+      provider: "devin",
+    }, { signal })).resolves.toMatchObject({
+      account: { id: added.account.id, label: "Devin private" },
+      authentication: { provider: "devin", signedIn: false },
+      nextCommand: `hra account login ${added.account.id} --provider devin`,
+      usage: {
+        allowance: "unknown",
+        source: "devin_acp",
+      },
+    });
+
+    const key = "00000000-0000-4000-8000-000000000711";
+    const prepared = await value.service.execute({
+      kind: "account.devin-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+      manualTokenFlow: true,
+    }, { signal }) as {
+      login: { attemptId: `attempt_${string}`; providerGeneration: number };
+    };
+    expect(prepared).toMatchObject({
+      authentication: { provider: "devin", signedIn: false },
+      login: { status: "launch_granted", idempotencyKey: key },
+    });
+    const readsBeforeRecovery = value.devinReadCalls();
+    await expect(value.service.execute({
+      kind: "account.show",
+      account: added.account.id,
+      provider: "devin",
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "devin", signedIn: null },
+      recovery: {
+        required: true,
+        attemptId: prepared.login.attemptId,
+        idempotencyKey: key,
+      },
+      usage: { allowance: "unknown", source: "devin_acp" },
+    });
+    expect(value.devinReadCalls()).toBe(readsBeforeRecovery);
+
+    value.setDevinSignedIn(true);
+    await expect(value.service.execute({
+      kind: "account.devin-login.complete",
+      account: added.account.id,
+      attemptId: prepared.login.attemptId,
+      idempotencyKey: key,
+      providerGeneration: prepared.login.providerGeneration,
+      outcome: { state: "joined", exitCode: 0, interruptedBy: null },
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "devin", signedIn: true },
+      login: { status: "signed_in" },
+    });
+    expect(value.store.readMutation(key)).toMatchObject({ state: "applied" });
+
+    value.setDevinReadError(new Error("terminal replay must not inspect Devin auth"));
+    await expect(value.service.execute({
+      kind: "account.devin-login.prepare",
+      account: added.account.id,
+      idempotencyKey: key,
+      manualTokenFlow: false,
+    }, { signal })).resolves.toMatchObject({
+      authentication: { provider: "devin", signedIn: true },
+      login: { status: "signed_in" },
+    });
+    expect(value.providerSessionCalls).toEqual([]);
   });
 
   test("grants Claude foreground login once and accepts a status-versus-complete race", async () => {
@@ -2208,6 +2359,24 @@ describe("HraService", () => {
       `This daemon has no Claude Code runtime. Install Claude Code ${CLAUDE_PIN} exactly`,
     );
 
+    await expect(service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "devin",
+      preset: "ultra",
+      fast: false,
+    }, { signal })).rejects.toThrow("does not support the `ultra` model preset");
+
+    await expect(service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      provider: "devin",
+      preset: "astra",
+      fast: false,
+    }, { signal })).rejects.toThrow(
+      `This daemon has no Devin runtime. Install Devin CLI ${DEVIN_PIN} exactly`,
+    );
+
     // Every existing Codex path is unchanged.
     const started = await service.execute({
       kind: "session.start",
@@ -2816,6 +2985,117 @@ describe("HraService", () => {
       limit: 1,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     expect(value.codex.sessionListRequests).toHaveLength(callsBeforeInvalid);
+  });
+
+  test("pages durable non-Codex sessions before Codex without duplicates or private provider reads", async () => {
+    const value = await fixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Mixed provider history" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+
+    const localSessions = [
+      value.store.createSession({
+        profileId: added.account.id,
+        provider: "claude",
+        preset: "fable-max",
+        fastEnabled: false,
+        title: "Durable Claude one",
+      }),
+      value.store.createSession({
+        profileId: added.account.id,
+        provider: "devin",
+        preset: "astra",
+        fastEnabled: false,
+        title: "Durable Devin",
+      }),
+      value.store.createSession({
+        profileId: added.account.id,
+        provider: "claude",
+        preset: "fable-max",
+        fastEnabled: false,
+        title: "Durable Claude two",
+      }),
+    ];
+    const existingCodex = value.store.upsertProviderSession({
+      profileId: added.account.id,
+      providerThreadId: "provider-existing-codex",
+      state: "idle",
+      title: "Existing Codex cache",
+    });
+
+    const first = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      limit: 2,
+    }, { signal }) as {
+      sessions: readonly { id: string; provider: string }[];
+      nextCursor: string;
+    };
+    expect(first.sessions).toHaveLength(2);
+    expect(first.sessions.every((session) => session.provider !== "codex")).toBe(true);
+    expect(value.codex.sessionListRequests).toHaveLength(0);
+
+    value.codex.listedProjections = [{
+      providerThreadId: "provider-existing-codex",
+      status: "idle",
+      title: "Existing Codex refreshed",
+    }];
+    value.codex.listedNextCursor = "provider-page-two";
+    const second = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      cursor: first.nextCursor,
+      limit: 2,
+    }, { signal }) as {
+      sessions: readonly { id: string; provider: string }[];
+      nextCursor: string;
+    };
+    expect(second.sessions).toHaveLength(2);
+    expect(second.sessions.filter((session) => session.provider !== "codex")).toHaveLength(1);
+    expect(second.sessions.filter((session) => session.id === existingCodex.id)).toHaveLength(1);
+
+    value.codex.listedProjections = [{
+      providerThreadId: "provider-new-codex",
+      status: "idle",
+      title: "Next Codex page",
+    }];
+    value.codex.listedNextCursor = null;
+    const third = await value.service.execute({
+      kind: "session.list",
+      archived: false,
+      account: added.account.id,
+      cursor: second.nextCursor,
+      limit: 2,
+    }, { signal }) as {
+      sessions: readonly { id: string; provider: string }[];
+      nextCursor: null;
+    };
+
+    const allReturned = [...first.sessions, ...second.sessions, ...third.sessions];
+    const nextCodex = third.sessions[0];
+    if (nextCodex === undefined) throw new Error("Expected the final Codex session page.");
+    expect(new Set(allReturned.map((session) => session.id)).size).toBe(allReturned.length);
+    expect(new Set(allReturned.map((session) => session.id))).toEqual(new Set([
+      ...localSessions.map((session) => session.id),
+      existingCodex.id,
+      nextCodex.id,
+    ]));
+    expect(third).toMatchObject({
+      sessions: [{ provider: "codex" }],
+      nextCursor: null,
+    });
+    expect(value.codex.sessionListRequests.map(({ cursor, limit }) => ({ cursor, limit }))).toEqual([
+      { cursor: undefined, limit: 1 },
+      { cursor: "provider-page-two", limit: 2 },
+    ]);
   });
 
   test("fails closed on a provider session-list cursor cycle before importing that page", async () => {
@@ -4024,7 +4304,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -4042,6 +4322,7 @@ describe("HraService", () => {
         { version: 36 },
         { version: 37 },
         { version: 38 },
+        { version: 39 },
       ]);
     } finally {
       inspector.close(false);
@@ -7497,6 +7778,97 @@ describe("HraService", () => {
     });
     expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
     expect(store.readPendingLoginAuthority(added.account.id, 2)).toBeNull();
+  });
+
+  test("scopes an isolated Devin disconnect to its provider session", async () => {
+    const value = await fixture();
+    const profile = value.store.createProfile("Provider-scoped disconnect");
+    const codexCreated = value.store.createSession({
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      provider: "codex",
+    });
+    const codexSession = value.store.bindSession({
+      expectedRevision: codexCreated.revision,
+      providerThreadId: "codex-provider-scoped-thread",
+      sessionId: codexCreated.id,
+      state: "idle",
+    });
+    const devinCreated = value.store.createSession({
+      fastEnabled: false,
+      preset: "astra",
+      profileId: profile.id,
+      provider: "devin",
+    });
+    const devinSession = value.store.bindSession({
+      expectedRevision: devinCreated.revision,
+      providerThreadId: "devin-provider-scoped-thread",
+      sessionId: devinCreated.id,
+      state: "idle",
+    });
+    const codexProviderThreadId = "codex-provider-scoped-thread";
+    const devinProviderThreadId = "devin-provider-scoped-thread";
+    const authority: ProfileAuthority = {
+      codexHome: "unused",
+      desktopUserData: "unused",
+      generation: profile.processGeneration,
+      id: profile.id,
+    };
+    const codexConnection = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
+    const devinConnection = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3c";
+    await value.service.observeCodexFact(authority, {
+      connectionId: codexConnection,
+      status: { type: "idle" },
+      threadId: codexProviderThreadId,
+      type: "threadStatusChanged",
+    });
+    await value.service.observeDevinFact(authority, {
+      connectionId: devinConnection,
+      status: { type: "idle" },
+      threadId: devinProviderThreadId,
+      type: "threadStatusChanged",
+    });
+
+    // A provider-scoped observer may not mutate a sibling provider even when
+    // handed its exact thread id.
+    await value.service.observeDevinFact(authority, {
+      connectionId: devinConnection,
+      status: { type: "systemError" },
+      threadId: codexProviderThreadId,
+      type: "threadStatusChanged",
+    });
+    await value.service.observeDevinFact(authority, {
+      connectionId: devinConnection,
+      reason: "process_exit",
+      type: "providerDisconnected",
+    });
+
+    expect(value.store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration);
+    expect(value.store.listSessionEvents({
+      afterSequence: 0,
+      limit: 20,
+      sessionId: codexSession.id,
+    }).events.map((event) => event.body)).toEqual([
+      { state: "connected", type: "connection" },
+      { activeTurnId: null, status: "idle", type: "session_status" },
+    ]);
+    expect(value.store.listSessionEvents({
+      afterSequence: 0,
+      limit: 20,
+      sessionId: devinSession.id,
+    }).events.map((event) => event.body)).toEqual([
+      { state: "connected", type: "connection" },
+      { activeTurnId: null, status: "idle", type: "session_status" },
+      { reason: "process_exit", state: "disconnected", type: "connection" },
+      {
+        fromSequence: 4,
+        reason: "provider_disconnect",
+        throughSequence: 4,
+        type: "gap",
+      },
+    ]);
   });
 
   test("atomically retires an old connection while a fresh login advances the profile", async () => {

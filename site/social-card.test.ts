@@ -99,7 +99,7 @@ describe("social card", () => {
     const lines = socialCardLines();
     expect(lines.tagline).toBe("Release candidate v0.6.0 · hra.sh");
     expect(lines.title).toBe("HRA");
-    expect(lines.comment).toBe("# Current source: Codex and Claude Code, side by side.");
+    expect(lines.comment).toBe("# Current source: Codex, Claude Code, and Devin.");
     expect(lines.commands).toEqual([
       `$ ${publicContent.hero.steps[0]!.command}`,
       `$ ${publicContent.hero.steps[3]!.command}`,

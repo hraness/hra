@@ -141,6 +141,45 @@ export const sessionListCursorPayloadSchema = z.object({
 
 export type SessionListCursorPayload = z.infer<typeof sessionListCursorPayloadSchema>;
 
+export const compositeSessionListContinuationSchema = z.discriminatedUnion("phase", [
+  z.object({
+    phase: z.literal("local"),
+    afterCreatedAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+    afterSessionId: sessionIdSchema,
+  }).strict(),
+  z.object({
+    phase: z.literal("provider_start"),
+  }).strict(),
+  z.object({
+    phase: z.literal("provider"),
+    state: sessionListCursorPayloadSchema,
+  }).strict(),
+]);
+
+export type CompositeSessionListContinuation = z.infer<typeof compositeSessionListContinuationSchema>;
+
+export const compositeSessionListCursorPayloadSchema = z.object({
+  version: z.literal(1),
+  type: z.literal("session_list_composite"),
+  accountId: profileIdSchema,
+  providerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  limit: z.number().int().min(1).max(100),
+  continuation: compositeSessionListContinuationSchema,
+}).strict().superRefine((value, context) => {
+  if (
+    value.continuation.phase === "provider"
+    && !sameSessionListFilter(value.continuation.state, value)
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["continuation", "state"],
+      message: "Composite session-list provider state does not match its outer filter.",
+    });
+  }
+});
+
+export type CompositeSessionListCursorPayload = z.infer<typeof compositeSessionListCursorPayloadSchema>;
+
 export const localSessionListCursorFilterSchema = z.object({
   accountId: profileIdSchema,
   accountGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -193,6 +232,34 @@ const canonicalSessionListPayload = (payload: SessionListCursorPayload): string 
   power: payload.power,
   span: payload.span,
   pageCount: payload.pageCount,
+});
+
+const canonicalCompositeSessionListContinuation = (
+  continuation: CompositeSessionListContinuation,
+): CompositeSessionListContinuation => {
+  switch (continuation.phase) {
+    case "local": return {
+      phase: "local",
+      afterCreatedAt: continuation.afterCreatedAt,
+      afterSessionId: continuation.afterSessionId,
+    };
+    case "provider_start": return { phase: "provider_start" };
+    case "provider": return {
+      phase: "provider",
+      state: JSON.parse(canonicalSessionListPayload(continuation.state)) as SessionListCursorPayload,
+    };
+  }
+};
+
+const canonicalCompositeSessionListPayload = (
+  payload: CompositeSessionListCursorPayload,
+): string => JSON.stringify({
+  version: payload.version,
+  type: payload.type,
+  accountId: payload.accountId,
+  providerGeneration: payload.providerGeneration,
+  limit: payload.limit,
+  continuation: canonicalCompositeSessionListContinuation(payload.continuation),
 });
 
 const canonicalLocalSessionListPayload = (
@@ -560,6 +627,86 @@ export class SessionEventCursorCodec {
       );
     }
     return parsed.data;
+  }
+
+  encodeCompositeSessionList(
+    input: SessionListCursorFilter & Readonly<{
+      continuation: CompositeSessionListContinuation;
+    }>,
+  ): string {
+    const payload = compositeSessionListCursorPayloadSchema.parse({
+      version: 1,
+      type: "session_list_composite",
+      accountId: input.accountId,
+      providerGeneration: input.providerGeneration,
+      limit: input.limit,
+      continuation: input.continuation,
+    });
+    return this.#encodeCanonical(
+      canonicalCompositeSessionListPayload(payload),
+      "Composite session-list cursor",
+    );
+  }
+
+  decodeCompositeSessionList(
+    cursor: string,
+    expectedFilter: SessionListCursorFilter,
+  ): CompositeSessionListCursorPayload {
+    const expected = sessionListCursorFilterSchema.parse(expectedFilter);
+    const envelope = this.#decodeEnvelope(cursor, "Composite session-list cursor");
+    if (
+      typeof envelope.value !== "object"
+      || envelope.value === null
+      || !("type" in envelope.value)
+      || envelope.value.type !== "session_list_composite"
+    ) {
+      throw new SessionEventCursorError(
+        "Another HRA cursor type cannot be used as a composite session-list cursor.",
+        "type_mismatch",
+      );
+    }
+    const parsed = compositeSessionListCursorPayloadSchema.safeParse(envelope.value);
+    if (
+      !parsed.success
+      || canonicalCompositeSessionListPayload(parsed.data) !== envelope.payloadJson
+    ) {
+      throw new SessionEventCursorError(
+        "Composite session-list cursor payload is not canonical.",
+        "noncanonical",
+      );
+    }
+    if (!sameSessionListFilter(parsed.data, expected)) {
+      throw new SessionEventCursorError(
+        "Composite session-list cursor filters do not match the requested account listing.",
+        "filter_mismatch",
+      );
+    }
+    return parsed.data;
+  }
+
+  advanceCompositeSessionList(
+    input: SessionListCursorFilter & Readonly<{
+      providerCursor: string;
+      prior?: CompositeSessionListCursorPayload;
+    }>,
+  ): string {
+    const filter = sessionListCursorFilterSchema.parse({
+      accountId: input.accountId,
+      providerGeneration: input.providerGeneration,
+      limit: input.limit,
+    });
+    const priorProviderState = input.prior?.continuation.phase === "provider"
+      ? input.prior.continuation.state
+      : undefined;
+    const providerState = this.decodeSessionList(this.advanceSessionList({
+      ...filter,
+      providerCursor: input.providerCursor,
+      ...(priorProviderState === undefined ? {} : { prior: priorProviderState }),
+    }), filter);
+    return this.encodeCompositeSessionList({
+      ...filter,
+      continuation: { phase: "provider", state: providerState },
+    });
   }
 
   advanceSessionList(

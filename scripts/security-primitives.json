@@ -17,7 +17,7 @@
   "src/cli.ts": {
     "mode0600": 3,
     "mode0700": 3,
-    "assertCurrent": 5,
+    "assertCurrent": 7,
     "redactCompleteSensitiveText": 1
   },
   "src/cloud/daemon-adapters.ts": {
@@ -62,6 +62,9 @@
     "mode0600": 7,
     "assertCurrent": 3
   },
+  "src/daemon/devin-runtime-adapter.ts": {
+    "assertCurrent": 4
+  },
   "src/daemon/local-transport.ts": {
     "timingSafeEqual": 1,
     "O_NOFOLLOW": 2,
@@ -69,7 +72,7 @@
     "validateOwnedFile": 6
   },
   "src/daemon/service.ts": {
-    "assertCurrent": 60
+    "assertCurrent": 62
   },
   "src/daemon/session-event-cursor.ts": {
     "timingSafeEqual": 1
@@ -86,6 +89,15 @@
   },
   "src/desktop/switch.ts": {
     "assertCurrent": 4
+  },
+  "src/devin/index.ts": {
+    "safeEnvironmentKeys": 1
+  },
+  "src/devin/process.ts": {
+    "safeEnvironmentKeys": 2
+  },
+  "src/devin/protocol.ts": {
+    "redactCompleteSensitiveText": 1
   },
   "src/install-normalizer.ts": {
     "O_NOFOLLOW": 13,
@@ -138,7 +150,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 90,
+    "immediateTransaction": 93,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 2

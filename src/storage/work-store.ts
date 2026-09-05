@@ -4,6 +4,7 @@ import type { Database } from "bun:sqlite";
 
 import { currentPresetContract } from "../domain/presets";
 import { isUuidV7 } from "../domain/uuid-v7";
+import type { Provider } from "../domain/presets";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
 import { workPreparedEffectMessage } from "../domain/work-message";
 import { MESSAGE_MAX_BYTES } from "../domain/values";
@@ -163,6 +164,26 @@ CREATE TRIGGER IF NOT EXISTS work_retained_limit_guard
 BEFORE INSERT ON works
 WHEN (SELECT COUNT(*) FROM works) >= ${WORK_RETAINED_LIMIT}
 BEGIN SELECT RAISE(ABORT,'WORK_RETAINED_LIMIT'); END;
+DROP TRIGGER IF EXISTS work_devin_preset_contract_guard;
+CREATE TRIGGER work_devin_preset_contract_guard
+BEFORE INSERT ON works
+WHEN NEW.preset_contract!=${currentPresetContract} AND EXISTS (
+  SELECT 1 FROM sessions AS s
+  WHERE s.id=NEW.coordinator_session_id AND s.provider_v39='devin'
+)
+BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
+DROP TRIGGER IF EXISTS work_session_devin_contract_guard;
+CREATE TRIGGER work_session_devin_contract_guard
+BEFORE UPDATE OF provider_v39,preset_contract ON sessions
+WHEN NEW.provider_v39='devin' AND (
+  NEW.preset_contract!=${currentPresetContract}
+  OR EXISTS (
+    SELECT 1 FROM works AS w
+    WHERE w.coordinator_session_id=OLD.id
+      AND w.preset_contract!=${currentPresetContract}
+  )
+)
+BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
 
 CREATE TABLE IF NOT EXISTS work_routes (
   work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
@@ -662,7 +683,7 @@ WHEN NOT EXISTS (
     AND t.preset=NEW.preset AND t.fast=NEW.fast
     AND s.profile_id=NEW.account_id AND s.project_id=NEW.project_id
     AND s.preset=NEW.preset AND s.fast_enabled=NEW.fast
-    AND s.provider='codex'
+    AND s.provider_v39='codex'
     AND (
       s.preset_contract=w.preset_contract
       OR NEW.preset='low'
@@ -691,7 +712,7 @@ WHEN OLD.kind='session.switch'
 BEGIN SELECT RAISE(ABORT,'WORK_SESSION_SWITCH_ATTEMPT_AUTHORITY'); END;
 DROP TRIGGER IF EXISTS work_session_attempt_authority_guard;
 CREATE TRIGGER work_session_attempt_authority_guard
-BEFORE UPDATE OF profile_id,project_id,provider,preset,fast_enabled,preset_contract ON sessions
+BEFORE UPDATE OF profile_id,project_id,provider_v39,preset,fast_enabled,preset_contract ON sessions
 WHEN EXISTS (
   SELECT 1 FROM work_attempts AS a
   JOIN works AS w ON w.id=a.work_id
@@ -699,7 +720,7 @@ WHEN EXISTS (
     AND a.state IN ('claimed','dispatching','running','recovery_required')
     AND (
       NEW.profile_id!=a.account_id OR NEW.project_id!=a.project_id
-      OR NEW.provider!='codex' OR NEW.preset!=a.preset OR NEW.fast_enabled!=a.fast
+      OR NEW.provider_v39!='codex' OR NEW.preset!=a.preset OR NEW.fast_enabled!=a.fast
       OR (
         NEW.preset_contract!=w.preset_contract
         AND a.preset!='low'
@@ -717,7 +738,7 @@ WHEN EXISTS (
     AND a.state IN ('claimed','dispatching','running')
     AND (
       NEW.process_generation!=a.account_generation
-      OR (NEW.state!='signed_in' AND s.provider!='claude')
+      OR (NEW.state!='signed_in' AND s.provider_v39='codex')
     )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_PROFILE_ATTEMPT_AUTHORITY'); END;
@@ -763,7 +784,7 @@ WHEN NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND sessio
   OR NOT EXISTS (
     SELECT 1 FROM sessions AS s JOIN profiles AS p ON p.id=s.profile_id
     WHERE s.id=NEW.to_session_id AND s.state IN ('active','idle')
-      AND p.state!='removed' AND (s.provider='claude' OR p.state='signed_in')
+      AND p.state!='removed' AND (s.provider_v39 IN ('claude','devin') OR p.state='signed_in')
       AND p.process_generation=NEW.target_account_generation
   )
 BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_MEMBER_INVALID'); END;
@@ -956,6 +977,8 @@ const requiredWorkTriggers = [
   "works_identity_immutable",
   "work_active_limit_guard",
   "work_retained_limit_guard",
+  "work_devin_preset_contract_guard",
+  "work_session_devin_contract_guard",
   "works_no_delete",
   "works_state_guard",
   "works_stream_advance_guard",
@@ -1057,7 +1080,7 @@ const assertWorkSchemaShape = (database: Database): void => {
   const requiredColumns: Readonly<Record<string, readonly string[]>> = {
     // Current work authority guards inspect the provider on their parent
     // session, so a merely present trigger is not a usable work schema.
-    sessions: ["provider", "preset_contract"],
+    sessions: ["provider_v39", "preset_contract"],
     work_release_tombstones: [
       "work_id", "release_idempotency_key", "release_request_digest", "client_ref_digest",
       "terminal_kind", "final_revision", "final_head_hash", "discarded_counts_json",
@@ -1094,6 +1117,15 @@ const assertWorkSchemaShape = (database: Database): void => {
     for (const column of columns) {
       if (!present.has(column)) throw new Error(`WORK_SCHEMA_STALE:${table}.${column}`);
     }
+  }
+  if (database.query(
+    `SELECT 1
+     FROM works AS w
+     JOIN sessions AS s ON s.id=w.coordinator_session_id
+     WHERE s.provider_v39='devin' AND w.preset_contract!=${currentPresetContract}
+     LIMIT 1`,
+  ).get() !== null) {
+    throw new Error("WORK_SCHEMA_DEVIN_PRESET_CONTRACT_INVALID");
   }
   const clock = database.query(
     "SELECT logical_time FROM work_clock WHERE singleton=1",
@@ -2009,7 +2041,7 @@ export class WorkStore {
        WHERE t.id=? AND t.work_id=?
          AND t.account_id=s.profile_id AND t.project_id=s.project_id
          AND t.preset=s.preset AND t.fast=s.fast_enabled
-         AND s.provider='codex'
+         AND s.provider_v39='codex'
          AND (s.preset_contract=w.preset_contract OR s.preset='low')
          AND s.state IN ('active','idle') AND p.state='signed_in'
          AND p.process_generation=?`,
@@ -2034,7 +2066,7 @@ export class WorkStore {
          AND w.target_account_generation=?
          AND p.process_generation=w.target_account_generation
          AND s.state IN ('active','idle') AND p.state!='removed'
-         AND (s.provider='claude' OR p.state='signed_in')`,
+         AND (s.provider_v39 IN ('claude','devin') OR p.state='signed_in')`,
     ).get(
       effect.signalId,
       effect.workId,
@@ -3569,7 +3601,7 @@ export class WorkStore {
        JOIN profiles AS p ON p.id=s.profile_id
        JOIN works AS w ON w.id=?
        WHERE s.id=? AND s.profile_id=? AND s.project_id=? AND s.preset=? AND s.fast_enabled=?
-         AND s.provider='codex'
+         AND s.provider_v39='codex'
          AND (
            s.preset_contract=w.preset_contract
            OR s.preset='low'
@@ -3606,7 +3638,7 @@ export class WorkStore {
        JOIN work_members AS m ON m.work_id=? AND m.session_id=s.id
        JOIN works AS w ON w.id=m.work_id
        WHERE s.id=? AND s.profile_id=? AND s.project_id=? AND s.preset=? AND s.fast_enabled=?
-         AND s.provider='codex'
+         AND s.provider_v39='codex'
          AND (
            s.preset_contract=w.preset_contract
            OR s.preset='low'
@@ -3628,7 +3660,7 @@ export class WorkStore {
   prepareProfileAuthorityChange(
     profileId: string,
     expectedGeneration: number,
-    provider?: "codex" | "claude",
+    provider?: Provider,
   ): readonly string[] {
     const prepare = this.#database.transaction((): readonly string[] => {
       const profile = this.#database.query(
@@ -3642,7 +3674,7 @@ export class WorkStore {
          JOIN sessions AS s ON s.id=a.worker_session_id
          WHERE a.account_id=? AND a.account_generation=?
            AND a.state IN ('claimed','dispatching','running')
-           AND (? IS NULL OR s.provider=?)
+           AND (? IS NULL OR s.provider_v39=?)
          ORDER BY a.work_id,a.created_at,a.id`,
       ).all(profileId, expectedGeneration, provider ?? null, provider ?? null) as AttemptRow[];
       const workIds = [...new Set(attempts.map((attempt) => attempt.work_id))].sort();
@@ -3712,13 +3744,13 @@ export class WorkStore {
 
   assertProfileCanChangeAuthority(
     profileId: string,
-    provider?: "codex" | "claude",
+    provider?: Provider,
   ): void {
     const live = this.#database.query(
       `SELECT 1 AS present FROM work_attempts AS a
        JOIN sessions AS s ON s.id=a.worker_session_id
        WHERE a.account_id=? AND a.state IN ('claimed','dispatching','running')
-         AND (? IS NULL OR s.provider=?)
+         AND (? IS NULL OR s.provider_v39=?)
        LIMIT 1`,
     ).get(profileId, provider ?? null, provider ?? null) as { present: number } | null;
     if (live !== null) throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
@@ -5262,7 +5294,7 @@ export class WorkStore {
       `SELECT p.process_generation AS account_generation
        FROM sessions AS s JOIN profiles AS p ON p.id=s.profile_id
        WHERE s.id=? AND s.state IN ('active','idle') AND p.state!='removed'
-         AND (s.provider='claude' OR p.state='signed_in')`,
+         AND (s.provider_v39 IN ('claude','devin') OR p.state='signed_in')`,
     ).get(operation.targetSessionId) as { account_generation: number } | null;
     if (
       targetAuthority === null

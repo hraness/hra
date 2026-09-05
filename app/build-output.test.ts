@@ -38,6 +38,22 @@ const reviewedVendorOrigins = new Set([
   "https://github.com",
 ]);
 
+// Zod 4.4.3's v4/core/to-json-schema.js assigns these dialect identifiers to
+// result.$schema. They are metadata, never fetch targets. Keep this exception
+// narrower than an origin: a different path or query still needs review.
+const reviewedVendorSchemaLiterals = new Set([
+  "https://json-schema.org/draft/2020-12/schema",
+  "http://json-schema.org/draft-07/schema#",
+  "http://json-schema.org/draft-04/schema#",
+]);
+
+function isReviewedVendorSchemaLiteral(text: string, index: number): boolean {
+  const quote = text[index - 1];
+  if (quote !== '"' && quote !== "'") return false;
+  return [...reviewedVendorSchemaLiterals].some((literal) =>
+    text.startsWith(literal, index) && text[index + literal.length] === quote);
+}
+
 const pinnedConvexOrigins = new Set([
   "https://qualified-hummingbird-537.convex.cloud",
   "wss://qualified-hummingbird-537.convex.cloud",
@@ -148,10 +164,25 @@ describe("bundle invariants", () => {
       for (const match of artifact.text.matchAll(originPattern)) {
         const origin = match[0];
         if (pinnedConvexOrigins.has(origin) || reviewedVendorOrigins.has(origin)) continue;
+        if (isReviewedVendorSchemaLiteral(artifact.text, match.index)) continue;
         unexpected.add(`${artifact.name}: ${origin}`);
       }
     }
     expect([...unexpected]).toEqual([]);
+  });
+
+  test("schema metadata exceptions accept only the reviewed complete literals", () => {
+    for (const literal of reviewedVendorSchemaLiterals) {
+      for (const quote of ['"', "'"]) {
+        expect(isReviewedVendorSchemaLiteral(`${quote}${literal}${quote}`, 1)).toBe(true);
+        for (const suffix of ["/other", "?token=example", "#other"]) {
+          expect(isReviewedVendorSchemaLiteral(`${quote}${literal}${suffix}${quote}`, 1))
+            .toBe(false);
+        }
+      }
+      expect(isReviewedVendorSchemaLiteral(literal, 0)).toBe(false);
+    }
+    expect(isReviewedVendorSchemaLiteral('"https://json-schema.org/unreviewed"', 1)).toBe(false);
   });
 
   /*

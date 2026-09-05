@@ -558,6 +558,39 @@ describe("CLI rendering", () => {
     expect(json.stdout.join("")).not.toMatch(/providerEmail|providerPlan|updatedAt|state/u);
   });
 
+  test("renders Devin auth and explicit unknown account allowance", () => {
+    const accountId = `acct_${"9".repeat(32)}`;
+    const data = {
+      account: { id: accountId, label: "Devin private" },
+      authentication: { provider: "devin", signedIn: false },
+      nextCommand: `hra account login ${accountId} --provider devin`,
+      providerGeneration: 2,
+      usage: {
+        allowance: "unknown",
+        reason: "Devin ACP reports context and optional cumulative session cost, but exposes no account allowance or reset window.",
+        source: "devin_acp",
+      },
+    } as const;
+    const human = capture();
+    renderSuccess(
+      { kind: "account.show", account: accountId, provider: "devin" },
+      data,
+      false,
+      human.output,
+    );
+    expect(human.stdout.join("")).toBe([
+      "Devin: signed out",
+      "Label: Devin private",
+      `ID: ${accountId}`,
+      "Provider generation: 2",
+      `Next: hra account login ${accountId} --provider devin`,
+      "Account allowance: unknown",
+      "  Devin ACP reports context and optional cumulative session cost, but exposes no account allowance or reset window.",
+      "",
+    ].join("\n"));
+    expect(human.stdout.join("")).not.toContain("Account: unknown");
+  });
+
   test("renders Claude recovery and acknowledged local abandon truthfully", () => {
     const accountId = `acct_${"2".repeat(32)}`;
     const attemptId = `attempt_${"3".repeat(32)}`;
@@ -582,7 +615,7 @@ describe("CLI rendering", () => {
     );
     expect(status.stdout.join("")).toContain("Claude Code: status unknown");
     expect(status.stdout.join("")).toContain(
-      `Only after confirming the original Claude child exited: ${abandonCommand}`,
+      `Only after confirming the original Claude Code child exited: ${abandonCommand}`,
     );
 
     const abandoned = capture();
@@ -1895,6 +1928,7 @@ describe("CLI rendering", () => {
         { ...base, sequence: 5, body: { type: "item_completed", turnId: publicProviderId("turn-1"), itemId: publicProviderId("mcp-1"), itemKind: "mcpToolCall", server: "github", tool: "create_issue", status: "completed" } },
         { ...base, sequence: 6, body: { type: "tool_progress", turnId: publicProviderId("turn-1"), itemId: publicProviderId("tool-1"), toolKind: "command", status: "started", outputBytesObserved: 0 } },
         { ...base, sequence: 7, body: { type: "tool_progress", turnId: publicProviderId("turn-1"), itemId: publicProviderId("tool-1"), toolKind: "command", status: "completed", outputBytesObserved: 120 } },
+        { ...base, sequence: 8, body: { type: "token_usage", turnId: publicProviderId("turn-1"), inputTokens: null, cachedInputTokens: null, outputTokens: null, reasoningOutputTokens: null, totalTokens: 53_000, modelContextWindow: 200_000, providerCost: { amount: 0.01, currency: "USD" } } },
       ],
     };
     const events = capture();
@@ -1911,6 +1945,7 @@ describe("CLI rendering", () => {
     expect(events.stdout.join("")).toContain(`Item completed: mcpToolCall github/create_issue ${publicProviderId("mcp-1")} (completed)`);
     expect(events.stdout.join("")).toContain("Tool: command, completed, 120 bytes observed");
     expect(events.stdout.join("")).not.toContain("Tool: command, started");
+    expect(events.stdout.join("")).toContain("Tokens: 53000 total of 200000; provider cost 0.01 USD");
   });
 
   test("renders public interaction lists and details without private callback authority", () => {
