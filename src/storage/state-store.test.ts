@@ -45,6 +45,7 @@ import {
   StateStore,
   type SecurityScrubCheckpointPolicy,
 } from "./state-store";
+import { WORK_SCHEMA_SQL } from "./work-store";
 
 const stores: StateStore[] = [];
 const privateUserPathRoot = ["", "Users", "private"].join("/");
@@ -7840,6 +7841,76 @@ describe("StateStore", () => {
       ).all()).toEqual([
         { count: 6, type: "table" },
         { count: 12, type: "trigger" },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("heals a v30 work schema before rebuilding the legacy autorespond table", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    try {
+      legacy.exec(`
+        DROP TRIGGER work_profile_attempt_authority_guard;
+        DROP TRIGGER work_signal_member_guard;
+        ALTER TABLE sessions DROP COLUMN provider;
+        DROP TABLE autorespond_evidence;
+        CREATE TABLE autorespond_evidence (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          interaction_id TEXT NOT NULL CHECK(length(interaction_id) = 36),
+          kind TEXT NOT NULL CHECK(kind IN (
+            'command_approval','file_change_approval','permission_approval'
+          )),
+          class TEXT NOT NULL CHECK(length(class) BETWEEN 1 AND 256),
+          decision TEXT NOT NULL CHECK(length(decision) BETWEEN 1 AND 64),
+          mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace','manual')),
+          outcome TEXT NOT NULL CHECK(outcome IN ('accepted','refused')),
+          latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
+          subagent INTEGER NOT NULL CHECK(subagent IN (0,1)),
+          occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0)
+        ) STRICT;
+        CREATE INDEX autorespond_evidence_session
+          ON autorespond_evidence(session_id, occurred_at DESC, id DESC);
+        CREATE INDEX autorespond_evidence_recent
+          ON autorespond_evidence(occurred_at DESC, id DESC);
+      `);
+      // SQLite accepts trigger definitions that reference a missing column.
+      // The next schema rewrite must not be the first operation to discover it.
+      legacy.exec(WORK_SCHEMA_SQL);
+      legacy.exec("DELETE FROM migrations WHERE version>30; PRAGMA user_version=30;");
+      expect(legacy.query("PRAGMA user_version").get()).toEqual({ user_version: 30 });
+      expect(legacy.query("PRAGMA table_info(sessions)").all())
+        .not.toContainEqual(expect.objectContaining({ name: "provider" }));
+      expect(legacy.query("PRAGMA table_info(autorespond_evidence)").all())
+        .not.toContainEqual(expect.objectContaining({ name: "path" }));
+    } finally {
+      legacy.close(false);
+    }
+
+    const migrated = new StateStore(paths, { now: () => 2_000 });
+    stores.push(migrated);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA table_info(sessions)").all())
+        .toContainEqual(expect.objectContaining({ name: "provider", dflt_value: "'codex'" }));
+      expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
+        .toContainEqual(expect.objectContaining({ name: "path" }));
+      expect(inspector.query(
+        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 35 ORDER BY version",
+      ).all()).toEqual([
+        { version: 30 },
+        { version: 31 },
+        { version: 32 },
+        { version: 33 },
+        { version: 34 },
+        { version: 35 },
       ]);
     } finally {
       inspector.close(false);

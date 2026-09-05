@@ -3667,6 +3667,14 @@ const migrateWritableDatabase = (
     // materializes the omitted tables without rewriting existing objects.
     database.exec(schemaVersion1);
 
+    // v26 installed the current work authority guards, which now inspect the
+    // provider bound to a session. Older SQLite releases admitted those trigger
+    // definitions before the additive v32 column existed, while newer releases
+    // reject an unrelated table rebuild as soon as they revalidate the broken
+    // trigger. Heal every pre-v32 database before any later migration can force
+    // that validation; v32 remains the migration that stamps the column.
+    if (version < 32) applySchemaVersion32(database);
+
     if (version < 2) {
       // Early development builds accidentally stamped this column as schema v1.
       // Accept those databases without weakening the canonical append-only v1→v2 path.

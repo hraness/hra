@@ -1016,6 +1016,9 @@ const assertWorkSchemaShape = (database: Database): void => {
     if (!triggers.has(name)) throw new Error(`WORK_SCHEMA_MISSING_TRIGGER:${name}`);
   }
   const requiredColumns: Readonly<Record<string, readonly string[]>> = {
+    // Current work authority guards inspect the provider on their parent
+    // session, so a merely present trigger is not a usable work schema.
+    sessions: ["provider"],
     work_release_tombstones: [
       "work_id", "release_idempotency_key", "release_request_digest", "client_ref_digest",
       "terminal_kind", "final_revision", "final_head_hash", "discarded_counts_json",

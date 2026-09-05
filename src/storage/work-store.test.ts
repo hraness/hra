@@ -506,6 +506,26 @@ describe("WorkStore schema and atomic plans", () => {
     );
   });
 
+  test("rejects current work guards against a pre-provider session schema", () => {
+    const database = new Database(":memory:", { strict: true });
+    databases.push(database);
+    database.exec("PRAGMA foreign_keys=ON;");
+    const legacyParentSchema = parentSchema.replace(
+      "  provider TEXT NOT NULL DEFAULT 'codex',\n",
+      "",
+    );
+    expect(legacyParentSchema).not.toBe(parentSchema);
+    database.exec(legacyParentSchema);
+    database.exec(WORK_SCHEMA_SQL);
+
+    expect(() => assertWorkSchema(database)).toThrow(
+      "WORK_SCHEMA_STALE:sessions.provider",
+    );
+    expect(() => assertReadonlyWorkSchema(database)).toThrow(
+      "WORK_SCHEMA_STALE:sessions.provider",
+    );
+  });
+
   test("replays an exact UUID result and rejects changed semantic intent", () => {
     const value = fixture();
     const key = randomUUID();
