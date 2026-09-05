@@ -120,7 +120,6 @@ export const spawnClaudeAuthStatusProbe: ClaudeAuthStatusProbe = async (input) =
   const stdout = collectBoundedStdout(child.stdout, AUTH_STATUS_MAX_BYTES);
   const completion = Promise.all([child.exited, stdout]);
   void completion.catch(() => undefined);
-  let timer: ReturnType<typeof setTimeout> | undefined;
   let rejectBoundary!: (reason: unknown) => void;
   const boundary = new Promise<never>((_resolve, reject) => {
     rejectBoundary = reject;
@@ -135,7 +134,7 @@ export const spawnClaudeAuthStatusProbe: ClaudeAuthStatusProbe = async (input) =
   };
   const onAbort = (): void => stop(input.signal.reason);
   input.signal.addEventListener("abort", onAbort, { once: true });
-  timer = setTimeout(
+  const timer = setTimeout(
     () => stop(new ClaudeError("TIMEOUT", "Claude account status did not settle in time.")),
     AUTH_STATUS_TIMEOUT_MS,
   );
@@ -151,7 +150,7 @@ export const spawnClaudeAuthStatusProbe: ClaudeAuthStatusProbe = async (input) =
       throw new ClaudeError("PROTOCOL_ERROR", "Claude account status was invalid.", { cause });
     }
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    clearTimeout(timer);
     input.signal.removeEventListener("abort", onAbort);
   }
 };
@@ -224,12 +223,20 @@ function optionalIdentityScalar(value: unknown, email: boolean): string | null {
   if (
     normalized.length === 0
     || encoder.encode(normalized).byteLength > ACCOUNT_IDENTITY_MAX_BYTES
-    || /[\u0000-\u001f\u007f]/u.test(normalized)
+    || hasAsciiControlCharacter(normalized)
     || (email && !/^[^@\s]+@[^@\s]+$/u.test(normalized))
   ) {
     throw new ClaudeError("PROTOCOL_ERROR", "Claude account metadata contained an invalid scalar.");
   }
   return normalized;
+}
+
+function hasAsciiControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
 }
 
 function sameAccountIdentity(
