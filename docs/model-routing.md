@@ -1,15 +1,16 @@
 # Model routing: Phase 3 shadow contract
 
-HRA does not automatically route work to a different model in Phase 3. Ultra
-is the only effective automatic default for new Codex sessions, with Fast off.
+HRA does not automatically route work to a different model in Phase 3. Astra
+Ultra is the only effective automatic default for new Codex sessions, with Fast off.
 The task-shape classifier and the routing decision are shadow-only: they can
 describe disabled studies, but they cannot mutate a session or authorize a
 runtime profile.
 
-Terra, Opus, Fast, and Astra are not enabled by this work. New sessions that
-explicitly choose the Claude family continue to use Fable Max. Explicit preset
-choices are preserved, and established sessions never change provider, preset,
-or Fast state because of a shadow decision.
+Terra, Opus, and Fast are not enabled by this work. Astra is the admitted Codex
+baseline, not a shadow candidate. New sessions that explicitly choose the Claude
+family continue to use Fable Max. Explicit preset choices are preserved, and
+established sessions never change provider, preset, exact model, effort, or Fast
+state because of a shadow decision or a default change.
 
 ## Decision contract
 
@@ -36,7 +37,8 @@ identifier that is not a preset, and never occupies the effective field.
 Established sessions, explicit presets, mechanical work, open-ended work,
 uncertain work, and work requiring the strong profile receive no candidate.
 A new, well-defined Codex default may describe the disabled Terra Ultra and
-Terra Fast studies. A new, explicit, well-defined Claude family default may
+Terra Fast studies against the admitted Astra baseline. A new, explicit,
+well-defined Claude family default may
 describe the disabled Opus effort study. Unknown safety does not license either
 study; it adds an unresolved effect-class blocker.
 
@@ -54,11 +56,16 @@ path, pair identifiers, environment bindings, task text, or model output.
 Unknown keys and malformed UTF-8 are rejected. Rejections are generic so that a
 private field cannot be copied into diagnostics.
 
-The strict schema accepts one of three comparisons:
+The current schema version 2 accepts one of three comparisons:
 
-- Codex Terra Ultra against Codex Sol Ultra.
+- Codex Terra Ultra against Codex Astra Ultra.
 - Claude Opus at `high`, `xhigh`, or `max` effort against Claude Fable Max.
 - Codex Terra Fast against Terra in standard mode.
+
+Schema version 1 remains readable only with its exact historical Sol baseline,
+including the `terra_vs_sol` and `codex_sol_ultra` literals. Version 2 uses the
+Astra literals above. Relabelling a v1 result as Astra, or an Astra result as
+v1, is rejected.
 
 An export declares `pilot` or `holdout`, a `well_defined` task shape, a
 SHA-256 case-set digest over the exact ordered opaque pair identifiers and

@@ -5,6 +5,7 @@ import {
   attachmentMessageText,
   type PreparedAttachment,
 } from "../domain/attachments.ts";
+import type { PresetRequirement } from "../domain/presets.ts";
 import { HRA_VERSION } from "../version.ts";
 import type {
   InteractionKind,
@@ -618,12 +619,13 @@ export class CodexAppServerClient {
   resolvePreset(
     capabilities: FencedCodexValue<CodexCapabilitySnapshot>,
     alias: PresetAlias,
+    requirement: PresetRequirement,
     fast: boolean,
   ): ResolvedPreset {
     if (!sameAuthority(capabilities.authority, this.#authority)) {
       throw new CodexError("AUTHORITY_STALE", "capabilities belong to another process generation");
     }
-    return resolvePreset(capabilities.value, alias, fast);
+    return resolvePreset(capabilities.value, alias, requirement, fast);
   }
 
   async listThreads(options: ThreadListOptions = {}): Promise<FencedCodexValue<ThreadPage>> {

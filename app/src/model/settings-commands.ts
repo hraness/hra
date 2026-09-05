@@ -43,9 +43,9 @@ export const presetChoices: readonly PresetChoice[] = Object.freeze([
 
 export const presetLabels: Readonly<Record<PresetChoice, string>> = Object.freeze({
   "fable-max": "Fable Max",
-  high: "Sol Max",
+  high: "Astra Max",
   low: "Luna Max",
-  ultra: "Sol Ultra",
+  ultra: "Astra Ultra",
 });
 
 export function approvalModeCommand(mode: ApprovalMode): RemoteCommandPayload {

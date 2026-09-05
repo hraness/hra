@@ -382,8 +382,8 @@ export const publicContent: PublicContent = {
     steps: [
       {
         label: "Start",
-        command: "hra session start personal --provider codex --preset high --json",
-        detail: "Create a Codex session under the account profile you name.",
+        command: "hra session start personal --provider codex --json",
+        detail: "Create an Astra Ultra Codex session under the account profile you name.",
       },
       {
         label: "Inspect",
@@ -681,7 +681,7 @@ export const publicContent: PublicContent = {
         {
           kind: "commands",
           commands: [
-            "hra session start personal --provider codex --preset high",
+            "hra session start personal --provider codex",
             "hra",
             "/account personal",
             "/session <session-id>",
@@ -699,7 +699,7 @@ export const publicContent: PublicContent = {
         {
           kind: "commands",
           commands: [
-            "hra session start personal --provider codex --preset high --json",
+            "hra session start personal --provider codex --json",
             "hra session status <session-id> --json",
             "hra session send <session-id> -- \"Review this project and summarize its current state.\"",
             "hra session watch <session-id> --cursor <status-cursor> --jsonl",
@@ -1109,10 +1109,17 @@ export const publicContent: PublicContent = {
         ),
         list(
           [code("low"), text(": Codex Luna Max, currently "), code("gpt-5.6-luna"), text(" with "), code("max"), text(" reasoning.")],
-          [code("high"), text(": Codex Sol Max, currently "), code("gpt-5.6-sol"), text(" with "), code("max"), text(" reasoning.")],
-          [code("ultra"), text(": Codex Sol Ultra, currently "), code("gpt-5.6-sol"), text(" with "), code("ultra"), text(" reasoning.")],
+          [code("high"), text(": Codex Astra Max, currently "), code("gpt-6-astra"), text(" with "), code("max"), text(" reasoning.")],
+          [code("ultra"), text(": Codex Astra Ultra, currently "), code("gpt-6-astra"), text(" with "), code("ultra"), text(" reasoning.")],
           [code("fable-max"), text(": Claude Code Fable, currently "), code("claude-fable-5-1"), text(" with "), code("max"), text(" reasoning.")],
           [code("fast on|off"), text(": a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.")],
+        ),
+        paragraph(
+          text("New HRA-created Codex sessions and every explicit preset selection use the current mapping above. Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping for "),
+          code("high"),
+          text(" and "),
+          code("ultra"),
+          text(" until a preset is explicitly selected; metadata edits, restart recovery, and queued work do not reinterpret an established session."),
         ),
         paragraph(
           code("hra init"),
@@ -1264,6 +1271,10 @@ export const publicContent: PublicContent = {
             "hra auth login --input-stdin|--input-fd <fd>",
             "hra auth status|logout",
             "hra auth delete --acknowledge-erasure",
+            "hra notification-hours status [--json]",
+            "hra notification-hours set --start <HH:MM> --end <HH:MM> --timezone <IANA-zone> --revision <n> [--json]",
+            "hra notification-email status [--json]",
+            "hra notification-email enable|disable --revision <n> [--json]",
             "hra device list",
             "hra device pair",
             "hra device key-loss --acknowledge-no-key-holders",
@@ -1330,7 +1341,7 @@ export const publicContent: PublicContent = {
             "hra remote command <uuidv7>",
             "hra remote send|queue|steer <cloud-session> <message>",
             "hra remote send --or-steer <cloud-session> <message>",
-            "hra remote resolve <cloud-session> --interaction <interaction-id> --revision <n> --decision <decline>",
+            "hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>",
             "hra remote stop <cloud-session>",
             "hra remote preset <cloud-session> <low|high|ultra|fable-max>",
             "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",

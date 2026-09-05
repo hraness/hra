@@ -260,8 +260,8 @@ Platform:
 
 Recommended profiles:
   low         Luna Max        (codex)
-  high        Sol Max         (codex)
-  ultra       Sol Ultra       (codex)
+  high        Astra Max       (codex)
+  ultra       Astra Ultra     (codex)
   fable-max   Claude Fable    (claude)
 
 Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
@@ -406,7 +406,7 @@ Usage:
   hra session task delete <session> <task-id> --revision <n> [--idempotency-key <uuid>]
 
 Examples:
-  hra session start personal --project jungle --preset high
+  hra session start personal --project jungle
   hra session start personal --provider claude --preset fable-max
   hra session switch my-session --provider claude
   hra session export my-session --format trajectory --out ./trajectory.json

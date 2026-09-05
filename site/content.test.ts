@@ -635,13 +635,13 @@ describe("public content contract", () => {
     const html = htmlVisibleText(rawHtml);
     const claims = [
       "Human terminal",
-      "hra session start personal --provider codex --preset high",
+      "hra session start personal --provider codex",
       "/account personal",
       "/session <session-id>",
       "Agent caller",
       "data.session.id",
       "data.eventStream.cursor",
-      "hra session start personal --provider codex --preset high --json",
+      "hra session start personal --provider codex --json",
       "hra session status <session-id> --json",
       "hra session watch <session-id> --cursor <status-cursor> --jsonl",
       "--follow",
@@ -671,6 +671,13 @@ describe("public content contract", () => {
       expect(markdown).toContain(claim);
       expect(html).toContain(claim);
     }
+    expect(publicContent.hero.steps[0]).toMatchObject({
+      command: "hra session start personal --provider codex --json",
+      detail: "Create an Astra Ultra Codex session under the account profile you name.",
+    });
+    expect(markdown).toContain("Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping");
+    expect(html).toContain("Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping");
+    expect(markdown).not.toContain("session start personal --provider codex --preset high");
   });
 
   test("publishes bounded status and cursor-safe observation contracts", () => {

@@ -24,11 +24,38 @@ export const ROUTING_EVAL_HOLDOUT_MINIMUM_PAIRS = 200;
 export const ROUTING_EVAL_NON_INFERIORITY_MARGIN = 0.05;
 export const ROUTING_EVAL_FAST_RATIO_TARGET = 0.9;
 
-export const routingEvaluationComparisonSchema = z.discriminatedUnion("kind", [
+const routingEvaluationComparisonV1Schema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("terra_vs_sol"),
       baseline: z.literal("codex_sol_ultra"),
+      candidate: z.literal("codex_terra_ultra"),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("opus_vs_fable"),
+      baseline: z.literal("claude_fable_max"),
+      candidate: z.literal("claude_opus"),
+      candidateEffort: z.enum(["high", "xhigh", "max"]),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("fast_vs_standard"),
+      profile: z.literal("terra"),
+      baselineFast: z.literal(false),
+      candidateFast: z.literal(true),
+    })
+    .strict(),
+]);
+
+/** Current evaluation comparisons. Schema v1 remains an exact historical Sol decoder. */
+export const routingEvaluationComparisonSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("terra_vs_astra"),
+      baseline: z.literal("codex_astra_ultra"),
       candidate: z.literal("codex_terra_ultra"),
     })
     .strict(),
@@ -134,11 +161,7 @@ export function routingEvaluationCaseSetDigest(
     .digest("hex");
 }
 
-export const routingEvaluationInputSchema = z
-  .object({
-    schemaVersion: z.literal(1),
-    study: z.enum(["pilot", "holdout"]),
-    comparison: routingEvaluationComparisonSchema,
+const routingEvaluationInputTailShape = {
     taskShape: z.literal("well_defined"),
     caseSetDigest: z.string().regex(SHA_256_DIGEST),
     preregistrationDigest: z.string().regex(SHA_256_DIGEST).nullable(),
@@ -147,8 +170,23 @@ export const routingEvaluationInputSchema = z
       .array(routingEvaluationPairSchema)
       .min(2)
       .max(ROUTING_EVAL_MAX_PAIRS),
-  })
-  .strict()
+} as const;
+
+export const routingEvaluationInputSchema = z
+  .discriminatedUnion("schemaVersion", [
+    z.object({
+      schemaVersion: z.literal(1),
+      study: z.enum(["pilot", "holdout"]),
+      comparison: routingEvaluationComparisonV1Schema,
+      ...routingEvaluationInputTailShape,
+    }).strict(),
+    z.object({
+      schemaVersion: z.literal(2),
+      study: z.enum(["pilot", "holdout"]),
+      comparison: routingEvaluationComparisonSchema,
+      ...routingEvaluationInputTailShape,
+    }).strict(),
+  ])
   .superRefine((input, context) => {
     const pairIds = new Set<string>();
     const bindings = new Set<string>();
@@ -242,12 +280,7 @@ const usageTotalsSchema = z
   })
   .strict();
 
-export const routingEvaluationReportSchema = z
-  .object({
-    schemaVersion: z.literal(1),
-    mode: z.literal("shadow"),
-    study: z.enum(["pilot", "holdout"]),
-    comparison: routingEvaluationComparisonSchema,
+const routingEvaluationReportTailShape = {
     taskShape: z.literal("well_defined"),
     caseSetDigest: z.string().regex(SHA_256_DIGEST),
     preregistrationDigest: z.string().regex(SHA_256_DIGEST).nullable(),
@@ -322,8 +355,27 @@ export const routingEvaluationReportSchema = z
     liveRouting: z.literal("forbidden_phase_3_shadow_only"),
     decision: z.literal("no_activation"),
     blockers: z.array(routingEvaluationReportBlockerSchema),
-  })
-  .strict();
+} as const;
+
+export const routingEvaluationReportSchema = z.discriminatedUnion(
+  "schemaVersion",
+  [
+    z.object({
+      schemaVersion: z.literal(1),
+      mode: z.literal("shadow"),
+      study: z.enum(["pilot", "holdout"]),
+      comparison: routingEvaluationComparisonV1Schema,
+      ...routingEvaluationReportTailShape,
+    }).strict(),
+    z.object({
+      schemaVersion: z.literal(2),
+      mode: z.literal("shadow"),
+      study: z.enum(["pilot", "holdout"]),
+      comparison: routingEvaluationComparisonSchema,
+      ...routingEvaluationReportTailShape,
+    }).strict(),
+  ],
+);
 export type RoutingEvaluationReport = z.infer<
   typeof routingEvaluationReportSchema
 >;
@@ -538,7 +590,7 @@ export function analyzeRoutingEvaluation(input: unknown): RoutingEvaluationRepor
   blockers.push("phase_3_shadow_only");
 
   return routingEvaluationReportSchema.parse({
-    schemaVersion: 1,
+    schemaVersion: parsed.schemaVersion,
     mode: "shadow",
     study: parsed.study,
     comparison: { ...parsed.comparison },

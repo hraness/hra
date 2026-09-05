@@ -2,11 +2,16 @@ import { describe, expect, test } from "bun:test";
 
 import {
   assertPresetSupportedByProvider,
+  currentPresetContract,
   defaultPresetForProvider,
+  isAdmittedPresetRequirement,
   isPresetSupportedByProvider,
+  legacyPresetContract,
   PresetProviderMismatchError,
+  presetContractSchema,
   presetForProviderTier,
   presetProviders,
+  presetRequirementForContract,
   presetSchema,
   presetTiers,
   presetsForProvider,
@@ -31,6 +36,29 @@ describe("model presets and providers", () => {
       expect(presetProviders[preset]).toBe(provider);
       expect(isPresetSupportedByProvider(provider, preset)).toBe(true);
     }
+  });
+
+  test("versions exact requirements without widening the admitted tuples", () => {
+    expect(presetContractSchema.options.map((option) => option.value)).toEqual([
+      legacyPresetContract,
+      currentPresetContract,
+    ]);
+    expect(presetRequirementForContract("high", legacyPresetContract)).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(presetRequirementForContract("ultra", currentPresetContract)).toEqual({
+      model: "gpt-6-astra",
+      effort: "ultra",
+    });
+    expect(isAdmittedPresetRequirement("high", {
+      model: "gpt-5.6-sol",
+      effort: "max",
+    })).toBe(true);
+    expect(isAdmittedPresetRequirement("high", {
+      model: "gpt-6-astra",
+      effort: "ultra",
+    })).toBe(false);
   });
 
   test("refuses a preset the session's provider cannot run", () => {
@@ -61,7 +89,7 @@ describe("model presets and providers", () => {
       computerUse: true,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 1_700_000_000_000,
       permissionProfile: ":workspace",
       pluginCapability: true,
@@ -73,6 +101,18 @@ describe("model presets and providers", () => {
       serviceTier: null,
     };
     expect(effectiveRuntimeProfileSchema.safeParse(profile).success).toBe(true);
+    const legacy = {
+      ...profile,
+      model: "gpt-5.6-sol",
+    };
+    // Durable profile JSON is written from the parsed object, whose key order
+    // is canonical. Reopening it must not rewrite that historical document.
+    const legacyJson = JSON.stringify(effectiveRuntimeProfileSchema.parse(legacy));
+    expect(JSON.stringify(effectiveRuntimeProfileSchema.parse(JSON.parse(legacyJson)))).toBe(legacyJson);
+    expect(effectiveRuntimeProfileSchema.safeParse({
+      ...legacy,
+      reasoningEffort: "max",
+    }).success).toBe(false);
     expect(effectiveRuntimeProfileSchema.safeParse({
       ...profile,
       model: "claude-fable-5-1",

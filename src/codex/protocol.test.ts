@@ -7,6 +7,11 @@ import { join } from "node:path";
 import fc from "fast-check";
 
 import { INTERACTION_MAX_PENDING_MS } from "../domain/interactions.ts";
+import {
+  legacyPresetContract,
+  presetRequirementForContract,
+  presetRequirements,
+} from "../domain/presets.ts";
 
 import { CodexError } from "./errors.ts";
 import { CODEX_PIN, PINNED_CODEX_MATRIX_DIGESTS, PINNED_CODEX_SCHEMA_DIGESTS } from "./pin.ts";
@@ -102,9 +107,9 @@ const capabilities: CodexCapabilitySnapshot = {
       isDefault: false,
     },
     {
-      id: "gpt-5.6-sol",
-      model: "gpt-5.6-sol",
-      displayName: "GPT-5.6 Sol",
+      id: "gpt-6-astra",
+      model: "gpt-6-astra",
+      displayName: "GPT-6 Astra",
       hidden: false,
       supportedReasoningEfforts: ["low", "max", "ultra"],
       defaultReasoningEffort: "low",
@@ -1556,20 +1561,45 @@ describe("pinned server requests and safe notifications", () => {
 
 describe("runtime capability resolution", () => {
   test("maps only the advertised reduced presets", () => {
-    expect(resolvePreset(capabilities, "low", false)).toMatchObject({
+    expect(resolvePreset(capabilities, "low", presetRequirements.low, false)).toMatchObject({
       model: "gpt-5.6-luna",
       effort: "max",
       serviceTier: null,
     });
-    expect(resolvePreset(capabilities, "high", true)).toMatchObject({
-      model: "gpt-5.6-sol",
+    expect(resolvePreset(capabilities, "high", presetRequirements.high, true)).toMatchObject({
+      model: "gpt-6-astra",
       effort: "max",
       serviceTier: "priority",
     });
-    expect(resolvePreset(capabilities, "ultra", false)).toMatchObject({
-      model: "gpt-5.6-sol",
+    expect(resolvePreset(capabilities, "ultra", presetRequirements.ultra, false)).toMatchObject({
+      model: "gpt-6-astra",
       effort: "ultra",
     });
+  });
+
+  test("resolves a historical exact tuple without reinterpreting its alias", () => {
+    const legacyHigh = presetRequirementForContract("high", legacyPresetContract);
+    const legacyCapabilities: CodexCapabilitySnapshot = {
+      ...capabilities,
+      models: [
+        ...capabilities.models,
+        {
+          ...capabilities.models[1]!,
+          id: "gpt-5.6-sol",
+          model: "gpt-5.6-sol",
+          displayName: "GPT-5.6 Sol",
+        },
+      ],
+    };
+    expect(resolvePreset(legacyCapabilities, "high", legacyHigh, false)).toMatchObject({
+      alias: "high",
+      model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(() => resolvePreset(capabilities, "high", {
+      model: "gpt-5.6-luna",
+      effort: "max",
+    }, false)).toThrow("unadmitted exact HRA model and reasoning tuple");
   });
 
   test("fails closed when Fast is not advertised", () => {
@@ -1577,24 +1607,24 @@ describe("runtime capability resolution", () => {
       ...capabilities,
       models: capabilities.models.map((model) => ({ ...model, serviceTiers: [] })),
     };
-    expect(() => resolvePreset(withoutFast, "high", true)).toThrow(CodexError);
+    expect(() => resolvePreset(withoutFast, "high", presetRequirements.high, true)).toThrow(CodexError);
   });
 
   test("never selects a prefixed or suffixed lookalike under catalog reordering", () => {
     const catalog = [
       { ...capabilities.models[0]!, id: "gpt-5.6-luna-mini", model: "gpt-5.6-luna-mini" },
-      { ...capabilities.models[1]!, id: "legacy-gpt-5.6-sol", model: "legacy-gpt-5.6-sol" },
+      { ...capabilities.models[1]!, id: "legacy-gpt-6-astra", model: "legacy-gpt-6-astra" },
       ...capabilities.models,
     ];
     fc.assert(fc.property(fc.shuffledSubarray(catalog, { minLength: 4, maxLength: 4 }), (models) => {
-      expect(resolvePreset({ ...capabilities, models }, "low", false).model).toBe("gpt-5.6-luna");
-      expect(resolvePreset({ ...capabilities, models }, "high", false).model).toBe("gpt-5.6-sol");
+      expect(resolvePreset({ ...capabilities, models }, "low", presetRequirements.low, false).model).toBe("gpt-5.6-luna");
+      expect(resolvePreset({ ...capabilities, models }, "high", presetRequirements.high, false).model).toBe("gpt-6-astra");
     }));
     const lookalikesOnly = {
       ...capabilities,
       models: capabilities.models.map((model) => ({ ...model, model: `${model.model}-mini` })),
     };
-    expect(() => resolvePreset(lookalikesOnly, "high", false)).toThrow(CodexError);
+    expect(() => resolvePreset(lookalikesOnly, "high", presetRequirements.high, false)).toThrow(CodexError);
   });
 
   test("rejects an unrecognized reasoning effort", () => {

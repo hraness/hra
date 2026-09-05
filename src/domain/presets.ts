@@ -19,15 +19,68 @@ export type Preset = z.infer<typeof presetSchema>;
 export const presetTierSchema = z.enum(["low", "high", "ultra"]);
 export type PresetTier = z.infer<typeof presetTierSchema>;
 
-export const presetRequirements = {
+/**
+ * The durable interpretation of a stored preset alias.
+ *
+ * Contract 1 is the model mapping shipped before Astra. Contract 2 is the
+ * current mapping. These integers are stored in SQLite, so never renumber or
+ * reinterpret them.
+ */
+export const legacyPresetContract = 1 as const;
+export const currentPresetContract = 2 as const;
+export const presetContractSchema = z.union([
+  z.literal(legacyPresetContract),
+  z.literal(currentPresetContract),
+]);
+export type PresetContract = z.infer<typeof presetContractSchema>;
+
+export type PresetRequirement = Readonly<{
+  model: string;
+  effort: "max" | "ultra";
+}>;
+
+const legacyPresetRequirements = {
   low: { model: "gpt-5.6-luna", effort: "max" },
   high: { model: "gpt-5.6-sol", effort: "max" },
   ultra: { model: "gpt-5.6-sol", effort: "ultra" },
+  "fable-max": { model: "claude-fable-5-1", effort: "max" },
+} as const satisfies Record<Preset, PresetRequirement>;
+
+const currentPresetRequirements = {
+  low: { model: "gpt-5.6-luna", effort: "max" },
+  high: { model: "gpt-6-astra", effort: "max" },
+  ultra: { model: "gpt-6-astra", effort: "ultra" },
   // The local Fable model id measured for the pinned Claude Code release. It
   // is spelled here rather than imported because `src/domain` is the leaf
   // layer; `src/claude/pin.test.ts` proves the two stay equal.
   "fable-max": { model: "claude-fable-5-1", effort: "max" },
-} as const satisfies Record<Preset, { readonly model: string; readonly effort: string }>;
+} as const satisfies Record<Preset, PresetRequirement>;
+
+const presetRequirementsByContract = {
+  [legacyPresetContract]: legacyPresetRequirements,
+  [currentPresetContract]: currentPresetRequirements,
+} as const satisfies Record<PresetContract, Record<Preset, PresetRequirement>>;
+
+/** Current requirements used for every new or explicitly selected preset. */
+export const presetRequirements = currentPresetRequirements;
+
+/** Resolve one alias under its durable, session-owned interpretation. */
+export const presetRequirementForContract = (
+  preset: Preset,
+  contract: PresetContract,
+): PresetRequirement => presetRequirementsByContract[contract][preset];
+
+/**
+ * Historical runtime documents remain admissible only when they carry one of
+ * the exact tuples HRA has shipped for that alias.
+ */
+export const isAdmittedPresetRequirement = (
+  preset: Preset,
+  requirement: PresetRequirement,
+): boolean => [legacyPresetContract, currentPresetContract].some((contract) => {
+  const admitted = presetRequirementForContract(preset, contract);
+  return admitted.model === requirement.model && admitted.effort === requirement.effort;
+});
 
 export const presetProviders = {
   low: "codex",

@@ -56,8 +56,10 @@ import {
   type SessionStatus,
 } from "../domain/observation";
 import {
+  currentPresetContract,
   isPresetSupportedByProvider,
   PresetProviderMismatchError,
+  presetRequirementForContract,
   presetsForProvider,
   presetTiers,
   type Preset,
@@ -1271,7 +1273,12 @@ export class HraService {
         case "session.note.edit": throw new CommandFailure("INTERACTION_REQUIRED", "Open the editor through the local `hra session note edit` command.");
         case "session.note.set": return { session: await this.#updateSession(command.session, (session) => ({ note: command.note, expectedRevision: session.revision })) };
         case "session.note.clear": return { session: await this.#updateSession(command.session, (session) => ({ note: "", expectedRevision: session.revision })) };
-        case "session.preset": return { session: await this.#updateSession(command.session, (session) => ({ preset: command.preset, expectedRevision: session.revision })) };
+        case "session.preset": return {
+          session: await this.#updateSession(
+            command.session,
+            (session) => this.#presetMetadataUpdate(session, command.preset),
+          ),
+        };
         case "session.switch": {
           const replay = this.#settledProviderSwitchReplay(command);
           if (replay.matched) return replay.value;
@@ -1750,9 +1757,8 @@ export class HraService {
         case "session.rename": return await this.#rename(session.id, command.name, command.idempotencyKey, context.signal);
         case "session.preset": return {
           session: this.#store.updateSessionMetadata({
-            expectedRevision: session.revision,
-            preset: command.preset,
             sessionId: session.id,
+            ...this.#presetMetadataUpdate(session, command.preset),
           }),
         };
         case "session.switch": return await this.#switchProvider(command, context.signal);
@@ -7336,6 +7342,10 @@ export class HraService {
     // port proves, and every later turn, steer, stop, and interaction on this
     // session is routed back to the same port by `sessions.provider`.
     const runtime = this.#sessionRuntime(provider);
+    const requirement = presetRequirementForContract(
+      command.preset,
+      currentPresetContract,
+    );
     // Prove authentication under the account serializer before the first
     // durable mutation row or runtime review exists. Storage consumes this
     // exact profile/provider/generation tuple at the effect boundary.
@@ -7372,6 +7382,7 @@ export class HraService {
             authority: authorityFor(this.#paths, profile),
             projectRoot,
             preset: command.preset,
+            requirement,
             fast: command.fast,
             signal,
           });
@@ -7737,6 +7748,10 @@ export class HraService {
     });
 
     const runtime = this.#sessionRuntime(command.provider);
+    const requirement = presetRequirementForContract(
+      preset,
+      currentPresetContract,
+    );
     const fromProvider = session.provider;
     const fromPreset = session.preset;
     let sessionReview: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
@@ -7773,6 +7788,7 @@ export class HraService {
               authority: authorityFor(this.#paths, targetProfile),
               ...(projectRoot === undefined ? {} : { projectRoot }),
               preset,
+              requirement,
               fast: session.fastEnabled,
               signal,
             }),
@@ -7853,6 +7869,7 @@ export class HraService {
                 providerThreadId: startedTarget.providerThreadId,
                 ...(projectRoot === undefined ? {} : { projectRoot }),
                 preset,
+                requirement,
                 fast: session.fastEnabled,
                 signal,
               }),
@@ -8129,6 +8146,10 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
+    const presetSelection = this.#store.requireSessionPresetRequirement(session.id);
+    if (presetSelection.preset !== session.preset) {
+      throw new CommandFailure("CONFLICT", "The session preset authority changed before dispatch.");
+    }
     this.#assertEstablishedSessionAccount(profile, session);
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     if (project !== undefined) await this.#requireUsableProjectRoot(project.rootPath);
@@ -8176,6 +8197,7 @@ export class HraService {
           providerThreadId: session.providerThreadId,
           ...(projectRoot === undefined ? {} : { projectRoot }),
           preset: session.preset,
+          requirement: presetSelection.requirement,
           fast: session.fastEnabled,
           signal,
         });
@@ -9539,6 +9561,19 @@ export class HraService {
     return { expectedRevision: session.revision, fastEnabled: enabled };
   }
 
+  #presetMetadataUpdate(
+    session: SessionRecord,
+    preset: Preset,
+  ): Omit<Parameters<StateStore["updateSessionMetadata"]>[0], "sessionId"> {
+    if (session.state === "recovery_required") {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session requires recovery before its model preset can change.",
+      );
+    }
+    return { expectedRevision: session.revision, preset };
+  }
+
   async #reconcileTerminalFactsMemory(): Promise<void> {
     const targetRevision = this.#terminalFactsMemoryRevision;
     if (
@@ -9583,6 +9618,8 @@ export class HraService {
     const admittedProfile = this.#store.requireProfile(session.profileId);
     if (!this.#profileAllowsEstablishedSession(admittedProfile, session)) return;
     const boundSession: BoundSessionRecord = { ...session, providerThreadId: session.providerThreadId };
+    const presetSelection = this.#store.requireSessionPresetRequirement(session.id);
+    if (presetSelection.preset !== session.preset) return;
     const queued = this.#store.nextPendingQueue(session.id);
     if (queued === null) return;
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
@@ -9605,6 +9642,7 @@ export class HraService {
           providerThreadId: boundSession.providerThreadId,
           projectRoot,
           preset: session.preset,
+          requirement: presetSelection.requirement,
           fast: session.fastEnabled,
           signal,
         });

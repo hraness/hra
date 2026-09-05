@@ -16,6 +16,9 @@ import {
 } from "../domain/observation";
 import type { InteractionDisplay, InteractionKind } from "../domain/interactions";
 import {
+  legacyPresetContract,
+} from "../domain/presets";
+import {
   SESSION_EVENT_MAX_BYTES,
   SESSION_EVENT_PUBLIC_MAX_BYTES,
   SESSION_EVENT_RETAIN_AGE_MS,
@@ -830,6 +833,131 @@ describe("StateStore", () => {
     expect(updated.fastEnabled).toBe(true);
   });
 
+  test("keeps imported sessions legacy until an explicit preset selection", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Preset contracts");
+    const created = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    expect(store.requireSessionPresetRequirement(created.id)).toEqual({
+      preset: "high",
+      requirement: { model: "gpt-6-astra", effort: "max" },
+    });
+
+    const imported = store.upsertProviderSession({
+      profileId: profile.id,
+      providerThreadId: "thread-imported-contract",
+      title: "Imported",
+      state: "idle",
+    });
+    expect(store.requireSessionPresetRequirement(imported.id)).toEqual({
+      preset: "high",
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
+    });
+    const renamed = store.updateSessionMetadata({
+      sessionId: imported.id,
+      expectedRevision: imported.revision,
+      title: "Still legacy",
+    });
+    expect(store.requireSessionPresetRequirement(imported.id).requirement.model)
+      .toBe("gpt-5.6-sol");
+    store.updateSessionMetadata({
+      sessionId: imported.id,
+      expectedRevision: renamed.revision,
+      preset: "high",
+    });
+    expect(store.requireSessionPresetRequirement(imported.id).requirement.model)
+      .toBe("gpt-6-astra");
+  });
+
+  test("settles immutable legacy evidence before permitting a preset-contract upgrade", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Legacy recovery preset", "legacy-recovery@example.com");
+    const session = store.upsertProviderSession({
+      profileId: profile.id,
+      providerThreadId: "thread-legacy-recovery-preset",
+      title: "Legacy recovery preset",
+      state: "idle",
+      providerUpdatedAt: 10,
+    });
+    const runtimeProfile = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-5.6-sol",
+      observedAt: 2_000,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+    const idempotencyKey = "00000000-0000-4000-8000-0000000006c0";
+    const attempt = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: session.id,
+      idempotencyKey,
+      kind: "session.send",
+      request: { message: "legacy recovery" },
+    });
+    const evidence = store.beginSessionMutationEffect({
+      attemptId: attempt.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
+        clientMessageId: attempt.id,
+        kind: "session.send",
+        messageDigest: createHash("sha256").update("legacy recovery").digest("hex"),
+        providerThreadId: "thread-legacy-recovery-preset",
+        runtimeProfile,
+      },
+    });
+    expect(store.transitionMutation(attempt.id, "effect_started", "ambiguous", {
+      code: "LOST_RESPONSE",
+    })).toBe(true);
+    const quarantined = store.quarantineSession(session.id);
+    expect(() => store.updateSessionMetadata({
+      expectedRevision: quarantined.revision,
+      preset: "high",
+      sessionId: session.id,
+    })).toThrow("SESSION_PRESET_RECOVERY_REQUIRED");
+
+    const recovered = store.resolveSessionMutation({
+      attemptId: attempt.id,
+      expectedEvidenceDigest: evidence.digest,
+      expectedOriginalState: "ambiguous",
+      provider: {
+        providerThreadId: "thread-legacy-recovery-preset",
+        providerUpdatedAt: 11,
+        status: "idle",
+        title: "Legacy recovery preset",
+      },
+      receipt: { turnId: "turn-legacy-recovery-preset" },
+      resolution: "proven_applied",
+      resolutionEvidence: { providerUpdatedAt: 11, source: "thread/read" },
+    });
+    expect(recovered.state).toBe("idle");
+    expect(store.runtimeProfileForTurn(session.id, "turn-legacy-recovery-preset"))
+      .toEqual(runtimeProfile);
+    expect(store.requireSessionPresetRequirement(session.id).requirement)
+      .toEqual({ model: "gpt-5.6-sol", effort: "max" });
+
+    store.updateSessionMetadata({
+      expectedRevision: recovered.revision,
+      preset: "high",
+      sessionId: session.id,
+    });
+    expect(store.requireSessionPresetRequirement(session.id).requirement)
+      .toEqual({ model: "gpt-6-astra", effort: "max" });
+  });
+
   test("records the session provider and refuses another provider's preset", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Providers");
@@ -1430,7 +1558,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
       preset: "high" as const,
@@ -1568,7 +1696,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -1980,7 +2108,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -2113,7 +2241,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -2364,6 +2492,152 @@ describe("StateStore", () => {
       state: "idle",
     })).toThrow("does not support the `high` model preset");
     expect(store.requireSession(started.id).providerThreadId).toBe("claude-thread");
+  });
+
+  test("fences provider-switch seed reviews to the exact historical preset contract", async () => {
+    const { store } = await fixture();
+    const sourceProfile = signInProfile(store, "Seed source", "seed-source@example.com");
+    const targetProfile = signInProfile(store, "Seed target", "seed-target@example.com");
+    const astraProfile = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-6-astra",
+      observedAt: 2_200,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: targetProfile.processGeneration,
+      profileId: targetProfile.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+    const solProfile = { ...astraProfile, model: "gpt-5.6-sol" };
+    const stageSwitch = (suffix: string, seedText: string) => {
+      const starting = store.createSession({
+        fastEnabled: false,
+        preset: "fable-max",
+        profileId: sourceProfile.id,
+        provider: "claude",
+      });
+      const session = store.bindSession({
+        expectedRevision: starting.revision,
+        providerThreadId: `source-${suffix}`,
+        sessionId: starting.id,
+        state: "idle",
+      });
+      const attempt = store.prepareMutation({
+        authorityGeneration: targetProfile.processGeneration,
+        authorityId: session.id,
+        idempotencyKey: `00000000-0000-4000-8000-000000000${suffix}`,
+        kind: "session.switch",
+        request: { preset: "high", provider: "codex" },
+      });
+      const seedDigest = createHash("sha256")
+        .update("hra:session-transcript-seed:v1\0", "utf8")
+        .update(seedText, "utf8")
+        .digest("hex");
+      const evidence = {
+        kind: "session.switch" as const,
+        daemonGeneration: 0,
+        requestedAccountId: targetProfile.id,
+        requestedPreset: "high" as const,
+        runtimeProfile: astraProfile,
+        seedDigest,
+        seedIncludedRecords: 1,
+        seedOmittedRecords: 0,
+        sourcePreset: "fable-max" as const,
+        sourceProcessGeneration: sourceProfile.processGeneration,
+        sourceProfileId: sourceProfile.id,
+        sourceProvider: "claude" as const,
+        sourceProviderThreadId: `source-${suffix}`,
+        targetPreset: "high" as const,
+        targetProcessGeneration: targetProfile.processGeneration,
+        targetProfileId: targetProfile.id,
+        targetProvider: "codex" as const,
+        transcriptDigest: createHash("sha256").update(`transcript-${suffix}`).digest("hex"),
+      };
+      store.beginSessionProviderSwitchEffect({
+        attemptId: attempt.id,
+        evidence,
+        sessionId: session.id,
+      });
+      store.recordSessionProviderSwitchTarget({
+        attemptId: attempt.id,
+        providerThreadId: `target-${suffix}`,
+        sessionId: session.id,
+      });
+      return { attempt, seedText, session };
+    };
+
+    const current = stageSwitch("6b2", "Seed the current Astra target.");
+    expect(() => store.recordSessionProviderSwitchSeedIntent({
+      attemptId: current.attempt.id,
+      providerThreadId: "target-6b2",
+      runtimeProfile: solProfile,
+      seedText: current.seedText,
+      sessionId: current.session.id,
+    })).toThrow("SESSION_PROVIDER_SWITCH_SEED_INTENT_AUTHORITY_MISMATCH");
+    expect(store.readSessionProviderSwitchProgress(current.attempt.id).seed).toBeUndefined();
+    store.recordSessionProviderSwitchSeedIntent({
+      attemptId: current.attempt.id,
+      providerThreadId: "target-6b2",
+      runtimeProfile: astraProfile,
+      seedText: current.seedText,
+      sessionId: current.session.id,
+    });
+    expect(store.readSessionProviderSwitchProgress(current.attempt.id).seed?.runtimeProfile.model)
+      .toBe("gpt-6-astra");
+
+    const legacy = stageSwitch("6b3", "Resume the historical Sol target.");
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      // Simulate the immutable switch evidence a pre-v38 daemon could have
+      // left after the provider target was created but before its seed began.
+      const stored = inspector.query(
+        "SELECT evidence_json FROM mutation_effect_evidence WHERE attempt_id=?",
+      ).get(legacy.attempt.id) as { evidence_json: string };
+      const legacyEvidence = JSON.parse(stored.evidence_json) as {
+        runtimeProfile: { model: string };
+      };
+      legacyEvidence.runtimeProfile.model = "gpt-5.6-sol";
+      const legacyEvidenceJson = JSON.stringify(legacyEvidence);
+      inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
+      inspector.query(
+        `UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=?
+         WHERE attempt_id=?`,
+      ).run(
+        legacyEvidenceJson,
+        createHash("sha256").update(legacyEvidenceJson).digest("hex"),
+        legacy.attempt.id,
+      );
+      inspector.exec(`
+        CREATE TRIGGER mutation_effect_evidence_immutable_update
+        BEFORE UPDATE ON mutation_effect_evidence
+        BEGIN SELECT RAISE(ABORT, 'mutation effect evidence is immutable'); END;
+      `);
+    } finally {
+      inspector.close(false);
+    }
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006b3"))
+      .toMatchObject({ evidence: { evidence: { runtimeProfile: { model: "gpt-5.6-sol" } } } });
+    expect(store.isSessionMutationProviderAuthorityCurrent({
+      attemptId: legacy.attempt.id,
+      originGeneration: targetProfile.processGeneration,
+      profileId: targetProfile.id,
+      provider: "codex",
+    })).toBe(true);
+    expect(() => store.recordSessionProviderSwitchSeedIntent({
+      attemptId: legacy.attempt.id,
+      providerThreadId: "target-6b3",
+      runtimeProfile: solProfile,
+      seedText: legacy.seedText,
+      sessionId: legacy.session.id,
+    })).not.toThrow();
+    expect(store.readSessionProviderSwitchProgress(legacy.attempt.id).seed?.runtimeProfile.model)
+      .toBe("gpt-5.6-sol");
   });
 
   test("refuses a session-start evidence row whose profile names another provider", async () => {
@@ -2756,7 +3030,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -3043,7 +3317,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -3135,7 +3409,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -3834,7 +4108,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -3872,7 +4146,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -6281,7 +6555,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -7935,8 +8209,8 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }, { version: 38 }]);
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -8018,6 +8292,114 @@ describe("StateStore", () => {
     }
   });
 
+  test("migrates historical Sol runtime profiles without rewriting their durable JSON", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Historical Sol", "historical-sol@example.com");
+    const session = store.upsertProviderSession({
+      profileId: profile.id,
+      providerThreadId: "thread-historical-sol",
+      title: "Historical Sol",
+      state: "idle",
+    });
+    const runtimeProfile = effectiveRuntimeProfileSchema.parse({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request",
+      reviewMode: "auto_review",
+      permissionProfile: ":workspace",
+      computerUse: true,
+      pluginCapability: true,
+      enabledApps: [],
+    });
+    store.recordSessionRuntimeProfile({
+      sessionId: session.id,
+      sourceKind: "turn_start",
+      sourceId: "historical-sol-source",
+      profile: runtimeProfile,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    const before = z.object({ profile_json: z.string() }).strict().parse(legacy.query(
+      "SELECT profile_json FROM session_runtime_profiles WHERE source_id='historical-sol-source'",
+    ).get()).profile_json;
+    legacy.exec("DELETE FROM migrations WHERE version=38; PRAGMA user_version=37;");
+    legacy.close(false);
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:37:38");
+    const migrated = new StateStore(paths, { now: () => 4_000 });
+    stores.push(migrated);
+    expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
+    expect(migrated.requireSessionPresetRequirement(session.id)).toEqual({
+      preset: "high",
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT profile_json FROM session_runtime_profiles WHERE source_id='historical-sol-source'",
+      ).get()).toEqual({ profile_json: before });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("pre-applies v38 preset contracts before replaying the current work schema from v25", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Pre-v26 preset contract");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      DROP TRIGGER IF EXISTS works_identity_immutable;
+      DROP TRIGGER IF EXISTS work_attempt_route_guard;
+      DROP TRIGGER IF EXISTS work_session_attempt_authority_guard;
+      ALTER TABLE works DROP COLUMN preset_contract;
+      ALTER TABLE sessions DROP COLUMN preset_contract;
+      DELETE FROM migrations WHERE version > 25;
+      PRAGMA user_version=25;
+    `);
+    legacy.close(false);
+
+    const migrated = new StateStore(paths, { now: () => 5_000 });
+    stores.push(migrated);
+    expect(migrated.requireSessionPresetRequirement(session.id)).toEqual({
+      preset: "high",
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA table_info(sessions)").all())
+        .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
+      expect(inspector.query("PRAGMA table_info(works)").all())
+        .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
+      expect(inspector.query("SELECT preset_contract FROM sessions WHERE id=?").get(session.id))
+        .toEqual({ preset_contract: legacyPresetContract });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version=38").get())
+        .toEqual({ version: 38 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
   test("captures the fresh notification-hours default from the machine zone exactly once", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-hours-fresh-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
@@ -8076,7 +8458,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("migrates populated main-v35 provider-switch evidence to v37 without rewriting it", async () => {
+  test("migrates populated main-v35 provider-switch evidence to v38 without rewriting it", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Main v35", "main-v35@example.com");
     const session = store.createSession({
@@ -8103,13 +8485,13 @@ describe("StateStore", () => {
     mainV35.exec(`
       DROP TABLE attention_email_policy;
       DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version IN (36,37);
+      DELETE FROM migrations WHERE version IN (36,37,38);
       PRAGMA user_version=35;
     `);
     mainV35.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:37");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:38");
     const migrated = new StateStore(paths, {
       now: () => 8_000,
       resolveMachineTimeZone: () => "UTC",
@@ -8123,7 +8505,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query(
         "SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
       ).get(attempt.id)).toEqual({
@@ -8131,8 +8513,8 @@ describe("StateStore", () => {
         recorded_at: 7_350,
       });
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 37 ORDER BY version",
-      ).all()).toEqual([{ version: 35 }, { version: 36 }, { version: 37 }]);
+        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 38 ORDER BY version",
+      ).all()).toEqual([{ version: 35 }, { version: 36 }, { version: 37 }, { version: 38 }]);
     } finally {
       inspector.close(false);
     }
@@ -8155,14 +8537,14 @@ describe("StateStore", () => {
     dropProviderSwitchVersion35Objects(legacy);
     legacy.exec(`
       DROP TABLE attention_email_policy;
-      DELETE FROM migrations WHERE version IN (36,37);
+      DELETE FROM migrations WHERE version IN (36,37,38);
       PRAGMA user_version=35;
     `);
     expect(providerSwitchSchemaObjectCount(legacy)).toBe(0);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:37");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:38");
     const migrated = new StateStore(paths, {
       now: () => 9_000,
       resolveMachineTimeZone: () => {
@@ -8184,7 +8566,7 @@ describe("StateStore", () => {
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(18);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
     } finally {
       inspector.close(false);
     }
@@ -8202,13 +8584,13 @@ describe("StateStore", () => {
 
     const legacy = new Database(paths.database, { create: false, strict: true });
     legacy.exec(`
-      DELETE FROM migrations WHERE version=37;
+      DELETE FROM migrations WHERE version IN (37,38);
       PRAGMA user_version=36;
     `);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:37");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:38");
 
     expect(() => new StateStore(paths))
       .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
@@ -8245,7 +8627,7 @@ describe("StateStore", () => {
 
     const legacy = new Database(paths.database, { create: false, strict: true });
     dropProviderSwitchVersion35Objects(legacy);
-    legacy.exec("DELETE FROM migrations WHERE version=37; PRAGMA user_version=36;");
+    legacy.exec("DELETE FROM migrations WHERE version IN (37,38); PRAGMA user_version=36;");
     const before = legacy.query(
       `SELECT h.start_minute,h.end_minute,h.time_zone,h.revision AS hours_revision,
               e.enabled,e.revision AS email_revision,e.created_at,e.updated_at
@@ -8255,7 +8637,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:37");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:38");
     const migrated = new StateStore(paths, {
       now: () => 12_000,
       resolveMachineTimeZone: () => {
@@ -8283,7 +8665,7 @@ describe("StateStore", () => {
          FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
       ).get()).toEqual(before);
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(18);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
     } finally {
       inspector.close(false);
     }
@@ -8303,7 +8685,7 @@ describe("StateStore", () => {
     dropProviderSwitchVersion35Objects(lookalike);
     lookalike.exec(`
       CREATE INDEX attention_email_policy_untrusted ON attention_email_policy(enabled);
-      DELETE FROM migrations WHERE version=37;
+      DELETE FROM migrations WHERE version IN (37,38);
       PRAGMA user_version=36;
     `);
     lookalike.close(false);
@@ -8416,13 +8798,13 @@ describe("StateStore", () => {
     legacy.exec(`
       DROP TABLE attention_email_policy;
       DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version BETWEEN 35 AND 37;
+      DELETE FROM migrations WHERE version BETWEEN 35 AND 38;
       PRAGMA user_version=34;
     `);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:37");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:38");
     const unchanged = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
@@ -8480,7 +8862,7 @@ describe("StateStore", () => {
     const schemaInspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(18);
-      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
     } finally {
       schemaInspector.close(false);
     }
@@ -8496,7 +8878,7 @@ describe("StateStore", () => {
     legacy.exec(`
       DROP TABLE attention_email_policy;
       DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version BETWEEN 35 AND 37;
+      DELETE FROM migrations WHERE version BETWEEN 35 AND 38;
       PRAGMA user_version=34;
     `);
     legacy.close(false);
@@ -8801,13 +9183,13 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query("PRAGMA table_info(sessions)").all())
         .toContainEqual(expect.objectContaining({ name: "provider", dflt_value: "'codex'" }));
       expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
         .toContainEqual(expect.objectContaining({ name: "path" }));
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 37 ORDER BY version",
+        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 38 ORDER BY version",
       ).all()).toEqual([
         { version: 30 },
         { version: 31 },
@@ -8817,6 +9199,7 @@ describe("StateStore", () => {
         { version: 35 },
         { version: 36 },
         { version: 37 },
+        { version: 38 },
       ]);
     } finally {
       inspector.close(false);
@@ -9110,7 +9493,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -9218,7 +9601,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -9333,7 +9716,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -9390,7 +9773,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -9478,7 +9861,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -9584,7 +9967,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -9676,7 +10059,7 @@ describe("StateStore", () => {
     expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
         id: 7,
         path: "protocol",
@@ -9785,7 +10168,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -9824,6 +10207,7 @@ describe("StateStore", () => {
         { version: 35, applied_at: 2000 },
         { version: 36, applied_at: 2000 },
         { version: 37, applied_at: 2000 },
+        { version: 38, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -9870,7 +10254,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -9890,9 +10274,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 38");
+    newer.exec("PRAGMA user_version = 39");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:38:37");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:39:38");
   });
 });

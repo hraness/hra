@@ -43,7 +43,6 @@ import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
 import type { PreparedAttachment } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
-import type { Preset } from "../domain/presets";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import {
   SESSION_EVENT_RETAIN_AGE_MS,
@@ -81,7 +80,7 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
   processGeneration: authority.generation,
   observedAt: 2_000,
   preset: "high",
-  model: "gpt-5.6-sol",
+  model: "gpt-6-astra",
   reasoningEffort: "max",
   serviceTier: null,
   fast: false,
@@ -205,6 +204,8 @@ class FakeCodex implements CodexRuntimePort {
   listedProjections: readonly CodexSessionProjection[] = [];
   listedNextCursor: string | null = null;
   readonly sessionListRequests: Array<Parameters<CodexRuntimePort["listSessions"]>[0]> = [];
+  readonly sessionReviewRequests: Array<Parameters<CodexRuntimePort["reviewSessionStart"]>[0]> = [];
+  readonly turnReviewRequests: Array<Parameters<CodexRuntimePort["reviewTurnStart"]>[0]> = [];
   loginResult: CodexLoginOutcome = { status: "signed_in", account: { signedIn: true, email: "person@example.com", plan: "Plus" } };
   cancelLoginResult: { status: "canceled" | "not_found" } = { status: "canceled" };
   beforeLoginReturn?: (input: { authority: ProfileAuthority; method: "browser" | "device_code" }) => Promise<void>;
@@ -239,16 +240,17 @@ class FakeCodex implements CodexRuntimePort {
     this.sessionListRequests.push(input);
     return { sessions: this.listedProjections, nextCursor: this.listedNextCursor };
   }
-  async reviewSessionStart(input: { authority: ProfileAuthority; preset: Preset; fast: boolean }): Promise<RuntimeStartReview> {
+  async reviewSessionStart(input: Parameters<CodexRuntimePort["reviewSessionStart"]>[0]): Promise<RuntimeStartReview> {
     this.calls.push("review-session");
+    this.sessionReviewRequests.push(input);
     const base = runtimeProfile(input.authority);
     const effectiveRuntimeProfile = this.runtimeProfileOverride ?? {
       ...base,
       preset: input.preset,
       fast: input.fast,
       serviceTier: input.fast ? "priority" as const : null,
-      model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
-      reasoningEffort: input.preset === "ultra" ? "ultra" as const : "max" as const,
+      model: input.requirement.model,
+      reasoningEffort: input.requirement.effort,
     };
     return { reviewId: crypto.randomUUID(), kind: "session_start", effectiveRuntimeProfile };
   }
@@ -303,9 +305,10 @@ class FakeCodex implements CodexRuntimePort {
     await this.beforeReadSessionReturn?.();
     return this.readProjection;
   }
-  async reviewTurnStart(input: { authority: ProfileAuthority; preset: Preset; fast: boolean }): Promise<RuntimeStartReview> {
+  async reviewTurnStart(input: Parameters<CodexRuntimePort["reviewTurnStart"]>[0]): Promise<RuntimeStartReview> {
     this.calls.push("review-turn");
     this.turnEffectTrace.push("review");
+    this.turnReviewRequests.push(input);
     const error = this.reviewTurnErrorOnce;
     delete this.reviewTurnErrorOnce;
     if (error !== undefined) throw error;
@@ -315,8 +318,8 @@ class FakeCodex implements CodexRuntimePort {
       preset: input.preset,
       fast: input.fast,
       serviceTier: input.fast ? "priority" as const : null,
-      model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
-      reasoningEffort: input.preset === "ultra" ? "ultra" as const : "max" as const,
+      model: input.requirement.model,
+      reasoningEffort: input.requirement.effort,
     };
     return { reviewId: crypto.randomUUID(), kind: "turn_start", effectiveRuntimeProfile };
   }
@@ -3199,6 +3202,40 @@ describe("HraService", () => {
     }]);
   });
 
+  test("refuses local and remote preset changes until session recovery settles", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Recovery preset fence");
+    const quarantined = value.store.quarantineSession(sessionId);
+    const profile = value.store.requireProfileById(quarantined.profileId);
+    if (quarantined.providerThreadId === undefined) throw new Error("Expected provider binding.");
+    const refusal = {
+      code: "RECOVERY_REQUIRED",
+      message: "The session requires recovery before its model preset can change.",
+    };
+
+    await expect(value.service.execute({
+      kind: "session.preset",
+      preset: "high",
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject(refusal);
+    await expect(value.service.executeRemote({
+      idempotencyKey: "00000000-0000-4000-8000-0000000006c1",
+      kind: "session.preset",
+      preset: "high",
+      session: sessionId,
+    }, {
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      providerThreadId: quarantined.providerThreadId,
+      sessionId,
+    }, { signal })).rejects.toMatchObject(refusal);
+    expect(value.store.requireSession(sessionId)).toMatchObject({
+      preset: "high",
+      revision: quarantined.revision,
+      state: "recovery_required",
+    });
+  });
+
   test("reactivates stale live memory with a current TTL and does not churn epochs on unchanged resume", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     factsMemory.simulateExpiry = true;
@@ -3987,7 +4024,7 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
       ).all()).toEqual([
@@ -4004,6 +4041,7 @@ describe("HraService", () => {
         { version: 35 },
         { version: 36 },
         { version: 37 },
+        { version: 38 },
       ]);
     } finally {
       inspector.close(false);
@@ -6496,6 +6534,53 @@ describe("HraService", () => {
     await service.settled();
     expect(store.requireQueue(queued.queued.id)).toMatchObject({ state: "applied" });
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
+    expect(codex.turnReviewRequests.at(-1)?.requirement).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(store.latestSessionRuntimeProfile(imported.id)?.profile).toMatchObject({
+      preset: "high",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+    });
+  });
+
+  test("sends an imported session with its legacy exact preset requirement", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Imported send" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Imported send docs", path: documents }, { signal });
+    const project = store.listProjects()[0];
+    if (project === undefined) throw new Error("Expected the imported session project.");
+    const imported = store.upsertProviderSession({
+      profileId: added.account.id,
+      projectId: project.id,
+      providerThreadId: "provider-thread-imported-send",
+      title: "Imported send",
+      state: "idle",
+      providerUpdatedAt: 10,
+    });
+    codex.readProjection = {
+      ...codex.readProjection,
+      providerThreadId: "provider-thread-imported-send",
+    };
+    codex.turnStatus = "completed";
+
+    await service.execute({
+      kind: "session.send",
+      session: imported.id,
+      message: "keep the admitted model",
+    }, { signal });
+
+    expect(codex.turnReviewRequests.at(-1)?.requirement).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(store.latestSessionRuntimeProfile(imported.id)?.profile).toMatchObject({
+      preset: "high",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+    });
   });
 
   test("retries bounded pre-evidence baseline and capability failures without replaying a provider effect", async () => {

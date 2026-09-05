@@ -38,10 +38,15 @@ function outcome(
   };
 }
 
+type RoutingEvaluationInputV2 = Extract<
+  RoutingEvaluationInput,
+  { schemaVersion: 2 }
+>;
+
 function evaluation(
   pairCount: number,
-  overrides: Partial<RoutingEvaluationInput> = {},
-): RoutingEvaluationInput {
+  overrides: Partial<RoutingEvaluationInputV2> = {},
+): RoutingEvaluationInputV2 {
   const pairs = Array.from({ length: pairCount }, (_, index) => ({
     pairId: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
     environmentBinding: `hmac-sha256:${(index + 1)
@@ -52,11 +57,11 @@ function evaluation(
     candidate: outcome(),
   })) as RoutingEvaluationInput["pairs"];
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     study: "holdout",
     comparison: {
-      kind: "terra_vs_sol",
-      baseline: "codex_sol_ultra",
+      kind: "terra_vs_astra",
+      baseline: "codex_astra_ultra",
       candidate: "codex_terra_ultra",
     },
     taskShape: "well_defined",
@@ -88,8 +93,8 @@ describe("routing evaluation input", () => {
   test("accepts only the three closed comparison families", () => {
     for (const comparison of [
       {
-        kind: "terra_vs_sol",
-        baseline: "codex_sol_ultra",
+        kind: "terra_vs_astra",
+        baseline: "codex_astra_ultra",
         candidate: "codex_terra_ultra",
       },
       {
@@ -115,15 +120,15 @@ describe("routing evaluation input", () => {
 
   test.each([
     { privateTaskText: "must never enter an export" },
-    { schemaVersion: 2 },
+    { schemaVersion: 3 },
     { taskShape: "mechanical" },
     { design: { ...evaluation(2).design, paired: false } },
     { caseSetDigest: "not-a-digest" },
     {
       comparison: {
-        kind: "terra_vs_sol",
+        kind: "terra_vs_astra",
         baseline: "codex_terra_ultra",
-        candidate: "codex_sol_ultra",
+        candidate: "codex_astra_ultra",
       },
     },
     {
@@ -141,6 +146,43 @@ describe("routing evaluation input", () => {
         ...override,
       }).success,
     ).toBe(false);
+  });
+
+  test("preserves schema v1 as an exact historical Sol comparison", () => {
+    const historical = {
+      ...evaluation(2),
+      schemaVersion: 1 as const,
+      comparison: {
+        kind: "terra_vs_sol" as const,
+        baseline: "codex_sol_ultra" as const,
+        candidate: "codex_terra_ultra" as const,
+      },
+    };
+    const parsedHistorical = routingEvaluationInputSchema.parse(historical);
+    expect(Object.keys(parsedHistorical).slice(0, 4)).toEqual([
+      "schemaVersion",
+      "study",
+      "comparison",
+      "taskShape",
+    ]);
+    const historicalReport = analyzeRoutingEvaluation(historical);
+    expect(historicalReport.schemaVersion).toBe(1);
+    expect(Object.keys(historicalReport).slice(0, 5)).toEqual([
+      "schemaVersion",
+      "mode",
+      "study",
+      "comparison",
+      "taskShape",
+    ]);
+
+    expect(routingEvaluationInputSchema.safeParse({
+      ...historical,
+      comparison: evaluation(2).comparison,
+    }).success).toBe(false);
+    expect(routingEvaluationInputSchema.safeParse({
+      ...evaluation(2),
+      comparison: historical.comparison,
+    }).success).toBe(false);
   });
 
   test("requires unique ordered UUID pairs, unique HMAC bindings, and balanced order", () => {

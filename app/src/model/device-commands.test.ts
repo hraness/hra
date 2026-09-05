@@ -82,7 +82,7 @@ function machine(overrides: Partial<Readonly<{
 }
 
 describe("device command builders", () => {
-  test("the composer default is Sol Ultra", () => {
+  test("the composer default is Astra Ultra", () => {
     expect(defaultSessionStartPreset).toBe("ultra");
   });
 

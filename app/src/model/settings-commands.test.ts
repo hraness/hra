@@ -111,9 +111,9 @@ describe("machine default builders", () => {
   test("preset labels name the actual model and effort", () => {
     expect(presetLabels).toEqual({
       "fable-max": "Fable Max",
-      high: "Sol Max",
+      high: "Astra Max",
       low: "Luna Max",
-      ultra: "Sol Ultra",
+      ultra: "Astra Ultra",
     });
   });
 

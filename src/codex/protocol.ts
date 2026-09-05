@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 
-import { presetRequirements } from "../domain/presets.ts";
+import {
+  isAdmittedPresetRequirement,
+  type PresetRequirement,
+} from "../domain/presets.ts";
 import {
   INTERACTION_MAX_PENDING_MS,
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
@@ -3358,9 +3361,15 @@ export function parseFact(method: string, params: unknown): CodexFact {
 export function resolvePreset(
   snapshot: CodexCapabilitySnapshot,
   alias: PresetAlias,
+  requirement: PresetRequirement,
   fast: boolean,
 ): ResolvedPreset {
-  const requirement = presetRequirements[alias];
+  if (!isAdmittedPresetRequirement(alias, requirement)) {
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      `${alias} requested an unadmitted exact HRA model and reasoning tuple`,
+    );
+  }
   const candidates = snapshot.models.filter((model) => model.model === requirement.model);
   const model = candidates[0];
   if (

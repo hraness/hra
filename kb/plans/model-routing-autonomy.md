@@ -18,16 +18,16 @@ relations:
 
 ## Outcome
 
-Make Sol Ultra the authoritative default for every implicit new Codex session, then add a conservative and explainable routing framework that can be evaluated without changing live sessions. Later phases may admit additional model profiles, exact Work provisioning, notification timing, and bounded supervision only after their capability, privacy, recovery, and holdout gates pass.
+Make Astra Ultra the authoritative default for every implicit new Codex session, then add a conservative and explainable routing framework that can be evaluated without changing live sessions. Later phases may admit additional model profiles, exact Work provisioning, notification timing, and bounded supervision only after their capability, privacy, recovery, and holdout gates pass.
 
-The public benchmark survey selects candidates for local evaluation. It does not license a live routing rule. Astra is not available to the owner and is not part of any schema, route, or runtime in this plan.
+The public benchmark survey selects candidates for local evaluation. It does not license a live routing rule. Astra became available after the original plan: the exact pinned Codex 0.153.2 model catalog admits `gpt-6-astra` at `max` and `ultra`, and the owner directed the existing `high` and `ultra` aliases to use those exact profiles for new or explicitly changed sessions. That default amendment does not license Terra, automatic Fast, or live shadow routing.
 
 ## Constraints
 
-- Preserve the meanings of `low`, `high`, `ultra`, and `fable-max`. Persisted sessions and established conversations must not be reinterpreted or rerouted.
+- Preserve the durable identities of `low`, `high`, `ultra`, and `fable-max`. Existing sessions stay bound to their previously admitted exact model and effort; new or explicitly changed `high` and `ultra` selections resolve to Astra.
 - Routing is performance policy only. It never changes approval mode, sandboxing, permissions, account, project, execution device, or remote-action authority.
 - Unknown, ambiguous, open-ended, safety-relevant, network, MCP, authentication, release, migration, and cryptographic work stay on the strong admitted profile unless an exact declared Work effect class proves otherwise.
-- Never rotate accounts to evade limits, replay a failed turn on another model automatically, or change model, effort, provider, or service tier after a conversation has begun.
+- Never rotate accounts to evade limits, replay a failed turn on another model automatically, or automatically change model, effort, provider, or service tier after a conversation has begun. Explicit preset and provider changes remain available through their existing fenced commands.
 - Fable and any later Claude profile require explicit Claude selection. No automatic cross-provider data transfer is introduced.
 - Private task text, transcripts, paths, account labels, provider credentials, and model output never enter committed fixtures or content-free receipts. Evaluation reads only an explicit owner-provided input path.
 - Keep Work route matching exact. A relative rule such as "tier or above" has no stable meaning across provider families and would weaken an authority fence.
@@ -41,10 +41,10 @@ The public benchmark survey selects candidates for local evaluation. It does not
 
 | Phase | Outcome | Depends on | Write scope | Parallel with |
 | --- | --- | --- | --- | --- |
-| 1 | Sol Ultra default and truthful explicit controls | none | preset defaults, CLI parser, app model controls and focused tests | 2, 3 after contracts freeze |
+| 1 | Ultra default and truthful explicit controls | none | preset defaults, CLI parser, app model controls and focused tests | 2, 3 after contracts freeze |
 | 2 | Conservative lexical task-shape classifier in shadow mode | none | new domain classifier and content-free fixtures | 1, 3 |
 | 3 | Pure shadow routing decision and explicit-input evaluation analyzer | 1, 2 | new domain routing and scripts | none until Phase 2 exports freeze |
-| 4 | Canonical provider profile identity and admitted candidate profiles | 3 plus live capability evidence | preset/runtime contracts, state and Work migrations, provider matrices | none |
+| 4 | Canonical provider profile identity and admitted candidate profiles; Astra compatibility slice done | 3 plus live capability evidence | preset/runtime contracts, state and Work migrations, provider matrices | none |
 | 5 | Exact task-owned Work session lifecycle | 4 | Work domain, store, daemon effects, recovery and protocol docs | none |
 | 6 | Evidence-gated routing and Fast activation | private holdout plus 4 and 5 | routing integration, runtime receipts, settings and UI | none |
 | 7 | Notification-only working hours | 3 | daemon settings, projection, command unions and app settings | 8 after contract freeze |
@@ -52,14 +52,14 @@ The public benchmark survey selects candidates for local evaluation. It does not
 | 9 | Hostile inbound email decisions | 8 plus accepted authority design | Convex webhook and lifecycle, reply capability, daemon command path | none |
 | 10 | Event-driven bounded supervisor | 5, 6, 8 plus dogfood evidence | supervisor domain, effects, limits, evidence and UI | none |
 
-## Phase 1: Sol Ultra default and truthful explicit controls
+## Phase 1: Ultra default and truthful explicit controls
 
 - **Status:** Done
 - **Depends on:** none
 - **Objective:** Every implicit new Codex session starts with `ultra`, while explicit presets and established sessions remain unchanged. The app names existing presets accurately and exposes Fast only as an explicit manual turn-boundary control.
 - **Scope:** `src/domain/presets.ts`, `src/domain/presets.test.ts`, `src/cli/parser.ts`, `src/cli/parser.test.ts`, `app/src/model/settings-commands.ts`, its test, and the session model menu.
 - **Out of scope:** automatic task routing, a new preset, provider switching, Fast automation, storage changes, account selection, and any approval change.
-- **Approach:** Define one provider-default function in the domain. Use it in CLI parsing. Keep the already-Ultra daemon and browser defaults aligned. Correct the misleading Low and High labels to Luna Max and Sol Max. Send the existing closed `set_fast` command from a manual app control without inferring the current daemon value.
+- **Approach:** Define one provider-default function in the domain. Use it in CLI parsing. Keep the already-Ultra daemon and browser defaults aligned. Name the then-current new-session choices Luna Max, Sol Max, and Sol Ultra. Send the existing closed `set_fast` command from a manual app control without inferring the current daemon value.
 - **Acceptance criteria:**
   - An implicit Codex CLI start parses as `ultra`; explicit `high` still parses as `high`.
   - An implicit Claude CLI start remains `fable-max`.
@@ -68,6 +68,17 @@ The public benchmark survey selects candidates for local evaluation. It does not
   - The app labels the current four aliases by their actual model and effort.
   - Fast remains false unless the operator explicitly changes it.
 - **Validation:** `bun test src/domain/presets.test.ts src/cli/parser.test.ts app/src/model/settings-commands.test.ts`; `bun run build:app` after the app edit.
+
+### Astra baseline amendment (2026-09-05)
+
+- **Status:** Done as the Astra compatibility slice of Phase 4; future candidate-profile admission remains open.
+- **Depends on:** Phase 3 and exact pinned-runtime capability evidence for Astra.
+- **Objective:** Make Astra the current exact implementation of `high` and the default `ultra` without silently reinterpreting any established Sol session or its Work authority.
+- **Scope:** Frozen preset requirements, runtime-profile admission, state schema v38, Work contract fencing, daemon review requirements, routing-evaluation schema versioning, UI and CLI labels, and public compatibility copy.
+- **Out of scope:** Terra or Opus admission, automatic routing, automatic Fast, global attention delivery, and notification canary activation.
+- **Approach:** Treat `(preset, preset_contract)` as the durable alias identity. Contract 1 freezes the historical Sol mapping and contract 2 freezes the Astra mapping. Pre-v38 and provider-imported sessions use contract 1; new HRA sessions and explicit preset selections use contract 2. Thread the resulting exact model and effort through every review, queue, provider-switch, recovery, and Work-authority check. Preserve exact routing-evaluation schema 1 for Sol and add schema 2 for Astra.
+- **Acceptance criteria:** Established Sol effects remain readable and replayable; new and explicitly selected `high` and `ultra` resolve only to Astra; mixed contract tuples fail closed; Work claims, active attempts, settlement, and sweep cannot cross a meaningful route change; the exact-equivalent Codex `low` tuple may cross versions; historical evaluation evidence is never relabelled.
+- **Validation:** Focused domain, protocol, adapter, service, state-migration, Work, routing-evaluation, app, CLI, and site tests followed by the exact-tree repository gate. Exact results are recorded in the implementation log.
 
 ## Phase 2: Conservative lexical task-shape classifier
 
@@ -91,7 +102,7 @@ The public benchmark survey selects candidates for local evaluation. It does not
 - **Objective:** Produce an explainable effective route plus any disabled candidate, and analyze an explicit private experiment export without discovering or emitting private content.
 - **Scope:** New `src/domain/model-routing.ts`, focused tests, `scripts/routing-eval.ts`, script tests, and model-routing documentation.
 - **Out of scope:** mutating a session, admitting Terra or Opus, running provider tasks, reading session histories, dollar-cost claims, and enabling Fast automatically.
-- **Approach:** Keep established sessions unchanged. New Codex sessions resolve to Sol Ultra and new explicitly Claude sessions to Fable Max. A well-defined Codex task may name Terra Ultra only as a disabled candidate until both capability and private non-inferiority gates pass. A well-defined Claude task may name Opus only as unsupported until an exact reviewed runtime exists. Fast remains off. Analyze paired result records with predeclared margins and publish only counts, rates, intervals, and content-free hashes.
+- **Approach:** Keep established sessions unchanged. New Codex sessions resolve to Astra Ultra and new explicitly Claude sessions to Fable Max. A well-defined Codex task may name Terra Ultra only as a disabled candidate until both capability and private non-inferiority gates pass. A well-defined Claude task may name Opus only as unsupported until an exact reviewed runtime exists. Fast remains off. Analyze paired result records with predeclared margins and publish only counts, rates, intervals, and content-free hashes.
 - **Acceptance criteria:**
   - Every decision identifies effective provider, preset, Fast state, rule id, and one-line reason.
   - Shadow candidates never inhabit the effective preset field.
@@ -102,12 +113,12 @@ The public benchmark survey selects candidates for local evaluation. It does not
 
 ## Phase 4: Canonical profile identity and candidate admission
 
-- **Status:** Not started
+- **Status:** In progress. The Astra compatibility slice above is done; generalized candidate-profile admission is not started.
 - **Depends on:** Phase 3 and exact live capability evidence
-- **Objective:** Represent more than one model and effort per provider without reusing or reinterpreting a legacy tier.
+- **Objective:** Generalize beyond the frozen Sol and Astra alias contracts to represent additional models and efforts without reusing or reinterpreting a legacy tier.
 - **Scope:** Provider/profile schemas, reviewed runtime profiles, state schema version migration, Work table migration, cloud compatibility, provider pin and protocol matrices, and tests from populated older databases.
 - **Out of scope:** automatic routing and relative Work routes.
-- **Approach:** Introduce a versioned canonical profile identity while retaining a dual-read compatibility window. Preserve legacy aliases exactly. Rebuild affected SQLite tables only inside a transactional migration. Admit `terra-ultra` or an Opus alias only after the pinned runtime and account generation report the exact model and effort, and after reviewed protocol fixtures exist.
+- **Approach:** The completed Astra slice establishes a narrow versioned identity for existing aliases and a dual-read compatibility window. Before any new candidate alias is added, finish the generalized canonical profile design, preserve both frozen contracts exactly, and rebuild any additionally affected SQLite tables only inside a transactional migration. Admit `terra-ultra` or an Opus alias only after the pinned runtime and account generation report the exact model and effort, and after reviewed protocol fixtures exist.
 - **Acceptance criteria:**
   - Every supported older schema upgrades without data loss and a failed migration rolls back atomically.
   - Legacy Codex and Claude sessions reassemble to the same alias, model, and effort as before.
@@ -140,7 +151,7 @@ The public benchmark survey selects candidates for local evaluation. It does not
 - **Approach:** Use paired randomized runs on exact repository trees, declared effect classes, and equal tool and permission conditions. Primary outcome is completion without human repair under a predeclared non-inferiority margin. Track provider-native usage separately. Fast requires its own measured latency and cost gate. Unlicensed candidates remain visible as shadow-disabled.
 - **Acceptance criteria:**
   - Each enabled rule cites an immutable content-free evaluation receipt and capability proof.
-  - Disabling a rule restores Sol Ultra without changing any established session.
+  - Disabling a rule restores Astra Ultra without changing any established session.
   - Automatic changes occur only before a provider thread exists.
   - Routing never changes authority or sends content to another provider family without explicit selection.
 - **Validation:** decision-table and property tests, exact-tree paired holdout receipts, live cold-start acceptance, rollback, kill-switch, and established-session invariance tests.
@@ -225,7 +236,7 @@ The public benchmark survey selects candidates for local evaluation. It does not
 
 - **Status:** Not started
 - **Depends on:** Phases 5, 6, and 8 plus dogfood evidence
-- **Objective:** Run a stateless bounded supervisor only for named stalled or batched-attention events, using Sol Ultra and exact Work capabilities.
+- **Objective:** Run a stateless bounded supervisor only for named stalled or batched-attention events, using Astra Ultra and exact Work capabilities.
 - **Scope:** Closed trigger union, deduplication, cooldowns, budgets, prepared effects, evidence, kill switch, and visibility.
 - **Out of scope:** an always-on manager conversation, idle polling, approval resolution, account rotation, provider fallback, or scope expansion.
 - **Approach:** Bind each run to a source id and revision, cancel on newer progress, distinguish active provider work from a stall, prohibit recursion, and require monotonic progress. The supervisor may advise or dispatch only inside an explicit Work route and capability.
@@ -238,13 +249,14 @@ The public benchmark survey selects candidates for local evaluation. It does not
 
 ## Open questions and evidence gates
 
-- **Canonical profile migration design, resolver: Phase 4 integration owner.** Choose a durable identity after inventorying every current reader, writer, trigger, projection, and downgrade path. Reusing a tier is forbidden.
+- **Astra alias migration: resolved 2026-09-05.** `(preset, preset_contract)` is the durable identity for the frozen Sol and Astra mappings; state and Work own the binding and exact requirements cross every runtime boundary.
+- **Future canonical candidate identity, resolver: Phase 4 integration owner.** Generalize beyond those two frozen contracts only after inventorying every current reader, writer, trigger, projection, and downgrade path. Reusing a tier is forbidden.
 - **Terra Ultra support, resolver: provider capability evidence.** The exact pinned Codex runtime and account generation must admit the model and effort before a preset exists.
 - **Terra routing, resolver: private holdout.** Require preregistered non-inferiority evidence; a public benchmark or forty arbitrary tasks is insufficient.
 - **Opus model and effort, resolver: Claude runtime review plus private holdout.** Current pinned evidence covers one Fable profile only.
 - **Rich email content, resolver: owner privacy decision.** It conflicts with the current encrypted hosted boundary and is not presumed acceptable.
 - **Email reply authority, resolver: security review.** The accepted design must preserve device, auth epoch, execution custodian, revision, deadline, and live-verification properties.
-- **Astra, resolver: owner availability plus future evaluation.** It remains absent until the owner has access and asks to evaluate it.
+- **Astra availability: resolved 2026-09-05.** The owner has access, the pinned runtime reports the exact model and efforts, and Astra is the admitted Codex baseline; this supplies no evidence for Terra routing or automatic Fast.
 
 ## Delivery policy
 
@@ -252,6 +264,7 @@ Each phase receives focused implementation and independent review before its sta
 
 ## Implementation log
 
+- 2026-09-05, Astra baseline amendment: Versioned the durable preset alias contract instead of silently relabelling established sessions. Contract 1 preserves exact Sol Max and Sol Ultra identities for pre-v38 and imported state; contract 2 binds new and explicitly reselected High and Ultra sessions to Astra Max and Astra Ultra. Exact model, effort, provider, and contract authority now cross review, queue, provider-switch, recovery, and Work boundaries; mixed tuples, provider collisions, recovery-time reselection, and switch seeds that disagree with immutable evidence fail closed. Routing-evaluation schema 1 remains exact Sol while schema 2 records Astra, and public CLI, app, site, onboarding, and compatibility copy now match the versioned behavior. Adversarial review found and closed three defects in recovery immutability, Work provider/contract fencing, and historical provider-switch evidence; two independent final reviews found no remaining P0-P2 issue. Focused evidence: routing evaluation 25 tests/90 assertions; Work store 44/778; site content 34/987; v38 and newer-schema CLI migration groups 3/16 and 2/10; cross-layer contract suite 16/256; recovery 2/10; exact switch history 3/31; the six-file regression produced 468 passing behavior tests and exposed one stale test double, whose repaired exact adapter regression passed 1/41. TypeScript, scoped lint, generated-site, and diff checks passed. This amendment admits no Terra or automatic Fast behavior, starts no Phase 8C work, and leaves global attention delivery and its canary disabled.
 - 2026-09-05, Phase 8B design gate: Replaced the inherited per-session enqueue sketch with one bounded, complete machine reconciliation protocol after an adversarial repository-wide impact survey. A second attack review removed an impossible instantaneous-offline-revocation guarantee and a sessionless-interaction deadlock: hosted consent now has a two-minute server-clock lease with explicit pending-revocation status, and only session-linked interactions participate without poisoning snapshot completeness. A final review required live revalidation of every stored execution-lease tuple, changed unknown provider outcomes from false refusal to same-key retry then ambiguity, made idempotency-key and body divergence immediately ambiguous, and shortened retry authority to 23 hours so transport cannot cross Resend's 24-hour key lifetime. The frozen protocol also defines hosted commit-order cancellation, fail-closed overflow, one-row-per-interaction digest groups, immutable same-key retries, separate local and global policy generations, recipient-digest continuity, deletion and revocation races, CLI-only consent authority, DST transition semantics, and exact operational caps and timers. No delivery is enabled by this design gate; implementation and inactive deployment evidence remain required.
 - 2026-09-05, Phase 8A: Replaced the former per-client approval heuristics with one browser-safe, versioned `decline | answer` policy shared by compact projection and live daemon verification. Every grant, cancel, session scope, free-text or Other response, and MCP answer stays local; remote answers require a complete closed-choice user-question set plus an own, exact provider-losslessness marker, and both provider compilers independently validate the submitted translation. Compact detail v2 fails closed across old and unknown policy revisions, the app derives controls only from parser-validated policy, and foreign JSON is copied through bounded accessor-free snapshots before authority-bearing reads. Adversarial review found and closed cross-kind reason smuggling, prototype-inherited losslessness and optional-field authority, duplicate literal provider questions, stateful draft accessors, unsafe legacy answer shapes, retry ambiguity, and aggregate envelope-limit gaps. Exact focused evidence: 155 tests passed with 1,542 assertions; repository TypeScript, production app build, generated-site parity, public-tree policy, focused final-tree ESLint, and diff checks passed. Two independent reviews found no remaining P1/P2 defect. This slice enables no email delivery, changes no notification consent, and does not widen any local approval category.
 - 2026-09-05, Phase 7: Added a strict versioned per-machine notification-hours policy with one-time 10:00 through 22:00 machine-zone initialization, inclusive-start and exclusive-end evaluation, overnight and DST handling, optimistic local revisions, guarded append-only SQLite migration, local CLI status and set commands, a machine-only device command, and a separately encrypted additive registry envelope. The app distinguishes an older daemon from an unreadable projection, retains active-device authority, prevents duplicate or stale form submissions, and states explicitly that notification delivery is not active and that approvals and autonomy do not read the schedule. Adversarial review closed malformed clock normalization, heartbeat draft clobbering, duplicate enqueue, stale-device enablement, misleading success and capability copy, projection corruption ambiguity, and revision-exhaustion result gaps. Focused evidence: 144 domain and storage tests passed; 100 parser and renderer tests passed; the full daemon service suite passed; 181 cloud payload, policy, adapter, and bridge tests passed; 7 Convex registry tests passed; 39 app registry and model tests passed with 108 expectations; app build, typecheck, scoped ESLint, and diff checks passed. Independent cloud, UI, storage, CLI, and integration reviews found no remaining P1/P2 defect. The policy still relies on the host ICU timezone database for future wall-clock interpretation, and no notification delivery path consumes it in this phase.

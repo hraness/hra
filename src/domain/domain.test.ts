@@ -15,8 +15,8 @@ describe("domain laws", () => {
   test("owns one exact reduced preset mapping", () => {
     expect(presetRequirements).toEqual({
       low: { model: "gpt-5.6-luna", effort: "max" },
-      high: { model: "gpt-5.6-sol", effort: "max" },
-      ultra: { model: "gpt-5.6-sol", effort: "ultra" },
+      high: { model: "gpt-6-astra", effort: "max" },
+      ultra: { model: "gpt-6-astra", effort: "ultra" },
       "fable-max": { model: "claude-fable-5-1", effort: "max" },
     });
   });

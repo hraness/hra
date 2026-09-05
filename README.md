@@ -24,7 +24,7 @@ Codex on macOS and Linux · Claude Code on Linux · local v0.6.0 release-ready �
 
 ### One request, one account, one session.
 
-1. **Start:** `hra session start personal --provider codex --preset high --json`. Create a Codex session under the account profile you name.
+1. **Start:** `hra session start personal --provider codex --json`. Create an Astra Ultra Codex session under the account profile you name.
 2. **Inspect:** `hra session status <session-id> --json`. Read the session and the cursor where its event stream continues.
 3. **Switch:** `hra session switch <session-id> --provider claude --preset fable-max`. Move the next turns to your signed-in Claude Code profile. The HRA conversation stays intact.
 4. **Direct:** `hra session send <session-id> -- "Review this project."`. Send the next request to that session and provider.
@@ -118,7 +118,7 @@ Complete initialization and the first provider login before this walkthrough. Ac
 Create an idle session, open the persistent shell, select the account and exact returned session ID, then type a request as an ordinary line. HRA sends that line to the selected session and shows safe live updates. `/exit` leaves the daemon running.
 
 ```text
-hra session start personal --provider codex --preset high
+hra session start personal --provider codex
 hra
 /account personal
 /session <session-id>
@@ -130,7 +130,7 @@ Review this project and summarize its current state.
 Read `data.session.id` from the start response. Before sending, call status and read `data.eventStream.cursor` from its version-2 result. Start watch from that exact cursor so the atomic local snapshot and subsequent event stream are contiguous. Keep watch as a long-running subprocess, consume its two output streams independently, and use the exact ID instead of a mutable title in automation.
 
 ```text
-hra session start personal --provider codex --preset high --json
+hra session start personal --provider codex --json
 hra session status <session-id> --json
 hra session send <session-id> -- "Review this project and summarize its current state."
 hra session watch <session-id> --cursor <status-cursor> --jsonl
@@ -315,10 +315,12 @@ For non-streaming `--json` commands, stdout contains exactly one versioned succe
 HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; `hra session show` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Each provider remains authoritative for its native permissions, tools, and hidden runtime state.
 
 - `low`: Codex Luna Max, currently `gpt-5.6-luna` with `max` reasoning.
-- `high`: Codex Sol Max, currently `gpt-5.6-sol` with `max` reasoning.
-- `ultra`: Codex Sol Ultra, currently `gpt-5.6-sol` with `ultra` reasoning.
+- `high`: Codex Astra Max, currently `gpt-6-astra` with `max` reasoning.
+- `ultra`: Codex Astra Ultra, currently `gpt-6-astra` with `ultra` reasoning.
 - `fable-max`: Claude Code Fable, currently `claude-fable-5-1` with `max` reasoning.
 - `fast on|off`: a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.
+
+New HRA-created Codex sessions and every explicit preset selection use the current mapping above. Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping for `high` and `ultra` until a preset is explicitly selected; metadata edits, restart recovery, and queued work do not reinterpret an established session.
 
 `hra init` reports the required confirmation without changing local state; `hra init --yes` creates your Documents directory when it is absent, verifies that it is a readable, writable, and traversable canonical directory, and accepts it as the default project. Initialization is a one-shot maintenance command: run it before opening the persistent shell. The shell rejects `/init` because its running daemon already owns local state. Codex turns use Codex's `auto_review` path, the exact advertised `:workspace` permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox, network policy, computer use, plugins, and protected turn inspection. Claude Code runs in its default interactive permission mode under the selected project and maps supported tool-use requests into HRA interactions; it does not expose Codex's permission-profile, app, plugin, or protected turn-inspection surfaces.
 
@@ -427,6 +429,10 @@ hra doctor [--offline] [--json]
 hra auth login --input-stdin|--input-fd <fd>
 hra auth status|logout
 hra auth delete --acknowledge-erasure
+hra notification-hours status [--json]
+hra notification-hours set --start <HH:MM> --end <HH:MM> --timezone <IANA-zone> --revision <n> [--json]
+hra notification-email status [--json]
+hra notification-email enable|disable --revision <n> [--json]
 hra device list
 hra device pair
 hra device key-loss --acknowledge-no-key-holders
@@ -493,7 +499,7 @@ hra remote show <cloud-session>
 hra remote command <uuidv7>
 hra remote send|queue|steer <cloud-session> <message>
 hra remote send --or-steer <cloud-session> <message>
-hra remote resolve <cloud-session> --interaction <interaction-id> --revision <n> --decision <decline>
+hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>
 hra remote stop <cloud-session>
 hra remote preset <cloud-session> <low|high|ultra|fable-max>
 hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]

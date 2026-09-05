@@ -65,12 +65,17 @@ import {
 } from "../domain/observation";
 import {
   assertPresetSupportedByProvider,
+  currentPresetContract,
+  legacyPresetContract,
   presetForProviderTier,
+  presetContractSchema,
+  presetRequirementForContract,
   presetSchema,
   presetTiers,
   presetTierSchema,
   providerSchema,
   type Preset,
+  type PresetRequirement,
   type Provider,
 } from "../domain/presets";
 import {
@@ -249,6 +254,7 @@ const sessionRowSchema = z.object({
   // Stored as the provider-neutral tier: the column's SQLite CHECK predates
   // multi-provider presets, so `provider` plus this tier names the preset.
   preset: presetTierSchema,
+  preset_contract: presetContractSchema,
   fast_enabled: z.union([z.literal(0), z.literal(1)]),
   state: sessionStateSchema,
   active_turn_id: z.string().nullable(),
@@ -872,7 +878,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 37;
+const currentSchemaVersion = 38;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -1058,6 +1064,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   note TEXT NOT NULL DEFAULT '' CHECK(length(CAST(note AS BLOB)) <= 16384),
   provider TEXT NOT NULL DEFAULT 'codex' CHECK(provider IN ('codex','claude')),
   preset TEXT NOT NULL CHECK(preset IN ('low','high','ultra')),
+  preset_contract INTEGER NOT NULL DEFAULT ${legacyPresetContract} CHECK(preset_contract IN (1,2)),
   fast_enabled INTEGER NOT NULL CHECK(fast_enabled IN (0,1)),
   state TEXT NOT NULL CHECK(state IN ('starting','active','idle','terminal','recovery_required')),
   active_turn_id TEXT,
@@ -3227,6 +3234,56 @@ const applySchemaVersion37AttentionEmailPolicy = (
   assertCompositeNotificationPolicy(database);
 };
 
+// Preset aliases are durable user intent, but their exact model mapping has
+// changed once. Existing and provider-imported rows retain the legacy mapping;
+// HRA-created or explicitly reselected rows are stamped current at their write
+// boundary. `works` is installed by WorkStore in the same database and carries
+// the same contract so a claim cannot reinterpret its route mid-flight.
+const schemaVersion38SessionPresetContractColumn =
+  `ALTER TABLE sessions ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT ${legacyPresetContract} `
+  + `CHECK(preset_contract IN (${legacyPresetContract},${currentPresetContract}))`;
+const schemaVersion38WorkPresetContractColumn =
+  `ALTER TABLE works ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT ${legacyPresetContract} `
+  + `CHECK(preset_contract IN (${legacyPresetContract},${currentPresetContract}))`;
+
+const applySchemaVersion38PresetContracts = (database: Database): void => {
+  if (!hasTableColumn(database, "sessions", "preset_contract")) {
+    database.exec(schemaVersion38SessionPresetContractColumn);
+  }
+  const workTableExists = database.query(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'",
+  ).get() !== null;
+  if (workTableExists && !hasTableColumn(database, "works", "preset_contract")) {
+    database.exec(schemaVersion38WorkPresetContractColumn);
+  }
+};
+
+const assertSchemaVersion38PresetContracts = (database: Database): void => {
+  if (!hasTableColumn(database, "sessions", "preset_contract")) {
+    throw new Error("STATE_SCHEMA_V38_SESSION_PRESET_CONTRACT_MISSING");
+  }
+  if (database.query(
+    `SELECT 1 FROM sessions
+     WHERE preset_contract IS NULL OR preset_contract NOT IN (${legacyPresetContract},${currentPresetContract})
+     LIMIT 1`,
+  ).get() !== null) {
+    throw new Error("STATE_SCHEMA_V38_SESSION_PRESET_CONTRACT_INVALID");
+  }
+  const workTableExists = database.query(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'",
+  ).get() !== null;
+  if (workTableExists && !hasTableColumn(database, "works", "preset_contract")) {
+    throw new Error("STATE_SCHEMA_V38_WORK_PRESET_CONTRACT_MISSING");
+  }
+  if (workTableExists && database.query(
+    `SELECT 1 FROM works
+     WHERE preset_contract IS NULL OR preset_contract NOT IN (${legacyPresetContract},${currentPresetContract})
+     LIMIT 1`,
+  ).get() !== null) {
+    throw new Error("STATE_SCHEMA_V38_WORK_PRESET_CONTRACT_INVALID");
+  }
+};
+
 const assertSchemaVersion24Objects = (database: Database): void => {
   const names = schemaVersion24Objects.map((object) => `'${object.name}'`).join(",");
   const rows = database.query(
@@ -4096,6 +4153,12 @@ const migrateWritableDatabase = (
     // that validation; v32 remains the migration that stamps the column.
     if (version < 32) applySchemaVersion32(database);
 
+    // Current WorkStore guards name both preset-contract columns. Install the
+    // additive v38 authority before any older migration replays the current
+    // work schema; the ordered v38 block below remains the ledger/version
+    // stamp.
+    applySchemaVersion38PresetContracts(database);
+
     if (version < 2) {
       // Early development builds accidentally stamped this column as schema v1.
       // Accept those databases without weakening the canonical append-only v1→v2 path.
@@ -4528,6 +4591,16 @@ const migrateWritableDatabase = (
       version = 37;
     }
 
+    if (version < 38) {
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      applySchemaVersion38PresetContracts(database);
+      database.query(
+        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(38, migratedAt);
+      database.exec("PRAGMA user_version = 38");
+      version = 38;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -4555,8 +4628,10 @@ const migrateWritableDatabase = (
     rebuildSchemaVersion24(database);
     assertSchemaVersion24Objects(database);
     ensureSessionEventProjectionVersion(database);
+    applySchemaVersion38PresetContracts(database);
     database.exec(WORK_SCHEMA_SQL);
     assertWorkSchema(database);
+    assertSchemaVersion38PresetContracts(database);
     database.exec(schemaVersion27);
     ensureUsagePollFailureAccountFingerprint(database);
     database.exec(schemaVersion28);
@@ -4627,6 +4702,34 @@ const mapSession = (row: unknown): SessionRecord => {
     createdAt: parsed.created_at,
     updatedAt: parsed.updated_at,
   };
+};
+
+const assertRuntimeProfileRequirement = (
+  profile: ReviewedRuntimeProfile,
+  preset: Preset,
+  requirement: PresetRequirement,
+  code: string,
+): void => {
+  if (
+    profile.preset !== preset
+    || profile.model !== requirement.model
+    || profile.reasoningEffort !== requirement.effort
+  ) throw new Error(code);
+};
+
+const presetContractForRuntimeProfile = (
+  profile: ReviewedRuntimeProfile,
+  preset: Preset,
+): z.infer<typeof presetContractSchema> => {
+  const current = presetRequirementForContract(preset, currentPresetContract);
+  if (profile.model === current.model && profile.reasoningEffort === current.effort) {
+    return currentPresetContract;
+  }
+  const legacy = presetRequirementForContract(preset, legacyPresetContract);
+  if (profile.model === legacy.model && profile.reasoningEffort === legacy.effort) {
+    return legacyPresetContract;
+  }
+  throw new Error("SESSION_RUNTIME_PROFILE_PRESET_CONTRACT_UNADMITTED");
 };
 
 const sessionEventStreamRowSchema = z.object({
@@ -4979,6 +5082,7 @@ export class StateStore {
       }
       assertSchemaVersion24Objects(this.#database);
       assertSchemaVersion35Objects(this.#database);
+      assertSchemaVersion38PresetContracts(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -5881,7 +5985,7 @@ export class StateStore {
     const preset = presetSchema.parse(input.preset);
     assertPresetSupportedByProvider(provider, preset);
     const create = this.#database.transaction(() => {
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, provider, presetTiers[preset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, provider, presetTiers[preset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(id, now);
     });
     create.immediate();
@@ -6220,6 +6324,44 @@ export class StateStore {
     throw new SelectionError("AMBIGUOUS", rows.map((session) => ({ id: session.id, label: session.title })));
   }
 
+  #requireSessionPresetBinding(sessionId: SessionId): Readonly<{
+    contract: z.infer<typeof presetContractSchema>;
+    preset: Preset;
+    requirement: PresetRequirement;
+  }> {
+    const parsed = sessionRowSchema.parse(
+      this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionIdSchema.parse(sessionId)),
+    );
+    const preset = presetForProviderTier(parsed.provider, parsed.preset);
+    return {
+      contract: parsed.preset_contract,
+      preset,
+      requirement: presetRequirementForContract(preset, parsed.preset_contract),
+    };
+  }
+
+  /** Exact route for execution; the durable contract itself remains internal. */
+  requireSessionPresetRequirement(sessionId: SessionId): Readonly<{
+    preset: Preset;
+    requirement: PresetRequirement;
+  }> {
+    const binding = this.#requireSessionPresetBinding(sessionId);
+    return { preset: binding.preset, requirement: binding.requirement };
+  }
+
+  #assertSessionRuntimeProfileContract(
+    sessionId: SessionId,
+    profile: ReviewedRuntimeProfile,
+  ): void {
+    const binding = this.#requireSessionPresetBinding(sessionId);
+    assertRuntimeProfileRequirement(
+      profile,
+      binding.preset,
+      binding.requirement,
+      "SESSION_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
+    );
+  }
+
   findSessionByProviderThread(profileId: ProfileId, providerThreadId: string): SessionRecord | null {
     const row = this.#database.query("SELECT * FROM sessions WHERE profile_id=? AND provider_thread_id=?").get(profileId, providerThreadId);
     return row === null ? null : mapSession(row);
@@ -6260,6 +6402,10 @@ export class StateStore {
       }
       return record;
     }
+    // Historical source replays remain valid after an explicit contract
+    // upgrade; only a genuinely new durable profile must match today's
+    // session-owned interpretation.
+    this.#assertSessionRuntimeProfileContract(input.sessionId, profile);
     const nextRow = z.object({ revision: z.number().int().nonnegative() }).strict().parse(
       this.#database.query(
         "SELECT COALESCE(MAX(revision),0) AS revision FROM session_runtime_profiles WHERE session_id=?",
@@ -6488,7 +6634,7 @@ export class StateStore {
     if (current === null) {
       const id = createSessionId();
       const create = this.#database.transaction(() => {
-        this.#database.query("INSERT INTO sessions(id,profile_id,project_id,provider_thread_id,title,preset,fast_enabled,state,active_turn_id,provider_updated_at,revision,created_at,updated_at) VALUES (?,?,?,?,?,'high',0,?,?,?,1,?,?)").run(id, input.profileId, input.projectId ?? null, input.providerThreadId, titleSchema.parse(input.title), input.state, input.activeTurnId ?? null, input.providerUpdatedAt ?? null, now, now);
+        this.#database.query("INSERT INTO sessions(id,profile_id,project_id,provider_thread_id,title,preset,preset_contract,fast_enabled,state,active_turn_id,provider_updated_at,revision,created_at,updated_at) VALUES (?,?,?,?,?,'high',?,0,?,?,?,1,?,?)").run(id, input.profileId, input.projectId ?? null, input.providerThreadId, titleSchema.parse(input.title), legacyPresetContract, input.state, input.activeTurnId ?? null, input.providerUpdatedAt ?? null, now, now);
         this.#insertSessionEventStream(id, now);
       });
       create.immediate();
@@ -7173,7 +7319,15 @@ export class StateStore {
 
   updateSessionMetadata(input: { sessionId: SessionId; expectedRevision: number; title?: string; note?: string; preset?: Preset; fastEnabled?: boolean; projectId?: ProjectId | null }): SessionRecord {
     const current = this.requireSession(input.sessionId);
+    const currentPresetBinding = this.#requireSessionPresetBinding(current.id);
     if (current.revision !== input.expectedRevision) throw new Error("Session metadata revision conflict.");
+    // An unsettled provider effect owns the exact runtime profile it reviewed.
+    // Keep that recovery evidence admissible by refusing any route
+    // reinterpretation until recovery has settled it or explicit abandonment
+    // has terminalized the session.
+    if (input.preset !== undefined && current.state === "recovery_required") {
+      throw new Error("SESSION_PRESET_RECOVERY_REQUIRED");
+    }
     const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
     const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
     const preset = input.preset === undefined ? current.preset : presetSchema.parse(input.preset);
@@ -7181,8 +7335,14 @@ export class StateStore {
     assertPresetSupportedByProvider(current.provider, preset);
     const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
     const project = input.projectId === undefined ? current.projectId ?? null : input.projectId;
+    // Naming the preset is an explicit opt-in to the current mapping, even
+    // when the alias itself did not change. Unrelated metadata preserves the
+    // durable interpretation admitted for this session.
+    const presetContract = input.preset === undefined
+      ? currentPresetBinding.contract
+      : currentPresetContract;
     const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], fast ? 1 : 0, project, now, current.id, current.revision);
+    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,preset_contract=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], presetContract, fast ? 1 : 0, project, now, current.id, current.revision);
     if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
     return this.requireSession(current.id);
   }
@@ -7231,6 +7391,7 @@ export class StateStore {
     if (runtimeProfile.profileId !== profileId) {
       throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_ACCOUNT_MISMATCH");
     }
+    const targetPresetContract = presetContractForRuntimeProfile(runtimeProfile, preset);
     const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
     const seedTurnId = providerThreadIdSchema.parse(input.seedTurnId);
     const now = this.#now();
@@ -7319,7 +7480,7 @@ export class StateStore {
       ) throw new Error("SESSION_PROVIDER_SWITCH_SEED_STATE_MISMATCH");
       const bound = this.#database.query(
         `UPDATE sessions
-         SET provider=?,profile_id=?,preset=?,provider_thread_id=?,state=?,active_turn_id=?,
+         SET provider=?,profile_id=?,preset=?,preset_contract=?,provider_thread_id=?,state=?,active_turn_id=?,
              provider_updated_at=?,revision=revision+1,updated_at=?
          WHERE id=? AND revision=? AND profile_id=? AND provider=?
            AND provider_thread_id=? AND state NOT IN ('recovery_required','terminal')`,
@@ -7327,6 +7488,7 @@ export class StateStore {
         provider,
         profileId,
         presetTiers[preset],
+        targetPresetContract,
         providerThreadId,
         input.state,
         input.activeTurnId ?? null,
@@ -7857,6 +8019,7 @@ export class StateStore {
         || evidence.runtimeProfile.profileId !== authority.profile_id
         || evidence.runtimeProfile.processGeneration !== generation
       ) throw new Error("QUEUE_EFFECT_AUTHORITY_CHANGED");
+      this.#assertSessionRuntimeProfileContract(sessionId, evidence.runtimeProfile);
       this.#database.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?)").run(queueId, canonical, digest, now);
       const changed = this.#database.query("UPDATE queue_entries SET state='dispatching',updated_at=? WHERE id=? AND state='pending'").run(now, queueId);
       if (changed.changes !== 1) throw new Error("QUEUE_EFFECT_AUTHORITY_CHANGED");
@@ -8480,6 +8643,9 @@ export class StateStore {
         || authority.session_state === "recovery_required"
         || authority.session_state === "terminal"
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      if (evidence.kind === "session.send" && evidence.runtimeProfile !== undefined) {
+        this.#assertSessionRuntimeProfileContract(parsedSessionId, evidence.runtimeProfile);
+      }
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
       if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
@@ -8527,6 +8693,14 @@ export class StateStore {
     assertPresetSupportedByProvider(parsedProvider, parsedPreset);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
     if (evidence.projectId !== parsedProjectId) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
+    if (evidence.runtimeProfile !== undefined) {
+      assertRuntimeProfileRequirement(
+        evidence.runtimeProfile,
+        parsedPreset,
+        presetRequirementForContract(parsedPreset, currentPresetContract),
+        "MUTATION_EFFECT_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
+      );
+    }
     if (evidence.runtimeProfile !== undefined && (
       evidence.runtimeProfile.profileId !== parsedProfileId
       || evidence.runtimeProfile.processGeneration !== parsedGeneration
@@ -8554,7 +8728,7 @@ export class StateStore {
         || authority.profile_state === "removed"
         || (parsedProvider === "codex" && authority.profile_state !== "signed_in")
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedProvider, presetTiers[parsedPreset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedProvider, presetTiers[parsedPreset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
       this.#database.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,?)").run(parsedAttemptId, sessionId, now);
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
@@ -8588,6 +8762,12 @@ export class StateStore {
       || evidence.runtimeProfile.processGeneration !== evidence.targetProcessGeneration
       || evidence.runtimeProfile.preset !== evidence.targetPreset
     ) throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_MISMATCH");
+    assertRuntimeProfileRequirement(
+      evidence.runtimeProfile,
+      evidence.targetPreset,
+      presetRequirementForContract(evidence.targetPreset, currentPresetContract),
+      "SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
+    );
     if (
       providerAuthentication !== undefined
       && (
@@ -8750,6 +8930,8 @@ export class StateStore {
         || runtimeProfile.profileId !== evidence.targetProfileId
         || runtimeProfile.processGeneration !== evidence.targetProcessGeneration
         || runtimeProfile.preset !== evidence.targetPreset
+        || runtimeProfile.model !== evidence.runtimeProfile.model
+        || runtimeProfile.reasoningEffort !== evidence.runtimeProfile.reasoningEffort
         || !this.isSessionMutationProviderAuthorityCurrent({
           attemptId,
           profileId: evidence.targetProfileId,
@@ -9145,6 +9327,10 @@ export class StateStore {
       ) {
         throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_MISMATCH");
       }
+      const targetPresetContract = presetContractForRuntimeProfile(
+        evidence.runtimeProfile,
+        evidence.targetPreset,
+      );
       const current = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionId));
       const sourceBinding = current.profileId === evidence.sourceProfileId
         && current.provider === evidence.sourceProvider
@@ -9175,7 +9361,7 @@ export class StateStore {
       }
       const changed = this.#database.query(
         `UPDATE sessions
-         SET provider=?,profile_id=?,preset=?,provider_thread_id=?,title=?,
+         SET provider=?,profile_id=?,preset=?,preset_contract=?,provider_thread_id=?,title=?,
              state='recovery_required',active_turn_id=NULL,provider_updated_at=?,
              revision=revision+1,updated_at=?
          WHERE id=? AND revision=? AND state!='terminal'`,
@@ -9183,6 +9369,7 @@ export class StateStore {
         evidence.targetProvider,
         evidence.targetProfileId,
         presetTiers[evidence.targetPreset],
+        targetPresetContract,
         authority.target_provider_thread_id,
         titleSchema.parse(input.title),
         input.providerUpdatedAt ?? null,

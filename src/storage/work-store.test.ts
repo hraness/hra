@@ -99,6 +99,7 @@ CREATE TABLE sessions(
   project_id TEXT NOT NULL REFERENCES projects(id),
   provider TEXT NOT NULL DEFAULT 'codex',
   preset TEXT NOT NULL,
+  preset_contract INTEGER NOT NULL DEFAULT 2 CHECK(preset_contract IN (1,2)),
   fast_enabled INTEGER NOT NULL,
   state TEXT NOT NULL
 ) STRICT;
@@ -119,7 +120,9 @@ CREATE TABLE mutation_attempts(
   authority_generation INTEGER NOT NULL,
   request_digest TEXT NOT NULL,
   state TEXT NOT NULL,
-  result_json TEXT
+  result_json TEXT,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 CREATE TABLE mutation_effect_evidence(
   attempt_id TEXT PRIMARY KEY,
@@ -455,6 +458,9 @@ describe("WorkStore schema and atomic plans", () => {
   test("creates strict append-only state with a verified event hash chain", () => {
     const value = fixture();
     const created = createWork(value);
+    expect(value.database.query(
+      "SELECT preset_contract FROM works WHERE id=?",
+    ).get(created.work.id)).toEqual({ preset_contract: 2 });
     const page = value.store.events(created.work.id, 0, 20);
     expect(page.events.map((event) => event.body.type)).toEqual(["work.created"]);
     expect(page.events[0]?.sequence).toBe(1);
@@ -523,6 +529,25 @@ describe("WorkStore schema and atomic plans", () => {
     );
     expect(() => assertReadonlyWorkSchema(database)).toThrow(
       "WORK_SCHEMA_STALE:sessions.provider",
+    );
+  });
+
+  test("rejects current work guards against a pre-contract session schema", () => {
+    const database = new Database(":memory:", { strict: true });
+    databases.push(database);
+    database.exec("PRAGMA foreign_keys=ON;");
+    const legacyParentSchema = parentSchema.replace(
+      "  preset_contract INTEGER NOT NULL DEFAULT 2 CHECK(preset_contract IN (1,2)),\n",
+      "",
+    );
+    expect(legacyParentSchema).not.toBe(parentSchema);
+    database.exec(legacyParentSchema);
+    database.exec(WORK_SCHEMA_SQL);
+    expect(() => assertWorkSchema(database)).toThrow(
+      "WORK_SCHEMA_STALE:sessions.preset_contract",
+    );
+    expect(() => assertReadonlyWorkSchema(database)).toThrow(
+      "WORK_SCHEMA_STALE:sessions.preset_contract",
     );
   });
 
@@ -619,22 +644,57 @@ describe("WorkStore schema and atomic plans", () => {
 });
 
 describe("WorkStore claims, fences, and prepared effects", () => {
-  test("keeps established Claude work authoritative while the Codex profile is signed out", () => {
+  test("refuses a claim when the session and immutable work preset contracts differ", () => {
     const value = fixture();
-    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
-      .run(value.accountId);
-    value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
-      .run(value.accountId);
-
     const created = createWork(value);
-    join(value, created.work.id, created.work.revision, value.actorSessionId);
-    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+    value.database.query("UPDATE sessions SET preset_contract=1 WHERE id=?")
+      .run(value.actorSessionId);
+
+    expect(() => claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+
+    value.database.query("UPDATE sessions SET preset_contract=2 WHERE id=?")
+      .run(value.actorSessionId);
+    expect(claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    }).attempt.fence).toBe(1);
+    expect(() => value.database.query(
+      "UPDATE sessions SET preset_contract=1 WHERE id=?",
+    ).run(value.actorSessionId)).toThrow("WORK_SESSION_ATTEMPT_AUTHORITY");
+  });
+
+  test("treats the byte-identical low route as compatible across contracts", () => {
+    const value = fixture();
+    const created = createWork(value, [taskSpec(value, "low-contract", {
+      preset: "low",
+    })]);
+    value.database.query(
+      "UPDATE sessions SET preset='low',preset_contract=1 WHERE id=?",
+    ).run(value.actorSessionId);
+
+    value.database.query("UPDATE sessions SET provider='claude' WHERE id=?")
+      .run(value.actorSessionId);
+    expect(() => claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    value.database.query("UPDATE sessions SET provider='codex' WHERE id=?")
+      .run(value.actorSessionId);
+
     const claimed = claim(value, {
       workId: created.work.id,
       taskId: created.tasks[0]!.id,
       revision: created.tasks[0]!.revision,
     });
-    expect(claimed.attempt.accountGeneration).toBe(0);
+    expect(() => value.database.query(
+      "UPDATE sessions SET preset_contract=2 WHERE id=?",
+    ).run(value.actorSessionId)).not.toThrow();
 
     const dispatchKey = randomUUID();
     value.store.apply({
@@ -649,7 +709,28 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       targetSessionId: value.actorSessionId,
       mode: "send",
     });
-    expect(value.store.authorizePreparedEffect(dispatchKey)).toMatchObject({ executable: true });
+    expect(value.store.authorizePreparedEffect(dispatchKey)).toMatchObject({
+      executable: true,
+    });
+  });
+
+  test("refuses Claude task execution while keeping session-owned signals provider-neutral", () => {
+    const value = fixture();
+    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
+      .run(value.accountId);
+    value.database.query("UPDATE sessions SET provider='claude',preset='ultra' WHERE profile_id=?")
+      .run(value.accountId);
+
+    const created = createWork(value, [taskSpec(value, "claude-tier-collision", {
+      preset: "ultra",
+    })]);
+    join(value, created.work.id, created.work.revision, value.actorSessionId);
+    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+    expect(() => claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
 
     const signalKey = randomUUID();
     const signal = value.store.apply({
@@ -667,10 +748,8 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     expect(value.store.authorizePreparedEffect(signalKey)).toMatchObject({ executable: true });
   });
 
-  test("does not retire active Claude work for a Codex-only state transition", () => {
+  test("fences provider identity and rechecks it before Codex task dispatch", () => {
     const value = fixture();
-    value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
-      .run(value.accountId);
     const created = createWork(value);
     const claimed = claim(value, {
       workId: created.work.id,
@@ -678,12 +757,30 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       revision: created.tasks[0]!.revision,
     });
 
-    expect(value.store.prepareProfileAuthorityChange(value.accountId, 1, "codex")).toEqual([]);
-    expect(() => value.database.query("UPDATE profiles SET state='signed_out' WHERE id=?")
-      .run(value.accountId)).not.toThrow();
-    expect(value.store.snapshot(created.work.id).tasks[0]).toMatchObject({
-      activeAttemptId: claimed.attempt.id,
-      status: "claimed",
+    expect(() => value.database.query(
+      "UPDATE sessions SET provider='claude' WHERE id=?",
+    ).run(value.actorSessionId)).toThrow("WORK_SESSION_ATTEMPT_AUTHORITY");
+
+    const dispatchKey = randomUUID();
+    value.store.apply({
+      kind: "attempt.dispatch",
+      idempotencyKey: dispatchKey,
+      workId: created.work.id,
+      attemptId: claimed.attempt.id,
+      expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence,
+      actorSessionId: value.actorSessionId,
+      attemptCapability: capability,
+      targetSessionId: value.actorSessionId,
+      mode: "send",
+    });
+    value.database.exec("DROP TRIGGER work_session_attempt_authority_guard");
+    value.database.query("UPDATE sessions SET provider='claude' WHERE id=?")
+      .run(value.actorSessionId);
+    expect(value.store.authorizePreparedEffect(dispatchKey)).toMatchObject({
+      disposition: "settled",
+      executable: false,
+      status: { state: "failed" },
     });
   });
 

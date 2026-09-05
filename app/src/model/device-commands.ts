@@ -18,7 +18,7 @@ import type { MachineView } from "./settings-view";
 
 export type PresetChoice = "low" | "high" | "ultra";
 
-/** The UI default the plan names: Sol Ultra. */
+/** The UI default the plan names: Astra Ultra. */
 export const defaultSessionStartPreset: PresetChoice = "ultra";
 
 export type SessionStartTarget = Readonly<{
