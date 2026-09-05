@@ -9,6 +9,7 @@ import {
   commandTargetForMachine,
   isMachineOnline,
   machineLabelsByDevice,
+  personalSessionAdoptionCommand,
   registryHeartbeatToleranceMs,
   scheduledTaskKindLabel,
   shortSessionId,
@@ -125,11 +126,39 @@ describe("toMachineView", () => {
     expect(view.defaultPreset).toBe("ultra");
     expect(view.showThinkingDefault).toBe(false);
     expect(view.proseAutorespondConfigured).toBe(true);
+    expect(view.sessionAdoption).toBeNull();
     expect(view.devicePublicId).toBe("dev_one");
     expect(view.revision).toBe(7);
     expect(view.online).toBe(true);
     expect(view.accounts.map((account) => account.label)).toEqual(["work", "personal"]);
     expect(view.projects.map((project) => project.label)).toEqual(["hra"]);
+  });
+
+  test("renders personal-home consent as a local command in both directions", () => {
+    expect(personalSessionAdoptionCommand("codex", false))
+      .toBe("hra session adoption enable <account> --provider codex");
+    expect(personalSessionAdoptionCommand("claude", true))
+      .toBe("hra session adoption disable --provider claude");
+  });
+
+  test("carries exact provider aggregates and never guesses an older daemon's opt-in", () => {
+    const view = toMachineView({
+      device: { online: true, status: "active" },
+      devicePublicId: "dev_one",
+      now,
+      payload: registry({
+        sessionAdoption: {
+          claude: { adopted: 1, enabled: false, fenced: 2, pending: 3 },
+          codex: { adopted: 4, enabled: true, fenced: 5, pending: 6 },
+        },
+      }),
+      revision: 7,
+      updatedAt: now - minute,
+    });
+    expect(view.sessionAdoption).toEqual({
+      claude: { adopted: 1, enabled: false, fenced: 2, pending: 3 },
+      codex: { adopted: 4, enabled: true, fenced: 5, pending: 6 },
+    });
   });
 
   test("labels every scheduled task by provider and carries its machine", () => {

@@ -5,6 +5,7 @@ import {
   createProfileId,
   createProjectId,
   createSessionId,
+  type ProfileId,
   type SessionId,
 } from "../domain/values";
 import {
@@ -34,7 +35,8 @@ INSERT INTO daemon_state(singleton,generation) VALUES (1,7);
 CREATE TABLE profiles (
   id TEXT PRIMARY KEY,
   state TEXT NOT NULL,
-  process_generation INTEGER NOT NULL
+  process_generation INTEGER NOT NULL,
+  provider_email TEXT
 ) STRICT;
 CREATE TABLE projects (
   id TEXT PRIMARY KEY,
@@ -45,6 +47,28 @@ CREATE TABLE sessions (
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   project_id TEXT REFERENCES projects(id),
   provider_thread_id TEXT,
+  provider TEXT NOT NULL DEFAULT 'codex',
+  state TEXT NOT NULL
+) STRICT;
+CREATE TABLE session_account_authorities (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  account_key TEXT,
+  recorded_at INTEGER NOT NULL
+) STRICT;
+CREATE TRIGGER session_account_authority_insert
+AFTER INSERT ON sessions
+BEGIN
+  INSERT INTO session_account_authorities(session_id,profile_id,account_key,recorded_at)
+  SELECT NEW.id,NEW.profile_id,
+    CASE WHEN p.provider_email IS NULL THEN NULL ELSE lower(trim(p.provider_email)) END,
+    0
+  FROM profiles p WHERE p.id=NEW.profile_id;
+END;
+CREATE TABLE session_personal_runtime_bindings (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  provider_thread_id TEXT NOT NULL,
   state TEXT NOT NULL
 ) STRICT;
 CREATE TABLE queue_sequence_authority (
@@ -68,6 +92,7 @@ const idempotencyKey = (): string =>
   `123e4567-e89b-42d3-a456-${(++uuidSequence).toString(16).padStart(12, "0")}`;
 
 type Fixture = Readonly<{
+  accountId: ProfileId;
   database: Database;
   now: { value: number };
   otherSessionId: SessionId;
@@ -89,7 +114,8 @@ function fixture(input: Readonly<{
   const sessionId = createSessionId();
   const otherSessionId = createSessionId();
   database.query(
-    "INSERT INTO profiles(id,state,process_generation) VALUES (?,'signed_in',1)",
+    `INSERT INTO profiles(id,state,process_generation,provider_email)
+     VALUES (?,'signed_in',1,'scheduler@example.com')`,
   ).run(accountId);
   database.query("INSERT INTO projects(id,root_path) VALUES (?,?)").run(projectId, "/project");
   for (const id of [sessionId, otherSessionId]) {
@@ -103,7 +129,7 @@ function fixture(input: Readonly<{
     now: () => now.value,
     resolveProjectDirectory: input.resolveProjectDirectory ?? (async (root) => root),
   });
-  return { database, now, otherSessionId, sessionId, store };
+  return { accountId, database, now, otherSessionId, sessionId, store };
 }
 
 const createTask = (
@@ -607,6 +633,34 @@ describe("SessionTaskStore mutation authority", () => {
 });
 
 describe("SessionTaskStore due materialization", () => {
+  test("does not advertise or retry a native task under stale account identity", async () => {
+    const value = fixture();
+    const created = createTask(value);
+    const dueAt = created.nextDueAt ?? 0;
+    expect(value.store.nextDueAt()).toBe(dueAt);
+
+    value.database.query(
+      "UPDATE profiles SET provider_email='replacement@example.com' WHERE id=?",
+    ).run(value.accountId);
+    expect(value.store.nextDueAt()).toBeNull();
+    expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM session_task_occurrences",
+    ).get()).toEqual({ count: 0 });
+    expect(value.database.query("SELECT COUNT(*) AS count FROM queue_entries").get())
+      .toEqual({ count: 0 });
+
+    value.database.query(
+      "UPDATE profiles SET provider_email='scheduler@example.com' WHERE id=?",
+    ).run(value.accountId);
+    expect(await value.store.materializeDue({ now: dueAt })).toMatchObject([{
+      task: { id: created.id, sessionId: value.sessionId },
+      occurrence: { taskId: created.id, sessionId: value.sessionId },
+      queue: { sessionId: value.sessionId },
+    }]);
+  });
+
   test("returns after one atomic handoff before resolving the next candidate", async () => {
     let rejectSecond = true;
     const resolvedRoots: string[] = [];
@@ -669,7 +723,8 @@ describe("SessionTaskStore due materialization", () => {
     const invalidProjectId = createProjectId();
     const validProjectId = createProjectId();
     value.database.query(
-      "INSERT INTO profiles(id,state,process_generation) VALUES (?,'signed_in',1)",
+      `INSERT INTO profiles(id,state,process_generation,provider_email)
+       VALUES (?,'signed_in',1,'other-scheduler@example.com')`,
     ).run(accountId);
     value.database.query("INSERT INTO projects(id,root_path) VALUES (?,?)")
       .run(invalidProjectId, "/invalid");

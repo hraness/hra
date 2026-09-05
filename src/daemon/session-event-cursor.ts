@@ -105,6 +105,7 @@ export const sessionListCursorFilterSchema = z.object({
   accountId: profileIdSchema,
   providerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   limit: z.number().int().min(1).max(100),
+  includeArchived: z.boolean(),
 }).strict();
 
 export type SessionListCursorFilter = z.infer<typeof sessionListCursorFilterSchema>;
@@ -115,6 +116,8 @@ export const sessionListCursorPayloadSchema = z.object({
   accountId: profileIdSchema,
   providerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   limit: z.number().int().min(1).max(100),
+  includeArchived: z.boolean(),
+  traversalId: z.string().uuid().optional(),
   providerCursor: sessionListProviderCursorSchema,
   checkpointDigest: sessionListProviderCursorDigestSchema,
   power: safePositiveIntegerSchema,
@@ -141,10 +144,35 @@ export const sessionListCursorPayloadSchema = z.object({
 
 export type SessionListCursorPayload = z.infer<typeof sessionListCursorPayloadSchema>;
 
+/** Signed continuation for the source-neutral local phase of a signed-in account listing. */
+export const accountSessionLocalCursorPayloadSchema = z.object({
+  version: z.literal(1),
+  type: z.literal("session_list_account_local"),
+  accountId: profileIdSchema,
+  providerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  limit: z.number().int().min(1).max(100),
+  includeArchived: z.boolean(),
+  traversalId: z.string().uuid(),
+  afterCreatedAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER).nullable(),
+  afterSessionId: sessionIdSchema.nullable(),
+}).strict().superRefine((value, context) => {
+  if ((value.afterCreatedAt === null) !== (value.afterSessionId === null)) {
+    context.addIssue({
+      code: "custom",
+      message: "Account local-session position must be wholly present or absent.",
+    });
+  }
+});
+
+export type AccountSessionLocalCursorPayload = z.infer<
+  typeof accountSessionLocalCursorPayloadSchema
+>;
+
 export const localSessionListCursorFilterSchema = z.object({
   accountId: profileIdSchema,
   accountGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   limit: z.number().int().min(1).max(100),
+  includeArchived: z.boolean(),
 }).strict();
 
 export type LocalSessionListCursorFilter = z.infer<typeof localSessionListCursorFilterSchema>;
@@ -155,6 +183,7 @@ export const localSessionListCursorPayloadSchema = z.object({
   accountId: profileIdSchema,
   accountGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   limit: z.number().int().min(1).max(100),
+  includeArchived: z.boolean(),
   afterCreatedAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
   afterSessionId: sessionIdSchema,
 }).strict();
@@ -188,6 +217,8 @@ const canonicalSessionListPayload = (payload: SessionListCursorPayload): string 
   accountId: payload.accountId,
   providerGeneration: payload.providerGeneration,
   limit: payload.limit,
+  includeArchived: payload.includeArchived,
+  ...(payload.traversalId === undefined ? {} : { traversalId: payload.traversalId }),
   providerCursor: payload.providerCursor,
   checkpointDigest: payload.checkpointDigest,
   power: payload.power,
@@ -203,6 +234,21 @@ const canonicalLocalSessionListPayload = (
   accountId: payload.accountId,
   accountGeneration: payload.accountGeneration,
   limit: payload.limit,
+  includeArchived: payload.includeArchived,
+  afterCreatedAt: payload.afterCreatedAt,
+  afterSessionId: payload.afterSessionId,
+});
+
+const canonicalAccountSessionLocalPayload = (
+  payload: AccountSessionLocalCursorPayload,
+): string => JSON.stringify({
+  version: payload.version,
+  type: payload.type,
+  accountId: payload.accountId,
+  providerGeneration: payload.providerGeneration,
+  limit: payload.limit,
+  includeArchived: payload.includeArchived,
+  traversalId: payload.traversalId,
   afterCreatedAt: payload.afterCreatedAt,
   afterSessionId: payload.afterSessionId,
 });
@@ -261,14 +307,16 @@ const sameSessionListFilter = (
   expected: SessionListCursorFilter,
 ): boolean => actual.accountId === expected.accountId
   && actual.providerGeneration === expected.providerGeneration
-  && actual.limit === expected.limit;
+  && actual.limit === expected.limit
+  && actual.includeArchived === expected.includeArchived;
 
 const sameLocalSessionListFilter = (
   actual: LocalSessionListCursorFilter,
   expected: LocalSessionListCursorFilter,
 ): boolean => actual.accountId === expected.accountId
   && actual.accountGeneration === expected.accountGeneration
-  && actual.limit === expected.limit;
+  && actual.limit === expected.limit
+  && actual.includeArchived === expected.includeArchived;
 
 const sessionListProviderCursorDigest = (providerCursor: string): string =>
   createHash("sha256")
@@ -517,6 +565,7 @@ export class SessionEventCursorCodec {
       accountId: input.accountId,
       accountGeneration: input.accountGeneration,
       limit: input.limit,
+      includeArchived: input.includeArchived,
       afterCreatedAt: input.afterCreatedAt,
       afterSessionId: input.afterSessionId,
     });
@@ -564,6 +613,7 @@ export class SessionEventCursorCodec {
 
   advanceSessionList(
     input: SessionListCursorFilter & Readonly<{
+      traversalId?: string;
       providerCursor: string;
       prior?: SessionListCursorPayload;
     }>,
@@ -572,6 +622,7 @@ export class SessionEventCursorCodec {
       accountId: input.accountId,
       providerGeneration: input.providerGeneration,
       limit: input.limit,
+      includeArchived: input.includeArchived,
     });
     const providerCursor = sessionListProviderCursorSchema.safeParse(input.providerCursor);
     if (!providerCursor.success) {
@@ -585,6 +636,9 @@ export class SessionEventCursorCodec {
     let power = 1;
     let span = 0;
     let pageCount = 1;
+    const traversalId = input.traversalId === undefined
+      ? input.prior?.traversalId
+      : z.string().uuid().parse(input.traversalId);
     if (input.prior !== undefined) {
       const prior = sessionListCursorPayloadSchema.safeParse(input.prior);
       if (!prior.success) {
@@ -596,6 +650,12 @@ export class SessionEventCursorCodec {
       if (!sameSessionListFilter(prior.data, filter)) {
         throw new SessionEventCursorError(
           "Session-list cursor filters do not match the requested account listing.",
+          "filter_mismatch",
+        );
+      }
+      if (prior.data.traversalId !== traversalId) {
+        throw new SessionEventCursorError(
+          "Session-list cursor traversal authority changed.",
           "filter_mismatch",
         );
       }
@@ -628,6 +688,7 @@ export class SessionEventCursorCodec {
       version: 1,
       type: "session_list",
       ...filter,
+      ...(traversalId === undefined ? {} : { traversalId }),
       providerCursor: providerCursor.data,
       checkpointDigest,
       power,
@@ -667,6 +728,69 @@ export class SessionEventCursorCodec {
     if (!sameSessionListFilter(parsed.data, expected)) {
       throw new SessionEventCursorError(
         "Session-list cursor filters do not match the requested account listing.",
+        "filter_mismatch",
+      );
+    }
+    return parsed.data;
+  }
+
+  encodeAccountSessionLocal(
+    input: SessionListCursorFilter & Readonly<{
+      traversalId: string;
+      afterCreatedAt: number | null;
+      afterSessionId: string | null;
+    }>,
+  ): string {
+    const filter = sessionListCursorFilterSchema.parse({
+      accountId: input.accountId,
+      providerGeneration: input.providerGeneration,
+      limit: input.limit,
+      includeArchived: input.includeArchived,
+    });
+    const payload = accountSessionLocalCursorPayloadSchema.parse({
+      version: 1,
+      type: "session_list_account_local",
+      ...filter,
+      traversalId: input.traversalId,
+      afterCreatedAt: input.afterCreatedAt,
+      afterSessionId: input.afterSessionId,
+    });
+    return this.#encodeCanonical(
+      canonicalAccountSessionLocalPayload(payload),
+      "Account local-session cursor",
+    );
+  }
+
+  decodeAccountSessionLocal(
+    cursor: string,
+    expectedFilter: SessionListCursorFilter,
+  ): AccountSessionLocalCursorPayload {
+    const expected = sessionListCursorFilterSchema.parse(expectedFilter);
+    const envelope = this.#decodeEnvelope(cursor, "Account local-session cursor");
+    if (
+      typeof envelope.value !== "object"
+      || envelope.value === null
+      || !("type" in envelope.value)
+      || envelope.value.type !== "session_list_account_local"
+    ) {
+      throw new SessionEventCursorError(
+        "Another HRA cursor type cannot be used as an account local-session cursor.",
+        "type_mismatch",
+      );
+    }
+    const parsed = accountSessionLocalCursorPayloadSchema.safeParse(envelope.value);
+    if (
+      !parsed.success
+      || canonicalAccountSessionLocalPayload(parsed.data) !== envelope.payloadJson
+    ) {
+      throw new SessionEventCursorError(
+        "Account local-session cursor payload is not canonical.",
+        "noncanonical",
+      );
+    }
+    if (!sameSessionListFilter(parsed.data, expected)) {
+      throw new SessionEventCursorError(
+        "Account local-session cursor filters do not match the requested account listing.",
         "filter_mismatch",
       );
     }

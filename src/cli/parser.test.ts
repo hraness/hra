@@ -520,6 +520,41 @@ describe("CLI parser", () => {
     ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
   });
 
+  test("parses personal-home session adoption controls", () => {
+    expect(parseCli(["session", "adoption", "status"]))
+      .toEqual({ kind: "command", command: { kind: "session.adoption.status" }, json: false });
+    expect(parseCli(["session", "adoption", "status", "--provider", "claude", "--json"]))
+      .toEqual({
+        kind: "command",
+        command: { kind: "session.adoption.status", provider: "claude" },
+        json: true,
+      });
+    expect(parseCli(["session", "adoption", "enable", "personal", "--provider", "codex"]))
+      .toMatchObject({
+        command: {
+          account: "personal",
+          enabled: true,
+          kind: "session.adoption.set",
+          provider: "codex",
+        },
+      });
+    expect(parseCli(["session", "adoption", "disable", "--provider", "claude"]))
+      .toMatchObject({
+        command: { enabled: false, kind: "session.adoption.set", provider: "claude" },
+      });
+    expect(parseCli(["session", "discover", "--provider", "codex"]))
+      .toMatchObject({ command: { kind: "session.adoption.discover", provider: "codex" } });
+
+    for (const argv of [
+      ["session", "adoption", "enable", "personal"],
+      ["session", "adoption", "disable"],
+      ["session", "adoption", "status", "--provider", "other"],
+      ["session", "discover", "--provider", "other"],
+      ["session", "detach", "working-session"],
+      ["session", "detach"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
   test("maps cloud session reads and the closed remote command set", () => {
     const idempotencyKey = "018bcfe5-6800-7000-8000-000000000001";
     expect(parseCli(["remote", "list", "--limit", "25", "--json"])).toEqual({

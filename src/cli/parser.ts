@@ -219,6 +219,10 @@ Usage:
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
   hra session list|show|status|watch|start|send|queue|steer|stop
+  hra session adoption status [--provider codex|claude]
+  hra session adoption enable <account> --provider codex|claude
+  hra session adoption disable --provider codex|claude
+  hra session discover [--provider codex|claude]
   hra session task list|show|create|edit|delete
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session watch <session> [--cursor <cursor>] [--jsonl]
@@ -359,6 +363,10 @@ Usage:
   hra session send|queue|steer <session> [--attach <path>]... <message>
   hra session stop|recover|abandon <session>
   hra session archive|unarchive <session>
+  hra session adoption status [--provider <codex|claude>]
+  hra session adoption enable <account> --provider <codex|claude>
+  hra session adoption disable --provider <codex|claude>
+  hra session discover [--provider <codex|claude>]
   hra session rename <session> <name>
   hra session note get|edit|clear <session>
   hra session note set <session> <note>
@@ -376,6 +384,8 @@ Usage:
 Examples:
   hra session start personal --project jungle --preset high
   hra session start personal --provider claude --preset fable-max
+  hra session adoption enable personal --provider codex
+  hra session discover --provider codex
   hra session switch my-session --provider claude
   hra session export my-session --format trajectory --out ./trajectory.json
   hra session watch my-session
@@ -1323,6 +1333,41 @@ const parseSession = (
     case "rename": { const session = take(cursor, "session"); return command({ kind: "session.rename", session, name: remainder(cursor, "name") }); }
     case "archive": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.archive", session, archived: true }; }
     case "unarchive": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.archive", session, archived: false }; }
+    case "adoption": {
+      const adoptionAction = take(cursor, "session adoption action");
+      const provider = option(cursor, "--provider");
+      if (provider !== undefined && provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      if (adoptionAction === "status") {
+        finish(cursor);
+        return command({ kind: "session.adoption.status", provider });
+      }
+      if (adoptionAction === "enable") {
+        if (provider === undefined) {
+          throw new CliUsageError("Session adoption enable requires --provider codex|claude.");
+        }
+        const account = take(cursor, "account");
+        finish(cursor);
+        return command({ kind: "session.adoption.set", provider, enabled: true, account });
+      }
+      if (adoptionAction === "disable") {
+        if (provider === undefined) {
+          throw new CliUsageError("Session adoption disable requires --provider codex|claude.");
+        }
+        finish(cursor);
+        return command({ kind: "session.adoption.set", provider, enabled: false });
+      }
+      throw new CliUsageError("Unknown session adoption action. Use `status`, `enable`, or `disable`.");
+    }
+    case "discover": {
+      const provider = option(cursor, "--provider");
+      if (provider !== undefined && provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      finish(cursor);
+      return command({ kind: "session.adoption.discover", provider });
+    }
     case "recover": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.recover", session }; }
     case "abandon": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.abandon", session }; }
     case "note": return parseSessionNote(cursor);

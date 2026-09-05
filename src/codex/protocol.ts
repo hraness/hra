@@ -431,6 +431,7 @@ export type CodexMethod =
   | "thread/read"
   | "thread/resume"
   | "thread/start"
+  | "thread/unsubscribe"
   | "thread/turns/list"
   | "turn/interrupt"
   | "turn/start"
@@ -478,6 +479,7 @@ export const OPERATIONS: Readonly<Record<CodexMethod, CodexOperationDescriptor>>
   "thread/turns/list": operation("thread/turns/list", "read", 20_000, "retry-read", true),
   "thread/start": operation("thread/start", "thread-mutation", 30_000, "reconcile"),
   "thread/resume": operation("thread/resume", "thread-mutation", 30_000, "reconcile"),
+  "thread/unsubscribe": operation("thread/unsubscribe", "thread-mutation", 15_000, "reconcile"),
   "thread/name/set": operation("thread/name/set", "thread-mutation", 15_000, "reconcile"),
   "turn/start": operation("turn/start", "turn-mutation", 30_000, "reconcile"),
   "turn/steer": operation("turn/steer", "turn-mutation", 20_000, "reconcile"),
@@ -1546,6 +1548,22 @@ export function parseThreadMutation(value: unknown): CodexThread {
   return parseThread(record(value, "thread mutation result").thread, 0);
 }
 
+export type ThreadUnsubscribeResult = Readonly<{
+  status: "notLoaded" | "notSubscribed" | "unsubscribed";
+}>;
+
+/** Exact pinned (`CODEX_PIN`) `thread/unsubscribe` response. */
+export function parseThreadUnsubscribe(value: unknown): ThreadUnsubscribeResult {
+  const root = record(value, "thread/unsubscribe result");
+  return {
+    status: oneOf(
+      root.status,
+      "thread/unsubscribe status",
+      ["notLoaded", "notSubscribed", "unsubscribed"] as const,
+    ),
+  };
+}
+
 /** Exact pinned (`CODEX_PIN`) `thread/start` response, including effective policy. */
 export function parseThreadStart(value: unknown): ThreadStartResult {
   const root = record(value, "thread/start result");
@@ -1647,8 +1665,8 @@ function parseThread(value: unknown, index: number): CodexThread {
       ["legacy", "paginated"] as const,
     ),
     modelProvider: identifier(root.modelProvider, "thread.modelProvider"),
-    createdAt: nonnegativeNumber(root.createdAt, "thread.createdAt"),
-    updatedAt: nonnegativeNumber(root.updatedAt, "thread.updatedAt"),
+    createdAt: unixSecondsToMilliseconds(root.createdAt, "thread.createdAt"),
+    updatedAt: unixSecondsToMilliseconds(root.updatedAt, "thread.updatedAt"),
     status: parseThreadStatus(root.status),
     cwd: string(root.cwd, "thread.cwd", { min: 1, max: 16_384 }),
     name: nullableString(root.name, "thread.name", 1_024),
@@ -3376,6 +3394,15 @@ function nonnegativeNumber(value: unknown, label: string): number {
   const parsed = number(value, label);
   if (parsed < 0) throw protocol(`${label} must be nonnegative`);
   return parsed;
+}
+
+function unixSecondsToMilliseconds(value: unknown, label: string): number {
+  const seconds = nonnegativeInteger(value, label);
+  const milliseconds = seconds * 1_000;
+  if (!Number.isSafeInteger(milliseconds)) {
+    throw protocol(`${label} exceeds the safe Unix-millisecond range`);
+  }
+  return milliseconds;
 }
 
 export function validateAuthority(authority: CodexAuthority): CodexAuthority {

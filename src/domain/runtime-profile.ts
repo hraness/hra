@@ -71,10 +71,11 @@ export type EffectiveRuntimeProfile = z.infer<typeof effectiveRuntimeProfileSche
  * runtime start a session or a turn. Claude Code owns its own permission
  * engine, so the profile pins the interactive permission mode (every tool use
  * reaches HRA as a `can_use_tool` control request), the exact pinned CLI
- * version, and the fact that the runtime home is an isolated
- * `CLAUDE_CONFIG_DIR` rather than the user's own configuration.
+ * version, and which reviewed `CLAUDE_CONFIG_DIR` authority it uses. Managed
+ * sessions use an isolated account home; adopted sessions use the explicitly
+ * bound personal home without pretending that it is isolated.
  */
-export const effectiveClaudeRuntimeProfileSchema = z.object({
+const effectiveClaudeRuntimeProfileFields = {
   profileId: profileIdSchema,
   processGeneration: z.number().int().nonnegative(),
   observedAt: unixMillisecondsSchema,
@@ -83,10 +84,32 @@ export const effectiveClaudeRuntimeProfileSchema = z.object({
   reasoningEffort: z.literal("max"),
   claudeVersion: z.string().regex(/^\d{1,5}\.\d{1,5}\.\d{1,5}$/u),
   permissionMode: z.literal("default"),
+} as const;
+
+export const claudeConfigHomeSchema = z.enum(["isolated", "personal"]);
+export type ClaudeConfigHome = z.infer<typeof claudeConfigHomeSchema>;
+
+const currentEffectiveClaudeRuntimeProfileSchema = z.object({
+  ...effectiveClaudeRuntimeProfileFields,
+  configHome: claudeConfigHomeSchema,
+  outputFormat: z.literal("stream-json"),
+  inputFormat: z.literal("stream-json"),
+}).strict();
+
+// Runtime-profile rows are immutable evidence. Keep accepting the exact
+// legacy shape so its stored JSON and digest remain byte-stable; new reviews
+// always write `configHome` instead.
+const legacyEffectiveClaudeRuntimeProfileSchema = z.object({
+  ...effectiveClaudeRuntimeProfileFields,
   isolatedConfigDir: z.literal(true),
   outputFormat: z.literal("stream-json"),
   inputFormat: z.literal("stream-json"),
-}).strict().superRefine((value, context) => {
+}).strict();
+
+export const effectiveClaudeRuntimeProfileSchema = z.union([
+  currentEffectiveClaudeRuntimeProfileSchema,
+  legacyEffectiveClaudeRuntimeProfileSchema,
+]).superRefine((value, context) => {
   if (value.model !== presetRequirements[value.preset].model) {
     context.addIssue({ code: "custom", message: "The effective model must match the exact HRA preset." });
   }
@@ -114,6 +137,42 @@ export const reviewedRuntimeProfileSchema = z.union([
 ]);
 
 export type ReviewedRuntimeProfile = EffectiveRuntimeProfile | EffectiveClaudeRuntimeProfile;
+
+/**
+ * Public runtime evidence intentionally omits which Claude config home owns
+ * the process. That field is required private custody evidence, but exposing
+ * `personal` versus `isolated` would distinguish adopted sessions from native
+ * ones. The legacy isolation marker is provenance for the same reason.
+ */
+export const publicEffectiveClaudeRuntimeProfileSchema = z.object({
+  ...effectiveClaudeRuntimeProfileFields,
+  outputFormat: z.literal("stream-json"),
+  inputFormat: z.literal("stream-json"),
+}).strict().superRefine((value, context) => {
+  if (value.model !== presetRequirements[value.preset].model) {
+    context.addIssue({ code: "custom", message: "The effective model must match the exact HRA preset." });
+  }
+});
+
+export const publicReviewedRuntimeProfileSchema = z.union([
+  effectiveRuntimeProfileSchema,
+  publicEffectiveClaudeRuntimeProfileSchema,
+]);
+
+export type PublicReviewedRuntimeProfile = z.infer<typeof publicReviewedRuntimeProfileSchema>;
+
+export const projectPublicReviewedRuntimeProfile = (
+  profile: ReviewedRuntimeProfile,
+): PublicReviewedRuntimeProfile => {
+  const reviewed = reviewedRuntimeProfileSchema.parse(profile);
+  if ("configHome" in reviewed || "isolatedConfigDir" in reviewed) {
+    const publicProfile: Record<string, unknown> = { ...reviewed };
+    delete publicProfile.configHome;
+    delete publicProfile.isolatedConfigDir;
+    return publicEffectiveClaudeRuntimeProfileSchema.parse(publicProfile);
+  }
+  return effectiveRuntimeProfileSchema.parse(reviewed);
+};
 
 /** The provider a reviewed profile belongs to, read from its exact preset. */
 export const reviewedRuntimeProfileProvider = (

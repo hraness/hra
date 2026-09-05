@@ -14,6 +14,11 @@ export interface PinnedClaudeRuntime {
   readonly argv: readonly [string, ...string[]];
 }
 
+export type ClaudeSessionLaunch = Readonly<{
+  kind: "create" | "resume";
+  providerThreadId: string;
+}>;
+
 export interface ClaudeVersionProbeProcess {
   readonly exited: Promise<number>;
   readonly stdout: AsyncIterable<Uint8Array>;
@@ -30,6 +35,7 @@ export type ClaudeVersionProbeProcessFactory = (input: Readonly<{
 export type ClaudeVersionProbe = (input: {
   readonly executablePath: string;
   readonly configDir: string;
+  readonly configHome: "isolated" | "personal";
   readonly environment: Readonly<Record<string, string | undefined>>;
   readonly signal: AbortSignal;
   readonly deadlineMs: number;
@@ -39,8 +45,10 @@ export type ClaudeVersionProbe = (input: {
 export interface ResolvePinnedClaudeRuntimeOptions {
   /** Absolute path to the `claude` executable. Located on PATH when omitted. */
   readonly executablePath?: string;
-  /** Absolute, isolated `CLAUDE_CONFIG_DIR` for this profile. */
+  /** Absolute reviewed home; exported as `CLAUDE_CONFIG_DIR` only in isolated mode. */
   readonly configDir: string;
+  /** Defaults to an explicitly selected isolated home. */
+  readonly configHome?: "isolated" | "personal";
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly probeVersion?: ClaudeVersionProbe;
   readonly signal?: AbortSignal;
@@ -58,6 +66,8 @@ const VERSION_PROBE_STDOUT_MAX_BYTES = 512;
 const VERSION_PROBE_STDERR_MAX_BYTES = 4 * 1024;
 const VERSION_PROBE_TERMINATION_GRACE_MS = 250;
 const VERSION_PROBE_FORCE_JOIN_MS = 1_000;
+const sessionIdPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 const chunks = async function* (
   stream: ReadableStream<Uint8Array> | number | undefined,
@@ -146,10 +156,33 @@ const stopVersionProbe = async (
   if (!drained) throw new ClaudeError("PROCESS_EXITED", "Claude version probe output could not be drained after termination.");
 };
 
-/** Reads `claude --version` inside the isolated home, bounded and non-interactive. */
+/**
+ * Binds one process invocation to one durable Claude session. Creation and
+ * resume are deliberately distinct flags: a typo must never make Claude
+ * allocate a new conversation while HRA believes it reclaimed an old one.
+ */
+export function claudeSessionArgv(
+  runtime: PinnedClaudeRuntime,
+  launch: ClaudeSessionLaunch,
+): readonly [string, ...string[]] {
+  if (!sessionIdPattern.test(launch.providerThreadId)) {
+    throw new ClaudeError(
+      "INVALID_INPUT",
+      "A Claude provider session id must be a canonical lowercase UUID.",
+    );
+  }
+  return [
+    ...runtime.argv,
+    launch.kind === "create" ? "--session-id" : "--resume",
+    launch.providerThreadId,
+  ];
+}
+
+/** Reads `claude --version` inside the reviewed home, bounded and non-interactive. */
 export const spawnClaudeVersionProbe: ClaudeVersionProbe = async (input) => {
+  input.signal.throwIfAborted();
   const env = allowlistedEnvironment(input.environment);
-  env.CLAUDE_CONFIG_DIR = input.configDir;
+  if (input.configHome === "isolated") env.CLAUDE_CONFIG_DIR = input.configDir;
   env.NO_COLOR = "1";
   let child: ClaudeVersionProbeProcess;
   try {
@@ -227,6 +260,8 @@ export async function locateClaudeExecutable(
 export async function resolvePinnedClaudeRuntime(
   options: ResolvePinnedClaudeRuntimeOptions,
 ): Promise<PinnedClaudeRuntime> {
+  const signal = options.signal ?? new AbortController().signal;
+  signal.throwIfAborted();
   assertPinnedClaudeMatrices();
   if (!isAbsolute(options.configDir)) {
     throw new ClaudeError("INVALID_INPUT", "CLAUDE_CONFIG_DIR must be an absolute path");
@@ -253,14 +288,16 @@ export async function resolvePinnedClaudeRuntime(
   }
   const reported = await probe({
     configDir: options.configDir,
+    configHome: options.configHome ?? "isolated",
     environment,
     executablePath,
-    signal: options.signal ?? new AbortController().signal,
+    signal,
     deadlineMs,
     ...(options.versionProbeProcessFactory === undefined ? {} : {
       processFactory: options.versionProbeProcessFactory,
     }),
   });
+  signal.throwIfAborted();
   const version = versionOutputPattern.exec(reported)?.[1];
   if (version === undefined) {
     throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable reported no exact version");

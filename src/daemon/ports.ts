@@ -14,6 +14,9 @@ import type {
   ProviderInteractionAuthority,
 } from "../domain/interactions";
 import type { ProfileId, ProjectId, SessionId } from "../domain/values";
+import type { ClaudeProcessIdentity } from "../claude/process";
+
+export type { ClaudeProcessIdentity } from "../claude/process";
 
 export type ProfileAuthority = {
   id: ProfileId;
@@ -39,7 +42,11 @@ export type ClaudeRuntimeStartReview = RuntimeStartReviewOf<EffectiveClaudeRunti
 
 export type CodexAccountProjection = {
   signedIn: boolean;
+  /** Stable provider account identity when that provider exposes one. */
+  accountId?: string;
   email?: string;
+  /** Stable provider organization identity when account authority is org-scoped. */
+  organizationId?: string;
   plan?: string;
 };
 
@@ -135,6 +142,47 @@ export class CodexSessionObservationError extends Error {
   }
 }
 
+/**
+ * A Codex claim failed after it could have acquired a provider subscription,
+ * and neither an exact unsubscribe nor retirement of that connection proved
+ * the controller was released. Durable claiming authority must survive this
+ * error; every other `claimSession` rejection proves that no controller from
+ * the failed attempt remains.
+ */
+export class CodexClaimReleaseUnprovenError extends Error {
+  constructor(options?: ErrorOptions) {
+    super("A failed Codex session claim could not prove controller release.", options);
+    this.name = "CodexClaimReleaseUnprovenError";
+  }
+}
+
+export type ClaudeSessionClaimProof = "not_live";
+
+/**
+ * Closed signal that a durable Claude conversation has no process in this
+ * runtime manager. The daemon may resume only when it independently holds one
+ * of `ClaudeSessionClaimProof`'s fenced authorities.
+ */
+export class ClaudeSessionObservationError extends Error {
+  readonly reason = "not_running" as const;
+
+  constructor(options?: ErrorOptions) {
+    super("Claude session observation requires a fenced runtime resume.", options);
+    this.name = "ClaudeSessionObservationError";
+  }
+}
+
+/**
+ * A Claude admission failed and even force-termination did not prove the
+ * spawned child exited. Durable launch intent must survive this error.
+ */
+export class ClaudeProcessExitUnprovenError extends Error {
+  constructor(options?: ErrorOptions) {
+    super("Claude session admission failed and child exit could not be proven.", options);
+    this.name = "ClaudeProcessExitUnprovenError";
+  }
+}
+
 export type CodexSessionPage = {
   readonly sessions: readonly CodexSessionProjection[];
   readonly nextCursor: string | null;
@@ -156,7 +204,20 @@ export interface SessionRuntimePort<Profile> {
   reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
   /** Releases a review that never reached its matching start effect. */
   discardRuntimeReview(review: RuntimeStartReviewOf<Profile>): void;
-  startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: Profile }>;
+  startSession(input: {
+    authority: ProfileAuthority;
+    /** Persists exact Claude child custody before that child is admitted. */
+    admitProcessIdentity?: (identity: ClaudeProcessIdentity) => Promise<void>;
+    projectRoot?: string;
+    /**
+     * An HRA-reserved provider identity supplied before a Claude child is
+     * launched, so crash recovery can recognize an indeterminate launch.
+     * Codex allocates its own thread identity and therefore ignores this.
+     */
+    providerThreadId?: string;
+    review: RuntimeStartReviewOf<Profile>;
+    signal: AbortSignal;
+  }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: Profile }>;
   observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation>;
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
   /**
@@ -213,6 +274,30 @@ export interface SessionRuntimePort<Profile> {
  */
 export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRuntimeProfile> {
   readonly provider: "claude";
+  /**
+   * Reclaims an existing Claude conversation under this runtime's full stdin
+   * and interaction authority. Callers may supply the closed liveness proof
+   * only after the prior process is known not to be live.
+   */
+  claimSession(input: {
+    authority: ProfileAuthority;
+    /** Persists exact child custody before the resumed process is admitted. */
+    admitProcessIdentity?: (identity: ClaudeProcessIdentity) => Promise<void>;
+    providerThreadId: string;
+    projectRoot: string;
+    /** Durable display title retained across takeover and daemon restart. */
+    title: string;
+    preset: Preset;
+    fast: boolean;
+    sourceLiveness: ClaudeSessionClaimProof;
+    signal: AbortSignal;
+  }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveClaudeRuntimeProfile }>;
+  /** Exact live child authority retained for durable restart liveness fencing. */
+  readSessionProcessIdentity(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    signal: AbortSignal;
+  }): Promise<ClaudeProcessIdentity>;
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
   /**
    * Rebinds live, quiescent Claude processes when only the sibling Codex
@@ -235,9 +320,30 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
 
 export interface CodexRuntimePort extends SessionRuntimePort<EffectiveRuntimeProfile> {
   readonly provider: "codex";
+  /**
+   * Explicitly retries custody of a personal-home thread. Unlike ordinary
+   * observation, one retained determinate resume refusal may be invalidated
+   * so a later adoption poll can acquire a thread its prior controller freed.
+   */
+  claimSession?(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    projectRoot: string;
+    preset: Preset;
+    fast: boolean;
+    signal: AbortSignal;
+  }): Promise<CodexSessionObservation & { effectiveRuntimeProfile: EffectiveRuntimeProfile }>;
   login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<CodexLoginOutcome>;
   cancelLogin(input: { authority: ProfileAuthority; loginId: string; signal: AbortSignal }): Promise<{ status: "canceled" | "not_found" }>;
   logout(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<void>;
+  /**
+   * Retire an already-running exact account generation without discovering,
+   * launching, resuming, or releasing any individual provider thread.
+   */
+  releaseOwnedAuthority?(input: {
+    authority: ProfileAuthority;
+    signal: AbortSignal;
+  }): Promise<void>;
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
   readUsage(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<{ revision: number; observedAt: number; payload: unknown }>;
   consumeRateLimitReset(input: {
@@ -252,6 +358,16 @@ export interface CodexRuntimePort extends SessionRuntimePort<EffectiveRuntimePro
     cursor?: string;
     signal: AbortSignal;
   }): Promise<CodexSessionPage>;
+  /**
+   * Reads one exact thread's bounded metadata without resuming, subscribing,
+   * or creating session observation authority. Personal discovery uses this
+   * only to reach scheduled-task targets outside recency-sorted list pages.
+   */
+  readSessionMetadata?(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+    signal: AbortSignal,
+  ): Promise<CodexSessionProjection>;
   rename(input: { authority: ProfileAuthority; providerThreadId: string; name: string; signal: AbortSignal }): Promise<void>;
   inspectTurn(input: { authority: ProfileAuthority; providerThreadId: string; turnId: string; signal: AbortSignal }): Promise<unknown>;
   inspectInteractionAuthority(input: {
@@ -334,11 +450,13 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   login(): Promise<never> { return Promise.reject(this.#unavailable()); }
   cancelLogin(): Promise<never> { return Promise.reject(this.#unavailable()); }
   logout(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  async releaseOwnedAuthority(): Promise<void> {}
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readUsage(): Promise<never> { return Promise.reject(this.#unavailable()); }
   consumeRateLimitReset(): Promise<never> { return Promise.reject(this.#unavailable()); }
   listPlugins(): Promise<never> { return Promise.reject(this.#unavailable()); }
   listSessions(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  claimSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   discardRuntimeReview(): void {}
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -394,6 +512,8 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
   }
   interactionAuthority(): ProviderInteractionAuthority { return this.#unavailable(); }
   pinnedVersion(): string { return this.#unavailable(); }
+  claimSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  readSessionProcessIdentity(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   rebindProfileAuthority(): void {}
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }

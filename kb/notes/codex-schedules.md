@@ -98,6 +98,24 @@ Searched the generated schema (`codex app-server generate-json-schema --out ... 
 
 `~/Library/Application Support/Codex` and `~/Library/Application Support/com.openai.codex` were checked and contain only ordinary Chromium/Electron app-shell state (caches, cookies, crash reporting, component updater data); nothing schedule-related lives there. No `LaunchAgents`/launchd plist drives automation firing; it is presumably timed by the running Desktop app process itself (consistent with the jitter-salt file).
 
+## Session-adoption trigger
+
+Personal-home session adoption uses one additional narrow consequence of this
+mapping: a present, valid `heartbeat` record with an exact nonblank
+`target_thread_id` makes that Codex thread discoverable even when it falls
+outside the ordinary recent-session window. Both `ACTIVE` and `PAUSED` records
+count because pausing does not delete the task or its conversation binding;
+deletion or retargeting removes the trigger. HRA reads neither `prompt` nor any
+transcript for this decision.
+
+The automation is only an age-gate hint. HRA obtains the exact target through
+metadata-only `thread/read`, without resuming it during discovery, and then
+requires the ordinary account, registered-project, timestamp, liveness,
+quiescence, collision, and exact-resume proofs. It re-reads the association
+around claim. The Codex Desktop task remains owned by Codex Desktop; HRA adopts
+its target conversation as an ordinary HRA session and does not convert the
+record into an HRA conversation task. Claude has no equivalent schedule source.
+
 ## Recommended read-only projection
 
 ```ts

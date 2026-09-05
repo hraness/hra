@@ -88,7 +88,8 @@ const parentSchema = `
 CREATE TABLE profiles(
   id TEXT PRIMARY KEY,
   state TEXT NOT NULL,
-  process_generation INTEGER NOT NULL
+  process_generation INTEGER NOT NULL,
+  provider_email TEXT
 ) STRICT;
 CREATE TABLE projects(
   id TEXT PRIMARY KEY
@@ -102,6 +103,21 @@ CREATE TABLE sessions(
   fast_enabled INTEGER NOT NULL,
   state TEXT NOT NULL
 ) STRICT;
+CREATE TABLE session_account_authorities(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  account_key TEXT,
+  recorded_at INTEGER NOT NULL
+) STRICT;
+CREATE TRIGGER session_account_authority_insert
+AFTER INSERT ON sessions
+BEGIN
+  INSERT INTO session_account_authorities(session_id,profile_id,account_key,recorded_at)
+  SELECT NEW.id,NEW.profile_id,
+    CASE WHEN p.provider_email IS NULL THEN NULL ELSE lower(trim(p.provider_email)) END,
+    0
+  FROM profiles p WHERE p.id=NEW.profile_id;
+END;
 CREATE TABLE session_events(
   session_id TEXT NOT NULL,
   sequence INTEGER NOT NULL,
@@ -159,7 +175,8 @@ function fixture(): Fixture {
   const actorSessionId = createSessionId();
   const reviewerSessionId = createSessionId();
   database.query(
-    "INSERT INTO profiles(id,state,process_generation) VALUES (?,'signed_in',1)",
+    `INSERT INTO profiles(id,state,process_generation,provider_email)
+     VALUES (?,'signed_in',1,'worker@example.com')`,
   ).run(accountId);
   database.query("INSERT INTO projects(id) VALUES (?)").run(projectId);
   for (const sessionId of [actorSessionId, reviewerSessionId]) {
@@ -506,6 +523,82 @@ describe("WorkStore schema and atomic plans", () => {
     );
   });
 
+  test("rejects stale or unidentified session account authority for create, join, and claim", () => {
+    const value = fixture();
+    const original = createWork(value);
+    value.database.query(
+      "UPDATE profiles SET provider_email='replacement@example.com' WHERE id=?",
+    ).run(value.accountId);
+
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(value.database.query("SELECT COUNT(*) AS count FROM works").get()).toEqual({ count: 1 });
+
+    const freshCoordinatorSessionId = createSessionId();
+    value.database.query(
+      `INSERT INTO sessions(id,profile_id,project_id,preset,fast_enabled,state)
+       VALUES (?,?,?,'high',0,'active')`,
+    ).run(freshCoordinatorSessionId, value.accountId, value.projectId);
+    const freshKey = randomUUID();
+    const fresh = value.store.apply({
+      kind: "work.create",
+      idempotencyKey: freshKey,
+      clientRef: `plan-${freshKey}`,
+      coordinatorSessionId: freshCoordinatorSessionId,
+      objective: "Use only the replacement account authority.",
+      routes: [{
+        accountId: value.accountId,
+        projectId: value.projectId,
+        preset: "high",
+        fast: false,
+      }],
+      tasks: [taskSpec(value, "replacement")],
+    });
+    if (fresh.kind !== "work.create") throw new Error("unexpected result");
+    expect(() => value.store.apply({
+      kind: "work.join",
+      idempotencyKey: randomUUID(),
+      workId: fresh.work.id,
+      coordinatorSessionId: freshCoordinatorSessionId,
+      coordinatorCapability: capability,
+      actorSessionId: value.reviewerSessionId,
+    })).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_members WHERE work_id=?",
+    ).get(fresh.work.id)).toEqual({ count: 1 });
+    value.database.query(
+      "UPDATE sessions SET state='recovery_required' WHERE id=?",
+    ).run(freshCoordinatorSessionId);
+    expect(() => value.store.apply({
+      kind: "task.addBatch",
+      idempotencyKey: randomUUID(),
+      workId: fresh.work.id,
+      expectedWorkRevision: fresh.work.revision,
+      coordinatorSessionId: freshCoordinatorSessionId,
+      coordinatorCapability: capability,
+      tasks: [taskSpec(value, "recovery-fenced")],
+    })).toThrow(new WorkStoreError("ATTEMPT_NOT_OWNER"));
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_tasks WHERE work_id=?",
+    ).get(fresh.work.id)).toEqual({ count: 1 });
+
+    expect(() => claim(value, {
+      workId: original.work.id,
+      taskId: original.tasks[0]!.id,
+      revision: original.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_attempts WHERE work_id=?",
+    ).get(original.work.id)).toEqual({ count: 0 });
+
+    const unidentified = fixture();
+    unidentified.database.query(
+      "UPDATE profiles SET provider_email=NULL WHERE id=?",
+    ).run(unidentified.accountId);
+    expect(() => createWork(unidentified)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(unidentified.database.query("SELECT COUNT(*) AS count FROM works").get())
+      .toEqual({ count: 0 });
+  });
+
   test("rejects current work guards against a pre-provider session schema", () => {
     const database = new Database(":memory:", { strict: true });
     databases.push(database);
@@ -619,55 +712,18 @@ describe("WorkStore schema and atomic plans", () => {
 });
 
 describe("WorkStore claims, fences, and prepared effects", () => {
-  test("keeps established Claude work authoritative while the Codex profile is signed out", () => {
+  test("requires signed-in HRA account authority for established Claude work", () => {
     const value = fixture();
-    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
-      .run(value.accountId);
     value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
       .run(value.accountId);
+    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
+      .run(value.accountId);
 
-    const created = createWork(value);
-    join(value, created.work.id, created.work.revision, value.actorSessionId);
-    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
-    const claimed = claim(value, {
-      workId: created.work.id,
-      taskId: created.tasks[0]!.id,
-      revision: created.tasks[0]!.revision,
-    });
-    expect(claimed.attempt.accountGeneration).toBe(0);
-
-    const dispatchKey = randomUUID();
-    value.store.apply({
-      kind: "attempt.dispatch",
-      idempotencyKey: dispatchKey,
-      workId: created.work.id,
-      attemptId: claimed.attempt.id,
-      expectedAttemptRevision: claimed.attempt.revision,
-      fence: claimed.attempt.fence,
-      actorSessionId: value.actorSessionId,
-      attemptCapability: capability,
-      targetSessionId: value.actorSessionId,
-      mode: "send",
-    });
-    expect(value.store.authorizePreparedEffect(dispatchKey)).toMatchObject({ executable: true });
-
-    const signalKey = randomUUID();
-    const signal = value.store.apply({
-      kind: "signal.send",
-      idempotencyKey: signalKey,
-      workId: created.work.id,
-      senderSessionId: value.actorSessionId,
-      senderCapability: capability,
-      targetSessionId: value.reviewerSessionId,
-      mode: "queue",
-      body: "Claude remains reachable independently of Codex authentication.",
-    });
-    if (signal.kind !== "signal.send") throw new Error("unexpected result");
-    expect(signal.signal.accountGeneration).toBe(0);
-    expect(value.store.authorizePreparedEffect(signalKey)).toMatchObject({ executable: true });
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(value.database.query("SELECT COUNT(*) AS count FROM works").get()).toEqual({ count: 0 });
   });
 
-  test("does not retire active Claude work for a Codex-only state transition", () => {
+  test("does not let Codex-only retirement bypass active Claude work authority", () => {
     const value = fixture();
     value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
       .run(value.accountId);
@@ -680,23 +736,18 @@ describe("WorkStore claims, fences, and prepared effects", () => {
 
     expect(value.store.prepareProfileAuthorityChange(value.accountId, 1, "codex")).toEqual([]);
     expect(() => value.database.query("UPDATE profiles SET state='signed_out' WHERE id=?")
-      .run(value.accountId)).not.toThrow();
+      .run(value.accountId)).toThrow("WORK_PROFILE_ATTEMPT_AUTHORITY");
     expect(value.store.snapshot(created.work.id).tasks[0]).toMatchObject({
       activeAttemptId: claimed.attempt.id,
       status: "claimed",
     });
   });
 
-  test("still refuses Codex work authority while the Codex profile is signed out", () => {
+  test("refuses Codex work admission while the HRA profile is signed out", () => {
     const value = fixture();
     value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
       .run(value.accountId);
-    const created = createWork(value);
-    expect(() => claim(value, {
-      workId: created.work.id,
-      taskId: created.tasks[0]!.id,
-      revision: created.tasks[0]!.revision,
-    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
   });
 
   test("CAS claims a ready task once and increments its committed fence", () => {
@@ -2965,6 +3016,55 @@ describe("WorkStore submissions, reviews, and signals", () => {
 });
 
 describe("WorkStore cancellation and recovery", () => {
+  test("retires only attempts owned by the exact bounded session set", () => {
+    const value = fixture();
+    const created = createWork(value, [
+      taskSpec(value, "actor-task"),
+      taskSpec(value, "reviewer-task"),
+    ]);
+    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+    const actorTask = created.tasks.find((task) => task.clientRef === "actor-task")!;
+    const reviewerTask = created.tasks.find((task) => task.clientRef === "reviewer-task")!;
+    const actorClaim = claim(value, {
+      workId: created.work.id,
+      taskId: actorTask.id,
+      revision: actorTask.revision,
+    });
+    const reviewerClaim = claim(value, {
+      workId: created.work.id,
+      taskId: reviewerTask.id,
+      revision: reviewerTask.revision,
+      actorSessionId: value.reviewerSessionId,
+    });
+
+    expect(() => value.store.prepareSessionAuthorityChange(
+      [value.reviewerSessionId],
+      2,
+    )).toThrow(new WorkStoreError("REVISION_CONFLICT"));
+    expect(value.store.task(actorTask.id).activeAttempt?.status).toBe("claimed");
+    expect(value.store.task(reviewerTask.id).activeAttempt?.status).toBe("claimed");
+    expect(() => value.store.prepareSessionAuthorityChange(
+      Array.from({ length: 501 }, () => value.reviewerSessionId),
+      1,
+    )).toThrow(new WorkStoreError("WORK_CAPACITY_EXCEEDED"));
+    expect(value.store.task(reviewerTask.id).activeAttempt?.status).toBe("claimed");
+
+    expect(value.store.prepareSessionAuthorityChange(
+      [value.reviewerSessionId, value.reviewerSessionId],
+      1,
+    )).toEqual([created.work.id]);
+    expect(value.store.task(actorTask.id).activeAttempt).toMatchObject({
+      id: actorClaim.attempt.id,
+      status: "claimed",
+    });
+    expect(value.store.task(reviewerTask.id).activeAttempt).toBeNull();
+    expect(value.store.task(reviewerTask.id).task.status).toBe("ready");
+    expect(value.database.query(
+      "SELECT state FROM work_attempts WHERE id=?",
+    ).get(reviewerClaim.attempt.id)).toEqual({ state: "released" });
+    expect(value.store.prepareSessionAuthorityChange([], 1)).toEqual([]);
+  });
+
   test("reconciles no-effect only from a determinate failed nested mutation", () => {
     const prepareRecovery = (nestedState: "ambiguous" | "failed") => {
       const value = fixture();

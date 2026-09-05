@@ -189,6 +189,69 @@ describe("pinned Codex runtime", () => {
     expect(child.signals).toEqual(["SIGTERM"]);
   });
 
+  test("forwards the synchronous account-authority signal to the client", async () => {
+    const packageJsonPath = await fakePackage("0.153.2");
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const events: string[] = [];
+    const child = new TrackedProcess({
+      onWrite: (message, target) => {
+        if (message.method === "initialize") {
+          target.respond({
+            id: message.id,
+            result: {
+              userAgent: "codex-cli/0.153.2",
+              codexHome,
+              platformFamily: "unix",
+              platformOs: "macos",
+            },
+          });
+        } else if (message.method === "config/read") {
+          target.respond({
+            id: message.id,
+            result: {
+              config: {
+                cli_auth_credentials_store: "file",
+                mcp_oauth_credentials_store: "file",
+              },
+              origins: {},
+            },
+          });
+        }
+      },
+    });
+    const client = await launchPinnedCodexAppServer({
+      packageJsonPath,
+      bunExecutable: process.execPath,
+      processFactory: () => child,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      credentialStorePreflight: CREDENTIAL_STORE_PREFLIGHT,
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+      onAccountAuthoritySignal: () => { events.push("signal"); },
+      onFact: ({ value }) => { events.push(`fact:${value.type}`); },
+    });
+    child.respond({
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "pro" },
+    });
+    child.respond({
+      method: "account/login/completed",
+      params: { loginId: "login-exact", success: true },
+    });
+    for (let attempt = 0; attempt < 200 && events.length < 5; attempt += 1) {
+      await Bun.sleep(1);
+    }
+
+    expect(events.filter((event) => event === "signal")).toHaveLength(2);
+    const firstAccountFact = events.indexOf("fact:accountUpdated");
+    const loginFact = events.indexOf("fact:loginCompleted");
+    expect(events.slice(0, firstAccountFact).filter((event) => event === "signal"))
+      .not.toHaveLength(0);
+    expect(events.slice(0, loginFact).filter((event) => event === "signal"))
+      .toHaveLength(2);
+    await client.close();
+  });
+
   test("reaps the exact spawned process when client construction fails", async () => {
     const packageJsonPath = await fakePackage("0.153.2");
     const child = new TrackedProcess({ ignoreTerm: true });

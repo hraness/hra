@@ -69,8 +69,8 @@ describe("CLI rendering", () => {
       {
         effectiveRuntimeProfile: {
           claudeVersion: "2.1.260",
+          configHome: "isolated",
           inputFormat: "stream-json",
-          isolatedConfigDir: true,
           model: "claude-fable-5-1",
           observedAt: 2_000,
           outputFormat: "stream-json",
@@ -98,13 +98,47 @@ describe("CLI rendering", () => {
     expect(rendered).toContain("preset: fable-max");
     expect(rendered).toContain("model: claude-fable-5-1");
     expect(rendered).toContain("permission mode: default");
-    expect(rendered).toContain("isolated profile: enabled");
+    expect(rendered).not.toContain("config home");
+    expect(rendered).not.toContain("isolatedConfigDir");
     expect(rendered).toContain("stream: stream-json in, stream-json out");
     // No Codex-only row is invented for a provider that has none of them.
     expect(rendered).not.toContain("service tier");
     expect(rendered).not.toContain("Fast:");
     expect(rendered).not.toContain("plugin capability");
     expect(rendered).not.toContain("enabled apps");
+
+    const json = capture();
+    renderSuccess(
+      { detail: false, kind: "session.show", session: "claude-session" },
+      {
+        effectiveRuntimeProfile: {
+          claudeVersion: "2.1.260",
+          configHome: "personal",
+          inputFormat: "stream-json",
+          model: "claude-fable-5-1",
+          observedAt: 2_000,
+          outputFormat: "stream-json",
+          permissionMode: "default",
+          preset: "fable-max",
+          processGeneration: 3,
+          profileId: "acct_00000000000000000000000000000000",
+          reasoningEffort: "max",
+        },
+        projection: {
+          providerThreadId: "thread-claude",
+          status: "idle",
+          title: "Claude work",
+        },
+        session: { id: "sess-claude", state: "idle", title: "Claude work" },
+      },
+      true,
+      json.output,
+    );
+    const document = JSON.parse(json.stdout.join("")) as {
+      data: { effectiveRuntimeProfile: Record<string, unknown> };
+    };
+    expect(document.data.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+    expect(document.data.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
   });
 
   test("renders bounded local root status with closed recovery commands", () => {
@@ -2082,6 +2116,7 @@ describe("CLI rendering", () => {
       listing: {
         accountSelector: accountId,
         accountState: "signed_out",
+        provider: "codex",
         scope: "local_only",
         freshness: "stale",
         localCompleteness: "partial",
@@ -2100,6 +2135,17 @@ describe("CLI rendering", () => {
         revision: 4,
         createdAt: 1_700_000_000_000,
         updatedAt: 1_700_000_000_001,
+      }, {
+        id: "sess_11111111111111111111111111111111",
+        profileId: accountId,
+        title: "Live Claude thread",
+        state: "idle",
+        provider: "claude",
+        preset: "fable-max",
+        fastEnabled: false,
+        revision: 2,
+        createdAt: 1_700_000_000_002,
+        updatedAt: 1_700_000_000_003,
       }],
       nextCursor: cursor,
     };
@@ -2110,13 +2156,17 @@ describe("CLI rendering", () => {
       false,
       human.output,
     );
-    expect(human.stdout.join("")).toContain(`Scope: local-only cache for ${accountId}`);
-    expect(human.stdout.join("")).toContain("Freshness: stale; provider not contacted");
+    expect(human.stdout.join("")).toContain(`Codex scope: local-only cache for ${accountId}`);
+    expect(human.stdout.join("")).toContain("Codex freshness: stale; Codex provider not contacted");
     expect(human.stdout.join("")).toContain(
-      "Completeness: partial local cache; more pages available; provider completeness unknown",
+      "Codex completeness: partial local cache; more pages available; Codex provider completeness unknown",
     );
-    expect(human.stdout.join("")).toContain(`Sign in to refresh: hra account login ${accountId}`);
+    expect(human.stdout.join("")).toContain(`Sign in to refresh Codex: hra account login ${accountId}`);
     expect(human.stdout.join("")).toContain("Older imported thread");
+    expect(human.stdout.join("")).toContain("Live Claude thread");
+    expect(human.stdout.join("")).not.toContain("Claude freshness");
+    expect(human.stdout.join("")).not.toContain("Claude provider not contacted");
+    expect(human.stdout.join("")).not.toContain("Sign in to refresh Claude");
     expect(human.stdout.join("")).toContain(
       `Continue: hra session list --account ${accountId} --limit 37 --cursor ${cursor}\n`,
     );
@@ -2209,6 +2259,20 @@ describe("CLI rendering", () => {
       unsafeMetadata.output,
     )).toThrow(InvalidCommandResponseError);
     expect(unsafeMetadata.stdout.join("")).not.toContain("touch /tmp/unsafe");
+
+    for (const invalidListing of [
+      { ...listing.listing, provider: "claude" },
+      Object.fromEntries(Object.entries(listing.listing).filter(([key]) => key !== "provider")),
+    ]) {
+      const invalidProvider = capture();
+      expect(() => renderSuccess(
+        { kind: "session.list", account: accountId, archived: false, limit: 37 },
+        { ...listing, listing: invalidListing },
+        false,
+        invalidProvider.output,
+      )).toThrow(InvalidCommandResponseError);
+      expect(invalidProvider.stdout).toEqual([]);
+    }
   });
 
   test("renders brokered MCP form input as protected", () => {

@@ -36,6 +36,8 @@ import {
   parseRateLimitResetCreditConsumption,
   parseThreadItemsPage,
   parseThreadMetadataRead,
+  parseThreadPage,
+  parseThreadUnsubscribe,
   parseThreadTurnsPage,
   resolvePreset,
   safeLiveAcceptanceCommandDigest,
@@ -194,6 +196,21 @@ describe("pinned server requests and safe notifications", () => {
       lostResponse: "reconcile",
       experimental: false,
     });
+  });
+
+  test("declares and parses the closed pinned thread unsubscribe operation", () => {
+    expect(OPERATIONS["thread/unsubscribe"]).toEqual({
+      method: "thread/unsubscribe",
+      effect: "thread-mutation",
+      deadlineMs: 15_000,
+      lostResponse: "reconcile",
+      experimental: false,
+    });
+    for (const status of ["notLoaded", "notSubscribed", "unsubscribed"] as const) {
+      expect(parseThreadUnsubscribe({ status })).toEqual({ status });
+    }
+    expect(() => parseThreadUnsubscribe({ status: "stillSubscribed" })).toThrow(CodexError);
+    expect(() => parseThreadUnsubscribe({})).toThrow(CodexError);
   });
 
   test("projects only the safe reset-credit count from account rate limits", () => {
@@ -1646,6 +1663,42 @@ describe("runtime capability resolution", () => {
       nextCursor: null,
       backwardsCursor: "back",
     });
+  });
+
+  test("normalizes pinned Codex thread epoch seconds to milliseconds", () => {
+    const createdAtSeconds = 1_900_000_000;
+    const updatedAtSeconds = 1_900_000_123;
+    const providerThread = {
+      id: "thread-1",
+      sessionId: "thread-1",
+      preview: "hello",
+      ephemeral: false,
+      historyMode: "paginated",
+      modelProvider: "openai",
+      createdAt: createdAtSeconds,
+      updatedAt: updatedAtSeconds,
+      status: { type: "idle" },
+      cwd: "/workspace",
+      name: null,
+      turns: [],
+    };
+    const page = parseThreadPage({
+      data: [providerThread],
+      nextCursor: null,
+      backwardsCursor: null,
+    });
+
+    expect(page.data[0]).toMatchObject({
+      createdAt: createdAtSeconds * 1_000,
+      updatedAt: updatedAtSeconds * 1_000,
+    });
+    for (const invalidCreatedAt of [1.5, Math.floor(Number.MAX_SAFE_INTEGER / 1_000) + 1]) {
+      expect(() => parseThreadPage({
+        data: [{ ...providerThread, createdAt: invalidCreatedAt }],
+        nextCursor: null,
+        backwardsCursor: null,
+      })).toThrow(CodexError);
+    }
   });
 
   test("rejects provider turns at the metadata-only thread boundary", () => {

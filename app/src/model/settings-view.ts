@@ -13,6 +13,7 @@ import type {
   DeviceRegistryPayload,
   DeviceRegistryProject,
   DeviceRegistryScheduledTask,
+  DeviceRegistrySessionAdoption,
 } from "../hra/cloud";
 import type { ApprovalMode, PresetChoice } from "./settings-commands";
 
@@ -24,6 +25,21 @@ export const registryHeartbeatIntervalMs = 60_000;
 
 /** Three missed registry heartbeats before a machine reads as offline. */
 export const registryHeartbeatToleranceMs = 3 * registryHeartbeatIntervalMs;
+
+export type SessionAdoptionProvider = keyof DeviceRegistrySessionAdoption;
+
+/**
+ * Personal-home access is a machine-local consent boundary. Settings shows
+ * the exact local command instead of manufacturing a browser mutation.
+ */
+export function personalSessionAdoptionCommand(
+  provider: SessionAdoptionProvider,
+  enabled: boolean,
+): string {
+  return enabled
+    ? `hra session adoption disable --provider ${provider}`
+    : `hra session adoption enable <account> --provider ${provider}`;
+}
 
 export type MachineDeviceState = Readonly<{
   online: boolean;
@@ -88,6 +104,8 @@ export type MachineView = Readonly<{
   proseAutorespondConfigured: boolean;
   revision: number;
   scheduledTasks: readonly ScheduledTaskView[];
+  /** Null means the daemon predates this optional registry projection. */
+  sessionAdoption: DeviceRegistrySessionAdoption | null;
   showThinkingDefault: boolean;
   updatedAt: number;
 }>;
@@ -131,6 +149,7 @@ export function toMachineView(input: MachineViewInput): MachineView {
       nextRunAt: task.nextRunAt,
       sessionPublicId: task.sessionPublicId,
     })),
+    sessionAdoption: payload.sessionAdoption ?? null,
     showThinkingDefault: payload.showThinkingDefault,
     updatedAt: input.updatedAt,
   };

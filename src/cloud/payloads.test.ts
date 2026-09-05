@@ -278,6 +278,23 @@ describe("device registry payloads", () => {
     }));
   });
 
+  test("accepts additive exact personal-session adoption aggregates without candidate detail", async () => {
+    const withAdoption = {
+      ...registry,
+      sessionAdoption: {
+        claude: { adopted: 1, enabled: false, fenced: 2, pending: 3 },
+        codex: { adopted: 4, enabled: true, fenced: 5, pending: 6 },
+      },
+    } as const;
+    const parsed = parseDeviceRegistryPayload(withAdoption);
+    expect(parsed).toEqual(withAdoption);
+    expect(JSON.stringify(parsed)).not.toContain("providerThreadId");
+
+    const key = randomKeyBytes();
+    const envelope = await encryptDeviceRegistry(withAdoption, key, authority);
+    expect(await decryptDeviceRegistry(envelope, key, authority)).toEqual(withAdoption);
+  });
+
   test("refuses a path-shaped label anywhere in the projection", async () => {
     const absolutePath = ["", "srv", "runner", "checkout"].join("/");
     const homePath = `~/${["projects", "control-plane"].join("/")}`;
@@ -331,6 +348,26 @@ describe("device registry payloads", () => {
     expect(parseDeviceRegistryPayload({
       ...registry,
       projects: Array.from({ length: 201 }, () => registry.projects[0]),
+    })).toBeNull();
+    const adoption = {
+      claude: { adopted: 1, enabled: false, fenced: 2, pending: 3 },
+      codex: { adopted: 4, enabled: true, fenced: 5, pending: 6 },
+    } as const;
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      sessionAdoption: { ...adoption, codex: { ...adoption.codex, pending: -1 } },
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      sessionAdoption: { ...adoption, claude: { ...adoption.claude, enabled: "yes" } },
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      sessionAdoption: { ...adoption, codex: { ...adoption.codex, title: "private" } },
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      sessionAdoption: { codex: adoption.codex },
     })).toBeNull();
   });
 });

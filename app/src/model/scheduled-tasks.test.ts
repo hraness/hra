@@ -44,6 +44,7 @@ function machine(
     proseAutorespondConfigured: false,
     revision: 1,
     scheduledTasks,
+    sessionAdoption: null,
     showThinkingDefault: false,
     updatedAt: now,
   };

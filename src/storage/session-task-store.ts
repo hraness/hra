@@ -1152,6 +1152,21 @@ export class SessionTaskStore {
          AND s.provider_thread_id IS NOT NULL
          AND s.state NOT IN ('terminal','recovery_required')
          AND a.state='signed_in'
+         AND EXISTS(
+           SELECT 1 FROM session_account_authorities authority
+           WHERE authority.session_id=s.id
+             AND authority.profile_id=s.profile_id
+             AND authority.account_key IS NOT NULL
+             AND a.provider_email IS NOT NULL
+             AND authority.account_key=lower(trim(a.provider_email))
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM session_personal_runtime_bindings b
+           WHERE b.session_id=s.id
+             AND b.state!='active'
+             AND b.provider=s.provider
+             AND b.provider_thread_id=s.provider_thread_id
+         )
          AND NOT EXISTS(
            SELECT 1
            FROM session_task_occurrences o
@@ -1207,6 +1222,21 @@ export class SessionTaskStore {
          AND s.provider_thread_id IS NOT NULL
          AND s.state NOT IN ('terminal','recovery_required')
          AND a.state='signed_in'
+         AND EXISTS(
+           SELECT 1 FROM session_account_authorities authority
+           WHERE authority.session_id=s.id
+             AND authority.profile_id=s.profile_id
+             AND authority.account_key IS NOT NULL
+             AND a.provider_email IS NOT NULL
+             AND authority.account_key=lower(trim(a.provider_email))
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM session_personal_runtime_bindings b
+           WHERE b.session_id=s.id
+             AND b.state!='active'
+             AND b.provider=s.provider
+             AND b.provider_thread_id=s.provider_thread_id
+         )
          AND (
            ? IS NULL
            OR t.next_due_at>?
@@ -1280,6 +1310,21 @@ export class SessionTaskStore {
              AND s.provider_thread_id IS NOT NULL
              AND s.state NOT IN ('terminal','recovery_required')
              AND a.state='signed_in'
+             AND EXISTS(
+               SELECT 1 FROM session_account_authorities authority
+               WHERE authority.session_id=s.id
+                 AND authority.profile_id=s.profile_id
+                 AND authority.account_key IS NOT NULL
+                 AND a.provider_email IS NOT NULL
+                 AND authority.account_key=lower(trim(a.provider_email))
+             )
+             AND NOT EXISTS(
+               SELECT 1 FROM session_personal_runtime_bindings b
+               WHERE b.session_id=s.id
+                 AND b.state!='active'
+                 AND b.provider=s.provider
+                 AND b.provider_thread_id=s.provider_thread_id
+             )
              AND NOT EXISTS(
                SELECT 1
                FROM session_task_occurrences o

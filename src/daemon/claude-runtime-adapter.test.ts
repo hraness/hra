@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { lstatSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,20 +7,34 @@ import { join } from "node:path";
 import type {
   ClaudeAuthStatusReader,
   ClaudeProcess,
+  ClaudeProcessIdentity,
   PinnedClaudeRuntime,
 } from "../claude/index";
+import { ClaudeDeltaAssembler } from "../claude/assembler";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { PresetProviderMismatchError } from "../domain/presets";
 import { effectiveClaudeRuntimeProfileSchema } from "../domain/runtime-profile";
 import { ensurePrivateDirectory } from "../storage/paths";
 import {
   PinnedClaudeRuntimeManager,
+  type ClaudeProcessFactory,
   type ClaudeSessionFact,
 } from "./claude-runtime-adapter";
-import type { ProfileAuthority } from "./ports";
+import {
+  ClaudeProcessExitUnprovenError,
+  ClaudeSessionObservationError,
+  type ProfileAuthority,
+} from "./ports";
 
 const CONFIG_DIR = "/var/hra/profiles/acct/claude";
 const PROJECT_ROOT = "/var/hra/projects/demo";
+const ADOPTED_PROVIDER_THREAD_ID = "726b1b3d-ed97-4b55-9904-e58fa7d7eb45";
+const ADOPTED_TITLE = "Existing Claude conversation";
+const PROCESS_IDENTITY: ClaudeProcessIdentity = Object.freeze({
+  pid: 8_123,
+  pidDomain: "darwin",
+  procStart: "Fri Sep  4 12:00:00 2026",
+});
 
 const authority: ProfileAuthority = {
   codexHome: "/var/hra/profiles/acct/codex",
@@ -31,6 +45,11 @@ const authority: ProfileAuthority = {
 
 class FakeClaudeProcess implements ClaudeProcess {
   readonly written: string[] = [];
+  readonly signals: string[] = [];
+  terminated = false;
+  readonly identity: Promise<ClaudeProcessIdentity>;
+  readonly #ignoreTerm: boolean;
+  readonly #ignoreKill: boolean;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
@@ -38,7 +57,14 @@ class FakeClaudeProcess implements ClaudeProcess {
   readonly stdout: AsyncIterable<Uint8Array>;
   readonly stderr: AsyncIterable<Uint8Array> = { async *[Symbol.asyncIterator]() { /* silent */ } };
 
-  constructor() {
+  constructor(options: Readonly<{
+    identity?: Promise<ClaudeProcessIdentity>;
+    ignoreKill?: boolean;
+    ignoreTerm?: boolean;
+  }> = {}) {
+    this.identity = options.identity ?? Promise.resolve(PROCESS_IDENTITY);
+    this.#ignoreKill = options.ignoreKill ?? false;
+    this.#ignoreTerm = options.ignoreTerm ?? false;
     this.exited = new Promise((resolve) => { this.#resolveExit = resolve; });
     const queue: Uint8Array[] = [];
     let waiter: (() => void) | undefined;
@@ -66,11 +92,22 @@ class FakeClaudeProcess implements ClaudeProcess {
   }
 
   terminate(): void {
+    this.terminated = true;
+    this.signals.push("SIGTERM");
+    if (this.#ignoreTerm) return;
+    this.end();
+  }
+
+  end(): void {
     this.#finish?.();
     this.#resolveExit?.(0);
   }
 
-  forceTerminate(): void { this.terminate(); }
+  forceTerminate(): void {
+    this.terminated = true;
+    this.signals.push("SIGKILL");
+    if (!this.#ignoreKill) this.end();
+  }
 }
 
 const runtime: PinnedClaudeRuntime = {
@@ -86,18 +123,38 @@ const settle = async (): Promise<void> => {
   await new Promise((resolve) => { setTimeout(resolve, 1); });
 };
 
+type InitializationOverride = Readonly<{
+  model?: string;
+  permissionMode?: string;
+  providerThreadId?: string;
+  version?: string;
+}>;
+
 const harness = (options: {
   clientShutdownSettlementMs?: number;
   clientShutdownTermGraceMs?: number;
   configDirFor?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["configDirFor"];
-  isCurrent?: (authority: ProfileAuthority) => boolean;
+  configHome?: "isolated" | "personal";
+  exitAfterInitialization?: boolean;
+  initialization?: InitializationOverride | "silent";
+  initializationTimeoutMs?: number;
+  isCurrent?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["isCurrent"];
+  onFact?: (
+    authority: ProfileAuthority,
+    fact: ClaudeSessionFact,
+  ) => void | Promise<void>;
+  processIdentity?: ClaudeProcessIdentity | "reject";
+  processIgnoresKill?: boolean;
+  processIgnoresTerm?: boolean;
   processFactory?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["processFactory"];
   readAuthStatus?: ClaudeAuthStatusReader;
   resolveRuntime?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["resolveRuntime"];
 } = {}) => {
   const facts: ClaudeSessionFact[] = [];
   const processes: FakeClaudeProcess[] = [];
+  const launches: Parameters<ClaudeProcessFactory>[0][] = [];
   const manager = new PinnedClaudeRuntimeManager({
+    configHome: options.configHome ?? "isolated",
     configDirFor: options.configDirFor ?? (() => CONFIG_DIR),
     ...(options.clientShutdownSettlementMs === undefined
       ? {}
@@ -105,18 +162,55 @@ const harness = (options: {
     ...(options.clientShutdownTermGraceMs === undefined
       ? {}
       : { clientShutdownTermGraceMs: options.clientShutdownTermGraceMs }),
+    ...(options.initializationTimeoutMs === undefined
+      ? {}
+      : { initializationTimeoutMs: options.initializationTimeoutMs }),
     isCurrent: options.isCurrent ?? (() => true),
     now: () => 1_700_000_000_000,
-    observer: { fact: (_authority, fact) => { facts.push(fact); } },
-    processFactory: options.processFactory ?? (() => {
-      const process = new FakeClaudeProcess();
+    observer: {
+      fact: (factAuthority, fact) => {
+        facts.push(fact);
+        return options.onFact?.(factAuthority, fact);
+      },
+    },
+    processFactory: (launch) => {
+      launches.push(launch);
+      const process = options.processFactory?.(launch) ?? new FakeClaudeProcess({
+          identity: options.processIdentity === "reject"
+            ? Promise.reject(new Error("identity unavailable"))
+            : Promise.resolve(options.processIdentity ?? PROCESS_IDENTITY),
+          ...(options.processIgnoresKill === undefined
+            ? {}
+            : { ignoreKill: options.processIgnoresKill }),
+          ...(options.processIgnoresTerm === undefined
+            ? {}
+            : { ignoreTerm: options.processIgnoresTerm }),
+        });
+      if (!(process instanceof FakeClaudeProcess)) return process;
       processes.push(process);
+      if (options.initialization !== "silent") {
+        const override = options.initialization ?? {};
+        const requestedId = launch.argv.at(-1);
+        if (requestedId === undefined) throw new Error("expected a session-bound Claude argv");
+        queueMicrotask(() => {
+          process.emit({
+            claude_code_version: override.version ?? CLAUDE_PIN,
+            model: override.model ?? CLAUDE_PIN_MODEL,
+            permissionMode: override.permissionMode ?? "default",
+            session_id: override.providerThreadId ?? requestedId,
+            subtype: "init",
+            tools: ["Bash"],
+            type: "system",
+          });
+          if (options.exitAfterInitialization === true) process.end();
+        });
+      }
       return process;
-    }),
+    },
     ...(options.readAuthStatus === undefined ? {} : { readAuthStatus: options.readAuthStatus }),
     resolveRuntime: options.resolveRuntime ?? (async () => runtime),
   });
-  return { facts, manager, processes };
+  return { facts, launches, manager, processes };
 };
 
 const signal = (): AbortSignal => new AbortController().signal;
@@ -466,7 +560,7 @@ describe("pinned Claude runtime manager", () => {
     });
 
     await expect(manager.startSession({ authority, review, signal: signal() }))
-      .rejects.toThrow("child cleanup was incomplete");
+      .rejects.toBeInstanceOf(ClaudeProcessExitUnprovenError);
     expect(launches).toBe(1);
     expect(terminations).toEqual(["terminate", "force"]);
 
@@ -658,7 +752,7 @@ describe("pinned Claude runtime manager", () => {
   });
 
   test("reviews, starts, runs, and completes one full turn", async () => {
-    const { facts, manager, processes } = harness();
+    const { facts, launches, manager, processes } = harness();
     const review = await manager.reviewSessionStart({
       authority,
       fast: false,
@@ -669,8 +763,8 @@ describe("pinned Claude runtime manager", () => {
     expect(review.kind).toBe("session_start");
     expect(effectiveClaudeRuntimeProfileSchema.parse(review.effectiveRuntimeProfile)).toEqual({
       claudeVersion: CLAUDE_PIN,
+      configHome: "isolated",
       inputFormat: "stream-json",
-      isolatedConfigDir: true,
       model: CLAUDE_PIN_MODEL,
       observedAt: 1_700_000_000_000,
       outputFormat: "stream-json",
@@ -685,6 +779,13 @@ describe("pinned Claude runtime manager", () => {
     const started = await manager.startSession({ authority, review, signal: signal() });
     expect(started.status).toBe("idle");
     expect(started.projectRoot).toBe(PROJECT_ROOT);
+    expect(launches[0]?.launch).toBe("create");
+    expect(launches[0]?.argv.slice(-2)).toEqual(["--session-id", started.providerThreadId]);
+    await expect(manager.readSessionProcessIdentity({
+      authority,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    })).resolves.toEqual(PROCESS_IDENTITY);
 
     const turnId = await startTurn(manager, started.providerThreadId, "say ok");
     const process = processes[0];
@@ -702,15 +803,6 @@ describe("pinned Claude runtime manager", () => {
 
     process.emit(
       {
-        claude_code_version: CLAUDE_PIN,
-        model: CLAUDE_PIN_MODEL,
-        permissionMode: "default",
-        session_id: "sess",
-        subtype: "init",
-        tools: ["Bash"],
-        type: "system",
-      },
-      {
         message: {
           content: [{ text: "ok", type: "text" }],
           id: "msg_1",
@@ -719,7 +811,7 @@ describe("pinned Claude runtime manager", () => {
           type: "message",
         },
         parent_tool_use_id: null,
-        session_id: "sess",
+        session_id: started.providerThreadId,
         type: "assistant",
       },
       {
@@ -727,7 +819,7 @@ describe("pinned Claude runtime manager", () => {
         is_error: false,
         num_turns: 1,
         result: "ok",
-        session_id: "sess",
+        session_id: started.providerThreadId,
         stop_reason: "end_turn",
         terminal_reason: "completed",
         type: "result",
@@ -738,7 +830,6 @@ describe("pinned Claude runtime manager", () => {
 
     expect(facts.map((fact) => fact.type)).toEqual([
       "turnStarted",
-      "sessionBootstrapped",
       "assistantDelta",
       "tokenUsageUpdated",
       "turnCompleted",
@@ -753,6 +844,187 @@ describe("pinned Claude runtime manager", () => {
     expect(observation.projection.status).toBe("idle");
     expect(observation.projection.activeTurnId).toBeUndefined();
     await manager.close();
+  });
+
+  test("passes a reserved session id directly to Claude before process admission", async () => {
+    const { launches, manager } = harness();
+    const review = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    const admittedIdentities: ClaudeProcessIdentity[] = [];
+    const started = await manager.startSession({
+      authority,
+      admitProcessIdentity: (identity) => {
+        admittedIdentities.push(identity);
+        return Promise.resolve();
+      },
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      review,
+      signal: signal(),
+    });
+
+    expect(started.providerThreadId).toBe(ADOPTED_PROVIDER_THREAD_ID);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]?.argv).toEqual([
+      ...runtime.argv,
+      "--session-id",
+      ADOPTED_PROVIDER_THREAD_ID,
+    ]);
+    expect(admittedIdentities).toEqual([PROCESS_IDENTITY]);
+    await manager.close();
+  });
+
+  test("keeps the initialized child unobservable while process admission is pending", async () => {
+    const { manager, processes } = harness();
+    const review = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    let markCallbackEntered!: () => void;
+    const callbackEntered = new Promise<void>((resolve) => {
+      markCallbackEntered = resolve;
+    });
+    let releaseCallback!: () => void;
+    const callbackRelease = new Promise<void>((resolve) => {
+      releaseCallback = resolve;
+    });
+    let callbackIdentity: ClaudeProcessIdentity | undefined;
+    const starting = manager.startSession({
+      authority,
+      admitProcessIdentity: async (identity) => {
+        callbackIdentity = identity;
+        markCallbackEntered();
+        await callbackRelease;
+      },
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      review,
+      signal: signal(),
+    });
+
+    await callbackEntered;
+    let startSettled = false;
+    void starting.then(
+      () => { startSettled = true; },
+      () => { startSettled = true; },
+    );
+    await Promise.resolve();
+    try {
+      expect(callbackIdentity).toEqual(PROCESS_IDENTITY);
+      expect(startSettled).toBe(false);
+      expect(processes).toHaveLength(1);
+      expect(processes[0]?.terminated).toBe(false);
+      await expect(manager.observeSession({
+        authority,
+        providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+        signal: signal(),
+      })).rejects.toMatchObject({ reason: "not_running" });
+    } finally {
+      releaseCallback();
+    }
+
+    const started = await starting;
+    expect(started.providerThreadId).toBe(ADOPTED_PROVIDER_THREAD_ID);
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+    })).resolves.toMatchObject({
+      projection: { providerThreadId: ADOPTED_PROVIDER_THREAD_ID },
+    });
+    await manager.close();
+  });
+
+  test("rejects process admission failure only after proving child cleanup", async () => {
+    const { manager, processes } = harness();
+    const review = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    const admissionFailure = new Error("durable process custody rejected");
+    await expect(manager.startSession({
+      authority,
+      admitProcessIdentity: () => Promise.reject(admissionFailure),
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      review,
+      signal: signal(),
+    })).rejects.toBe(admissionFailure);
+
+    const rejectedProcess = processes[0];
+    if (rejectedProcess === undefined) throw new Error("expected a rejected child process");
+    expect(rejectedProcess.signals).toEqual(["SIGTERM"]);
+    await expect(rejectedProcess.exited).resolves.toBe(0);
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+    })).rejects.toMatchObject({ reason: "not_running" });
+
+    const retryReview = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    await expect(manager.startSession({
+      authority,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      review: retryReview,
+      signal: signal(),
+    })).resolves.toMatchObject({ providerThreadId: ADOPTED_PROVIDER_THREAD_ID });
+    expect(processes).toHaveLength(2);
+    await manager.close();
+  });
+
+  test("retains typed unproven-exit custody when admission cleanup cannot prove exit", async () => {
+    const { manager, processes } = harness({
+      processIgnoresKill: true,
+      processIgnoresTerm: true,
+      clientShutdownSettlementMs: 5,
+      clientShutdownTermGraceMs: 5,
+    });
+    const review = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    await expect(manager.startSession({
+      authority,
+      admitProcessIdentity: () => Promise.reject(new Error("durable process custody rejected")),
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      review,
+      signal: signal(),
+    })).rejects.toBeInstanceOf(ClaudeProcessExitUnprovenError);
+
+    expect(processes[0]?.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+    })).rejects.toMatchObject({ reason: "not_running" });
+    await expect(manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toThrow("still unjoined");
+    expect(processes).toHaveLength(1);
+
+    processes[0]?.end();
+    await expect(manager.close()).resolves.toBeUndefined();
   });
 
   test("refuses a preset the Claude provider does not support", async () => {
@@ -985,6 +1257,415 @@ describe("pinned Claude runtime manager", () => {
       providerThreadId,
       signal: signal(),
     })).rejects.toThrow("another authority");
+    await manager.close();
+  });
+
+  test("a stale generation cannot release a replacement session controller", async () => {
+    const { manager, processes } = harness();
+    const providerThreadId = await startSession(manager);
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+
+    await expect(manager.endSession({
+      authority: { ...authority, generation: authority.generation - 1 },
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: signal(),
+    })).resolves.toMatchObject({ projection: { providerThreadId } });
+    expect(process.signals).toEqual([]);
+    await manager.close();
+  });
+
+  test("claims one non-live durable session with full runtime authority", async () => {
+    const { launches, manager, processes } = harness({ configHome: "personal" });
+    const claimed = await manager.claimSession({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+      sourceLiveness: "not_live",
+      title: ADOPTED_TITLE,
+    });
+    expect(claimed).toMatchObject({
+      effectiveRuntimeProfile: { configHome: "personal", permissionMode: "default" },
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      status: "idle",
+      title: ADOPTED_TITLE,
+    });
+    expect(launches[0]?.launch).toBe("resume");
+    expect(launches[0]?.argv.slice(-2)).toEqual(["--resume", ADOPTED_PROVIDER_THREAD_ID]);
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+    })).resolves.toMatchObject({ resumed: true });
+
+    const turnId = await startTurn(manager, ADOPTED_PROVIDER_THREAD_ID, "continue");
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected resumed process");
+    expect(typeof turnId).toBe("string");
+    expect(JSON.parse(process.written[0] ?? "") as unknown).toMatchObject({ type: "user" });
+    await expect(manager.readSession({
+      authority,
+      detail: false,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+    })).resolves.toMatchObject({ title: ADOPTED_TITLE });
+
+    // A second local writer is refused instead of spawning a duplicate copy.
+    await expect(manager.claimSession({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+      sourceLiveness: "not_live",
+      title: ADOPTED_TITLE,
+    })).rejects.toThrow("already has a runtime owner");
+    expect(processes).toHaveLength(1);
+    await manager.close();
+  });
+
+  test("validates and bounds the durable title before resuming Claude", async () => {
+    const invalid = harness();
+    await expect(invalid.manager.claimSession({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+      sourceLiveness: "not_live",
+      title: 42 as never,
+    })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(invalid.processes).toHaveLength(0);
+    await invalid.manager.close();
+
+    const bounded = harness();
+    const claimed = await bounded.manager.claimSession({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+      sourceLiveness: "not_live",
+      title: `Existing ${"é".repeat(100)}`,
+    });
+    expect(claimed.title.startsWith("Existing ")).toBe(true);
+    expect(new TextEncoder().encode(claimed.title).byteLength).toBeLessThanOrEqual(120);
+    await bounded.manager.close();
+  });
+
+  test("rejects the former daemon-fence shortcut without spawning a writer", async () => {
+    const prior = harness();
+    const providerThreadId = await startSession(prior.manager);
+    await prior.manager.close();
+
+    const replacement = harness();
+    await expect(replacement.manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toBeInstanceOf(ClaudeSessionObservationError);
+    await expect(replacement.manager.claimSession({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      providerThreadId,
+      signal: signal(),
+      sourceLiveness: "prior_hra_daemon_fenced" as never,
+      title: ADOPTED_TITLE,
+    })).rejects.toThrow("source process is not live");
+    expect(replacement.launches).toHaveLength(0);
+    await replacement.manager.close();
+  });
+
+  test("refuses a claim without the closed non-live proof", async () => {
+    const { manager, processes } = harness();
+    await expect(manager.claimSession({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+      // Exercises the runtime boundary against an untyped or stale caller.
+      sourceLiveness: "live" as never,
+      title: ADOPTED_TITLE,
+    })).rejects.toThrow("source process is not live");
+    expect(processes).toHaveLength(0);
+    await manager.close();
+  });
+
+  test("fails closed and cleans up every mismatched initialization identity", async () => {
+    const mismatches: readonly InitializationOverride[] = [
+      { providerThreadId: "069d2fc6-b09a-4ced-8932-14b1229cc043" },
+      { version: "2.1.259" },
+      { model: "claude-fable-5" },
+      { permissionMode: "bypassPermissions" },
+    ];
+    for (const initialization of mismatches) {
+      const { manager, processes } = harness({ initialization });
+      await expect(manager.claimSession({
+        authority,
+        fast: false,
+        preset: "fable-max",
+        projectRoot: PROJECT_ROOT,
+        providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+        signal: signal(),
+        sourceLiveness: "not_live",
+        title: ADOPTED_TITLE,
+      })).rejects.toBeInstanceOf(Error);
+      expect(processes[0]?.terminated).toBe(true);
+      await expect(manager.observeSession({
+        authority,
+        providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+        signal: signal(),
+      })).rejects.toMatchObject({ reason: "not_running" });
+      await manager.close();
+    }
+  });
+
+  test("fails closed and reaps a child whose exact process identity is unavailable", async () => {
+    const { manager, processes } = harness({ processIdentity: "reject" });
+    await expect(manager.claimSession({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+      sourceLiveness: "not_live",
+      title: ADOPTED_TITLE,
+    })).rejects.toThrow("identity unavailable");
+    expect(processes[0]?.terminated).toBe(true);
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+    })).rejects.toBeInstanceOf(ClaudeSessionObservationError);
+    await manager.close();
+  });
+
+  test("retains an unproven admission cleanup fence until manager close can retry", async () => {
+    const { manager, processes } = harness({
+      processIdentity: "reject",
+      processIgnoresKill: true,
+      processIgnoresTerm: true,
+      clientShutdownSettlementMs: 5,
+      clientShutdownTermGraceMs: 5,
+    });
+    const claim = (): ReturnType<PinnedClaudeRuntimeManager["claimSession"]> =>
+      manager.claimSession({
+        authority,
+        fast: false,
+        preset: "fable-max",
+        projectRoot: PROJECT_ROOT,
+        providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+        signal: signal(),
+        sourceLiveness: "not_live",
+        title: ADOPTED_TITLE,
+      });
+    await expect(claim()).rejects.toThrow("exit could not be proven");
+    await expect(claim()).rejects.toThrow("still unjoined");
+    expect(processes).toHaveLength(1);
+
+    processes[0]?.end();
+    await expect(manager.close()).resolves.toBeUndefined();
+  });
+
+  test("does not admit a process that reaches EOF immediately after initialization", async () => {
+    const { manager, processes } = harness({ exitAfterInitialization: true });
+    await expect(startSession(manager)).rejects.toMatchObject({ code: "PROCESS_EXITED" });
+    await expect(processes[0]?.exited).resolves.toBe(0);
+    await manager.close();
+  });
+
+  test("evicts and reports one committed process that exits", async () => {
+    const { facts, manager, processes } = harness();
+    const providerThreadId = await startSession(manager);
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+    process.end();
+    await settle();
+
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toBeInstanceOf(ClaudeSessionObservationError);
+    await expect(manager.readSessionProcessIdentity({
+      authority,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow(/no longer live|cleanup is unresolved/u);
+    expect(facts.filter((fact) => fact.type === "providerDisconnected")).toHaveLength(1);
+    await manager.close();
+  });
+
+  test("drops late disconnect and turn facts from a replaced Claude connection", async () => {
+    const evictionSentinel = "hra_test_evict_old_claude_connection";
+    // The spy delegates with `.call(this, ...)`, preserving the exact assembler instance.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const originalApply = ClaudeDeltaAssembler.prototype.apply;
+    const applySpy = spyOn(ClaudeDeltaAssembler.prototype, "apply").mockImplementation(function (
+      this: ClaudeDeltaAssembler,
+      event: Parameters<ClaudeDeltaAssembler["apply"]>[0],
+    ): ReturnType<ClaudeDeltaAssembler["apply"]> {
+      if (event.type === "protocol_notice" && event.event === evictionSentinel) {
+        return [{ type: "providerDisconnected", reason: "process_exit" }];
+      }
+      return originalApply.call(this, event);
+    });
+    let resolveInitialDisconnect!: () => void;
+    const initialDisconnect = new Promise<void>((resolve) => {
+      resolveInitialDisconnect = resolve;
+    });
+    const value = harness({
+      onFact: (_factAuthority, fact) => {
+        if (fact.type === "providerDisconnected") resolveInitialDisconnect();
+      },
+    });
+    let oldProcess: FakeClaudeProcess | undefined;
+    try {
+      const providerThreadId = await startSession(value.manager);
+      const oldObservation = await value.manager.observeSession({
+        authority,
+        providerThreadId,
+        signal: signal(),
+      });
+      await startTurn(value.manager, providerThreadId, "old connection turn");
+      oldProcess = value.processes[0];
+      if (oldProcess === undefined) throw new Error("expected the old Claude process");
+
+      // This test-only sentinel reaches the manager through the real stream
+      // client callback and models the disconnect that first evicts the old
+      // runtime. Its process stays readable so later old-client callbacks can
+      // race a newly admitted owner for the same provider thread.
+      oldProcess.emit({ type: evictionSentinel });
+      await initialDisconnect;
+      await expect(value.manager.observeSession({
+        authority,
+        providerThreadId,
+        signal: signal(),
+      })).rejects.toBeInstanceOf(ClaudeSessionObservationError);
+
+      // Disconnect fences provider effects immediately, but the exact old
+      // client remains owned until its process and output drains are joined.
+      await value.manager.endSession({ authority, providerThreadId, signal: signal() });
+
+      await value.manager.claimSession({
+        authority,
+        fast: false,
+        preset: "fable-max",
+        projectRoot: PROJECT_ROOT,
+        providerThreadId,
+        signal: signal(),
+        sourceLiveness: "not_live",
+        title: ADOPTED_TITLE,
+      });
+      const replacement = await value.manager.observeSession({
+        authority,
+        providerThreadId,
+        signal: signal(),
+      });
+      expect(replacement.connectionId).not.toBe(oldObservation.connectionId);
+      const factsBeforeLateCallbacks = [...value.facts];
+
+      oldProcess.emit({
+        message: {
+          content: [{ text: "stale output from the old connection", type: "text" }],
+          id: "stale-old-connection-message",
+          role: "assistant",
+          type: "message",
+        },
+        parent_tool_use_id: null,
+        session_id: providerThreadId,
+        type: "assistant",
+      });
+      // The old client's natural exit publishes abandoned-turn mutations and
+      // then a second providerDisconnected through its captured connection.
+      oldProcess.end();
+      await settle();
+
+      await expect(value.manager.observeSession({
+        authority,
+        providerThreadId,
+        signal: signal(),
+      })).resolves.toMatchObject({
+        connectionId: replacement.connectionId,
+        projection: {
+          messages: [],
+          status: "idle",
+          title: ADOPTED_TITLE,
+        },
+        resumed: true,
+      });
+      expect(value.facts).toEqual(factsBeforeLateCallbacks);
+      expect(value.facts.filter((fact) => fact.type === "providerDisconnected"))
+        .toHaveLength(1);
+      expect(value.processes).toHaveLength(2);
+    } finally {
+      oldProcess?.end();
+      await value.manager.close();
+      applySpy.mockRestore();
+    }
+  });
+
+  test("retains ambiguous close custody and permits an exact release retry", async () => {
+    const { manager, processes } = harness({
+      processIgnoresKill: true,
+      processIgnoresTerm: true,
+      clientShutdownSettlementMs: 5,
+      clientShutdownTermGraceMs: 5,
+    });
+    const providerThreadId = await startSession(manager);
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+
+    await expect(manager.endSession({ authority, providerThreadId, signal: signal() }))
+      .rejects.toMatchObject({ code: "TIMEOUT" });
+    await expect(manager.readSessionProcessIdentity({
+      authority,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("cleanup is unresolved");
+
+    process.end();
+    await expect(manager.endSession({ authority, providerThreadId, signal: signal() }))
+      .resolves.toBeUndefined();
+    await expect(manager.observeSession({ authority, providerThreadId, signal: signal() }))
+      .rejects.toBeInstanceOf(ClaudeSessionObservationError);
+    expect(process.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM"]);
+    await manager.close();
+  });
+
+  test("times out and cleans up a resumed process that never initializes", async () => {
+    const { manager, processes } = harness({
+      initialization: "silent",
+      initializationTimeoutMs: 1,
+    });
+    await expect(manager.claimSession({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+      sourceLiveness: "not_live",
+      title: ADOPTED_TITLE,
+    })).rejects.toMatchObject({ code: "TIMEOUT" });
+    expect(processes[0]?.terminated).toBe(true);
     await manager.close();
   });
 

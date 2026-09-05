@@ -8,6 +8,7 @@ type: index
 ## Plans
 
 - [HRA v1](plans/hra-v1.md)
+- [Personal-home session adoption](plans/session-adoption.md)
 - [HRA v2](plans/hra-v2.md)
 
 ## Notes
@@ -28,6 +29,8 @@ type: index
 ### Plans
 
 - [[plans/hra-v1|HRA v1]] — Status: in-progress. Release plan for a persistent Codex control plane for humans and agents, with isolated accounts, bounded work coordination, durable interactions and event streams, device…
+
+- [[plans/session-adoption|Personal-home session adoption]] — Status: in-progress. Delivery plan for adopting personal Codex and Claude Code sessions with ordinary HRA authority and fail-closed account recovery.
 
 - [[plans/hra-v2|HRA v2]] — Status: proposed. Provider-neutral control plane for humans and agent swarms: CLI contract v2, web surface, decomposition, typed routing, Claude provider, public surface rewrite.
 

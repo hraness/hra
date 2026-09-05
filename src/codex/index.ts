@@ -1,14 +1,23 @@
-export { parseCodexAutomationToml, readCodexAutomations } from "./automations.ts";
+export {
+  parseCodexAutomationToml,
+  readCodexAutomationAuthority,
+  readCodexAutomations,
+} from "./automations.ts";
 export type {
   CodexAutomation,
+  CodexAutomationAuthorityEntry,
+  CodexAutomationAuthorityRequest,
+  CodexAutomationAuthorityScan,
   CodexAutomationDiagnostic,
   CodexAutomationScan,
+  ReadCodexAutomationAuthorityInput,
   ReadCodexAutomationsInput,
 } from "./automations.ts";
 export { CodexAppServerClient } from "./client.ts";
 export type {
   CodexAppServerClientOptions,
   DiscoverCapabilitiesOptions,
+  ResumeThreadInput,
   StartThreadInput,
   StartTurnInput,
   ThreadListOptions,
@@ -88,6 +97,7 @@ export type {
   ResolvedPreset,
   ThreadPage,
   ThreadStartResult,
+  ThreadUnsubscribeResult,
   ThreadItemPage,
   TurnPage,
   TurnStartResult,

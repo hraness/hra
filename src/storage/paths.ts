@@ -17,6 +17,26 @@ export type StatePaths = {
   switchLock: string;
 };
 
+/**
+ * The provider homes owned by the current OS user rather than by an HRA
+ * profile. Merely resolving these paths grants no read or write authority;
+ * the session-adoption policy and the provider-specific custody check do that.
+ */
+export type PersonalProviderPaths = Readonly<{
+  codexHome: string;
+  claudeConfigDir: string;
+}>;
+
+export function personalProviderPaths(
+  homeDirectory: string = homedir(),
+): PersonalProviderPaths {
+  const home = resolve(homeDirectory);
+  return {
+    claudeConfigDir: join(home, ".claude"),
+    codexHome: join(home, ".codex"),
+  };
+}
+
 export function resolveStatePaths(input: { homeDirectory?: string; platform?: NodeJS.Platform; rootDirectory?: string } = {}): StatePaths {
   const home = resolve(input.homeDirectory ?? homedir());
   const platform = input.platform ?? process.platform;
