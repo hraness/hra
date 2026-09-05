@@ -18883,35 +18883,10 @@ export class StateStore {
              WHERE s.profile_id=p.id AND b.state IN ('active','detaching')
          )`,
       ).run();
-      // Releasing jobs survive a daemon crash. Carry their exact Claude
-      // process custody forward with the profile so startup can finish the
-      // same release instead of either losing it or blocking generation roll.
-      this.#database.query(
-        `UPDATE session_claude_process_authorities
-         SET profile_generation=profile_generation+1,revision=revision+1
-         WHERE state!='released' AND EXISTS(
-           SELECT 1 FROM profiles p
-           WHERE p.id=session_claude_process_authorities.profile_id
-             AND p.state!='removed' AND p.process_generation>0
-             AND p.process_generation=session_claude_process_authorities.profile_generation
-             AND (
-               EXISTS(
-                 SELECT 1 FROM profile_personal_authority_revocations g
-                 WHERE g.profile_id=p.id
-                   AND g.profile_generation=p.process_generation
-                   AND g.state='releasing'
-               )
-               OR EXISTS(
-                 SELECT 1 FROM provider_runtime_account_revocations r
-                 WHERE r.profile_id=p.id
-                   AND r.profile_generation=p.process_generation
-                   AND r.provider='claude'
-                   AND r.runtime_scope=session_claude_process_authorities.runtime_scope
-                   AND r.state='releasing'
-               )
-             )
-         )`,
-      ).run();
+      // Any unreleased Claude process remains bound to the generation that
+      // launched it. Startup must prove that exact PID/start identity dead
+      // and complete its release before this transaction can advance the
+      // profile; the generation guard below otherwise aborts atomically.
       this.#database.query(
         `UPDATE profile_personal_authority_revocations
          SET profile_generation=profile_generation+1,revision=revision+1,

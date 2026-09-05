@@ -58,7 +58,7 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-const codexProviderAccountKey = `v1:codex:${sha256("cloud-adoption-account")}`;
+const codexProviderAccountKey = `v1:codex:${sha256("person@example.com")}`;
 
 class FakeCodex implements CodexRuntimePort {
   readonly provider = "codex" as const;

@@ -97,6 +97,8 @@ class WorkRuntime implements CodexRuntimePort {
     return { signedIn: true, email: "work-agent@example.com", plan: "Plus" };
   }
 
+  async releaseOwnedAuthority(): Promise<void> {}
+
   async reviewSessionStart(
     input: Parameters<CodexRuntimePort["reviewSessionStart"]>[0],
   ): Promise<RuntimeStartReview> {
