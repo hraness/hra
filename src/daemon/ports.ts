@@ -142,6 +142,20 @@ export class CodexSessionObservationError extends Error {
   }
 }
 
+/**
+ * A Codex claim failed after it could have acquired a provider subscription,
+ * and neither an exact unsubscribe nor retirement of that connection proved
+ * the controller was released. Durable claiming authority must survive this
+ * error; every other `claimSession` rejection proves that no controller from
+ * the failed attempt remains.
+ */
+export class CodexClaimReleaseUnprovenError extends Error {
+  constructor(options?: ErrorOptions) {
+    super("A failed Codex session claim could not prove controller release.", options);
+    this.name = "CodexClaimReleaseUnprovenError";
+  }
+}
+
 export type ClaudeSessionClaimProof = "not_live";
 
 /**
@@ -188,6 +202,8 @@ export type CodexSessionPage = {
 export interface SessionRuntimePort<Profile> {
   readonly provider: Provider;
   reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
+  /** Releases a review that never reached its matching start effect. */
+  discardRuntimeReview(review: RuntimeStartReviewOf<Profile>): void;
   startSession(input: {
     authority: ProfileAuthority;
     /** Persists exact Claude child custody before that child is admitted. */
@@ -283,6 +299,16 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
     signal: AbortSignal;
   }): Promise<ClaudeProcessIdentity>;
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
+  /**
+   * Rebinds live, quiescent Claude processes when only the sibling Codex
+   * account generation changes. The daemon calls this synchronously after
+   * the durable generation CAS, before another provider fact can run.
+   */
+  rebindProfileAuthority(input: {
+    profileId: ProfileId;
+    expectedGeneration: number;
+    nextGeneration: number;
+  }): void;
   pinnedVersion(): string;
   /**
    * The exact durable authority one pending Claude control request binds.
@@ -332,6 +358,16 @@ export interface CodexRuntimePort extends SessionRuntimePort<EffectiveRuntimePro
     cursor?: string;
     signal: AbortSignal;
   }): Promise<CodexSessionPage>;
+  /**
+   * Reads one exact thread's bounded metadata without resuming, subscribing,
+   * or creating session observation authority. Personal discovery uses this
+   * only to reach scheduled-task targets outside recency-sorted list pages.
+   */
+  readSessionMetadata?(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+    signal: AbortSignal,
+  ): Promise<CodexSessionProjection>;
   rename(input: { authority: ProfileAuthority; providerThreadId: string; name: string; signal: AbortSignal }): Promise<void>;
   inspectTurn(input: { authority: ProfileAuthority; providerThreadId: string; turnId: string; signal: AbortSignal }): Promise<unknown>;
   inspectInteractionAuthority(input: {
@@ -422,6 +458,7 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   listSessions(): Promise<never> { return Promise.reject(this.#unavailable()); }
   claimSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  discardRuntimeReview(): void {}
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -478,7 +515,9 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
   claimSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSessionProcessIdentity(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  rebindProfileAuthority(): void {}
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  discardRuntimeReview(): void {}
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }

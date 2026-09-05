@@ -21,6 +21,7 @@ import {
   projectBoundedThread,
   projectUtf8Text,
 } from "./codex-runtime-adapter";
+import { CodexClaimReleaseUnprovenError } from "./ports";
 import type { CodexAccountProjection, CodexSessionObservationError, ProfileAuthority } from "./ports";
 
 const authority = {
@@ -391,6 +392,42 @@ describe("PinnedCodexRuntimeManager", () => {
     await manager.close();
   });
 
+  test("reports unproven claim release when an indeterminate resume cannot retire its connection", async () => {
+    const resumeFailure = new IndeterminateCodexEffectError("thread/resume", 18);
+    const closeFailure = new Error("Synthetic failed retirement after indeterminate resume.");
+    let closeCalls = 0;
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000018",
+      resumeThread: async () => { throw resumeFailure; },
+      close: async () => {
+        closeCalls += 1;
+        if (closeCalls === 1) throw closeFailure;
+      },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      allowSameGenerationRelaunchAfterProviderDisconnect: true,
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    const rejection = await manager.claimSession({
+      authority,
+      providerThreadId: "thread-resume-release-unproven",
+      projectRoot: "/workspace/project",
+      preset: "high",
+      fast: false,
+      signal: new AbortController().signal,
+    }).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(CodexClaimReleaseUnprovenError);
+    expect((rejection as Error).cause).toBeInstanceOf(AggregateError);
+    expect(closeCalls).toBe(1);
+
+    await manager.close();
+    expect(closeCalls).toBe(2);
+  });
+
   test("caches a determinate resume rejection without retiring or retrying the client", async () => {
     let resumeCalls = 0;
     let readCalls = 0;
@@ -548,14 +585,24 @@ describe("PinnedCodexRuntimeManager", () => {
 
   test("claim rejects a resumed thread mismatch instead of accepting foreign custody", async () => {
     const requestedThreadId = "thread-personal-requested";
+    const resumedThreadId = "thread-personal-other";
+    const unsubscribeCalls: string[] = [];
+    let closeCalls = 0;
     const fake = {
       state: "ready",
       connectionId: "71000000-0000-4000-8000-000000000007",
       resumeThread: async () => ({
         authority: { profileId: authority.id, processGeneration: authority.generation },
-        value: makeThread([], "thread-personal-other"),
+        value: makeThread([], resumedThreadId),
       }),
-      close: async () => undefined,
+      unsubscribeThread: async (threadId: string) => {
+        unsubscribeCalls.push(threadId);
+        return {
+          authority: { profileId: authority.id, processGeneration: authority.generation },
+          value: { status: "unsubscribed" as const },
+        };
+      },
+      close: async () => { closeCalls += 1; },
     } as unknown as CodexAppServerClient;
     const manager = createRuntimeManager({
       isCurrent: () => true,
@@ -574,7 +621,284 @@ describe("PinnedCodexRuntimeManager", () => {
       name: "CodexSessionObservationError",
       reason: "thread_mismatch",
     });
+    expect(unsubscribeCalls).toEqual([]);
+    expect(closeCalls).toBe(1);
+    await expect(manager.readAccount({
+      authority,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     await manager.close();
+  });
+
+  test("reports unproven claim release when a mismatched resume cannot retire its connection", async () => {
+    let closeCalls = 0;
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000076",
+      resumeThread: async () => ({
+        authority: { profileId: authority.id, processGeneration: authority.generation },
+        value: makeThread([], "thread-personal-mismatch-foreign"),
+      }),
+      close: async () => {
+        closeCalls += 1;
+        if (closeCalls === 1) throw new Error("Synthetic failed mismatch retirement.");
+      },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    const rejection = await manager.claimSession({
+      authority,
+      providerThreadId: "thread-personal-mismatch-requested",
+      projectRoot: "/workspace/project",
+      preset: "high",
+      fast: false,
+      signal: new AbortController().signal,
+    }).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(CodexClaimReleaseUnprovenError);
+    expect((rejection as Error).cause).toBeInstanceOf(AggregateError);
+    expect(closeCalls).toBe(1);
+
+    await manager.close();
+    expect(closeCalls).toBe(2);
+  });
+
+  test("claim immediately unsubscribes a resumed thread when its metadata read fails", async () => {
+    const providerThreadId = "thread-personal-claim-read-failure";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const readFailure = new CodexError("PROTOCOL_ERROR", "Synthetic metadata read failure.");
+    const events: string[] = [];
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000071",
+      resumeThread: async (threadId: string) => {
+        events.push(`resume:${threadId}`);
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      readThread: async (threadId: string) => {
+        events.push(`read:${threadId}`);
+        throw readFailure;
+      },
+      unsubscribeThread: async (threadId: string) => {
+        events.push(`unsubscribe:${threadId}`);
+        return { authority: providerAuthority, value: { status: "unsubscribed" as const } };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await expect(manager.claimSession({
+      authority,
+      providerThreadId,
+      projectRoot: "/workspace/project",
+      preset: "high",
+      fast: false,
+      signal: new AbortController().signal,
+    })).rejects.toBe(readFailure);
+    expect(events).toEqual([
+      `resume:${providerThreadId}`,
+      `read:${providerThreadId}`,
+      `unsubscribe:${providerThreadId}`,
+    ]);
+    await manager.close();
+  });
+
+  test("claim retires the connection when resumed-thread metadata names another thread", async () => {
+    const providerThreadId = "thread-personal-claim-metadata-mismatch";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const unsubscribeCalls: string[] = [];
+    let closeCalls = 0;
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000072",
+      resumeThread: async (threadId: string) => ({
+        authority: providerAuthority,
+        value: makeThread([], threadId),
+      }),
+      readThread: async () => ({
+        authority: providerAuthority,
+        value: makeThread([], "thread-personal-claim-metadata-other"),
+      }),
+      unsubscribeThread: async (threadId: string) => {
+        unsubscribeCalls.push(threadId);
+        return { authority: providerAuthority, value: { status: "unsubscribed" as const } };
+      },
+      close: async () => { closeCalls += 1; },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await expect(manager.claimSession({
+      authority,
+      providerThreadId,
+      projectRoot: "/workspace/project",
+      preset: "high",
+      fast: false,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({
+      name: "CodexSessionObservationError",
+      reason: "thread_mismatch",
+    });
+    expect(unsubscribeCalls).toEqual([]);
+    expect(closeCalls).toBe(1);
+    await expect(manager.readAccount({
+      authority,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    await manager.close();
+  });
+
+  test("claim immediately unsubscribes a resumed thread when its caller aborts after metadata", async () => {
+    const providerThreadId = "thread-personal-claim-aborted";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const controller = new AbortController();
+    const abortReason = new Error("Synthetic post-resume claim abort.");
+    const unsubscribeCalls: string[] = [];
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000073",
+      resumeThread: async (threadId: string) => ({
+        authority: providerAuthority,
+        value: makeThread([], threadId),
+      }),
+      readThread: async (threadId: string) => {
+        controller.abort(abortReason);
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      unsubscribeThread: async (threadId: string) => {
+        unsubscribeCalls.push(threadId);
+        return { authority: providerAuthority, value: { status: "unsubscribed" as const } };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await expect(manager.claimSession({
+      authority,
+      providerThreadId,
+      projectRoot: "/workspace/project",
+      preset: "high",
+      fast: false,
+      signal: controller.signal,
+    })).rejects.toBe(abortReason);
+    expect(unsubscribeCalls).toEqual([providerThreadId]);
+    await manager.close();
+  });
+
+  test("claim retires the connection when failed-claim unsubscribe is indeterminate", async () => {
+    const providerThreadId = "thread-personal-claim-release-unknown";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const readFailure = new CodexError("PROTOCOL_ERROR", "Synthetic metadata read failure.");
+    let closeCalls = 0;
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000074",
+      resumeThread: async (threadId: string) => ({
+        authority: providerAuthority,
+        value: makeThread([], threadId),
+      }),
+      readThread: async () => {
+        throw readFailure;
+      },
+      unsubscribeThread: async () => {
+        throw new IndeterminateCodexEffectError("thread/unsubscribe", 74);
+      },
+      close: async () => {
+        closeCalls += 1;
+      },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await expect(manager.claimSession({
+      authority,
+      providerThreadId,
+      projectRoot: "/workspace/project",
+      preset: "high",
+      fast: false,
+      signal: new AbortController().signal,
+    })).rejects.toBe(readFailure);
+    expect(closeCalls).toBe(1);
+    await expect(manager.readAccount({
+      authority,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    await manager.close();
+  });
+
+  test("reports unproven claim release when unsubscribe and connection retirement both fail", async () => {
+    const providerThreadId = "thread-personal-claim-release-failed";
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const readFailure = new CodexError("PROTOCOL_ERROR", "Synthetic metadata read failure.");
+    let closeCalls = 0;
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000075",
+      resumeThread: async (threadId: string) => ({
+        authority: providerAuthority,
+        value: makeThread([], threadId),
+      }),
+      readThread: async () => { throw readFailure; },
+      unsubscribeThread: async () => {
+        throw new IndeterminateCodexEffectError("thread/unsubscribe", 75);
+      },
+      close: async () => {
+        closeCalls += 1;
+        if (closeCalls === 1) throw new Error("Synthetic failed claim connection retirement.");
+      },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    const rejection = await manager.claimSession({
+      authority,
+      providerThreadId,
+      projectRoot: "/workspace/project",
+      preset: "high",
+      fast: false,
+      signal: new AbortController().signal,
+    }).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(CodexClaimReleaseUnprovenError);
+    expect((rejection as Error).cause).toBeInstanceOf(AggregateError);
+    expect(closeCalls).toBe(1);
+
+    await manager.close();
+    expect(closeCalls).toBe(2);
   });
 
   test("endSession unsubscribes the exact thread and clears its observation proof", async () => {
@@ -960,6 +1284,49 @@ describe("PinnedCodexRuntimeManager", () => {
       sessions: [{ providerThreadId: "thread-1", title: "Projection test" }],
     });
     expect(requested).toEqual({ cursor: "provider-page-2", limit: 17 });
+    await manager.close();
+  });
+
+  test("reads exact scheduled-target metadata without resuming or observing the thread", async () => {
+    let current = true;
+    let resumeCalls = 0;
+    const reads: Array<Readonly<{ includeTurns: boolean; threadId: string }>> = [];
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const fake = {
+      state: "ready",
+      readThread: async (threadId: string, includeTurns: boolean) => {
+        reads.push({ includeTurns, threadId });
+        if (threadId === "scheduled-stale") current = false;
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      resumeThread: async () => {
+        resumeCalls += 1;
+        throw new Error("metadata discovery must not resume a thread");
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => current,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+    const requestSignal = new AbortController().signal;
+
+    await expect(manager.readSessionMetadata(authority, "scheduled-old", requestSignal))
+      .resolves.toMatchObject({
+        providerThreadId: "scheduled-old",
+        status: "idle",
+        title: "Projection test",
+      });
+    expect(reads).toEqual([{ includeTurns: false, threadId: "scheduled-old" }]);
+    expect(resumeCalls).toBe(0);
+
+    await expect(manager.readSessionMetadata(authority, "scheduled-stale", requestSignal))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(resumeCalls).toBe(0);
     await manager.close();
   });
 

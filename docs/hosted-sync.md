@@ -8,7 +8,7 @@ Never copy retired HRA v0 data, deployment URLs, deploy keys, authentication key
 
 The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. Retired HRA v0 Convex project ID `2680173` and production deployment ID `4677913` remain permanent denylisted safety tombstones; neither may be recreated, renamed into, or selected by this runbook. The current source repository has GitHub repository ID `1343008607`, and the current web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Provider names may change. The team identity and numeric resource IDs do not.
 
-Browser app project. The web app at `app.hra.sh` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, output directory `dist`, and no environment variables: the Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `hra-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.hra.sh`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`.
+Browser app project. The web app at `app.hra.sh` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`. Its tracked ignore command exits nonzero for production so Vercel builds `main` rather than skipping it, while preview deployments remain ignored. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `hra-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.hra.sh`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`.
 
 Live projection. Besides the compact stream of completed turns, the daemon streams the current turn's assistant text (and reasoning summaries only when show-thinking is enabled for the session, default off) to the `detail` stream about once per second in redacted, encrypted batches of at most 8 KiB. Detail chunks carry the `live_tail` retention class: each row expires six hours after it is written, a session keeps at most 200 rows, and the `live_tail_chunks` maintenance category sweeps expired rows behind a detail stream epoch so digest-chain verification of the surviving tail stays valid and both the chunk quota and the per-user `live_chunk` resource counter are released. Raw reasoning is never uploaded.
 
@@ -42,7 +42,7 @@ The operation is safe to replay after a crash or refusal. Exact copies are accep
 
 ## Replace a quarantined current target
 
-Use this exceptional preproduction recovery path only after the exact `approve both` authorization and only when the current default production deployment is unsuitable for bootstrap. It stays inside the current project and never reads, selects, imports, recreates, or modifies a retired v0 resource.
+Use this exceptional preproduction recovery path only when the active task already authorizes hosted delivery and the current default production deployment is unsuitable for bootstrap. It stays inside the current project and never reads, selects, imports, recreates, or modifies a retired v0 resource. The retired `approve both` phrase is not a recurring authorization gate.
 
 Log in with the Convex CLI first. Its global `config.json` must be a regular, single-link, mode-`0600` file. Do not supply a deploy key or deployment selector through an environment variable, `.env`, or `.env.local`. Choose one UUIDv7 replacement ID and one unused absolute evidence path whose existing parent is an invoking-user-owned mode-`0700` directory. Both values remain fixed across the whole transaction.
 
@@ -200,6 +200,66 @@ The helper reads at most 8 KiB, rejects a terminal descriptor, and ignores inher
 
 If any target name already exists, the names response is ambiguous, Convex refuses the batch, or the final names readback is incomplete, the helper closes with a generic error. A failure after the batch may have left a complete or partial provider write. Do not retry or overwrite. Inspect names only, then replace the still-unused deployment if the result is uncertain.
 
+### Migrate the Reply-To name on an existing deployment
+
+Deployments configured before `HRA_AUTH_EMAIL_REPLY_TO` became required continue
+to send with the source-pinned `ben@substrate.run` fallback, but hosted preflight
+requires the replacement name to be present explicitly. Run this checkout-only
+package entry from the exact clean candidate commit, after its attested candidate
+deploy and before hosted status:
+
+```sh
+bun run hosted:migrate-reply-to -- \
+  --source-commit <N_COMMIT> \
+  --deploy-evidence /protected/release/candidate-deploy.json \
+  --evidence-path /protected/release/reply-to-migration.json \
+  --deployment <CURRENT_DEFAULT_DEPLOYMENT_NAME> \
+  --team-id <CURRENT_TEAM_ID> \
+  --project-id <CURRENT_PROJECT_ID> \
+  --deployment-id <CURRENT_DEFAULT_DEPLOYMENT_ID> \
+  --deployment-url <CURRENT_DEFAULT_DEPLOYMENT_URL>
+```
+
+The operator requires `HEAD` to equal `N_COMMIT` and the complete checkout to be
+clean. It reads a protected, candidate-phase deploy receipt whose source and
+target match, then proves the live release attestation equals that receipt. It
+repeats the source, target, receipt, and runtime proof before mutation and before
+publishing its own protected receipt. Keep the candidate deploy, this migration,
+and then `hosted:status --require-passed` in that order.
+
+The ordinary write preflight requires the exact predecessor name set:
+`SITE_URL`, `JWT_PRIVATE_KEY`, `JWKS`, `HRA_AUTH_HMAC_SECRET`,
+`HRA_RESEND_API_KEY`, and the retired `HRA_AUTH_EMAIL_FROM`; it also requires
+`HRA_AUTH_EMAIL_REPLY_TO` to be absent. A missing old From name signals drift
+from the known predecessor configuration and refuses before an intent or effect.
+The migration never reads, sets, or removes the old value, so it remains
+available to the predecessor runtime for immediate rollback. Unrelated provider
+names are also left alone. This migration is additive and preserves that known
+rollback configuration; it does not establish rollback readiness for any other
+source or manually altered environment.
+
+Before the only permitted write, HRA publishes a mode-`0600`, single-link intent
+beside the requested receipt path. It then sends only the source-pinned default
+as one in-memory dotenv line to `convex env set` through standard input. It never
+puts the mailbox in argv, the child environment, or output, and it never reads or
+replaces JWT, JWKS, HMAC, or Resend values. Whether the set command returns zero,
+nonzero, or loses its ordinary response after cleanup and target identity remain
+proved, HRA does not set again: it reads `HRA_AUTH_EMAIL_REPLY_TO` from the exact
+target and requires byte-exact `ben@substrate.run` plus one newline, then reads
+names and requires all seven names: the six-name predecessor set plus the new
+Reply-To name. Only that proof, a fresh matching
+release attestation, and unchanged protected intent permit the final receipt.
+
+A restart with the same exact arguments is read-only. A matching intent can be
+completed without another set only when the exact value and all seven names are
+already present, including the retained old From name. A matching receipt is
+replayed only after the same remote
+proofs. A replacement name that predates the intent, a conflicting or missing
+value, changed source, target, deploy receipt, runtime attestation, evidence
+custody, authority containment, or unproven process cleanup fails closed. Keep
+both the receipt and its `.intent`; do not delete or rewrite either to force a
+retry.
+
 ## Read hosted preflight status
 
 Before a controlled live-acceptance run, an operator can read one bounded,
@@ -322,7 +382,7 @@ Any other state is an incident and must remain quarantined for inspection.
 
 Read the capability file only into HRA's protected authentication JSON input. Never print it, substitute it into argv, copy it into an environment variable, or route it through a log. Complete the verified-email code flow and confirm the identity and first device are active. Consuming this specific bound invitation atomically records a durable bootstrap-accepted timestamp in service control. Later friend invitation issuance depends on that durable fact, so maintenance may remove the terminal invitation receipt without relocking the service. Then remove the one-time capability file.
 
-Continue launch acceptance with a second pending device approved by the active device against the key fingerprint that `hra device list` shows for it, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. Hosted acceptance does not authorize domain movement or publication. Those effects require a future current-project-only release design; retired HRA v0 resources cannot satisfy one of its gates.
+Continue launch acceptance with a second pending device approved by the active device against the key fingerprint that `hra device list` shows for it, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. Hosted acceptance does not authorize domain movement or publication. Those effects use their own separately gated operators: current-package publication now uses the owner-authenticated local `release:tag` command plus the protected tag-push workflow, while domain movement remains outside this hosted-acceptance scope. Retired HRA v0 resources cannot satisfy either operator's gates.
 
 ## Operate friend-beta invitations
 
@@ -490,16 +550,22 @@ from silently starting a second session.
 | Kind | Payload | Result |
 | --- | --- | --- |
 | `session_start` | `{accountPublicId, projectPublicId, prompt, preset, provider}` | `{sessionPublicId}` |
-| `account_login_start` | `{accountPublicId}` | `{loginUrl, expiresAt}`, single use |
-| `account_login_status` | none | `{status, instruction}` |
+| `account_login_start` | `{accountPublicId,handoffVersion?:2}` | current: `{handoffVersion:2,loginUrl,userCode,expiresAt}`; legacy: `{loginUrl,expiresAt}`, single use |
+| `account_login_status` | current: `{accountPublicId}`; legacy: none | `{status, instruction}` |
 | `usage_refresh` | none | `{accountsRefreshed}` |
 
 Addressing is by the cloud public ids the device registry already projects
 (`DeviceRegistryPayload.accounts` and `.projects`). A filesystem path is
 refused by the payload parser, so a project root can never reach the hosted
-deployment. `account_login_status` deliberately carries no account: a machine
-relays at most one login at a time, so the poll asks what the machine is doing
-rather than naming an account.
+deployment. Current `account_login_status` requests name the projected account
+whose Settings row exposed the action. The machine reports only that account's
+state and uses its exact public id in any local finish or cancel instruction,
+so a pending login on a sibling profile cannot change the row's answer. The
+account-less machine-wide shape remains accepted for legacy browsers during a
+rolling deployment. The requesting browser decrypts this reusable result under
+the exact device-command-result authority and renders the machine's bounded
+status and instruction. It does not replace the result with a generic
+acknowledgement.
 
 `session_start` runs as start-then-send under one idempotency key. The two
 local effects use keys derived deterministically from the device command's own
@@ -516,12 +582,13 @@ Every guard is local. Nothing hosted and no browser can change one.
 | Per-device kill switch (`hra remote deny device-commands`) | `DEVICE_COMMANDS_DENIED` |
 | Requesting device revoked after enqueue | `REQUESTING_DEVICE_INACTIVE` |
 | Account linking without the local opt-in | `ACCOUNT_LINKING_DENIED` |
+| Account login start while the account is not exactly signed out | `ACCOUNT_LOGIN_NOT_AVAILABLE` |
 | Account not in the projected registry | `DEVICE_COMMAND_ACCOUNT_UNKNOWN` |
 | Account signed out on the machine | `DEVICE_COMMAND_ACCOUNT_SIGNED_OUT` |
-| Provider does not match the projected account | `DEVICE_COMMAND_PROVIDER_UNSUPPORTED` |
+| Provider does not match the projected account, or browser linking targets non-Codex | `DEVICE_COMMAND_PROVIDER_UNSUPPORTED` |
 | Project not in the projected registry | `DEVICE_COMMAND_PROJECT_UNKNOWN` |
 | Per-device daily cap (100 admitted commands) | `DEVICE_COMMAND_DAILY_CAP` |
-| Login URL that cannot be completed on another device | `ACCOUNT_LOGIN_RELAY_UNAVAILABLE` |
+| Incomplete or non-relayable login handoff | `ACCOUNT_LOGIN_RELAY_UNAVAILABLE` |
 
 The cap is checked last, so a refused or malformed request never consumes the
 day's budget. A browser device can never be a device command target
@@ -535,13 +602,48 @@ is a daemon diagnostic and the CLI injects a real notifier when one exists. And
 a browser-started session inherits its project's approval mode, applied before
 the prompt is sent, so the first turn is already governed by it.
 
-The relayed login URL is account-key encrypted like every other payload, is
-`https` only with no credentials in its authority, expires five minutes after
-it is issued, and is released by the hosted row exactly once
-(`deviceCommands:consumeResult` erases the ciphertext in the same
-transaction). When the machine's provider login offers a URL that cannot be
-completed elsewhere, the command fails closed and the browser falls back to
-one-way status polling and the CLI instruction.
+For Codex, a current browser sends `account_login_start` with
+`handoffVersion: 2`, which dispatches the local `account.login` command in
+device-code mode. The current web lane never requests browser mode. A
+browser-mode loopback callback cannot be completed on another device, so HRA
+does not relay it.
+
+The pending Codex response must carry both the verification URL and its
+separate one-time user code. The URL is bounded and must be an HTTPS URL with
+a hostname, no username or password, and an exact round trip through URL
+parsing. The user code must match the closed device-code grammar. A missing or
+malformed value fails closed with
+`ACCOUNT_LOGIN_RELAY_UNAVAILABLE`.
+
+HRA encrypts the URL and user code together under the account key in one
+result. The hosted deployment stores only that ciphertext. The result expires
+five minutes after hosted settlement and `deviceCommands:consumeResult`
+releases it only to the requesting browser, exactly once, while erasing the
+ciphertext in the same transaction. Convex returns that server-owned deadline
+with the release, so machine or browser clock skew cannot extend the readable
+window. Settings displays the code before the link for manual selection; it
+does not offer a clipboard control or programmatically write the clipboard. It
+keeps both account-row actions locked
+while a login-start handoff is outstanding. The exact row unlocks only after
+this tab consumes the single-use result, hosted expiry makes it unavailable, or
+the command terminalizes without a handoff; a later start or status check cannot
+supersede it. Once safely consumed and displayed, the code remains in memory
+until its expiry or until the user starts a later action.
+
+Both local gates still apply: device commands must be enabled and the machine
+must have `hra remote allow account-linking` set. Settings offers the flow only
+for an account in that machine's encrypted registry after the registry reports
+the opt-in. The daemon rechecks the requesting device, account public id, local
+switches, and daily cap before starting the provider effect.
+
+The request version makes mixed rollout fail before the wrong provider effect.
+A current browser sends `handoffVersion: 2`; an older daemon rejects that
+unknown shape before login starts. A current daemon treats an unversioned
+request as the legacy browser-mode lane and returns only its legacy URL shape,
+which still fails closed for a loopback callback. A current browser can consume
+that legacy result exactly once only to ask for a machine update. This behavior
+is covered by focused parser, adapter, bridge, and UI tests. It has not yet been
+accepted against production or in a live two-device Codex login.
 
 ### Operator switches
 
@@ -558,8 +660,8 @@ that machine's encrypted device registry, so the web settings screen shows the
 current state and offers the CLI instruction rather than a button the daemon
 would refuse. Device commands are allowed by default because a browser device
 is already an enrolled key holder; account linking is denied by default because
-relaying a login URL is the one command that hands a credential path to another
-surface.
+relaying a login handoff is the one command that hands a provider authorization
+path to another surface.
 
 ### Retention and erasure
 

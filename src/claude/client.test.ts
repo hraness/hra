@@ -422,10 +422,9 @@ describe("Claude stream client", () => {
       shutdownTermGraceMs: 5,
     });
     await expect(Promise.all([client.close(), client.close()])).rejects.toMatchObject({
-      code: "PROCESS_EXITED",
+      code: "TIMEOUT",
     });
     expect(process.signals).toEqual(["SIGTERM", "SIGKILL"]);
-    expect(diagnostics).toContain("Claude process exit did not settle after termination");
 
     process.end();
     await expect(client.close()).resolves.toBeUndefined();
@@ -450,7 +449,7 @@ describe("Claude stream client", () => {
       .rejects.toMatchObject({ code: "PROCESS_EXITED" });
     expect(process.written).toHaveLength(0);
     expect(diagnostics).toContain("Claude process exit settlement was indeterminate");
-    await expect(client.close()).rejects.toMatchObject({ code: "PROCESS_EXITED" });
+    await expect(client.close()).rejects.toMatchObject({ code: "TIMEOUT" });
   });
 
   test("refuses a queued frame when the process authority is fenced before its write begins", async () => {
@@ -491,6 +490,30 @@ describe("Claude stream client", () => {
         type: "user",
       },
     ]);
-    await expect(client.close()).rejects.toMatchObject({ code: "PROCESS_EXITED" });
+    await expect(client.close()).rejects.toMatchObject({ code: "TIMEOUT" });
+  });
+
+  test("force-terminates and exactly joins a session child that ignores TERM", async () => {
+    const process = new FakeClaudeProcess();
+    let forceTerminations = 0;
+    const gracefulExit = process.terminate.bind(process);
+    process.terminate = () => { process.terminated = true; };
+    process.forceTerminate = () => {
+      forceTerminations += 1;
+      gracefulExit();
+    };
+    const client = new ClaudeStreamClient({
+      configDir: CONFIG_DIR,
+      onFact: () => undefined,
+      process,
+      shutdownSettlementMs: 20,
+      shutdownTermGraceMs: 1,
+    });
+
+    await client.close();
+
+    expect(process.terminated).toBe(true);
+    expect(forceTerminations).toBe(1);
+    await expect(process.exited).resolves.toBe(0);
   });
 });

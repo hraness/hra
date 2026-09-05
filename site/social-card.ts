@@ -51,14 +51,14 @@ export interface SocialCardLines {
 }
 
 export const socialCardLines = (content: PublicContent = publicContent): SocialCardLines => {
-  const [start, , , observe] = content.hero.steps;
-  if (start === undefined || observe === undefined) {
-    throw new Error("Public content must publish the start and observe hero steps.");
+  const [start, , , direct] = content.hero.steps;
+  if (start === undefined || direct === undefined) {
+    throw new Error("Public content must publish the start and direct hero steps.");
   }
   return {
-    commands: [`$ ${start.command}`, `$ ${observe.command}`],
-    comment: `# ${content.providerRoadmap}`,
-    tagline: content.socialCard.alt,
+    commands: [`$ ${start.command}`, `$ ${direct.command}`],
+    comment: `# Current source: ${content.providerRoadmap}`,
+    tagline: `Release candidate v${content.releaseVersion} · hra.sh`,
     title: content.productName,
   };
 };
@@ -143,7 +143,7 @@ export const renderSocialCardSvg = (content: PublicContent = publicContent): str
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${SOCIAL_CARD_WIDTH} ${SOCIAL_CARD_HEIGHT}" width="${SOCIAL_CARD_WIDTH}" height="${SOCIAL_CARD_HEIGHT}" role="img" aria-labelledby="title description">`,
     `  <title id="title">${escapeXml(lines.title)}</title>`,
-    `  <desc id="description">${escapeXml(lines.tagline)}</desc>`,
+    `  <desc id="description">${escapeXml(content.socialCard.alt)}</desc>`,
     `  <rect width="${SOCIAL_CARD_WIDTH}" height="${SOCIAL_CARD_HEIGHT}" fill="${palette.background}"/>`,
     textLine(lines.title, layout.margin, layout.titleBaseline, layout.titleSize, palette.ink, 700),
     `  <rect x="${layout.margin}" y="${layout.panel.y}" width="${layout.panel.width}" height="${layout.panel.height}" rx="${layout.panel.radius}" fill="${palette.panel}"/>`,

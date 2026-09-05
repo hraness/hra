@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -15,7 +16,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ensureManagedCommandSymlink, parseBootstrapArguments } from "./bootstrap";
+import {
+  claudeAutoModeCapability,
+  ensureManagedCommandSymlink,
+  parseBootstrapArguments,
+} from "./bootstrap";
 
 const temporary: string[] = [];
 
@@ -40,6 +45,33 @@ function createPluginCommand(pluginRoot: string, script: string, body = "#!/usr/
   return target;
 }
 
+function fakeClaude(
+  root: string,
+  version = "2.1.261",
+  configExit = 0,
+  configOutput = '{"allow":["default allow"],"environment":["default environment"],"hard_deny":["default hard deny"],"soft_deny":["default soft deny"]}',
+): Readonly<NodeJS.ProcessEnv> {
+  const tools = join(root, "tools");
+  mkdirSync(tools, { recursive: true });
+  const executable = join(tools, "claude");
+  writeFileSync(executable, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\\n' '${version} (Claude Code)'
+  exit 0
+fi
+if [ "$1" = "auto-mode" ] && { [ "$2" = "config" ] || [ "$2" = "defaults" ]; }; then
+  printf '%s\\n' '${configOutput}'
+  exit ${configExit}
+fi
+exit 2
+`);
+  chmodSync(executable, 0o755);
+  return {
+    ...process.env,
+    PATH: `${tools}:${process.env.PATH ?? ""}`,
+  };
+}
+
 describe("machine bootstrap", () => {
   test("requires one explicit mode and bounded absolute overrides", () => {
     expect(() => parseBootstrapArguments([])).toThrow("choose --apply or --check");
@@ -53,19 +85,41 @@ describe("machine bootstrap", () => {
     const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-"));
     temporary.push(root);
     const codexHome = join(root, "codex");
+    const claudeHome = join(root, "claude");
     const bunBin = join(root, "bin");
     mkdirSync(codexHome, { recursive: true });
+    mkdirSync(claudeHome, { recursive: true });
     mkdirSync(bunBin, { recursive: true });
     mkdirSync(join(codexHome, "rules"), { recursive: true });
     writeFileSync(join(codexHome, "AGENTS.md"), "# Existing\n\nKeep me.\n");
     chmodSync(join(codexHome, "AGENTS.md"), 0o600);
+    const originalCodexConfig = "# Keep this comment exactly.\napproval_policy = \"never\"\n\n[features]\nkeep_me = true\n";
+    writeFileSync(join(codexHome, "config.toml"), originalCodexConfig);
+    chmodSync(join(codexHome, "config.toml"), 0o640);
     const rulesPath = join(codexHome, "rules", "hra-local-efficiency.rules");
     writeFileSync(rulesPath, "# Existing rule before the managed block.\n");
     chmodSync(rulesPath, 0o640);
+    const originalClaudeSettings = `{
+  "keep": { "spacing":  true },
+  "permissions": {
+    "allow": ["Read", "PowerShell", "Monitor", "NotebookEdit", "Artifact", "Workflow", "mcp__example__deploy", "NotebookEdit(*)", "Artifact(**)", "Workflow(/**)", "mcp__example__deploy( * )", "PowerShell(*)", "Bash(gh *)", "Bash(gh:*)", "Bash(gh release *)", "Bash(python*)", "Bash(vercel *)", "Bash(bun run cli *)", "Bash(git status)", "Read(./docs/**)"],
+    "deny": ["Bash(rm -rf *)"],
+    "defaultMode": "default"
+  },
+  "autoMode": {
+    "allow": ["Bash(git status)"],
+    "soft_deny": ["Never destroy production"],
+    "environment": ["A long generated environment description that should be replaced."]
+  }
+}
+`;
+    writeFileSync(join(claudeHome, "settings.json"), originalClaudeSettings);
+    chmodSync(join(claudeHome, "settings.json"), 0o600);
+    writeFileSync(join(claudeHome, "CLAUDE.md"), "# Existing Claude guidance\n\nKeep this too.\n");
     const modulePath = join(root, "host-resources.js");
     writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
     const environment = {
-      ...process.env,
+      ...fakeClaude(root),
       HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
     };
     const first = Bun.spawnSync({
@@ -76,6 +130,8 @@ describe("machine bootstrap", () => {
         "--skip-dependency-install",
         "--codex-home",
         codexHome,
+        "--claude-home",
+        claudeHome,
         "--bun-bin",
         bunBin,
       ],
@@ -88,6 +144,55 @@ describe("machine bootstrap", () => {
     expect(guidance).toContain("Keep me.");
     expect(guidance.match(/hra-local-efficiency:start/gu)).toHaveLength(1);
     expect(statSync(join(codexHome, "AGENTS.md")).mode & 0o777).toBe(0o600);
+    const codexConfig = readFileSync(join(codexHome, "config.toml"), "utf8");
+    expect(codexConfig).toContain('# Keep this comment exactly.\n\n[features]\nkeep_me = true\n');
+    expect(codexConfig).not.toContain('approval_policy = "never"');
+    expect(Bun.TOML.parse(codexConfig)).toMatchObject({
+      approval_policy: "on-request",
+      approvals_reviewer: "auto_review",
+      default_permissions: ":workspace",
+      features: { keep_me: true },
+    });
+    expect(statSync(join(codexHome, "config.toml")).mode & 0o777).toBe(0o640);
+    const claudeSettingsText = readFileSync(join(claudeHome, "settings.json"), "utf8");
+    expect(claudeSettingsText).toContain('  "keep": { "spacing":  true },');
+    expect(claudeSettingsText).toContain('    "allow": ["Bash(git status)","Read(./docs/**)"]');
+    expect(claudeSettingsText).toContain('    "deny": ["Bash(rm -rf *)"],');
+    expect(claudeSettingsText).not.toContain('"Bash(gh *)"');
+    expect(claudeSettingsText).not.toContain('"Bash(vercel *)"');
+    expect(claudeSettingsText).not.toContain('"Bash(gh:*)"');
+    expect(claudeSettingsText).not.toContain('"Bash(gh release *)"');
+    expect(claudeSettingsText).not.toContain('"Bash(python*)"');
+    expect(claudeSettingsText).not.toContain('"Bash(bun run cli *)"');
+    expect(claudeSettingsText).not.toContain('"PowerShell"');
+    expect(claudeSettingsText).not.toContain('"PowerShell(*)"');
+    expect(claudeSettingsText).not.toContain('"Read"');
+    expect(claudeSettingsText).not.toContain('"Monitor"');
+    expect(claudeSettingsText).not.toContain('"NotebookEdit"');
+    expect(claudeSettingsText).not.toContain('"Artifact"');
+    expect(claudeSettingsText).not.toContain('"Workflow"');
+    expect(claudeSettingsText).not.toContain('"mcp__example__deploy"');
+    expect(claudeSettingsText).not.toContain('"NotebookEdit(*)"');
+    expect(claudeSettingsText).not.toContain('"Artifact(**)"');
+    expect(claudeSettingsText).not.toContain('"Workflow(/**)"');
+    expect(claudeSettingsText).not.toContain('"mcp__example__deploy( * )"');
+    expect(claudeSettingsText).toContain('    "allow": ["$defaults","Bash(git status)"],');
+    const parsedClaudeSettings = JSON.parse(claudeSettingsText) as {
+      autoMode: { allow: unknown; environment: unknown; soft_deny: unknown };
+      permissions: { allow: unknown; defaultMode: unknown; deny: unknown };
+    };
+    expect(parsedClaudeSettings.permissions.defaultMode).toBe("auto");
+    expect(parsedClaudeSettings.permissions.allow).toEqual([
+      "Bash(git status)",
+      "Read(./docs/**)",
+    ]);
+    expect(parsedClaudeSettings.permissions.deny).toEqual(["Bash(rm -rf *)"]);
+    expect(parsedClaudeSettings.autoMode.allow).toEqual(["$defaults", "Bash(git status)"]);
+    expect(parsedClaudeSettings.autoMode.environment).toEqual(["$defaults"]);
+    expect(parsedClaudeSettings.autoMode.soft_deny).toEqual(["$defaults", "Never destroy production"]);
+    const claudeGuidance = readFileSync(join(claudeHome, "CLAUDE.md"), "utf8");
+    expect(claudeGuidance).toContain("Keep this too.");
+    expect(claudeGuidance.match(/hra-local-efficiency:start/gu)).toHaveLength(1);
     expect(readlinkSync(join(bunBin, "hra-host-run"))).toContain("host-run.ts");
     expect(readlinkSync(join(bunBin, "hra-throughput-report"))).toContain("throughput-report.ts");
     expect(readlinkSync(join(bunBin, "hra-ci-ref-audit"))).toContain("ci-ref-audit.ts");
@@ -109,6 +214,8 @@ describe("machine bootstrap", () => {
         "--skip-dependency-install",
         "--codex-home",
         codexHome,
+        "--claude-home",
+        claudeHome,
         "--bun-bin",
         bunBin,
       ],
@@ -118,6 +225,9 @@ describe("machine bootstrap", () => {
     });
     expect(reapplied.exitCode, reapplied.stderr.toString()).toBe(0);
     expect(readFileSync(rulesPath, "utf8")).toBe(rules);
+    expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toBe(codexConfig);
+    expect(readFileSync(join(claudeHome, "settings.json"), "utf8")).toBe(claudeSettingsText);
+    expect(readFileSync(join(claudeHome, "CLAUDE.md"), "utf8")).toBe(claudeGuidance);
 
     const second = Bun.spawnSync({
       cmd: [
@@ -126,6 +236,8 @@ describe("machine bootstrap", () => {
         "--check",
         "--codex-home",
         codexHome,
+        "--claude-home",
+        claudeHome,
         "--bun-bin",
         bunBin,
       ],
@@ -145,6 +257,8 @@ describe("machine bootstrap", () => {
         "--check",
         "--codex-home",
         codexHome,
+        "--claude-home",
+        claudeHome,
         "--bun-bin",
         bunBin,
       ],
@@ -154,6 +268,178 @@ describe("machine bootstrap", () => {
     });
     expect(drifted.exitCode).toBe(1);
     expect(drifted.stderr.toString()).toContain("Codex host-access rule differs");
+  });
+
+  test("leaves Claude permission settings unchanged when Auto mode is unavailable", () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-claude-fallback-"));
+    temporary.push(root);
+    const codexHome = join(root, "codex");
+    const claudeHome = join(root, "claude");
+    const bunBin = join(root, "bin");
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(claudeHome, { recursive: true });
+    mkdirSync(bunBin, { recursive: true });
+    const settings = '{\n  "permissions": { "defaultMode": "default" },\n  "keep": true\n}\n';
+    writeFileSync(join(claudeHome, "settings.json"), settings);
+    const modulePath = join(root, "host-resources.js");
+    writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
+    const environment = {
+      ...fakeClaude(root, "2.1.82"),
+      HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+    };
+
+    expect(claudeAutoModeCapability(environment)).toEqual({
+      available: false,
+      reason: "cli_too_old",
+      version: "2.1.82",
+    });
+    const result = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        import.meta.dir + "/bootstrap.ts",
+        "--apply",
+        "--skip-dependency-install",
+        "--codex-home",
+        codexHome,
+        "--claude-home",
+        claudeHome,
+        "--bun-bin",
+        bunBin,
+      ],
+      env: environment,
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(result.stdout.toString()).toContain("SKIP\tClaude Auto mode unavailable (cli_too_old)");
+    expect(readFileSync(join(claudeHome, "settings.json"), "utf8")).toBe(settings);
+    expect(readFileSync(join(claudeHome, "CLAUDE.md"), "utf8"))
+      .toContain("Use Claude Code auto mode when it is available");
+  });
+
+  test("reports a malformed Auto-mode configuration surface accurately", () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-claude-config-"));
+    temporary.push(root);
+    expect(claudeAutoModeCapability(fakeClaude(root, "2.1.261", 0, "not-json"))).toEqual({
+      available: false,
+      reason: "config_unavailable",
+      version: "2.1.261",
+    });
+  });
+
+  test("refuses managed-marker lookalikes inside TOML multiline strings", () => {
+    for (const quote of ['"""', "'''"]) {
+      const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-toml-marker-"));
+      temporary.push(root);
+      const codexHome = join(root, "codex");
+      const claudeHome = join(root, "claude");
+      const bunBin = join(root, "bin");
+      mkdirSync(codexHome, { recursive: true });
+      mkdirSync(claudeHome, { recursive: true });
+      mkdirSync(bunBin, { recursive: true });
+      const config = `note = ${quote}\n# hra-local-efficiency:config:start\nkeep me\n# hra-local-efficiency:config:end\n${quote}\n`;
+      writeFileSync(join(codexHome, "config.toml"), config);
+      const modulePath = join(root, "host-resources.js");
+      writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
+
+      const result = Bun.spawnSync({
+        cmd: [
+          process.execPath,
+          import.meta.dir + "/bootstrap.ts",
+          "--apply",
+          "--skip-dependency-install",
+          "--codex-home",
+          codexHome,
+          "--claude-home",
+          claudeHome,
+          "--bun-bin",
+          bunBin,
+        ],
+        env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+        stderr: "pipe",
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.toString()).toContain("managed marker must be a TOML comment token");
+      expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toBe(config);
+    }
+  });
+
+  test("preflights every managed config before changing any target", () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-preflight-"));
+    temporary.push(root);
+    const codexHome = join(root, "codex");
+    const claudeHome = join(root, "claude");
+    const bunBin = join(root, "bin");
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(claudeHome, { recursive: true });
+    mkdirSync(bunBin, { recursive: true });
+    const originalGuidance = "# User-owned guidance\n";
+    writeFileSync(join(codexHome, "AGENTS.md"), originalGuidance);
+    writeFileSync(join(claudeHome, "settings.json"), "{ invalid JSON\n");
+    const modulePath = join(root, "host-resources.js");
+    writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
+
+    const result = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        import.meta.dir + "/bootstrap.ts",
+        "--apply",
+        "--skip-dependency-install",
+        "--codex-home",
+        codexHome,
+        "--claude-home",
+        claudeHome,
+        "--bun-bin",
+        bunBin,
+      ],
+      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain("Claude settings is not valid JSON");
+    expect(readFileSync(join(codexHome, "AGENTS.md"), "utf8")).toBe(originalGuidance);
+    expect(existsSync(join(codexHome, "config.toml"))).toBe(false);
+    expect(existsSync(join(claudeHome, "CLAUDE.md"))).toBe(false);
+  });
+
+  test("refuses hard-linked user configuration before changing guidance", () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-hardlink-"));
+    temporary.push(root);
+    const codexHome = join(root, "codex");
+    const claudeHome = join(root, "claude");
+    const bunBin = join(root, "bin");
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(claudeHome, { recursive: true });
+    mkdirSync(bunBin, { recursive: true });
+    const originalGuidance = "# User-owned guidance\n";
+    writeFileSync(join(codexHome, "AGENTS.md"), originalGuidance);
+    const managedElsewhere = join(root, "managed-config.toml");
+    writeFileSync(managedElsewhere, "model = \"keep-me\"\n");
+    linkSync(managedElsewhere, join(codexHome, "config.toml"));
+
+    const result = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        import.meta.dir + "/bootstrap.ts",
+        "--apply",
+        "--skip-dependency-install",
+        "--codex-home",
+        codexHome,
+        "--claude-home",
+        claudeHome,
+        "--bun-bin",
+        bunBin,
+      ],
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain("hard-linked Codex config");
+    expect(readFileSync(managedElsewhere, "utf8")).toBe("model = \"keep-me\"\n");
+    expect(readFileSync(join(codexHome, "AGENTS.md"), "utf8")).toBe(originalGuidance);
   });
 
   test("refuses a symlinked Codex rule without changing its target", () => {
@@ -178,6 +464,8 @@ describe("machine bootstrap", () => {
         "--skip-dependency-install",
         "--codex-home",
         codexHome,
+        "--claude-home",
+        join(root, "claude"),
         "--bun-bin",
         bunBin,
       ],
@@ -210,6 +498,8 @@ describe("machine bootstrap", () => {
         "--skip-dependency-install",
         "--codex-home",
         codexHome,
+        "--claude-home",
+        join(root, "claude"),
         "--bun-bin",
         bunBin,
       ],
@@ -253,6 +543,8 @@ describe("machine bootstrap", () => {
       "--skip-dependency-install",
       "--codex-home",
       codexHome,
+      "--claude-home",
+      join(root, "claude"),
       "--bun-bin",
       bunBin,
     ];
@@ -275,7 +567,7 @@ describe("machine bootstrap", () => {
     expect(refused.exitCode).toBe(1);
     expect(lstatSync(join(codexHome, "hra-worker.config.toml")).isSymbolicLink()).toBe(true);
     expect(readFileSync(globalAtet, "utf8")).toBe("existing-global-command\n");
-  });
+  }, 10_000);
 
   test("updates a command link owned by a prior plugin-cache install", () => {
     const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-upgrade-"));
@@ -312,6 +604,8 @@ describe("machine bootstrap", () => {
         "--skip-dependency-install",
         "--codex-home",
         codexHome,
+        "--claude-home",
+        join(root, "claude"),
         "--bun-bin",
         bunBin,
       ],
@@ -438,6 +732,8 @@ describe("machine bootstrap", () => {
         "--skip-dependency-install",
         "--codex-home",
         codexHome,
+        "--claude-home",
+        join(root, "claude"),
         "--bun-bin",
         bunBin,
       ],

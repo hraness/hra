@@ -298,6 +298,12 @@ export class LiveAcceptanceError extends Error {
   }
 }
 
+export const assertCurrentLiveAcceptancePackageVersion = (
+  packageVersion: string,
+): void => {
+  if (packageVersion !== HRA_VERSION) throw new LiveAcceptanceError("input_invalid");
+};
+
 export class LiveAcceptanceStartError extends LiveAcceptanceError {
   constructor(
     code: z.infer<typeof recoveryFailureCodeSchema>,
@@ -2533,6 +2539,7 @@ const persistLiveAcceptanceEvidence = (
   runtimeAttestation: RuntimeReleaseAttestation | undefined,
 ): LiveAcceptanceEvidenceDocument | undefined => {
   if (output === undefined) return undefined;
+  assertCurrentLiveAcceptancePackageVersion(evidence.packageVersion);
   if (
     deployEvidence === undefined
     || runtimeAttestation === undefined
@@ -2706,6 +2713,7 @@ export const liveAcceptanceMain = async (
     const attestation = await (options.sourceAttestation ?? liveAcceptanceSourceAttestation)(
       configuration.cloudDeploymentUrl,
     );
+    assertCurrentLiveAcceptancePackageVersion(attestation.packageVersion);
     const deployEvidence = parsedOutput.deployEvidencePath === undefined
       ? undefined
       : parseDeployEvidenceFile(parsedOutput.deployEvidencePath);

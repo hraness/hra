@@ -98,6 +98,7 @@ CREATE TABLE sessions(
   id TEXT PRIMARY KEY,
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   project_id TEXT NOT NULL REFERENCES projects(id),
+  provider TEXT NOT NULL DEFAULT 'codex',
   preset TEXT NOT NULL,
   fast_enabled INTEGER NOT NULL,
   state TEXT NOT NULL
@@ -598,6 +599,26 @@ describe("WorkStore schema and atomic plans", () => {
       .toEqual({ count: 0 });
   });
 
+  test("rejects current work guards against a pre-provider session schema", () => {
+    const database = new Database(":memory:", { strict: true });
+    databases.push(database);
+    database.exec("PRAGMA foreign_keys=ON;");
+    const legacyParentSchema = parentSchema.replace(
+      "  provider TEXT NOT NULL DEFAULT 'codex',\n",
+      "",
+    );
+    expect(legacyParentSchema).not.toBe(parentSchema);
+    database.exec(legacyParentSchema);
+    database.exec(WORK_SCHEMA_SQL);
+
+    expect(() => assertWorkSchema(database)).toThrow(
+      "WORK_SCHEMA_STALE:sessions.provider",
+    );
+    expect(() => assertReadonlyWorkSchema(database)).toThrow(
+      "WORK_SCHEMA_STALE:sessions.provider",
+    );
+  });
+
   test("replays an exact UUID result and rejects changed semantic intent", () => {
     const value = fixture();
     const key = randomUUID();
@@ -691,6 +712,44 @@ describe("WorkStore schema and atomic plans", () => {
 });
 
 describe("WorkStore claims, fences, and prepared effects", () => {
+  test("requires signed-in HRA account authority for established Claude work", () => {
+    const value = fixture();
+    value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
+      .run(value.accountId);
+    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
+      .run(value.accountId);
+
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(value.database.query("SELECT COUNT(*) AS count FROM works").get()).toEqual({ count: 0 });
+  });
+
+  test("does not let Codex-only retirement bypass active Claude work authority", () => {
+    const value = fixture();
+    value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
+      .run(value.accountId);
+    const created = createWork(value);
+    const claimed = claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+
+    expect(value.store.prepareProfileAuthorityChange(value.accountId, 1, "codex")).toEqual([]);
+    expect(() => value.database.query("UPDATE profiles SET state='signed_out' WHERE id=?")
+      .run(value.accountId)).toThrow("WORK_PROFILE_ATTEMPT_AUTHORITY");
+    expect(value.store.snapshot(created.work.id).tasks[0]).toMatchObject({
+      activeAttemptId: claimed.attempt.id,
+      status: "claimed",
+    });
+  });
+
+  test("refuses Codex work admission while the HRA profile is signed out", () => {
+    const value = fixture();
+    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
+      .run(value.accountId);
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+  });
+
   test("CAS claims a ready task once and increments its committed fence", () => {
     const value = fixture();
     const created = createWork(value);

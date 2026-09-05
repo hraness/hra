@@ -12,6 +12,7 @@ export const DEVICE_COMMAND_REFUSAL_CODES = [
   "DEVICE_COMMANDS_DENIED",
   "DEVICE_COMMAND_DAILY_CAP",
   "ACCOUNT_LINKING_DENIED",
+  "ACCOUNT_LOGIN_NOT_AVAILABLE",
   "DEVICE_COMMAND_ACCOUNT_UNKNOWN",
   "DEVICE_COMMAND_PROJECT_UNKNOWN",
   "DEVICE_COMMAND_ACCOUNT_SIGNED_OUT",
@@ -91,9 +92,20 @@ export function deviceCommandGuardDecision(
     && !input.accountLinkingAllowed
   ) return refused("ACCOUNT_LINKING_DENIED");
 
-  if (payload.kind === "session_start" || payload.kind === "account_login_start") {
+  if (
+    payload.kind === "session_start"
+    || payload.kind === "account_login_start"
+    || (payload.kind === "account_login_status" && "accountPublicId" in payload)
+  ) {
     const account = input.accounts.find((entry) => entry.publicId === payload.accountPublicId);
     if (account === undefined) return refused("DEVICE_COMMAND_ACCOUNT_UNKNOWN");
+    if (
+      (payload.kind === "account_login_start" || payload.kind === "account_login_status")
+      && account.provider !== "codex"
+    ) return refused("DEVICE_COMMAND_PROVIDER_UNSUPPORTED");
+    if (payload.kind === "account_login_start" && account.status !== "signed_out") {
+      return refused("ACCOUNT_LOGIN_NOT_AVAILABLE");
+    }
     if (payload.kind === "session_start") {
       // The projected provider is what the browser saw; a mismatch means the
       // picker addressed an account that is not the one it thought it was.

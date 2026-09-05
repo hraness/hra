@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { parseDeviceRegistryPayload, type DeviceRegistryPayload } from "../hra/cloud";
 import {
+  accountBrowserLoginAllowed,
   accountRows,
   allScheduledTasks,
   archivedSessionRows,
@@ -241,6 +242,22 @@ describe("machine and task ordering", () => {
       ["work", "studio", "signed_in"],
       ["personal", "studio", "signed_out"],
     ]);
+  });
+
+  test("carries both local login gates and admits Codex only when both are on", () => {
+    for (const deviceCommandsAllowed of [false, true]) {
+      for (const accountLinkingAllowed of [false, true]) {
+        const rows = accountRows([machine("dev_a", "studio", true, {
+          accountLinkingAllowed,
+          deviceCommandsAllowed,
+        })]);
+        expect(rows[0]).toMatchObject({ accountLinkingAllowed, deviceCommandsAllowed });
+        expect(accountBrowserLoginAllowed(rows[0]!)).toBe(
+          accountLinkingAllowed && deviceCommandsAllowed,
+        );
+        expect(accountBrowserLoginAllowed(rows[1]!)).toBe(false);
+      }
+    }
   });
 });
 

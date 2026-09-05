@@ -11,6 +11,7 @@ import {
   locateClaudeExecutable,
   resolvePinnedClaudeRuntime,
   spawnClaudeVersionProbe,
+  type ClaudeVersionProbeProcess,
 } from "./runtime";
 
 const roots: string[] = [];
@@ -75,6 +76,18 @@ describe("pinned Claude runtime", () => {
       executablePath: path,
       probeVersion: async () => "unknown build",
     })).rejects.toThrow(ClaudeError);
+    for (const reported of [
+      `${CLAUDE_PIN}-beta`,
+      `wrapper ${CLAUDE_PIN} around 9.9.9`,
+      `${CLAUDE_PIN} (Claude Code) 9.9.9`,
+      ` ${CLAUDE_PIN} (Claude Code)`,
+    ]) {
+      await expect(resolvePinnedClaudeRuntime({
+        configDir,
+        executablePath: path,
+        probeVersion: async () => reported,
+      })).rejects.toThrow("reported no exact version");
+    }
   });
 
   test("binds creation and resume to one canonical durable session id", async () => {
@@ -135,130 +148,107 @@ describe("pinned Claude runtime", () => {
     });
   });
 
-  test("bounds and reaps a version probe whose stdout exceeds the protocol limit", async () => {
-    let forceTerminations = 0;
-    let settleExit!: (code: number) => void;
-    let closeStdout!: () => void;
-    const exited = new Promise<number>((resolve) => { settleExit = resolve; });
-    const stdout = new ReadableStream<Uint8Array>({
-      start(controller) {
-        closeStdout = () => controller.close();
-        controller.enqueue(new Uint8Array(4 * 1_024 + 1));
-      },
-    });
-
+  test("terminates and joins an overproducing version probe", async () => {
+    let resolveExit!: (code: number) => void;
+    let resolveStderr!: () => void;
+    let terminated = 0;
+    const stderrDone = new Promise<void>((resolve) => { resolveStderr = resolve; });
+    const process: ClaudeVersionProbeProcess = {
+      exited: new Promise((resolve) => { resolveExit = resolve; }),
+      stdout: (async function* () { yield new Uint8Array(513); })(),
+      stderr: (async function* () { await stderrDone; yield* []; })(),
+      terminate: () => { terminated += 1; resolveStderr(); resolveExit(143); },
+      forceTerminate: () => { throw new Error("graceful termination should join"); },
+    };
     await expect(spawnClaudeVersionProbe({
-      configDir: "/tmp/personal-claude",
-      configHome: "personal",
-      environment: {},
-      executablePath: "/tmp/claude",
+      configDir: "/tmp/claude-config",
+      configHome: "isolated",
+      deadlineMs: 1_000,
+      environment: { PATH: "/usr/bin:/bin" },
+      executablePath: "/test/claude",
+      processFactory: () => process,
       signal: new AbortController().signal,
-      spawn: () => ({
-        exited,
-        forceTerminate: () => {
-          forceTerminations += 1;
-          closeStdout();
-          settleExit(137);
-        },
-        stdout,
-      }),
     })).rejects.toMatchObject({ code: "PROTOCOL_LIMIT" });
-    expect(forceTerminations).toBe(1);
+    expect(terminated).toBe(1);
   });
 
-  test("aborts and reaps a hanging version probe", async () => {
-    let forceTerminations = 0;
-    let settleExit!: (code: number) => void;
-    let closeStdout!: () => void;
-    const exited = new Promise<number>((resolve) => { settleExit = resolve; });
-    const stdout = new ReadableStream<Uint8Array>({
-      start(controller) { closeStdout = () => controller.close(); },
-    });
-    const controller = new AbortController();
-    const reason = new Error("version probe canceled");
-    const probe = spawnClaudeVersionProbe({
-      configDir: "/tmp/personal-claude",
-      configHome: "personal",
-      environment: {},
-      executablePath: "/tmp/claude",
-      signal: controller.signal,
-      timeoutMs: 1_000,
-      spawn: () => ({
-        exited,
-        forceTerminate: () => {
-          forceTerminations += 1;
-          closeStdout();
-          settleExit(137);
-        },
-        stdout,
-      }),
-    });
-
-    controller.abort(reason);
-    await expect(probe).rejects.toBe(reason);
-    expect(forceTerminations).toBe(1);
-  });
-
-  test("times out and reaps a hanging version probe", async () => {
-    let forceTerminations = 0;
-    let settleExit!: (code: number) => void;
-    let closeStdout!: () => void;
-    const exited = new Promise<number>((resolve) => { settleExit = resolve; });
-    const stdout = new ReadableStream<Uint8Array>({
-      start(controller) { closeStdout = () => controller.close(); },
-    });
-
+  test("bounds a hung version probe with terminate, force, and an exit join", async () => {
+    let resolveExit!: (code: number) => void;
+    let resolveStreams!: () => void;
+    const trace: string[] = [];
+    const streamsDone = new Promise<void>((resolve) => { resolveStreams = resolve; });
+    const empty = () => (async function* () { await streamsDone; yield* []; })();
+    const process: ClaudeVersionProbeProcess = {
+      exited: new Promise((resolve) => { resolveExit = resolve; }),
+      stdout: empty(),
+      stderr: empty(),
+      terminate: () => { trace.push("terminate"); },
+      forceTerminate: () => {
+        trace.push("force");
+        resolveStreams();
+        resolveExit(137);
+      },
+    };
     await expect(spawnClaudeVersionProbe({
-      configDir: "/tmp/personal-claude",
-      configHome: "personal",
-      environment: {},
-      executablePath: "/tmp/claude",
+      configDir: "/tmp/claude-config",
+      configHome: "isolated",
+      deadlineMs: 1,
+      environment: { PATH: "/usr/bin:/bin" },
+      executablePath: "/test/claude",
+      processFactory: () => process,
       signal: new AbortController().signal,
-      timeoutMs: 5,
-      spawn: () => ({
-        exited,
-        forceTerminate: () => {
-          forceTerminations += 1;
-          closeStdout();
-          settleExit(137);
-        },
-        stdout,
-      }),
     })).rejects.toMatchObject({ code: "TIMEOUT" });
-    expect(forceTerminations).toBe(1);
+    expect(trace).toEqual(["terminate", "force"]);
   });
 
-  test("validates version-probe admission before spawning a process", async () => {
-    let spawns = 0;
-    const invalid = spawnClaudeVersionProbe({
-      configDir: "/tmp/personal-claude",
-      configHome: "personal",
-      environment: {},
-      executablePath: "/tmp/claude",
-      signal: new AbortController().signal,
-      timeoutMs: 0,
-      spawn: () => {
-        spawns += 1;
-        throw new Error("must not spawn");
-      },
-    });
-    await expect(invalid).rejects.toMatchObject({ code: "INVALID_INPUT" });
-    expect(spawns).toBe(0);
-
-    const controller = new AbortController();
-    const reason = new Error("already canceled");
-    controller.abort(reason);
+  test("does not mistake a rejected version-exit observer for process exit", async () => {
+    const trace: string[] = [];
+    const process: ClaudeVersionProbeProcess = {
+      exited: Promise.reject(new Error("broken version wait")),
+      stdout: (async function* () { yield new TextEncoder().encode(CLAUDE_PIN); })(),
+      stderr: (async function* () { yield new Uint8Array(); })(),
+      terminate: () => { trace.push("terminate"); },
+      forceTerminate: () => { trace.push("force"); },
+    };
     await expect(spawnClaudeVersionProbe({
-      configDir: "/tmp/personal-claude",
-      configHome: "personal",
-      environment: {},
-      executablePath: "/tmp/claude",
-      signal: controller.signal,
-      spawn: () => {
-        spawns += 1;
-        throw new Error("must not spawn");
-      },
-    })).rejects.toBe(reason);
-    expect(spawns).toBe(0);
+      configDir: "/tmp/claude-config",
+      configHome: "isolated",
+      deadlineMs: 1_000,
+      environment: { PATH: "/usr/bin:/bin" },
+      executablePath: "/test/claude",
+      processFactory: () => process,
+      signal: new AbortController().signal,
+    })).rejects.toThrow("could not be joined after forced termination");
+    expect(trace).toEqual(["terminate", "force"]);
+  });
+
+  test("exports the reviewed home only for isolated probes", async () => {
+    const environments: Array<Readonly<Record<string, string>>> = [];
+    const processFactory = (input: Readonly<{
+      argv: readonly [string, "--version"];
+      environment: Readonly<Record<string, string>>;
+    }>): ClaudeVersionProbeProcess => {
+      environments.push(input.environment);
+      return {
+        exited: Promise.resolve(0),
+        stdout: (async function* () { yield new TextEncoder().encode(CLAUDE_PIN); })(),
+        stderr: (async function* () { yield* []; })(),
+        terminate: () => undefined,
+        forceTerminate: () => undefined,
+      };
+    };
+    for (const configHome of ["isolated", "personal"] as const) {
+      await spawnClaudeVersionProbe({
+        configDir: "/tmp/reviewed-claude-home",
+        configHome,
+        deadlineMs: 1_000,
+        environment: { PATH: "/usr/bin:/bin" },
+        executablePath: "/test/claude",
+        processFactory,
+        signal: new AbortController().signal,
+      });
+    }
+    expect(environments[0]?.CLAUDE_CONFIG_DIR).toBe("/tmp/reviewed-claude-home");
+    expect(environments[1]?.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 });

@@ -1163,10 +1163,10 @@ const renderSessionList = (
     && accountId.success
     && metadata.data.accountSelector === accountId.data
     ? [
-        `Scope: local-only cache for ${accountId.data}`,
-        "Freshness: stale; provider not contacted",
-        `Completeness: ${metadata.data.localCompleteness === "complete" ? "complete local cache" : "partial local cache; more pages available"}; provider completeness unknown`,
-        `Sign in to refresh: ${metadata.data.nextCommand}`,
+        `Codex scope: local-only cache for ${accountId.data}`,
+        "Codex freshness: stale; Codex provider not contacted",
+        `Codex completeness: ${metadata.data.localCompleteness === "complete" ? "complete local cache" : "partial local cache; more pages available"}; Codex provider completeness unknown`,
+        `Sign in to refresh Codex: ${metadata.data.nextCommand}`,
       ]
     : [];
   const tableListing = table(sessions, ["title", "state", "preset", "fastEnabled", "id"]);
@@ -1850,6 +1850,34 @@ const renderAccountShow = (data: unknown): string => {
   const root = object(data);
   const account = object(root?.account);
   if (account === null) return "Account data is unavailable.";
+  const authentication = object(root?.authentication);
+  if (
+    authentication?.provider === "claude"
+    && (typeof authentication.signedIn === "boolean" || authentication.signedIn === null)
+  ) {
+    const rows = [
+      `Claude Code: ${authentication.signedIn === null
+        ? "status unknown"
+        : authentication.signedIn ? "signed in" : "signed out"}`,
+      `Label: ${line(account.label)}`,
+      `ID: ${line(account.id)}`,
+    ];
+    if (typeof root?.providerGeneration === "number") {
+      rows.push(`Provider generation: ${line(root.providerGeneration)}`);
+    }
+    const recovery = object(root?.recovery);
+    if (recovery?.required === true) {
+      rows.push("Recovery: required");
+      if (typeof recovery.diagnostic === "string") rows.push(`  ${safeDiagnostic(recovery.diagnostic)}`);
+      if (typeof recovery.statusCommand === "string") rows.push(`Next: ${line(recovery.statusCommand)}`);
+      if (typeof recovery.abandonCommand === "string") {
+        rows.push(`Only after confirming the original Claude child exited: ${line(recovery.abandonCommand)}`);
+      }
+    } else if (authentication.signedIn === false && typeof root?.nextCommand === "string") {
+      rows.push(`Next: ${line(root.nextCommand)}`);
+    }
+    return rows.join("\n");
+  }
   const rows = renderAccountHeader(account);
   const provider = object(root?.providerProjection);
   if (typeof provider?.signedIn === "boolean") {
@@ -2424,6 +2452,8 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(value.running === true ? `HRA daemon is running (pid ${line(value.pid)}).\n` : "HRA daemon is stopped.\n");
   } else if (command.kind === "daemon.stop") {
     output.writeStdout(value.released === true ? "HRA daemon stopped.\n" : "HRA daemon is already stopped.\n");
+  } else if (command.kind === "account.claude-login.abandon") {
+    output.writeStdout("Released the exact local Claude login fence. HRA did not stop Claude or change or delete Claude credentials; use a fresh idempotency key for another login.\n");
   } else if (command.kind === "account.login-cancel") {
     if (value.status === "signed_in") {
       output.writeStdout("The account completed sign-in before cancellation.\n");
@@ -2491,8 +2521,19 @@ const failureNextCommand = (details: unknown): string | null => {
   }
   const prefix = "hra account login ";
   if (!value.nextCommand.startsWith(prefix)) return null;
-  const parsed = profileIdSchema.safeParse(value.nextCommand.slice(prefix.length));
-  if (!parsed.success || value.nextCommand !== `${prefix}${parsed.data}`) return null;
+  const claudeSuffix = " --provider claude";
+  const claude = value.provider === "claude"
+    && Object.keys(value).length === 4
+    && value.nextCommand.endsWith(claudeSuffix);
+  const selector = value.nextCommand.slice(
+    prefix.length,
+    claude ? -claudeSuffix.length : undefined,
+  );
+  const parsed = profileIdSchema.safeParse(selector);
+  const expected = parsed.success
+    ? `${prefix}${parsed.data}${claude ? claudeSuffix : ""}`
+    : null;
+  if (!parsed.success || value.nextCommand !== expected) return null;
   return value.accountSelector === parsed.data ? value.nextCommand : null;
 };
 

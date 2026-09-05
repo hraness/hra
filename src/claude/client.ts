@@ -47,6 +47,51 @@ type PendingInteraction = {
 };
 
 const STDERR_DIAGNOSTIC_BYTES = 4 * 1024;
+const PROCESS_TERMINATION_GRACE_MS = 250;
+const PROCESS_FORCE_JOIN_DEADLINE_MS = 1_000;
+
+const boundedShutdownDuration = (value: number, label: string): number => {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 30_000) {
+    throw new ClaudeError("INVALID_INPUT", `${label} must be between 1 and 30000 milliseconds`);
+  }
+  return value;
+};
+
+const resolvesWithin = async (promise: Promise<unknown>, milliseconds: number): Promise<boolean> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true as const,
+        () => false as const,
+      ),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), milliseconds);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+};
+
+const settlesWithin = async (promise: Promise<unknown>, milliseconds: number): Promise<boolean> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true as const,
+        () => true as const,
+      ),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), milliseconds);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+};
 
 /**
  * Owns one pinned Claude Code process speaking stream-json in both
@@ -64,7 +109,8 @@ export class ClaudeStreamClient {
   readonly #encoder = new TextEncoder();
   readonly #readTask: Promise<void>;
   readonly #stderrTask: Promise<void>;
-  readonly #exitTask: Promise<void>;
+  readonly #exitTask: Promise<number>;
+  readonly #exitWatchTask: Promise<void>;
   readonly #initialization: Promise<ClaudeStreamInitialization>;
   readonly #resolveInitialization: (value: ClaudeStreamInitialization) => void;
   readonly #rejectInitialization: (reason: unknown) => void;
@@ -72,10 +118,11 @@ export class ClaudeStreamClient {
   readonly #shutdownSettlementMs: number;
   #initializationSettled = false;
   #initializationValue: ClaudeStreamInitialization | undefined;
+  #exitResolved = false;
+  #closeTask: Promise<void> | null = null;
   #state: "open" | "closing" | "closed" | "failed" = "open";
   #disconnectEmitted = false;
   #writeChain: Promise<void> = Promise.resolve();
-  #closeTask: Promise<void> | null = null;
 
   constructor(options: ClaudeStreamClientOptions) {
     if (!options.configDir.startsWith("/")) {
@@ -86,11 +133,11 @@ export class ClaudeStreamClient {
     this.#onFact = options.onFact;
     this.#onSafeDiagnostic = options.onSafeDiagnostic;
     this.#shutdownTermGraceMs = boundedShutdownDuration(
-      options.shutdownTermGraceMs ?? 2_000,
+      options.shutdownTermGraceMs ?? PROCESS_TERMINATION_GRACE_MS,
       "Claude TERM grace",
     );
     this.#shutdownSettlementMs = boundedShutdownDuration(
-      options.shutdownSettlementMs ?? 1_000,
+      options.shutdownSettlementMs ?? PROCESS_FORCE_JOIN_DEADLINE_MS,
       "Claude shutdown settlement",
     );
     this.#decoder = new ClaudeJsonLineDecoder(
@@ -107,11 +154,16 @@ export class ClaudeStreamClient {
     // A process can fail before its owner reaches the wait call. Keep that
     // deterministic rejection owned while preserving it for the later await.
     void this.#initialization.catch(() => undefined);
+    this.#exitTask = this.#process.exited.then((code) => {
+      this.#exitResolved = true;
+      return code;
+    });
+    void this.#exitTask.catch(() => undefined);
     this.#readTask = this.#readStdout();
     void this.#readTask.catch(() => undefined);
     this.#stderrTask = this.#drainStderr();
-    this.#exitTask = this.#watchProcessExit();
-    void this.#exitTask.catch(() => undefined);
+    this.#exitWatchTask = this.#watchProcessExit();
+    void this.#exitWatchTask.catch(() => undefined);
   }
 
   get configDir(): string {
@@ -223,20 +275,22 @@ export class ClaudeStreamClient {
   }
 
   async close(): Promise<void> {
-    if (this.#closeTask === null) {
-      const task = this.#close();
-      this.#closeTask = task;
-      try {
-        await task;
-      } catch (error: unknown) {
-        // A failed close retains custody. Permit the exact owner to retry the
-        // TERM/KILL/exit proof instead of caching an ambiguous release.
-        if (this.#closeTask === task) this.#closeTask = null;
-        throw error;
-      }
+    if (this.#closeTask !== null) {
+      await this.#closeTask;
       return;
     }
-    await this.#closeTask;
+    const closeTask = this.#close();
+    this.#closeTask = closeTask;
+    try {
+      await closeTask;
+    } catch (error: unknown) {
+      // A bounded close can fail before the exact child or its output drains
+      // settle. Keep the client closed to new writes, but let its owner retry
+      // the same exact process rather than turning the first timeout into a
+      // permanently cached observation that can never prove later reaping.
+      if (this.#closeTask === closeTask) this.#closeTask = null;
+      throw error;
+    }
   }
 
   async #close(): Promise<void> {
@@ -245,52 +299,46 @@ export class ClaudeStreamClient {
     this.#failInitialization(
       new ClaudeError("PROCESS_EXITED", "The Claude runtime closed before initialization."),
     );
-    this.#pending.clear();
-
-    let terminated = false;
-    try {
-      this.#process.terminate();
-      terminated = await resolvesWithin(this.#process.exited, this.#shutdownTermGraceMs);
-    } catch {
-      this.#onSafeDiagnostic?.("Claude TERM failed; forcing process termination");
+    if (!this.#exitResolved) {
+      try {
+        this.#process.terminate();
+      } catch {
+        this.#onSafeDiagnostic?.("claude TERM failed; forcing process termination");
+      }
+      await resolvesWithin(this.#exitTask, this.#shutdownTermGraceMs);
     }
-    if (!terminated) {
+    if (!this.#exitResolved) {
       try {
         this.#process.forceTerminate();
       } catch {
-        this.#onSafeDiagnostic?.("Claude force termination failed");
+        this.#onSafeDiagnostic?.("claude force termination failed");
       }
     }
-
-    const abandonment = (async (): Promise<void> => {
+    const [exitSettled, stdoutSettled, stderrSettled] = await Promise.all([
+      resolvesWithin(this.#exitTask, this.#shutdownSettlementMs),
+      settlesWithin(this.#readTask, this.#shutdownSettlementMs),
+      settlesWithin(this.#stderrTask, this.#shutdownSettlementMs),
+    ]);
+    if (!exitSettled) {
+      throw new ClaudeError(
+        "TIMEOUT",
+        "Claude session process could not be joined after forced termination.",
+      );
+    }
+    if (!stdoutSettled || !stderrSettled) {
+      throw new ClaudeError(
+        "TIMEOUT",
+        "Claude session output could not be drained after forced termination.",
+      );
+    }
+    try {
       for (const fact of this.#assembler.abandonTurn("the Claude runtime was closed")) {
         await this.#onFact(fact);
       }
-    })();
-    const [exitSettled, stdoutSettled, stderrSettled, writesSettled, factsSettled] =
-      await Promise.all([
-        resolvesWithin(this.#process.exited, this.#shutdownSettlementMs),
-        settlesWithin(this.#readTask, this.#shutdownSettlementMs),
-        settlesWithin(this.#stderrTask, this.#shutdownSettlementMs),
-        settlesWithin(this.#writeChain, this.#shutdownSettlementMs),
-        settlesWithin(abandonment, this.#shutdownSettlementMs),
-      ]);
-    if (!exitSettled) {
-      this.#onSafeDiagnostic?.("Claude process exit did not settle after termination");
+    } finally {
+      this.#pending.clear();
+      this.#state = "closed";
     }
-    if (!stdoutSettled) this.#onSafeDiagnostic?.("Claude stdout did not settle after termination");
-    if (!stderrSettled) this.#onSafeDiagnostic?.("Claude stderr did not settle after termination");
-    if (!writesSettled) this.#onSafeDiagnostic?.("Claude writes did not settle after termination");
-    if (!factsSettled) {
-      this.#onSafeDiagnostic?.("HRA fact delivery did not settle after Claude termination");
-    }
-    if (!exitSettled) {
-      throw new ClaudeError(
-        "PROCESS_EXITED",
-        "Claude process exit could not be proven after force termination.",
-      );
-    }
-    this.#state = "closed";
   }
 
   #assertOpen(): void {
@@ -337,7 +385,7 @@ export class ClaudeStreamClient {
 
   async #watchProcessExit(): Promise<void> {
     try {
-      await this.#process.exited;
+      await this.#exitTask;
     } catch {
       // A rejected exit promise is not proof of termination. The manager
       // retains the failed client so an exact close can be retried, but no
@@ -394,7 +442,7 @@ export class ClaudeStreamClient {
         this.#onSafeDiagnostic?.("Claude force termination failed after stream loss");
       }
       const exitSettled = await resolvesWithin(
-        this.#process.exited,
+        this.#exitTask,
         this.#shutdownSettlementMs,
       );
       if (!exitSettled) {
@@ -467,48 +515,5 @@ export class ClaudeStreamClient {
       // Diagnostics are advisory; provider stderr never becomes HRA data.
     }
     if (observed > 0) this.#onSafeDiagnostic?.(`claude stderr bytes: ${String(observed)}`);
-  }
-}
-
-function boundedShutdownDuration(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value < 1 || value > 30_000) {
-    throw new ClaudeError("INVALID_INPUT", `${label} must be between 1 and 30000 milliseconds`);
-  }
-  return value;
-}
-
-async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<false>((resolveTimeout) => {
-    timer = setTimeout(() => resolveTimeout(false), timeoutMs);
-  });
-  try {
-    return await Promise.race([
-      promise.then(
-        () => true as const,
-        () => true as const,
-      ),
-      timeout,
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-async function resolvesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<false>((resolveTimeout) => {
-    timer = setTimeout(() => resolveTimeout(false), timeoutMs);
-  });
-  try {
-    return await Promise.race([
-      promise.then(
-        () => true as const,
-        () => false as const,
-      ),
-      timeout,
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
   }
 }

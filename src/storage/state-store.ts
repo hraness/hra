@@ -82,6 +82,7 @@ import {
   SESSION_EVENT_RETAIN_AGE_MS,
   SESSION_EVENT_RETAIN_BYTES,
   SESSION_EVENT_RETAIN_COUNT,
+  SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
   sessionEventBodySchema,
   sessionEventGapReasonSchema,
   sessionEventSchema,
@@ -90,6 +91,11 @@ import {
   type SessionEventGapReason,
 } from "../domain/session-events";
 import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../domain/session-tasks";
+import {
+  digestTranscriptSeed,
+  sessionProviderSwitchDurableReceiptSchema,
+  sessionProviderSwitchReceiptSchema,
+} from "../domain/transcript";
 import {
   canTransitionQueue,
   mutationStateSchema,
@@ -166,6 +172,18 @@ const claudeProcessAuthorityStateSchema = z.enum(["claimed", "bound", "releasing
 const claudeProcessRuntimeScopeSchema = z.enum(["managed", "personal"]);
 const providerAccountAuthorityKeySchema = z.string()
   .regex(/^v1:(?:codex|claude):[a-f0-9]{64}$/u);
+const providerAccountAuthorityKeyMatchesProvider = (
+  provider: Provider,
+  accountKey: string,
+): boolean => accountKey.startsWith(`v1:${provider}:`);
+const codexProviderAccountAuthorityKeyForEmail = (email: string): string =>
+  `v1:codex:${createHash("sha256").update(email.trim().toLowerCase()).digest("hex")}`;
+const profileStateAllowsProviderSessionAuthority = (
+  provider: Provider,
+  state: ProfileRecord["state"],
+): boolean => provider === "claude"
+  ? state === "signed_in" || state === "signed_out"
+  : state === "signed_in";
 const sessionAdoptionProviderThreadIdSchema = z.string().min(1).max(200);
 const claudeProcessIdentitySchema = z.object({
   pid: z.number().int().positive().safe(),
@@ -176,6 +194,12 @@ const claudeProcessAuthorityKeySchema = z.object({
   providerThreadId: sessionAdoptionProviderThreadIdSchema,
   profileId: profileIdSchema,
   runtimeScope: claudeProcessRuntimeScopeSchema,
+}).strict();
+const providerAuthenticationSchema = z.object({
+  profileId: profileIdSchema,
+  processGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  provider: providerSchema,
+  signedIn: z.literal(true),
 }).strict();
 const interactionListPositionSchema = z.object({
   requestedAt: unixMillisecondsSchema,
@@ -204,6 +228,7 @@ const profileRowSchema = z.object({
   state: profileStateSchema,
   process_generation: z.number().int().nonnegative(),
   provider_email: z.string().nullable(),
+  codex_account_key: providerAccountAuthorityKeySchema.nullable(),
   provider_plan: z.string().nullable(),
   created_at: unixMillisecondsSchema,
   updated_at: unixMillisecondsSchema,
@@ -238,13 +263,6 @@ const sessionRowSchema = z.object({
   revision: z.number().int().positive(),
   created_at: unixMillisecondsSchema,
   updated_at: unixMillisecondsSchema,
-}).strict();
-
-const sessionAccountAuthorityRowSchema = z.object({
-  session_id: sessionIdSchema,
-  profile_id: profileIdSchema,
-  account_key: z.string().min(1).max(320).nullable(),
-  recorded_at: unixMillisecondsSchema,
 }).strict();
 
 const sessionProviderAccountAuthorityRowSchema = z.object({
@@ -318,6 +336,9 @@ const sessionClaudeProcessLaunchIntentRowSchema = z.object({
   profile_id: profileIdSchema,
   profile_generation: z.number().int().nonnegative().safe(),
   runtime_scope: claudeProcessRuntimeScopeSchema,
+  provider_account_key: providerAccountAuthorityKeySchema.refine(
+    (value) => providerAccountAuthorityKeyMatchesProvider("claude", value),
+  ).nullable(),
   session_id: sessionIdSchema.nullable(),
   revision: z.number().int().positive().safe(),
   staged_at: unixMillisecondsSchema,
@@ -488,7 +509,7 @@ export type SessionRecord = {
   providerThreadId?: string;
   title: string;
   note: string;
-  /** The provider this session is bound to for its whole life. */
+  /** The provider this session is currently bound to. */
   provider: Provider;
   preset: Preset;
   fastEnabled: boolean;
@@ -587,6 +608,8 @@ export type ClaudeProcessLaunchIntentRecord = Readonly<{
   profileId: ProfileId;
   profileGeneration: number;
   runtimeScope: z.infer<typeof claudeProcessRuntimeScopeSchema>;
+  /** Null only for a pre-release v36 launch fence recovered fail-closed. */
+  providerAccountKey: string | null;
   sessionId: SessionId | null;
   revision: number;
   stagedAt: number;
@@ -888,7 +911,9 @@ export type MutationEffectEvidence =
   | { kind: "session.stop"; providerThreadId: string; baseline: SessionProviderBaseline; activeTurnId: string | null }
   | { kind: "session.rename"; providerThreadId: string; baseline: SessionProviderBaseline; requestedName: string }
   | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: ReviewedRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
+  | { kind: "session.switch"; daemonGeneration?: number | undefined; requestedAccountId: ProfileId | null; requestedPreset: Preset | null; sourceProfileId: ProfileId; sourceProcessGeneration: number; sourceProvider: Provider; sourceProviderThreadId: string; sourcePreset: Preset; targetProfileId: ProfileId; targetProcessGeneration: number; targetProvider: Provider; targetProviderAccountKey?: string | undefined; targetPreset: Preset; transcriptDigest: string; seedDigest: string; seedIncludedRecords: number; seedOmittedRecords: number; runtimeProfile: ReviewedRuntimeProfile }
   | { kind: "account.login"; method: "browser" | "device_code" }
+  | { kind: "account.claude-login"; provider: "claude"; baselineSignedIn: false }
   | { kind: "account.logout"; baselineSignedIn: boolean }
   | { kind: "account.login-cancel"; loginId: string };
 
@@ -979,7 +1004,34 @@ const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.stop"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, activeTurnId: z.string().min(1).max(200).nullable() }).strict(),
   z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
   z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: reviewedRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
+  z.object({
+    kind: z.literal("session.switch"),
+    // Optional only so an unsettled receipt written by an older release can
+    // still be parsed after upgrade. New switch effects must bind this value
+    // to daemon_state before any provider process is started.
+    daemonGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    requestedAccountId: profileIdSchema.nullable(),
+    requestedPreset: presetSchema.nullable(),
+    sourceProfileId: profileIdSchema,
+    sourceProcessGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    sourceProvider: providerSchema,
+    sourceProviderThreadId: providerThreadIdSchema,
+    sourcePreset: presetSchema,
+    targetProfileId: profileIdSchema,
+    targetProcessGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    targetProvider: providerSchema,
+    // Optional only for parsing an unsettled switch written before the
+    // provider-account proof became durable. Every new effect requires it.
+    targetProviderAccountKey: providerAccountAuthorityKeySchema.optional(),
+    targetPreset: presetSchema,
+    transcriptDigest: sha256Schema,
+    seedDigest: sha256Schema,
+    seedIncludedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    seedOmittedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    runtimeProfile: reviewedRuntimeProfileSchema,
+  }).strict(),
   z.object({ kind: z.literal("account.login"), method: z.enum(["browser", "device_code"]) }).strict(),
+  z.object({ kind: z.literal("account.claude-login"), provider: z.literal("claude"), baselineSignedIn: z.literal(false) }).strict(),
   z.object({ kind: z.literal("account.logout"), baselineSignedIn: z.boolean() }).strict(),
   z.object({ kind: z.literal("account.login-cancel"), loginId: providerLoginIdSchema }).strict(),
 ]);
@@ -1049,7 +1101,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 35;
+const currentSchemaVersion = 36;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -2687,6 +2739,89 @@ BEFORE UPDATE ON message_attachments
 BEGIN SELECT RAISE(ABORT, 'message attachments are immutable'); END;
 `;
 
+/*
+ * Provider switches cross two independently owned runtime authorities. The
+ * immutable mutation evidence fences both accounts before the target is
+ * launched; these append-only receipts then record the exact target thread
+ * and the later, separately proven source release. A crash can therefore
+ * leave less progress, but can never manufacture progress or release either
+ * account's authority without exact evidence.
+ */
+const schemaVersion35ProviderSwitchProgress = `
+CREATE TABLE IF NOT EXISTS session_provider_switch_targets (
+  attempt_id TEXT PRIMARY KEY REFERENCES mutation_attempts(id),
+  provider_thread_id TEXT NOT NULL CHECK(length(provider_thread_id) BETWEEN 1 AND 200),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS session_provider_switch_seed_intents (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_provider_switch_targets(attempt_id),
+  client_message_id TEXT NOT NULL CHECK(client_message_id=attempt_id AND length(client_message_id) BETWEEN 1 AND 200),
+  seed_text TEXT NOT NULL CHECK(length(CAST(seed_text AS BLOB)) BETWEEN 1 AND 131072),
+  runtime_profile_json TEXT NOT NULL CHECK(length(CAST(runtime_profile_json AS BLOB)) BETWEEN 2 AND 262144),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS session_provider_switch_source_releases (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_provider_switch_seed_results(attempt_id),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS session_provider_switch_seed_results (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_provider_switch_seed_intents(attempt_id),
+  turn_id TEXT NOT NULL CHECK(length(turn_id) BETWEEN 1 AND 200),
+  turn_status TEXT NOT NULL CHECK(turn_status IN ('completed','interrupted','failed','inProgress')),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS session_provider_switch_target_releases (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_provider_switch_targets(attempt_id),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS session_mutation_authority_rebinds (
+  attempt_id TEXT NOT NULL REFERENCES mutation_attempts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
+  from_generation INTEGER NOT NULL CHECK(from_generation >= 0),
+  to_generation INTEGER NOT NULL CHECK(to_generation = from_generation + 1),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0),
+  PRIMARY KEY(attempt_id,profile_id,provider,to_generation),
+  UNIQUE(attempt_id,profile_id,provider,from_generation)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_targets_immutable_update
+BEFORE UPDATE ON session_provider_switch_targets
+BEGIN SELECT RAISE(ABORT, 'session provider switch target is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_targets_immutable_delete
+BEFORE DELETE ON session_provider_switch_targets
+BEGIN SELECT RAISE(ABORT, 'session provider switch target is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_source_releases_immutable_update
+BEFORE UPDATE ON session_provider_switch_source_releases
+BEGIN SELECT RAISE(ABORT, 'session provider switch source release is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_source_releases_immutable_delete
+BEFORE DELETE ON session_provider_switch_source_releases
+BEGIN SELECT RAISE(ABORT, 'session provider switch source release is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_seed_intents_immutable_update
+BEFORE UPDATE ON session_provider_switch_seed_intents
+BEGIN SELECT RAISE(ABORT, 'session provider switch seed intent is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_seed_intents_immutable_delete
+BEFORE DELETE ON session_provider_switch_seed_intents
+BEGIN SELECT RAISE(ABORT, 'session provider switch seed intent is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_seed_results_immutable_update
+BEFORE UPDATE ON session_provider_switch_seed_results
+BEGIN SELECT RAISE(ABORT, 'session provider switch seed result is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_seed_results_immutable_delete
+BEFORE DELETE ON session_provider_switch_seed_results
+BEGIN SELECT RAISE(ABORT, 'session provider switch seed result is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_target_releases_immutable_update
+BEFORE UPDATE ON session_provider_switch_target_releases
+BEGIN SELECT RAISE(ABORT, 'session provider switch target release is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_switch_target_releases_immutable_delete
+BEFORE DELETE ON session_provider_switch_target_releases
+BEGIN SELECT RAISE(ABORT, 'session provider switch target release is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_mutation_authority_rebinds_immutable_update
+BEFORE UPDATE ON session_mutation_authority_rebinds
+BEGIN SELECT RAISE(ABORT, 'session mutation authority rebind is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_mutation_authority_rebinds_immutable_delete
+BEFORE DELETE ON session_mutation_authority_rebinds
+BEGIN SELECT RAISE(ABORT, 'session mutation authority rebind is immutable'); END;
+`;
+
 /** Per-session attachment-carrying message sources kept for projection. */
 export const MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP = 200;
 
@@ -2860,6 +2995,51 @@ const quarantineUnprovenProviderSessions = (
   }
 };
 
+const applySchemaVersion35ProviderSwitchProgress = (database: Database): void => {
+  database.exec(schemaVersion35ProviderSwitchProgress);
+};
+
+const schemaVersion35ObjectRowSchema = z.object({
+  name: z.string().min(1),
+  sql: z.string().min(1),
+  tbl_name: z.string().min(1),
+  type: z.enum(["table", "trigger"]),
+}).strict();
+
+const schemaVersion35Objects = (() => {
+  const expected = new Database(":memory:");
+  try {
+    applySchemaVersion35ProviderSwitchProgress(expected);
+    return schemaVersion35ObjectRowSchema.array().parse(
+      expected.query(`
+        SELECT name, sql, tbl_name, type
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+        ORDER BY type, name
+      `).all(),
+    );
+  } finally {
+    expected.close(false);
+  }
+})();
+
+const assertSchemaVersion35Objects = (database: Database): void => {
+  for (const expected of schemaVersion35Objects) {
+    const row = schemaVersion35ObjectRowSchema.safeParse(
+      database.query(
+        "SELECT name, sql, tbl_name, type FROM sqlite_master WHERE name=? AND type=?",
+      ).get(expected.name, expected.type),
+    );
+    if (!row.success) throw new Error(`STATE_SCHEMA_V35_OBJECT_MISSING:${expected.name}`);
+    if (
+      row.data.sql !== expected.sql
+      || row.data.tbl_name !== expected.tbl_name
+    ) {
+      throw new Error(`STATE_SCHEMA_V35_OBJECT_INVALID:${expected.name}`);
+    }
+  }
+};
+
 /*
  * Personal-home session adoption. Provenance remains in these private routing
  * tables instead of widening SessionRecord or any public projection.
@@ -2869,7 +3049,25 @@ const quarantineUnprovenProviderSessions = (
  * observations, not execution authority. A binding is the sole-controller
  * routing decision and its provider/thread identity never changes.
  */
-const schemaVersion35SessionAdoption = `
+const schemaVersion36SessionAdoption = `
+CREATE TRIGGER IF NOT EXISTS profile_codex_account_key_insert_guard
+BEFORE INSERT ON profiles
+WHEN (NEW.provider_email IS NULL)!=(NEW.codex_account_key IS NULL)
+BEGIN SELECT RAISE(ABORT, 'profile Codex account key must accompany its identity'); END;
+CREATE TRIGGER IF NOT EXISTS profile_codex_account_key_update_guard
+BEFORE UPDATE OF provider_email,codex_account_key ON profiles
+WHEN (NEW.provider_email IS NULL)!=(NEW.codex_account_key IS NULL)
+  OR (
+    OLD.provider_email IS NOT NULL AND NEW.provider_email IS NOT NULL
+    AND lower(trim(NEW.provider_email))!=lower(trim(OLD.provider_email))
+    AND NEW.codex_account_key IS OLD.codex_account_key
+  )
+  OR (
+    OLD.provider_email IS NOT NULL AND NEW.provider_email IS NOT NULL
+    AND lower(trim(NEW.provider_email))=lower(trim(OLD.provider_email))
+    AND NEW.codex_account_key IS NOT OLD.codex_account_key
+  )
+BEGIN SELECT RAISE(ABORT, 'profile Codex account key must change with its identity'); END;
 CREATE TABLE IF NOT EXISTS session_account_authorities (
   session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   profile_id TEXT NOT NULL REFERENCES profiles(id),
@@ -2918,6 +3116,14 @@ BEFORE INSERT ON session_provider_account_authorities
 WHEN NOT EXISTS(
     SELECT 1 FROM sessions s
     WHERE s.id=NEW.session_id AND s.provider=NEW.provider
+      AND (
+        NEW.provider!='codex' OR EXISTS(
+          SELECT 1 FROM profiles p
+          WHERE p.id=s.profile_id AND p.state='signed_in'
+            AND p.provider_email IS NOT NULL
+            AND p.codex_account_key=NEW.account_key
+        )
+      )
       AND NOT EXISTS(
         SELECT 1 FROM provider_runtime_account_revocations r
         WHERE r.profile_id=s.profile_id
@@ -2926,7 +3132,8 @@ WHEN NOT EXISTS(
           )
           AND r.provider=NEW.provider
           AND r.runtime_scope=NEW.runtime_scope
-          AND r.state='releasing'
+          AND (r.state='releasing' OR r.current_account_key IS NULL
+            OR r.current_account_key!=NEW.account_key)
       )
   ) OR NOT (
     (NEW.provider='codex' AND length(NEW.account_key)=73
@@ -2970,11 +3177,18 @@ WHEN NOT EXISTS(
   NEW.profile_id=OLD.profile_id
   AND NEW.account_key IS NOT OLD.account_key
   AND NOT (
-    OLD.account_key IS NOT NULL
-    AND NEW.account_key IS NULL
-    AND NOT EXISTS(
+    NOT EXISTS(
       SELECT 1 FROM session_provider_account_authorities a
       WHERE a.session_id=NEW.session_id
+    ) AND (
+      (OLD.account_key IS NOT NULL AND NEW.account_key IS NULL)
+      OR (
+        OLD.account_key IS NULL
+        AND NEW.account_key=(
+          SELECT lower(trim(p.provider_email)) FROM profiles p
+          WHERE p.id=NEW.profile_id AND p.provider_email IS NOT NULL
+        )
+      )
     )
   )
 )
@@ -2982,57 +3196,202 @@ BEGIN SELECT RAISE(ABORT, 'session account authority is immutable within one acc
 CREATE TRIGGER IF NOT EXISTS session_account_authority_queue_guard
 BEFORE INSERT ON queue_entries
 WHEN NOT EXISTS(
-  SELECT 1 FROM session_account_authorities a
-  JOIN sessions s ON s.id=a.session_id AND s.profile_id=a.profile_id
-  JOIN profiles p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.session_id AND p.state='signed_in'
-    AND a.account_key IS NOT NULL AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
+  SELECT 1 FROM sessions s
+  JOIN profiles p ON p.id=s.profile_id
+  JOIN session_provider_account_authorities pa
+    ON pa.session_id=s.id AND pa.provider=s.provider
+  WHERE s.id=NEW.session_id
+    AND NOT EXISTS(
+      SELECT 1 FROM provider_runtime_account_revocations r
+      WHERE r.profile_id=s.profile_id
+        AND r.profile_generation=p.process_generation
+        AND r.provider=s.provider AND r.runtime_scope=pa.runtime_scope
+        AND (r.state='releasing' OR r.current_account_key IS NULL
+          OR r.current_account_key!=pa.account_key)
+    )
+    AND (
+      (pa.runtime_scope='personal' AND EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=s.id AND b.provider=s.provider
+          AND b.provider_thread_id=s.provider_thread_id AND b.state='active'
+      ))
+      OR (pa.runtime_scope='managed' AND NOT EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+      ))
+    )
+    AND (
+      (s.provider='claude' AND p.state IN ('signed_in','signed_out'))
+      OR (s.provider='codex' AND p.state='signed_in'
+        AND p.provider_email IS NOT NULL
+        AND p.codex_account_key=pa.account_key AND EXISTS(
+          SELECT 1 FROM session_account_authorities a
+          WHERE a.session_id=s.id AND a.profile_id=s.profile_id
+            AND a.account_key IS NOT NULL
+            AND a.account_key=lower(trim(p.provider_email))
+        ))
+    )
 )
-BEGIN SELECT RAISE(ABORT, 'session account authority does not match the signed-in provider identity'); END;
+BEGIN SELECT RAISE(ABORT, 'session provider account authority is not current'); END;
 CREATE TRIGGER IF NOT EXISTS session_account_authority_interaction_guard
 BEFORE INSERT ON provider_interactions
 WHEN NEW.session_id IS NOT NULL AND NOT EXISTS(
-  SELECT 1 FROM session_account_authorities a
-  JOIN sessions s ON s.id=a.session_id AND s.profile_id=a.profile_id
-  JOIN profiles p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.session_id AND p.state='signed_in'
-    AND a.account_key IS NOT NULL AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
+  SELECT 1 FROM sessions s
+  JOIN profiles p ON p.id=s.profile_id
+  JOIN session_provider_account_authorities pa
+    ON pa.session_id=s.id AND pa.provider=s.provider
+  WHERE s.id=NEW.session_id
+    AND NOT EXISTS(
+      SELECT 1 FROM provider_runtime_account_revocations r
+      WHERE r.profile_id=s.profile_id
+        AND r.profile_generation=p.process_generation
+        AND r.provider=s.provider AND r.runtime_scope=pa.runtime_scope
+        AND (r.state='releasing' OR r.current_account_key IS NULL
+          OR r.current_account_key!=pa.account_key)
+    )
+    AND (
+      (pa.runtime_scope='personal' AND EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=s.id AND b.provider=s.provider
+          AND b.provider_thread_id=s.provider_thread_id AND b.state='active'
+      ))
+      OR (pa.runtime_scope='managed' AND NOT EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+      ))
+    )
+    AND (
+      (s.provider='claude' AND p.state IN ('signed_in','signed_out'))
+      OR (s.provider='codex' AND p.state='signed_in'
+        AND p.provider_email IS NOT NULL
+        AND p.codex_account_key=pa.account_key AND EXISTS(
+          SELECT 1 FROM session_account_authorities a
+          WHERE a.session_id=s.id AND a.profile_id=s.profile_id
+            AND a.account_key IS NOT NULL
+            AND a.account_key=lower(trim(p.provider_email))
+        ))
+    )
 )
-BEGIN SELECT RAISE(ABORT, 'session account authority does not match the signed-in provider identity'); END;
+BEGIN SELECT RAISE(ABORT, 'session provider account authority is not current'); END;
 CREATE TRIGGER IF NOT EXISTS session_account_authority_active_state_guard
 BEFORE UPDATE OF state,active_turn_id ON sessions
 WHEN (NEW.state='active' OR NEW.active_turn_id IS NOT NULL) AND NOT EXISTS(
-  SELECT 1 FROM session_account_authorities a
-  JOIN profiles p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.id AND a.profile_id=NEW.profile_id AND p.state='signed_in'
-    AND a.account_key IS NOT NULL AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
+  SELECT 1 FROM profiles p
+  JOIN session_provider_account_authorities pa
+    ON pa.session_id=NEW.id AND pa.provider=NEW.provider
+  WHERE p.id=NEW.profile_id
+    AND NOT EXISTS(
+      SELECT 1 FROM provider_runtime_account_revocations r
+      WHERE r.profile_id=NEW.profile_id
+        AND r.profile_generation=p.process_generation
+        AND r.provider=NEW.provider AND r.runtime_scope=pa.runtime_scope
+        AND (r.state='releasing' OR r.current_account_key IS NULL
+          OR r.current_account_key!=pa.account_key)
+    )
+    AND (
+      (pa.runtime_scope='personal' AND EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=NEW.id AND b.provider=NEW.provider
+          AND b.provider_thread_id=NEW.provider_thread_id AND b.state='active'
+      ))
+      OR (pa.runtime_scope='managed' AND NOT EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=NEW.id AND b.state IN ('active','detaching')
+      ))
+    )
+    AND (
+      (NEW.provider='claude' AND p.state IN ('signed_in','signed_out'))
+      OR (NEW.provider='codex' AND p.state='signed_in'
+        AND p.provider_email IS NOT NULL
+        AND p.codex_account_key=pa.account_key AND EXISTS(
+          SELECT 1 FROM session_account_authorities a
+          WHERE a.session_id=NEW.id AND a.profile_id=NEW.profile_id
+            AND a.account_key IS NOT NULL
+            AND a.account_key=lower(trim(p.provider_email))
+        ))
+    )
 )
-BEGIN SELECT RAISE(ABORT, 'session account authority does not match the signed-in provider identity'); END;
+BEGIN SELECT RAISE(ABORT, 'session provider account authority is not current'); END;
 CREATE TRIGGER IF NOT EXISTS session_account_authority_task_insert_guard
 BEFORE INSERT ON session_tasks
 WHEN NEW.status='active' AND NOT EXISTS(
-  SELECT 1 FROM session_account_authorities a
-  JOIN sessions s ON s.id=a.session_id AND s.profile_id=a.profile_id
-  JOIN profiles p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.session_id AND p.state='signed_in'
-    AND a.account_key IS NOT NULL AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
+  SELECT 1 FROM sessions s
+  JOIN profiles p ON p.id=s.profile_id
+  JOIN session_provider_account_authorities pa
+    ON pa.session_id=s.id AND pa.provider=s.provider
+  WHERE s.id=NEW.session_id
+    AND NOT EXISTS(
+      SELECT 1 FROM provider_runtime_account_revocations r
+      WHERE r.profile_id=s.profile_id
+        AND r.profile_generation=p.process_generation
+        AND r.provider=s.provider AND r.runtime_scope=pa.runtime_scope
+        AND (r.state='releasing' OR r.current_account_key IS NULL
+          OR r.current_account_key!=pa.account_key)
+    )
+    AND (
+      (pa.runtime_scope='personal' AND EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=s.id AND b.provider=s.provider
+          AND b.provider_thread_id=s.provider_thread_id AND b.state='active'
+      ))
+      OR (pa.runtime_scope='managed' AND NOT EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+      ))
+    )
+    AND (
+      (s.provider='claude' AND p.state IN ('signed_in','signed_out'))
+      OR (s.provider='codex' AND p.state='signed_in'
+        AND p.provider_email IS NOT NULL
+        AND p.codex_account_key=pa.account_key AND EXISTS(
+          SELECT 1 FROM session_account_authorities a
+          WHERE a.session_id=s.id AND a.profile_id=s.profile_id
+            AND a.account_key IS NOT NULL
+            AND a.account_key=lower(trim(p.provider_email))
+        ))
+    )
 )
-BEGIN SELECT RAISE(ABORT, 'session account authority does not match the signed-in provider identity'); END;
+BEGIN SELECT RAISE(ABORT, 'session provider account authority is not current'); END;
 CREATE TRIGGER IF NOT EXISTS session_account_authority_task_update_guard
 BEFORE UPDATE OF status ON session_tasks
 WHEN NEW.status='active' AND NOT EXISTS(
-  SELECT 1 FROM session_account_authorities a
-  JOIN sessions s ON s.id=a.session_id AND s.profile_id=a.profile_id
-  JOIN profiles p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.session_id AND p.state='signed_in'
-    AND a.account_key IS NOT NULL AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
+  SELECT 1 FROM sessions s
+  JOIN profiles p ON p.id=s.profile_id
+  JOIN session_provider_account_authorities pa
+    ON pa.session_id=s.id AND pa.provider=s.provider
+  WHERE s.id=NEW.session_id
+    AND NOT EXISTS(
+      SELECT 1 FROM provider_runtime_account_revocations r
+      WHERE r.profile_id=s.profile_id
+        AND r.profile_generation=p.process_generation
+        AND r.provider=s.provider AND r.runtime_scope=pa.runtime_scope
+        AND (r.state='releasing' OR r.current_account_key IS NULL
+          OR r.current_account_key!=pa.account_key)
+    )
+    AND (
+      (pa.runtime_scope='personal' AND EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=s.id AND b.provider=s.provider
+          AND b.provider_thread_id=s.provider_thread_id AND b.state='active'
+      ))
+      OR (pa.runtime_scope='managed' AND NOT EXISTS(
+        SELECT 1 FROM session_personal_runtime_bindings b
+        WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+      ))
+    )
+    AND (
+      (s.provider='claude' AND p.state IN ('signed_in','signed_out'))
+      OR (s.provider='codex' AND p.state='signed_in'
+        AND p.provider_email IS NOT NULL
+        AND p.codex_account_key=pa.account_key AND EXISTS(
+          SELECT 1 FROM session_account_authorities a
+          WHERE a.session_id=s.id AND a.profile_id=s.profile_id
+            AND a.account_key IS NOT NULL
+            AND a.account_key=lower(trim(p.provider_email))
+        ))
+    )
 )
-BEGIN SELECT RAISE(ABORT, 'session account authority does not match the signed-in provider identity'); END;
+BEGIN SELECT RAISE(ABORT, 'session provider account authority is not current'); END;
 CREATE TABLE IF NOT EXISTS session_adoption_policies (
   provider TEXT PRIMARY KEY CHECK(provider IN ('codex','claude')),
   profile_id TEXT REFERENCES profiles(id),
@@ -3049,16 +3408,22 @@ CREATE TRIGGER IF NOT EXISTS session_adoption_policy_profile_guard_insert
 BEFORE INSERT ON session_adoption_policies
 WHEN NEW.state='enabled' AND NOT EXISTS(
   SELECT 1 FROM profiles p
-  WHERE p.id=NEW.profile_id AND p.state='signed_in' AND p.provider_email IS NOT NULL
+  WHERE p.id=NEW.profile_id
+    AND ((NEW.provider='claude' AND p.state IN ('signed_in','signed_out'))
+      OR (NEW.provider='codex' AND p.state='signed_in'
+        AND p.provider_email IS NOT NULL AND p.codex_account_key IS NOT NULL))
 )
-BEGIN SELECT RAISE(ABORT, 'session adoption policy requires an identifiable signed-in profile'); END;
+BEGIN SELECT RAISE(ABORT, 'session adoption policy requires current provider authority'); END;
 CREATE TRIGGER IF NOT EXISTS session_adoption_policy_profile_guard_update
 BEFORE UPDATE OF state,profile_id ON session_adoption_policies
 WHEN NEW.state='enabled' AND NOT EXISTS(
   SELECT 1 FROM profiles p
-  WHERE p.id=NEW.profile_id AND p.state='signed_in' AND p.provider_email IS NOT NULL
+  WHERE p.id=NEW.profile_id
+    AND ((NEW.provider='claude' AND p.state IN ('signed_in','signed_out'))
+      OR (NEW.provider='codex' AND p.state='signed_in'
+        AND p.provider_email IS NOT NULL AND p.codex_account_key IS NOT NULL))
 )
-BEGIN SELECT RAISE(ABORT, 'session adoption policy requires an identifiable signed-in profile'); END;
+BEGIN SELECT RAISE(ABORT, 'session adoption policy requires current provider authority'); END;
 CREATE TRIGGER IF NOT EXISTS session_adoption_policy_identity_immutable
 BEFORE UPDATE OF provider,created_at ON session_adoption_policies
 BEGIN SELECT RAISE(ABORT, 'session adoption policy identity is immutable'); END;
@@ -3169,6 +3534,11 @@ CREATE TABLE IF NOT EXISTS session_claude_process_launch_intents (
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   profile_generation INTEGER NOT NULL CHECK(profile_generation BETWEEN 0 AND 9007199254740991),
   runtime_scope TEXT NOT NULL CHECK(runtime_scope IN ('managed','personal')),
+  provider_account_key TEXT NOT NULL CHECK(
+    length(provider_account_key)=74
+    AND substr(provider_account_key,1,10)='v1:claude:'
+    AND substr(provider_account_key,11) NOT GLOB '*[^0-9a-f]*'
+  ),
   session_id TEXT REFERENCES sessions(id),
   revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
   staged_at INTEGER NOT NULL CHECK(staged_at >= 0),
@@ -3182,21 +3552,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS session_claude_process_launch_intents_session
   WHERE session_id IS NOT NULL;
 CREATE TRIGGER IF NOT EXISTS session_claude_process_launch_intent_profile_guard
 BEFORE INSERT ON session_claude_process_launch_intents
-WHEN NOT EXISTS(
+WHEN NEW.provider_account_key IS NULL
+  OR length(NEW.provider_account_key)!=74
+  OR substr(NEW.provider_account_key,1,10)!='v1:claude:'
+  OR substr(NEW.provider_account_key,11) GLOB '*[^0-9a-f]*'
+  OR NOT EXISTS(
   SELECT 1 FROM profiles p
   WHERE p.id=NEW.profile_id
     AND p.process_generation=NEW.profile_generation
-    AND p.state='signed_in'
+    AND p.state IN ('signed_in','signed_out')
     AND NOT EXISTS(
       SELECT 1 FROM provider_runtime_account_revocations r
       WHERE r.profile_id=NEW.profile_id
         AND r.profile_generation=NEW.profile_generation
         AND r.provider='claude'
         AND r.runtime_scope=NEW.runtime_scope
-        AND r.state='releasing'
+        AND (r.state='releasing' OR r.current_account_key IS NULL
+          OR r.current_account_key!=NEW.provider_account_key)
     )
 )
-BEGIN SELECT RAISE(ABORT, 'Claude process launch intent requires current signed-in profile authority'); END;
+BEGIN SELECT RAISE(ABORT, 'Claude process launch intent requires current provider authority'); END;
 CREATE TRIGGER IF NOT EXISTS session_claude_process_launch_intent_no_update
 BEFORE UPDATE ON session_claude_process_launch_intents
 BEGIN SELECT RAISE(ABORT, 'Claude process launch intent is immutable'); END;
@@ -3221,23 +3596,11 @@ WHEN NEW.state IN ('detaching','detached')
 BEGIN SELECT RAISE(ABORT, 'Claude process launch intent must be cancelled before personal session detach'); END;
 CREATE TRIGGER IF NOT EXISTS session_adoption_profile_identity_guard
 BEFORE UPDATE OF provider_email ON profiles
-WHEN NEW.provider_email IS NOT OLD.provider_email AND (
-  EXISTS(
-    SELECT 1 FROM session_personal_runtime_bindings b
-    JOIN sessions s ON s.id=b.session_id
-    WHERE s.profile_id=OLD.id AND b.state IN ('active','detaching')
-  )
-  OR EXISTS(
-    SELECT 1 FROM session_claude_process_authorities a
-    WHERE a.profile_id=OLD.id
-      AND a.profile_generation=OLD.process_generation
-      AND a.state!='released'
-  )
-  OR EXISTS(
-    SELECT 1 FROM session_claude_process_launch_intents i
-    WHERE i.profile_id=OLD.id
-      AND i.profile_generation=OLD.process_generation
-  )
+WHEN NEW.provider_email IS NOT OLD.provider_email AND EXISTS(
+  SELECT 1 FROM session_personal_runtime_bindings b
+  JOIN sessions s ON s.id=b.session_id
+  WHERE s.profile_id=OLD.id AND s.provider='codex'
+    AND b.provider='codex' AND b.state IN ('active','detaching')
 )
 BEGIN SELECT RAISE(ABORT, 'live session controllers must release before account identity changes'); END;
 CREATE TRIGGER IF NOT EXISTS sessions_personal_runtime_binding_rebind_guard
@@ -3254,18 +3617,19 @@ WHEN NEW.state IN ('signed_out','removed') AND NEW.state!=OLD.state AND (
     SELECT 1 FROM session_personal_runtime_bindings b
     JOIN sessions s ON s.id=b.session_id
     WHERE s.profile_id=OLD.id AND b.state IN ('active','detaching')
+      AND (NEW.state='removed' OR (s.provider='codex' AND b.provider='codex'))
   )
-  OR EXISTS(
+  OR (NEW.state='removed' AND EXISTS(
     SELECT 1 FROM session_claude_process_authorities a
     WHERE a.profile_id=OLD.id
       AND a.profile_generation=OLD.process_generation
       AND a.state!='released'
-  )
-  OR EXISTS(
+  ))
+  OR (NEW.state='removed' AND EXISTS(
     SELECT 1 FROM session_claude_process_launch_intents i
     WHERE i.profile_id=OLD.id
       AND i.profile_generation=OLD.process_generation
-  )
+  ))
 )
 BEGIN SELECT RAISE(ABORT, 'live session controllers must release before account authority ends'); END;
 CREATE TRIGGER IF NOT EXISTS session_adoption_profile_generation_guard
@@ -3289,12 +3653,23 @@ WHEN NEW.process_generation!=OLD.process_generation AND (
       WHERE s.profile_id=OLD.id AND b.state IN ('active','detaching')
     )
     AND NOT (
-      NEW.state=OLD.state
-      AND EXISTS(
+      EXISTS(
         SELECT 1 FROM session_adoption_profile_generation_permits permit
         WHERE permit.profile_id=OLD.id
           AND permit.from_generation=OLD.process_generation
           AND permit.to_generation=NEW.process_generation
+      )
+      AND (
+        NEW.state=OLD.state
+        OR (
+          NEW.state='login_pending'
+          AND NOT EXISTS(
+            SELECT 1 FROM session_personal_runtime_bindings b
+            JOIN sessions s ON s.id=b.session_id
+            WHERE s.profile_id=OLD.id AND s.provider='codex'
+              AND b.provider='codex' AND b.state IN ('active','detaching')
+          )
+        )
       )
     )
   )
@@ -3307,7 +3682,16 @@ BEGIN
   UPDATE session_adoption_policies
   SET profile_id=NULL,state='disabled',revision=revision+1,
     updated_at=MAX(updated_at,NEW.updated_at)
-  WHERE profile_id=NEW.id AND state='enabled';
+  WHERE profile_id=NEW.id AND provider='codex' AND state='enabled';
+END;
+CREATE TRIGGER IF NOT EXISTS session_adoption_profile_unidentified_policy_disable
+AFTER UPDATE OF provider_email ON profiles
+WHEN NEW.provider_email IS NULL AND OLD.provider_email IS NOT NULL
+BEGIN
+  UPDATE session_adoption_policies
+  SET profile_id=NULL,state='disabled',revision=revision+1,
+    updated_at=MAX(updated_at,NEW.updated_at)
+  WHERE profile_id=NEW.id AND provider='codex' AND state='enabled';
 END;
 CREATE TABLE IF NOT EXISTS session_claude_process_authorities (
   provider_thread_id TEXT NOT NULL CHECK(length(provider_thread_id) BETWEEN 1 AND 200),
@@ -3393,7 +3777,7 @@ WHEN NEW.state='enabled' AND EXISTS(
   SELECT 1 FROM provider_runtime_account_revocations r
   JOIN profiles p ON p.id=r.profile_id
   WHERE r.profile_id=NEW.profile_id AND r.provider=NEW.provider
-    AND r.runtime_scope='personal' AND r.state='releasing'
+    AND r.runtime_scope='personal'
     AND r.profile_generation=p.process_generation
 )
 BEGIN SELECT RAISE(ABORT, 'provider runtime account revocation must complete before adoption is enabled'); END;
@@ -3403,7 +3787,7 @@ WHEN NEW.state='enabled' AND EXISTS(
   SELECT 1 FROM provider_runtime_account_revocations r
   JOIN profiles p ON p.id=r.profile_id
   WHERE r.profile_id=NEW.profile_id AND r.provider=NEW.provider
-    AND r.runtime_scope='personal' AND r.state='releasing'
+    AND r.runtime_scope='personal'
     AND r.profile_generation=p.process_generation
 )
 BEGIN SELECT RAISE(ABORT, 'provider runtime account revocation must complete before adoption is enabled'); END;
@@ -3608,7 +3992,7 @@ const rebuildLegacyVersion35ClaudeProcessAuthorities = (database: Database): voi
   rebuild.immediate();
 };
 
-const schemaVersion35CandidateSourceProcessIdentity = `
+const schemaVersion36CandidateSourceProcessIdentity = `
 CREATE INDEX IF NOT EXISTS session_adoption_candidates_claude_reprobe
   ON session_adoption_candidates(last_observed_at,provider_thread_id)
   WHERE provider='claude'
@@ -3652,7 +4036,7 @@ WHEN NOT (
 BEGIN SELECT RAISE(ABORT, 'session adoption candidate source identity is invalid'); END;
 `;
 
-const ensureVersion35CandidateSourceProcessIdentity = (database: Database): void => {
+const ensureVersion36CandidateSourceProcessIdentity = (database: Database): void => {
   if (!hasTableColumn(database, "session_adoption_candidates", "source_pid")) {
     database.exec(
       "ALTER TABLE session_adoption_candidates ADD COLUMN source_pid INTEGER CHECK(source_pid IS NULL OR (source_pid > 0 AND source_pid <= 9007199254740991))",
@@ -3668,18 +4052,22 @@ const ensureVersion35CandidateSourceProcessIdentity = (database: Database): void
       "ALTER TABLE session_adoption_candidates ADD COLUMN source_proc_start TEXT CHECK(source_proc_start IS NULL OR length(CAST(source_proc_start AS BLOB)) BETWEEN 1 AND 128)",
     );
   }
-  database.exec(schemaVersion35CandidateSourceProcessIdentity);
+  database.exec(schemaVersion36CandidateSourceProcessIdentity);
 };
 
-const applySchemaVersion35SessionAdoption = (
+const applySchemaVersion36SessionAdoption = (
   database: Database,
   migratedAt: number,
 ): void => {
-  // Version 35 is still pre-release and is deliberately reapplied on startup.
-  // Repair earlier development copies before idempotently recreating v35 so a
+  // Version 36 is still pre-release and is deliberately reapplied on startup.
+  // Repair earlier development copies before idempotently recreating v36 so a
   // thread id from one provider home can never alias authority in another.
   database.exec("DROP TRIGGER IF EXISTS session_adoption_profile_signout_guard");
   database.exec("DROP TRIGGER IF EXISTS session_adoption_profile_generation_guard");
+  database.exec("DROP TRIGGER IF EXISTS session_adoption_profile_signed_out_policy_disable");
+  database.exec("DROP TRIGGER IF EXISTS session_adoption_profile_unidentified_policy_disable");
+  database.exec("DROP TRIGGER IF EXISTS profile_codex_account_key_insert_guard");
+  database.exec("DROP TRIGGER IF EXISTS profile_codex_account_key_update_guard");
   database.exec("DROP TRIGGER IF EXISTS profile_controller_authority_recovery_guard");
   database.exec("DROP TRIGGER IF EXISTS sessions_claude_process_authority_rebind_guard");
   database.exec("DROP TRIGGER IF EXISTS session_claude_process_launch_intent_profile_guard");
@@ -3688,14 +4076,74 @@ const applySchemaVersion35SessionAdoption = (
   database.exec("DROP TRIGGER IF EXISTS session_personal_runtime_binding_launch_intent_detach_guard");
   database.exec("DROP TRIGGER IF EXISTS session_adoption_profile_identity_guard");
   database.exec("DROP TRIGGER IF EXISTS session_adoption_policy_unsettled_claim_guard");
-  // Tighten the pre-release provider-key validator for existing v35 databases.
+  database.exec("DROP TRIGGER IF EXISTS session_adoption_policy_profile_guard_insert");
+  database.exec("DROP TRIGGER IF EXISTS session_adoption_policy_profile_guard_update");
+  database.exec("DROP TRIGGER IF EXISTS session_adoption_policy_provider_revocation_guard_insert");
+  database.exec("DROP TRIGGER IF EXISTS session_adoption_policy_provider_revocation_guard_update");
+  database.exec("DROP TRIGGER IF EXISTS session_account_authority_queue_guard");
+  database.exec("DROP TRIGGER IF EXISTS session_account_authority_interaction_guard");
+  database.exec("DROP TRIGGER IF EXISTS session_account_authority_active_state_guard");
+  database.exec("DROP TRIGGER IF EXISTS session_account_authority_task_insert_guard");
+  database.exec("DROP TRIGGER IF EXISTS session_account_authority_task_update_guard");
+  // Tighten the pre-release provider-key validator for existing feature-v35 databases.
   database.exec("DROP TRIGGER IF EXISTS session_provider_account_authority_insert_guard");
-  // The first v35 development backfill inferred identity from the profile's
+  // The first feature-v35 development backfill inferred identity from the profile's
   // then-current email. A session without immutable provider evidence has no
   // safe provenance, so both legacy v34 rows and partial v35 rows fail closed.
   database.exec("DROP TRIGGER IF EXISTS session_account_authority_update_guard");
   rebuildLegacyVersion35ClaudeProcessAuthorities(database);
-  database.exec(schemaVersion35SessionAdoption);
+  if (
+    database.query(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_claude_process_launch_intents'",
+    ).get() !== null
+    && !hasTableColumn(
+      database,
+      "session_claude_process_launch_intents",
+      "provider_account_key",
+    )
+  ) {
+    // An interrupted pre-release v36 launch is retained, but its absent
+    // account proof remains NULL and can never be consumed to admit a child.
+    database.exec(
+      `ALTER TABLE session_claude_process_launch_intents
+       ADD COLUMN provider_account_key TEXT CHECK(
+         provider_account_key IS NULL OR (
+           length(provider_account_key)=74
+           AND substr(provider_account_key,1,10)='v1:claude:'
+           AND substr(provider_account_key,11) NOT GLOB '*[^0-9a-f]*'
+         )
+       )`,
+    );
+  }
+  if (!hasTableColumn(database, "profiles", "codex_account_key")) {
+    database.exec(
+      `ALTER TABLE profiles
+       ADD COLUMN codex_account_key TEXT CHECK(
+         codex_account_key IS NULL OR (
+           length(codex_account_key)=73
+           AND substr(codex_account_key,1,9)='v1:codex:'
+           AND substr(codex_account_key,10) NOT GLOB '*[^0-9a-f]*'
+         )
+       )`,
+    );
+  }
+  const profileIdentities = database.query(
+    "SELECT id,provider_email FROM profiles ORDER BY id",
+  ).all().map((row) => z.object({
+    id: profileIdSchema,
+    provider_email: z.string().nullable(),
+  }).strict().parse(row));
+  for (const profile of profileIdentities) {
+    database.query(
+      "UPDATE profiles SET codex_account_key=? WHERE id=?",
+    ).run(
+      profile.provider_email === null
+        ? null
+        : codexProviderAccountAuthorityKeyForEmail(profile.provider_email),
+      profile.id,
+    );
+  }
+  database.exec(schemaVersion36SessionAdoption);
   database.exec("DROP TRIGGER IF EXISTS session_account_authority_update_guard");
   database.exec(`
     INSERT OR IGNORE INTO session_account_authorities(
@@ -3703,6 +4151,52 @@ const applySchemaVersion35SessionAdoption = (
     )
     SELECT s.id,s.profile_id,NULL,s.created_at
     FROM sessions s
+  `);
+  // A pre-release copy may contain syntactically valid provider proof that no
+  // longer belongs to the current profile generation or runtime scope. Retire
+  // that proof rather than inferring provenance from mutable profile state.
+  // The existing quarantine pass then fences every nonterminal effect before
+  // startup can dispatch it.
+  database.exec(`
+    DELETE FROM session_provider_account_authorities
+    WHERE NOT EXISTS(
+      SELECT 1 FROM sessions s
+      JOIN profiles p ON p.id=s.profile_id
+      WHERE s.id=session_provider_account_authorities.session_id
+        AND s.provider=session_provider_account_authorities.provider
+        AND NOT EXISTS(
+          SELECT 1 FROM provider_runtime_account_revocations r
+          WHERE r.profile_id=s.profile_id
+            AND r.profile_generation=p.process_generation
+            AND r.provider=s.provider
+            AND r.runtime_scope=session_provider_account_authorities.runtime_scope
+            AND (r.state='releasing' OR r.current_account_key IS NULL
+              OR r.current_account_key!=session_provider_account_authorities.account_key)
+        )
+        AND (
+          (session_provider_account_authorities.runtime_scope='personal' AND EXISTS(
+            SELECT 1 FROM session_personal_runtime_bindings b
+            WHERE b.session_id=s.id AND b.provider=s.provider
+              AND b.provider_thread_id=s.provider_thread_id AND b.state='active'
+          ))
+          OR (session_provider_account_authorities.runtime_scope='managed' AND NOT EXISTS(
+            SELECT 1 FROM session_personal_runtime_bindings b
+            WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+          ))
+        )
+        AND (
+          (s.provider='claude' AND p.state IN ('signed_in','signed_out'))
+          OR (s.provider='codex' AND p.state='signed_in'
+            AND p.provider_email IS NOT NULL
+            AND p.codex_account_key=session_provider_account_authorities.account_key
+            AND EXISTS(
+              SELECT 1 FROM session_account_authorities a
+              WHERE a.session_id=s.id AND a.profile_id=s.profile_id
+                AND a.account_key IS NOT NULL
+                AND a.account_key=lower(trim(p.provider_email))
+            ))
+        )
+    )
   `);
   database.exec(`
     UPDATE session_account_authorities
@@ -3722,23 +4216,29 @@ const applySchemaVersion35SessionAdoption = (
       NEW.profile_id=OLD.profile_id
       AND NEW.account_key IS NOT OLD.account_key
       AND NOT (
-        OLD.account_key IS NOT NULL
-        AND NEW.account_key IS NULL
-        AND NOT EXISTS(
+        NOT EXISTS(
           SELECT 1 FROM session_provider_account_authorities a
           WHERE a.session_id=NEW.session_id
+        ) AND (
+          (OLD.account_key IS NOT NULL AND NEW.account_key IS NULL)
+          OR (
+            OLD.account_key IS NULL
+            AND NEW.account_key=(
+              SELECT lower(trim(p.provider_email)) FROM profiles p
+              WHERE p.id=NEW.profile_id AND p.provider_email IS NOT NULL
+            )
+          )
         )
       )
     )
     BEGIN SELECT RAISE(ABORT, 'session account authority is immutable within one account profile'); END;
   `);
   quarantineUnprovenProviderSessions(database, migratedAt);
-  ensureVersion35CandidateSourceProcessIdentity(database);
+  ensureVersion36CandidateSourceProcessIdentity(database);
 };
 
 /** Maximum unclaimed candidates retained per provider. */
 export const SESSION_ADOPTION_PENDING_CANDIDATE_CAP = 2_000;
-
 const applySchemaVersion33DeviceCommands = (database: Database): void => {
   if (!hasTableColumn(database, "daemon_state", "device_commands_allowed")) {
     database.exec(schemaVersion33DeviceCommandsAllowedColumn);
@@ -4746,6 +5246,14 @@ const migrateWritableDatabase = (
     // materializes the omitted tables without rewriting existing objects.
     database.exec(schemaVersion1);
 
+    // v26 installed the current work authority guards, which now inspect the
+    // provider bound to a session. Older SQLite releases admitted those trigger
+    // definitions before the additive v32 column existed, while newer releases
+    // reject an unrelated table rebuild as soon as they revalidate the broken
+    // trigger. Heal every pre-v32 database before any later migration can force
+    // that validation; v32 remains the migration that stamps the column.
+    if (version < 32) applySchemaVersion32(database);
+
     if (version < 2) {
       // Early development builds accidentally stamped this column as schema v1.
       // Accept those databases without weakening the canonical append-only v1→v2 path.
@@ -5135,10 +5643,21 @@ const migrateWritableDatabase = (
     }
 
     if (version < 35) {
-      applySchemaVersion35SessionAdoption(database, unixMillisecondsSchema.parse(now()));
+      applySchemaVersion35ProviderSwitchProgress(database);
       database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(35, now());
       database.exec("PRAGMA user_version = 35");
       version = 35;
+    }
+
+    if (version < 36) {
+      // A feature development build also stamped its unrelated adoption
+      // schema as v35. Reapply the canonical v35 objects before advancing so
+      // databases produced by either parent converge on the same authority.
+      applySchemaVersion35ProviderSwitchProgress(database);
+      applySchemaVersion36SessionAdoption(database, unixMillisecondsSchema.parse(now()));
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(36, now());
+      database.exec("PRAGMA user_version = 36");
+      version = 36;
     }
 
     // Reapplying additive objects and idempotent authority backfills makes a
@@ -5181,7 +5700,8 @@ const migrateWritableDatabase = (
     applySchemaVersion31Archive(database);
     applySchemaVersion33DeviceCommands(database);
     applySchemaVersion34Attachments(database);
-    applySchemaVersion35SessionAdoption(database, unixMillisecondsSchema.parse(now()));
+    applySchemaVersion35ProviderSwitchProgress(database);
+    applySchemaVersion36SessionAdoption(database, unixMillisecondsSchema.parse(now()));
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -5369,6 +5889,7 @@ const mapSessionClaudeProcessLaunchIntent = (
     profileId: parsed.profile_id,
     profileGeneration: parsed.profile_generation,
     runtimeScope: parsed.runtime_scope,
+    providerAccountKey: parsed.provider_account_key,
     sessionId: parsed.session_id,
     revision: parsed.revision,
     stagedAt: parsed.staged_at,
@@ -5656,6 +6177,13 @@ const desktopRecoverySettlementMs = 30_000;
 const digestJson = (value: unknown): string =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
+const sessionProviderSwitchTargetAliasesSource = (
+  evidence: Extract<MutationEffectEvidence, { kind: "session.switch" }>,
+  targetProviderThreadId: string,
+): boolean => evidence.sourceProfileId === evidence.targetProfileId
+  && evidence.sourceProvider === evidence.targetProvider
+  && evidence.sourceProviderThreadId === targetProviderThreadId;
+
 const sessionAdoptionCandidateFingerprint = (input: Readonly<{
   provider: Provider;
   providerThreadId: string;
@@ -5680,6 +6208,37 @@ const sessionAdoptionCandidateFingerprint = (input: Readonly<{
     ? {}
     : { sourceProcessIdentity: input.sourceProcessIdentity }),
 });
+
+const parseSessionProviderSwitchReceipt = (
+  value: unknown,
+  evidence: Extract<MutationEffectEvidence, { kind: "session.switch" }>,
+  sessionId: SessionId,
+  targetProviderThreadId: string,
+  seedTurnId: string,
+  seedTurnStatus: "completed" | "interrupted" | "failed" | "inProgress",
+) => {
+  const receipt = sessionProviderSwitchReceiptSchema.parse(value);
+  if (
+    receipt.sessionId !== sessionId
+    || receipt.providerThreadId !== targetProviderThreadId
+    || receipt.request.accountId !== evidence.requestedAccountId
+    || receipt.request.preset !== evidence.requestedPreset
+    || receipt.request.provider !== evidence.targetProvider
+    || receipt.from.account !== evidence.sourceProfileId
+    || receipt.from.preset !== evidence.sourcePreset
+    || receipt.from.provider !== evidence.sourceProvider
+    || receipt.to.account !== evidence.targetProfileId
+    || receipt.to.preset !== evidence.targetPreset
+    || receipt.to.provider !== evidence.targetProvider
+    || receipt.transcriptDigest !== evidence.transcriptDigest
+    || receipt.seed.digest !== evidence.seedDigest
+    || receipt.seed.includedRecords !== evidence.seedIncludedRecords
+    || receipt.seed.omittedRecords !== evidence.seedOmittedRecords
+    || receipt.seed.status !== seedTurnStatus
+    || receipt.turnId !== seedTurnId
+  ) throw new Error("SESSION_PROVIDER_SWITCH_RECEIPT_MISMATCH");
+  return receipt;
+};
 
 const parseOptionalPlan = (value: string | undefined): string | undefined => {
   if (value === undefined) return undefined;
@@ -5758,6 +6317,7 @@ export class StateStore {
         if (hasPendingSecurityScrub(this.#database)) throw new Error("STATE_SECURITY_SCRUB_REQUIRED");
       }
       assertSchemaVersion24Objects(this.#database);
+      assertSchemaVersion35Objects(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -5888,10 +6448,616 @@ export class StateStore {
     return mapProfile(row);
   }
 
+  providerAuthorityAdvanceBlocker(
+    profileId: ProfileId,
+    provider: Provider,
+  ): "active_session" | "recovery_required" | "unsettled_authority" | null {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedProvider = providerSchema.parse(provider);
+    if (this.#hasUnsettledClaudeLoginAuthority(parsedProfileId)) {
+      return "unsettled_authority";
+    }
+    const providerSwitch = this.#database.query(
+      `SELECT 1 AS present
+       FROM mutation_attempts m
+       JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+       LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+       WHERE e.kind='session.switch'
+         AND m.state IN ('effect_started','ambiguous')
+         AND r.attempt_id IS NULL
+         AND (
+           (json_extract(e.evidence_json,'$.sourceProfileId')=?
+             AND json_extract(e.evidence_json,'$.sourceProvider')=?)
+           OR
+           (json_extract(e.evidence_json,'$.targetProfileId')=?
+             AND json_extract(e.evidence_json,'$.targetProvider')=?)
+         )
+       LIMIT 1`,
+    ).get(
+      parsedProfileId,
+      parsedProvider,
+      parsedProfileId,
+      parsedProvider,
+    );
+    if (providerSwitch !== null) return "unsettled_authority";
+    const row = z.object({
+      reason: z.enum([
+        "active_session",
+        "recovery_required",
+        "unsettled_authority",
+      ]).nullable(),
+    }).strict().parse(this.#database.query(
+      `SELECT CASE
+         WHEN EXISTS(
+           SELECT 1 FROM sessions s
+           WHERE s.profile_id=? AND s.provider=?
+             AND (s.state IN ('starting','active') OR s.active_turn_id IS NOT NULL)
+         ) THEN 'active_session'
+         WHEN EXISTS(
+           SELECT 1 FROM sessions s
+           WHERE s.profile_id=? AND s.provider=? AND s.state='recovery_required'
+         ) THEN 'recovery_required'
+         WHEN EXISTS(
+           SELECT 1
+           FROM sessions s
+           WHERE s.profile_id=? AND s.provider=?
+             AND (
+               EXISTS(
+                 SELECT 1 FROM provider_interactions i
+                 WHERE i.session_id=s.id
+                   AND i.state IN ('pending','response_prepared','response_written')
+               )
+               OR EXISTS(
+                 SELECT 1 FROM mutation_attempts m
+                 LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+                 WHERE m.authority_id=s.id
+                   AND m.state IN ('effect_started','ambiguous')
+                   AND r.attempt_id IS NULL
+               )
+               OR EXISTS(
+                 SELECT 1 FROM queue_entries q
+                 LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
+                 WHERE q.session_id=s.id
+                   AND q.state IN ('dispatching','ambiguous')
+                   AND r.queue_id IS NULL
+               )
+               OR EXISTS(
+                 SELECT 1 FROM work_attempts w
+                 WHERE w.worker_session_id=s.id
+                   AND w.state IN ('claimed','dispatching','running','recovery_required')
+               )
+               OR EXISTS(
+                 SELECT 1 FROM work_signals w
+                 WHERE w.to_session_id=s.id
+                   AND NOT EXISTS(
+                     SELECT 1 FROM work_signal_receipts r
+                     WHERE r.signal_id=w.id AND r.kind='ack'
+                   )
+               )
+             )
+         ) THEN 'unsettled_authority'
+         ELSE NULL
+       END AS reason`,
+    ).get(
+      parsedProfileId,
+      parsedProvider,
+      parsedProfileId,
+      parsedProvider,
+      parsedProfileId,
+      parsedProvider,
+    )).reason;
+    return row;
+  }
+
+  /**
+   * Managed Claude login replaces only the isolated Claude home. An active or
+   * detaching personal binding owns a different provider home, so its session
+   * and source-side work cannot block that managed-only replacement. A stale
+   * binding/session identity mismatch fails closed, while a switch targeting
+   * Claude still reserves managed Claude authority.
+   */
+  managedClaudeLoginAuthorityBlocker(
+    profileId: ProfileId,
+  ): "active_session" | "recovery_required" | "unsettled_authority" | null {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    if (this.#hasUnsettledClaudeLoginAuthority(parsedProfileId)) {
+      return "unsettled_authority";
+    }
+    const mismatchedPersonalBinding = this.#database.query(
+      `SELECT 1 AS present
+       FROM session_personal_runtime_bindings b
+       JOIN sessions s ON s.id=b.session_id
+       WHERE s.profile_id=? AND b.state IN ('active','detaching')
+         AND (
+           b.provider!=s.provider
+           OR s.provider_thread_id IS NULL
+           OR b.provider_thread_id!=s.provider_thread_id
+         )
+       LIMIT 1`,
+    ).get(parsedProfileId);
+    if (mismatchedPersonalBinding !== null) return "unsettled_authority";
+    const providerSwitch = this.#database.query(
+      `SELECT 1 AS present
+       FROM mutation_attempts m
+       JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+       LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+       WHERE e.kind='session.switch'
+         AND m.state IN ('effect_started','ambiguous')
+         AND r.attempt_id IS NULL
+         AND (
+           (json_extract(e.evidence_json,'$.targetProfileId')=?
+             AND json_extract(e.evidence_json,'$.targetProvider')='claude')
+           OR
+           (json_extract(e.evidence_json,'$.sourceProfileId')=?
+             AND json_extract(e.evidence_json,'$.sourceProvider')='claude'
+             AND NOT EXISTS(
+               SELECT 1 FROM session_personal_runtime_bindings b
+               WHERE b.session_id=m.authority_id
+                 AND b.provider='claude' AND b.state IN ('active','detaching')
+             )
+             AND (
+               EXISTS(
+                 SELECT 1 FROM session_provider_account_authorities a
+                 WHERE a.session_id=m.authority_id AND a.provider='claude'
+                   AND a.runtime_scope='managed'
+               )
+               OR NOT EXISTS(
+                 SELECT 1
+                 FROM session_personal_runtime_bindings b
+                 JOIN sessions s ON s.id=b.session_id
+                 WHERE b.session_id=m.authority_id AND b.state='detached'
+                   AND b.provider=s.provider
+                   AND b.provider_thread_id=s.provider_thread_id
+               )
+             ))
+         )
+       LIMIT 1`,
+    ).get(parsedProfileId, parsedProfileId);
+    if (providerSwitch !== null) return "unsettled_authority";
+    return z.object({
+      reason: z.enum([
+        "active_session",
+        "recovery_required",
+        "unsettled_authority",
+      ]).nullable(),
+    }).strict().parse(this.#database.query(
+      `SELECT CASE
+         WHEN EXISTS(
+           SELECT 1 FROM sessions s
+           WHERE s.profile_id=? AND s.provider='claude'
+             AND (s.state IN ('starting','active') OR s.active_turn_id IS NOT NULL)
+             AND NOT EXISTS(
+               SELECT 1 FROM session_personal_runtime_bindings b
+               WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+             )
+             AND (
+               EXISTS(
+                 SELECT 1 FROM session_provider_account_authorities a
+                 WHERE a.session_id=s.id AND a.provider='claude'
+                   AND a.runtime_scope='managed'
+               )
+               OR NOT EXISTS(
+                 SELECT 1 FROM session_personal_runtime_bindings b
+                 WHERE b.session_id=s.id AND b.state='detached'
+                   AND b.provider=s.provider
+                   AND b.provider_thread_id=s.provider_thread_id
+               )
+             )
+         ) THEN 'active_session'
+         WHEN EXISTS(
+           SELECT 1 FROM sessions s
+           WHERE s.profile_id=? AND s.provider='claude'
+             AND s.state='recovery_required'
+             AND NOT EXISTS(
+               SELECT 1 FROM session_personal_runtime_bindings b
+               WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+             )
+             AND (
+               EXISTS(
+                 SELECT 1 FROM session_provider_account_authorities a
+                 WHERE a.session_id=s.id AND a.provider='claude'
+                   AND a.runtime_scope='managed'
+               )
+               OR NOT EXISTS(
+                 SELECT 1 FROM session_personal_runtime_bindings b
+                 WHERE b.session_id=s.id AND b.state='detached'
+                   AND b.provider=s.provider
+                   AND b.provider_thread_id=s.provider_thread_id
+               )
+             )
+         ) THEN 'recovery_required'
+         WHEN EXISTS(
+           SELECT 1
+           FROM sessions s
+           WHERE s.profile_id=? AND s.provider='claude'
+             AND NOT EXISTS(
+               SELECT 1 FROM session_personal_runtime_bindings b
+               WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+             )
+             AND (
+               EXISTS(
+                 SELECT 1 FROM session_provider_account_authorities a
+                 WHERE a.session_id=s.id AND a.provider='claude'
+                   AND a.runtime_scope='managed'
+               )
+               OR NOT EXISTS(
+                 SELECT 1 FROM session_personal_runtime_bindings b
+                 WHERE b.session_id=s.id AND b.state='detached'
+                   AND b.provider=s.provider
+                   AND b.provider_thread_id=s.provider_thread_id
+               )
+             )
+             AND (
+               EXISTS(
+                 SELECT 1 FROM provider_interactions i
+                 WHERE i.session_id=s.id
+                   AND i.state IN ('pending','response_prepared','response_written')
+               )
+               OR EXISTS(
+                 SELECT 1 FROM mutation_attempts m
+                 LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+                 WHERE m.authority_id=s.id
+                   AND m.state IN ('effect_started','ambiguous')
+                   AND r.attempt_id IS NULL
+               )
+               OR EXISTS(
+                 SELECT 1 FROM queue_entries q
+                 LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
+                 WHERE q.session_id=s.id
+                   AND q.state IN ('dispatching','ambiguous')
+                   AND r.queue_id IS NULL
+               )
+               OR EXISTS(
+                 SELECT 1 FROM work_attempts w
+                 WHERE w.worker_session_id=s.id
+                   AND w.state IN ('claimed','dispatching','running','recovery_required')
+               )
+               OR EXISTS(
+                 SELECT 1 FROM work_signals w
+                 WHERE w.to_session_id=s.id
+                   AND NOT EXISTS(
+                     SELECT 1 FROM work_signal_receipts r
+                     WHERE r.signal_id=w.id AND r.kind='ack'
+                   )
+               )
+             )
+         ) THEN 'unsettled_authority'
+         ELSE NULL
+       END AS reason`,
+    ).get(
+      parsedProfileId,
+      parsedProfileId,
+      parsedProfileId,
+    )).reason;
+  }
+
+  hasUnsettledSessionMutationAuthority(
+    profileId: ProfileId,
+    provider?: Provider,
+  ): boolean {
+    const tuples = this.#sessionMutationAuthorityTuplesForProfile(
+      profileIdSchema.parse(profileId),
+    );
+    return provider === undefined
+      ? tuples.length > 0
+      : tuples.some((tuple) => tuple.provider === providerSchema.parse(provider));
+  }
+
+  isSessionMutationProviderAuthorityCurrent(input: Readonly<{
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    provider: Provider;
+    originGeneration: number;
+  }>): boolean {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const profileId = profileIdSchema.parse(input.profileId);
+    const provider = providerSchema.parse(input.provider);
+    const originGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.originGeneration);
+    const current = z.object({
+      process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    }).strict().safeParse(this.#database.query(
+      "SELECT process_generation FROM profiles WHERE id=? AND state!='removed'",
+    ).get(profileId));
+    if (!current.success) return false;
+    if (current.data.process_generation === originGeneration) return true;
+    return this.#database.query(
+      `WITH RECURSIVE authority_chain(generation) AS (
+         VALUES (?)
+         UNION ALL
+         SELECT r.to_generation
+         FROM session_mutation_authority_rebinds r
+         JOIN authority_chain c ON r.from_generation=c.generation
+         WHERE r.attempt_id=? AND r.profile_id=? AND r.provider=?
+       )
+       SELECT 1 AS current FROM authority_chain WHERE generation=? LIMIT 1`,
+    ).get(
+      originGeneration,
+      attemptId,
+      profileId,
+      provider,
+      current.data.process_generation,
+    ) !== null;
+  }
+
+  hasNonterminalProviderSession(profileId: ProfileId, provider: Provider): boolean {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedProvider = providerSchema.parse(provider);
+    return this.#database.query(
+      `SELECT 1 AS present FROM sessions
+       WHERE profile_id=? AND provider=? AND state!='terminal'
+       LIMIT 1`,
+    ).get(parsedProfileId, parsedProvider) !== null;
+  }
+
+  listNonterminalProviderSessions(
+    profileId: ProfileId,
+    provider: Provider,
+  ): readonly SessionRecord[] {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedProvider = providerSchema.parse(provider);
+    return this.#database.query(
+      `SELECT * FROM sessions
+       WHERE profile_id=? AND provider=? AND state!='terminal'
+       ORDER BY id`,
+    ).all(parsedProfileId, parsedProvider).map(mapSession);
+  }
+
+  listNonterminalManagedClaudeSessions(
+    profileId: ProfileId,
+  ): readonly SessionRecord[] {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    return this.#database.query(
+      `SELECT s.* FROM sessions s
+       WHERE s.profile_id=? AND s.provider='claude' AND s.state!='terminal'
+         AND NOT EXISTS(
+           SELECT 1 FROM session_personal_runtime_bindings b
+           WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+         )
+         AND (
+           EXISTS(
+             SELECT 1 FROM session_provider_account_authorities a
+             WHERE a.session_id=s.id AND a.provider='claude'
+               AND a.runtime_scope='managed'
+           )
+           OR NOT EXISTS(
+             SELECT 1 FROM session_personal_runtime_bindings b
+             WHERE b.session_id=s.id AND b.state='detached'
+               AND b.provider=s.provider
+               AND b.provider_thread_id=s.provider_thread_id
+           )
+         )
+       ORDER BY s.id`,
+    ).all(parsedProfileId).map(mapSession);
+  }
+
+  canReleaseIdleClaudeSessionForAccountLogin(input: Readonly<{
+    profileId: ProfileId;
+    profileGeneration: number;
+    sessionId: SessionId;
+  }>): boolean {
+    return this.canReleaseIdleManagedClaudeSessionForAccountLogin(input);
+  }
+
+  canReleaseIdleManagedClaudeSessionForAccountLogin(input: Readonly<{
+    profileId: ProfileId;
+    profileGeneration: number;
+    sessionId: SessionId;
+  }>): boolean {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const profileGeneration = z.number().int().nonnegative()
+      .max(Number.MAX_SAFE_INTEGER).parse(input.profileGeneration);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    return this.#database.query(
+      `SELECT 1 AS releasable
+       FROM sessions s
+       JOIN profiles p ON p.id=s.profile_id
+       JOIN session_provider_account_authorities pa
+         ON pa.session_id=s.id AND pa.provider='claude' AND pa.runtime_scope='managed'
+       WHERE s.id=? AND s.profile_id=? AND p.process_generation=?
+         AND p.state!='removed'
+         AND s.provider='claude' AND s.provider_thread_id IS NOT NULL
+         AND s.state='idle' AND s.active_turn_id IS NULL
+         AND NOT EXISTS(
+           SELECT 1 FROM session_personal_runtime_bindings b
+           WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM mutation_attempts m
+           LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+           LEFT JOIN session_start_attempts a ON a.attempt_id=m.id
+           WHERE (m.authority_id=s.id OR a.session_id=s.id)
+             AND m.state IN ('prepared','effect_started','ambiguous')
+             AND r.attempt_id IS NULL
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM queue_entries q
+           LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
+           WHERE q.session_id=s.id
+             AND q.state IN ('pending','dispatching','ambiguous')
+             AND r.queue_id IS NULL
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM provider_interactions i
+           WHERE i.session_id=s.id
+             AND i.state IN ('pending','response_prepared','response_written')
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM work_attempts w
+           WHERE w.worker_session_id=s.id
+             AND w.state IN ('claimed','dispatching','running','recovery_required')
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM work_signals w
+           WHERE w.to_session_id=s.id
+             AND NOT EXISTS(
+               SELECT 1 FROM work_signal_receipts r
+               WHERE r.signal_id=w.id AND r.kind='ack'
+             )
+         )
+       LIMIT 1`,
+    ).get(sessionId, profileId, profileGeneration) !== null;
+  }
+
+  #hasUnsettledClaudeLoginAuthority(profileId: ProfileId): boolean {
+    return this.#database.query(
+      `SELECT 1 AS present FROM mutation_attempts m
+       LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+       WHERE m.authority_id=? AND m.kind='account.claude-login'
+         AND m.state IN ('effect_started','ambiguous')
+         AND r.attempt_id IS NULL
+       LIMIT 1`,
+    ).get(profileId) !== null;
+  }
+
+  #sessionMutationAuthorityTuplesForProfile(profileId: ProfileId): readonly Readonly<{
+    attemptId: AttemptId;
+    originGeneration: number;
+    provider: Provider;
+  }>[] {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const rows = this.#database.query(
+      `SELECT m.id,m.kind AS mutation_kind,m.authority_id,m.authority_generation,
+              e.kind AS evidence_kind,e.evidence_json,e.evidence_digest,
+              a.session_id AS session_start_id
+       FROM mutation_attempts m
+       LEFT JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+       LEFT JOIN session_start_attempts a ON a.attempt_id=m.id
+       LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+       WHERE m.kind IN ('session.start','session.switch')
+         AND m.state IN ('effect_started','ambiguous')
+         AND r.attempt_id IS NULL
+       ORDER BY m.id`,
+    ).all() as readonly {
+      id: string;
+      mutation_kind: string;
+      authority_id: string;
+      authority_generation: number;
+      evidence_kind: string | null;
+      evidence_json: string | null;
+      evidence_digest: string | null;
+      session_start_id: string | null;
+    }[];
+    const tuples = new Map<string, {
+      attemptId: AttemptId;
+      originGeneration: number;
+      provider: Provider;
+    }>();
+    const add = (tuple: {
+      attemptId: AttemptId;
+      originGeneration: number;
+      provider: Provider;
+    }): void => {
+      const key = `${tuple.attemptId}\0${tuple.provider}`;
+      const existing = tuples.get(key);
+      if (existing !== undefined && existing.originGeneration !== tuple.originGeneration) {
+        throw new Error("SESSION_MUTATION_SUCCESSOR_AUTHORITY_AMBIGUOUS");
+      }
+      tuples.set(key, tuple);
+    };
+    for (const raw of rows) {
+      const attemptId = attemptIdSchema.parse(raw.id);
+      const mutationKind = z.enum(["session.start", "session.switch"])
+        .parse(raw.mutation_kind);
+      if (
+        raw.evidence_json === null
+        || raw.evidence_digest === null
+        || raw.evidence_kind !== mutationKind
+      ) throw new Error("SESSION_MUTATION_SUCCESSOR_EVIDENCE_MISSING");
+      const evidence = mutationEffectEvidenceSchema.parse(
+        JSON.parse(raw.evidence_json) as unknown,
+      );
+      if (
+        evidence.kind !== mutationKind
+        || digestJson(evidence) !== sha256Schema.parse(raw.evidence_digest)
+      ) throw new Error("SESSION_MUTATION_SUCCESSOR_EVIDENCE_MISMATCH");
+      const authorityGeneration = z.number().int().nonnegative()
+        .max(Number.MAX_SAFE_INTEGER).parse(raw.authority_generation);
+      if (mutationKind === "session.start" && evidence.kind === "session.start") {
+        const sessionId = sessionIdSchema.parse(raw.session_start_id);
+        const session = this.requireSession(sessionId);
+        if (
+          profileIdSchema.parse(raw.authority_id) !== session.profileId
+          || (evidence.runtimeProfile !== undefined && (
+            evidence.runtimeProfile.profileId !== session.profileId
+            || evidence.runtimeProfile.processGeneration !== authorityGeneration
+            || reviewedRuntimeProfileProvider(evidence.runtimeProfile) !== session.provider
+          ))
+        ) throw new Error("SESSION_MUTATION_SUCCESSOR_START_AUTHORITY_MISMATCH");
+        if (session.profileId === parsedProfileId) {
+          add({
+            attemptId,
+            originGeneration: authorityGeneration,
+            provider: session.provider,
+          });
+        }
+        continue;
+      }
+      if (mutationKind !== "session.switch" || evidence.kind !== "session.switch") {
+        throw new Error("SESSION_MUTATION_SUCCESSOR_KIND_MISMATCH");
+      }
+      const switchSessionId = sessionIdSchema.parse(raw.authority_id);
+      this.requireSession(switchSessionId);
+      if (authorityGeneration !== evidence.targetProcessGeneration) {
+        throw new Error("SESSION_MUTATION_SUCCESSOR_SWITCH_AUTHORITY_MISMATCH");
+      }
+      if (evidence.sourceProfileId === parsedProfileId) {
+        add({
+          attemptId,
+          originGeneration: evidence.sourceProcessGeneration,
+          provider: evidence.sourceProvider,
+        });
+      }
+      if (evidence.targetProfileId === parsedProfileId) {
+        add({
+          attemptId,
+          originGeneration: evidence.targetProcessGeneration,
+          provider: evidence.targetProvider,
+        });
+      }
+    }
+    return [...tuples.values()];
+  }
+
+  #recordSessionMutationAuthoritySuccessors(input: Readonly<{
+    fromGeneration: number;
+    now: number;
+    profileId: ProfileId;
+  }>): void {
+    const tuples = this.#sessionMutationAuthorityTuplesForProfile(input.profileId);
+    for (const tuple of tuples) {
+      if (!this.isSessionMutationProviderAuthorityCurrent({
+        attemptId: tuple.attemptId,
+        profileId: input.profileId,
+        provider: tuple.provider,
+        originGeneration: tuple.originGeneration,
+      })) throw new Error("SESSION_MUTATION_SUCCESSOR_AUTHORITY_MISMATCH");
+      const inserted = this.#database.query(
+        `INSERT INTO session_mutation_authority_rebinds(
+           attempt_id,profile_id,provider,from_generation,to_generation,recorded_at
+         ) VALUES (?,?,?,?,?,?)`,
+      ).run(
+        tuple.attemptId,
+        input.profileId,
+        tuple.provider,
+        input.fromGeneration,
+        input.fromGeneration + 1,
+        input.now,
+      );
+      if (inserted.changes !== 1) throw new Error("SESSION_MUTATION_SUCCESSOR_CAS_CONFLICT");
+    }
+  }
+
   nextProfileGeneration(profileId: ProfileId): ProfileRecord {
     const now = this.#now();
     const update = this.#database.transaction(() => {
       const current = mapProfile(this.#database.query("SELECT * FROM profiles WHERE id = ? AND state != 'removed'").get(profileId));
+      if (this.#hasUnsettledClaudeLoginAuthority(current.id)) {
+        throw new Error("CLAUDE_LOGIN_AUTHORITY_UNSETTLED");
+      }
+      if (this.#sessionMutationAuthorityTuplesForProfile(current.id).length > 0) {
+        throw new Error("SESSION_MUTATION_AUTHORITY_UNSETTLED");
+      }
       this.#database.query("UPDATE profiles SET process_generation = ?, updated_at = ? WHERE id = ? AND process_generation = ?").run(current.processGeneration + 1, now, profileId, current.processGeneration);
     });
     update.immediate();
@@ -5906,8 +7072,9 @@ export class StateStore {
     profileId: ProfileId,
     expectedGeneration: number,
     workStore: WorkStore,
+    options: Readonly<{ preserveSessionMutationAuthorities?: boolean }> = {},
   ): ProfileAuthorityChangeResult {
-    return this.#advanceProfileGeneration(profileId, expectedGeneration, workStore);
+    return this.#advanceProfileGeneration(profileId, expectedGeneration, workStore, options);
   }
 
   /**
@@ -5920,12 +7087,13 @@ export class StateStore {
     profileId: ProfileId,
     expectedGeneration: number,
     workStore: WorkStore,
+    options: Readonly<{ preserveSessionMutationAuthorities?: boolean }> = {},
   ): ProfileAuthorityChangeResult {
     return this.#advanceProfileGeneration(
       profileId,
       expectedGeneration,
       workStore,
-      true,
+      { ...options, allowPersonalBindingRollover: true },
     );
   }
 
@@ -5933,13 +7101,30 @@ export class StateStore {
     profileId: ProfileId,
     expectedGeneration: number,
     workStore?: WorkStore,
-    allowPersonalBindingRollover = false,
+    options: Readonly<{
+      allowPersonalBindingRollover?: boolean;
+      preserveSessionMutationAuthorities?: boolean;
+    }> = {},
   ): ProfileAuthorityChangeResult {
     const now = this.#now();
     const advance = this.#database.transaction(() => {
       const current = mapProfile(this.#database.query("SELECT * FROM profiles WHERE id=? AND state!='removed'").get(profileId));
       if (current.processGeneration !== expectedGeneration) {
         throw new Error("Profile generation authority changed.");
+      }
+      if (this.#hasUnsettledClaudeLoginAuthority(current.id)) {
+        throw new Error("CLAUDE_LOGIN_AUTHORITY_UNSETTLED");
+      }
+      const sessionMutationAuthorities = this.#sessionMutationAuthorityTuplesForProfile(current.id);
+      if (sessionMutationAuthorities.length > 0) {
+        if (options.preserveSessionMutationAuthorities !== true) {
+          throw new Error("SESSION_MUTATION_AUTHORITY_UNSETTLED");
+        }
+        this.#recordSessionMutationAuthoritySuccessors({
+          fromGeneration: expectedGeneration,
+          now,
+          profileId: current.id,
+        });
       }
       const activeLogin = this.#database.query(`SELECT attempt_id,process_generation
                                                 FROM provider_login_authorities
@@ -5970,7 +7155,7 @@ export class StateStore {
         profileId,
         expectedGeneration,
       ) ?? [];
-      if (allowPersonalBindingRollover) {
+      if (options.allowPersonalBindingRollover === true) {
         const permit = this.#database.query(
           `INSERT INTO session_adoption_profile_generation_permits(
              profile_id,from_generation,to_generation
@@ -5984,7 +7169,7 @@ export class StateStore {
         .query("UPDATE profiles SET process_generation = ?, state=?, updated_at = ? WHERE id = ? AND process_generation = ? AND state != 'removed'")
         .run(expectedGeneration + 1, state, now, profileId, expectedGeneration);
       if (result.changes !== 1) throw new Error("Profile generation authority changed.");
-      if (allowPersonalBindingRollover) {
+      if (options.allowPersonalBindingRollover === true) {
         const released = this.#database.query(
           `DELETE FROM session_adoption_profile_generation_permits
            WHERE profile_id=? AND from_generation=? AND to_generation=?`,
@@ -6072,6 +7257,10 @@ export class StateStore {
       const nextAccountFingerprint = state === "signed_in" && identity?.email !== undefined
         ? canonicalAccountFingerprint(identity.email)
         : null;
+      const nextProviderEmail = identity?.email ?? null;
+      const nextCodexAccountKey = nextProviderEmail === null
+        ? null
+        : codexProviderAccountAuthorityKeyForEmail(nextProviderEmail);
       const previousProviderFingerprint = current.provider_email === null
         ? null
         : canonicalAccountFingerprint(current.provider_email);
@@ -6083,17 +7272,33 @@ export class StateStore {
         && policy.accountFingerprint !== nextAccountFingerprint;
       const affectedWorkIds = state === "signed_in"
         ? []
-        : [...(workStore?.prepareProfileAuthorityChange(profileId, expectedGeneration) ?? [])];
+        : [...(workStore?.prepareProfileAuthorityChange(
+            profileId,
+            expectedGeneration,
+            "codex",
+          ) ?? [])];
       const result = this.#database.query(
         `UPDATE profiles
-         SET state=?,provider_email=?,provider_plan=?,updated_at=?
+         SET state=?,provider_email=?,codex_account_key=?,provider_plan=?,updated_at=?
          WHERE id=?
            AND process_generation=?
            AND state!='removed'
            AND (state!='recovery_required' OR ?='recovery_required')`,
       )
-      .run(state, identity?.email ?? null, identity?.plan ?? null, now, profileId, expectedGeneration, state);
-      if (result.changes !== 1) throw new Error("Profile state authority changed.");
+      .run(
+        state,
+        nextProviderEmail,
+        nextCodexAccountKey,
+        identity?.plan ?? null,
+        now,
+        profileId,
+        expectedGeneration,
+        state,
+      );
+      // Bun includes rows changed by AFTER triggers in this count. One exact
+      // profile row is the CAS authority; policy-disable trigger changes are
+      // expected auxiliary effects of that same successful update.
+      if (result.changes < 1) throw new Error("Profile state authority changed.");
       if (changedProviderIdentity || changedPolicyIdentity) {
         if (policy.accountFingerprint !== null) {
           this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
@@ -6139,7 +7344,7 @@ export class StateStore {
           `UPDATE session_adoption_policies
            SET profile_id=NULL,state='disabled',revision=revision+1,
              updated_at=MAX(updated_at,?)
-           WHERE profile_id=? AND state='enabled'`,
+           WHERE profile_id=? AND provider='codex' AND state='enabled'`,
         ).run(now, profileId);
       }
       return { affectedWorkIds, changed: true };
@@ -6182,12 +7387,14 @@ export class StateStore {
       }
       const state = provider.signedIn ? "signed_in" : "signed_out";
       const now = unixMillisecondsSchema.parse(this.#now());
+      const providerEmail = provider.signedIn ? provider.email ?? null : null;
       const changed = this.#database.query(
-        `UPDATE profiles SET state=?,provider_email=?,provider_plan=?,updated_at=?
+        `UPDATE profiles SET state=?,provider_email=?,codex_account_key=?,provider_plan=?,updated_at=?
          WHERE id=? AND process_generation=? AND state='recovery_required'`,
       ).run(
         state,
-        provider.signedIn ? provider.email ?? null : null,
+        providerEmail,
+        providerEmail === null ? null : codexProviderAccountAuthorityKeyForEmail(providerEmail),
         provider.signedIn ? provider.plan ?? null : null,
         now,
         profileId,
@@ -6236,7 +7443,8 @@ export class StateStore {
       ).run(now, id);
       const result = this.#database.query(
         `UPDATE profiles
-         SET state='removed',provider_email=NULL,provider_plan=NULL,updated_at=?
+         SET state='removed',provider_email=NULL,codex_account_key=NULL,
+           provider_plan=NULL,updated_at=?
          WHERE id=? AND state!='removed'`,
       ).run(now, id);
       if (result.changes !== 1) throw new SelectionError("NOT_FOUND");
@@ -6454,14 +7662,42 @@ export class StateStore {
     const accountAuthorityClause = input.requireCurrentAccountAuthority === true
       ? ` AND EXISTS (
            SELECT 1
-           FROM session_account_authorities a
-           JOIN profiles p ON p.id=a.profile_id
-           WHERE a.session_id=s.id
-             AND a.profile_id=s.profile_id
-             AND p.state='signed_in'
-             AND a.account_key IS NOT NULL
-             AND p.provider_email IS NOT NULL
-             AND a.account_key=lower(trim(p.provider_email))
+           FROM profiles p
+           JOIN session_provider_account_authorities pa
+             ON pa.session_id=s.id AND pa.provider=s.provider
+           WHERE p.id=s.profile_id
+             AND NOT EXISTS(
+               SELECT 1 FROM provider_runtime_account_revocations r
+               WHERE r.profile_id=s.profile_id
+                 AND r.profile_generation=p.process_generation
+                 AND r.provider=s.provider
+                 AND r.runtime_scope=pa.runtime_scope
+                 AND (r.state='releasing' OR r.current_account_key IS NULL
+                   OR r.current_account_key!=pa.account_key)
+             )
+             AND (
+               (pa.runtime_scope='personal' AND EXISTS(
+                 SELECT 1 FROM session_personal_runtime_bindings b
+                 WHERE b.session_id=s.id AND b.provider=s.provider
+                   AND b.provider_thread_id=s.provider_thread_id
+                   AND b.state='active'
+               ))
+               OR (pa.runtime_scope='managed' AND NOT EXISTS(
+                 SELECT 1 FROM session_personal_runtime_bindings b
+                 WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+               ))
+             )
+             AND (
+               (s.provider='claude' AND p.state IN ('signed_in','signed_out'))
+               OR (s.provider='codex' AND p.state='signed_in'
+                 AND p.provider_email IS NOT NULL
+                 AND p.codex_account_key=pa.account_key AND EXISTS(
+                   SELECT 1 FROM session_account_authorities a
+                   WHERE a.session_id=s.id AND a.profile_id=s.profile_id
+                     AND a.account_key IS NOT NULL
+                     AND a.account_key=lower(trim(p.provider_email))
+                 ))
+             )
          )`
       : "";
     const rows = (after === null
@@ -6547,28 +7783,73 @@ export class StateStore {
     return row === null ? null : mapSession(row);
   }
 
+  /**
+   * Resolve a provider-global thread association only when exactly one local
+   * session owns it. Provider thread ids are scoped by provider home, so two
+   * profiles may legitimately contain the same opaque id; callers without a
+   * profile/home authority must fail closed instead of choosing either row.
+   */
+  findUniqueSessionByProviderThread(
+    provider: Provider,
+    providerThreadId: string,
+  ): SessionRecord | null {
+    const parsedProvider = providerSchema.parse(provider);
+    const parsedProviderThreadId = providerThreadIdSchema.parse(providerThreadId);
+    const rows = this.#database.query(
+      `SELECT * FROM sessions
+       WHERE provider=? AND provider_thread_id=?
+       ORDER BY id LIMIT 2`,
+    ).all(parsedProvider, parsedProviderThreadId);
+    return rows.length === 1 ? mapSession(rows[0]) : null;
+  }
+
   sessionAccountAuthorityMatches(
     sessionId: SessionId,
     profileId: ProfileId,
   ): boolean {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const parsedProfileId = profileIdSchema.parse(profileId);
-    const row = this.#database.query(
-      `SELECT a.session_id,a.profile_id,a.account_key,a.recorded_at,p.provider_email,p.state
-       FROM session_account_authorities a
-       JOIN sessions s ON s.id=a.session_id AND s.profile_id=a.profile_id
-       JOIN profiles p ON p.id=a.profile_id
-       WHERE a.session_id=? AND a.profile_id=?`,
-    ).get(parsedSessionId, parsedProfileId);
-    if (row === null) return false;
-    const parsed = sessionAccountAuthorityRowSchema.extend({
-      provider_email: z.string().nullable(),
-      state: profileStateSchema,
-    }).strict().parse(row);
-    return parsed.state === "signed_in"
-      && parsed.account_key !== null
-      && parsed.provider_email !== null
-      && parsed.account_key === parsed.provider_email.trim().toLowerCase();
+    return this.#database.query(
+      `SELECT 1 AS current
+       FROM sessions s
+       JOIN profiles p ON p.id=s.profile_id
+       JOIN session_provider_account_authorities pa
+         ON pa.session_id=s.id AND pa.provider=s.provider
+       WHERE s.id=? AND s.profile_id=?
+         AND NOT EXISTS(
+           SELECT 1 FROM provider_runtime_account_revocations r
+           WHERE r.profile_id=s.profile_id
+             AND r.profile_generation=p.process_generation
+             AND r.provider=s.provider
+             AND r.runtime_scope=pa.runtime_scope
+             AND (r.state='releasing' OR r.current_account_key IS NULL
+               OR r.current_account_key!=pa.account_key)
+         )
+         AND (
+           (pa.runtime_scope='personal' AND EXISTS(
+             SELECT 1 FROM session_personal_runtime_bindings b
+             WHERE b.session_id=s.id AND b.provider=s.provider
+               AND b.provider_thread_id=s.provider_thread_id
+               AND b.state='active'
+           ))
+           OR (pa.runtime_scope='managed' AND NOT EXISTS(
+             SELECT 1 FROM session_personal_runtime_bindings b
+             WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+           ))
+         )
+         AND (
+           (s.provider='claude' AND p.state IN ('signed_in','signed_out'))
+           OR (s.provider='codex' AND p.state='signed_in'
+             AND p.provider_email IS NOT NULL
+             AND p.codex_account_key=pa.account_key AND EXISTS(
+               SELECT 1 FROM session_account_authorities a
+               WHERE a.session_id=s.id AND a.profile_id=s.profile_id
+                 AND a.account_key IS NOT NULL
+                 AND a.account_key=lower(trim(p.provider_email))
+             ))
+         )
+       LIMIT 1`,
+    ).get(parsedSessionId, parsedProfileId) !== null;
   }
 
   readSessionProviderAccountAuthority(
@@ -6611,9 +7892,34 @@ export class StateStore {
     }>,
     recordedAt: number,
   ): SessionProviderAccountAuthorityRecord {
+    if (!providerAccountAuthorityKeyMatchesProvider(
+      input.provider,
+      input.accountKey,
+    )) throw new Error("SESSION_PROVIDER_ACCOUNT_AUTHORITY_KEY_MISMATCH");
     const session = this.requireSession(input.sessionId);
     if (session.provider !== input.provider) {
       throw new Error("SESSION_PROVIDER_ACCOUNT_AUTHORITY_PROVIDER_MISMATCH");
+    }
+    if (input.provider === "codex") {
+      const profile = this.requireProfileById(session.profileId);
+      if (
+        profile.providerEmail === undefined
+        || codexProviderAccountAuthorityKeyForEmail(profile.providerEmail) !== input.accountKey
+      ) throw new Error("SESSION_PROVIDER_ACCOUNT_AUTHORITY_ACCOUNT_MISMATCH");
+      // createSession deliberately clears the legacy email authority until a
+      // provider observation proves the account. Restore that compatibility
+      // row only after the exact hashed Codex key has been verified and before
+      // the immutable provider proof is inserted; the surrounding transaction
+      // makes the two rows one authority boundary.
+      this.#database.query(
+        `UPDATE session_account_authorities
+         SET account_key=lower(trim(?)),recorded_at=?
+         WHERE session_id=? AND profile_id=? AND account_key IS NULL
+           AND NOT EXISTS(
+             SELECT 1 FROM session_provider_account_authorities a
+             WHERE a.session_id=session_account_authorities.session_id
+           )`,
+      ).run(profile.providerEmail, recordedAt, session.id, session.profileId);
     }
     const existing = this.readSessionProviderAccountAuthority(input.sessionId);
     if (existing !== null) {
@@ -6703,7 +8009,13 @@ export class StateStore {
         const profile = this.#database.query(
           "SELECT state FROM profiles WHERE id=?",
         ).get(parsed.profileId);
-        if (profile === null || z.object({ state: profileStateSchema }).strict().parse(profile).state !== "signed_in") {
+        if (
+          profile === null
+          || !profileStateAllowsProviderSessionAuthority(
+            parsed.provider,
+            z.object({ state: profileStateSchema }).strict().parse(profile).state,
+          )
+        ) {
           throw new Error("SESSION_ADOPTION_POLICY_PROFILE_NOT_SIGNED_IN");
         }
         const foreignActiveBinding = this.#database.query(
@@ -7295,14 +8607,18 @@ export class StateStore {
         || policy.profileId !== parsed.profileId
       ) throw new Error("SESSION_ADOPTION_POLICY_MISMATCH");
       const profileState = this.#database.query(
-        "SELECT state,process_generation FROM profiles WHERE id=?",
+        "SELECT state,process_generation,provider_email FROM profiles WHERE id=?",
       ).get(parsed.profileId);
       if (profileState === null) throw new Error("SESSION_ADOPTION_PROFILE_NOT_SIGNED_IN");
       const profileAuthority = z.object({
         state: profileStateSchema,
         process_generation: z.number().int().nonnegative().safe(),
+        provider_email: z.string().nullable(),
       }).strict().parse(profileState);
-      if (profileAuthority.state !== "signed_in") {
+      if (!profileStateAllowsProviderSessionAuthority(
+        parsed.provider,
+        profileAuthority.state,
+      ) || (parsed.provider === "codex" && profileAuthority.provider_email === null)) {
         throw new Error("SESSION_ADOPTION_PROFILE_NOT_SIGNED_IN");
       }
       if (profileAuthority.process_generation !== parsed.profileGeneration) {
@@ -7497,6 +8813,9 @@ export class StateStore {
           identity: parsed.claudeProcessIdentity,
         });
       }
+      if (!this.sessionAccountAuthorityMatches(session.id, parsed.profileId)) {
+        throw new Error("SESSION_ADOPTION_ACCOUNT_AUTHORITY_MISMATCH");
+      }
       this.#insertSessionRuntimeProfile({
         sessionId: session.id,
         sourceKind: "session_start",
@@ -7553,6 +8872,7 @@ export class StateStore {
     profileId: ProfileId;
     profileGeneration: number;
     runtimeScope: z.infer<typeof claudeProcessRuntimeScopeSchema>;
+    providerAccountKey: string;
     sessionId?: SessionId;
   }): ClaudeProcessLaunchIntentRecord {
     const parsed = z.object({
@@ -7560,27 +8880,241 @@ export class StateStore {
       profileId: profileIdSchema,
       profileGeneration: z.number().int().nonnegative().safe(),
       runtimeScope: claudeProcessRuntimeScopeSchema,
+      providerAccountKey: providerAccountAuthorityKeySchema.refine(
+        (value) => providerAccountAuthorityKeyMatchesProvider("claude", value),
+      ),
       sessionId: sessionIdSchema.optional(),
     }).strict().parse(input);
     const stage = this.#database.transaction(() => {
       const profile = this.requireProfileById(parsed.profileId);
       if (
         profile.processGeneration !== parsed.profileGeneration
-        || profile.state !== "signed_in"
+        || !profileStateAllowsProviderSessionAuthority("claude", profile.state)
       ) throw new Error("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_PROFILE_STALE");
-      if (parsed.sessionId !== undefined) {
-        const session = this.#database.query(
-          "SELECT 1 FROM sessions WHERE id=?",
+      const revocation = this.readProviderRuntimeAccountRevocation({
+        profileId: parsed.profileId,
+        provider: "claude",
+        runtimeScope: parsed.runtimeScope,
+      });
+      if (
+        revocation?.profileGeneration === parsed.profileGeneration
+        && (
+          revocation.state === "releasing"
+          || revocation.currentAccountKey === null
+          || revocation.currentAccountKey !== parsed.providerAccountKey
+        )
+      ) throw new Error("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_ACCOUNT_STALE");
+      if (parsed.sessionId === undefined) {
+        const policy = this.readSessionAdoptionPolicy("claude");
+        const candidateRow = this.#database.query(
+          `SELECT * FROM session_adoption_candidates
+           WHERE provider='claude' AND provider_thread_id=?`,
+        ).get(parsed.providerThreadId);
+        const candidate = candidateRow === null
+          ? null
+          : mapSessionAdoptionCandidate(candidateRow);
+        const priorBinding = this.findSessionPersonalRuntimeBinding(
+          "claude",
+          parsed.providerThreadId,
+        );
+        if (
+          parsed.runtimeScope !== "personal"
+          || policy === null
+          || !policy.enabled
+          || policy.profileId !== parsed.profileId
+          || candidate === null
+          || candidate.status !== "claiming"
+          || candidate.liveness !== "not_live"
+          || (priorBinding !== null && priorBinding.state !== "detached")
+        ) {
+          throw new Error(
+            "SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_ADOPTION_AUTHORITY_MISMATCH",
+          );
+        }
+      } else {
+        const sessionRow = this.#database.query(
+          "SELECT * FROM sessions WHERE id=?",
         ).get(parsed.sessionId);
-        if (session === null) {
+        if (sessionRow === null) {
           throw new Error("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_MISSING");
         }
+        const session = mapSession(sessionRow);
         const personalBinding = this.readSessionPersonalRuntimeBinding(
           parsed.sessionId,
           true,
         );
-        if (personalBinding !== null && personalBinding.state !== "active") {
+        if (personalBinding?.state === "detaching") {
           throw new Error("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_DETACHING");
+        }
+        const providerAuthority = this.readSessionProviderAccountAuthority(
+          parsed.sessionId,
+        );
+        const exactClaudeSessionAuthority = providerAuthority !== null
+          && providerAuthority.provider === "claude"
+          && providerAuthority.runtimeScope === parsed.runtimeScope
+          && providerAuthority.accountKey === parsed.providerAccountKey
+          && this.sessionAccountAuthorityMatches(session.id, parsed.profileId);
+        const existingSessionResume = session.profileId === parsed.profileId
+          && session.provider === "claude"
+          && session.providerThreadId === parsed.providerThreadId
+          && session.state !== "starting"
+          && session.state !== "terminal"
+          && exactClaudeSessionAuthority;
+
+        const startRows = this.#database.query(
+          `SELECT m.authority_id,m.authority_generation,
+                  e.evidence_json,e.evidence_digest
+           FROM session_start_attempts sa
+           JOIN mutation_attempts m ON m.id=sa.attempt_id
+           JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+           LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+           WHERE sa.session_id=? AND m.kind='session.start'
+             AND m.state='effect_started' AND r.attempt_id IS NULL
+           ORDER BY m.created_at,m.id LIMIT 2`,
+        ).all(parsed.sessionId);
+        const startAuthority = startRows.length === 1
+          ? z.object({
+              authority_id: profileIdSchema,
+              authority_generation: z.number().int().nonnegative().safe(),
+              evidence_json: z.string(),
+              evidence_digest: sha256Schema,
+            }).strict().parse(startRows[0])
+          : null;
+        const startEvidence = (() => {
+          if (startAuthority === null) return null;
+          try {
+            const evidence = mutationEffectEvidenceSchema.parse(
+              JSON.parse(startAuthority.evidence_json) as unknown,
+            );
+            return evidence.kind === "session.start"
+              && digestJson(evidence) === startAuthority.evidence_digest
+              ? evidence
+              : null;
+          } catch {
+            return null;
+          }
+        })();
+        const startRuntimeProfile = startEvidence?.kind === "session.start"
+          ? startEvidence.runtimeProfile
+          : undefined;
+        const startRuntimeIsManagedClaude = startRuntimeProfile !== undefined
+          && !isCodexRuntimeProfile(startRuntimeProfile)
+          && ("configHome" in startRuntimeProfile
+            ? startRuntimeProfile.configHome === "isolated"
+            : startRuntimeProfile.isolatedConfigDir);
+        const sessionStartPlaceholder = parsed.runtimeScope === "managed"
+          && z.string().uuid().safeParse(parsed.providerThreadId).success
+          && session.profileId === parsed.profileId
+          && session.provider === "claude"
+          && session.providerThreadId === undefined
+          && session.state === "starting"
+          && exactClaudeSessionAuthority
+          && startAuthority !== null
+          && startAuthority.authority_id === parsed.profileId
+          && startAuthority.authority_generation === parsed.profileGeneration
+          && startEvidence?.kind === "session.start"
+          && startEvidence.projectId === session.projectId
+          && startRuntimeProfile !== undefined
+          && reviewedRuntimeProfileProvider(startRuntimeProfile) === "claude"
+          && startRuntimeProfile.profileId === parsed.profileId
+          && startRuntimeProfile.processGeneration === parsed.profileGeneration
+          && startRuntimeProfile.preset === session.preset
+          && startRuntimeIsManagedClaude;
+
+        const switchRows = this.#database.query(
+          `SELECT m.id AS attempt_id,m.authority_generation,
+                  e.evidence_json,e.evidence_digest,
+                  t.provider_thread_id AS target_provider_thread_id,
+                  EXISTS(
+                    SELECT 1 FROM session_provider_switch_target_releases tr
+                    WHERE tr.attempt_id=m.id
+                  ) AS target_released
+           FROM mutation_attempts m
+           JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+           LEFT JOIN session_provider_switch_targets t ON t.attempt_id=m.id
+           LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+           WHERE m.authority_id=? AND m.kind='session.switch'
+             AND m.state='effect_started' AND r.attempt_id IS NULL
+           ORDER BY m.created_at,m.id LIMIT 2`,
+        ).all(parsed.sessionId);
+        const switchAuthority = switchRows.length === 1
+          ? z.object({
+              attempt_id: attemptIdSchema,
+              authority_generation: z.number().int().nonnegative().safe(),
+              evidence_json: z.string(),
+              evidence_digest: sha256Schema,
+              target_provider_thread_id: providerThreadIdSchema.nullable(),
+              target_released: z.number().int().min(0).max(1),
+            }).strict().parse(switchRows[0])
+          : null;
+        const switchEvidence = (() => {
+          if (switchAuthority === null) return null;
+          try {
+            const evidence = mutationEffectEvidenceSchema.parse(
+              JSON.parse(switchAuthority.evidence_json) as unknown,
+            );
+            return evidence.kind === "session.switch"
+              && digestJson(evidence) === switchAuthority.evidence_digest
+              ? evidence
+              : null;
+          } catch {
+            return null;
+          }
+        })();
+        const switchRuntimeProfile = switchEvidence?.kind === "session.switch"
+          ? switchEvidence.runtimeProfile
+          : undefined;
+        const switchRuntimeIsManagedClaude = switchRuntimeProfile !== undefined
+          && !isCodexRuntimeProfile(switchRuntimeProfile)
+          && ("configHome" in switchRuntimeProfile
+            ? switchRuntimeProfile.configHome === "isolated"
+            : switchRuntimeProfile.isolatedConfigDir);
+        const sessionSwitchTarget = parsed.runtimeScope === "managed"
+          && z.string().uuid().safeParse(parsed.providerThreadId).success
+          && switchAuthority !== null
+          && switchAuthority.target_provider_thread_id === null
+          && switchAuthority.target_released === 0
+          && switchAuthority.authority_generation === parsed.profileGeneration
+          && switchEvidence?.kind === "session.switch"
+          && switchEvidence.sourceProfileId === session.profileId
+          && switchEvidence.sourceProvider === session.provider
+          && switchEvidence.sourceProviderThreadId === session.providerThreadId
+          && switchEvidence.sourcePreset === session.preset
+          && switchEvidence.targetProfileId === parsed.profileId
+          && switchEvidence.targetProcessGeneration === parsed.profileGeneration
+          && switchEvidence.targetProvider === "claude"
+          && switchEvidence.targetProviderAccountKey === parsed.providerAccountKey
+          && switchEvidence.targetPreset === "fable-max"
+          && !sessionProviderSwitchTargetAliasesSource(
+            switchEvidence,
+            parsed.providerThreadId,
+          )
+          && switchRuntimeProfile !== undefined
+          && reviewedRuntimeProfileProvider(switchRuntimeProfile) === "claude"
+          && switchRuntimeProfile.profileId === parsed.profileId
+          && switchRuntimeProfile.processGeneration === parsed.profileGeneration
+          && switchRuntimeProfile.preset === switchEvidence.targetPreset
+          && switchRuntimeIsManagedClaude
+          && this.sessionAccountAuthorityMatches(
+            session.id,
+            switchEvidence.sourceProfileId,
+          )
+          && this.isSessionMutationProviderAuthorityCurrent({
+            attemptId: switchAuthority.attempt_id,
+            profileId: switchEvidence.sourceProfileId,
+            provider: switchEvidence.sourceProvider,
+            originGeneration: switchEvidence.sourceProcessGeneration,
+          })
+          && this.isSessionMutationProviderAuthorityCurrent({
+            attemptId: switchAuthority.attempt_id,
+            profileId: switchEvidence.targetProfileId,
+            provider: switchEvidence.targetProvider,
+            originGeneration: switchEvidence.targetProcessGeneration,
+          });
+        if (!existingSessionResume && !sessionStartPlaceholder && !sessionSwitchTarget) {
+          throw new Error(
+            "SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_AUTHORITY_MISMATCH",
+          );
         }
       }
       const key = {
@@ -7607,14 +9141,15 @@ export class StateStore {
       const inserted = this.#database.query(
         `INSERT INTO session_claude_process_launch_intents(
            intent_id,provider_thread_id,profile_id,profile_generation,
-           runtime_scope,session_id,revision,staged_at,updated_at
-         ) VALUES (?,?,?,?,?,?,1,?,?)`,
+           runtime_scope,provider_account_key,session_id,revision,staged_at,updated_at
+         ) VALUES (?,?,?,?,?,?,?,1,?,?)`,
       ).run(
         intentId,
         parsed.providerThreadId,
         parsed.profileId,
         parsed.profileGeneration,
         parsed.runtimeScope,
+        parsed.providerAccountKey,
         parsed.sessionId ?? null,
         now,
         now,
@@ -7623,7 +9158,10 @@ export class StateStore {
         throw new Error("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
       }
       const staged = this.readClaudeProcessLaunchIntent(key);
-      if (staged?.intentId !== intentId) {
+      if (
+        staged?.intentId !== intentId
+        || staged.providerAccountKey !== parsed.providerAccountKey
+      ) {
         throw new Error("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_STAGE_INCOMPLETE");
       }
       return staged;
@@ -7801,7 +9339,7 @@ export class StateStore {
         profile.processGeneration !== parsed.profileGeneration
         || (
           launchIntentExpectation !== null
-          && profile.state !== "signed_in"
+          && !profileStateAllowsProviderSessionAuthority("claude", profile.state)
         )
       ) {
         throw new Error("SESSION_CLAUDE_PROCESS_AUTHORITY_PROFILE_STALE");
@@ -7818,8 +9356,22 @@ export class StateStore {
           || intent.intentId !== launchIntentExpectation.intentId
           || intent.revision !== launchIntentExpectation.revision
           || intent.profileGeneration !== parsed.profileGeneration
+          || intent.providerAccountKey === null
           || intent.sessionId !== (parsed.sessionId ?? null)
         ) throw new Error("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
+        const revocation = this.readProviderRuntimeAccountRevocation({
+          profileId: parsed.profileId,
+          provider: "claude",
+          runtimeScope: parsed.runtimeScope,
+        });
+        if (
+          revocation?.profileGeneration === parsed.profileGeneration
+          && (
+            revocation.state === "releasing"
+            || revocation.currentAccountKey === null
+            || revocation.currentAccountKey !== intent.providerAccountKey
+          )
+        ) throw new Error("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_ACCOUNT_STALE");
       }
       const current = this.readClaudeProcessAuthority(key);
       if (current === null) {
@@ -8387,6 +9939,80 @@ export class StateStore {
     return row === null ? null : mapProviderRuntimeAccountRevocation(row);
   }
 
+  /**
+   * Clears a completed scoped fence only after the caller freshly attested the
+   * exact replacement identity. The revocation transaction already removed
+   * every mismatched session proof; asserting that invariant here prevents a
+   * successful reread from resurrecting an older account's sessions.
+   */
+  clearCompletedProviderRuntimeAccountRevocation(input: {
+    profileId: ProfileId;
+    expectedGeneration: number;
+    provider: Provider;
+    runtimeScope: z.infer<typeof claudeProcessRuntimeScopeSchema>;
+    currentAccountKey: string;
+  }): void {
+    const parsed = z.object({
+      profileId: profileIdSchema,
+      expectedGeneration: z.number().int().nonnegative().safe(),
+      provider: providerSchema,
+      runtimeScope: claudeProcessRuntimeScopeSchema,
+      currentAccountKey: providerAccountAuthorityKeySchema,
+    }).strict().parse(input);
+    if (!providerAccountAuthorityKeyMatchesProvider(
+      parsed.provider,
+      parsed.currentAccountKey,
+    )) throw new Error("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_KEY_MISMATCH");
+    const clear = this.#database.transaction(() => {
+      const profile = this.requireProfileById(parsed.profileId);
+      if (profile.processGeneration !== parsed.expectedGeneration) {
+        throw new Error("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_STALE");
+      }
+      const current = this.readProviderRuntimeAccountRevocation({
+        profileId: parsed.profileId,
+        provider: parsed.provider,
+        runtimeScope: parsed.runtimeScope,
+      });
+      if (current === null) return;
+      if (
+        current.profileGeneration !== parsed.expectedGeneration
+        || current.state !== "completed"
+        || current.currentAccountKey !== parsed.currentAccountKey
+      ) throw new Error("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_NOT_RECONCILED");
+      const mismatchedProof = this.#database.query(
+        `SELECT 1 FROM sessions s
+         JOIN session_provider_account_authorities a ON a.session_id=s.id
+         WHERE s.profile_id=? AND s.provider=? AND a.provider=s.provider
+           AND a.runtime_scope=? AND a.account_key!=? LIMIT 1`,
+      ).get(
+        parsed.profileId,
+        parsed.provider,
+        parsed.runtimeScope,
+        parsed.currentAccountKey,
+      );
+      if (mismatchedProof !== null) {
+        throw new Error("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_STALE_PROOF");
+      }
+      const deleted = this.#database.query(
+        `DELETE FROM provider_runtime_account_revocations
+         WHERE profile_id=? AND provider=? AND runtime_scope=?
+           AND profile_generation=? AND state='completed' AND revision=?
+           AND current_account_key=?`,
+      ).run(
+        parsed.profileId,
+        parsed.provider,
+        parsed.runtimeScope,
+        parsed.expectedGeneration,
+        current.revision,
+        parsed.currentAccountKey,
+      );
+      if (deleted.changes !== 1) {
+        throw new Error("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_CONFLICT");
+      }
+    });
+    clear.immediate();
+  }
+
   listReleasingProviderRuntimeAccountRevocations(): readonly ProviderRuntimeAccountRevocationRecord[] {
     return this.#database.query(
       `SELECT * FROM provider_runtime_account_revocations
@@ -8525,7 +10151,7 @@ export class StateStore {
                AND b.provider_thread_id=s.provider_thread_id
                AND b.state IN ('active','detaching')
            LEFT JOIN session_provider_account_authorities a ON a.session_id=s.id
-           WHERE s.profile_id=? AND s.provider=? AND s.state!='terminal' AND s.id>?
+           WHERE s.profile_id=? AND s.provider=? AND s.id>?
              AND ((?='personal' AND b.session_id IS NOT NULL)
                OR (?='managed' AND b.session_id IS NULL))
              AND (a.session_id IS NULL OR a.provider!=s.provider
@@ -8644,6 +10270,13 @@ export class StateStore {
             this.#ensureInteractionStateEventInTransaction(interaction, now);
             interactions.push(interaction);
           }
+          // Revocation is a permanent loss of this exact session authority,
+          // not merely a same-generation pause. Removing the mismatched proof
+          // here prevents a daemon-generation advance or a later same-scope
+          // revocation from making an old account key authoritative again.
+          this.#database.query(
+            "DELETE FROM session_provider_account_authorities WHERE session_id=?",
+          ).run(sessionId);
         }
         const last = page.at(-1);
         if (last === undefined) break;
@@ -9048,10 +10681,20 @@ export class StateStore {
         throw new Error("PROFILE_PERSONAL_AUTHORITY_REVOCATION_CLAUDE_LAUNCH_INTENT_LIVE");
       }
       const now = unixMillisecondsSchema.parse(this.#now());
+      // An account-wide release can race an ambiguous cross-profile start or
+      // switch. Preserve that exact mutation's provider authority across the
+      // generation advance so restart/recovery can still settle it; otherwise
+      // the next daemon admission sees an unbridgeable origin generation.
+      this.#recordSessionMutationAuthoritySuccessors({
+        fromGeneration: parsed.expectedGeneration,
+        now,
+        profileId: parsed.profileId,
+      });
       const profile = this.#database.query(
         `UPDATE profiles
          SET process_generation=process_generation+1,
-           state='signed_out',provider_email=NULL,provider_plan=NULL,
+           state='signed_out',provider_email=NULL,codex_account_key=NULL,
+           provider_plan=NULL,
            updated_at=MAX(updated_at,?)
          WHERE id=? AND process_generation=? AND state='recovery_required'
          RETURNING id`,
@@ -9434,7 +11077,7 @@ export class StateStore {
     const now = this.#now();
     const transaction = this.#database.transaction(() => {
       const row = z.object({
-        state: z.literal("effect_started"),
+        state: z.enum(["effect_started", "ambiguous"]),
         session_id: sessionIdSchema,
         evidence_json: z.string(),
       }).strict().parse(this.#database.query(`SELECT m.state,s.session_id,e.evidence_json
@@ -9461,6 +11104,13 @@ export class StateStore {
       );
       if (bound.changes !== 1) throw new Error("SESSION_START_BINDING_CAS_CONFLICT");
       const boundSession = this.requireSession(sessionId);
+      const currentProfile = this.requireProfileById(boundSession.profileId);
+      if (
+        boundSession.profileId !== profile.profileId
+        || boundSession.provider !== reviewedRuntimeProfileProvider(profile)
+        || currentProfile.processGeneration !== profile.processGeneration
+        || !this.sessionAccountAuthorityMatches(sessionId, boundSession.profileId)
+      ) throw new Error("SESSION_START_ACCOUNT_AUTHORITY_MISMATCH");
       if ((boundSession.provider === "claude") !== (claudeProcessIdentity !== undefined)) {
         throw new Error("SESSION_START_CLAUDE_PROCESS_AUTHORITY_REQUIRED");
       }
@@ -9613,6 +11263,9 @@ export class StateStore {
         if (automation === null) {
           throw new Error("SESSION_IMPORT_CONVERSATION_AUTOMATION_BINDING_CONFLICT");
         }
+      }
+      if (!this.sessionAccountAuthorityMatches(session.id, parsed.profileId)) {
+        throw new Error("SESSION_IMPORT_ACCOUNT_AUTHORITY_MISMATCH");
       }
       return session;
     });
@@ -10393,12 +12046,13 @@ export class StateStore {
     profileId: ProfileId;
     preset: Preset;
     providerThreadId: string;
-    state: "active" | "idle" | "terminal";
+    state: "active" | "idle";
     activeTurnId?: string;
     providerUpdatedAt?: number;
     runtimeProfile: ReviewedRuntimeProfile;
     providerAccountKey: string;
     claudeProcessIdentity?: ClaudeProcessIdentity;
+    seedTurnId: string;
     receipt: unknown;
   }): SessionRecord {
     const attemptId = attemptIdSchema.parse(input.attemptId);
@@ -10426,16 +12080,16 @@ export class StateStore {
       throw new Error("SESSION_PROVIDER_SWITCH_CLAUDE_PROCESS_AUTHORITY_REQUIRED");
     }
     const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
-    const receiptJson = JSON.stringify(input.receipt);
+    const seedTurnId = providerThreadIdSchema.parse(input.seedTurnId);
     const now = this.#now();
     const transaction = this.#database.transaction(() => {
-      const targetProfile = mapProfile(
+      const targetProfileAuthority = mapProfile(
         this.#database.query("SELECT * FROM profiles WHERE id=?").get(profileId),
       );
       if (
-        targetProfile.state !== "signed_in"
-        || targetProfile.processGeneration !== expectedTargetProfileGeneration
-        || targetProfile.providerEmail === undefined
+        !profileStateAllowsProviderSessionAuthority(provider, targetProfileAuthority.state)
+        || targetProfileAuthority.processGeneration !== expectedTargetProfileGeneration
+        || (provider === "codex" && targetProfileAuthority.providerEmail === undefined)
       ) {
         throw new Error("SESSION_PROVIDER_SWITCH_TARGET_AUTHORITY_CHANGED");
       }
@@ -10495,22 +12149,114 @@ export class StateStore {
       if (retiredProviderAuthority.changes !== 1) {
         throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_ACCOUNT_AUTHORITY_CONFLICT");
       }
+      const authority = z.object({
+        authority_id: sessionIdSchema,
+        authority_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        state: z.literal("effect_started"),
+        evidence_json: z.string(),
+        target_provider_thread_id: providerThreadIdSchema,
+        seed_client_message_id: attemptIdSchema,
+        seed_text: z.string().min(1).max(24_576),
+        seed_runtime_profile_json: z.string(),
+        seed_turn_id: providerThreadIdSchema,
+        seed_turn_status: z.enum(["completed", "interrupted", "failed", "inProgress"]),
+        source_released: z.number().int().min(0).max(1),
+        target_released: z.number().int().min(0).max(1),
+      }).strict().parse(this.#database.query(
+        `SELECT m.authority_id,m.authority_generation,m.state,e.evidence_json,
+                t.provider_thread_id AS target_provider_thread_id,
+                i.client_message_id AS seed_client_message_id,
+                i.seed_text,
+                i.runtime_profile_json AS seed_runtime_profile_json,
+                sr.turn_id AS seed_turn_id,
+                sr.turn_status AS seed_turn_status,
+                EXISTS(SELECT 1 FROM session_provider_switch_source_releases r WHERE r.attempt_id=m.id) AS source_released,
+                EXISTS(SELECT 1 FROM session_provider_switch_target_releases r WHERE r.attempt_id=m.id) AS target_released
+         FROM mutation_attempts m
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         JOIN session_provider_switch_targets t ON t.attempt_id=m.id
+         JOIN session_provider_switch_seed_intents i ON i.attempt_id=m.id
+         JOIN session_provider_switch_seed_results sr ON sr.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.id=? AND m.kind='session.switch' AND r.attempt_id IS NULL`,
+      ).get(attemptId));
+      const evidence = mutationEffectEvidenceSchema.parse(
+        JSON.parse(authority.evidence_json) as unknown,
+      );
+      const seedRuntimeProfile = reviewedRuntimeProfileSchema.parse(
+        JSON.parse(authority.seed_runtime_profile_json) as unknown,
+      );
+      if (
+        evidence.kind !== "session.switch"
+        || authority.authority_id !== sessionId
+        || authority.authority_generation !== evidence.targetProcessGeneration
+        || authority.source_released !== 1
+        || authority.target_released !== 0
+        || evidence.targetProfileId !== profileId
+        || evidence.targetProvider !== provider
+        || evidence.targetProviderAccountKey !== providerAccountKey
+        || evidence.targetPreset !== preset
+        || authority.target_provider_thread_id !== providerThreadId
+        || sessionProviderSwitchTargetAliasesSource(evidence, providerThreadId)
+        || authority.seed_client_message_id !== attemptId
+        || authority.seed_turn_id !== seedTurnId
+        || digestTranscriptSeed(authority.seed_text) !== evidence.seedDigest
+        || JSON.stringify(evidence.runtimeProfile) !== JSON.stringify(runtimeProfile)
+        || reviewedRuntimeProfileProvider(seedRuntimeProfile) !== provider
+        || seedRuntimeProfile.profileId !== profileId
+        || seedRuntimeProfile.processGeneration !== runtimeProfile.processGeneration
+        || seedRuntimeProfile.preset !== preset
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.sourceProfileId,
+          provider: evidence.sourceProvider,
+          originGeneration: evidence.sourceProcessGeneration,
+        })
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.targetProfileId,
+          provider: evidence.targetProvider,
+          originGeneration: evidence.targetProcessGeneration,
+        })
+      ) throw new Error("SESSION_PROVIDER_SWITCH_EFFECT_EVIDENCE_MISMATCH");
+      const receipt = parseSessionProviderSwitchReceipt(
+        input.receipt,
+        evidence,
+        sessionId,
+        providerThreadId,
+        seedTurnId,
+        authority.seed_turn_status,
+      );
+      const expectedSeedState = authority.seed_turn_status === "inProgress" ? "active" : "idle";
+      if (
+        input.state !== expectedSeedState
+        || (expectedSeedState === "active" && input.activeTurnId !== seedTurnId)
+        || (expectedSeedState !== "active" && input.activeTurnId !== undefined)
+      ) throw new Error("SESSION_PROVIDER_SWITCH_SEED_STATE_MISMATCH");
+      // Rebind through an inert state. The active-state guard must never see
+      // a target session before its exact provider-account proof exists. Both
+      // writes and the proof insertion are held by this transaction, so no
+      // caller can observe the intermediate idle row.
       const bound = this.#database.query(
         `UPDATE sessions
          SET provider=?,profile_id=?,preset=?,provider_thread_id=?,state=?,active_turn_id=?,
              provider_updated_at=?,revision=revision+1,updated_at=?
-         WHERE id=? AND revision=? AND state NOT IN ('recovery_required','terminal')`,
+         WHERE id=? AND revision=? AND profile_id=? AND provider=?
+           AND provider_thread_id=? AND state NOT IN ('recovery_required','terminal')`,
       ).run(
         provider,
         profileId,
         presetTiers[preset],
         providerThreadId,
-        input.state,
-        input.activeTurnId ?? null,
+        "idle",
+        null,
         input.providerUpdatedAt ?? null,
         now,
         sessionId,
         expectedSessionRevision,
+        evidence.sourceProfileId,
+        evidence.sourceProvider,
+        evidence.sourceProviderThreadId,
       );
       // SQLite includes the account-authority rebind trigger's UPDATE in this
       // count. The session predicate still names one exact id and revision, so
@@ -10522,9 +12268,30 @@ export class StateStore {
         runtimeScope: "managed",
         accountKey: providerAccountKey,
       }, now);
+      let expectedReboundRevision = expectedSessionRevision + 1;
+      if (input.state === "active") {
+        const activated = this.#database.query(
+          `UPDATE sessions
+           SET state='active',active_turn_id=?,revision=revision+1,updated_at=?
+           WHERE id=? AND revision=? AND profile_id=? AND provider=?
+             AND provider_thread_id=? AND state='idle' AND active_turn_id IS NULL`,
+        ).run(
+          input.activeTurnId ?? null,
+          now,
+          sessionId,
+          expectedReboundRevision,
+          profileId,
+          provider,
+          providerThreadId,
+        );
+        if (activated.changes !== 1) {
+          throw new Error("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
+        }
+        expectedReboundRevision += 1;
+      }
       const rebound = this.requireSession(sessionId);
       if (
-        rebound.revision !== expectedSessionRevision + 1
+        rebound.revision !== expectedReboundRevision
         || rebound.profileId !== profileId
         || rebound.provider !== provider
         || rebound.providerThreadId !== providerThreadId
@@ -10550,8 +12317,57 @@ export class StateStore {
         { sessionId, sourceKind: "session_start", sourceId: attemptId, profile: runtimeProfile },
         now,
       );
+      this.#bindSessionTurnRuntimeProfile({
+        sessionId,
+        sourceKind: "turn_start",
+        sourceId: attemptId,
+        turnId: seedTurnId,
+        profile: seedRuntimeProfile,
+      }, now);
+      const targetProfile = this.requireProfileById(profileId);
+      this.#appendSessionEventInTransaction({
+        accountId: profileId,
+        body: {
+          type: "provider_switched",
+          fromProvider: evidence.sourceProvider,
+          toProvider: evidence.targetProvider,
+          fromPreset: evidence.sourcePreset,
+          toPreset: evidence.targetPreset,
+          accountChanged: evidence.sourceProfileId !== evidence.targetProfileId,
+          transcriptDigest: evidence.transcriptDigest,
+          seedDigest: evidence.seedDigest,
+          seedOmittedRecords: evidence.seedOmittedRecords,
+        },
+        providerConnectionId: null,
+        providerGeneration: targetProfile.processGeneration,
+        sessionId,
+        recordedAt: now,
+      });
+      const text = authority.seed_text.slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS);
+      this.#appendSessionEventInTransaction({
+        accountId: profileId,
+        body: sessionEventBodySchema.parse(projectPublicSessionEventBody({
+          type: "user_message",
+          turnId: seedTurnId,
+          actor: "provider_switch",
+          text,
+          omittedCharacters: authority.seed_text.length - text.length,
+        }, this.#publicProviderIdentifierProjector)),
+        providerConnectionId: null,
+        providerGeneration: targetProfile.processGeneration,
+        sessionId,
+        recordedAt: now,
+      });
+      const receiptJson = JSON.stringify(sessionProviderSwitchDurableReceiptSchema.parse({
+        ...receipt,
+        session: this.requireSession(sessionId),
+      }));
       const applied = this.#database.query(
-        "UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=? WHERE id=? AND state='effect_started'",
+        `UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=?
+         WHERE id=? AND state='effect_started'
+           AND NOT EXISTS(
+             SELECT 1 FROM mutation_resolutions r WHERE r.attempt_id=mutation_attempts.id
+           )`,
       ).run(receiptJson, now, attemptId);
       if (applied.changes !== 1) throw new Error("SESSION_PROVIDER_SWITCH_RECEIPT_CAS_CONFLICT");
     });
@@ -10589,6 +12405,41 @@ export class StateStore {
     interactions: readonly InteractionRecord[];
     session: SessionRecord;
   }> {
+    return this.#terminalizeProviderSession({
+      ...input,
+      source: "provider_thread_deleted",
+    });
+  }
+
+  terminalizeIdleClaudeSessionForAccountLogin(input: Readonly<{
+    accountId: ProfileId;
+    providerConnectionId: string | null;
+    providerGeneration: number;
+    sessionId: SessionId;
+  }>): Readonly<{
+    changed: boolean;
+    event?: SessionEvent;
+    interactions: readonly InteractionRecord[];
+    session: SessionRecord;
+  }> {
+    return this.#terminalizeProviderSession({
+      ...input,
+      source: "claude_account_login",
+    });
+  }
+
+  #terminalizeProviderSession(input: Readonly<{
+    accountId: ProfileId;
+    providerConnectionId: string | null;
+    providerGeneration: number;
+    sessionId: SessionId;
+    source: "provider_thread_deleted" | "claude_account_login";
+  }>): Readonly<{
+    changed: boolean;
+    event?: SessionEvent;
+    interactions: readonly InteractionRecord[];
+    session: SessionRecord;
+  }> {
     completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const accountId = profileIdSchema.parse(input.accountId);
@@ -10598,6 +12449,14 @@ export class StateStore {
     const now = unixMillisecondsSchema.parse(this.#now());
     const terminalize = this.#database.transaction(() => {
       const current = this.requireSession(parsedSessionId);
+      if (
+        input.source === "claude_account_login"
+        && !this.canReleaseIdleManagedClaudeSessionForAccountLogin({
+          profileId: accountId,
+          profileGeneration: providerGeneration,
+          sessionId: current.id,
+        })
+      ) throw new Error("CLAUDE_LOGIN_SESSION_NOT_QUIESCENT");
       let sessionChanged = false;
       let event: SessionEvent | undefined;
       if (current.state !== "terminal") {
@@ -10626,7 +12485,7 @@ export class StateStore {
       this.#database.query(
         "UPDATE queue_entries SET state='ambiguous',updated_at=? WHERE session_id=? AND state='dispatching'",
       ).run(now, current.id);
-      const providerDeletionEvidence = JSON.stringify({ source: "provider_thread_deleted" });
+      const providerDeletionEvidence = JSON.stringify({ source: input.source });
       this.#database.query(
         `INSERT OR IGNORE INTO queue_effect_resolutions(
            queue_id,resolution_kind,evidence_json,receipt_json,created_at
@@ -11346,10 +13205,12 @@ export class StateStore {
           now,
         );
       } else {
+        const providerEmail = receipt.account.email ?? null;
         const profileChanged = this.#database.query(`UPDATE profiles
-                                                     SET state='signed_in',provider_email=?,provider_plan=?,updated_at=?
+                                                     SET state='signed_in',provider_email=?,codex_account_key=?,provider_plan=?,updated_at=?
                                                      WHERE id=? AND process_generation=? AND state='login_pending'`).run(
-          receipt.account.email ?? null,
+          providerEmail,
+          providerEmail === null ? null : codexProviderAccountAuthorityKeyForEmail(providerEmail),
           receipt.account.plan ?? null,
           now,
           profileId,
@@ -11396,11 +13257,13 @@ export class StateStore {
         throw new Error("LOGIN_CANCEL_AUTHORITY_MISMATCH");
       }
       const now = this.#now();
+      const providerEmail = provider.signedIn ? provider.email ?? null : null;
       const changed = this.#database.query(`UPDATE profiles
-                                            SET state=?,provider_email=?,provider_plan=?,updated_at=?
+                                            SET state=?,provider_email=?,codex_account_key=?,provider_plan=?,updated_at=?
                                             WHERE id=? AND process_generation=? AND state='login_pending'`).run(
         provider.signedIn ? "signed_in" : "signed_out",
-        provider.signedIn ? provider.email ?? null : null,
+        providerEmail,
+        providerEmail === null ? null : codexProviderAccountAuthorityKeyForEmail(providerEmail),
         provider.signedIn ? provider.plan ?? null : null,
         now,
         profileId,
@@ -11605,6 +13468,12 @@ export class StateStore {
     profileGeneration: number;
     projectId: ProjectId;
     provider?: Provider;
+    providerAuthentication?: Readonly<{
+      profileId: ProfileId;
+      processGeneration: number;
+      provider: Provider;
+      signedIn: true;
+    }>;
     preset: Preset;
     fastEnabled: boolean;
     providerAccountKey: string;
@@ -11619,6 +13488,20 @@ export class StateStore {
     const providerAccountKey = providerAccountAuthorityKeySchema.parse(
       input.providerAccountKey,
     );
+    const providerAuthentication = input.providerAuthentication === undefined
+      ? undefined
+      : providerAuthenticationSchema.parse(input.providerAuthentication);
+    if (
+      providerAuthentication !== undefined
+      && (
+        providerAuthentication.profileId !== parsedProfileId
+        || providerAuthentication.processGeneration !== parsedGeneration
+        || providerAuthentication.provider !== parsedProvider
+      )
+    ) throw new Error("SESSION_START_PROVIDER_AUTHENTICATION_MISMATCH");
+    if (parsedProvider === "claude" && providerAuthentication === undefined) {
+      throw new Error("SESSION_START_PROVIDER_AUTHENTICATION_REQUIRED");
+    }
     assertPresetSupportedByProvider(parsedProvider, parsedPreset);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
     if (evidence.projectId !== parsedProjectId) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
@@ -11638,15 +13521,19 @@ export class StateStore {
     const sessionId = createSessionId();
     const now = this.#now();
     const begin = this.#database.transaction(() => {
-      const authority = z.object({ kind: z.literal("session.start"), authority_id: profileIdSchema, authority_generation: z.number().int().nonnegative(), state: z.literal("prepared"), process_generation: z.number().int().nonnegative(), profile_state: profileStateSchema }).strict().parse(
-        this.#database.query(`SELECT m.kind,m.authority_id,m.authority_generation,m.state,p.process_generation,p.state AS profile_state
+      const authority = z.object({ kind: z.literal("session.start"), authority_id: profileIdSchema, authority_generation: z.number().int().nonnegative(), state: z.literal("prepared"), process_generation: z.number().int().nonnegative(), profile_state: profileStateSchema, provider_email: z.string().nullable() }).strict().parse(
+        this.#database.query(`SELECT m.kind,m.authority_id,m.authority_generation,m.state,p.process_generation,p.state AS profile_state,p.provider_email
                               FROM mutation_attempts m JOIN profiles p ON p.id=m.authority_id WHERE m.id=?`).get(parsedAttemptId),
       );
       if (
         authority.authority_id !== parsedProfileId
         || authority.authority_generation !== parsedGeneration
         || authority.process_generation !== parsedGeneration
-        || authority.profile_state !== "signed_in"
+        || !profileStateAllowsProviderSessionAuthority(
+          parsedProvider,
+          authority.profile_state,
+        )
+        || (parsedProvider === "codex" && authority.provider_email === null)
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedProvider, presetTiers[parsedPreset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
@@ -11656,12 +13543,865 @@ export class StateStore {
         runtimeScope: "managed",
         accountKey: providerAccountKey,
       }, now);
+      if (!this.sessionAccountAuthorityMatches(sessionId, parsedProfileId)) {
+        throw new Error("SESSION_START_ACCOUNT_AUTHORITY_MISMATCH");
+      }
       this.#database.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,?)").run(parsedAttemptId, sessionId, now);
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
       if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
     });
     begin.immediate();
+    return this.requireSession(sessionId);
+  }
+
+  beginSessionProviderSwitchEffect(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    providerAuthentication?: Readonly<{
+      profileId: ProfileId;
+      processGeneration: number;
+      provider: Provider;
+      signedIn: true;
+    }>;
+    evidence: Extract<MutationEffectEvidence, { kind: "session.switch" }>
+      & Readonly<{ targetProviderAccountKey: string }>;
+  }): MutationEffectEvidenceRecord {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
+    if (!providerAccountAuthorityKeyMatchesProvider(
+      evidence.targetProvider,
+      evidence.targetProviderAccountKey,
+    )) throw new Error("SESSION_PROVIDER_SWITCH_TARGET_ACCOUNT_AUTHORITY_REQUIRED");
+    const providerAuthentication = input.providerAuthentication === undefined
+      ? undefined
+      : providerAuthenticationSchema.parse(input.providerAuthentication);
+    if (
+      reviewedRuntimeProfileProvider(evidence.runtimeProfile) !== evidence.targetProvider
+      || evidence.runtimeProfile.profileId !== evidence.targetProfileId
+      || evidence.runtimeProfile.processGeneration !== evidence.targetProcessGeneration
+      || evidence.runtimeProfile.preset !== evidence.targetPreset
+    ) throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_MISMATCH");
+    if (
+      providerAuthentication !== undefined
+      && (
+        providerAuthentication.profileId !== evidence.targetProfileId
+        || providerAuthentication.processGeneration !== evidence.targetProcessGeneration
+        || providerAuthentication.provider !== evidence.targetProvider
+      )
+    ) throw new Error("SESSION_PROVIDER_SWITCH_AUTHENTICATION_MISMATCH");
+    if (evidence.targetProvider === "claude" && providerAuthentication === undefined) {
+      throw new Error("SESSION_PROVIDER_SWITCH_AUTHENTICATION_REQUIRED");
+    }
+    const canonical = JSON.stringify(evidence);
+    const digest = digestJson(evidence);
+    const now = this.#now();
+    const record = this.#database.transaction(() => {
+      const authority = z.object({
+        daemon_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        kind: z.literal("session.switch"),
+        authority_id: sessionIdSchema,
+        authority_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        mutation_state: z.literal("prepared"),
+        source_profile_id: profileIdSchema,
+        source_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        source_provider: providerSchema,
+        source_provider_thread_id: providerThreadIdSchema,
+        source_preset: presetTierSchema,
+        session_state: sessionStateSchema,
+        target_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        target_profile_state: profileStateSchema,
+        target_provider_email: z.string().nullable(),
+      }).strict().parse(this.#database.query(
+        `SELECT (SELECT generation FROM daemon_state WHERE singleton=1) AS daemon_generation,
+                m.kind,m.authority_id,m.authority_generation,m.state AS mutation_state,
+                s.profile_id AS source_profile_id,sp.process_generation AS source_process_generation,
+                s.provider AS source_provider,s.provider_thread_id AS source_provider_thread_id,
+                s.preset AS source_preset,s.state AS session_state,
+                tp.process_generation AS target_process_generation,
+                tp.state AS target_profile_state,tp.provider_email AS target_provider_email
+         FROM mutation_attempts m
+         JOIN sessions s ON s.id=m.authority_id
+         JOIN profiles sp ON sp.id=s.profile_id
+         JOIN profiles tp ON tp.id=?
+         WHERE m.id=?`,
+      ).get(evidence.targetProfileId, attemptId));
+      if (
+        evidence.daemonGeneration === undefined
+        || authority.daemon_generation !== evidence.daemonGeneration
+        || authority.authority_id !== sessionId
+        || authority.authority_generation !== evidence.targetProcessGeneration
+        || authority.source_profile_id !== evidence.sourceProfileId
+        || authority.source_process_generation !== evidence.sourceProcessGeneration
+        || authority.source_provider !== evidence.sourceProvider
+        || authority.source_provider_thread_id !== evidence.sourceProviderThreadId
+        || presetForProviderTier(authority.source_provider, authority.source_preset)
+          !== evidence.sourcePreset
+        || authority.session_state === "terminal"
+        || authority.session_state === "recovery_required"
+        || !this.sessionAccountAuthorityMatches(sessionId, evidence.sourceProfileId)
+        || authority.target_process_generation !== evidence.targetProcessGeneration
+        || !profileStateAllowsProviderSessionAuthority(
+          evidence.targetProvider,
+          authority.target_profile_state,
+        )
+        || (
+          evidence.targetProvider === "codex"
+          && (
+            authority.target_provider_email === null
+            || codexProviderAccountAuthorityKeyForEmail(
+              authority.target_provider_email,
+            ) !== evidence.targetProviderAccountKey
+          )
+        )
+      ) throw new Error("SESSION_PROVIDER_SWITCH_AUTHORITY_CHANGED");
+      const targetRevocation = this.readProviderRuntimeAccountRevocation({
+        profileId: evidence.targetProfileId,
+        provider: evidence.targetProvider,
+        runtimeScope: "managed",
+      });
+      if (
+        targetRevocation?.profileGeneration === evidence.targetProcessGeneration
+        && (
+          targetRevocation.state === "releasing"
+          || targetRevocation.currentAccountKey === null
+          || targetRevocation.currentAccountKey !== evidence.targetProviderAccountKey
+        )
+      ) throw new Error("SESSION_PROVIDER_SWITCH_AUTHORITY_CHANGED");
+      this.#database.query(
+        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
+      ).run(attemptId, evidence.kind, canonical, digest, now);
+      const changed = this.#database.query(
+        "UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'",
+      ).run(now, attemptId);
+      if (changed.changes !== 1) throw new Error("SESSION_PROVIDER_SWITCH_AUTHORITY_CHANGED");
+    });
+    record.immediate();
+    return { attemptId, digest, evidence, recordedAt: now };
+  }
+
+  recordSessionProviderSwitchTarget(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    providerThreadId: string;
+  }): void {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
+    const now = this.#now();
+    const record = this.#database.transaction(() => {
+      const row = z.object({
+        authority_id: sessionIdSchema,
+        kind: z.literal("session.switch"),
+        state: z.literal("effect_started"),
+        evidence_digest: sha256Schema,
+        evidence_json: z.string(),
+      }).strict().parse(this.#database.query(
+        `SELECT m.authority_id,m.kind,m.state,e.evidence_digest,e.evidence_json
+         FROM mutation_attempts m
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.id=? AND r.attempt_id IS NULL`,
+      ).get(attemptId));
+      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      if (
+        row.authority_id !== sessionId
+        || evidence.kind !== "session.switch"
+        || digestJson(evidence) !== row.evidence_digest
+        || sessionProviderSwitchTargetAliasesSource(evidence, providerThreadId)
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.targetProfileId,
+          provider: evidence.targetProvider,
+          originGeneration: evidence.targetProcessGeneration,
+        })
+      ) {
+        throw new Error("SESSION_PROVIDER_SWITCH_TARGET_AUTHORITY_MISMATCH");
+      }
+      const inserted = this.#database.query(
+        "INSERT INTO session_provider_switch_targets(attempt_id,provider_thread_id,recorded_at) VALUES (?,?,?)",
+      ).run(attemptId, providerThreadId, now);
+      if (inserted.changes !== 1) throw new Error("SESSION_PROVIDER_SWITCH_TARGET_CAS_CONFLICT");
+    });
+    record.immediate();
+  }
+
+  recordSessionProviderSwitchSeedIntent(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    providerThreadId: string;
+    seedText: string;
+    runtimeProfile: ReviewedRuntimeProfile;
+  }): void {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
+    const seedText = z.string().min(1).max(24_576).parse(input.seedText);
+    const runtimeProfile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
+    const runtimeProfileJson = JSON.stringify(runtimeProfile);
+    const now = this.#now();
+    const record = this.#database.transaction(() => {
+      const row = z.object({
+        authority_id: sessionIdSchema,
+        kind: z.literal("session.switch"),
+        state: z.literal("effect_started"),
+        evidence_digest: sha256Schema,
+        evidence_json: z.string(),
+        target_provider_thread_id: providerThreadIdSchema,
+        target_released: z.number().int().min(0).max(1),
+      }).strict().parse(this.#database.query(
+        `SELECT m.authority_id,m.kind,m.state,e.evidence_digest,e.evidence_json,
+                t.provider_thread_id AS target_provider_thread_id,
+                EXISTS(SELECT 1 FROM session_provider_switch_target_releases r WHERE r.attempt_id=m.id) AS target_released
+         FROM mutation_attempts m
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         JOIN session_provider_switch_targets t ON t.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.id=? AND r.attempt_id IS NULL`,
+      ).get(attemptId));
+      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      if (
+        row.authority_id !== sessionId
+        || row.target_provider_thread_id !== providerThreadId
+        || row.target_released !== 0
+        || evidence.kind !== "session.switch"
+        || digestJson(evidence) !== row.evidence_digest
+        || sessionProviderSwitchTargetAliasesSource(evidence, providerThreadId)
+        || evidence.seedDigest !== digestTranscriptSeed(seedText)
+        || reviewedRuntimeProfileProvider(runtimeProfile) !== evidence.targetProvider
+        || runtimeProfile.profileId !== evidence.targetProfileId
+        || runtimeProfile.processGeneration !== evidence.targetProcessGeneration
+        || runtimeProfile.preset !== evidence.targetPreset
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.targetProfileId,
+          provider: evidence.targetProvider,
+          originGeneration: evidence.targetProcessGeneration,
+        })
+      ) throw new Error("SESSION_PROVIDER_SWITCH_SEED_INTENT_AUTHORITY_MISMATCH");
+      const inserted = this.#database.query(
+        `INSERT INTO session_provider_switch_seed_intents(
+           attempt_id,client_message_id,seed_text,runtime_profile_json,recorded_at
+         ) VALUES (?,?,?,?,?)`,
+      ).run(attemptId, attemptId, seedText, runtimeProfileJson, now);
+      if (inserted.changes !== 1) throw new Error("SESSION_PROVIDER_SWITCH_SEED_INTENT_CAS_CONFLICT");
+    });
+    record.immediate();
+  }
+
+  recordSessionProviderSwitchSeedResult(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    providerThreadId: string;
+    runtimeProfile: ReviewedRuntimeProfile;
+    turnId: string;
+    turnStatus: "completed" | "interrupted" | "failed" | "inProgress";
+  }): void {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
+    const runtimeProfile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
+    const turnId = providerThreadIdSchema.parse(input.turnId);
+    const turnStatus = z.enum(["completed", "interrupted", "failed", "inProgress"])
+      .parse(input.turnStatus);
+    const now = this.#now();
+    const record = this.#database.transaction(() => {
+      const row = z.object({
+        authority_id: sessionIdSchema,
+        client_message_id: attemptIdSchema,
+        kind: z.literal("session.switch"),
+        runtime_profile_json: z.string(),
+        state: z.enum(["effect_started", "ambiguous"]),
+        target_provider_thread_id: providerThreadIdSchema,
+        target_released: z.number().int().min(0).max(1),
+      }).strict().parse(this.#database.query(
+        `SELECT m.authority_id,m.kind,m.state,t.provider_thread_id AS target_provider_thread_id,
+                i.client_message_id,i.runtime_profile_json,
+                EXISTS(SELECT 1 FROM session_provider_switch_target_releases r WHERE r.attempt_id=m.id) AS target_released
+         FROM mutation_attempts m
+         JOIN session_provider_switch_targets t ON t.attempt_id=m.id
+         JOIN session_provider_switch_seed_intents i ON i.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.id=? AND r.attempt_id IS NULL`,
+      ).get(attemptId));
+      if (
+        row.authority_id !== sessionId
+        || row.target_provider_thread_id !== providerThreadId
+        || row.client_message_id !== attemptId
+        || row.target_released !== 0
+        || row.runtime_profile_json !== JSON.stringify(runtimeProfile)
+      ) throw new Error("SESSION_PROVIDER_SWITCH_SEED_RESULT_AUTHORITY_MISMATCH");
+      this.#database.query(
+        "INSERT OR IGNORE INTO session_provider_switch_seed_results(attempt_id,turn_id,turn_status,recorded_at) VALUES (?,?,?,?)",
+      ).run(attemptId, turnId, turnStatus, now);
+      const result = z.object({
+        turn_id: providerThreadIdSchema,
+        turn_status: z.enum(["completed", "interrupted", "failed", "inProgress"]),
+      }).strict().parse(
+        this.#database.query(
+          "SELECT turn_id,turn_status FROM session_provider_switch_seed_results WHERE attempt_id=?",
+        ).get(attemptId),
+      );
+      if (result.turn_id !== turnId || result.turn_status !== turnStatus) {
+        throw new Error("SESSION_PROVIDER_SWITCH_SEED_RESULT_CAS_CONFLICT");
+      }
+    });
+    record.immediate();
+  }
+
+  recordSessionProviderSwitchSourceReleased(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+  }): void {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const now = this.#now();
+    const record = this.#database.transaction(() => {
+      const row = z.object({
+        authority_id: sessionIdSchema,
+        kind: z.literal("session.switch"),
+        state: z.enum(["effect_started", "ambiguous"]),
+        evidence_digest: sha256Schema,
+        evidence_json: z.string(),
+        profile_id: profileIdSchema,
+        provider: providerSchema,
+        provider_thread_id: providerThreadIdSchema,
+        target_provider_thread_id: providerThreadIdSchema,
+        target_released: z.number().int().min(0).max(1),
+      }).strict().parse(this.#database.query(
+        `SELECT m.authority_id,m.kind,m.state,e.evidence_digest,e.evidence_json,
+                session.profile_id,session.provider,session.provider_thread_id,
+                t.provider_thread_id AS target_provider_thread_id,
+                EXISTS(SELECT 1 FROM session_provider_switch_target_releases tr WHERE tr.attempt_id=m.id) AS target_released
+         FROM mutation_attempts m
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         JOIN session_provider_switch_targets t ON t.attempt_id=m.id
+         JOIN session_provider_switch_seed_results seed ON seed.attempt_id=m.id
+         JOIN sessions session ON session.id=m.authority_id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.id=? AND r.attempt_id IS NULL`,
+      ).get(attemptId));
+      const evidence = mutationEffectEvidenceSchema.parse(
+        JSON.parse(row.evidence_json) as unknown,
+      );
+      if (
+        row.authority_id !== sessionId
+        || evidence.kind !== "session.switch"
+        || digestJson(evidence) !== row.evidence_digest
+        || row.profile_id !== evidence.sourceProfileId
+        || row.provider !== evidence.sourceProvider
+        || row.provider_thread_id !== evidence.sourceProviderThreadId
+        || sessionProviderSwitchTargetAliasesSource(
+          evidence,
+          row.target_provider_thread_id,
+        )
+        || row.target_released !== 0
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.sourceProfileId,
+          provider: evidence.sourceProvider,
+          originGeneration: evidence.sourceProcessGeneration,
+        })
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.targetProfileId,
+          provider: evidence.targetProvider,
+          originGeneration: evidence.targetProcessGeneration,
+        })
+      ) {
+        throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_RELEASE_AUTHORITY_MISMATCH");
+      }
+      const inserted = this.#database.query(
+        "INSERT INTO session_provider_switch_source_releases(attempt_id,recorded_at) VALUES (?,?)",
+      ).run(attemptId, now);
+      if (inserted.changes !== 1) throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_RELEASE_CAS_CONFLICT");
+    });
+    record.immediate();
+  }
+
+  recordSessionProviderSwitchTargetReleased(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    providerThreadId: string;
+    providerAccountKey: string;
+  }): void {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
+    const providerAccountKey = providerAccountAuthorityKeySchema.parse(
+      input.providerAccountKey,
+    );
+    const now = this.#now();
+    const record = this.#database.transaction(() => {
+      const row = z.object({
+        authority_id: sessionIdSchema,
+        kind: z.literal("session.switch"),
+        state: z.enum(["effect_started", "ambiguous"]),
+        evidence_digest: sha256Schema,
+        evidence_json: z.string(),
+        target_provider_thread_id: providerThreadIdSchema.nullable(),
+      }).strict().parse(this.#database.query(
+        `SELECT m.authority_id,m.kind,m.state,e.evidence_digest,e.evidence_json,
+                t.provider_thread_id AS target_provider_thread_id
+         FROM mutation_attempts m
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         LEFT JOIN session_provider_switch_targets t ON t.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.id=? AND r.attempt_id IS NULL`,
+      ).get(attemptId));
+      const evidence = mutationEffectEvidenceSchema.parse(
+        JSON.parse(row.evidence_json) as unknown,
+      );
+      if (
+        row.authority_id !== sessionId
+        || evidence.kind !== "session.switch"
+        || digestJson(evidence) !== row.evidence_digest
+        || evidence.targetProviderAccountKey !== providerAccountKey
+        || sessionProviderSwitchTargetAliasesSource(evidence, providerThreadId)
+        || (row.target_provider_thread_id !== null
+          && row.target_provider_thread_id !== providerThreadId)
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.targetProfileId,
+          provider: evidence.targetProvider,
+          originGeneration: evidence.targetProcessGeneration,
+        })
+      ) {
+        throw new Error("SESSION_PROVIDER_SWITCH_TARGET_RELEASE_AUTHORITY_MISMATCH");
+      }
+      this.#database.query(
+        "INSERT OR IGNORE INTO session_provider_switch_targets(attempt_id,provider_thread_id,recorded_at) VALUES (?,?,?)",
+      ).run(attemptId, providerThreadId, now);
+      const target = z.object({ provider_thread_id: providerThreadIdSchema }).strict().parse(
+        this.#database.query(
+          "SELECT provider_thread_id FROM session_provider_switch_targets WHERE attempt_id=?",
+        ).get(attemptId),
+      );
+      if (target.provider_thread_id !== providerThreadId) {
+        throw new Error("SESSION_PROVIDER_SWITCH_TARGET_RELEASE_THREAD_MISMATCH");
+      }
+      this.#database.query(
+        "INSERT OR IGNORE INTO session_provider_switch_target_releases(attempt_id,recorded_at) VALUES (?,?)",
+      ).run(attemptId, now);
+      if (this.#database.query(
+        "SELECT 1 AS present FROM session_provider_switch_target_releases WHERE attempt_id=?",
+      ).get(attemptId) === null) {
+        throw new Error("SESSION_PROVIDER_SWITCH_TARGET_RELEASE_CAS_CONFLICT");
+      }
+    });
+    record.immediate();
+  }
+
+  readSessionProviderSwitchProgress(attemptId: AttemptId): Readonly<{
+    seed?: Readonly<{
+      clientMessageId: AttemptId;
+      runtimeProfile: ReviewedRuntimeProfile;
+      text: string;
+    }>;
+    seedTurnId?: string;
+    seedTurnStatus?: "completed" | "interrupted" | "failed" | "inProgress";
+    sourceReleased: boolean;
+    targetReleased: boolean;
+    targetProviderAccountKey?: string;
+    targetProviderThreadId?: string;
+  }> {
+    const row = z.object({
+      evidence_json: z.string(),
+      provider_thread_id: providerThreadIdSchema.nullable(),
+      client_message_id: attemptIdSchema.nullable(),
+      seed_text: z.string().nullable(),
+      runtime_profile_json: z.string().nullable(),
+      seed_turn_id: providerThreadIdSchema.nullable(),
+      seed_turn_status: z.enum(["completed", "interrupted", "failed", "inProgress"]).nullable(),
+      source_released: z.number().int().min(0).max(1),
+      target_released: z.number().int().min(0).max(1),
+    }).strict().parse(this.#database.query(
+      `SELECT e.evidence_json,t.provider_thread_id,i.client_message_id,i.seed_text,i.runtime_profile_json,
+              sr.turn_id AS seed_turn_id,sr.turn_status AS seed_turn_status,
+              EXISTS(SELECT 1 FROM session_provider_switch_source_releases r WHERE r.attempt_id=m.id) AS source_released,
+              EXISTS(SELECT 1 FROM session_provider_switch_target_releases r WHERE r.attempt_id=m.id) AS target_released
+       FROM mutation_attempts m
+       JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+       LEFT JOIN session_provider_switch_targets t ON t.attempt_id=m.id
+       LEFT JOIN session_provider_switch_seed_intents i ON i.attempt_id=m.id
+       LEFT JOIN session_provider_switch_seed_results sr ON sr.attempt_id=m.id
+       WHERE m.id=? AND m.kind='session.switch'`,
+    ).get(attemptIdSchema.parse(attemptId)));
+    if (
+      (row.client_message_id === null) !== (row.seed_text === null)
+      || (row.client_message_id === null) !== (row.runtime_profile_json === null)
+      || (row.seed_turn_id !== null && row.client_message_id === null)
+      || (row.seed_turn_id === null) !== (row.seed_turn_status === null)
+    ) throw new Error("SESSION_PROVIDER_SWITCH_SEED_PROGRESS_CORRUPT");
+    const evidence = mutationEffectEvidenceSchema.parse(
+      JSON.parse(row.evidence_json) as unknown,
+    );
+    if (evidence.kind !== "session.switch") {
+      throw new Error("SESSION_PROVIDER_SWITCH_SEED_PROGRESS_CORRUPT");
+    }
+    if (
+      row.provider_thread_id !== null
+      && sessionProviderSwitchTargetAliasesSource(evidence, row.provider_thread_id)
+    ) throw new Error("SESSION_PROVIDER_SWITCH_TARGET_ALIASES_SOURCE");
+    const seed = row.client_message_id === null
+      ? undefined
+      : {
+          clientMessageId: row.client_message_id,
+          runtimeProfile: reviewedRuntimeProfileSchema.parse(
+            JSON.parse(z.string().parse(row.runtime_profile_json)) as unknown,
+          ),
+          text: z.string().min(1).max(24_576).parse(row.seed_text),
+        };
+    return {
+      sourceReleased: row.source_released === 1,
+      targetReleased: row.target_released === 1,
+      ...(evidence.targetProviderAccountKey === undefined
+        ? {}
+        : { targetProviderAccountKey: evidence.targetProviderAccountKey }),
+      ...(seed === undefined ? {} : { seed }),
+      ...(row.seed_turn_id === null ? {} : { seedTurnId: row.seed_turn_id }),
+      ...(row.seed_turn_status === null ? {} : { seedTurnStatus: row.seed_turn_status }),
+      ...(row.provider_thread_id === null ? {} : { targetProviderThreadId: row.provider_thread_id }),
+    };
+  }
+
+  bindSessionStartRecoveryTarget(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    expectedSessionRevision: number;
+    providerThreadId: string;
+    title: string;
+    providerUpdatedAt?: number;
+    runtimeProfile: ReviewedRuntimeProfile;
+  }): SessionRecord {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
+    const runtimeProfile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
+    const now = this.#now();
+    const bind = this.#database.transaction(() => {
+      const authority = z.object({
+        kind: z.literal("session.start"),
+        mutation_state: z.enum(["effect_started", "ambiguous"]),
+        session_id: sessionIdSchema,
+        profile_id: profileIdSchema,
+        process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        provider: providerSchema,
+        session_state: z.literal("starting"),
+        provider_thread_id: z.null(),
+        evidence_json: z.string(),
+      }).strict().parse(this.#database.query(
+        `SELECT m.kind,m.state AS mutation_state,a.session_id,s.profile_id,
+                p.process_generation,s.provider,s.state AS session_state,
+                s.provider_thread_id,e.evidence_json
+         FROM mutation_attempts m
+         JOIN session_start_attempts a ON a.attempt_id=m.id
+         JOIN sessions s ON s.id=a.session_id
+         JOIN profiles p ON p.id=s.profile_id
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         WHERE m.id=?`,
+      ).get(attemptId));
+      const evidence = mutationEffectEvidenceSchema.parse(
+        JSON.parse(authority.evidence_json) as unknown,
+      );
+      if (
+        authority.session_id !== sessionId
+        || authority.profile_id !== runtimeProfile.profileId
+        || authority.process_generation !== runtimeProfile.processGeneration
+        || reviewedRuntimeProfileProvider(runtimeProfile) !== authority.provider
+        || evidence.kind !== "session.start"
+        || evidence.runtimeProfile === undefined
+        || JSON.stringify(evidence.runtimeProfile) !== JSON.stringify(runtimeProfile)
+      ) throw new Error("SESSION_START_RECOVERY_TARGET_MISMATCH");
+      const changed = this.#database.query(
+        `UPDATE sessions
+         SET provider_thread_id=?,title=?,state='recovery_required',active_turn_id=NULL,
+             provider_updated_at=?,revision=revision+1,updated_at=?
+         WHERE id=? AND revision=? AND state='starting' AND provider_thread_id IS NULL`,
+      ).run(
+        providerThreadId,
+        titleSchema.parse(input.title),
+        input.providerUpdatedAt ?? null,
+        now,
+        sessionId,
+        z.number().int().positive().parse(input.expectedSessionRevision),
+      );
+      if (changed.changes !== 1) throw new Error("SESSION_START_RECOVERY_TARGET_CAS_CONFLICT");
+      this.#insertSessionRuntimeProfile({
+        sessionId,
+        sourceKind: "session_start",
+        sourceId: attemptId,
+        profile: runtimeProfile,
+      }, now);
+    });
+    bind.immediate();
+    return this.requireSession(sessionId);
+  }
+
+  bindSessionProviderSwitchRecoveryTarget(input: {
+    attemptId: AttemptId;
+    sessionId: SessionId;
+    expectedSessionRevision: number;
+    providerAccountKey: string;
+    title: string;
+    providerUpdatedAt?: number;
+    recordSourceReleased?: boolean;
+  }): SessionRecord {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const providerAccountKey = providerAccountAuthorityKeySchema.parse(
+      input.providerAccountKey,
+    );
+    const now = this.#now();
+    const bind = this.#database.transaction(() => {
+      const authority = z.object({
+        kind: z.literal("session.switch"),
+        mutation_state: z.enum(["effect_started", "ambiguous"]),
+        authority_id: sessionIdSchema,
+        evidence_digest: sha256Schema,
+        evidence_json: z.string(),
+        target_provider_thread_id: providerThreadIdSchema,
+        seed_result_present: z.number().int().min(0).max(1),
+        source_released: z.number().int().min(0).max(1),
+        target_released: z.number().int().min(0).max(1),
+      }).strict().parse(this.#database.query(
+        `SELECT m.kind,m.state AS mutation_state,m.authority_id,
+                e.evidence_digest,e.evidence_json,
+                t.provider_thread_id AS target_provider_thread_id,
+                EXISTS(SELECT 1 FROM session_provider_switch_seed_results s WHERE s.attempt_id=m.id) AS seed_result_present,
+                EXISTS(SELECT 1 FROM session_provider_switch_source_releases r WHERE r.attempt_id=m.id) AS source_released,
+                EXISTS(SELECT 1 FROM session_provider_switch_target_releases r WHERE r.attempt_id=m.id) AS target_released
+         FROM mutation_attempts m
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         JOIN session_provider_switch_targets t ON t.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.id=? AND r.attempt_id IS NULL`,
+      ).get(attemptId));
+      const evidence = mutationEffectEvidenceSchema.parse(
+        JSON.parse(authority.evidence_json) as unknown,
+      );
+      if (
+        authority.authority_id !== sessionId
+        || evidence.kind !== "session.switch"
+        || evidence.targetProviderAccountKey !== providerAccountKey
+        || sessionProviderSwitchTargetAliasesSource(
+          evidence,
+          authority.target_provider_thread_id,
+        )
+        || digestJson(evidence) !== authority.evidence_digest
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.sourceProfileId,
+          provider: evidence.sourceProvider,
+          originGeneration: evidence.sourceProcessGeneration,
+        })
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.targetProfileId,
+          provider: evidence.targetProvider,
+          originGeneration: evidence.targetProcessGeneration,
+        })
+      ) {
+        throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_MISMATCH");
+      }
+      const current = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionId));
+      const sourceBinding = current.profileId === evidence.sourceProfileId
+        && current.provider === evidence.sourceProvider
+        && current.providerThreadId === evidence.sourceProviderThreadId;
+      const targetBinding = current.profileId === evidence.targetProfileId
+        && current.provider === evidence.targetProvider
+        && current.providerThreadId === authority.target_provider_thread_id;
+      if (
+        current.revision !== z.number().int().positive().parse(input.expectedSessionRevision)
+        || (!sourceBinding && !targetBinding)
+        || current.state === "terminal"
+        || authority.seed_result_present !== 1
+        || authority.target_released === 1
+        || (input.recordSourceReleased === true
+          && authority.source_released === 0
+          && !sourceBinding)
+      ) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_CAS_CONFLICT");
+      if (input.recordSourceReleased === true && authority.source_released === 0) {
+        this.#database.query(
+          "INSERT INTO session_provider_switch_source_releases(attempt_id,recorded_at) VALUES (?,?)",
+        ).run(attemptId, now);
+      }
+      const sourceRelease = this.#database.query(
+        "SELECT 1 AS present FROM session_provider_switch_source_releases WHERE attempt_id=?",
+      ).get(attemptId);
+      if (sourceRelease === null) {
+        throw new Error("SESSION_PROVIDER_SWITCH_SOURCE_RELEASE_UNPROVEN");
+      }
+      const targetProfile = this.requireProfileById(evidence.targetProfileId);
+      if (
+        !profileStateAllowsProviderSessionAuthority(
+          evidence.targetProvider,
+          targetProfile.state,
+        )
+        || (evidence.targetProvider === "codex"
+          && targetProfile.providerEmail === undefined)
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId,
+          profileId: evidence.targetProfileId,
+          provider: evidence.targetProvider,
+          originGeneration: evidence.targetProcessGeneration,
+        })
+      ) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_AUTHORITY_CHANGED");
+      if (targetBinding) {
+        const targetProviderAuthority = this.readSessionProviderAccountAuthority(sessionId);
+        const personalBinding = this.readSessionPersonalRuntimeBinding(sessionId, true);
+        if (
+          targetProviderAuthority === null
+          || targetProviderAuthority.provider !== evidence.targetProvider
+          || targetProviderAuthority.runtimeScope !== "managed"
+          || targetProviderAuthority.accountKey !== providerAccountKey
+          || (personalBinding !== null && personalBinding.state !== "detached")
+          || !this.sessionAccountAuthorityMatches(
+            current.id,
+            evidence.targetProfileId,
+          )
+        ) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_ACCOUNT_AUTHORITY_MISMATCH");
+        if (evidence.targetProvider === "claude") {
+          const targetProcess = this.readClaudeProcessAuthority({
+            providerThreadId: authority.target_provider_thread_id,
+            profileId: evidence.targetProfileId,
+            runtimeScope: "managed",
+          });
+          if (
+            targetProcess === null
+            || targetProcess.state !== "bound"
+            || targetProcess.sessionId !== sessionId
+            || targetProcess.profileGeneration !== targetProfile.processGeneration
+          ) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_PROCESS_AUTHORITY_MISMATCH");
+        }
+        return current;
+      }
+      const sourceProviderAuthority = this.readSessionProviderAccountAuthority(sessionId);
+      if (
+        sourceProviderAuthority === null
+        || sourceProviderAuthority.provider !== evidence.sourceProvider
+      ) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_SOURCE_ACCOUNT_AUTHORITY_MISSING");
+      const personalBinding = this.readSessionPersonalRuntimeBinding(sessionId, true);
+      if (sourceProviderAuthority.runtimeScope === "personal") {
+        if (
+          personalBinding === null
+          || personalBinding.state === "detached"
+          || personalBinding.provider !== evidence.sourceProvider
+          || personalBinding.providerThreadId !== evidence.sourceProviderThreadId
+        ) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_SOURCE_PERSONAL_BINDING_MISMATCH");
+      } else if (personalBinding !== null && personalBinding.state !== "detached") {
+        throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_SOURCE_RUNTIME_SCOPE_MISMATCH");
+      }
+      if (evidence.sourceProvider === "claude") {
+        const sourceProcess = this.readClaudeProcessAuthority({
+          providerThreadId: evidence.sourceProviderThreadId,
+          profileId: evidence.sourceProfileId,
+          runtimeScope: sourceProviderAuthority.runtimeScope,
+        });
+        if (sourceProcess === null || sourceProcess.state !== "released") {
+          throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_SOURCE_PROCESS_AUTHORITY_LIVE");
+        }
+      }
+      let targetClaudeProcess: ClaudeProcessAuthorityRecord | null = null;
+      if (evidence.targetProvider === "claude") {
+        targetClaudeProcess = this.readClaudeProcessAuthority({
+          providerThreadId: authority.target_provider_thread_id,
+          profileId: evidence.targetProfileId,
+          runtimeScope: "managed",
+        });
+        if (
+          targetClaudeProcess === null
+          || targetClaudeProcess.state !== "claimed"
+          || targetClaudeProcess.sessionId !== sessionId
+          || targetClaudeProcess.profileGeneration !== targetProfile.processGeneration
+        ) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_PROCESS_AUTHORITY_MISMATCH");
+      }
+      if (personalBinding !== null && personalBinding.state !== "detached") {
+        const detached = this.#database.query(
+          `UPDATE session_personal_runtime_bindings
+           SET state='detached',revision=revision+1,
+             updated_at=MAX(updated_at,?),detached_at=?
+           WHERE session_id=? AND revision=? AND state IN ('active','detaching')`,
+        ).run(now, now, sessionId, personalBinding.revision);
+        if (detached.changes !== 1) {
+          throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_SOURCE_PERSONAL_BINDING_CONFLICT");
+        }
+        const fenced = this.#database.query(
+          `UPDATE session_adoption_candidates
+           SET claim_status='fenced',fenced_fingerprint=candidate_fingerprint,
+             revision=revision+1
+           WHERE provider=? AND provider_thread_id=?`,
+        ).run(personalBinding.provider, personalBinding.providerThreadId);
+        if (fenced.changes !== 1) {
+          throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_SOURCE_PERSONAL_CANDIDATE_MISSING");
+        }
+      }
+      const retiredProviderAuthority = this.#database.query(
+        `DELETE FROM session_provider_account_authorities
+         WHERE session_id=? AND provider=? AND runtime_scope=? AND account_key=?`,
+      ).run(
+        sessionId,
+        sourceProviderAuthority.provider,
+        sourceProviderAuthority.runtimeScope,
+        sourceProviderAuthority.accountKey,
+      );
+      if (retiredProviderAuthority.changes !== 1) {
+        throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_SOURCE_ACCOUNT_AUTHORITY_CONFLICT");
+      }
+      const changed = this.#database.query(
+        `UPDATE sessions
+         SET provider=?,profile_id=?,preset=?,provider_thread_id=?,title=?,
+             state='recovery_required',active_turn_id=NULL,provider_updated_at=?,
+             revision=revision+1,updated_at=?
+         WHERE id=? AND revision=? AND state!='terminal'`,
+      ).run(
+        evidence.targetProvider,
+        evidence.targetProfileId,
+        presetTiers[evidence.targetPreset],
+        authority.target_provider_thread_id,
+        titleSchema.parse(input.title),
+        input.providerUpdatedAt ?? null,
+        now,
+        sessionId,
+        current.revision,
+      );
+      // SQLite includes the account-authority rebind trigger's session write in
+      // this count, so successful cross-account recovery can report >1 change.
+      if (changed.changes < 1) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_CAS_CONFLICT");
+      this.#bindSessionProviderAccountAuthorityLocked({
+        sessionId,
+        provider: evidence.targetProvider,
+        runtimeScope: "managed",
+        accountKey: providerAccountKey,
+      }, now);
+      const rebound = this.requireSession(sessionId);
+      if (
+        rebound.profileId !== evidence.targetProfileId
+        || rebound.provider !== evidence.targetProvider
+        || rebound.providerThreadId !== authority.target_provider_thread_id
+        || !this.sessionAccountAuthorityMatches(rebound.id, evidence.targetProfileId)
+      ) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_CAS_CONFLICT");
+      if (targetClaudeProcess !== null) {
+        this.#bindClaudeProcessAuthorityLocked({
+          providerThreadId: targetClaudeProcess.providerThreadId,
+          profileId: targetClaudeProcess.profileId,
+          sessionId,
+          runtimeScope: "managed",
+          identity: targetClaudeProcess.identity,
+        });
+      }
+      this.#database.query(
+        "UPDATE session_conversation_automation SET provider_thread_id=? WHERE session_id=?",
+      ).run(authority.target_provider_thread_id, sessionId);
+      this.#insertSessionRuntimeProfile({
+        sessionId,
+        sourceKind: "session_start",
+        sourceId: attemptId,
+        profile: evidence.runtimeProfile,
+      }, now);
+    });
+    bind.immediate();
     return this.requireSession(sessionId);
   }
 
@@ -11730,9 +14470,6 @@ export class StateStore {
       });
       return { connectionId, releasedEvents, sessionId };
     });
-    if (evidence.kind !== "account.login" && providerRetirements.length > 0) {
-      throw new Error("ACCOUNT_LOGOUT_CANNOT_RETIRE_PROVIDER_GENERATION");
-    }
     const canonical = JSON.stringify(evidence);
     const digest = createHash("sha256").update(canonical).digest("hex");
     const now = this.#now();
@@ -11749,27 +14486,96 @@ export class StateStore {
         || row.profile_state === "removed"
         || row.profile_state === "recovery_required"
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      if (
+        evidence.kind === "account.login"
+      ) {
+        if (this.#sessionMutationAuthorityTuplesForProfile(parsedProfileId).length > 0) {
+          throw new Error("SESSION_MUTATION_AUTHORITY_UNSETTLED");
+        }
+        const claudeBlocker = this.providerAuthorityAdvanceBlocker(
+          parsedProfileId,
+          "claude",
+        );
+        if (claudeBlocker !== null) {
+          throw new Error(`CLAUDE_PROVIDER_AUTHORITY_NOT_QUIESCENT:${claudeBlocker}`);
+        }
+      }
+      if (
+        evidence.kind === "account.logout"
+        && this.#sessionMutationAuthorityTuplesForProfile(parsedProfileId)
+          .some((tuple) => tuple.provider === "codex")
+      ) throw new Error("SESSION_MUTATION_AUTHORITY_UNSETTLED");
+      for (const runtimeScope of ["personal", "managed"] as const) {
+        const revocation = this.readProviderRuntimeAccountRevocation({
+          profileId: parsedProfileId,
+          provider: "codex",
+          runtimeScope,
+        });
+        const retirementStateIsSufficient = revocation?.state === "completed"
+          || (
+            evidence.kind === "account.logout"
+            && runtimeScope === "managed"
+            && revocation?.state === "releasing"
+          );
+        if (
+          revocation?.profileGeneration !== expectedCurrentGeneration
+          || !retirementStateIsSufficient
+          || revocation.currentAccountKey !== null
+        ) throw new Error("ACCOUNT_MUTATION_CODEX_AUTHORITY_NOT_RETIRED");
+      }
       const retiredSessionIds = new Set<SessionId>();
       let affectedWorkIds: readonly string[] = [];
-      if (evidence.kind === "account.login") {
-        for (const retirement of providerRetirements) {
-          const session = z.object({
-            profile_id: profileIdSchema,
-          }).strict().parse(this.#database.query(
-            "SELECT profile_id FROM sessions WHERE id=?",
-          ).get(retirement.sessionId));
-          if (session.profile_id !== parsedProfileId) {
-            throw new Error("ACCOUNT_LOGIN_RETIREMENT_SESSION_AUTHORITY_MISMATCH");
-          }
-          for (const event of retirement.releasedEvents) {
-            this.#appendSessionEventInTransaction({ ...event, recordedAt: now });
-          }
+      for (const retirement of providerRetirements) {
+        const session = z.object({
+          profile_id: profileIdSchema,
+          provider: providerSchema,
+        }).strict().parse(this.#database.query(
+          "SELECT profile_id,provider FROM sessions WHERE id=?",
+        ).get(retirement.sessionId));
+        if (session.profile_id !== parsedProfileId || session.provider !== "codex") {
+          throw new Error("ACCOUNT_MUTATION_RETIREMENT_SESSION_AUTHORITY_MISMATCH");
         }
+        for (const event of retirement.releasedEvents) {
+          this.#appendSessionEventInTransaction({ ...event, recordedAt: now });
+        }
+        this.#appendSessionEventInTransaction({
+          accountId: parsedProfileId,
+          body: { type: "connection", state: "disconnected", reason: "closed" },
+          providerConnectionId: retirement.connectionId,
+          providerGeneration: expectedCurrentGeneration,
+          recordedAt: now,
+          sessionId: retirement.sessionId,
+        });
+        const position = this.#readSessionEventStream(retirement.sessionId);
+        const missingSequence = position.observed_through_sequence + 1;
+        this.#appendSessionEventInTransaction({
+          accountId: parsedProfileId,
+          body: {
+            type: "gap",
+            reason: "provider_disconnect",
+            fromSequence: missingSequence,
+            throughSequence: missingSequence,
+          },
+          providerConnectionId: retirement.connectionId,
+          providerGeneration: expectedCurrentGeneration,
+          recordedAt: now,
+          sessionId: retirement.sessionId,
+        });
+        retiredSessionIds.add(retirement.sessionId);
+      }
+      if (evidence.kind === "account.login") {
         const openInteractions = this.#database.query(
-          `SELECT * FROM provider_interactions
-           WHERE profile_id=? AND process_generation=?
+          `SELECT i.* FROM provider_interactions i
+           WHERE i.profile_id=? AND i.process_generation=?
              AND state IN ('pending','response_prepared','response_written')
-           ORDER BY requested_at,public_id`,
+             AND (
+               i.session_id IS NULL
+               OR EXISTS(
+                 SELECT 1 FROM sessions s
+                 WHERE s.id=i.session_id AND s.provider='codex'
+               )
+             )
+           ORDER BY i.requested_at,i.public_id`,
         ).all(parsedProfileId, expectedCurrentGeneration);
         for (const value of openInteractions) {
           const current = interactionRowSchema.parse(value);
@@ -11788,38 +14594,34 @@ export class StateStore {
           this.#ensureInteractionStateEventInTransaction(interaction, now);
           if (interaction.sessionId !== null) retiredSessionIds.add(interaction.sessionId);
         }
-        for (const retirement of providerRetirements) {
-          this.#appendSessionEventInTransaction({
-            accountId: parsedProfileId,
-            body: { type: "connection", state: "disconnected", reason: "closed" },
-            providerConnectionId: retirement.connectionId,
-            providerGeneration: expectedCurrentGeneration,
-            recordedAt: now,
-            sessionId: retirement.sessionId,
-          });
-          const position = this.#readSessionEventStream(retirement.sessionId);
-          const missingSequence = position.observed_through_sequence + 1;
-          this.#appendSessionEventInTransaction({
-            accountId: parsedProfileId,
-            body: {
-              type: "gap",
-              reason: "provider_disconnect",
-              fromSequence: missingSequence,
-              throughSequence: missingSequence,
-            },
-            providerConnectionId: retirement.connectionId,
-            providerGeneration: expectedCurrentGeneration,
-            recordedAt: now,
-            sessionId: retirement.sessionId,
-          });
-          retiredSessionIds.add(retirement.sessionId);
-        }
         affectedWorkIds = input.workStore?.prepareProfileAuthorityChange(
           parsedProfileId,
           expectedCurrentGeneration,
         ) ?? [];
-        const advanced = this.#database.query("UPDATE profiles SET process_generation=?,state='login_pending',provider_email=NULL,provider_plan=NULL,updated_at=? WHERE id=? AND process_generation=?").run(parsedGeneration, now, parsedProfileId, expectedCurrentGeneration);
+        const personalClaudeBinding = this.#database.query(
+          `SELECT 1 FROM session_personal_runtime_bindings b
+           JOIN sessions s ON s.id=b.session_id
+           WHERE s.profile_id=? AND s.provider='claude' AND b.provider='claude'
+             AND b.state IN ('active','detaching') LIMIT 1`,
+        ).get(parsedProfileId) !== null;
+        if (personalClaudeBinding) {
+          this.#database.query(
+            `INSERT INTO session_adoption_profile_generation_permits(
+               profile_id,from_generation,to_generation
+             ) VALUES (?,?,?)`,
+          ).run(parsedProfileId, expectedCurrentGeneration, parsedGeneration);
+        }
+        const advanced = this.#database.query("UPDATE profiles SET process_generation=?,state='login_pending',provider_email=NULL,codex_account_key=NULL,provider_plan=NULL,updated_at=? WHERE id=? AND process_generation=?").run(parsedGeneration, now, parsedProfileId, expectedCurrentGeneration);
         if (advanced.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+        if (personalClaudeBinding) {
+          const released = this.#database.query(
+            `DELETE FROM session_adoption_profile_generation_permits
+             WHERE profile_id=? AND from_generation=? AND to_generation=?`,
+          ).run(parsedProfileId, expectedCurrentGeneration, parsedGeneration);
+          if (released.changes !== 1) {
+            throw new Error("ACCOUNT_LOGIN_PERSONAL_CLAUDE_ROLLOVER_CONFLICT");
+          }
+        }
       }
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
@@ -11831,6 +14633,282 @@ export class StateStore {
       };
     });
     return begin.immediate();
+  }
+
+  /**
+   * Durably consumes the one-time permission to launch Claude's foreground
+   * login. This deliberately does not mutate the profile's Codex account
+   * projection; the generic mutation attempt is the provider-specific fence.
+   */
+  beginClaudeLoginMutationEffect(input: {
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    profileGeneration: number;
+    evidence: Extract<MutationEffectEvidence, { kind: "account.claude-login" }>;
+  }): MutationEffectEvidenceRecord {
+    const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
+    const parsedProfileId = profileIdSchema.parse(input.profileId);
+    const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
+    const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
+    const canonical = JSON.stringify(evidence);
+    const digest = createHash("sha256").update(canonical).digest("hex");
+    const now = this.#now();
+    const begin = this.#database.transaction(() => {
+      const row = z.object({
+        kind: z.literal("account.claude-login"),
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative(),
+        state: z.literal("prepared"),
+        process_generation: z.number().int().nonnegative(),
+        profile_state: profileStateSchema,
+      }).strict().parse(this.#database.query(
+        `SELECT m.kind,m.authority_id,m.authority_generation,m.state,
+                p.process_generation,p.state AS profile_state
+         FROM mutation_attempts m JOIN profiles p ON p.id=m.authority_id
+         WHERE m.id=?`,
+      ).get(parsedAttemptId));
+      if (
+        row.authority_id !== parsedProfileId
+        || row.authority_generation !== parsedGeneration
+        || row.process_generation !== parsedGeneration
+        || row.profile_state === "removed"
+      ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      this.#database.query(
+        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
+      ).run(parsedAttemptId, evidence.kind, canonical, digest, now);
+      const changed = this.#database.query(
+        "UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'",
+      ).run(now, parsedAttemptId);
+      if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+    });
+    begin.immediate();
+    return { attemptId: parsedAttemptId, digest, evidence, recordedAt: now };
+  }
+
+  settleClaudeLoginMutation(input: {
+    attemptId: AttemptId;
+    idempotencyKey: string;
+    profileId: ProfileId;
+    profileGeneration: number;
+    signedIn: boolean;
+    outcome:
+      | Readonly<{ state: "joined"; exitCode: number; interruptedBy: "SIGINT" | "SIGTERM" | null }>
+      | Readonly<{ state: "not_started"; reason: "spawn_failed" }>
+      | Readonly<{ state: "not_started"; reason: "preflight_stale" }>
+      | Readonly<{ state: "not_started"; reason: "interrupted_before_spawn"; interruptedBy: "SIGINT" | "SIGTERM" }>;
+  }): Readonly<{
+    accountId: ProfileId;
+    attemptId: AttemptId;
+    idempotencyKey: string;
+    providerGeneration: number;
+    signedIn: boolean;
+    outcome:
+      | Readonly<{ state: "joined"; exitCode: number; interruptedBy: "SIGINT" | "SIGTERM" | null }>
+      | Readonly<{ state: "not_started"; reason: "spawn_failed" }>
+      | Readonly<{ state: "not_started"; reason: "preflight_stale" }>
+      | Readonly<{ state: "not_started"; reason: "interrupted_before_spawn"; interruptedBy: "SIGINT" | "SIGTERM" }>;
+  }> {
+    const parsed = z.object({
+      attemptId: attemptIdSchema,
+      idempotencyKey: z.string().uuid(),
+      profileId: profileIdSchema,
+      profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      signedIn: z.boolean(),
+      outcome: z.union([
+        z.object({
+          state: z.literal("joined"),
+          exitCode: z.number().int().nonnegative().max(255),
+          interruptedBy: z.enum(["SIGINT", "SIGTERM"]).nullable(),
+        }).strict(),
+        z.object({ state: z.literal("not_started"), reason: z.literal("spawn_failed") }).strict(),
+        z.object({ state: z.literal("not_started"), reason: z.literal("preflight_stale") }).strict(),
+        z.object({
+          state: z.literal("not_started"),
+          reason: z.literal("interrupted_before_spawn"),
+          interruptedBy: z.enum(["SIGINT", "SIGTERM"]),
+        }).strict(),
+      ]),
+    }).strict().parse(input);
+    if (parsed.outcome.state === "not_started" && parsed.signedIn) {
+      throw new Error("CLAUDE_LOGIN_NO_EFFECT_STATUS_CONFLICT");
+    }
+    const result = {
+      accountId: parsed.profileId,
+      attemptId: parsed.attemptId,
+      idempotencyKey: parsed.idempotencyKey,
+      providerGeneration: parsed.profileGeneration,
+      signedIn: parsed.signedIn,
+      outcome: parsed.outcome,
+    } as const;
+    const now = this.#now();
+    const settle = this.#database.transaction(() => {
+      const row = z.object({
+        id: attemptIdSchema,
+        idempotency_key: z.string().uuid(),
+        kind: z.literal("account.claude-login"),
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative(),
+        state: z.enum(["effect_started", "applied", "failed", "ambiguous"]),
+        result_json: z.string().nullable(),
+        profile_state: profileStateSchema,
+        evidence_json: z.string(),
+        evidence_digest: sha256Schema,
+        resolution_kind: mutationResolutionKindSchema.nullable(),
+        receipt_json: z.string().nullable(),
+      }).strict().parse(this.#database.query(
+        `SELECT m.id,m.idempotency_key,m.kind,m.authority_id,m.authority_generation,
+                m.state,m.result_json,p.state AS profile_state,e.evidence_json,e.evidence_digest,
+                r.resolution_kind,r.receipt_json
+         FROM mutation_attempts m
+         JOIN profiles p ON p.id=m.authority_id
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.idempotency_key=?`,
+      ).get(parsed.idempotencyKey));
+      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      if (
+        row.id !== parsed.attemptId
+        || row.authority_id !== parsed.profileId
+        || row.authority_generation !== parsed.profileGeneration
+        || row.profile_state === "removed"
+        || evidence.kind !== "account.claude-login"
+        || digestJson(evidence) !== row.evidence_digest
+      ) throw new Error("CLAUDE_LOGIN_AUTHORITY_MISMATCH");
+      if (row.resolution_kind !== null) {
+        const prior = row.receipt_json === null ? null : JSON.parse(row.receipt_json) as unknown;
+        if (
+          row.resolution_kind === "abandoned"
+          || JSON.stringify(prior) !== JSON.stringify(result)
+        ) throw new Error("CLAUDE_LOGIN_TERMINAL_OUTCOME_CONFLICT");
+        return;
+      }
+      if (row.state === "applied" || row.state === "failed") {
+        const prior = row.result_json === null ? null : JSON.parse(row.result_json) as unknown;
+        if (JSON.stringify(prior) !== JSON.stringify(result)) {
+          throw new Error("CLAUDE_LOGIN_TERMINAL_OUTCOME_CONFLICT");
+        }
+        return;
+      }
+      if (row.state === "ambiguous") {
+        const inserted = this.#database.query(
+          "INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)",
+        ).run(
+          parsed.attemptId,
+          parsed.signedIn ? "proven_applied" : "provider_state_reconciled",
+          JSON.stringify({
+            source: "account.claude-login.complete",
+            signedIn: parsed.signedIn,
+            outcome: parsed.outcome,
+          }),
+          JSON.stringify(result),
+          now,
+        );
+        if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
+        return;
+      }
+      const target = parsed.signedIn ? "applied" : "failed";
+      const changed = this.#database.query(
+        "UPDATE mutation_attempts SET state=?,result_json=?,updated_at=? WHERE id=? AND state='effect_started'",
+      ).run(target, JSON.stringify(result), now, parsed.attemptId);
+      if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+    });
+    settle.immediate();
+    return result;
+  }
+
+  /**
+   * Releases only Claude's local one-child fence after the operator confirms
+   * the original foreground child has exited. This never reads, changes, or
+   * deletes Claude credentials and never invokes the provider.
+   */
+  abandonClaudeLoginMutation(input: {
+    attemptId: AttemptId;
+    idempotencyKey: string;
+    profileId: ProfileId;
+    profileGeneration: number;
+    acknowledgeChildExited: true;
+  }): Readonly<{
+    accountId: ProfileId;
+    attemptId: AttemptId;
+    idempotencyKey: string;
+    providerGeneration: number;
+    acknowledgedChildExited: true;
+  }> {
+    const parsed = z.object({
+      attemptId: attemptIdSchema,
+      idempotencyKey: z.string().uuid(),
+      profileId: profileIdSchema,
+      profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      acknowledgeChildExited: z.literal(true),
+    }).strict().parse(input);
+    const result = {
+      accountId: parsed.profileId,
+      attemptId: parsed.attemptId,
+      idempotencyKey: parsed.idempotencyKey,
+      providerGeneration: parsed.profileGeneration,
+      acknowledgedChildExited: true,
+    } as const;
+    const now = this.#now();
+    const abandon = this.#database.transaction(() => {
+      const row = z.object({
+        id: attemptIdSchema,
+        kind: z.literal("account.claude-login"),
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative(),
+        state: mutationStateSchema.exclude(["reconciled"]),
+        profile_state: profileStateSchema,
+        evidence_json: z.string(),
+        evidence_digest: sha256Schema,
+        resolution_kind: mutationResolutionKindSchema.nullable(),
+        receipt_json: z.string().nullable(),
+      }).strict().parse(this.#database.query(
+        `SELECT m.id,m.kind,m.authority_id,m.authority_generation,m.state,
+                p.state AS profile_state,e.evidence_json,e.evidence_digest,
+                r.resolution_kind,r.receipt_json
+         FROM mutation_attempts m
+         JOIN profiles p ON p.id=m.authority_id
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.idempotency_key=?`,
+      ).get(parsed.idempotencyKey));
+      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      if (
+        row.id !== parsed.attemptId
+        || row.authority_id !== parsed.profileId
+        || row.authority_generation !== parsed.profileGeneration
+        || row.profile_state === "removed"
+        || evidence.kind !== "account.claude-login"
+        || digestJson(evidence) !== row.evidence_digest
+      ) throw new Error("CLAUDE_LOGIN_AUTHORITY_MISMATCH");
+      if (row.resolution_kind !== null) {
+        const prior = row.receipt_json === null ? null : JSON.parse(row.receipt_json) as unknown;
+        if (
+          row.resolution_kind !== "abandoned"
+          || JSON.stringify(prior) !== JSON.stringify(result)
+        ) throw new Error("CLAUDE_LOGIN_TERMINAL_OUTCOME_CONFLICT");
+        return;
+      }
+      if (row.state !== "effect_started" && row.state !== "ambiguous") {
+        throw new Error("CLAUDE_LOGIN_NOT_UNSETTLED");
+      }
+      const inserted = this.#database.query(
+        "INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)",
+      ).run(
+        parsed.attemptId,
+        "abandoned",
+        JSON.stringify({
+          source: "operator_acknowledgement",
+          acknowledgedChildExited: true,
+          localOnly: true,
+          credentialAction: "none",
+        }),
+        JSON.stringify(result),
+        now,
+      );
+      if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
+    });
+    abandon.immediate();
+    return result;
   }
 
   listUnsettledMutations(input: { authorityId?: string; sessionId?: SessionId } = {}): readonly MutationAttemptRecord[] {
@@ -11860,12 +14938,13 @@ export class StateStore {
     resolutionEvidence: unknown;
     receipt?: unknown;
     provider?: { providerThreadId: string; title: string; status: "active" | "idle" | "terminal"; activeTurnId?: string; providerUpdatedAt?: number };
+    acknowledgeProviderStateUnknown?: boolean;
   }): SessionRecord {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
     const expectedDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const resolution = mutationResolutionKindSchema.parse(input.resolution);
     const resolutionJson = JSON.stringify(input.resolutionEvidence);
-    const receiptJson = input.receipt === undefined ? null : JSON.stringify(input.receipt);
+    let receiptJson = input.receipt === undefined ? null : JSON.stringify(input.receipt);
     const now = this.#now();
     let resolvedSessionId: SessionId | undefined;
     const resolveAttempt = this.#database.transaction(() => {
@@ -11889,12 +14968,87 @@ export class StateStore {
       if (effectEvidence.kind !== row.kind || digestJson(effectEvidence) !== row.evidence_digest) {
         throw new Error("MUTATION_RECOVERY_EVIDENCE_MISMATCH");
       }
+      if (effectEvidence.kind === "session.switch") {
+        if (resolution === "proven_applied" && input.receipt === undefined) {
+          throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_RECEIPT_REQUIRED");
+        }
+        if (resolution !== "proven_applied" && input.receipt !== undefined) {
+          throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_RECEIPT_UNEXPECTED");
+        }
+        if (resolution !== "proven_applied") receiptJson = null;
+      }
+      if (effectEvidence.kind === "session.switch" && (
+        !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId: parsedAttemptId,
+          profileId: effectEvidence.sourceProfileId,
+          provider: effectEvidence.sourceProvider,
+          originGeneration: effectEvidence.sourceProcessGeneration,
+        })
+        || !this.isSessionMutationProviderAuthorityCurrent({
+          attemptId: parsedAttemptId,
+          profileId: effectEvidence.targetProfileId,
+          provider: effectEvidence.targetProvider,
+          originGeneration: effectEvidence.targetProcessGeneration,
+        })
+      )) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_AUTHORITY_MISMATCH");
       const sessionId = row.session_start_id ?? sessionIdSchema.parse(row.authority_id);
       resolvedSessionId = sessionId;
       const session = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionId));
       if (input.provider !== undefined) {
         if (session.providerThreadId === undefined || session.providerThreadId !== input.provider.providerThreadId) {
           throw new Error("MUTATION_RECOVERY_THREAD_MISMATCH");
+        }
+        if (effectEvidence.kind === "session.switch") {
+          const progress = z.object({
+            provider_thread_id: providerThreadIdSchema,
+            seed_result_present: z.number().int().min(0).max(1),
+            source_released: z.number().int().min(0).max(1),
+            target_released: z.number().int().min(0).max(1),
+          }).strict().parse(this.#database.query(
+            `SELECT t.provider_thread_id,
+                    EXISTS(SELECT 1 FROM session_provider_switch_seed_results ss WHERE ss.attempt_id=t.attempt_id) AS seed_result_present,
+                    EXISTS(SELECT 1 FROM session_provider_switch_source_releases sr WHERE sr.attempt_id=t.attempt_id) AS source_released,
+                    EXISTS(SELECT 1 FROM session_provider_switch_target_releases tr WHERE tr.attempt_id=t.attempt_id) AS target_released
+             FROM session_provider_switch_targets t WHERE t.attempt_id=?`,
+          ).get(parsedAttemptId));
+          const targetAdoption = resolution === "proven_applied"
+            && progress.seed_result_present === 1
+            && progress.source_released === 1
+            && progress.target_released === 0
+            && progress.provider_thread_id === input.provider.providerThreadId
+            && !sessionProviderSwitchTargetAliasesSource(
+              effectEvidence,
+              progress.provider_thread_id,
+            )
+            && session.profileId === effectEvidence.targetProfileId
+            && session.provider === effectEvidence.targetProvider
+            && (() => {
+              const providerAuthority = this.readSessionProviderAccountAuthority(session.id);
+              const personalBinding = this.readSessionPersonalRuntimeBinding(session.id, true);
+              return providerAuthority !== null
+                && providerAuthority.provider === effectEvidence.targetProvider
+                && providerAuthority.runtimeScope === "managed"
+                && effectEvidence.targetProviderAccountKey !== undefined
+                && providerAuthority.accountKey === effectEvidence.targetProviderAccountKey
+                && (personalBinding === null || personalBinding.state === "detached")
+                && this.sessionAccountAuthorityMatches(
+                  session.id,
+                  effectEvidence.targetProfileId,
+                );
+            })();
+          const sourceRetention = resolution === "abandoned"
+            && progress.source_released === 0
+            && progress.target_released === 1
+            && !sessionProviderSwitchTargetAliasesSource(
+              effectEvidence,
+              progress.provider_thread_id,
+            )
+            && effectEvidence.sourceProviderThreadId === input.provider.providerThreadId
+            && session.profileId === effectEvidence.sourceProfileId
+            && session.provider === effectEvidence.sourceProvider;
+          if (!targetAdoption && !sourceRetention) {
+            throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_BINDING_MISMATCH");
+          }
         }
         const changed = this.#database.query(`UPDATE sessions SET title=?,state=?,active_turn_id=?,provider_updated_at=?,revision=revision+1,updated_at=?
                                               WHERE id=? AND revision=? AND state='recovery_required'`).run(
@@ -11908,7 +15062,45 @@ export class StateStore {
         );
         if (changed.changes !== 1) throw new Error("MUTATION_RECOVERY_SESSION_CAS_CONFLICT");
       } else {
-        if (row.kind !== "session.start" || session.providerThreadId !== undefined || resolution !== "abandoned") {
+        if (resolution !== "abandoned") {
+          throw new Error("MUTATION_RECOVERY_PROVIDER_PROJECTION_REQUIRED");
+        }
+        if (effectEvidence.kind === "session.start") {
+          if (row.kind !== "session.start") {
+            throw new Error("MUTATION_RECOVERY_PROVIDER_PROJECTION_REQUIRED");
+          }
+        } else if (effectEvidence.kind === "session.switch") {
+          const progress = z.object({
+            provider_thread_id: providerThreadIdSchema.nullable(),
+            source_released: z.number().int().min(0).max(1),
+            target_released: z.number().int().min(0).max(1),
+          }).strict().parse(this.#database.query(
+            `SELECT t.provider_thread_id,
+                    EXISTS(SELECT 1 FROM session_provider_switch_source_releases sr WHERE sr.attempt_id=m.id) AS source_released,
+                    EXISTS(SELECT 1 FROM session_provider_switch_target_releases tr WHERE tr.attempt_id=m.id) AS target_released
+             FROM mutation_attempts m
+             LEFT JOIN session_provider_switch_targets t ON t.attempt_id=m.id
+             WHERE m.id=? AND m.kind='session.switch'`,
+          ).get(parsedAttemptId));
+          const sourceBinding = session.profileId === effectEvidence.sourceProfileId
+            && session.provider === effectEvidence.sourceProvider
+            && session.providerThreadId === effectEvidence.sourceProviderThreadId;
+          const targetBinding = session.profileId === effectEvidence.targetProfileId
+            && session.provider === effectEvidence.targetProvider
+            && session.providerThreadId === progress.provider_thread_id;
+          if (
+            (progress.provider_thread_id !== null
+              && sessionProviderSwitchTargetAliasesSource(
+                effectEvidence,
+                progress.provider_thread_id,
+              ))
+            || (!sourceBinding && !targetBinding)
+            || (
+              (progress.source_released !== 1 || progress.target_released !== 1)
+              && input.acknowledgeProviderStateUnknown !== true
+            )
+          ) throw new Error("SESSION_PROVIDER_SWITCH_ABANDONMENT_UNPROVEN");
+        } else {
           throw new Error("MUTATION_RECOVERY_PROVIDER_PROJECTION_REQUIRED");
         }
         const changed = this.#database.query("UPDATE sessions SET state='terminal',active_turn_id=NULL,revision=revision+1,updated_at=? WHERE id=? AND revision=? AND state='recovery_required'").run(now, session.id, session.revision);
@@ -11956,6 +15148,96 @@ export class StateStore {
           throw new Error("CONVERSATION_AUTOMATION_SESSION_BINDING_CONFLICT");
         }
       }
+      if (
+        resolution === "proven_applied"
+        && effectEvidence.kind === "session.switch"
+      ) {
+        const seed = z.object({
+          client_message_id: attemptIdSchema,
+          runtime_profile_json: z.string(),
+          seed_text: z.string().min(1).max(24_576),
+          turn_id: providerThreadIdSchema,
+          turn_status: z.enum(["completed", "interrupted", "failed", "inProgress"]),
+        }).strict().parse(this.#database.query(
+          `SELECT i.client_message_id,i.runtime_profile_json,i.seed_text,
+                  s.turn_id,s.turn_status
+           FROM session_provider_switch_seed_intents i
+           JOIN session_provider_switch_seed_results s ON s.attempt_id=i.attempt_id
+           WHERE i.attempt_id=?`,
+        ).get(parsedAttemptId));
+        if (
+          seed.client_message_id !== parsedAttemptId
+          || digestTranscriptSeed(seed.seed_text) !== effectEvidence.seedDigest
+        ) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_SEED_MISMATCH");
+        const receipt = parseSessionProviderSwitchReceipt(
+          input.receipt,
+          effectEvidence,
+          sessionId,
+          providerThreadIdSchema.parse(input.provider?.providerThreadId),
+          seed.turn_id,
+          seed.turn_status,
+        );
+        const seedRuntimeProfile = reviewedRuntimeProfileSchema.parse(
+          JSON.parse(seed.runtime_profile_json) as unknown,
+        );
+        const targetProfile = this.requireProfileById(effectEvidence.targetProfileId);
+        if (!this.isSessionMutationProviderAuthorityCurrent({
+          attemptId: parsedAttemptId,
+          profileId: targetProfile.id,
+          provider: effectEvidence.targetProvider,
+          originGeneration: effectEvidence.targetProcessGeneration,
+        })) throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_AUTHORITY_MISMATCH");
+        this.#insertSessionRuntimeProfile({
+          sessionId,
+          sourceKind: "session_start",
+          sourceId: parsedAttemptId,
+          profile: effectEvidence.runtimeProfile,
+        }, now);
+        this.#bindSessionTurnRuntimeProfile({
+          sessionId,
+          sourceKind: "turn_start",
+          sourceId: parsedAttemptId,
+          turnId: seed.turn_id,
+          profile: seedRuntimeProfile,
+        }, now);
+        this.#appendSessionEventInTransaction({
+          accountId: effectEvidence.targetProfileId,
+          body: {
+            type: "provider_switched",
+            fromProvider: effectEvidence.sourceProvider,
+            toProvider: effectEvidence.targetProvider,
+            fromPreset: effectEvidence.sourcePreset,
+            toPreset: effectEvidence.targetPreset,
+            accountChanged: effectEvidence.sourceProfileId !== effectEvidence.targetProfileId,
+            transcriptDigest: effectEvidence.transcriptDigest,
+            seedDigest: effectEvidence.seedDigest,
+            seedOmittedRecords: effectEvidence.seedOmittedRecords,
+          },
+          providerConnectionId: null,
+          providerGeneration: targetProfile.processGeneration,
+          sessionId,
+          recordedAt: now,
+        });
+        const seedText = seed.seed_text.slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS);
+        this.#appendSessionEventInTransaction({
+          accountId: effectEvidence.targetProfileId,
+          body: sessionEventBodySchema.parse(projectPublicSessionEventBody({
+            type: "user_message",
+            turnId: seed.turn_id,
+            actor: "provider_switch",
+            text: seedText,
+            omittedCharacters: seed.seed_text.length - seedText.length,
+          }, this.#publicProviderIdentifierProjector)),
+          providerConnectionId: null,
+          providerGeneration: targetProfile.processGeneration,
+          sessionId,
+          recordedAt: now,
+        });
+        receiptJson = JSON.stringify(sessionProviderSwitchDurableReceiptSchema.parse({
+          ...receipt,
+          session: this.requireSession(sessionId),
+        }));
+      }
       const inserted = this.#database.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, resolution, resolutionJson, receiptJson, now);
       if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
     });
@@ -11987,10 +15269,12 @@ export class StateStore {
       );
       if (row.state !== input.expectedOriginalState || row.evidence_digest !== expectedDigest) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
       profileId = row.authority_id;
-      const changed = this.#database.query(`UPDATE profiles SET state=?,provider_email=?,provider_plan=?,updated_at=?
+      const providerEmail = input.provider.signedIn ? input.provider.email ?? null : null;
+      const changed = this.#database.query(`UPDATE profiles SET state=?,provider_email=?,codex_account_key=?,provider_plan=?,updated_at=?
                                             WHERE id=? AND process_generation=? AND state='recovery_required'`).run(
         input.provider.signedIn ? "signed_in" : "signed_out",
-        input.provider.email ?? null,
+        providerEmail,
+        providerEmail === null ? null : codexProviderAccountAuthorityKeyForEmail(providerEmail),
         input.provider.plan ?? null,
         now,
         row.authority_id,
@@ -12065,6 +15349,20 @@ export class StateStore {
               authorityResolved = true;
             }
           }
+        } else if (kind === "account.claude-login") {
+          const parsedProfile = profileIdSchema.safeParse(authorityId);
+          if (parsedProfile.success) {
+            const profile = this.#database
+              .query("SELECT state,process_generation FROM profiles WHERE id=?")
+              .get(parsedProfile.data) as { state: string; process_generation: number } | null;
+            // Claude's provider-specific external-child fence survives the
+            // universal daemon-restart generation advance. It never rewrites
+            // the sibling Codex projection; only exact old-authority complete
+            // or acknowledged local abandon may append a resolution.
+            authorityResolved = profile !== null
+              && profile.state !== "removed"
+              && profile.process_generation >= authorityGeneration;
+          }
         } else if (["account.login", "account.logout", "account.login-cancel"].includes(kind)) {
           const parsedProfile = profileIdSchema.safeParse(authorityId);
           if (parsedProfile.success) {
@@ -12085,10 +15383,66 @@ export class StateStore {
           const parsedSession = sessionIdSchema.safeParse(raw.session_start_id);
           if (parsedProfile.success && parsedSession.success) {
             const binding = this.#database.query("SELECT profile_id,state FROM sessions WHERE id=?").get(parsedSession.data) as { profile_id: string; state: string } | null;
-            const profile = this.#database.query("SELECT process_generation FROM profiles WHERE id=?").get(parsedProfile.data) as { process_generation: number } | null;
-            if (binding?.profile_id === parsedProfile.data && profile?.process_generation === authorityGeneration) {
+            if (
+              binding?.profile_id === parsedProfile.data
+              && this.isSessionMutationProviderAuthorityCurrent({
+                attemptId: id,
+                profileId: parsedProfile.data,
+                provider: this.requireSession(parsedSession.data).provider,
+                originGeneration: authorityGeneration,
+              })
+            ) {
               if (binding.state !== "terminal" && binding.state !== "recovery_required") {
                 this.#database.query("UPDATE sessions SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=? WHERE id=?").run(this.#now(), parsedSession.data);
+              }
+              authorityResolved = true;
+            }
+          }
+        } else if (kind === "session.switch") {
+          const parsedSession = sessionIdSchema.safeParse(authorityId);
+          if (parsedSession.success && effectEvidence?.kind === "session.switch") {
+            const rawSession = this.#database.query(
+              "SELECT * FROM sessions WHERE id=?",
+            ).get(parsedSession.data);
+            if (rawSession === null) {
+              unresolved.push({ id, kind, authorityId });
+              continue;
+            }
+            const session = mapSession(rawSession);
+            const target = this.#database.query(
+              "SELECT provider_thread_id FROM session_provider_switch_targets WHERE attempt_id=?",
+            ).get(id) as { provider_thread_id: string } | null;
+            const sourceBinding = session.profileId === effectEvidence.sourceProfileId
+              && session.provider === effectEvidence.sourceProvider
+              && session.providerThreadId === effectEvidence.sourceProviderThreadId;
+            const targetBinding = target !== null
+              && session.profileId === effectEvidence.targetProfileId
+              && session.provider === effectEvidence.targetProvider
+              && session.providerThreadId === target.provider_thread_id;
+            if (
+              !(target !== null && sessionProviderSwitchTargetAliasesSource(
+                effectEvidence,
+                target.provider_thread_id,
+              ))
+              && this.isSessionMutationProviderAuthorityCurrent({
+                attemptId: id,
+                profileId: effectEvidence.sourceProfileId,
+                provider: effectEvidence.sourceProvider,
+                originGeneration: effectEvidence.sourceProcessGeneration,
+              })
+              && this.isSessionMutationProviderAuthorityCurrent({
+                attemptId: id,
+                profileId: effectEvidence.targetProfileId,
+                provider: effectEvidence.targetProvider,
+                originGeneration: effectEvidence.targetProcessGeneration,
+              })
+              && authorityGeneration === effectEvidence.targetProcessGeneration
+              && (sourceBinding || targetBinding)
+            ) {
+              if (session.state !== "terminal" && session.state !== "recovery_required") {
+                this.#database.query(
+                  "UPDATE sessions SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=? WHERE id=?",
+                ).run(this.#now(), parsedSession.data);
               }
               authorityResolved = true;
             }
@@ -12665,8 +16019,15 @@ export class StateStore {
       const resolvedAt = this.#now();
       if (activeAccount !== undefined) {
         const reconciledProfile = this.#database
-          .query("UPDATE profiles SET state='signed_in',provider_email=?,provider_plan=?,updated_at=? WHERE id=? AND process_generation=? AND state!='removed'")
-          .run(activeAccount.email, activeAccount.plan ?? null, resolvedAt, row.target_profile_id, row.target_generation);
+          .query("UPDATE profiles SET state='signed_in',provider_email=?,codex_account_key=?,provider_plan=?,updated_at=? WHERE id=? AND process_generation=? AND state!='removed'")
+          .run(
+            activeAccount.email,
+            codexProviderAccountAuthorityKeyForEmail(activeAccount.email),
+            activeAccount.plan ?? null,
+            resolvedAt,
+            row.target_profile_id,
+            row.target_generation,
+          );
         if (reconciledProfile.changes !== 1) throw new Error("DESKTOP_RECOVERY_PROFILE_CAS_CONFLICT");
       }
       const receipt = desktopRecoveryReceiptSchema.parse({
@@ -14256,6 +17617,13 @@ export class StateStore {
       if (currentProfile.processGeneration !== processGeneration) {
         throw new Error("INTERACTION_QUARANTINE_PROFILE_AUTHORITY_CHANGED");
       }
+      const claudeBlocker = this.providerAuthorityAdvanceBlocker(
+        profileId,
+        "claude",
+      );
+      if (claudeBlocker !== null) {
+        throw new Error(`CLAUDE_PROVIDER_AUTHORITY_NOT_QUIESCENT:${claudeBlocker}`);
+      }
 
       const focal = this.#requireInteractionRow(focalInteractionId);
       if (
@@ -14310,6 +17678,11 @@ export class StateStore {
       }
       this.#ensureInteractionStateEventInTransaction(focalInteraction, now);
 
+      this.#recordSessionMutationAuthoritySuccessors({
+        fromGeneration: processGeneration,
+        now,
+        profileId,
+      });
       const advanced = this.#database.query(
         `UPDATE profiles SET process_generation=process_generation+1,updated_at=MAX(updated_at,?)
          WHERE id=? AND process_generation=? AND state!='removed'`,
@@ -15477,6 +18850,14 @@ export class StateStore {
       if (invalidLoginAuthority !== null) {
         throw new Error("LOGIN_RESTART_AUTHORITY_MISMATCH");
       }
+      for (const profile of this.listProfiles()) {
+        if (this.#sessionMutationAuthorityTuplesForProfile(profile.id).length === 0) continue;
+        this.#recordSessionMutationAuthoritySuccessors({
+          fromGeneration: profile.processGeneration,
+          now,
+          profileId: profile.id,
+        });
+      }
       this.#database.query(`UPDATE provider_login_authorities
                             SET process_generation=process_generation+1,updated_at=MAX(updated_at,?)
                             WHERE state='active'`).run(now);
@@ -15549,7 +18930,47 @@ export class StateStore {
       this.#database.query(
         `UPDATE profiles
          SET process_generation=process_generation+1,updated_at=MAX(updated_at,?)
-         WHERE state!='removed' AND process_generation>0`,
+         WHERE state!='removed'
+           AND (
+             process_generation>0
+             OR EXISTS (
+               SELECT 1 FROM sessions s
+               WHERE s.profile_id=profiles.id AND s.state!='terminal'
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM mutation_attempts m
+               JOIN session_start_attempts a ON a.attempt_id=m.id
+               JOIN sessions s ON s.id=a.session_id AND s.profile_id=profiles.id
+               LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+               WHERE m.kind='session.start'
+                 AND m.state IN ('effect_started','ambiguous')
+                 AND r.attempt_id IS NULL
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM mutation_attempts m
+               JOIN mutation_effect_evidence e ON e.attempt_id=m.id AND e.kind='session.switch'
+               LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+               WHERE m.state IN ('effect_started','ambiguous')
+                 AND r.attempt_id IS NULL
+                 AND (
+                   json_extract(e.evidence_json,'$.sourceProfileId')=profiles.id
+                   OR json_extract(e.evidence_json,'$.targetProfileId')=profiles.id
+                 )
+             )
+             OR EXISTS (
+               SELECT 1
+               FROM mutation_attempts m
+               WHERE m.authority_id=profiles.id
+                 AND m.kind='account.claude-login'
+                 AND m.state IN ('effect_started','ambiguous')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM mutation_resolutions r
+                   WHERE r.attempt_id=m.id
+                 )
+             )
+           )`,
       ).run(now);
       this.#database.query("DELETE FROM session_adoption_profile_generation_permits").run();
       this.#database.query("UPDATE daemon_state SET generation=?,boot_id=?,started_at=?,stopped_at=NULL WHERE singleton=1 AND generation=?").run(current.generation + 1, bootId, now, current.generation);

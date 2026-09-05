@@ -164,6 +164,7 @@ export const maintenanceCategory = v.union(
   v.literal("pending_commands"),
   v.literal("terminal_commands"),
   v.literal("pending_device_commands"),
+  v.literal("device_command_login_results"),
   v.literal("terminal_device_commands"),
   v.literal("security_events"),
   v.literal("usage_snapshots"),

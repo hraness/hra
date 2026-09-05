@@ -29,10 +29,14 @@ export type DiscoveredPersonalSession = Readonly<{
   sourceProcessIdentity?: PersonalClaudeSourceProcessIdentity | null;
   /** False for a Claude row emitted only to fence retained-candidate reprobes. */
   admissionEligible?: boolean;
+  /** Private age-gate waiver for a present Codex Desktop heartbeat target. */
+  scheduledTaskTarget?: true;
 }>;
 
 export type PersonalSessionDiscoveryInput = Readonly<{
   provider: Provider;
+  /** Exact personal Codex thread ids named by bounded Desktop automations. */
+  codexScheduledThreadIds?: readonly string[];
   limit?: number;
   deadlineMs?: number;
   signal?: AbortSignal;
@@ -52,6 +56,17 @@ export type CodexPersonalSessionPageRequest = Readonly<{
 /** A closure can bind this source to the read-only app-server for the personal Codex home. */
 export type CodexPersonalSessionPageSource = (
   input: CodexPersonalSessionPageRequest,
+) => Promise<unknown>;
+
+export type CodexPersonalSessionReadRequest = Readonly<{
+  providerThreadId: string;
+  deadlineAt: number;
+  signal: AbortSignal;
+}>;
+
+/** Exact metadata-only read. It must not resume or subscribe to the thread. */
+export type CodexPersonalSessionReadSource = (
+  input: CodexPersonalSessionReadRequest,
 ) => Promise<unknown>;
 
 export type ClaudeRegistryReadRequest = Readonly<{
@@ -83,6 +98,7 @@ export type ClaudeProcessLivenessProbe = (
 
 export type PersonalSessionDiscoveryOptions = Readonly<{
   codexListPage?: CodexPersonalSessionPageSource;
+  codexReadSession?: CodexPersonalSessionReadSource;
   claudeRegistry?: ClaudeRegistrySource;
   claudeProcessLiveness?: ClaudeProcessLivenessProbe;
   pinnedClaudeVersion?: string;
@@ -156,6 +172,7 @@ export const CLAUDE_REGISTRY_MAX_RECORDS = 200;
 const DEFAULT_RESULT_LIMIT = 100;
 const CODEX_PAGE_LIMIT = 50;
 const CODEX_MAX_PAGES = 4;
+const CODEX_SCHEDULED_EXACT_READ_MAX = 50;
 const CODEX_RECENT_LIVENESS_WINDOW_MS = 10 * 60 * 1_000;
 const CODEX_CLOCK_SKEW_MS = 5 * 60 * 1_000;
 const PROVIDER_ID_MAX_BYTES = 200;
@@ -231,7 +248,12 @@ export class BoundedPersonalSessionDiscovery implements PersonalSessionDiscovery
     const deadlineAt = this.#now() + boundedDeadlineMs(input.deadlineMs);
     try {
       const candidates = input.provider === "codex"
-        ? await this.#discoverCodex(limit, deadlineAt, controller)
+        ? await this.#discoverCodex(
+            limit,
+            deadlineAt,
+            controller,
+            input.codexScheduledThreadIds ?? [],
+          )
         : await this.#discoverClaude(deadlineAt, controller);
       callerSignal?.throwIfAborted();
       return Object.freeze(sortCandidates(candidates).slice(0, limit));
@@ -245,10 +267,120 @@ export class BoundedPersonalSessionDiscovery implements PersonalSessionDiscovery
     limit: number,
     deadlineAt: number,
     controller: AbortController,
+    scheduledThreadIds: readonly string[],
   ): Promise<readonly DiscoveredPersonalSession[]> {
     const source = this.#options.codexListPage;
-    if (source === undefined) return [];
+    const exactSource = this.#options.codexReadSession;
+    if (source === undefined && exactSource === undefined) return [];
     const candidates = new Map<string, DiscoveredPersonalSession>();
+    const scheduledIds = new Set<string>();
+    for (const rawId of scheduledThreadIds) {
+      const providerThreadId = safeProviderId(rawId);
+      if (providerThreadId === null) continue;
+      scheduledIds.add(providerThreadId);
+      if (scheduledIds.size >= Math.min(limit, CODEX_SCHEDULED_EXACT_READ_MAX)) break;
+    }
+
+    // Recency-sorted pages cannot reliably reach an old automation target.
+    // Read each bounded target directly through metadata-only thread/read;
+    // controller resume remains reserved for the later durable claim.
+    if (exactSource !== undefined && scheduledIds.size > 0) {
+      const startedAt = this.#now();
+      const remainingMs = Math.max(1, deadlineAt - startedAt);
+      // A scheduled target can be arbitrarily old, but it must never consume
+      // the whole discovery deadline and suppress ordinary recent sessions.
+      // Start the entire bounded target batch together, then reserve the final
+      // third of the budget for the recency-sorted page source.
+      const recentReserveMs = source === undefined
+        ? 0
+        : Math.max(1, Math.floor(remainingMs / 3));
+      const scheduledDeadlineAt = deadlineAt - recentReserveMs;
+      const scheduledController = new AbortController();
+      const forwardScheduledAbort = (): void => {
+        scheduledController.abort(signalReason(controller.signal));
+      };
+      controller.signal.addEventListener("abort", forwardScheduledAbort, { once: true });
+      if (controller.signal.aborted) forwardScheduledAbort();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let onScheduledAbort: (() => void) | undefined;
+      let acceptResults = true;
+      const completedCandidates: DiscoveredPersonalSession[] = [];
+      try {
+        const reads = [...scheduledIds].map(async (providerThreadId) => {
+          try {
+            const raw = await exactSource({
+              providerThreadId,
+              deadlineAt: scheduledDeadlineAt,
+              signal: scheduledController.signal,
+            });
+            const session = parseCodexSession(raw);
+            if (
+              !acceptResults
+              || session === null
+              || session.providerThreadId !== providerThreadId
+              || session.status === "terminal"
+              || session.updatedAt === undefined
+            ) return null;
+            const liveness = (this.#options.inferCodexLiveness ?? inferCodexLiveness)({
+              status: session.status,
+              ...(session.activeTurnId === undefined
+                ? {}
+                : { activeTurnId: session.activeTurnId }),
+              updatedAt: session.updatedAt,
+              now: this.#now(),
+            });
+            const candidate = freezeCandidate({
+              provider: "codex",
+              providerThreadId,
+              title: session.title,
+              ...(session.projectRoot === undefined
+                ? {}
+                : { projectRoot: session.projectRoot }),
+              updatedAt: session.updatedAt,
+              liveness: validLiveness(liveness),
+              scheduledTaskTarget: true,
+            });
+            completedCandidates.push(candidate);
+            return;
+          } catch {
+            // An exact target read is only an eligibility hint. Its failure
+            // must not suppress independently verified recent candidates.
+            return;
+          }
+        });
+        const timeout = new Promise<null>((resolve) => {
+          timer = setTimeout(() => {
+            scheduledController.abort(
+              new Error("Scheduled-target discovery reached its reserved deadline."),
+            );
+            resolve(null);
+          }, Math.max(1, scheduledDeadlineAt - this.#now()));
+        });
+        const aborted = new Promise<null>((resolve) => {
+          onScheduledAbort = () => resolve(null);
+          scheduledController.signal.addEventListener(
+            "abort",
+            onScheduledAbort,
+            { once: true },
+          );
+        });
+        await Promise.race([Promise.all(reads), timeout, aborted]);
+        acceptResults = false;
+        for (const candidate of completedCandidates) {
+          candidates.set(candidate.providerThreadId, candidate);
+        }
+      } finally {
+        acceptResults = false;
+        if (timer !== undefined) clearTimeout(timer);
+        if (onScheduledAbort !== undefined) {
+          scheduledController.signal.removeEventListener("abort", onScheduledAbort);
+        }
+        controller.signal.removeEventListener("abort", forwardScheduledAbort);
+        scheduledController.abort(new Error("Scheduled-target discovery settled."));
+      }
+    }
+
+    if (source === undefined) return [...candidates.values()];
     const seenCursors = new Set<string>();
     let cursor: string | undefined;
     for (let pageIndex = 0; pageIndex < CODEX_MAX_PAGES && candidates.size < limit; pageIndex += 1) {
@@ -273,14 +405,19 @@ export class BoundedPersonalSessionDiscovery implements PersonalSessionDiscovery
       const page = parseCodexPage(raw);
       if (page === null) break;
       for (const session of page.sessions) {
+        const scheduledTaskTarget = scheduledIds.has(session.providerThreadId);
         if (
           session.status === "terminal"
-          || !withinDiscoveryRecency(session.updatedAt, this.#now())
+          || (
+            !scheduledTaskTarget
+            && !withinDiscoveryRecency(session.updatedAt, this.#now())
+          )
+          || session.updatedAt === undefined
         ) continue;
         const liveness = (this.#options.inferCodexLiveness ?? inferCodexLiveness)({
           status: session.status,
           ...(session.activeTurnId === undefined ? {} : { activeTurnId: session.activeTurnId }),
-          ...(session.updatedAt === undefined ? {} : { updatedAt: session.updatedAt }),
+          updatedAt: session.updatedAt,
           now: this.#now(),
         });
         candidates.set(session.providerThreadId, freezeCandidate({
@@ -288,8 +425,9 @@ export class BoundedPersonalSessionDiscovery implements PersonalSessionDiscovery
           providerThreadId: session.providerThreadId,
           title: session.title,
           ...(session.projectRoot === undefined ? {} : { projectRoot: session.projectRoot }),
-          ...(session.updatedAt === undefined ? {} : { updatedAt: session.updatedAt }),
+          updatedAt: session.updatedAt,
           liveness: validLiveness(liveness),
+          ...(scheduledTaskTarget ? { scheduledTaskTarget: true } : {}),
         }));
         if (candidates.size >= limit) break;
       }
@@ -1190,6 +1328,9 @@ function sortCandidates(
   candidates: readonly DiscoveredPersonalSession[],
 ): DiscoveredPersonalSession[] {
   return [...candidates].sort((left, right) => {
+    const byScheduledTarget = Number(right.scheduledTaskTarget === true)
+      - Number(left.scheduledTaskTarget === true);
+    if (byScheduledTarget !== 0) return byScheduledTarget;
     const byUpdated = (right.updatedAt ?? -1) - (left.updatedAt ?? -1);
     if (byUpdated !== 0) return byUpdated;
     return left.providerThreadId < right.providerThreadId

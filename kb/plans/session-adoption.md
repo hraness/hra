@@ -50,8 +50,11 @@ that call is a policy-neutral identity, connection, and quiescence proof, not
 an exclusivity proof. It must not change provider turn policy before the
 durable adoption commit. Codex admission uses the user's accepted inactivity
 inference: active rows and idle rows updated within 10 minutes remain pending;
-idle rows older than 10 minutes are eligible only inside the 15-minute
-discovery window. After commit, every HRA-owned turn applies a fresh reviewed
+idle rows older than 10 minutes are eligible inside the 15-minute discovery
+window or when a present valid Codex Desktop heartbeat automation names the
+exact target thread. Active and paused records both count until deletion or
+retargeting; the association waives only age and is re-read around claim. After
+commit, every HRA-owned turn applies a fresh reviewed
 model, workspace permission profile, `on-request` approval routing, and
 `auto_review` reviewer immediately before dispatch.
 
@@ -69,6 +72,11 @@ session ID. The new process is held under durable process authority.
 - A provider home can be bound to at most one HRA account on one daemon.
 - Runtime-home provenance and pending discovery state remain private SQLite
   authority. They never enter `SessionRecord`, Convex, or app session heads.
+- The profile state machine records the isolated Codex account, so its
+  `signed_in` prerequisite applies only to Codex. Every session also carries
+  exact provider-specific account authority: Claude sessions remain usable
+  when the profile's independent Codex account is signed out, while managed
+  and personal Claude runtime scopes are fenced independently.
 - Every admitted session operation resolves both the personal runtime port and
   the personal provider home from its private binding. Account login, logout,
   usage, plugins, and Desktop switching continue to use only isolated homes.
@@ -105,7 +113,7 @@ Status: implemented; final validation in progress.
   Enabling performs an immediate discovery pass; there is no origin-specific
   public session command.
 
-Acceptance: v35 upgrades restart-idempotently; the isolation boundary defaults
+Acceptance: v36 upgrades restart-idempotently; the isolation boundary defaults
 closed; repeated discovery and import are idempotent; public session schemas do
 not change.
 
@@ -114,9 +122,15 @@ not change.
 Status: implemented; final validation in progress.
 
 - Run a second pinned Codex runtime against the canonical personal Codex home.
-- Read only a bounded recent provider page, admit only recently active threads,
-  infer inactivity from the accepted quiet-time threshold, and use exact
-  `thread/resume` as policy-neutral identity and quiescence admission.
+- Read bounded recent provider pages plus exact metadata for the bounded set of
+  threads targeted by present Codex Desktop heartbeat automations. Cycle
+  fairly through bounded automation-directory pages, retain only exact source
+  directory identities privately, and reopen those sources around admission.
+  Never read
+  an automation prompt, transcript, session index, or Desktop SQLite cache,
+  and never resume a thread during discovery. Infer inactivity from the
+  accepted quiet-time threshold, then use exact `thread/resume` as
+  policy-neutral identity and quiescence admission.
 - Persist a normal session only after exact thread ID, current connection,
   quiescent state, and project are proven. Apply the reviewed model, workspace
   permissions, approval policy, and approval reviewer on every owned turn.
@@ -127,7 +141,10 @@ Status: implemented; final validation in progress.
 Acceptance: a quiet eligible external thread becomes a normal session; an
 active, recently updated, or unknown thread remains pending without a public
   session row; a later poll can adopt it; every HRA session uses the same
-  approval and autorespond integration path.
+  approval and autorespond integration path. A stale idle Codex thread with a
+  valid active or paused heartbeat target is discovered by exact metadata read
+  and admitted only while that association, account, project, liveness, and
+  quiescence all remain proven.
 
 ### C. Claude durable identity and resume takeover
 

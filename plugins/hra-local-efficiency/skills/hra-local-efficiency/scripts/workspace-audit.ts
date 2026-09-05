@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { decideDiskHeadroom, readDiskHeadroom } from "./check-disk-headroom";
+import { runRepositoryAdoption } from "./repo-adoption";
 import { command } from "./shared";
 
 type AuditOptions = {
@@ -18,6 +19,7 @@ type RepositoryAudit = {
   readonly eligibleGiB: number | null;
   readonly eligibleWorktrees: number;
   readonly error?: string;
+  readonly guidanceStatus: "current" | "error" | "needs-update";
   readonly path: string;
   readonly registeredWorktrees: number;
   readonly target?: string;
@@ -71,6 +73,14 @@ function repositoriesUnder(root: string): string[] {
 }
 
 function auditRepository(path: string, fetch: boolean, sizes: boolean): RepositoryAudit {
+  let guidanceStatus: RepositoryAudit["guidanceStatus"] = "error";
+  let guidanceError: string | undefined;
+  try {
+    const status = runRepositoryAdoption({ json: false, mode: "check", root: path }).status;
+    guidanceStatus = status === "current" ? "current" : "needs-update";
+  } catch (error: unknown) {
+    guidanceError = error instanceof Error ? error.message : String(error);
+  }
   const script = join(import.meta.dir, "worktree-cleanup.ts");
   const result = command([
     process.execPath,
@@ -83,7 +93,11 @@ function auditRepository(path: string, fetch: boolean, sizes: boolean): Reposito
     return {
       eligibleGiB: null,
       eligibleWorktrees: 0,
-      error: "worktree audit failed; use the worktree-cleanup.ts flow documented by $hra-local-efficiency for local diagnostics",
+      error: [
+        guidanceError === undefined ? undefined : `guidance audit failed: ${guidanceError}`,
+        "worktree audit failed; use the worktree-cleanup.ts flow documented by $hra-local-efficiency for local diagnostics",
+      ].filter((value) => value !== undefined).join("; "),
+      guidanceStatus,
       path,
       registeredWorktrees: 0,
     };
@@ -102,6 +116,8 @@ function auditRepository(path: string, fetch: boolean, sizes: boolean): Reposito
       ? null
       : eligibleKiB / 1_048_576,
     eligibleWorktrees: eligible.length,
+    ...(guidanceError === undefined ? {} : { error: `guidance audit failed: ${guidanceError}` }),
+    guidanceStatus,
     path,
     registeredWorktrees: parsed.worktrees.length,
     target: parsed.target,
@@ -161,6 +177,7 @@ if (import.meta.main) {
           `worktrees=${repository.registeredWorktrees}`,
           `eligible=${repository.eligibleWorktrees}`,
           `eligibleGiB=${repository.eligibleGiB === null ? "unknown" : repository.eligibleGiB.toFixed(1)}`,
+          `guidance=${repository.guidanceStatus}`,
           repository.error ?? repository.target ?? "",
         ].join("\t"));
       }

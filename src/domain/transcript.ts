@@ -9,7 +9,14 @@ import {
   type SessionMessageActor,
   type SessionEventBody,
 } from "./session-events";
-import { sessionIdSchema, unixMillisecondsSchema } from "./values";
+import {
+  noteSchema,
+  profileIdSchema,
+  projectIdSchema,
+  sessionIdSchema,
+  titleSchema,
+  unixMillisecondsSchema,
+} from "./values";
 
 /**
  * The provider-neutral conversation HRA owns.
@@ -43,6 +50,59 @@ const transcriptTextSchema = z.string().max(TRANSCRIPT_TEXT_MAX_CHARACTERS);
 const omittedCountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const sequenceSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+
+export const sessionProviderSwitchReceiptSchema = z.object({
+  from: z.object({
+    account: profileIdSchema,
+    preset: presetSchema,
+    provider: providerSchema,
+  }).strict(),
+  providerThreadId: z.string().min(1).max(200),
+  request: z.object({
+    accountId: profileIdSchema.nullable(),
+    preset: presetSchema.nullable(),
+    provider: providerSchema,
+  }).strict(),
+  seed: z.object({
+    digest: digestSchema,
+    includedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    omittedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    status: z.enum(["completed", "interrupted", "failed", "inProgress"]),
+  }).strict(),
+  sessionId: sessionIdSchema,
+  to: z.object({
+    account: profileIdSchema,
+    preset: presetSchema,
+    provider: providerSchema,
+  }).strict(),
+  transcriptDigest: digestSchema,
+  turnId: z.string().min(1).max(200),
+}).strict();
+
+/** The exact public session value returned by an idempotent switch replay. */
+export const sessionProviderSwitchSnapshotSchema = z.object({
+  activeTurnId: z.string().min(1).max(200).optional(),
+  archivedAt: unixMillisecondsSchema.optional(),
+  createdAt: unixMillisecondsSchema,
+  fastEnabled: z.boolean(),
+  id: sessionIdSchema,
+  note: noteSchema,
+  preset: presetSchema,
+  profileId: profileIdSchema,
+  projectId: projectIdSchema.optional(),
+  provider: providerSchema,
+  providerThreadId: z.string().min(1).max(200),
+  providerUpdatedAt: unixMillisecondsSchema.optional(),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  state: z.enum(["starting", "active", "idle", "terminal", "recovery_required"]),
+  title: titleSchema,
+  updatedAt: unixMillisecondsSchema,
+}).strict();
+
+/** A committed switch receipt, including the immutable response snapshot. */
+export const sessionProviderSwitchDurableReceiptSchema = sessionProviderSwitchReceiptSchema.extend({
+  session: sessionProviderSwitchSnapshotSchema,
+}).strict();
 const opaqueIdSchema = z.string().min(1).max(200);
 const labelSchema = z.string().min(1).max(256);
 
@@ -406,6 +466,11 @@ export type TranscriptSeed = Readonly<{
   includedRecords: number;
 }>;
 
+export const digestTranscriptSeed = (text: string): string => createHash("sha256")
+  .update("hra:session-transcript-seed:v1\0", "utf8")
+  .update(text, "utf8")
+  .digest("hex");
+
 /**
  * Render the neutral transcript as the single user message the target
  * provider is seeded with.
@@ -453,10 +518,7 @@ export const renderTranscriptSeed = (input: Readonly<{
   const text = `${header}${lines.join("\n")}`;
   return {
     text,
-    digest: createHash("sha256")
-      .update("hra:session-transcript-seed:v1\0", "utf8")
-      .update(text, "utf8")
-      .digest("hex"),
+    digest: digestTranscriptSeed(text),
     omittedRecords,
     includedRecords: included,
   };

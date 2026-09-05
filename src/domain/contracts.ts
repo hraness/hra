@@ -29,6 +29,7 @@ import {
 } from "./work";
 import { workProtocolQuerySchema } from "./work-protocol";
 import {
+  attemptIdSchema,
   gatewayKeySchema,
   labelSchema,
   messageSchema,
@@ -43,7 +44,10 @@ import {
   positiveRevisionSchema,
 } from "./values";
 
-const selectorSchema = z.string().trim().min(1).max(200);
+export const selectorSchema = z.string().trim().min(1).max(200).refine(
+  (value) => !/\p{Cc}/u.test(value),
+  "Selector contains control characters.",
+);
 const idempotencyKeySchema = z.string().uuid().optional();
 const requiredIdempotencyKeySchema = z.string().uuid();
 const requiredUuidV7IdempotencyKeySchema = z.string().regex(
@@ -73,6 +77,7 @@ const daemonStopAuthoritySchema = z.object({
 export const signedOutSessionListMetadataSchema = z.object({
   accountSelector: profileIdSchema,
   accountState: z.literal("signed_out"),
+  provider: z.literal("codex"),
   scope: z.literal("local_only"),
   freshness: z.literal("stale"),
   localCompleteness: z.enum(["partial", "complete"]),
@@ -165,8 +170,42 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("daemon.stop"), expected: daemonStopAuthoritySchema.optional() }).strict(),
   z.object({ kind: z.literal("account.list") }).strict(),
   z.object({ kind: z.literal("account.add"), label: labelSchema }).strict(),
-  z.object({ kind: z.literal("account.show"), account: selectorSchema }).strict(),
+  z.object({ kind: z.literal("account.show"), account: selectorSchema, provider: providerSchema.optional() }).strict(),
   z.object({ kind: z.literal("account.login"), account: selectorSchema, deviceCode: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({
+    kind: z.literal("account.claude-login.prepare"),
+    account: selectorSchema,
+    idempotencyKey: requiredIdempotencyKeySchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("account.claude-login.complete"),
+    account: selectorSchema,
+    attemptId: attemptIdSchema,
+    idempotencyKey: requiredIdempotencyKeySchema,
+    providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    outcome: z.union([
+      z.object({
+        state: z.literal("joined"),
+        exitCode: z.number().int().nonnegative().max(255),
+        interruptedBy: z.enum(["SIGINT", "SIGTERM"]).nullable(),
+      }).strict(),
+      z.object({ state: z.literal("not_started"), reason: z.literal("spawn_failed") }).strict(),
+      z.object({ state: z.literal("not_started"), reason: z.literal("preflight_stale") }).strict(),
+      z.object({
+        state: z.literal("not_started"),
+        reason: z.literal("interrupted_before_spawn"),
+        interruptedBy: z.enum(["SIGINT", "SIGTERM"]),
+      }).strict(),
+    ]),
+  }).strict(),
+  z.object({
+    kind: z.literal("account.claude-login.abandon"),
+    account: selectorSchema,
+    attemptId: attemptIdSchema,
+    idempotencyKey: requiredIdempotencyKeySchema,
+    providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    acknowledgeChildExited: z.literal(true),
+  }).strict(),
   z.object({ kind: z.literal("account.login-cancel"), account: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("account.logout"), account: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("account.usage"), account: selectorSchema.optional(), refresh: z.boolean() }).strict(),

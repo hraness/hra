@@ -28,15 +28,18 @@ const cleanupExpired = makeFunctionReference<"mutation", Args, Readonly<{
   authAttempts: number;
   authInvites: number;
   bindChallenges: number;
+  deviceCommandLoginResults: number;
   devicePresence: number;
   deviceRevocationJobs: number;
   expiredPendingCommands: number;
+  expiredPendingDeviceCommands: number;
   idempotencyReceipts: number;
   nextCategory: string;
   otpChallenges: number;
   processed: number;
   securityEvents: number;
   terminalCommands: number;
+  terminalDeviceCommands: number;
   usageSnapshots: number;
   visitedCategories: number;
 }>>("maintenance:cleanupExpired");
@@ -523,6 +526,52 @@ describe("bounded cloud retention", () => {
         "sessionCommands",
         unacknowledgedTerminal,
       );
+      const expiredLoginResult = {
+        createdAt: now - 10 * 60 * 1_000,
+        deadline: now - 9 * 60 * 1_000,
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000006",
+        kind: "account_login_start" as const,
+        nonterminal: false,
+        payload: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "C".repeat(32),
+          keyVersion: 1,
+          nonce: "C".repeat(16),
+        },
+        publicId: "018bcfe5-6800-7000-8000-000000000007",
+        requestDigest: "e".repeat(64),
+        requestingDeviceId: deviceId,
+        result: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "R".repeat(48),
+          keyVersion: 1,
+          nonce: "R".repeat(16),
+        },
+        resultCode: "APPLIED",
+        resultDigest: "f".repeat(64),
+        resultExpiresAt: now - 1,
+        resultSingleUse: true,
+        state: "applied" as const,
+        targetDeviceId: deviceId,
+        updatedAt: now - 5 * 60 * 1_000,
+        userId,
+      };
+      await reserveQuotaForInsert(ctx, userId, "command", expiredLoginResult);
+      const expiredLoginResultId = await ctx.db.insert("deviceCommands", expiredLoginResult);
+      const { resultExpiresAt: removedLegacyExpiry, ...legacyLoginResultBase } =
+        expiredLoginResult;
+      if (removedLegacyExpiry !== now - 1) throw new Error("invalid legacy expiry fixture");
+      const legacyExpiredLoginResult = {
+        ...legacyLoginResultBase,
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000008",
+        publicId: "018bcfe5-6800-7000-8000-000000000009",
+        resultDigest: "0".repeat(64),
+      };
+      await reserveQuotaForInsert(ctx, userId, "command", legacyExpiredLoginResult);
+      const legacyExpiredLoginResultId = await ctx.db.insert(
+        "deviceCommands",
+        legacyExpiredLoginResult,
+      );
       const oldSecurity = {
         createdAt: now - 91 * 24 * 60 * 60 * 1_000,
         entityId: "fixture_retention",
@@ -531,32 +580,271 @@ describe("bounded cloud retention", () => {
       } as const;
       await reserveQuotaForInsert(ctx, userId, "security", oldSecurity);
       const oldSecurityId = await ctx.db.insert("securityEvents", oldSecurity);
-      return { oldSecurityId, oldTerminalId, pendingId, recentTerminalId, unacknowledgedTerminalId };
+      return {
+        expiredLoginResultId,
+        legacyExpiredLoginResultId,
+        oldSecurityId,
+        oldTerminalId,
+        pendingId,
+        recentTerminalId,
+        unacknowledgedTerminalId,
+        userId,
+      };
     });
 
     const result = await runtime.mutation(cleanupExpired, { limit: 10 });
     expect(result).toMatchObject({
+      deviceCommandLoginResults: 2,
       expiredPendingCommands: 1,
       securityEvents: 1,
       terminalCommands: 1,
     });
-    expect(await runtime.run(async (ctx) => ({
-      oldSecurity: await ctx.db.get(ids.oldSecurityId),
-      oldTerminal: await ctx.db.get(ids.oldTerminalId),
-      pending: await ctx.db.get(ids.pendingId),
-      recentTerminal: await ctx.db.get(ids.recentTerminalId),
-      unacknowledgedTerminal: await ctx.db.get(ids.unacknowledgedTerminalId),
-    }))).toMatchObject({
+    expect(await runtime.run(async (ctx) => {
+      const loginResult = await ctx.db.get(ids.expiredLoginResultId);
+      const legacyLoginResult = await ctx.db.get(ids.legacyExpiredLoginResultId);
+      const projectLoginResult = (record: typeof loginResult) => record === null
+        ? null
+        : {
+            hasResult: "result" in record,
+            hasResultExpiresAt: "resultExpiresAt" in record,
+            resultConsumedAt: record.resultConsumedAt,
+            resultSingleUse: record.resultSingleUse,
+            state: record.state,
+          };
+      return {
+        oldSecurity: await ctx.db.get(ids.oldSecurityId),
+        oldTerminal: await ctx.db.get(ids.oldTerminalId),
+        pending: await ctx.db.get(ids.pendingId),
+        loginResult: projectLoginResult(loginResult),
+        legacyLoginResult: projectLoginResult(legacyLoginResult),
+        recentTerminal: await ctx.db.get(ids.recentTerminalId),
+        unacknowledgedTerminal: await ctx.db.get(ids.unacknowledgedTerminalId),
+      };
+    })).toMatchObject({
       oldSecurity: null,
       oldTerminal: null,
       pending: { state: "expired" },
+      loginResult: {
+        hasResult: false,
+        hasResultExpiresAt: false,
+        resultConsumedAt: expect.any(Number),
+        resultSingleUse: true,
+        state: "applied",
+      },
+      legacyLoginResult: {
+        hasResult: false,
+        hasResultExpiresAt: false,
+        resultConsumedAt: expect.any(Number),
+        resultSingleUse: true,
+        state: "applied",
+      },
       recentTerminal: { state: "applied" },
       unacknowledgedTerminal: { state: "applied" },
     });
     expect(await runtime.run(async (ctx) => {
-      const record = await ctx.db.get(ids.unacknowledgedTerminalId);
-      return record !== null && "requesterAcknowledgedAt" in record;
-    })).toBe(false);
+      const expiredPending = await ctx.db.get(ids.pendingId);
+      const oldTerminal = await ctx.db.get(ids.unacknowledgedTerminalId);
+      return {
+        expiredPendingAcknowledged: expiredPending !== null
+          && "requesterAcknowledgedAt" in expiredPending,
+        expiredPendingHasCleanup: expiredPending !== null
+          && "terminalCleanupAfter" in expiredPending,
+        oldTerminalAcknowledged: oldTerminal !== null
+          && "requesterAcknowledgedAt" in oldTerminal,
+      };
+    })).toEqual({
+      expiredPendingAcknowledged: false,
+      expiredPendingHasCleanup: false,
+      oldTerminalAcknowledged: false,
+    });
+    const accounting = async () => await runtime.run(async (ctx) => {
+      const [sessionCommands, deviceCommands, quota, service] = await Promise.all([
+        ctx.db.query("sessionCommands").collect(),
+        ctx.db.query("deviceCommands").collect(),
+        ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (builder) => builder
+            .eq("userId", ids.userId)
+            .eq("category", "command"))
+          .unique(),
+        ctx.db.query("storageUsageService")
+          .withIndex("by_key", (builder) => builder.eq("key", "global"))
+          .unique(),
+      ]);
+      const chargedBytes = [...sessionCommands, ...deviceCommands].reduce((total, document) => {
+        const stored = Object.fromEntries(Object.entries(document).filter(
+          ([key]) => key !== "_creationTime" && key !== "_id",
+        )) as Readonly<Record<string, Value>>;
+        return total + logicalDocumentBytes(stored);
+      }, 0);
+      return {
+        chargedBytes,
+        quotaBytes: quota?.logicalBytes,
+        serviceUserBytes: service?.userLogicalBytes,
+      };
+    });
+    const afterFirstSweep = await accounting();
+    expect(afterFirstSweep.quotaBytes).toBe(afterFirstSweep.chargedBytes);
+    expect(await runtime.mutation(cleanupExpired, { limit: 10 }))
+      .toMatchObject({ deviceCommandLoginResults: 0 });
+    expect(await accounting()).toEqual(afterFirstSweep);
+  });
+
+  test("drains every legacy terminal device state within budget at the hard quota ceiling", async () => {
+    const runtime = convexTest(schema, modules);
+    await runtime.mutation(genesisQuota, {});
+    const now = Date.now();
+    const terminalStates = ["applied", "failed", "ambiguous", "cancelled", "expired"] as const;
+    const fixture = await runtime.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", { email: "legacy-device-drain@example.com" });
+      await initializeUserQuotaAuthority(ctx, userId);
+      const user = await ctx.db.get(userId);
+      if (user === null) throw new Error("missing legacy device drain user");
+      await reserveQuotaForStoredIdentity(ctx, userId, user);
+      const device = {
+        activatedAt: now,
+        authEpoch: 1,
+        createdAt: now,
+        encryptedLabel: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "A".repeat(32),
+          keyVersion: 1,
+          nonce: "A".repeat(16),
+        },
+        keyVersion: 1,
+        publicId: "device_legacy_device_drain",
+        revision: 1,
+        signingPublicKey: "{}",
+        status: "active" as const,
+        updatedAt: now,
+        userId,
+        wrappingPublicKey: "{}",
+      };
+      await reserveDeviceQuotaForInsert(ctx, userId, device);
+      const deviceId = await ctx.db.insert("devices", device);
+      const payload = {
+        algorithm: "A256GCM" as const,
+        ciphertext: "B".repeat(32),
+        keyVersion: 1,
+        nonce: "B".repeat(16),
+      };
+      const oldIds = [];
+      for (const [index, state] of terminalStates.entries()) {
+        const ordinal = (index + 1).toString(16);
+        const command = {
+          createdAt: now - 60 * 24 * 60 * 60 * 1_000,
+          deadline: now - 59 * 24 * 60 * 60 * 1_000,
+          idempotencyKey: `018bcfe5-6800-7000-8000-0000000003${ordinal}`,
+          kind: "usage_refresh" as const,
+          nonterminal: false,
+          payload,
+          publicId: `018bcfe5-6800-7000-8000-0000000004${ordinal}`,
+          requestDigest: ordinal.repeat(64),
+          requestingDeviceId: deviceId,
+          state,
+          targetDeviceId: deviceId,
+          updatedAt: now - 60 * 24 * 60 * 60 * 1_000,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "command", command);
+        oldIds.push(await ctx.db.insert("deviceCommands", command));
+      }
+      const youngCommand = {
+        createdAt: now - 24 * 60 * 60 * 1_000,
+        deadline: now - 1,
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000036",
+        kind: "usage_refresh" as const,
+        nonterminal: false,
+        payload,
+        publicId: "018bcfe5-6800-7000-8000-00000000046",
+        requestDigest: "f".repeat(64),
+        requestingDeviceId: deviceId,
+        state: "expired" as const,
+        targetDeviceId: deviceId,
+        updatedAt: now - 24 * 60 * 60 * 1_000,
+        userId,
+      };
+      await reserveQuotaForInsert(ctx, userId, "command", youngCommand);
+      const youngId = await ctx.db.insert("deviceCommands", youngCommand);
+
+      // Leave one byte of quota headroom. Any repair that first adds hosted
+      // acknowledgement metadata would fail; direct deletion must still run.
+      const categoryRows = await ctx.db.query("storageUsageByUser")
+        .withIndex("by_user_and_category", (builder) => builder.eq("userId", userId))
+        .collect();
+      const chunk = categoryRows.find((row) => row.category === "chunk");
+      const service = await ctx.db.query("storageUsageService")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .unique();
+      if (chunk === undefined || service === null) throw new Error("missing drain quota authority");
+      const currentUserBytes = categoryRows.reduce((total, row) => total + row.logicalBytes, 0);
+      const fillerBytes = USER_TOTAL_QUOTA.logicalBytes - 1 - currentUserBytes;
+      if (fillerBytes <= 0) throw new Error("invalid drain quota fixture");
+      await ctx.db.patch(chunk._id, {
+        logicalBytes: fillerBytes,
+        records: 1,
+        updatedAt: now,
+      });
+      await ctx.db.patch(service._id, {
+        logicalBytes: service.logicalBytes + fillerBytes,
+        records: service.records + 1,
+        updatedAt: now,
+        userLogicalBytes: service.userLogicalBytes + fillerBytes,
+        userRecords: service.userRecords + 1,
+      });
+      return { oldIds, userId, youngId };
+    });
+
+    const accounting = async () => await runtime.run(async (ctx) => {
+      const commands = await ctx.db.query("deviceCommands")
+        .withIndex("by_user", (builder) => builder.eq("userId", fixture.userId))
+        .collect();
+      const quota = await ctx.db.query("storageUsageByUser")
+        .withIndex("by_user_and_category", (builder) => builder
+          .eq("userId", fixture.userId)
+          .eq("category", "command"))
+        .unique();
+      const service = await ctx.db.query("storageUsageService")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .unique();
+      const expectedBytes = commands.reduce((total, document) => total + logicalDocumentBytes(
+        Object.fromEntries(Object.entries(document).filter(
+          ([key]) => key !== "_creationTime" && key !== "_id",
+        )) as Readonly<Record<string, Value>>,
+      ), 0);
+      return {
+        commandBytes: quota?.logicalBytes,
+        commandRecords: quota?.records,
+        expectedBytes,
+        ids: commands.map((command) => String(command._id)).sort(),
+        serviceUserBytes: service?.userLogicalBytes,
+      };
+    });
+
+    const before = await accounting();
+    expect(before.commandBytes).toBe(before.expectedBytes);
+    expect(await runtime.mutation(cleanupExpired, { limit: 3 })).toMatchObject({
+      processed: 3,
+      terminalDeviceCommands: 3,
+    });
+    const afterFirst = await accounting();
+    expect(afterFirst.commandBytes).toBe(afterFirst.expectedBytes);
+    expect((before.commandRecords ?? 0) - (afterFirst.commandRecords ?? 0)).toBe(3);
+    expect((before.commandBytes ?? 0) - (afterFirst.commandBytes ?? 0)).toBe(
+      (before.serviceUserBytes ?? 0) - (afterFirst.serviceUserBytes ?? 0),
+    );
+
+    expect(await runtime.mutation(cleanupExpired, { limit: 3 })).toMatchObject({
+      processed: 2,
+      terminalDeviceCommands: 2,
+    });
+    const afterSecond = await accounting();
+    expect(afterSecond.commandBytes).toBe(afterSecond.expectedBytes);
+    expect((afterFirst.commandRecords ?? 0) - (afterSecond.commandRecords ?? 0)).toBe(2);
+    expect((afterFirst.commandBytes ?? 0) - (afterSecond.commandBytes ?? 0)).toBe(
+      (afterFirst.serviceUserBytes ?? 0) - (afterSecond.serviceUserBytes ?? 0),
+    );
+    expect(afterSecond.ids).toEqual([String(fixture.youngId)]);
+    expect(fixture.oldIds.every((id) => !afterSecond.ids.includes(String(id)))).toBe(true);
   });
 
   test("gives every eligible category one bounded quantum in a full rotation", async () => {
@@ -755,6 +1043,7 @@ describe("bounded cloud retention", () => {
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000108",
         nonterminal: true,
         publicId: "018bcfe5-6800-7000-8000-000000000109",
+        requesterAcknowledgedAt: now - 100_000,
         state: "pending",
         updatedAt: now - 1,
       } as const;
@@ -860,7 +1149,22 @@ describe("bounded cloud retention", () => {
       terminalDeviceCommands: 1,
       usageSnapshots: 1,
       processed: 15,
-      visitedCategories: 16,
+      visitedCategories: 17,
+    });
+    expect(await runtime.run(async (ctx) => {
+      const row = (await ctx.db.query("deviceCommands").collect())
+        .find((command) => command.publicId === "018bcfe5-6800-7000-8000-000000000109");
+      return row === undefined
+        ? null
+        : {
+            requesterAcknowledgedAt: row.requesterAcknowledgedAt,
+            state: row.state,
+            terminalCleanupAfter: row.terminalCleanupAfter,
+          };
+    })).toMatchObject({
+      requesterAcknowledgedAt: expect.any(Number),
+      state: "expired",
+      terminalCleanupAfter: expect.any(Number),
     });
     expect(await runtime.run(async (ctx) => {
       const service = await ctx.db.query("storageUsageService")

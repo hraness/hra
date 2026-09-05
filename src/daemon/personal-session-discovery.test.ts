@@ -258,6 +258,209 @@ describe("BoundedPersonalSessionDiscovery", () => {
     }]);
   });
 
+  test("reads a stale Codex heartbeat target exactly without weakening metadata or liveness checks", async () => {
+    const now = 1_900_000_000_000;
+    const exactReads: string[] = [];
+    const discovery = new BoundedPersonalSessionDiscovery({
+      now: () => now,
+      codexReadSession: ({ providerThreadId }) => {
+        exactReads.push(providerThreadId);
+        if (providerThreadId === "scheduled-terminal") {
+          return Promise.resolve({
+            providerThreadId,
+            title: "Terminal scheduled thread",
+            status: "terminal",
+            providerUpdatedAt: now - 86_400_000,
+          });
+        }
+        if (providerThreadId === "scheduled-missing-time") {
+          return Promise.resolve({
+            providerThreadId,
+            title: "Timestamp-less scheduled thread",
+            status: "idle",
+          });
+        }
+        return Promise.resolve({
+          providerThreadId,
+          title: "Old scheduled thread",
+          status: "idle",
+          projectRoot: "/workspace/scheduled",
+          providerUpdatedAt: now - 86_400_000,
+        });
+      },
+      codexListPage: () => Promise.resolve({
+        sessions: [{
+          providerThreadId: "recent-thread",
+          title: "Recent thread",
+          status: "idle",
+          providerUpdatedAt: now - 1_000,
+        }],
+        nextCursor: null,
+      }),
+    });
+
+    await expect(discovery.discover({
+      provider: "codex",
+      limit: 4,
+      codexScheduledThreadIds: [
+        "scheduled-old",
+        "scheduled-old",
+        "scheduled-terminal",
+        "scheduled-missing-time",
+      ],
+    })).resolves.toEqual([
+      {
+        provider: "codex",
+        providerThreadId: "scheduled-old",
+        title: "Old scheduled thread",
+        projectRoot: "/workspace/scheduled",
+        updatedAt: now - 86_400_000,
+        liveness: "not_live",
+        scheduledTaskTarget: true,
+      },
+      {
+        provider: "codex",
+        providerThreadId: "recent-thread",
+        title: "Recent thread",
+        updatedAt: now - 1_000,
+        liveness: "live",
+      },
+    ]);
+    expect(exactReads).toEqual([
+      "scheduled-old",
+      "scheduled-terminal",
+      "scheduled-missing-time",
+    ]);
+  });
+
+  test("does not let an unavailable exact scheduled-target read suppress recent discovery", async () => {
+    const now = 1_900_000_000_000;
+    const discovery = new BoundedPersonalSessionDiscovery({
+      now: () => now,
+      codexReadSession: () => Promise.reject(new Error("metadata unavailable")),
+      codexListPage: () => Promise.resolve({
+        sessions: [{
+          providerThreadId: "recent-after-target-failure",
+          title: "Recent after target failure",
+          status: "idle",
+          providerUpdatedAt: now - 1_000,
+        }],
+        nextCursor: null,
+      }),
+    });
+
+    await expect(discovery.discover({
+      provider: "codex",
+      codexScheduledThreadIds: ["unreadable-scheduled-target"],
+    })).resolves.toEqual([{
+      provider: "codex",
+      providerThreadId: "recent-after-target-failure",
+      title: "Recent after target failure",
+      updatedAt: now - 1_000,
+      liveness: "live",
+    }]);
+  });
+
+  test("starts every bounded scheduled read while reserving time for recent discovery", async () => {
+    const exactReads: string[] = [];
+    let recentPageCalls = 0;
+    const scheduled = Array.from(
+      { length: 50 },
+      (_, index) => `slow-scheduled-${String(index).padStart(2, "0")}`,
+    );
+    const discovery = new BoundedPersonalSessionDiscovery({
+      codexReadSession: ({ providerThreadId, signal }) => {
+        exactReads.push(providerThreadId);
+        return new Promise((_resolve, reject) => {
+          const rejectOnAbort = (): void => {
+            reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+          };
+          signal.addEventListener("abort", rejectOnAbort, { once: true });
+        });
+      },
+      codexListPage: () => {
+        recentPageCalls += 1;
+        const now = Date.now();
+        return Promise.resolve({
+          sessions: [{
+            providerThreadId: "recent-despite-slow-schedules",
+            title: "Recent despite slow schedules",
+            status: "idle",
+            providerUpdatedAt: now - 1,
+          }],
+          nextCursor: null,
+        });
+      },
+    });
+
+    const candidates = await discovery.discover({
+      provider: "codex",
+      codexScheduledThreadIds: scheduled,
+      deadlineMs: 120,
+      limit: 100,
+    });
+
+    expect(exactReads).toEqual(scheduled);
+    expect(recentPageCalls).toBe(1);
+    expect(candidates).toEqual([{
+      provider: "codex",
+      providerThreadId: "recent-despite-slow-schedules",
+      title: "Recent despite slow schedules",
+      updatedAt: expect.any(Number),
+      liveness: "live",
+    }]);
+  });
+
+  test("keeps completed scheduled targets when another exact read hangs", async () => {
+    const now = Date.now();
+    const discovery = new BoundedPersonalSessionDiscovery({
+      codexReadSession: ({ providerThreadId, signal }) => {
+        if (providerThreadId === "scheduled-hung") {
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(new Error("aborted")), {
+              once: true,
+            });
+          });
+        }
+        return Promise.resolve({
+          providerThreadId,
+          title: `Scheduled ${providerThreadId}`,
+          status: "idle",
+          providerUpdatedAt: now - 86_400_000,
+        });
+      },
+      codexListPage: () => Promise.resolve({
+        sessions: [{
+          providerThreadId: "recent-alongside-partial-schedules",
+          title: "Recent alongside partial schedules",
+          status: "idle",
+          providerUpdatedAt: now - 1,
+        }],
+        nextCursor: null,
+      }),
+    });
+
+    const candidates = await discovery.discover({
+      provider: "codex",
+      codexScheduledThreadIds: [
+        "scheduled-fast-a",
+        "scheduled-hung",
+        "scheduled-fast-b",
+      ],
+      deadlineMs: 120,
+      limit: 10,
+    });
+
+    expect(candidates.map((candidate) => candidate.providerThreadId)).toEqual([
+      "scheduled-fast-a",
+      "scheduled-fast-b",
+      "recent-alongside-partial-schedules",
+    ]);
+    expect(candidates.slice(0, 2).every(
+      (candidate) => candidate.scheduledTaskTarget === true,
+    )).toBe(true);
+  });
+
   test("uses only pinned registry scalars and conservative process liveness", async () => {
     const probed: ClaudeProcessIdentity[] = [];
     const now = 1_900_000_100_000;

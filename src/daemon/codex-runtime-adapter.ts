@@ -31,6 +31,7 @@ import type {
   ProviderInteractionAuthority,
 } from "../domain/interactions";
 import {
+  CodexClaimReleaseUnprovenError,
   CodexSessionObservationError,
   type CodexAccountProjection,
   type CodexLoginOutcome,
@@ -72,6 +73,14 @@ type SessionObservationEntry = {
   readonly startProjection?: CodexSessionProjection;
   readonly task: Promise<SessionObservationProof>;
 };
+class ResumedThreadMismatchObservationError extends CodexSessionObservationError {
+  readonly resumedThreadId: string;
+
+  constructor(resumedThreadId: string) {
+    super("thread_mismatch");
+    this.resumedThreadId = resumedThreadId;
+  }
+}
 type PendingRuntimeReview = {
   readonly review: RuntimeStartReview;
   readonly running: RunningClient;
@@ -904,6 +913,28 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
+  async readSessionMetadata(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+    signal: AbortSignal,
+  ): Promise<CodexSessionProjection> {
+    return await this.#admit(async () => {
+      signal.throwIfAborted();
+      const running = await this.#running(authority);
+      signal.throwIfAborted();
+      const metadata = await running.client.readThread(providerThreadId, false);
+      signal.throwIfAborted();
+      this.#assertObservedClientCurrent(running);
+      if (metadata.value.id !== providerThreadId) {
+        throw new CodexError(
+          "PROTOCOL_ERROR",
+          "thread/read returned metadata for a different Codex thread",
+        );
+      }
+      return projectBoundedThread(metadata.value, false);
+    });
+  }
+
   async reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview> {
     return await this.#admit(async () => {
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a session.");
@@ -920,6 +951,11 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       );
       return this.#rememberReview({ kind: "session_start", running, projectRoot: input.projectRoot, ...reviewed });
     });
+  }
+
+  discardRuntimeReview(review: RuntimeStartReview): void {
+    const pending = this.#runtimeReviews.get(review.reviewId);
+    if (pending?.review === review) this.#runtimeReviews.delete(review.reviewId);
   }
 
   async startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReview; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
@@ -1005,30 +1041,51 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         input.providerThreadId,
         input.signal,
       );
-      await this.#invalidateRetainedResumeUnavailable(running, input.providerThreadId);
-      input.signal.throwIfAborted();
       // Claiming is deliberately non-mutating. HRA applies its reviewed
       // approval and permission policy on every turn after the durable
       // adoption commit, so a failed commit cannot leave provider policy
       // changed on a thread HRA does not own.
-      const proof = await this.#ensureSessionObserved(running, input.providerThreadId);
-      const observation = await this.#readSessionObservation(
-        running,
-        input.providerThreadId,
-        proof,
-      );
-      input.signal.throwIfAborted();
-      this.#assertObservedClientCurrent(running);
-      if (observation.projection.providerThreadId !== input.providerThreadId) {
-        throw new CodexSessionObservationError("thread_mismatch");
-      }
-      if (observation.connectionId !== running.client.connectionId) {
-        throw new CodexError(
-          "AUTHORITY_STALE",
-          "The claimed Codex thread belongs to another provider connection.",
+      let resumedThreadId: string | undefined;
+      try {
+        await this.#invalidateRetainedResumeUnavailable(running, input.providerThreadId);
+        input.signal.throwIfAborted();
+        const proof = await this.#ensureSessionObserved(
+          running,
+          input.providerThreadId,
+          (threadId) => { resumedThreadId = threadId; },
         );
+        if (proof.resumed) resumedThreadId ??= input.providerThreadId;
+        const observation = await this.#readSessionObservation(
+          running,
+          input.providerThreadId,
+          proof,
+        );
+        input.signal.throwIfAborted();
+        this.#assertObservedClientCurrent(running);
+        if (observation.projection.providerThreadId !== input.providerThreadId) {
+          throw new CodexSessionObservationError("thread_mismatch");
+        }
+        if (observation.connectionId !== running.client.connectionId) {
+          throw new CodexError(
+            "AUTHORITY_STALE",
+            "The claimed Codex thread belongs to another provider connection.",
+          );
+        }
+        return { ...observation, effectiveRuntimeProfile: reviewed.profile };
+      } catch (error: unknown) {
+        if (resumedThreadId === undefined && error instanceof ResumedThreadMismatchObservationError) {
+          resumedThreadId = error.resumedThreadId;
+        }
+        if (resumedThreadId !== undefined) {
+          await this.#releaseFailedSessionClaim(
+            running,
+            input.providerThreadId,
+            resumedThreadId,
+            error,
+          );
+        }
+        throw error;
       }
-      return { ...observation, effectiveRuntimeProfile: reviewed.profile };
     });
   }
 
@@ -1764,9 +1821,69 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     }
   }
 
+  async #releaseFailedSessionClaim(
+    running: RunningClient,
+    observationThreadId: string,
+    resumedThreadId: string,
+    claimError: unknown,
+  ): Promise<void> {
+    // A successful policy-neutral resume is already a provider subscription.
+    // If a later claim check fails, remove that controller before returning the
+    // original failure to the adoption service. Ordinary failures unsubscribe
+    // the exact resumed id; an identity mismatch retires the connection because
+    // the subscribed thread is no longer provable.
+    this.#clearSessionObservation(running, observationThreadId);
+    if (
+      claimError instanceof CodexSessionObservationError
+      && claimError.reason === "thread_mismatch"
+    ) {
+      // A mismatched response leaves even the subscribed thread identity in
+      // doubt. Only closing the exact connection proves that neither possible
+      // subscription remains controlled by this failed claim.
+      try {
+        await this.#closeFailedSessionClaimConnection(running);
+      } catch (closeError: unknown) {
+        throw new CodexClaimReleaseUnprovenError({
+          cause: new AggregateError(
+            [claimError, closeError],
+            "Codex claim mismatch and connection retirement both failed.",
+          ),
+        });
+      }
+      return;
+    }
+    try {
+      await running.client.unsubscribeThread(resumedThreadId);
+      return;
+    } catch (unsubscribeError: unknown) {
+      // A rejected or lost unsubscribe response cannot prove release. Retiring
+      // the exact connection releases all of its subscriptions. A completed
+      // close restores certainty, so the caller can still receive its original
+      // claim error; a failed close replaces it with the cleanup failure below.
+      try {
+        await this.#closeFailedSessionClaimConnection(running);
+      } catch (closeError: unknown) {
+        throw new CodexClaimReleaseUnprovenError({
+          cause: new AggregateError(
+            [claimError, unsubscribeError, closeError],
+            "Codex claim, unsubscribe, and connection retirement all failed.",
+          ),
+        });
+      }
+    }
+  }
+
+  async #closeFailedSessionClaimConnection(running: RunningClient): Promise<void> {
+    const close = this.#retireExactClient(running.authority, running)
+      ?? this.#retryExactClientClose(running.authority)
+      ?? running.client.close();
+    await close;
+  }
+
   async #ensureSessionObserved(
     running: RunningClient,
     providerThreadId: string,
+    onResumed?: (providerThreadId: string) => void,
   ): Promise<SessionObservationProof> {
     const key = this.#observationKey(running, providerThreadId);
     for (;;) {
@@ -1783,15 +1900,25 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           const resumedThread: CodexThread = (
             await running.client.resumeThread(providerThreadId)
           ).value;
+          onResumed?.(resumedThread.id);
           if (resumedThread.id !== providerThreadId) {
-            throw new CodexSessionObservationError("thread_mismatch");
+            throw new ResumedThreadMismatchObservationError(resumedThread.id);
           }
           this.#assertObservedClientCurrent(running);
           return { resumed: true };
         } catch (error: unknown) {
           if (error instanceof CodexSessionObservationError) throw error;
           if (error instanceof IndeterminateCodexEffectError) {
-            await this.#retireIndeterminateObservation(running);
+            try {
+              await this.#retireIndeterminateObservation(running);
+            } catch (closeError: unknown) {
+              throw new CodexClaimReleaseUnprovenError({
+                cause: new AggregateError(
+                  [error, closeError],
+                  "Indeterminate Codex resume and connection retirement both failed.",
+                ),
+              });
+            }
             throw new CodexSessionObservationError("resume_unavailable", { cause: error });
           }
           if (error instanceof CodexError) {
@@ -1890,19 +2017,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
 
   async #retireIndeterminateObservation(running: RunningClient): Promise<void> {
     await this.#serializeLifecycle(running.authority.id, async () => {
-      const current = this.#clients.get(running.authority.id);
-      if (current !== running) return;
-      this.#clients.delete(running.authority.id);
-      this.#clearSessionObservations(running);
-      this.#deterministicallyDisconnectedByProfile.delete(running.authority.id);
-      this.#endedGenerationByProfile.set(
-        running.authority.id,
-        Math.max(
-          this.#endedGenerationByProfile.get(running.authority.id) ?? 0,
-          running.authority.generation,
-        ),
-      );
-      await running.client.close();
+      const close = this.#retireExactClient(running.authority, running)
+        ?? this.#retryExactClientClose(running.authority);
+      if (close !== undefined) await close;
     });
   }
 

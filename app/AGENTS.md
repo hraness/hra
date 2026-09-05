@@ -12,7 +12,7 @@
 - `src/lib/` holds the class-name helper, the cancellation helper, and the canvas image wrapper the downscaler injects.
 - `src/routing/` holds the hash route model and the router hook.
 - `src/components/ui/` holds the interface primitives as owned source.
-- `src/components/` holds the icons, the state indicator, the streaming tail, the session card, the subagent chips, the scheduled-tasks badge, the transcript, the attachment chips, and the interaction panel.
+- `src/components/` holds the icons, the state indicator, the streaming tail, the session card, the subagent chips, the scheduled-tasks badge, the transcript, the attachment chips, the account-login relay, and the interaction panel.
 - `src/screens/` holds the grid, session, and settings screens.
 
 # Guidelines

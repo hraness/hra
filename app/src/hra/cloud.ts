@@ -76,6 +76,7 @@ export {
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
   decryptSessionMetadata,
+  deviceCommandLoginResultLifetimeMs,
   deviceCommandLimits,
   deviceRegistryLimits,
   encryptDeviceCommand,

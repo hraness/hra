@@ -209,9 +209,10 @@ export type RemoteCommandPayload =
  * named by the `publicId` the device registry already projects, never by a
  * filesystem path, and `containsAbsolutePath` refuses one anyway.
  *
- * `account_login_status` deliberately carries no account: a device relays at
- * most one login at a time, so the poll asks "what is happening on this
- * machine", which also keeps the polled account out of the projection.
+ * Current `account_login_status` requests name the projected account whose
+ * row exposed the action. The account-less shape remains parseable only for a
+ * legacy browser, so a rolling deployment can still ask the older machine-wide
+ * question without widening the current UI's authority.
  */
 export type DeviceCommandPayload =
   | Readonly<{
@@ -222,7 +223,13 @@ export type DeviceCommandPayload =
       prompt: string;
       provider: "codex" | "claude";
     }>
-  | Readonly<{ accountPublicId: string; kind: "account_login_start" }>
+  | Readonly<{
+      accountPublicId: string;
+      /** Absent is the legacy URL-only browser handoff. */
+      handoffVersion?: 2;
+      kind: "account_login_start";
+    }>
+  | Readonly<{ accountPublicId: string; kind: "account_login_status" }>
   | Readonly<{ kind: "account_login_status" }>
   | Readonly<{ kind: "usage_refresh" }>;
 
@@ -235,13 +242,26 @@ export type DeviceCommandLoginStatus =
 
 /**
  * What the daemon settles back to the requesting browser. `account_login_start`
- * returns a relayed provider login URL: it is encrypted under the account key
- * like every other payload, carries its own short expiry, and the hosted row
- * releases it exactly once (`deviceCommands:consumeResult`).
+ * returns the complete provider device-code handoff: it is encrypted under the
+ * account key like every other payload, carries its own short expiry, and the
+ * hosted row releases it exactly once (`deviceCommands:consumeResult`). The
+ * browser replaces the encrypted machine-clock expiry with the hosted
+ * settlement deadline returned by that one-time exchange.
  */
 export type DeviceCommandResultPayload =
   | Readonly<{ kind: "session_start"; sessionPublicId: string }>
-  | Readonly<{ expiresAt: number; kind: "account_login_start"; loginUrl: string }>
+  | Readonly<{
+      expiresAt: number;
+      handoffVersion: 2;
+      kind: "account_login_start";
+      loginUrl: string;
+      userCode: string;
+    }>
+  | Readonly<{
+      expiresAt: number;
+      kind: "account_login_start";
+      loginUrl: string;
+    }>
   | Readonly<{
       instruction: string;
       kind: "account_login_status";
@@ -251,12 +271,31 @@ export type DeviceCommandResultPayload =
 
 export const deviceCommandLimits = Object.freeze({
   instructionCharacters: 512,
+  loginUserCodeCharacters: 38,
   loginUrlCharacters: 2_048,
   promptCharacters: 16_000,
 } as const);
 
+/** Maximum time a hosted Codex login handoff may remain readable. */
+export const deviceCommandLoginResultLifetimeMs = 5 * 60 * 1_000;
+
+const isLoopbackLoginHost = (hostname: string): boolean => {
+  const host = hostname.toLowerCase().replace(/\.$/u, "");
+  if (
+    host === "localhost"
+    || host.endsWith(".localhost")
+    || host === "0.0.0.0"
+    || host === "[::]"
+    || host === "[::1]"
+    || /^127(?:\.[0-9]{1,3}){3}$/u.test(host)
+  ) return true;
+  // URL canonicalization renders an IPv4-mapped 127/8 address in hexadecimal,
+  // for example [::ffff:127.0.0.1] becomes [::ffff:7f00:1].
+  return /^\[::ffff:7f[0-9a-f]{2}:/u.test(host);
+};
+
 // The relay is a provider login URL and nothing else: https only, no
-// credentials in the authority, no embedded fragment, and bounded.
+// credentials in the authority, no loopback destination, and bounded.
 export function isRelayedLoginUrl(value: unknown): value is string {
   if (
     typeof value !== "string"
@@ -274,7 +313,15 @@ export function isRelayedLoginUrl(value: unknown): value is string {
     && parsed.username === ""
     && parsed.password === ""
     && parsed.hostname.length > 0
+    && !isLoopbackLoginHost(parsed.hostname)
     && parsed.href === value;
+}
+
+/** The same closed device-code grammar accepted by the protected CLI handoff. */
+export function isRelayedLoginUserCode(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= deviceCommandLimits.loginUserCodeCharacters
+    && /^[A-Z0-9]{4,12}(?:-[A-Z0-9]{4,12}){0,2}$/u.test(value);
 }
 
 export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload | null {
@@ -314,9 +361,32 @@ export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload 
     && isOpaqueIdentifier(value.accountPublicId)
   ) return { accountPublicId: value.accountPublicId, kind: value.kind };
   if (
-    (value.kind === "account_login_status" || value.kind === "usage_refresh")
+    value.kind === "account_login_start"
+    && hasExactKeys(value, ["accountPublicId", "handoffVersion", "kind"])
+    && isOpaqueIdentifier(value.accountPublicId)
+    && value.handoffVersion === 2
+  ) {
+    return {
+      accountPublicId: value.accountPublicId,
+      handoffVersion: value.handoffVersion,
+      kind: value.kind,
+    };
+  }
+  if (
+    value.kind === "account_login_status"
+    && hasExactKeys(value, ["accountPublicId", "kind"])
+    && isOpaqueIdentifier(value.accountPublicId)
+  ) {
+    return { accountPublicId: value.accountPublicId, kind: value.kind };
+  }
+  if (
+    value.kind === "account_login_status"
     && hasExactKeys(value, ["kind"])
-  ) return { kind: value.kind };
+  ) return { kind: "account_login_status" };
+  if (
+    value.kind === "usage_refresh"
+    && hasExactKeys(value, ["kind"])
+  ) return { kind: "usage_refresh" };
   return null;
 }
 
@@ -333,6 +403,23 @@ export function parseDeviceCommandResultPayload(
     && hasExactKeys(value, ["kind", "sessionPublicId"])
     && isOpaqueIdentifier(value.sessionPublicId)
   ) return { kind: value.kind, sessionPublicId: value.sessionPublicId };
+  if (
+    value.kind === "account_login_start"
+    && hasExactKeys(value, ["expiresAt", "handoffVersion", "kind", "loginUrl", "userCode"])
+    && Number.isSafeInteger(value.expiresAt)
+    && (value.expiresAt as number) > 0
+    && value.handoffVersion === 2
+    && isRelayedLoginUrl(value.loginUrl)
+    && isRelayedLoginUserCode(value.userCode)
+  ) {
+    return {
+      expiresAt: value.expiresAt as number,
+      handoffVersion: value.handoffVersion,
+      kind: value.kind,
+      loginUrl: value.loginUrl,
+      userCode: value.userCode,
+    };
+  }
   if (
     value.kind === "account_login_start"
     && hasExactKeys(value, ["expiresAt", "kind", "loginUrl"])

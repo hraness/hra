@@ -62,6 +62,7 @@ const codexProviderAccountKey = `v1:codex:${sha256("cloud-adoption-account")}`;
 
 class FakeCodex implements CodexRuntimePort {
   readonly provider = "codex" as const;
+  discardRuntimeReview(): void {}
   projection: CodexSessionProjection = {
     providerThreadId: "thread_0001",
     providerUpdatedAt: 1_000,
@@ -197,18 +198,16 @@ async function fixture(): Promise<Readonly<{
     email: "person@example.com",
     plan: `file://${privateRootFixture}/plan`,
   })).toBe(true);
-  const starting = store.createSession({
+  const bound = store.upsertProviderSession({
     profileId: current.id,
     title: `Work ${privateRootFixture}`,
     preset: "high",
     fastEnabled: true,
-  });
-  const bound = store.bindSession({
-    sessionId: starting.id,
-    expectedRevision: starting.revision,
+    provider: "codex",
     providerThreadId: "thread_0001",
     state: "idle",
     providerUpdatedAt: 1_000,
+    providerAccountKey: `v1:codex:${sha256("person@example.com")}`,
   });
   store.updateSessionMetadata({
     sessionId: bound.id,
@@ -414,6 +413,7 @@ afterEach(async () => {
  */
 class FakeClaude implements ClaudeRuntimePort {
   readonly provider = "claude" as const;
+  discardRuntimeReview(): void {}
   readSessionCalls = 0;
   projection: CodexSessionProjection = {
     messages: [
@@ -442,6 +442,7 @@ class FakeClaude implements ClaudeRuntimePort {
   endSession(): Promise<void> { return Promise.resolve(); }
   #unused(): never { throw new Error("unused"); }
   pinnedVersion(): string { return this.#unused(); }
+  rebindProfileAuthority(): void {}
   interactionAuthority(): never { return this.#unused(); }
   readAccount(): Promise<CodexAccountProjection> { return Promise.reject(this.#unused()); }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unused()); }
@@ -494,22 +495,18 @@ describe("state-backed cloud daemon adapter", () => {
 
   test("projects a Claude session through the service-owned exact reader", async () => {
     const value = await fixture();
-    const profile = value.store.requireProfileById(
-      value.store.requireSession(value.sessionId).profileId,
-    );
-    const starting = value.store.createSession({
+    const profile = value.store.createProfile("Signed-out Codex, managed Claude");
+    expect(profile).toMatchObject({ processGeneration: 0, state: "signed_out" });
+    const bound = value.store.upsertProviderSession({
       fastEnabled: false,
       preset: "fable-max",
       profileId: profile.id,
       provider: "claude",
       title: "Claude work",
-    });
-    const bound = value.store.bindSession({
-      expectedRevision: starting.revision,
       providerThreadId: "thread_claude_0001",
-      sessionId: starting.id,
       state: "idle",
       providerUpdatedAt: 1_000,
+      providerAccountKey: `v1:claude:${sha256("managed-claude-account")}`,
     });
     // Bind the turn's reviewed Claude profile the way a dispatched queue entry
     // does, so the compact turn summary can name its model.
@@ -555,6 +552,7 @@ describe("state-backed cloud daemon adapter", () => {
     });
 
     const claude = new FakeClaude();
+    const commands: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
       readSessionProjectionForCloud: async (sessionPublicId, signal) => {
         if (sessionPublicId === bound.id) {
@@ -563,14 +561,45 @@ describe("state-backed cloud daemon adapter", () => {
         }
         return await value.codex.readSessionProjectionForCloud(sessionPublicId, signal);
       },
-      executeRemote: () => Promise.resolve({}),
+      executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
       paths: value.paths,
+      platform: "linux",
       store: value.store,
     });
     try {
       const signal = new AbortController().signal;
-      await adapter.listSessions({ limit: 25, signal });
+      const projected = await adapter.listSessions({ limit: 25, signal });
+      expect(projected.sessions.map((session) => session.publicId)).toContain(bound.id);
       expect(claude.readSessionCalls).toBe(1);
+      const recovery = await adapter.planCompactProjectionRecovery({
+        idempotencyKey: "018bcfe5-6800-7000-8000-0000000000c1",
+        sessionPublicId: bound.id,
+        signal,
+      });
+      expect(recovery.localAuthority).toMatchObject({
+        profileGeneration: profile.processGeneration,
+        profileId: profile.id,
+        providerThreadId: "thread_claude_0001",
+      });
+      const authority = await adapter.resolveCommandAuthority({
+        sessionPublicId: bound.id,
+        signal,
+      });
+      expect(authority).not.toBeNull();
+      for (const [idempotencyKey, payload] of [
+        ["00000000-0000-7000-8000-0000000000c2", { kind: "send", message: "Continue" }],
+        ["00000000-0000-7000-8000-0000000000c3", { kind: "stop" }],
+      ] as const) {
+        expect(await adapter.execute({
+          authority: authority as CloudLocalCommandAuthority,
+          idempotencyKey,
+          leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+          payload,
+          sessionPublicId: bound.id,
+          signal,
+        })).toEqual({ code: "APPLIED", state: "applied" });
+      }
+      expect(commands.map((command) => command.kind)).toEqual(["session.send", "session.stop"]);
       const events = await adapter.readCompactEvents({
         afterSequence: 0,
         limit: 128,
@@ -592,6 +621,202 @@ describe("state-backed cloud daemon adapter", () => {
         model: "fable-max",
         runtimeMs: 2_374,
       });
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("does not read or authorize a managed Claude session on Darwin", async () => {
+    const value = await fixture();
+    const profile = value.store.requireProfileById(
+      value.store.requireSession(value.sessionId).profileId,
+    );
+    const bound = value.store.upsertProviderSession({
+      fastEnabled: false,
+      preset: "fable-max",
+      profileId: profile.id,
+      provider: "claude",
+      title: "Durable Claude work",
+      providerThreadId: "thread_claude_darwin",
+      state: "idle",
+      providerAccountKey: `v1:claude:${sha256("managed-claude-darwin-account")}`,
+    });
+    const claude = new FakeClaude();
+    const projectedSessionIds: string[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      readSessionProjectionForCloud: async (sessionPublicId, signal) => {
+        signal.throwIfAborted();
+        projectedSessionIds.push(sessionPublicId);
+        return sessionPublicId === bound.id
+          ? await claude.readSession()
+          : await value.codex.readSessionProjectionForCloud(sessionPublicId, signal);
+      },
+      executeRemote: () => Promise.reject(new Error("remote effect was not expected")),
+      paths: value.paths,
+      platform: "darwin",
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const projected = await adapter.listSessions({ limit: 25, signal });
+      expect(projected.sessions.map((session) => session.publicId)).not.toContain(bound.id);
+      expect(projectedSessionIds).not.toContain(bound.id);
+      expect(claude.readSessionCalls).toBe(0);
+      await expect(adapter.resolveCommandAuthority({
+        sessionPublicId: bound.id,
+        signal,
+      })).resolves.toBeNull();
+      await expect(adapter.planCompactProjectionRecovery({
+        idempotencyKey: "018bcfe5-6800-7000-8000-0000000000c4",
+        sessionPublicId: bound.id,
+        signal,
+      })).rejects.toThrow("local authority changed");
+      expect(claude.readSessionCalls).toBe(0);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("projects and authorizes an actively bound personal Claude session on Darwin", async () => {
+    const value = await fixture();
+    const profile = value.store.createProfile("Signed-out Codex, personal Claude");
+    expect(profile).toMatchObject({ processGeneration: 0, state: "signed_out" });
+    value.store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const candidate = value.store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "thread_personal_claude_darwin",
+      title: "Personal Claude work",
+      state: "idle",
+      providerUpdatedAt: 1_000,
+      liveness: "not_live",
+    });
+    value.store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const processIdentity = {
+      pid: 42_701,
+      pidDomain: "darwin" as const,
+      procStart: "Fri Sep  4 12:00:00 2026",
+    };
+    value.store.recordClaimedClaudeProcessAuthority({
+      providerThreadId: candidate.providerThreadId,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      identity: processIdentity,
+    });
+    const claimed = value.store.listSessionAdoptionCandidates({ provider: "claude" })
+      .find((entry) => entry.providerThreadId === candidate.providerThreadId);
+    if (claimed === undefined) throw new Error("Expected the claimed personal Claude candidate.");
+    const adopted = value.store.adoptSessionCandidate({
+      provider: "claude",
+      providerThreadId: candidate.providerThreadId,
+      expectedCandidateRevision: claimed.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "fable-max",
+      fastEnabled: false,
+      runtimeProfile: {
+        claudeVersion: "2.1.260",
+        configHome: "personal",
+        inputFormat: "stream-json",
+        model: "claude-fable-5-1",
+        observedAt: 2_100,
+        outputFormat: "stream-json",
+        permissionMode: "default",
+        preset: "fable-max",
+        processGeneration: profile.processGeneration,
+        profileId: profile.id,
+        reasoningEffort: "max",
+      },
+      providerAccountKey: `v1:claude:${sha256("personal-claude-account")}`,
+      claudeProcessIdentity: processIdentity,
+    });
+    const claude = new FakeClaude();
+    const projectedSessionIds: string[] = [];
+    const commands: LocalCommand[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      readSessionProjectionForCloud: async (sessionPublicId, signal) => {
+        signal.throwIfAborted();
+        projectedSessionIds.push(sessionPublicId);
+        if (sessionPublicId !== adopted.session.id) {
+          return await value.codex.readSessionProjectionForCloud(sessionPublicId, signal);
+        }
+        return {
+          ...await claude.readSession(),
+          providerThreadId: candidate.providerThreadId,
+          title: candidate.title,
+        };
+      },
+      executeRemote: (command) => {
+        commands.push(command);
+        return Promise.resolve({});
+      },
+      paths: value.paths,
+      platform: "darwin",
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const projected = await adapter.listSessions({ limit: 25, signal });
+      const head = projected.sessions.find((session) => session.publicId === adopted.session.id);
+      if (head === undefined) throw new Error("Expected the adopted Claude session projection.");
+      expect(head).not.toHaveProperty("adopted");
+      expect(head).not.toHaveProperty("origin");
+      expect(head).not.toHaveProperty("runtimeScope");
+      expect(projectedSessionIds).toContain(adopted.session.id);
+
+      await expect(adapter.planCompactProjectionRecovery({
+        idempotencyKey: "018bcfe5-6800-7000-8000-0000000000c5",
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).resolves.toMatchObject({
+        localAuthority: {
+          profileGeneration: profile.processGeneration,
+          profileId: profile.id,
+          providerThreadId: candidate.providerThreadId,
+        },
+      });
+      const authority = await adapter.resolveCommandAuthority({
+        sessionPublicId: adopted.session.id,
+        signal,
+      });
+      expect(authority).not.toBeNull();
+      await expect(adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000c6",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "send", message: "Continue" },
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).resolves.toEqual({ code: "APPLIED", state: "applied" });
+      expect(commands.map((command) => command.kind)).toEqual(["session.send"]);
+
+      value.store.beginPersonalSessionDetach({ sessionId: adopted.session.id });
+      const readsBeforeDetachingChecks = claude.readSessionCalls;
+      await expect(adapter.resolveCommandAuthority({
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).resolves.toBeNull();
+      await expect(adapter.planCompactProjectionRecovery({
+        idempotencyKey: "018bcfe5-6800-7000-8000-0000000000c7",
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).rejects.toThrow("local authority changed");
+      await adapter.listSessions({ limit: 25, signal });
+      expect(claude.readSessionCalls).toBe(readsBeforeDetachingChecks);
+      await expect(adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000c8",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 2 },
+        payload: { kind: "stop" },
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).resolves.toEqual({ code: "LOCAL_AUTHORITY_CHANGED", state: "failed" });
     } finally {
       adapter.close();
       value.store.close();
@@ -852,18 +1077,16 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const profileId = value.store.requireSession(value.sessionId).profileId;
     for (let index = 0; index < 30; index += 1) {
-      const created = value.store.createSession({
+      value.store.upsertProviderSession({
         fastEnabled: false,
         preset: "high",
         profileId,
-        title: `Paged ${index}`,
-      });
-      value.store.bindSession({
-        expectedRevision: created.revision,
+        provider: "codex",
         providerThreadId: `thread_page_${index.toString().padStart(4, "0")}`,
         providerUpdatedAt: 2_000 + index,
-        sessionId: created.id,
+        providerAccountKey: `v1:codex:${sha256("person@example.com")}`,
         state: "idle",
+        title: `Paged ${index}`,
       });
     }
     const adapter = new StateBackedCloudDaemonAdapter({
@@ -4293,6 +4516,79 @@ describe("settings commands and the device registry", () => {
     }
   });
 
+  test("maps Codex automations to exact sessions beyond the recent window and fails closed on home ambiguity", async () => {
+    const value = await fixture();
+    const original = value.store.requireSession(value.sessionId);
+    const profile = value.store.requireProfileById(original.profileId);
+    value.setNow(2_000);
+    for (let index = 0; index < 101; index += 1) {
+      value.store.upsertProviderSession({
+        fastEnabled: false,
+        preset: "high",
+        profileId: profile.id,
+        provider: "codex",
+        providerAccountKey: `v1:codex:${sha256("person@example.com")}`,
+        providerThreadId: `newer-codex-thread-${index}`,
+        providerUpdatedAt: 2_000,
+        state: "idle",
+        title: `Newer Codex session ${index}`,
+      });
+    }
+    expect(value.store.listSessions(100, undefined, true).map((session) => session.id))
+      .not.toContain(original.id);
+    const adapter = new StateBackedCloudDaemonAdapter({
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      readCodexAutomations: () => Promise.resolve([{
+        cadence: "FREQ=DAILY",
+        id: "old-session-task",
+        kind: "heartbeat",
+        label: "Old session task",
+        status: "paused",
+        targetThreadId: original.providerThreadId ?? null,
+        updatedAt: 2_000,
+      }]),
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      expect((await adapter.readDeviceRegistry({ signal })).scheduledTasks)
+        .toEqual([expect.objectContaining({
+          id: "old-session-task",
+          sessionPublicId: original.id,
+        })]);
+
+      const duplicateProfile = value.store.createProfile("Other Codex home");
+      const duplicateGeneration = value.store.nextProfileGeneration(duplicateProfile.id);
+      expect(value.store.setProfileState(
+        duplicateGeneration.id,
+        duplicateGeneration.processGeneration,
+        "signed_in",
+        { email: "other@example.com" },
+      )).toBe(true);
+      value.store.upsertProviderSession({
+        fastEnabled: false,
+        preset: "high",
+        profileId: duplicateProfile.id,
+        provider: "codex",
+        providerAccountKey: `v1:codex:${sha256("other@example.com")}`,
+        providerThreadId: original.providerThreadId ?? "thread_0001",
+        providerUpdatedAt: 2_000,
+        state: "idle",
+        title: "Same opaque id in another home",
+      });
+      expect((await adapter.readDeviceRegistry({ signal })).scheduledTasks)
+        .toEqual([expect.objectContaining({
+          id: "old-session-task",
+          sessionPublicId: null,
+        })]);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
   test("uploads the archived flag in session metadata only while archived", async () => {
     const value = await fixture();
     const adapter = new StateBackedCloudDaemonAdapter({
@@ -4331,15 +4627,26 @@ async function deviceCommandFixture() {
   const project = await value.store.createProject("Control plane", root, true);
   const account = value.store.listProfiles()[0];
   if (account === undefined) throw new Error("missing account fixture");
+  const loginAccount = value.store.createProfile("Link target");
   const executed: LocalCommand[] = [];
   const notices: string[] = [];
   const adapter = new StateBackedCloudDaemonAdapter({
     readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
     executeLocal: (command) => {
       executed.push(command);
-      return Promise.resolve(command.kind === "session.start"
-        ? { session: { id: value.sessionId } }
-        : {});
+      if (command.kind === "session.start") {
+        return Promise.resolve({ session: { id: value.sessionId } });
+      }
+      if (command.kind === "account.login") {
+        return Promise.resolve({
+          login: {
+            loginId: "login_incomplete",
+            status: "pending",
+            verificationUrl: "https://auth.example.test/device",
+          },
+        });
+      }
+      return Promise.resolve({});
     },
     executeRemote: () => Promise.resolve({}),
     notifyOperator: (input) => { notices.push(input.title); return Promise.resolve(); },
@@ -4355,7 +4662,7 @@ async function deviceCommandFixture() {
     prompt: "continue the migration",
     provider: "codex" as const,
   };
-  return { account, adapter, executed, notices, project, sessionStart, value };
+  return { account, adapter, executed, loginAccount, notices, project, sessionStart, value };
 }
 
 describe("device command execution", () => {
@@ -4457,11 +4764,15 @@ describe("device command execution", () => {
     }
   });
 
-  test("account linking needs the local opt-in and refuses a non-relayable URL", async () => {
+  test("account linking needs the local opt-in and a complete device-code handoff", async () => {
     const world = await deviceCommandFixture();
     try {
       const signal = new AbortController().signal;
-      const payload = { accountPublicId: world.account.id, kind: "account_login_start" as const };
+      const payload = {
+        accountPublicId: world.loginAccount.id,
+        handoffVersion: 2 as const,
+        kind: "account_login_start" as const,
+      };
       expect(await world.adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000004",
         payload,
@@ -4470,30 +4781,44 @@ describe("device command execution", () => {
       })).toEqual({ code: "ACCOUNT_LINKING_DENIED", state: "failed" });
 
       world.value.store.setAccountLinkingAllowed(true);
-      // The daemon's login returned a loopback callback, which no other device
-      // can complete: the command fails closed rather than relaying it.
+      // A verification URL without the separate one-time user code is not a
+      // usable Codex device-code handoff, so the command fails closed.
       expect(await world.adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000005",
         payload,
         requestingDevicePublicId: "device_browser1",
         signal,
       })).toEqual({ code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" });
+      expect(world.executed).toHaveLength(1);
+      expect(world.executed[0]).toMatchObject({
+        account: world.loginAccount.id,
+        deviceCode: true,
+        kind: "account.login",
+      });
     } finally {
       world.adapter.close();
       world.value.store.close();
     }
   });
 
-  test("relays a single-use https login URL when the machine has opted in", async () => {
+  test("relays the complete single-use device-code handoff when the machine has opted in", async () => {
     const value = await fixture();
-    const account = value.store.listProfiles()[0];
-    if (account === undefined) throw new Error("missing account fixture");
+    const account = value.store.createProfile("Relay target");
     value.store.setAccountLinkingAllowed(true);
+    const executed: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
       readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
-      executeLocal: () => Promise.resolve({
-        login: { loginId: "login_1", status: "pending", verificationUrl: "https://auth.example.test/device?code=abc" },
-      }),
+      executeLocal: (command) => {
+        executed.push(command);
+        return Promise.resolve({
+          login: {
+            loginId: "login_1",
+            status: "pending",
+            userCode: "ABCD-EFGH",
+            verificationUrl: "https://auth.example.test/device",
+          },
+        });
+      },
       executeRemote: () => Promise.resolve({}),
       now: () => 1_760_000_000_000,
       paths: value.paths,
@@ -4502,15 +4827,26 @@ describe("device command execution", () => {
     try {
       const outcome = await adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000006",
-        payload: { accountPublicId: account.id, kind: "account_login_start" },
+        payload: {
+          accountPublicId: account.id,
+          handoffVersion: 2,
+          kind: "account_login_start",
+        },
         requestingDevicePublicId: "device_browser1",
         signal: new AbortController().signal,
       });
       expect(outcome).toMatchObject({ code: "APPLIED", singleUseResult: true, state: "applied" });
       expect(outcome.result).toEqual({
         expiresAt: 1_760_000_000_000 + 5 * 60 * 1_000,
+        handoffVersion: 2,
         kind: "account_login_start",
-        loginUrl: "https://auth.example.test/device?code=abc",
+        loginUrl: "https://auth.example.test/device",
+        userCode: "ABCD-EFGH",
+      });
+      expect(executed[0]).toMatchObject({
+        account: account.id,
+        deviceCode: true,
+        kind: "account.login",
       });
     } finally {
       adapter.close();
@@ -4518,19 +4854,107 @@ describe("device command execution", () => {
     }
   });
 
-  test("reports login status one way, with a CLI instruction and no account", async () => {
+  test("keeps the legacy URL-only browser handoff for an unversioned requester", async () => {
     const world = await deviceCommandFixture();
     try {
       world.value.store.setAccountLinkingAllowed(true);
       const outcome = await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000008",
+        payload: { accountPublicId: world.loginAccount.id, kind: "account_login_start" },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      expect(outcome).toEqual({
+        code: "APPLIED",
+        result: {
+          expiresAt: 1_760_000_000_000 + 5 * 60 * 1_000,
+          kind: "account_login_start",
+          loginUrl: "https://auth.example.test/device",
+        },
+        singleUseResult: true,
+        state: "applied",
+      });
+      expect(world.executed[0]).toMatchObject({
+        account: world.loginAccount.id,
+        deviceCode: false,
+        kind: "account.login",
+      });
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("refuses to relink a signed-in account before executing a local command", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      world.value.store.setAccountLinkingAllowed(true);
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000e",
+        payload: {
+          accountPublicId: world.account.id,
+          handoffVersion: 2,
+          kind: "account_login_start",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      })).toEqual({ code: "ACCOUNT_LOGIN_NOT_AVAILABLE", state: "failed" });
+      expect(world.executed).toEqual([]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("reports login status for the addressed account without leaking a sibling", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      world.value.store.setAccountLinkingAllowed(true);
+      const sibling = world.value.store.createProfile("Sibling");
+      expect(world.value.store.setProfileState(
+        sibling.id,
+        sibling.processGeneration,
+        "login_pending",
+      )).toBe(true);
+      const outcome = await world.adapter.executeDeviceCommand({
         idempotencyKey: "018bcfe5-6800-7000-8000-000000000007",
-        payload: { kind: "account_login_status" },
+        payload: {
+          accountPublicId: world.account.id,
+          kind: "account_login_status",
+        },
         requestingDevicePublicId: "device_browser1",
         signal: new AbortController().signal,
       });
       expect(outcome).toMatchObject({ code: "APPLIED", state: "applied" });
-      expect(outcome.result).toMatchObject({ kind: "account_login_status", status: "idle" });
-      expect(JSON.stringify(outcome.result)).toContain("hra account login");
+      expect(outcome.result).toEqual({
+        instruction: "This account is signed in on this machine.",
+        kind: "account_login_status",
+        status: "signed_in",
+      });
+      const siblingStatus = await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000d",
+        payload: {
+          accountPublicId: sibling.id,
+          kind: "account_login_status",
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      expect(siblingStatus.result).toEqual({
+        instruction: `A login is in progress for this account. Finish its existing browser or device-code handoff, or cancel it with \`hra account login-cancel ${sibling.id}\`.`,
+        kind: "account_login_status",
+        status: "pending",
+      });
+      const legacy = await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-00000000000c",
+        payload: { kind: "account_login_status" },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      });
+      expect(legacy.result).toMatchObject({
+        kind: "account_login_status",
+        status: "pending",
+      });
       expect(world.executed).toEqual([]);
     } finally {
       world.adapter.close();

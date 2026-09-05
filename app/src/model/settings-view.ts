@@ -268,6 +268,8 @@ export function archivedSessionRows(
 export type AccountRowView = Readonly<{
   /** The machine's local opt-in: `hra remote allow account-linking`. */
   accountLinkingAllowed: boolean;
+  /** The machine-wide device-command kill switch. */
+  deviceCommandsAllowed: boolean;
   label: string;
   machineLabel: string;
   provider: DeviceRegistryAccount["provider"];
@@ -288,6 +290,7 @@ export const accountStatusLabels: Readonly<
 export function accountRows(machines: readonly MachineView[]): readonly AccountRowView[] {
   return machines.flatMap((machine) => machine.accounts.map((account) => ({
     accountLinkingAllowed: machine.accountLinkingAllowed,
+    deviceCommandsAllowed: machine.deviceCommandsAllowed,
     label: account.label,
     machineLabel: machine.label,
     provider: account.provider,
@@ -295,4 +298,11 @@ export function accountRows(machines: readonly MachineView[]): readonly AccountR
     status: account.status,
     targetDevicePublicId: machine.devicePublicId,
   })));
+}
+
+/** Browser login controls exist only when both local machine gates admit them. */
+export function accountBrowserLoginAllowed(account: AccountRowView): boolean {
+  return account.provider === "codex"
+    && account.deviceCommandsAllowed
+    && account.accountLinkingAllowed;
 }

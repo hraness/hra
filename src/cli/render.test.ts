@@ -292,6 +292,89 @@ describe("CLI rendering", () => {
     expect(shown.stdout.join("")).not.toContain("/private/provider/profile");
   });
 
+  test("renders Claude account status without sibling Codex identity fields", () => {
+    const accountId = `acct_${"1".repeat(32)}`;
+    const data = {
+      account: { id: accountId, label: "Private" },
+      authentication: { provider: "claude", signedIn: false },
+      nextCommand: `hra account login ${accountId} --provider claude`,
+      providerGeneration: 4,
+    } as const;
+    const human = capture();
+    renderSuccess(
+      { kind: "account.show", account: accountId, provider: "claude" },
+      data,
+      false,
+      human.output,
+    );
+    expect(human.stdout.join("")).toBe([
+      "Claude Code: signed out",
+      "Label: Private",
+      `ID: ${accountId}`,
+      "Provider generation: 4",
+      `Next: hra account login ${accountId} --provider claude`,
+      "",
+    ].join("\n"));
+    const json = capture();
+    renderSuccess(
+      { kind: "account.show", account: accountId, provider: "claude" },
+      data,
+      true,
+      json.output,
+    );
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      command: "account.show",
+      data,
+      ok: true,
+      version: 1,
+    });
+    expect(json.stdout.join("")).not.toMatch(/providerEmail|providerPlan|updatedAt|state/u);
+  });
+
+  test("renders Claude recovery and acknowledged local abandon truthfully", () => {
+    const accountId = `acct_${"2".repeat(32)}`;
+    const attemptId = `attempt_${"3".repeat(32)}`;
+    const key = "00000000-0000-4000-8000-000000000317";
+    const abandonCommand = `hra account login-cancel ${accountId} --provider claude --attempt-id ${attemptId} --provider-generation 4 --idempotency-key ${key} --acknowledge-child-exited`;
+    const status = capture();
+    renderSuccess(
+      { kind: "account.show", account: accountId, provider: "claude" },
+      {
+        account: { id: accountId, label: "Recovery" },
+        authentication: { provider: "claude", signedIn: null },
+        providerGeneration: 5,
+        recovery: {
+          required: true,
+          diagnostic: "Credential presence does not prove child exit.",
+          statusCommand: `hra account show ${accountId} --provider claude`,
+          abandonCommand,
+        },
+      },
+      false,
+      status.output,
+    );
+    expect(status.stdout.join("")).toContain("Claude Code: status unknown");
+    expect(status.stdout.join("")).toContain(
+      `Only after confirming the original Claude child exited: ${abandonCommand}`,
+    );
+
+    const abandoned = capture();
+    renderSuccess({
+      kind: "account.claude-login.abandon",
+      account: accountId,
+      attemptId,
+      idempotencyKey: key,
+      providerGeneration: 4,
+      acknowledgeChildExited: true,
+    }, {
+      account: { id: accountId, label: "Recovery" },
+      login: { status: "abandoned", localOnly: true, credentialAction: "none" },
+    }, false, abandoned.output);
+    expect(abandoned.stdout.join("")).toContain(
+      "HRA did not stop Claude or change or delete Claude credentials",
+    );
+  });
+
   test("renders auth status as a state-first device handoff without changing JSON", () => {
     const pendingDeviceId = `device_${"A".repeat(24)}`;
     const localDeviceId = `device_${"B".repeat(24)}`;
@@ -933,6 +1016,25 @@ describe("CLI rendering", () => {
     }, false, malformed.output);
     expect(malformed.stderr.join("")).not.toContain("\nNext:");
     expect(malformed.stderr.join("")).toContain('"accountState": "signed_out"');
+
+    const claude = capture();
+    const claudeDetails = {
+      accountSelector: accountId,
+      accountState: "signed_out",
+      nextCommand: `hra account login ${accountId} --provider claude`,
+      provider: "claude",
+    } as const;
+    renderFailure({ ...error, details: claudeDetails }, false, claude.output);
+    expect(claude.stderr.join("")).toContain(
+      `Next: hra account login ${accountId} --provider claude`,
+    );
+
+    const widenedClaude = capture();
+    renderFailure({
+      ...error,
+      details: { ...claudeDetails, unexpected: true },
+    }, false, widenedClaude.output);
+    expect(widenedClaude.stderr.join("")).not.toContain("\nNext:");
   });
 
   test("renders only the exact bounded project repair action while preserving JSON details", () => {
@@ -2014,6 +2116,7 @@ describe("CLI rendering", () => {
       listing: {
         accountSelector: accountId,
         accountState: "signed_out",
+        provider: "codex",
         scope: "local_only",
         freshness: "stale",
         localCompleteness: "partial",
@@ -2032,6 +2135,17 @@ describe("CLI rendering", () => {
         revision: 4,
         createdAt: 1_700_000_000_000,
         updatedAt: 1_700_000_000_001,
+      }, {
+        id: "sess_11111111111111111111111111111111",
+        profileId: accountId,
+        title: "Live Claude thread",
+        state: "idle",
+        provider: "claude",
+        preset: "fable-max",
+        fastEnabled: false,
+        revision: 2,
+        createdAt: 1_700_000_000_002,
+        updatedAt: 1_700_000_000_003,
       }],
       nextCursor: cursor,
     };
@@ -2042,13 +2156,17 @@ describe("CLI rendering", () => {
       false,
       human.output,
     );
-    expect(human.stdout.join("")).toContain(`Scope: local-only cache for ${accountId}`);
-    expect(human.stdout.join("")).toContain("Freshness: stale; provider not contacted");
+    expect(human.stdout.join("")).toContain(`Codex scope: local-only cache for ${accountId}`);
+    expect(human.stdout.join("")).toContain("Codex freshness: stale; Codex provider not contacted");
     expect(human.stdout.join("")).toContain(
-      "Completeness: partial local cache; more pages available; provider completeness unknown",
+      "Codex completeness: partial local cache; more pages available; Codex provider completeness unknown",
     );
-    expect(human.stdout.join("")).toContain(`Sign in to refresh: hra account login ${accountId}`);
+    expect(human.stdout.join("")).toContain(`Sign in to refresh Codex: hra account login ${accountId}`);
     expect(human.stdout.join("")).toContain("Older imported thread");
+    expect(human.stdout.join("")).toContain("Live Claude thread");
+    expect(human.stdout.join("")).not.toContain("Claude freshness");
+    expect(human.stdout.join("")).not.toContain("Claude provider not contacted");
+    expect(human.stdout.join("")).not.toContain("Sign in to refresh Claude");
     expect(human.stdout.join("")).toContain(
       `Continue: hra session list --account ${accountId} --limit 37 --cursor ${cursor}\n`,
     );
@@ -2141,6 +2259,20 @@ describe("CLI rendering", () => {
       unsafeMetadata.output,
     )).toThrow(InvalidCommandResponseError);
     expect(unsafeMetadata.stdout.join("")).not.toContain("touch /tmp/unsafe");
+
+    for (const invalidListing of [
+      { ...listing.listing, provider: "claude" },
+      Object.fromEntries(Object.entries(listing.listing).filter(([key]) => key !== "provider")),
+    ]) {
+      const invalidProvider = capture();
+      expect(() => renderSuccess(
+        { kind: "session.list", account: accountId, archived: false, limit: 37 },
+        { ...listing, listing: invalidListing },
+        false,
+        invalidProvider.output,
+      )).toThrow(InvalidCommandResponseError);
+      expect(invalidProvider.stdout).toEqual([]);
+    }
   });
 
   test("renders brokered MCP form input as protected", () => {

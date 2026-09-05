@@ -146,6 +146,7 @@ class FakeClaudeProcess implements ClaudeProcess {
   readonly stderr: AsyncIterable<Uint8Array> = {
     async *[Symbol.asyncIterator]() { /* silent */ },
   };
+  terminated = false;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
@@ -180,6 +181,7 @@ class FakeClaudeProcess implements ClaudeProcess {
   }
 
   terminate(): void {
+    this.terminated = true;
     this.#finish?.();
     this.#resolveExit?.(0);
   }
@@ -190,6 +192,7 @@ class FakeClaudeProcess implements ClaudeProcess {
 /** The Codex seam a Claude-only fixture still needs for account sign-in. */
 class SignInOnlyCodex implements CodexRuntimePort {
   readonly provider = "codex" as const;
+  discardRuntimeReview(): void {}
   #unsupported(): never {
     throw new Error("This fixture drives the Claude provider only.");
   }
@@ -254,7 +257,10 @@ type ClaudeFixture = Readonly<{
 }>;
 
 async function claudeFixture(
-  options: Readonly<{ resolveRuntime?: () => Promise<PinnedClaudeRuntime> }> = {},
+  options: Readonly<{
+    claudeSignedIn?: boolean;
+    resolveRuntime?: () => Promise<PinnedClaudeRuntime>;
+  }> = {},
 ): Promise<ClaudeFixture> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-")));
   roots.push(home);
@@ -292,6 +298,7 @@ async function claudeFixture(
       queueMicrotask(() => { process.emit({ ...initLine, session_id: providerThreadId }); });
       return process;
     },
+    readAuthStatus: async () => ({ signedIn: options.claudeSignedIn ?? true }),
     resolveRuntime: options.resolveRuntime ?? (async () => pinnedRuntime),
   });
   const cloud = new OfflineCloud();
@@ -301,6 +308,7 @@ async function claudeFixture(
     codex: new SignInOnlyCodex(),
     daemonAuthority: { assertCurrent: async () => {}, close: () => {} },
     paths,
+    platform: "linux",
     requestStop: () => undefined,
     store,
   });
@@ -309,7 +317,7 @@ async function claudeFixture(
   return { cloud, documents, processes, service, store };
 }
 
-async function signedInClaudeAccount(
+async function authenticatedClaudeAccount(
   value: ClaudeFixture,
   label: string,
 ): Promise<`acct_${string}`> {
@@ -317,10 +325,6 @@ async function signedInClaudeAccount(
     { kind: "account.add", label },
     { signal },
   ) as { account: { id: `acct_${string}` } };
-  await value.service.execute(
-    { account: added.account.id, deviceCode: false, kind: "account.login" },
-    { signal },
-  );
   await value.service.execute(
     { kind: "project.add", label: `${label} project`, path: value.documents },
     { signal },
@@ -345,9 +349,208 @@ const eventBodies = async (
 };
 
 describe("Claude sessions on the local authority", () => {
+  test("does not rotate a profile underneath an unsettled Claude login launch", async () => {
+    const value = await claudeFixture({ claudeSignedIn: false });
+    const account = await authenticatedClaudeAccount(value, "Claude login generation fence");
+    const loginKey = crypto.randomUUID();
+    const prepared = await value.service.execute({
+      account,
+      idempotencyKey: loginKey,
+      kind: "account.claude-login.prepare",
+    }, { signal }) as { login: { attemptId: string; providerGeneration: number } };
+    const before = value.store.requireProfileById(account);
+
+    await expect(value.service.execute({
+      account,
+      deviceCode: true,
+      idempotencyKey: crypto.randomUUID(),
+      kind: "account.login",
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(value.store.requireProfileById(account).processGeneration).toBe(before.processGeneration);
+    expect(value.store.readMutation(loginKey)).toMatchObject({
+      id: prepared.login.attemptId,
+      state: "effect_started",
+    });
+
+    await value.service.observeCodexFact({
+      codexHome: "unused-codex-home",
+      desktopUserData: "unused-desktop-home",
+      generation: before.processGeneration,
+      id: before.id,
+    }, {
+      connectionId: "21000000-0000-4000-8000-000000000002",
+      reason: "eof",
+      type: "providerDisconnected",
+    });
+    expect(value.store.requireProfileById(account).processGeneration).toBe(before.processGeneration);
+    expect(value.store.readMutation(loginKey)).toMatchObject({ state: "effect_started" });
+  });
+
+  test("keeps an idle Claude session owned and usable across a Codex login generation change", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude survives Codex login");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+
+    const before = value.store.requireProfileById(account);
+    expect(before.state).toBe("signed_out");
+    await value.service.execute({
+      account,
+      deviceCode: false,
+      idempotencyKey: crypto.randomUUID(),
+      kind: "account.login",
+    }, { signal });
+
+    const after = value.store.requireProfileById(account);
+    expect(after).toMatchObject({
+      processGeneration: before.processGeneration + 1,
+      state: "signed_in",
+    });
+    expect(value.processes).toEqual([process]);
+    expect(process.terminated).toBe(false);
+    const afterLoginBodies = await eventBodies(value, started.session.id);
+    expect(afterLoginBodies).not.toContainEqual(
+      expect.objectContaining({ type: "gap", reason: "provider_disconnect" }),
+    );
+    expect(afterLoginBodies).not.toContainEqual(
+      expect.objectContaining({ type: "connection", state: "disconnected" }),
+    );
+
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Keep working after the Codex login",
+      session: started.session.id,
+    }, { signal });
+    const stopped = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.stop",
+      session: started.session.id,
+    }, { signal }) as { stopped: boolean };
+    expect(stopped.stopped).toBe(true);
+    expect(process.written.join("\n")).toContain("Keep working after the Codex login");
+    expect(process.written.some((line) => line.includes("interrupt"))).toBe(true);
+    expect(process.terminated).toBe(false);
+  });
+
+  test("refuses a Codex login before rotating an in-flight Claude authority", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude blocks Codex login");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Keep this turn in flight",
+      session: started.session.id,
+    }, { signal });
+    const before = value.store.requireProfileById(account);
+
+    const refusal = await value.service.execute({
+      account,
+      deviceCode: false,
+      idempotencyKey: crypto.randomUUID(),
+      kind: "account.login",
+    }, { signal }).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(Error);
+    expect(refusal).toMatchObject({ code: "CONFLICT" });
+    expect(value.store.requireProfileById(account)).toMatchObject({
+      processGeneration: before.processGeneration,
+      state: before.state,
+    });
+    expect(process.terminated).toBe(false);
+    expect(await eventBodies(value, started.session.id)).not.toContainEqual(
+      expect.objectContaining({ type: "gap", reason: "provider_disconnect" }),
+    );
+
+    const stopped = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.stop",
+      session: started.session.id,
+    }, { signal }) as { stopped: boolean };
+    expect(stopped.stopped).toBe(true);
+    expect(process.written.some((line) => line.includes("interrupt"))).toBe(true);
+    process.emit(resultLine("Stopped cleanly"));
+    await settle();
+    await expect(value.service.execute({
+      account,
+      deviceCode: false,
+      idempotencyKey: crypto.randomUUID(),
+      kind: "account.login",
+    }, { signal })).resolves.toMatchObject({
+      account: { processGeneration: before.processGeneration + 1 },
+    });
+    expect(process.terminated).toBe(false);
+  });
+
+  test("keeps an idle Claude session usable when the sibling Codex runtime disconnects", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude survives Codex disconnect");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    const before = value.store.requireProfileById(account);
+
+    await value.service.observeCodexFact({
+      codexHome: "unused-codex-home",
+      desktopUserData: "unused-desktop-home",
+      generation: before.processGeneration,
+      id: before.id,
+    }, {
+      connectionId: "21000000-0000-4000-8000-000000000001",
+      reason: "eof",
+      type: "providerDisconnected",
+    });
+
+    expect(value.store.requireProfileById(account).processGeneration)
+      .toBe(before.processGeneration + 1);
+    expect(process.terminated).toBe(false);
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Continue after the Codex disconnect",
+      session: started.session.id,
+    }, { signal });
+    const stopped = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.stop",
+      session: started.session.id,
+    }, { signal }) as { stopped: boolean };
+    expect(stopped.stopped).toBe(true);
+    expect(process.written.join("\n")).toContain("Continue after the Codex disconnect");
+    expect(process.written.some((line) => line.includes("interrupt"))).toBe(true);
+  });
+
   test("runs one whole session: start, turn, deltas, approval, steer, completion", async () => {
     const value = await claudeFixture();
-    const account = await signedInClaudeAccount(value, "Claude");
+    const account = await authenticatedClaudeAccount(value, "Claude");
+    expect(value.store.requireProfileById(account).state).toBe("signed_out");
 
     const started = await value.service.execute({
       account,
@@ -496,7 +699,7 @@ describe("Claude sessions on the local authority", () => {
 
   test("answers a Claude question and projects its subagents as durable events", async () => {
     const value = await claudeFixture();
-    const account = await signedInClaudeAccount(value, "Claude question");
+    const account = await authenticatedClaudeAccount(value, "Claude question");
     const started = await value.service.execute({
       account,
       fast: false,
@@ -554,7 +757,7 @@ describe("Claude sessions on the local authority", () => {
 
   test("stops an in-flight Claude turn through the same interrupt path", async () => {
     const value = await claudeFixture();
-    const account = await signedInClaudeAccount(value, "Claude stop");
+    const account = await authenticatedClaudeAccount(value, "Claude stop");
     const started = await value.service.execute({
       account,
       fast: false,
@@ -593,7 +796,7 @@ describe("Claude sessions on the local authority", () => {
         throw new Error("the pinned Claude Code executable is not installed");
       },
     });
-    const account = await signedInClaudeAccount(value, "No binary");
+    const account = await authenticatedClaudeAccount(value, "No binary");
     await expect(value.service.execute({
       account,
       fast: false,
@@ -609,7 +812,7 @@ describe("Claude sessions on the local authority", () => {
 
   test("refuses Codex-only capabilities on a Claude session by name", async () => {
     const value = await claudeFixture();
-    const account = await signedInClaudeAccount(value, "Claude capabilities");
+    const account = await authenticatedClaudeAccount(value, "Claude capabilities");
     const started = await value.service.execute({
       account,
       fast: false,
@@ -627,7 +830,7 @@ describe("Claude sessions on the local authority", () => {
 
   test("feeds the live uploader exactly as a Codex session does", async () => {
     const value = await claudeFixture();
-    const account = await signedInClaudeAccount(value, "Claude live");
+    const account = await authenticatedClaudeAccount(value, "Claude live");
     const started = await value.service.execute({
       account,
       fast: false,

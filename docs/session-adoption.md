@@ -1,6 +1,6 @@
 # Adopt sessions from personal provider homes
 
-HRA can discover recent Codex and Claude Code sessions in your personal provider homes and bring them into the local daemon. Adoption is opt-in for each provider. After provider-specific admission succeeds, the conversation is an ordinary HRA session with the same public session commands, autorespond policy, and approval authority as every other HRA session.
+HRA can discover recent Codex and Claude Code sessions in your personal provider homes and bring them into the local daemon. A personal Codex thread targeted by a present Codex Desktop scheduled task is also discoverable even when the thread is older. Adoption is opt-in for each provider. After provider-specific admission succeeds, the conversation is an ordinary HRA session with the same public session commands, autorespond policy, and approval authority as every other HRA session.
 
 Discovery does not create a public or reduced-capability session tier. Candidates stay in private local state until HRA can claim them. The session list and normal session interface expose no separate source badge or mode.
 
@@ -8,15 +8,15 @@ Discovery does not create a public or reduced-capability session tier. Candidate
 
 The default personal provider homes are `~/.codex` and `~/.claude` for the current OS user.
 
-- Codex discovery asks the pinned personal-home app-server for bounded session-list pages. It does not parse transcripts or a session index.
+- Codex discovery asks the pinned personal-home app-server for bounded session-list pages. It also cycles fairly through bounded pages of Codex Desktop `automation.toml` records to find exact heartbeat `target_thread_id` values, then obtains those threads through metadata-only `thread/read` requests. Before and after a claim, HRA reopens the exact automation sources that granted an age waiver. It never reads an automation prompt, Codex transcript, session index, or Desktop SQLite cache, and it does not resume a thread during discovery.
 - Claude discovery reads only allowlisted scalar fields from the local live-session registry, accepts only records naming HRA's exact pinned Claude Code version, and never invokes Claude merely to discover sessions. The bounded registry snapshot must reach a proven end before a dead-process result can authorize admission; truncation, a read failure, or conflicting duplicate metadata leaves the candidate unknown and pending.
 - Claude registry discovery never opens a registry key file or an advertised socket. Process liveness is inferred from the PID domain, PID, and the host's bounded process-start token.
 
-During discovery, HRA requests only read operations from the provider binary or app-server, which may maintain its own home internals while servicing those requests. HRA does not directly modify or parse Codex home files. Its Claude fallback directly opens only allowlisted registry records read-only. Candidate records, liveness evidence, and controller provenance remain private local state and are not uploaded as candidates by cloud sync. Once adopted, the session's ordinary fields follow the same optional encrypted-sync rules as any other HRA session.
+During discovery, HRA requests only read operations from the provider binary or app-server, which may maintain its own home internals while servicing those requests. HRA directly opens only allowlisted Codex automation records and Claude registry records, using bounded no-follow reads. Candidate records, scheduled-target evidence, liveness evidence, and controller provenance remain private local state and are not uploaded as candidates by cloud sync. Once adopted, the session's ordinary fields follow the same optional encrypted-sync rules as any other HRA session.
 
 ## Before you enable adoption
 
-You need a signed-in HRA account to own the adopted session. The account selector records HRA ownership and routing. It does not copy or move credentials from the personal provider home.
+You need an existing HRA account profile to own the adopted session. The account selector records HRA ownership and routing; it does not copy or move credentials from the personal provider home. Codex adoption additionally requires that profile's isolated Codex account to be signed in with an identifiable address matching the personal Codex home. Claude adoption instead proves the personal Claude account directly and does not require the profile's independent Codex account to be signed in.
 
 Register every project root that HRA may adopt:
 
@@ -52,22 +52,22 @@ Use `hra session list --account <account>` to list the account's ordinary HRA se
 
 ## Which sessions can be adopted
 
-HRA admits only bounded, nonterminal observations from the last 15 minutes. Stale Codex rows and rows without a usable timestamp are not claimable history. Claude registry rows also need a recent timestamp and the exact pinned version.
+HRA normally admits only bounded, nonterminal observations from the last 15 minutes. A valid Codex Desktop heartbeat automation with an exact target thread waives only that target's 15-minute age limit. Both active and paused automation records count while present; deleting the record or retargeting it removes the waiver. Rows without a usable timestamp remain ineligible. Claude registry rows still need a recent timestamp and the exact pinned version because Claude exposes no equivalent schedule source.
 
 Every candidate must also meet these conditions:
 
-- Its provider is enabled and bound to one signed-in HRA account.
+- Its provider is enabled and bound to one current HRA account profile. Codex also requires that profile's exact signed-in Codex identity; Claude requires the exact personal Claude identity and remains independent of the profile's Codex sign-in state.
 - Its reported project root matches a registered HRA project.
 - No other HRA session or account already owns its provider thread.
 - HRA can resume the exact provider thread and recheck its identity, project, and idle state.
 
-Discovery and admission are separate checks. A candidate may remain pending until every provider-specific admission condition succeeds.
+Discovery and admission are separate checks. A scheduled-task association is re-read around the Codex claim and never substitutes for account identity, project, liveness, quiescence, or exact-thread proof. A candidate may remain pending until every provider-specific admission condition succeeds.
 
 HRA permits only one active HRA binding for each provider thread. Provider APIs do not expose a global lock against every external controller, so adoption cannot prove that a terminal or another app will never resume the same conversation later. The private controller binding tells HRA where to route and release effects; it does not create a public session kind.
 
 ### Codex custody
 
-Codex does not expose an exclusive handoff operation. HRA therefore uses an inactivity inference that is part of the opt-in policy. A row is treated as live while the provider reports an active state or active turn, and an idle row remains live for 10 minutes after its last update. An idle row more than 10 minutes old can be admitted while it is still inside the 15-minute discovery window. Missing or unusable timestamps remain unknown and pending.
+Codex does not expose an exclusive handoff operation. HRA therefore uses an inactivity inference that is part of the opt-in policy. A row is treated as live while the provider reports an active state or active turn, and an idle row remains live for 10 minutes after its last update. An idle row more than 10 minutes old can be admitted while it is still inside the 15-minute discovery window or while a present valid heartbeat automation targets it. Missing or unusable timestamps remain unknown and pending.
 
 For an eligible row, HRA resumes the exact thread through the pinned personal-home app-server with a policy-neutral resume. Before durable admission commits, that resume changes no provider turn policy; it establishes the exact thread, connection, and quiescent observation. After commit, every HRA-owned turn applies a fresh reviewed model, workspace permission profile, `on-request` approval policy, and `auto_review` reviewer immediately before provider dispatch, then records the effective response under the session's authority.
 
@@ -87,11 +87,11 @@ An admitted session uses the ordinary HRA session surface. You can send, queue, 
 
 HRA cannot answer an approval that was delivered only to a prior controller, and it does not backfill a complete local event history from before adoption. Existing provider history remains in the provider home and can appear through ordinary bounded provider reads.
 
-One pinned Codex protocol limitation is narrower than the public session surface: `thread/resume` can replace approval, reviewer, model, and workspace policy, but it cannot add a thread-creation-only dynamic tool to a conversation that never had it. CLI and app scheduling still work, and HRA enables its automation handler if the resumed thread already knows that tool, but the model in an arbitrary pre-existing Codex thread may be unable to originate an automation change itself.
+One pinned Codex protocol limitation is narrower than the public session surface: `thread/resume` can replace approval, reviewer, model, and workspace policy, but it cannot add a thread-creation-only dynamic tool to a conversation that never had it. CLI and app scheduling still work, and HRA enables its automation handler if the resumed thread already knows that tool, but the model in an arbitrary pre-existing Codex thread may be unable to originate an automation change itself. A Codex Desktop scheduled task remains owned by Codex Desktop; HRA adopts its target conversation as an ordinary session rather than converting that task into a separate HRA conversation task.
 
 ## Account changes and recovery
 
-Session origin does not change account authority or recovery behavior. HRA binds each controlled session to the exact provider account identity it admitted and rechecks that identity around provider effects. If the provider signs out, exposes a replacement account, or no longer exposes a provable identity, HRA first marks every affected nonterminal session `recovery_required`. It cancels effects that have not started, preserves in-flight effects as ambiguous or unknown, pauses scheduled work, and releases the exact native and personal-home controllers held by the prior authority. Account and session status keep that recovery visible, and daemon restart continues any incomplete release.
+Session origin does not change account authority or recovery behavior. HRA binds each controlled session to the exact provider account and runtime scope it admitted and rechecks that identity around provider effects. If that provider scope signs out, exposes a replacement account, or no longer exposes a provable identity, HRA first marks every affected nonterminal session `recovery_required`. It cancels effects that have not started, preserves in-flight effects as ambiguous or unknown, pauses scheduled work, and releases the exact native and personal-home controllers held by the prior authority. An isolated Codex login change fences Codex sessions; a managed Claude login change fences managed Claude sessions without taking custody from a separate personal Claude home. Account and session status keep recovery visible, and daemon restart continues any incomplete release.
 
 No origin-specific command is required when you explicitly log in, log out, or replace the provider account. Those changes use the same fail-closed revocation path for HRA-created and adopted sessions, which can make them temporarily unavailable while prior controller authority is released. Establish the intended provider identity and resolve the reported recovery before sending another mutation.
 
@@ -110,10 +110,10 @@ Disabling a provider stops future discovery and adoption for that provider. It d
 
 Check these conditions:
 
-- The provider session was updated within the last 15 minutes and is not terminal.
+- The provider session was updated within the last 15 minutes, or it is the exact target of a present valid Codex Desktop heartbeat automation, and it is not terminal.
 - The session reports the exact root of a registered HRA project.
 - Codex has been idle for more than 10 minutes, or the prior Claude process probe reports not live.
 - Claude Code matches HRA's pinned version, and the old exact process identity is no longer live.
-- The selected HRA account is still signed in and the daemon is running.
+- The selected HRA account profile is current and the daemon is running. For Codex, its isolated account must still be signed in under the admitted identity; for Claude, the personal Claude home must still expose the admitted identity.
 
 Run `hra session discover --provider <codex|claude>` after correcting the condition. If enabling adoption reports discovery state `unavailable`, the daemon could not complete the bounded provider read or admission check. The candidate remains private and is not adopted speculatively.
