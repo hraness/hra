@@ -76,8 +76,8 @@ export function EmptyRow({ children }: Readonly<{ children: ReactNode }>) {
 
 /**
  * A command line the reader is meant to run on a machine. It is text in a
- * `code` element, never a link and never a copy button: `clipboard-read` is
- * denied by the Permissions-Policy the app is served with.
+ * `code` element, never a link or a clipboard-writing control. The reader can
+ * select it manually without this component creating an additional copy.
  */
 export function CommandHint({ children }: Readonly<{ children: string }>) {
   return (

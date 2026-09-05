@@ -176,9 +176,14 @@ export type LiveAcceptanceScenarioAttestation = Readonly<{
   sourceRevision: string;
 }>;
 
+const stablePackageVersionSchema = z.string()
+  .min(5)
+  .max(128)
+  .regex(/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u);
+
 const scenarioAttestationSchema = z.object({
   cloudTargetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-  packageVersion: z.string().min(1).max(128),
+  packageVersion: stablePackageVersionSchema,
   sourceRevision: z.string().regex(/^[a-f0-9]{40}$/u),
 }).strict();
 
@@ -196,7 +201,7 @@ const liveAcceptanceEvidenceSchema: z.ZodType<LiveAcceptanceEvidence> = z.object
     z.array(z.string().min(1).max(128)).min(1).max(32),
   ),
   markerDigests: z.tuple([evidenceDigestSchema, evidenceDigestSchema, evidenceDigestSchema]),
-  packageVersion: z.string().min(1).max(128),
+  packageVersion: stablePackageVersionSchema,
   pluginLifecycleEffectsRejected: z.tuple([
     z.literal("auth"),
     z.literal("disable"),
