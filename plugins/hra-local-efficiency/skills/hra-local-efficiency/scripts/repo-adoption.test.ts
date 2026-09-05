@@ -81,6 +81,7 @@ describe("repository policy adoption", () => {
   test("checks without mutation, applies the asset exactly, and is idempotent", () => {
     const root = fixture();
     const agentsPath = join(root, "AGENTS.md");
+    const claudePath = join(root, "CLAUDE.md");
     const original = "# Contents\n\n- Existing content.\n\n# Guidelines\n\n- Keep this.\n";
     writeFileSync(agentsPath, original);
 
@@ -88,11 +89,12 @@ describe("repository policy adoption", () => {
     expect(checked.exitCode).toBe(1);
     expect(JSON.parse(checked.stdout.toString())).toEqual({
       agentsPath,
+      claudePath,
       changed: false,
       mode: "check",
       root,
       status: "needs-update",
-      version: 1,
+      version: 2,
     });
     expect(readFileSync(agentsPath, "utf8")).toBe(original);
 
@@ -101,6 +103,7 @@ describe("repository policy adoption", () => {
     expect(applied.stdout.toString()).toContain('"status": "updated"');
     const adopted = readFileSync(agentsPath, "utf8");
     expect(adopted).toBe(`${original.trimEnd()}\n\n${policy()}`);
+    expect(readFileSync(claudePath, "utf8")).toBe("@AGENTS.md\n");
 
     const repeated = invoke(["--apply", "--json", "--root", root]);
     expect(repeated.exitCode, repeated.stderr.toString()).toBe(0);
@@ -121,6 +124,7 @@ describe("repository policy adoption", () => {
   test("replaces only the managed block and preserves the existing file mode", () => {
     const root = fixture();
     const agentsPath = join(root, "AGENTS.md");
+    const claudePath = join(root, "CLAUDE.md");
     const before = "# Contents\n\n- Untouched before.";
     const after = "# Guidelines\n\n- Untouched after.\n";
     writeFileSync(
@@ -128,6 +132,9 @@ describe("repository policy adoption", () => {
       `${before}\n\n${startMarker}\n- Stale policy.\n${endMarker}\n\n${after}`,
     );
     chmodSync(agentsPath, 0o640);
+    const existingClaude = "# Existing Claude rules\n\n```text\n@AGENTS.md\n```\n\nInline example: `@AGENTS.md`.\n\n- Preserve me.\n";
+    writeFileSync(claudePath, existingClaude);
+    chmodSync(claudePath, 0o600);
 
     const report = runRepositoryAdoption({ json: false, mode: "apply", root });
 
@@ -135,6 +142,10 @@ describe("repository policy adoption", () => {
     expect(readFileSync(agentsPath, "utf8"))
       .toBe(`${before}\n\n${policy().trimEnd()}\n\n${after}`);
     expect(statSync(agentsPath).mode & 0o777).toBe(0o640);
+    expect(readFileSync(claudePath, "utf8")).toBe(
+      `${existingClaude.trimEnd()}\n\n<!-- hra-local-efficiency:claude-import:start -->\n@AGENTS.md\n<!-- hra-local-efficiency:claude-import:end -->\n`,
+    );
+    expect(statSync(claudePath).mode & 0o777).toBe(0o600);
   });
 
   test("creates a missing root AGENTS.md from the policy asset", () => {
@@ -144,6 +155,74 @@ describe("repository policy adoption", () => {
 
     expect(report).toMatchObject({ changed: true, status: "updated" });
     expect(readFileSync(join(root, "AGENTS.md"), "utf8")).toBe(policy());
+    expect(readFileSync(join(root, "CLAUDE.md"), "utf8")).toBe("@AGENTS.md\n");
+  });
+
+  test("preserves an existing Claude import byte for byte", () => {
+    const root = fixture();
+    const claudePath = join(root, "CLAUDE.md");
+    const originalClaude = "# Claude-specific guidance\r\n\r\n@AGENTS.md\r\n\r\nKeep this layout.\r\n";
+    writeFileSync(claudePath, originalClaude);
+
+    const report = runRepositoryAdoption({ json: false, mode: "apply", root });
+
+    expect(report).toMatchObject({ changed: true, claudePath, status: "updated", version: 2 });
+    expect(readFileSync(claudePath, "utf8")).toBe(originalClaude);
+  });
+
+  test("recognizes an active Claude import in prose", () => {
+    const root = fixture();
+    const existingClaude = [
+      "# Claude guide",
+      "",
+      "See @AGENTS.md for the shared repository policy.",
+      "",
+      "Inline example: `@AGENTS.md`.",
+      "",
+      "```md",
+      "@AGENTS.md",
+      "```",
+      "",
+    ].join("\n");
+    writeFileSync(join(root, "CLAUDE.md"), existingClaude);
+
+    const report = runRepositoryAdoption({ json: false, mode: "apply", root });
+
+    expect(report.status).toBe("updated");
+    expect(readFileSync(join(root, "CLAUDE.md"), "utf8")).toBe(existingClaude);
+  });
+
+  test("does not mistake a nested-fence-looking example import for an active import", () => {
+    const root = fixture();
+    const existingClaude = [
+      "# Claude guide",
+      "",
+      "```md",
+      "```js",
+      "@AGENTS.md",
+      "```",
+      "",
+    ].join("\n");
+    writeFileSync(join(root, "CLAUDE.md"), existingClaude);
+
+    const report = runRepositoryAdoption({ json: false, mode: "apply", root });
+
+    expect(report.status).toBe("updated");
+    expect(readFileSync(join(root, "CLAUDE.md"), "utf8")).toBe(
+      `${existingClaude.trimEnd()}\n\n<!-- hra-local-efficiency:claude-import:start -->\n@AGENTS.md\n<!-- hra-local-efficiency:claude-import:end -->\n`,
+    );
+  });
+
+  test("preflights both root guidance targets before writing either", () => {
+    const root = fixture();
+    const agentsPath = join(root, "AGENTS.md");
+    const original = "# Existing root guidance\n";
+    writeFileSync(agentsPath, original);
+    mkdirSync(join(root, "CLAUDE.md"));
+
+    expect(() => runRepositoryAdoption({ json: false, mode: "apply", root }))
+      .toThrow("non-file root Claude guidance");
+    expect(readFileSync(agentsPath, "utf8")).toBe(original);
   });
 
   test("refuses ambiguous markers without modifying guidance", () => {

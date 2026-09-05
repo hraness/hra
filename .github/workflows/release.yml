@@ -33,12 +33,25 @@ jobs:
       - name: Require one stable tag push
         id: request
         env:
+          ACTOR_ID: ${{ github.actor_id }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_REF: ${{ github.ref }}
           EVENT_REF_NAME: ${{ github.ref_name }}
           EVENT_REF_TYPE: ${{ github.ref_type }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          SENDER_ID: ${{ github.event.sender.id }}
+          SENDER_TYPE: ${{ github.event.sender.type }}
         run: |
           set -euo pipefail
+          if [[ "$ACTOR_ID" != "894119" || "$SENDER_ID" != "894119" || "$SENDER_TYPE" != "User" ]]; then
+            echo "::error::Release tag push did not originate from immutable owner User ID 894119"
+            exit 1
+          fi
+          if [[ "$REPOSITORY_PRIVATE" != "false" || "$REPOSITORY_VISIBILITY" != "public" ]]; then
+            echo "::error::Release requires the exact public repository visibility"
+            exit 1
+          fi
           if [[ "$EVENT_NAME" != "push" || "$EVENT_REF_TYPE" != "tag" || "$EVENT_REF" != "refs/tags/$EVENT_REF_NAME" ]]; then
             echo "::error::Release request is not one exact tag push"
             exit 1
@@ -275,6 +288,7 @@ jobs:
   publish:
     name: Publish exact npm and GitHub artifacts
     needs: [verify, exact_artifact]
+    environment: npm-release
     permissions:
       actions: read
       contents: write
@@ -286,7 +300,6 @@ jobs:
       VERIFIED_SHA: ${{ needs.verify.outputs.verified_sha }}
       VERIFIED_TAG: ${{ needs.verify.outputs.verified_tag }}
       VERIFIED_TAG_OBJECT: ${{ needs.verify.outputs.verified_tag_object }}
-      HRA_APPROVE_NPM_PUBLICATION: ${{ vars.HRA_APPROVE_NPM_PUBLICATION }}
       HRA_NPM_PREFLIGHT_RUN_ATTEMPT: ${{ needs.verify.outputs.npm_preflight_run_attempt }}
       HRA_NPM_PREFLIGHT_RUN_ID: ${{ needs.verify.outputs.npm_preflight_run_id }}
       HRA_NPM_PREFLIGHT_STATE: ${{ needs.verify.outputs.npm_preflight_state }}
@@ -375,6 +388,8 @@ jobs:
           artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           bun run ./scripts/publish-github-release.ts "$VERIFIED_TAG" "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
       - name: Publish exact tarball through npm trusted publishing
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           bun run ./scripts/publish-npm-release.ts "$artifact"

@@ -39,6 +39,7 @@
     "hosted:status": "bun ./scripts/hosted-status.ts",
     "install-pins:update": "bun ./scripts/check-install-pins.ts --update",
     "operator:migrate-legacy-secrets": "bun ./scripts/migrate-legacy-secrets.ts",
+    "release:tag": "bun ./scripts/create-release-tag.ts",
     "lint": "eslint .",
     "start": "bun ./src/cli.ts",
     "test": "bun test ./scripts --isolate --max-concurrency=1 && bun run test:local-efficiency-plugin && bun run test:cloud-efficiency-plugin && bun test ./src --isolate --max-concurrency=1 && bun test ./convex ./site --isolate --max-concurrency=1 && bun test ./app --isolate --max-concurrency=1",

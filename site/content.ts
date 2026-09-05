@@ -222,7 +222,7 @@ export const siteDocumentPaths: readonly string[] = [
   "/privacy/",
 ];
 
-export const publicReleaseState: "live" | "release-ready" | "staged" = "release-ready";
+export const publicReleaseState: "live" | "release-ready" | "staged" = "live";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
   "https://github.com/hraness/hra/releases/download/v0.5.0/hraness-hra-0.5.0.tgz",
@@ -284,7 +284,7 @@ export const publicContent: PublicContent = {
   releaseVersion,
   thesis: `${productName} runs several coding-agent subscriptions side by side, keeps their sessions alive in a local daemon, and gives humans and AI agents the same commands to drive them. Codex is supported today; Claude is next.`,
   description: `${tagline}: run several accounts side by side, keep their sessions alive in a local daemon, and drive them from a shell or JSON. ${providerRoadmap}`,
-  statusLine: `Status: public beta. The local CLI v${releaseVersion} is release-ready for macOS and Linux; hosted sync is live as an ${hostedBetaLabel}.`,
+  statusLine: `Status: public beta. The local CLI v${releaseVersion} is live for macOS and Linux; hosted sync is live as an ${hostedBetaLabel}.`,
   badges,
   maintainer: {
     name: "Hraness",
@@ -301,7 +301,7 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-    betaTag: "release-ready",
+    betaTag: "live",
     githubRepository: "live",
     hostedSync: "live",
     website: "live",
@@ -312,7 +312,7 @@ export const publicContent: PublicContent = {
     eyebrow: tagline,
     heading: "Keep every Codex account and live session in one durable CLI.",
     summary: "Give each account its own Codex home, keep sessions alive behind one local daemon, and direct them from a human shell or versioned JSON.",
-    boundary: `macOS and Linux CLI · macOS desktop switching · local v${releaseVersion} release-ready · hosted sync live (${hostedBetaLabel})`,
+    boundary: `macOS and Linux CLI · macOS desktop switching · local v${releaseVersion} live · hosted sync live (${hostedBetaLabel})`,
     primaryAction: {
       href: "#install-command",
       label: "Install HRA",
@@ -370,11 +370,11 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: `Immutable local CLI release candidate; hosted sync live as an ${hostedBetaLabel}`,
+      label: `Immutable local CLI beta; hosted sync live as an ${hostedBetaLabel}`,
       content: [
-        text("The exact install command below works once GitHub exposes the immutable "),
+        text("The exact install command below uses the published immutable "),
         code("v0.5.0"),
-        text(" GitHub Release and its verified archive. The website and optional hosted sync are live; the public CLI stays immutable once admitted."),
+        text(" GitHub Release and its verified archive. The website, public CLI, and optional hosted sync are live; the public CLI remains immutable."),
       ],
     },
     paragraph(
@@ -610,7 +610,7 @@ export const publicContent: PublicContent = {
           content: [
             text("These commands are part of the immutable "),
             code("v0.5.0"),
-            text(" local CLI release candidate and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol."),
+            text(" local CLI beta and are installable through the exact command above. Hosted sync is not required for this local protocol."),
           ],
         },
         paragraph(
@@ -1340,7 +1340,7 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     content.thesis,
     content.statusLine,
     "",
-    `Install after the v0.5.0 beta tag is live: ${content.installCommand}`,
+    `Install the live v0.5.0 beta: ${content.installCommand}`,
     `Initialize: ${content.initCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
     "",

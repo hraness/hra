@@ -2819,14 +2819,14 @@ const executeCurrentProjectAliasRelease = async (
           alias: plan.alias,
           idempotencyKey,
           nextAction: ready
-            ? "obtain_conversational_plan_approval_then_execute_with_machine_token"
+            ? "execute_with_machine_token_under_standing_task_authority"
             : observation.state === "target"
               ? "none"
               : "stop_and_investigate",
           observedState: observation.state,
           reason: observation.reason,
           ...(ready ? { requiredConfirmation: requiredAliasConfirmation(plan) } : {}),
-          schemaVersion: 2,
+          schemaVersion: 3,
           sourceDeploymentId: plan.vercel.source.deploymentId,
           status: ready
             ? "ready"
