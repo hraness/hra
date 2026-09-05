@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { ClaudeError } from "./errors";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./pin";
 import { presetRequirements } from "../domain/presets";
-import { locateClaudeExecutable, resolvePinnedClaudeRuntime } from "./runtime";
+import {
+  locateClaudeExecutable,
+  resolvePinnedClaudeRuntime,
+  spawnClaudeVersionProbe,
+  type ClaudeVersionProbeProcess,
+} from "./runtime";
 
 const roots: string[] = [];
 
@@ -70,6 +75,18 @@ describe("pinned Claude runtime", () => {
       executablePath: path,
       probeVersion: async () => "unknown build",
     })).rejects.toThrow(ClaudeError);
+    for (const reported of [
+      `${CLAUDE_PIN}-beta`,
+      `wrapper ${CLAUDE_PIN} around 9.9.9`,
+      `${CLAUDE_PIN} (Claude Code) 9.9.9`,
+      ` ${CLAUDE_PIN} (Claude Code)`,
+    ]) {
+      await expect(resolvePinnedClaudeRuntime({
+        configDir,
+        executablePath: path,
+        probeVersion: async () => reported,
+      })).rejects.toThrow("reported no exact version");
+    }
   });
 
   test("requires an absolute config directory and an absolute executable", async () => {
@@ -110,5 +127,76 @@ describe("pinned Claude runtime", () => {
       effort: CLAUDE_PIN_EFFORT,
       model: CLAUDE_PIN_MODEL,
     });
+  });
+
+  test("terminates and joins an overproducing version probe", async () => {
+    let resolveExit!: (code: number) => void;
+    let resolveStderr!: () => void;
+    let terminated = 0;
+    const stderrDone = new Promise<void>((resolve) => { resolveStderr = resolve; });
+    const process: ClaudeVersionProbeProcess = {
+      exited: new Promise((resolve) => { resolveExit = resolve; }),
+      stdout: (async function* () { yield new Uint8Array(513); })(),
+      stderr: (async function* () { await stderrDone; yield* []; })(),
+      terminate: () => { terminated += 1; resolveStderr(); resolveExit(143); },
+      forceTerminate: () => { throw new Error("graceful termination should join"); },
+    };
+    await expect(spawnClaudeVersionProbe({
+      configDir: "/tmp/claude-config",
+      deadlineMs: 1_000,
+      environment: { PATH: "/usr/bin:/bin" },
+      executablePath: "/test/claude",
+      processFactory: () => process,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "PROTOCOL_LIMIT" });
+    expect(terminated).toBe(1);
+  });
+
+  test("bounds a hung version probe with terminate, force, and an exit join", async () => {
+    let resolveExit!: (code: number) => void;
+    let resolveStreams!: () => void;
+    const trace: string[] = [];
+    const streamsDone = new Promise<void>((resolve) => { resolveStreams = resolve; });
+    const empty = () => (async function* () { await streamsDone; yield* []; })();
+    const process: ClaudeVersionProbeProcess = {
+      exited: new Promise((resolve) => { resolveExit = resolve; }),
+      stdout: empty(),
+      stderr: empty(),
+      terminate: () => { trace.push("terminate"); },
+      forceTerminate: () => {
+        trace.push("force");
+        resolveStreams();
+        resolveExit(137);
+      },
+    };
+    await expect(spawnClaudeVersionProbe({
+      configDir: "/tmp/claude-config",
+      deadlineMs: 1,
+      environment: { PATH: "/usr/bin:/bin" },
+      executablePath: "/test/claude",
+      processFactory: () => process,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "TIMEOUT" });
+    expect(trace).toEqual(["terminate", "force"]);
+  });
+
+  test("does not mistake a rejected version-exit observer for process exit", async () => {
+    const trace: string[] = [];
+    const process: ClaudeVersionProbeProcess = {
+      exited: Promise.reject(new Error("broken version wait")),
+      stdout: (async function* () { yield new TextEncoder().encode(CLAUDE_PIN); })(),
+      stderr: (async function* () { yield new Uint8Array(); })(),
+      terminate: () => { trace.push("terminate"); },
+      forceTerminate: () => { trace.push("force"); },
+    };
+    await expect(spawnClaudeVersionProbe({
+      configDir: "/tmp/claude-config",
+      deadlineMs: 1_000,
+      environment: { PATH: "/usr/bin:/bin" },
+      executablePath: "/test/claude",
+      processFactory: () => process,
+      signal: new AbortController().signal,
+    })).rejects.toThrow("could not be joined after forced termination");
+    expect(trace).toEqual(["terminate", "force"]);
   });
 });

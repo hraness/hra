@@ -52,7 +52,6 @@ import {
   PresetProviderMismatchError,
   presetsForProvider,
   presetTiers,
-  providerSchema,
   type Preset,
   type Provider,
 } from "../domain/presets";
@@ -76,7 +75,11 @@ import {
 } from "../domain/session-events";
 import {
   buildSessionTranscript,
+  digestTranscriptSeed,
   renderTranscriptSeed,
+  sessionProviderSwitchDurableReceiptSchema,
+  sessionProviderSwitchReceiptSchema,
+  sessionProviderSwitchSnapshotSchema,
   sessionTranscriptSchema,
   TRANSCRIPT_PAGE_LIMIT,
   type SessionTranscript,
@@ -120,6 +123,7 @@ import { resolveMessageAttachments } from "./attachments";
 import { describeWorkProtocol } from "../domain/work-protocol";
 import { workPreparedEffectMessage } from "../domain/work-message";
 import {
+  attemptIdSchema,
   canonicalLabelKey,
   profileIdSchema,
   sessionIdSchema,
@@ -607,17 +611,7 @@ const neutralToolSummary = (fact: Readonly<{
  */
 const TRANSCRIPT_EVENT_PAGE_BUDGET = 20;
 
-/** The turn the handoff seed opened, when the provider named one. */
-const seededTurnId = (value: unknown): string | null => {
-  const parsed = z.object({ turnId: z.string().min(1).max(200) }).safeParse(value);
-  return parsed.success ? parsed.data.turnId : null;
-};
-
-const sessionSwitchReceiptSchema = z.object({
-  providerThreadId: z.string().min(1).max(200),
-  sessionId: sessionIdSchema,
-  toProvider: providerSchema,
-}).strict();
+const sessionSwitchReceiptSchema = sessionProviderSwitchReceiptSchema;
 
 /**
  * The preset a switch uses when the operator named none: the session's own
@@ -653,6 +647,27 @@ const loginCancelReceiptSchema = z.object({
     email: z.string().max(1_024).optional(),
     plan: z.string().max(128).optional(),
   }).strict(),
+}).strict();
+const claudeLoginTerminalReceiptSchema = z.object({
+  accountId: profileIdSchema,
+  attemptId: attemptIdSchema,
+  idempotencyKey: z.string().uuid(),
+  providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  signedIn: z.boolean(),
+  outcome: z.union([
+    z.object({
+      state: z.literal("joined"),
+      exitCode: z.number().int().nonnegative().max(255),
+      interruptedBy: z.enum(["SIGINT", "SIGTERM"]).nullable(),
+    }).strict(),
+    z.object({ state: z.literal("not_started"), reason: z.literal("spawn_failed") }).strict(),
+    z.object({ state: z.literal("not_started"), reason: z.literal("preflight_stale") }).strict(),
+    z.object({
+      state: z.literal("not_started"),
+      reason: z.literal("interrupted_before_spawn"),
+      interruptedBy: z.enum(["SIGINT", "SIGTERM"]),
+    }).strict(),
+  ]),
 }).strict();
 const sessionStartReceiptSchema = z.object({
   sessionId: sessionIdSchema,
@@ -797,7 +812,9 @@ export const BACKGROUND_DIAGNOSTIC_CODES = [
   "session_state_tracking_failed",
   "usage_refresh_failed",
   "usage_poll_account_failed",
+  "provider_switch_source_abandon_failed",
   "provider_switch_seed_failed",
+  "provider_switch_target_abandon_failed",
   "usage_poll_tick_failed",
   "user_message_record_failed",
 ] as const;
@@ -853,6 +870,7 @@ export class HraService {
   readonly #proseAutorespondedTurns = new Map<string, string>();
   readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
   readonly #daemonGeneration: number;
+  readonly #platform: NodeJS.Platform;
   readonly #now: () => number;
   readonly #mutationTails = new Map<string, Promise<unknown>>();
   readonly #background = new Set<Promise<unknown>>();
@@ -900,6 +918,7 @@ export class HraService {
     workWaiters?: WorkEventWaiters;
     workCapabilities?: WorkCapabilityCodec;
     daemonGeneration?: number;
+    platform?: NodeJS.Platform;
     now?: () => number;
     requestStop: () => void;
   }) {
@@ -932,6 +951,7 @@ export class HraService {
     this.#factsMemory = input.factsMemory;
     this.#daemonGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.daemonGeneration ?? 0);
+    this.#platform = input.platform ?? process.platform;
     const workCapabilities = input.workCapabilities
       ?? new WorkCapabilityCodec(WorkCapabilityCodec.generateKey());
     this.#work = this.#store.createWorkStore(
@@ -1021,8 +1041,11 @@ export class HraService {
         );
         case "account.list": return { accounts: this.#store.listProfiles().map((profile) => this.#publicProfile(profile)) };
         case "account.add": return await this.#addAccount(command.label);
-        case "account.show": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#showAccount(profile.id, context.signal)); }
+        case "account.show": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => command.provider === "claude" ? this.#showClaudeAccount(profile.id, context.signal) : this.#showAccount(profile.id, context.signal)); }
         case "account.login": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#login(profile.id, command.deviceCode, command.idempotencyKey, context.signal)); }
+        case "account.claude-login.prepare": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#prepareClaudeLogin(profile.id, command.idempotencyKey, context.signal)); }
+        case "account.claude-login.complete": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#completeClaudeLogin({ ...command, account: profile.id }, context.signal)); }
+        case "account.claude-login.abandon": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#abandonClaudeLogin({ ...command, account: profile.id })); }
         case "account.login-cancel": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#cancelLogin(profile.id, command.idempotencyKey, context.signal)); }
         case "account.logout": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#logout(profile.id, command.idempotencyKey, context.signal)); }
         case "account.usage": {
@@ -1171,24 +1194,47 @@ export class HraService {
         case "session.steer": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#steer(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? [])); }
         case "session.stop": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#stop(session.id, command.idempotencyKey, context.signal)); }
         case "session.rename": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#rename(session.id, command.name, command.idempotencyKey, context.signal)); }
-        case "session.recover": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#resolveSessionRecovery(session.id, "recover", context.signal)); }
+        case "session.recover": {
+          const session = this.#store.requireSession(command.session);
+          return await this.#serializeSessionAuthorityAcrossProfiles(
+            session,
+            this.#sessionRecoveryProfileIds(session),
+            async () => this.#resolveSessionRecovery(session.id, "recover", context.signal),
+          );
+        }
         case "session.abandon": {
           const session = this.#store.requireSession(command.session);
-          return await this.#serializeSessionAuthority(session, async () => {
-            const current = this.#store.requireSession(session.id);
-            if (current.state !== "recovery_required") {
+          return await this.#serializeSessionAuthorityAcrossProfiles(
+            session,
+            this.#sessionRecoveryProfileIds(session),
+            async () => {
+              const current = this.#store.requireSession(session.id);
+              if (current.state !== "recovery_required") {
+                return await this.#resolveSessionRecovery(current.id, "abandon", context.signal);
+              }
+              await this.#cleanupFactsMemory(current, "abandon");
               return await this.#resolveSessionRecovery(current.id, "abandon", context.signal);
-            }
-            await this.#cleanupFactsMemory(current, "abandon");
-            return await this.#resolveSessionRecovery(current.id, "abandon", context.signal);
-          });
+            },
+          );
         }
         case "session.note.get": { const session = this.#store.requireSession(command.session); return { sessionId: session.id, note: session.note, revision: session.revision }; }
         case "session.note.edit": throw new CommandFailure("INTERACTION_REQUIRED", "Open the editor through the local `hra session note edit` command.");
         case "session.note.set": return { session: await this.#updateSession(command.session, (session) => ({ note: command.note, expectedRevision: session.revision })) };
         case "session.note.clear": return { session: await this.#updateSession(command.session, (session) => ({ note: "", expectedRevision: session.revision })) };
         case "session.preset": return { session: await this.#updateSession(command.session, (session) => ({ preset: command.preset, expectedRevision: session.revision })) };
-        case "session.switch": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#switchProvider(command, context.signal)); }
+        case "session.switch": {
+          const replay = this.#settledProviderSwitchReplay(command);
+          if (replay.matched) return replay.value;
+          const session = this.#store.requireSession(command.session);
+          const targetProfileId = command.account === undefined
+            ? session.profileId
+            : this.#store.requireProfile(command.account).id;
+          return await this.#serializeSessionAuthorityAcrossProfiles(
+            session,
+            [session.profileId, targetProfileId],
+            async () => this.#switchProvider(command, context.signal),
+          );
+        }
         case "session.transcript": return this.#readTranscript(command.session, command.after, command.limit);
         case "session.fast": return { session: await this.#updateSession(command.session, (session) => ({ fastEnabled: command.enabled, expectedRevision: session.revision })) };
         case "session.project": {
@@ -1595,7 +1641,17 @@ export class HraService {
     if (command.kind !== "interaction.resolve" && command.session !== expected.sessionId) {
       throw new CommandFailure("CONFLICT", "The remote command selector does not match its exact session authority.");
     }
-    return await this.#serializeSessionAuthority({ id: expected.sessionId, profileId: expected.profileId }, async () => {
+    if (command.kind === "session.switch") {
+      const replay = this.#settledProviderSwitchReplay(command);
+      if (replay.matched) return replay.value;
+    }
+    const targetProfileId = command.kind === "session.switch" && command.account !== undefined
+      ? this.#store.requireProfile(command.account).id
+      : expected.profileId;
+    return await this.#serializeSessionAuthorityAcrossProfiles(
+      { id: expected.sessionId, profileId: expected.profileId },
+      [expected.profileId, targetProfileId],
+      async () => {
       await this.#daemonAuthority.assertCurrent();
       const session = this.#store.requireSession(expected.sessionId);
       const profile = this.#store.requireProfileById(expected.profileId);
@@ -1606,7 +1662,7 @@ export class HraService {
       ) {
         throw new CommandFailure("CONFLICT", "The remote command authority changed before dispatch.");
       }
-      this.#assertSignedIn(profile);
+      this.#assertEstablishedSessionAccount(profile, session);
       switch (command.kind) {
         case "session.send": return await this.#send(session.id, command.message, command.idempotencyKey, context.signal, undefined, "human", command.attachments ?? []);
         case "session.queue": return await this.#queue(session.id, command.message, command.idempotencyKey, undefined, command.attachments ?? []);
@@ -1639,7 +1695,8 @@ export class HraService {
           return await this.#resolveInteraction(command, { signal: context.signal });
         }
       }
-    });
+      },
+    );
   }
 
   #scheduleStop(afterResponse?: (callback: () => void) => void): void {
@@ -1706,7 +1763,9 @@ export class HraService {
     for (const sessionId of pendingSessions) {
       const session = this.#store.requireSession(sessionId);
       const profile = this.#store.requireProfile(session.profileId);
-      if (profile.state === "signed_in") this.#scheduleQueueDispatch(session);
+      if (this.#profileAllowsEstablishedSession(profile, session)) {
+        this.#scheduleQueueDispatch(session);
+      }
     }
     let continueAfterId: string | null = null;
     const activeSessions: SessionRecord[] = [];
@@ -1719,7 +1778,10 @@ export class HraService {
         if (session.providerThreadId === undefined || session.state === "terminal") continue;
         this.#sessionsAwaitingResubscription.add(session.id);
         const profile = this.#store.requireProfile(session.profileId);
-        if (session.state === "active" && profile.state === "signed_in") {
+        if (
+          session.state === "active"
+          && this.#profileAllowsEstablishedSession(profile, session)
+        ) {
           activeSessions.push(session);
         }
       }
@@ -2178,14 +2240,19 @@ export class HraService {
   ): SessionRuntimePort<ReviewedRuntimeProfile> {
     if (record.sessionId !== null) {
       try {
-        return this.#runtimeForSession(this.#store.requireSession(record.sessionId));
-      } catch {
+        const session = this.#store.requireSession(record.sessionId);
+        if (session.provider === "claude") this.#assertClaudeIsolationAccepted();
+        return this.#runtimeForSession(session);
+      } catch (error: unknown) {
+        if (!(error instanceof SelectionError && error.code === "NOT_FOUND")) throw error;
         // Fall through to the durable method name below.
       }
     }
-    return this.#sessionRuntime(
-      record.authority.method.startsWith("claude/") ? "claude" : "codex",
-    );
+    const provider = record.authority.method.startsWith("claude/")
+      ? "claude"
+      : "codex";
+    if (provider === "claude") this.#assertClaudeIsolationAccepted();
+    return this.#sessionRuntime(provider);
   }
 
   /** Refuses a Codex-only capability on a session bound to another provider. */
@@ -2427,13 +2494,37 @@ export class HraService {
           throw error;
         }
         if (current.processGeneration !== authority.generation) return;
+        const claudeBlocker = this.#store.providerAuthorityAdvanceBlocker(
+          current.id,
+          "claude",
+        );
         this.#handleProviderDisconnected(authority, fact.connectionId, fact.reason);
+        if (claudeBlocker !== null) {
+          // A spontaneous Codex disconnect cannot be refused and retried like
+          // an explicit login. Stop the whole daemon instead of rotating a
+          // live Claude authority underneath an in-flight turn or recovery.
+          this.#state = "closing";
+          this.#interactionDeadlineAbort.abort(
+            new Error(`Codex disconnected while Claude authority was ${claudeBlocker}.`),
+          );
+          this.#interactionDeadlineWake?.();
+          this.#interactionDeadlineWake = undefined;
+          this.#daemonAuthority.close();
+          this.#scheduleStop();
+          return;
+        }
         const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
           authority.id,
           authority.generation,
           this.#work,
+          { preserveSessionMutationAuthorities: true },
         );
         this.#notifyAffectedWork(retirement.affectedWorkIds);
+        this.#claude.rebindProfileAuthority({
+          profileId: current.id,
+          expectedGeneration: authority.generation,
+          nextGeneration: retirement.profile.processGeneration,
+        });
         this.#wakeSessionTaskPump();
       });
       return;
@@ -3128,7 +3219,7 @@ export class HraService {
     }>> = [];
     for (const [sessionId, connectionId] of this.#sessionProviderConnections) {
       const session = this.#store.requireSession(sessionId);
-      if (session.profileId !== profileId) continue;
+      if (session.profileId !== profileId || session.provider !== "codex") continue;
       retirements.push({
         connectionId,
         releasedEvents: this.#eventRedactor.interruptSession({
@@ -3329,11 +3420,12 @@ export class HraService {
     } catch {
       return false;
     }
-    if (profile.processGeneration !== authority.generation || profile.state !== "signed_in") return false;
+    if (profile.processGeneration !== authority.generation) return false;
     const current = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
     if (
       current === null
       || current.id !== expected.id
+      || !this.#profileAllowsEstablishedSession(profile, current)
       || current.state === "terminal"
       || (current.state === "recovery_required" && fact.type !== "threadDeleted")
       || this.#projectionRecoveriesInFlight.has(current.id)
@@ -3371,6 +3463,7 @@ export class HraService {
 
   async #closeAdmittedService(): Promise<void> {
     let runtimeError: unknown;
+    const failedProviders = new Set<Provider>();
     try {
       if (this.#interactionDeadlineTask !== undefined) {
         await this.#interactionDeadlineTask.catch(() => undefined);
@@ -3378,15 +3471,49 @@ export class HraService {
       if (this.#sessionTaskPumpTask !== undefined) {
         await this.#sessionTaskPumpTask.catch(() => undefined);
       }
-      const closed = await Promise.allSettled([this.#codex.close(), this.#claude.close()]);
-      for (const outcome of closed) {
-        if (outcome.status === "rejected") runtimeError ??= outcome.reason;
+      const closed = await Promise.allSettled([
+        Promise.resolve().then(async () => await this.#codex.close()),
+        Promise.resolve().then(async () => await this.#claude.close()),
+      ]);
+      for (const [index, outcome] of closed.entries()) {
+        if (outcome.status === "rejected") {
+          runtimeError ??= outcome.reason;
+          failedProviders.add(index === 0 ? "codex" : "claude");
+        }
       }
     } catch (error: unknown) {
       runtimeError = error;
     }
     await this.#drainOwnedWork();
     this.#persistSessionEventWrites(this.#eventRedactor.interruptAll());
+    if (runtimeError !== undefined) {
+      const quarantineErrors: unknown[] = [];
+      for (const profile of this.#store.listProfiles()) {
+        for (const provider of failedProviders) {
+          for (const session of this.#store.listNonterminalProviderSessions(profile.id, provider)) {
+            try {
+              this.#quarantineSession(session.id);
+            } catch (error: unknown) {
+              quarantineErrors.push(error);
+            }
+          }
+        }
+      }
+      this.#sessionProviderConnections.clear();
+      this.#sessionObservationFailures.clear();
+      this.#sessionResubscriptionConnections.clear();
+      this.#sessionsAwaitingResubscription.clear();
+      this.#state = "closed";
+      if (quarantineErrors.length > 0) {
+        throw new AggregateError(
+          [runtimeError, ...quarantineErrors],
+          "A provider runtime failed to close and its matching durable session quarantine was incomplete.",
+        );
+      }
+      throw runtimeError instanceof Error
+        ? runtimeError
+        : new Error("A provider runtime closed with a non-Error failure.");
+    }
     let retirementError: unknown;
     try {
       this.#retireClosedRuntimeAuthorities();
@@ -3394,15 +3521,6 @@ export class HraService {
       retirementError = error;
     }
     this.#state = "closed";
-    if (runtimeError !== undefined && retirementError !== undefined) {
-      throw new AggregateError(
-        [runtimeError, retirementError],
-        "The Codex runtime and its durable authority retirement both failed during shutdown.",
-      );
-    }
-    if (runtimeError !== undefined) {
-      throw runtimeError instanceof Error ? runtimeError : new Error("The Codex runtime closed with a non-Error failure.");
-    }
     if (retirementError !== undefined) {
       throw retirementError instanceof Error
         ? retirementError
@@ -3468,10 +3586,18 @@ export class HraService {
         }
       }
       try {
+        const unsettledClaudeLogin = this.#store
+          .listUnsettledMutations({ authorityId: profile.id })
+          .some((attempt) => attempt.kind === "account.claude-login");
+        // The foreground Claude child is owned by the invoking CLI rather than
+        // this runtime manager. Preserve its exact completion generation even
+        // though the daemon's managed session runtimes have already closed.
+        if (unsettledClaudeLogin) continue;
         const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
           profile.id,
           profile.processGeneration,
           this.#work,
+          { preserveSessionMutationAuthorities: true },
         );
         this.#notifyAffectedWork(retirement.affectedWorkIds);
       } catch (error: unknown) {
@@ -3533,6 +3659,21 @@ export class HraService {
     const result = await operation();
     await this.#daemonAuthority.assertCurrent();
     return result;
+  }
+
+  async #fencedRuntimeReview<Profile>(
+    runtime: SessionRuntimePort<Profile>,
+    operation: () => Promise<RuntimeStartReviewOf<Profile>>,
+  ): Promise<RuntimeStartReviewOf<Profile>> {
+    await this.#daemonAuthority.assertCurrent();
+    const review = await operation();
+    try {
+      await this.#daemonAuthority.assertCurrent();
+      return review;
+    } catch (error: unknown) {
+      runtime.discardRuntimeReview(review);
+      throw error;
+    }
   }
 
   async #doctor(offline: boolean, signal: AbortSignal): Promise<unknown> {
@@ -3769,6 +3910,413 @@ export class HraService {
     };
   }
 
+  #claudeLoginRecovery(attempt: MutationAttemptRecord): Readonly<Record<string, unknown>> {
+    const accountId = profileIdSchema.parse(attempt.authorityId);
+    return {
+      required: true,
+      attemptId: attempt.id,
+      idempotencyKey: attempt.idempotencyKey,
+      providerGeneration: attempt.authorityGeneration,
+      statusCommand: `hra account show ${accountId} --provider claude`,
+      sameKeyReplayCommand: `hra account login ${accountId} --provider claude --idempotency-key ${attempt.idempotencyKey}`,
+      abandonCommand: `hra account login-cancel ${accountId} --provider claude --attempt-id ${attempt.id} --provider-generation ${String(attempt.authorityGeneration)} --idempotency-key ${attempt.idempotencyKey} --acknowledge-child-exited`,
+      diagnostic: "The foreground Claude login launch was granted once. Its exact completion can settle after a daemon restart. Status may report credential presence but never proves that the child exited or grants another launch. If the original HRA parent is gone, first confirm its Claude child exited, then run the exact acknowledged local abandon command; abandon does not stop Claude or change or delete credentials.",
+    };
+  }
+
+  #publicClaudeAccount(profile: ProfileRecord): Readonly<{ id: ProfileRecord["id"]; label: string }> {
+    return { id: profile.id, label: profile.label };
+  }
+
+  #assertClaudeIsolationAccepted(): void {
+    if (this.#platform === "linux") return;
+    throw new CommandFailure(
+      "UNAVAILABLE",
+      `Claude account isolation is acceptance-pending on ${this.#platform}. New Claude authentication, status, and session effects are currently supported only on Linux; run this operation against an HRA daemon on Linux.`,
+      {
+        platform: this.#platform,
+        provider: "claude",
+        reason: "claude_isolation_acceptance_pending",
+        retryable: false,
+        supportedPlatforms: ["linux"],
+      },
+    );
+  }
+
+  #claudePlatformUnavailableObservation(
+    profile: ProfileRecord,
+  ): PublicProviderObservation {
+    return {
+      basis: "local_state",
+      code: "provider_platform_unavailable",
+      coverage: "unavailable",
+      freshness: "fresh",
+      observedAt: this.#now(),
+      profileGeneration: profile.processGeneration,
+      source: "codex_app_server",
+      state: "unavailable",
+    };
+  }
+
+  async #readClaudeAccount(profile: ProfileRecord, signal: AbortSignal): Promise<CodexAccountProjection> {
+    await this.#daemonAuthority.assertCurrent();
+    return await this.#fencedEffect(async () => await this.#claude.readAccount({
+      authority: authorityFor(this.#paths, profile),
+      signal,
+    }));
+  }
+
+  #unsettledClaudeLogin(profile: ProfileRecord): MutationAttemptRecord | undefined {
+    return this.#store.listUnsettledMutations({ authorityId: profile.id }).find((attempt) =>
+      attempt.kind === "account.claude-login");
+  }
+
+  async #showClaudeAccount(selector: string, signal: AbortSignal): Promise<unknown> {
+    const profile = this.#store.requireProfile(selector);
+    const unsettled = this.#unsettledClaudeLogin(profile);
+    if (unsettled !== undefined) {
+      // The durable child fence is authoritative even when the provider
+      // binary is missing, drifts from the pin, or cannot answer. Do not hide
+      // the only exact recovery command behind a best-effort status process.
+      return {
+        account: this.#publicClaudeAccount(profile),
+        authentication: { provider: "claude", signedIn: null },
+        providerGeneration: profile.processGeneration,
+        recovery: this.#claudeLoginRecovery(unsettled),
+      };
+    }
+    this.#assertClaudeIsolationAccepted();
+    const account = await this.#readClaudeAccount(profile, signal);
+    return {
+      account: this.#publicClaudeAccount(profile),
+      authentication: { provider: "claude", signedIn: account.signedIn },
+      providerGeneration: profile.processGeneration,
+      ...(account.signedIn
+        ? {}
+        : { nextCommand: `hra account login ${profile.id} --provider claude` }),
+    };
+  }
+
+  async #prepareClaudeLogin(
+    selector: string,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const profile = this.#store.requireProfile(selector);
+    if (profile.state === "removed") throw new CommandFailure("NOT_FOUND", "That account is removed.");
+    const prior = this.#store.readMutation(idempotencyKey);
+    if (prior !== null) {
+      // Reusing an existing key must validate the canonical request digest
+      // before even a no-effect signed-in response may succeed.
+      this.#store.prepareMutation({
+        kind: "account.claude-login",
+        authorityId: profile.id,
+        authorityGeneration: prior.authorityGeneration,
+        request: { provider: "claude" },
+        idempotencyKey,
+      });
+      if (prior.state === "effect_started" || prior.state === "ambiguous") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "This Claude login launch was already granted and will not be granted again.",
+          this.#claudeLoginRecovery(prior),
+        );
+      }
+      if (prior.state === "reconciled" && prior.resolution?.kind === "abandoned") {
+        throw new CommandFailure(
+          "CONFLICT",
+          "This Claude login fence was explicitly abandoned. Start a fresh login with a new idempotency key.",
+        );
+      }
+      if (prior.state === "applied" || prior.state === "reconciled") {
+        const receipt = claudeLoginTerminalReceiptSchema.safeParse(prior.result);
+        if (
+          !receipt.success
+          || receipt.data.accountId !== profile.id
+          || receipt.data.attemptId !== prior.id
+          || receipt.data.idempotencyKey !== prior.idempotencyKey
+          || receipt.data.providerGeneration !== prior.authorityGeneration
+        ) throw new CommandFailure("INTERNAL", "The Claude login terminal receipt is invalid.");
+        if (!receipt.data.signedIn) {
+          throw new CommandFailure(
+            "INTERACTION_REQUIRED",
+            "This Claude login attempt settled signed out. Start a fresh login with a new idempotency key.",
+          );
+        }
+        return {
+          account: this.#publicClaudeAccount(profile),
+          authentication: { provider: "claude", signedIn: true },
+          login: { status: "signed_in" },
+        };
+      }
+      if (prior.state === "failed" || prior.state === "cancelled") {
+        throw new CommandFailure(
+          "INTERACTION_REQUIRED",
+          "This Claude login attempt is terminal without sign-in. Start a fresh login with a new idempotency key.",
+        );
+      }
+      if (prior.authorityGeneration !== profile.processGeneration) {
+        if (!this.#store.transitionMutation(prior.id, "prepared", "cancelled", {
+          provider: "claude",
+          signedIn: false,
+          status: "stale_no_effect",
+        })) throw new CommandFailure("CONFLICT", "The Claude login preparation changed concurrently.");
+        throw new CommandFailure(
+          "CONFLICT",
+          "This no-effect Claude login preparation belongs to an older provider generation. Start a fresh login with a new idempotency key.",
+        );
+      }
+    }
+    const unsettled = this.#unsettledClaudeLogin(profile);
+    if (unsettled !== undefined) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "A Claude login already owns this account, including across provider generations.",
+        this.#claudeLoginRecovery(unsettled),
+      );
+    }
+    this.#assertClaudeIsolationAccepted();
+    const providerBlocker = this.#store.providerAuthorityAdvanceBlocker(
+      profile.id,
+      "claude",
+    );
+    if (providerBlocker !== null) {
+      throw new CommandFailure(
+        providerBlocker === "active_session" ? "CONFLICT" : "RECOVERY_REQUIRED",
+        `Claude login cannot replace the shared isolated configuration while Claude session authority is ${providerBlocker.replaceAll("_", " ")}. Inspect \`hra session list --account ${profile.id}\`, stop active turns, and resolve recovery before retrying.`,
+        { provider: "claude", reason: providerBlocker, retryable: true },
+      );
+    }
+    const releasableSessions = this.#store.listNonterminalProviderSessions(
+      profile.id,
+      "claude",
+    );
+    if (releasableSessions.some((session) =>
+      session.state !== "idle"
+      || session.activeTurnId !== undefined
+      || session.providerThreadId === undefined)) {
+      throw new CommandFailure(
+        "CONFLICT",
+        `Claude login can release only idle, fully bound Claude sessions. Inspect \`hra session list --account ${profile.id}\`, then finish or recover every other session before retrying.`,
+        { provider: "claude", reason: "session_not_idle", retryable: true },
+      );
+    }
+    const observed = await this.#readClaudeAccount(profile, signal);
+    if (observed.signedIn) {
+      if (prior?.state === "prepared") {
+        if (!this.#store.transitionMutation(prior.id, "prepared", "cancelled", {
+          provider: "claude",
+          signedIn: true,
+          status: "no_effect",
+        })) throw new CommandFailure("CONFLICT", "The Claude login preparation changed concurrently.");
+      }
+      return {
+        account: this.#publicClaudeAccount(profile),
+        authentication: { provider: "claude", signedIn: true },
+        login: { status: "signed_in" },
+      };
+    }
+    if (releasableSessions.length > 0) {
+      await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
+      for (const candidate of releasableSessions) {
+        await this.#serialize(`session:${candidate.id}`, async () => {
+          const current = this.#store.requireSession(candidate.id);
+          const blocker = this.#store.providerAuthorityAdvanceBlocker(
+            profile.id,
+            "claude",
+          );
+          if (
+            blocker !== null
+            || current.profileId !== profile.id
+            || current.provider !== "claude"
+            || current.state !== "idle"
+            || current.activeTurnId !== undefined
+            || current.providerThreadId === undefined
+            || !this.#store.canReleaseIdleClaudeSessionForAccountLogin({
+              profileId: profile.id,
+              profileGeneration: profile.processGeneration,
+              sessionId: current.id,
+            })
+          ) {
+            throw new CommandFailure(
+              blocker === "recovery_required" || blocker === "unsettled_authority"
+                ? "RECOVERY_REQUIRED"
+                : "CONFLICT",
+              "Claude session authority changed before the idle session could be released for login. Inspect the session and retry after it is quiescent.",
+              { provider: "claude", reason: blocker ?? "session_not_idle", retryable: true },
+            );
+          }
+          const providerConnectionId = this.#sessionProviderConnections.get(current.id) ?? null;
+          await this.#endProviderSession(
+            { ...current, providerThreadId: current.providerThreadId },
+            profile,
+            signal,
+            "Claude account login",
+          );
+          const terminal = this.#store.terminalizeIdleClaudeSessionForAccountLogin({
+            accountId: profile.id,
+            providerConnectionId,
+            providerGeneration: profile.processGeneration,
+            sessionId: current.id,
+          });
+          if (terminal.event !== undefined) this.#eventWaiters.notify(current.id);
+          for (const interaction of terminal.interactions) this.#appendInteractionState(interaction);
+          await this.#cleanupTerminalFactsMemory(terminal.session);
+          await this.#cloud.supersedeCompactProjectionRecoveryForProviderDeletion(current.id);
+          await this.#daemonAuthority.assertCurrent();
+        });
+      }
+    }
+    let attempt: ReturnType<StateStore["prepareMutation"]>;
+    try {
+      attempt = this.#store.prepareMutation({
+        kind: "account.claude-login",
+        authorityId: profile.id,
+        authorityGeneration: profile.processGeneration,
+        request: { provider: "claude" },
+        idempotencyKey,
+      });
+      this.#store.beginClaudeLoginMutationEffect({
+        attemptId: attempt.id,
+        profileId: profile.id,
+        profileGeneration: profile.processGeneration,
+        evidence: { kind: "account.claude-login", provider: "claude", baselineSignedIn: false },
+      });
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === "UNSETTLED_MUTATION_AUTHORITY") {
+        const blocking = this.#unsettledClaudeLogin(profile);
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Another mutation already owns this account generation.",
+          blocking === undefined ? undefined : this.#claudeLoginRecovery(blocking),
+        );
+      }
+      throw error;
+    }
+    return {
+      account: this.#publicClaudeAccount(profile),
+      authentication: { provider: "claude", signedIn: false },
+      login: {
+        status: "launch_granted",
+        attemptId: attempt.id,
+        idempotencyKey,
+        providerGeneration: profile.processGeneration,
+      },
+    };
+  }
+
+  async #completeClaudeLogin(
+    command: Extract<LocalCommand, { kind: "account.claude-login.complete" }>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const profile = this.#store.requireProfile(command.account);
+    const attempt = this.#store.readMutation(command.idempotencyKey);
+    if (
+      attempt === null
+      || attempt.id !== command.attemptId
+      || attempt.kind !== "account.claude-login"
+      || attempt.authorityId !== profile.id
+      || attempt.authorityGeneration !== command.providerGeneration
+    ) throw new CommandFailure("CONFLICT", "The Claude login completion does not match its exact launch authority.");
+    if (attempt.state === "reconciled" && attempt.resolution?.kind === "abandoned") {
+      throw new CommandFailure(
+        "CONFLICT",
+        "This Claude login fence was explicitly abandoned. Start a fresh login with a new idempotency key.",
+      );
+    }
+    const priorReceipt = attempt.state === "applied"
+      || attempt.state === "failed"
+      || attempt.state === "reconciled"
+      ? claudeLoginTerminalReceiptSchema.safeParse(attempt.result)
+      : undefined;
+    let signedIn: boolean;
+    if (priorReceipt?.success === true) {
+      signedIn = priorReceipt.data.signedIn;
+    } else if (command.outcome.state === "not_started") {
+      // The launch helper proved no child/effect existed. Settle from the
+      // recorded signed-out baseline without making this no-effect completion
+      // depend on a fallible provider status probe.
+      signedIn = false;
+    } else {
+      signedIn = (await this.#readClaudeAccount(profile, signal)).signedIn;
+    }
+    try {
+      this.#store.settleClaudeLoginMutation({
+        attemptId: command.attemptId,
+        idempotencyKey: command.idempotencyKey,
+        profileId: profile.id,
+        profileGeneration: command.providerGeneration,
+        signedIn,
+        outcome: command.outcome,
+      });
+    } catch (error: unknown) {
+      if (
+        error instanceof Error
+        && (
+          error.message === "CLAUDE_LOGIN_AUTHORITY_MISMATCH"
+          || error.message === "CLAUDE_LOGIN_TERMINAL_OUTCOME_CONFLICT"
+          || error.message === "MUTATION_RECOVERY_CAS_CONFLICT"
+        )
+      ) throw new CommandFailure("CONFLICT", "The Claude login completion conflicts with its durable terminal receipt.");
+      throw error;
+    }
+    return {
+      account: this.#publicClaudeAccount(profile),
+      authentication: { provider: "claude", signedIn },
+      login: {
+        status: signedIn ? "signed_in" : "signed_out",
+        attemptId: command.attemptId,
+        idempotencyKey: command.idempotencyKey,
+        providerGeneration: command.providerGeneration,
+      },
+    };
+  }
+
+  #abandonClaudeLogin(
+    command: Extract<LocalCommand, { kind: "account.claude-login.abandon" }>,
+  ): unknown {
+    const profile = this.#store.requireProfile(command.account);
+    const attempt = this.#store.readMutation(command.idempotencyKey);
+    if (
+      attempt === null
+      || attempt.id !== command.attemptId
+      || attempt.kind !== "account.claude-login"
+      || attempt.authorityId !== profile.id
+      || attempt.authorityGeneration !== command.providerGeneration
+    ) throw new CommandFailure("CONFLICT", "The acknowledged Claude login abandon does not match its exact launch authority.");
+    try {
+      this.#store.abandonClaudeLoginMutation({
+        attemptId: command.attemptId,
+        idempotencyKey: command.idempotencyKey,
+        profileId: profile.id,
+        profileGeneration: command.providerGeneration,
+        acknowledgeChildExited: command.acknowledgeChildExited,
+      });
+    } catch (error: unknown) {
+      if (
+        error instanceof Error
+        && (
+          error.message === "CLAUDE_LOGIN_AUTHORITY_MISMATCH"
+          || error.message === "CLAUDE_LOGIN_NOT_UNSETTLED"
+          || error.message === "CLAUDE_LOGIN_TERMINAL_OUTCOME_CONFLICT"
+          || error.message === "MUTATION_RECOVERY_CAS_CONFLICT"
+        )
+      ) throw new CommandFailure("CONFLICT", "The acknowledged Claude login abandon does not match one live unsettled launch fence.");
+      throw error;
+    }
+    return {
+      account: this.#publicClaudeAccount(profile),
+      login: {
+        status: "abandoned",
+        attemptId: command.attemptId,
+        idempotencyKey: command.idempotencyKey,
+        providerGeneration: command.providerGeneration,
+        localOnly: true,
+        credentialAction: "none",
+      },
+    };
+  }
+
   async #showAccount(selector: string, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(selector);
     if (profile.state === "signed_out" && profile.processGeneration === 0) {
@@ -3901,6 +4449,9 @@ export class HraService {
     if (prior !== null && (prior.kind !== "account.login" || prior.authorityId !== current.id)) {
       throw new CommandFailure("CONFLICT", "The idempotency key belongs to another mutation authority.");
     }
+    if (current.state === "signed_in" && prior === null) {
+      return { account: this.#publicProfile(current), login: { status: "signed_in" } };
+    }
     if (prior === null && (current.state === "login_pending" || current.state === "recovery_required")) {
       throw new CommandFailure("RECOVERY_REQUIRED", "This account already has an unsettled login. Reuse its idempotency key or inspect the account before starting another login.");
     }
@@ -3915,6 +4466,30 @@ export class HraService {
       throw new CommandFailure("CONFLICT", "The login attempt belongs to a stale account generation.");
     }
     const authority = { ...current, processGeneration: targetGeneration };
+    if (canBegin) {
+      if (this.#store.hasUnsettledSessionMutationAuthority(current.id)) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "This account has an unsettled session start or provider switch. Recover or abandon that session mutation before replacing the account login authority.",
+          { reason: "unsettled_session_mutation", retryable: true },
+        );
+      }
+      const blocker = this.#store.providerAuthorityAdvanceBlocker(
+        current.id,
+        "claude",
+      );
+      if (blocker !== null) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "The Claude runtime for this account is not quiescent. Finish or stop its active work, resolve any recovery, then retry the Codex login.",
+          {
+            provider: "claude",
+            reason: blocker,
+            retryable: true,
+          },
+        );
+      }
+    }
     try {
       const result = await this.#effect({
         kind: "account.login",
@@ -3941,6 +4516,11 @@ export class HraService {
               retirements,
               begun.retiredSessionIds,
             );
+            this.#claude.rebindProfileAuthority({
+              profileId: current.id,
+              expectedGeneration: current.processGeneration,
+              nextGeneration: targetGeneration,
+            });
           } catch (error: unknown) {
             // Preparing the retirement drains bounded redactor custody. A
             // failed atomic commit must stop this daemon so recovery exposes a
@@ -4134,7 +4714,14 @@ export class HraService {
   async #logout(selector: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(selector);
     await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
-    this.#work.assertProfileCanChangeAuthority(profile.id);
+    this.#work.assertProfileCanChangeAuthority(profile.id, "codex");
+    if (this.#store.hasUnsettledSessionMutationAuthority(profile.id, "codex")) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "This account has an unsettled Codex session start or provider switch. Recover or abandon that session mutation before signing out.",
+        { provider: "codex", reason: "unsettled_session_mutation", retryable: true },
+      );
+    }
     const key = idempotencyKey ?? randomUUID();
     if (profile.state === "recovery_required") {
       throw new CommandFailure("RECOVERY_REQUIRED", "This account has an indeterminate logout. Run `hra account show` to reconcile its exact provider state before another logout.");
@@ -4847,7 +5434,7 @@ export class HraService {
     ) {
       throw new CommandFailure("CONFLICT", "The projection recovery authority changed before admission.");
     }
-    this.#assertSignedIn(profile);
+    this.#assertEstablishedSessionAccount(profile, session);
     if (session.state !== "idle" || session.activeTurnId !== undefined) {
       throw new CommandFailure("CONFLICT", "Projection recovery requires an idle session with no active turn.");
     }
@@ -4987,7 +5574,10 @@ export class HraService {
       };
     }
     await this.#ensureFactsMemory(session);
-    if (profile.state !== "signed_in") {
+    if (session.provider === "claude" && this.#platform !== "linux") {
+      return this.#claudePlatformUnavailableObservation(profile);
+    }
+    if (!this.#profileAllowsEstablishedSession(profile, session)) {
       return {
         basis: "local_state",
         code: "account_signed_out",
@@ -5040,6 +5630,24 @@ export class HraService {
       ) {
         return this.#quarantineObservationMismatch(authority, exact);
       }
+      if (session.provider === "claude") {
+        this.#recordSessionObservationFailure(
+          authority,
+          exact,
+          "resume_unavailable",
+          false,
+        );
+        return {
+          basis: "provider_read",
+          code: "resume_unavailable",
+          coverage: "unavailable",
+          freshness: "fresh",
+          observedAt: this.#now(),
+          profileGeneration: profile.processGeneration,
+          source: "codex_app_server",
+          state: "unavailable",
+        };
+      }
       if (!(error instanceof CodexSessionObservationError)) throw error;
       this.#recordSessionObservationFailure(authority, exact, "resume_unavailable", false);
       return {
@@ -5061,7 +5669,7 @@ export class HraService {
       || session.providerThreadId === undefined
       || session.providerThreadId !== observation.projection.providerThreadId
       || currentProfile.processGeneration !== profile.processGeneration
-      || currentProfile.state !== "signed_in"
+      || !this.#profileAllowsEstablishedSession(currentProfile, session)
     ) {
       if (
         this.#currentObservationSession(authority, session.id, providerThreadId) !== null
@@ -5134,7 +5742,7 @@ export class HraService {
       const profile = this.#store.requireProfileById(authority.id);
       const session = this.#store.requireSession(sessionId);
       return profile.processGeneration === authority.generation
-        && profile.state === "signed_in"
+        && this.#profileAllowsEstablishedSession(profile, session)
         && session.profileId === authority.id
         && session.providerThreadId === providerThreadId
         && session.state !== "terminal"
@@ -5219,7 +5827,9 @@ export class HraService {
     if (observation.state === "unavailable") {
       throw new CommandFailure(
         "UNAVAILABLE",
-        "The provider thread is not currently observable; HRA will not use stale session state.",
+        observation.code === "provider_platform_unavailable"
+          ? `Claude session processes are acceptance-pending on ${this.#platform}. HRA retained the local session but will not contact Claude outside Linux.`
+          : "The provider thread is not currently observable; HRA will not use stale session state.",
         { providerObservation: observation },
       );
     }
@@ -5881,6 +6491,20 @@ export class HraService {
     let focalInteraction = input.focalInteraction;
     let quarantineFailed = false;
     try {
+      const focalProvider = input.focalInteraction.sessionId === null
+        ? "codex"
+        : this.#store.requireSession(input.focalInteraction.sessionId).provider;
+      const blocker = this.#store.providerAuthorityAdvanceBlocker(
+        input.focalInteraction.authority.profileId,
+        "claude",
+      );
+      if (focalProvider === "claude" || blocker !== null) {
+        throw new Error(
+          focalProvider === "claude"
+            ? "CLAUDE_INTERACTION_QUARANTINE_REQUIRES_DAEMON_RETIREMENT"
+            : `CODEX_INTERACTION_QUARANTINE_BLOCKED_BY_CLAUDE_${blocker}`,
+        );
+      }
       const quarantined = this.#store.quarantineInteractionPersistenceBoundary({
         profileId: input.focalInteraction.authority.profileId,
         processGeneration: input.focalInteraction.authority.processGeneration,
@@ -5895,6 +6519,11 @@ export class HraService {
       for (const interaction of quarantined.terminalInteractions) {
         if (interaction.sessionId !== null) this.#eventWaiters.notify(interaction.sessionId);
       }
+      this.#claude.rebindProfileAuthority({
+        profileId: quarantined.profile.id,
+        expectedGeneration: input.focalInteraction.authority.processGeneration,
+        nextGeneration: quarantined.profile.processGeneration,
+      });
     } catch (error: unknown) {
       quarantineFailed = true;
       failures.push(error);
@@ -6564,7 +7193,14 @@ export class HraService {
     if (session.providerThreadId === undefined) return { session, effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null };
     const providerThreadId = session.providerThreadId;
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    if (session.provider === "claude" && this.#platform !== "linux") {
+      return {
+        session,
+        effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null,
+        providerObservation: this.#claudePlatformUnavailableObservation(profile),
+      };
+    }
+    this.#assertEstablishedSessionAccount(profile, session);
     if (session.state !== "terminal" && session.state !== "recovery_required") {
       this.#requireLiveProviderObservation(
         await this.#ensureSessionObservedLocked(session.id, signal),
@@ -6604,11 +7240,10 @@ export class HraService {
 
   async #startSession(command: Extract<LocalCommand, { kind: "session.start" }>, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(command.account);
-    this.#assertSignedIn(profile);
+    const provider = command.provider ?? "codex";
     const project = command.project === undefined ? this.#store.listProjects().find((candidate) => candidate.default) : this.#store.requireProject(command.project);
     if (project === undefined) throw new CommandFailure("INTERACTION_REQUIRED", "Add or select a project directory before starting a session.");
     await this.#requireUsableProjectRoot(project.rootPath);
-    const provider = command.provider ?? "codex";
     // A preset the chosen provider cannot run is refused here, before any
     // durable placeholder or provider effect exists.
     if (!isPresetSupportedByProvider(provider, command.preset)) {
@@ -6622,22 +7257,37 @@ export class HraService {
     // port proves, and every later turn, steer, stop, and interaction on this
     // session is routed back to the same port by `sessions.provider`.
     const runtime = this.#sessionRuntime(provider);
+    // Prove authentication under the account serializer before the first
+    // durable mutation row or runtime review exists. Storage consumes this
+    // exact profile/provider/generation tuple at the effect boundary.
+    const providerAuthentication = await this.#assertProviderSignedIn(
+      profile,
+      provider,
+      signal,
+    );
     const key = command.idempotencyKey ?? randomUUID();
     let localSessionId: SessionRecord["id"] | undefined;
-    let clientMessageId: string | undefined;
+    let clientMessageId: MutationAttemptRecord["id"] | undefined;
     let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
     let startedProjection:
       | (CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile })
       | undefined;
-    const outcome = await this.#effect<z.infer<typeof sessionStartReceiptSchema>>({
+    let outcome: z.infer<typeof sessionStartReceiptSchema>;
+    try {
+      outcome = await this.#effect<z.infer<typeof sessionStartReceiptSchema>>({
       kind: "session.start",
       authorityId: profile.id,
       authorityGeneration: profile.processGeneration,
-      request: { projectId: project.id, preset: command.preset, fast: command.fast },
+      request: {
+        projectId: project.id,
+        provider,
+        preset: command.preset,
+        fast: command.fast,
+      },
       idempotencyKey: key,
       beginEffect: async (attemptId) => {
         clientMessageId = attemptId;
-        review = await this.#fencedEffect(async () => {
+        review = await this.#fencedRuntimeReview(runtime, async () => {
           const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
           return await runtime.reviewSessionStart({
             authority: authorityFor(this.#paths, profile),
@@ -6653,6 +7303,7 @@ export class HraService {
           profileGeneration: profile.processGeneration,
           projectId: project.id,
           provider,
+          providerAuthentication,
           preset: command.preset,
           fastEnabled: command.fast,
           evidence: {
@@ -6712,9 +7363,35 @@ export class HraService {
         });
       },
       onAmbiguous: () => {
-        if (localSessionId !== undefined) this.#quarantineSession(localSessionId);
+        if (localSessionId === undefined) return;
+        if (startedProjection !== undefined && clientMessageId !== undefined) {
+          try {
+            const local = this.#store.requireSession(localSessionId);
+            if (local.providerThreadId === undefined && local.state === "starting") {
+              this.#store.bindSessionStartRecoveryTarget({
+                attemptId: clientMessageId,
+                sessionId: local.id,
+                expectedSessionRevision: local.revision,
+                providerThreadId: startedProjection.providerThreadId,
+                title: startedProjection.title,
+                ...(startedProjection.providerUpdatedAt === undefined
+                  ? {}
+                  : { providerUpdatedAt: startedProjection.providerUpdatedAt }),
+                runtimeProfile: startedProjection.effectiveRuntimeProfile,
+              });
+              return;
+            }
+          } catch {
+            // The quarantine below is the last durable fallback if the exact
+            // provider binding cannot be persisted after the provider return.
+          }
+        }
+        this.#quarantineSession(localSessionId);
       },
-    });
+      });
+    } finally {
+      if (review !== undefined) runtime.discardRuntimeReview(review);
+    }
     try {
       await this.#ensureFactsMemory(this.#store.requireSession(outcome.sessionId));
     } catch (error: unknown) {
@@ -6780,27 +7457,161 @@ export class HraService {
    * Move one live conversation from its current provider to another one.
    *
    * What this does, in order: refuse an unsafe or impossible switch, build the
-   * neutral transcript and render the bounded handoff seed from it, release
-   * the outgoing provider's hold on the thread, start a thread on the target
-   * provider and account, commit the whole rebinding in one transaction,
-   * append the `provider_switched` record, and send the seed as the first user
-   * message of the new thread.
+   * neutral transcript and render the bounded handoff seed, fence both runtime
+   * authorities with immutable evidence, start and receipt the target, persist
+   * the seed intent and result around its one provider effect, release and
+   * receipt the source, then atomically rebind the session and append the
+   * switch boundary plus seed event.
    *
    * What it cannot do is carry the provider's own state across. The target
    * gets HRA's record of the conversation, not the source provider's thread,
    * hidden reasoning, or cached context — `docs/providers/portability.md`
    * states that boundary.
    */
+  #settledProviderSwitchReplay(
+    command: Extract<LocalCommand, { kind: "session.switch" }>,
+  ): Readonly<{ matched: false } | { matched: true; value: unknown }> {
+    if (command.idempotencyKey === undefined) return { matched: false };
+    const prior = this.#store.readMutation(command.idempotencyKey);
+    if (prior === null || (prior.state !== "applied" && prior.state !== "reconciled")) {
+      return { matched: false };
+    }
+    const session = this.#store.requireSession(command.session);
+    if (prior.kind !== "session.switch" || prior.authorityId !== session.id) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "That idempotency key belongs to a different mutation authority.",
+        { idempotencyKey: command.idempotencyKey },
+      );
+    }
+    if (prior.result === undefined) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "That provider switch was explicitly resolved without a replayable result.",
+        { idempotencyKey: command.idempotencyKey },
+      );
+    }
+    const receipt = sessionProviderSwitchDurableReceiptSchema.parse(prior.result);
+    const requestedAccountId = command.account === undefined
+      ? null
+      : command.account === receipt.request.accountId
+        ? receipt.request.accountId
+        : this.#store.requireProfile(command.account).id;
+    if (
+      receipt.request.provider !== command.provider
+      || receipt.request.accountId !== requestedAccountId
+      || receipt.request.preset !== (command.preset ?? null)
+    ) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "That idempotency key names a different provider-switch request.",
+        { idempotencyKey: command.idempotencyKey },
+      );
+    }
+    return {
+      matched: true,
+      value: {
+        session: receipt.session,
+        from: receipt.from,
+        to: receipt.to,
+        seed: { delivered: true, ...receipt.seed },
+        transcriptDigest: receipt.transcriptDigest,
+        turnId: receipt.turnId,
+        idempotencyKey: command.idempotencyKey,
+      },
+    };
+  }
+
   async #switchProvider(
     command: Extract<LocalCommand, { kind: "session.switch" }>,
     signal: AbortSignal,
   ): Promise<unknown> {
-    const session = this.#requireBoundSession(command.session);
+    const replay = this.#settledProviderSwitchReplay(command);
+    if (replay.matched) return replay.value;
+    const knownSession = this.#store.requireSession(command.session);
+    const key = command.idempotencyKey ?? randomUUID();
+    const responseFromReceipt = (
+      receipt: z.infer<typeof sessionSwitchReceiptSchema>,
+      sessionSnapshot: z.infer<typeof sessionProviderSwitchDurableReceiptSchema>["session"]
+        = sessionProviderSwitchSnapshotSchema.parse(this.#store.requireSession(receipt.sessionId)),
+    ): unknown => ({
+      session: sessionSnapshot,
+      from: receipt.from,
+      to: receipt.to,
+      seed: { delivered: true, ...receipt.seed },
+      transcriptDigest: receipt.transcriptDigest,
+      turnId: receipt.turnId,
+      idempotencyKey: key,
+    });
+    const prior = command.idempotencyKey === undefined
+      ? null
+      : this.#store.readMutation(command.idempotencyKey);
+    if (command.idempotencyKey !== undefined) {
+      if (prior !== null) {
+        if (prior.kind !== "session.switch" || prior.authorityId !== knownSession.id) {
+          throw new CommandFailure(
+            "CONFLICT",
+            "That idempotency key belongs to a different mutation authority.",
+            { idempotencyKey: command.idempotencyKey },
+          );
+        }
+        if (prior.state === "effect_started" || prior.state === "ambiguous") {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "session.switch has an indeterminate earlier attempt and will not be replayed.",
+            { idempotencyKey: command.idempotencyKey },
+          );
+        }
+        if (prior.state === "applied" || prior.state === "reconciled") {
+          if (prior.result === undefined) {
+            throw new CommandFailure(
+              "CONFLICT",
+              "That provider switch was explicitly resolved without a replayable result.",
+              { idempotencyKey: command.idempotencyKey },
+            );
+          }
+          const receipt = sessionProviderSwitchDurableReceiptSchema.parse(prior.result);
+          const replayAccountId = command.account === undefined
+            ? null
+            : command.account === receipt.request.accountId
+              ? receipt.request.accountId
+              : this.#store.requireProfile(command.account).id;
+          if (
+            receipt.request.provider !== command.provider
+            || receipt.request.accountId !== replayAccountId
+            || receipt.request.preset !== (command.preset ?? null)
+          ) {
+            throw new CommandFailure(
+              "CONFLICT",
+              "That idempotency key names a different provider-switch request.",
+              { idempotencyKey: command.idempotencyKey },
+            );
+          }
+          return responseFromReceipt(receipt, receipt.session);
+        }
+        if (prior.state !== "prepared") {
+          throw new CommandFailure(
+            "CONFLICT",
+            `session.switch already reached ${prior.state}.`,
+            { idempotencyKey: command.idempotencyKey },
+          );
+        }
+      }
+    }
+    const session = this.#requireBoundSession(knownSession.id);
+    const requestedAccountId = command.account === undefined
+      ? null
+      : this.#store.requireProfile(command.account).id;
     const currentProfile = this.#store.requireProfile(session.profileId);
-    const targetProfile = command.account === undefined
+    const targetProfile = requestedAccountId === null
       ? currentProfile
-      : this.#store.requireProfile(command.account);
-    this.#assertSignedIn(targetProfile);
+      : this.#store.requireProfileById(requestedAccountId);
+    this.#assertEstablishedSessionAccount(currentProfile, session);
+    const providerAuthentication = await this.#assertProviderSignedIn(
+      targetProfile,
+      command.provider,
+      signal,
+    );
     if (
       session.provider === command.provider
       && targetProfile.id === currentProfile.id
@@ -6847,138 +7658,297 @@ export class HraService {
     });
 
     const runtime = this.#sessionRuntime(command.provider);
-    const key = command.idempotencyKey ?? randomUUID();
     const fromProvider = session.provider;
     const fromPreset = session.preset;
-    let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
+    let sessionReview: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
+    let seedReview: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
+    let switchAttemptId: MutationAttemptRecord["id"] | undefined;
     let started:
       | (CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile })
       | undefined;
-    const outcome = await this.#effect<z.infer<typeof sessionSwitchReceiptSchema>>({
-      kind: "session.switch",
-      authorityId: session.id,
-      authorityGeneration: targetProfile.processGeneration,
-      request: {
-        provider: command.provider,
-        preset,
-        targetProfileId: targetProfile.id,
-        seedDigest: seed.digest,
-      },
-      idempotencyKey: key,
-      effect: async () => {
-        // The target thread is started before the source is released. A target
-        // that refuses then leaves the session exactly where it was, still
-        // observed and still runnable, instead of stranding it with a released
-        // thread it can no longer resume.
-        review = await this.#fencedEffect(async () => await runtime.reviewSessionStart({
-          authority: authorityFor(this.#paths, targetProfile),
-          ...(projectRoot === undefined ? {} : { projectRoot }),
-          preset,
-          fast: session.fastEnabled,
-          signal,
-        }));
-        const runtimeReview = review;
-        started = await this.#fencedEffect(async () => await runtime.startSession({
-          authority: authorityFor(this.#paths, targetProfile),
-          ...(projectRoot === undefined ? {} : { projectRoot }),
-          review: runtimeReview,
-          signal,
-        }));
-        // Now release the outgoing provider: a per-session runtime process is
-        // stopped rather than left running behind an abandoned thread.
-        await this.#endProviderSession(session, currentProfile, signal);
-        return {
-          providerThreadId: started.providerThreadId,
-          sessionId: session.id,
-          toProvider: command.provider,
-        };
-      },
-      receipt: (value) => sessionSwitchReceiptSchema.parse(value),
-      restore: (value) => sessionSwitchReceiptSchema.parse(value),
-      commit: (attemptId) => {
-        if (started === undefined) {
-          throw new Error("Provider switch commit lost its exact provider projection.");
-        }
-        const current = this.#store.requireSession(session.id);
-        this.#store.completeSessionProviderSwitch({
-          attemptId,
-          sessionId: current.id,
-          expectedSessionRevision: current.revision,
+    let seeded:
+      | Readonly<{
+          turnId: string;
+          status: "completed" | "interrupted" | "failed" | "inProgress";
+          effectiveRuntimeProfile: ReviewedRuntimeProfile;
+        }>
+      | undefined;
+    let outcome: z.infer<typeof sessionSwitchReceiptSchema>;
+    try {
+      outcome = await this.#effect<z.infer<typeof sessionSwitchReceiptSchema>>({
+        kind: "session.switch",
+        authorityId: session.id,
+        authorityGeneration: targetProfile.processGeneration,
+        request: {
           provider: command.provider,
-          profileId: targetProfile.id,
           preset,
-          providerThreadId: started.providerThreadId,
-          state: started.status,
-          ...(started.activeTurnId === undefined ? {} : { activeTurnId: started.activeTurnId }),
-          ...(started.providerUpdatedAt === undefined
-            ? {}
-            : { providerUpdatedAt: started.providerUpdatedAt }),
-          runtimeProfile: started.effectiveRuntimeProfile,
-          receipt: {
+          targetProfileId: targetProfile.id,
+          seedDigest: seed.digest,
+        },
+        idempotencyKey: key,
+        beginEffect: async (attemptId) => {
+          switchAttemptId = attemptId;
+          sessionReview = await this.#fencedRuntimeReview(
+            runtime,
+            async () => await runtime.reviewSessionStart({
+              authority: authorityFor(this.#paths, targetProfile),
+              ...(projectRoot === undefined ? {} : { projectRoot }),
+              preset,
+              fast: session.fastEnabled,
+              signal,
+            }),
+          );
+          this.#store.beginSessionProviderSwitchEffect({
+            attemptId,
+            sessionId: session.id,
+            providerAuthentication,
+            evidence: {
+              kind: "session.switch",
+              daemonGeneration: this.#daemonGeneration,
+              requestedAccountId,
+              requestedPreset: command.preset ?? null,
+              sourceProfileId: currentProfile.id,
+              sourceProcessGeneration: currentProfile.processGeneration,
+              sourceProvider: session.provider,
+              sourceProviderThreadId: session.providerThreadId,
+              sourcePreset: session.preset,
+              targetProfileId: targetProfile.id,
+              targetProcessGeneration: targetProfile.processGeneration,
+              targetProvider: command.provider,
+              targetPreset: preset,
+              transcriptDigest: transcript.digest,
+              seedDigest: seed.digest,
+              seedIncludedRecords: seed.includedRecords,
+              seedOmittedRecords: seed.omittedRecords,
+              runtimeProfile: sessionReview.effectiveRuntimeProfile,
+            },
+          });
+        },
+        effect: async (attemptId) => {
+          if (sessionReview === undefined) {
+            throw new Error("Provider switch lost its reviewed target runtime.");
+          }
+          const targetSessionReview = sessionReview;
+          started = await this.#fencedEffect(async () => await runtime.startSession({
+            authority: authorityFor(this.#paths, targetProfile),
+            ...(projectRoot === undefined ? {} : { projectRoot }),
+            review: targetSessionReview,
+            signal,
+          }));
+          const startedTarget = started;
+          const releaseTarget = async (): Promise<void> => {
+            await this.#fencedEffect(async () => await runtime.endSession({
+              authority: authorityFor(this.#paths, targetProfile),
+              providerThreadId: startedTarget.providerThreadId,
+              signal,
+            }));
+            this.#store.recordSessionProviderSwitchTargetReleased({
+              attemptId,
+              sessionId: session.id,
+              providerThreadId: startedTarget.providerThreadId,
+            });
+          };
+          try {
+            this.#store.recordSessionProviderSwitchTarget({
+              attemptId,
+              sessionId: session.id,
+              providerThreadId: startedTarget.providerThreadId,
+            });
+          } catch (recordError: unknown) {
+            try {
+              await releaseTarget();
+            } catch (cleanupError: unknown) {
+              this.#quarantineSession(session.id);
+              throw new IndeterminateLocalCommitError(
+                "The target provider started, but neither its exact binding nor its cleanup could be durably proven.",
+                new AggregateError([recordError, cleanupError]),
+              );
+            }
+            throw recordError;
+          }
+          try {
+            seedReview = await this.#fencedRuntimeReview(
+              runtime,
+              async () => await runtime.reviewTurnStart({
+                authority: authorityFor(this.#paths, targetProfile),
+                providerThreadId: startedTarget.providerThreadId,
+                ...(projectRoot === undefined ? {} : { projectRoot }),
+                preset,
+                fast: session.fastEnabled,
+                signal,
+              }),
+            );
+            const targetSeedReview = seedReview;
+            this.#store.recordSessionProviderSwitchSeedIntent({
+              attemptId,
+              sessionId: session.id,
+              providerThreadId: startedTarget.providerThreadId,
+              seedText: seed.text,
+              runtimeProfile: targetSeedReview.effectiveRuntimeProfile,
+            });
+            seeded = await this.#fencedEffect(async () => await runtime.startTurn({
+              authority: authorityFor(this.#paths, targetProfile),
+              providerThreadId: startedTarget.providerThreadId,
+              ...(projectRoot === undefined ? {} : { projectRoot }),
+              review: targetSeedReview,
+              message: seed.text,
+              clientMessageId: attemptId,
+              signal,
+            }));
+            this.#store.recordSessionProviderSwitchSeedResult({
+              attemptId,
+              sessionId: session.id,
+              providerThreadId: startedTarget.providerThreadId,
+              runtimeProfile: seeded.effectiveRuntimeProfile,
+              turnId: seeded.turnId,
+              turnStatus: seeded.status,
+            });
+          } catch (seedError: unknown) {
+            try {
+              await releaseTarget();
+            } catch (cleanupError: unknown) {
+              this.#quarantineSession(session.id);
+              throw new IndeterminateLocalCommitError(
+                "The target seed did not settle and the target provider could not be safely cleaned up.",
+                new AggregateError([seedError, cleanupError]),
+              );
+            }
+            if (seedError instanceof IndeterminateCodexEffectError) {
+              throw new CommandFailure(
+                "UNAVAILABLE",
+                "The target seed did not settle, but the target was released and the source session remains unchanged.",
+              );
+            }
+            throw seedError;
+          }
+          try {
+            await this.#endProviderSession(session, currentProfile, signal);
+          } catch (sourceError: unknown) {
+            if (sourceError instanceof DaemonAuthoritySafetyError) throw sourceError;
+            this.#quarantineSession(session.id);
+            throw new IndeterminateLocalCommitError(
+              "The source provider release did not settle; the seeded target was left intact for recovery.",
+              sourceError,
+            );
+          }
+          try {
+            this.#store.recordSessionProviderSwitchSourceReleased({
+              attemptId,
+              sessionId: session.id,
+            });
+          } catch (recordError: unknown) {
+            try {
+              const current = this.#store.requireSession(session.id);
+              this.#store.bindSessionProviderSwitchRecoveryTarget({
+                attemptId,
+                sessionId: session.id,
+                expectedSessionRevision: current.revision,
+                title: startedTarget.title,
+                ...(startedTarget.providerUpdatedAt === undefined
+                  ? {}
+                  : { providerUpdatedAt: startedTarget.providerUpdatedAt }),
+                recordSourceReleased: true,
+              });
+            } catch (fallbackError: unknown) {
+              this.#quarantineSession(session.id);
+              throw new IndeterminateLocalCommitError(
+                "The source provider was released, but its receipt and target recovery binding could not be committed.",
+                new AggregateError([recordError, fallbackError]),
+              );
+            }
+            throw new IndeterminateLocalCommitError(
+              "The source was released and the seeded target was durably bound for recovery, but the final receipt did not commit.",
+              recordError,
+            );
+          }
+          return {
+            from: { provider: fromProvider, preset: fromPreset, account: currentProfile.id },
             providerThreadId: started.providerThreadId,
+            request: {
+              accountId: requestedAccountId,
+              preset: command.preset ?? null,
+              provider: command.provider,
+            },
+            seed: {
+              digest: seed.digest,
+              includedRecords: seed.includedRecords,
+              omittedRecords: seed.omittedRecords,
+              status: seeded.status,
+            },
+            sessionId: session.id,
+            to: { provider: command.provider, preset, account: targetProfile.id },
+            transcriptDigest: transcript.digest,
+            turnId: seeded.turnId,
+          };
+        },
+        receipt: (value) => sessionSwitchReceiptSchema.parse(value),
+        restore: (value) => sessionSwitchReceiptSchema.parse(value),
+        commit: (attemptId, result, receipt) => {
+          if (started === undefined || seeded === undefined) {
+            throw new Error("Provider switch commit lost its exact provider projection or seed result.");
+          }
+          const current = this.#store.requireSession(session.id);
+          const state = seeded.status === "inProgress" ? "active" : "idle";
+          this.#store.completeSessionProviderSwitch({
+            attemptId,
             sessionId: current.id,
-            toProvider: command.provider,
-          },
-        });
-      },
-      onAmbiguous: () => this.#quarantineSession(session.id),
-    });
+            expectedSessionRevision: current.revision,
+            provider: command.provider,
+            profileId: targetProfile.id,
+            preset,
+            providerThreadId: started.providerThreadId,
+            state,
+            ...(state === "active" ? { activeTurnId: seeded.turnId } : {}),
+            ...(started.providerUpdatedAt === undefined
+              ? {}
+              : { providerUpdatedAt: started.providerUpdatedAt }),
+            runtimeProfile: started.effectiveRuntimeProfile,
+            seedTurnId: seeded.turnId,
+            receipt: sessionSwitchReceiptSchema.parse(receipt ?? result),
+          });
+        },
+        onAmbiguous: () => {
+          if (switchAttemptId !== undefined) {
+            const mutation = this.#store.readMutation(switchAttemptId);
+            if (mutation?.state === "applied" || mutation?.state === "reconciled") return;
+          }
+          const current = this.#store.requireSession(session.id);
+          if (
+            started !== undefined
+            && switchAttemptId !== undefined
+            && current.profileId === currentProfile.id
+            && current.provider === session.provider
+            && current.providerThreadId === session.providerThreadId
+          ) {
+            const progress = this.#store.readSessionProviderSwitchProgress(switchAttemptId);
+            if (
+              progress.sourceReleased
+              && !progress.targetReleased
+              && progress.seedTurnId !== undefined
+            ) {
+              this.#store.bindSessionProviderSwitchRecoveryTarget({
+                attemptId: switchAttemptId,
+                sessionId: session.id,
+                expectedSessionRevision: current.revision,
+                title: started.title,
+                ...(started.providerUpdatedAt === undefined
+                  ? {}
+                  : { providerUpdatedAt: started.providerUpdatedAt }),
+              });
+              return;
+            }
+          }
+          this.#quarantineSession(session.id);
+        },
+      });
+    } finally {
+      if (sessionReview !== undefined) runtime.discardRuntimeReview(sessionReview);
+      if (seedReview !== undefined) runtime.discardRuntimeReview(seedReview);
+    }
 
     const switched = this.#store.requireSession(outcome.sessionId);
-    this.#appendSessionEvent(
-      authorityFor(this.#paths, targetProfile),
-      switched.id,
-      null,
-      {
-        type: "provider_switched",
-        fromProvider,
-        toProvider: command.provider,
-        fromPreset,
-        toPreset: preset,
-        accountChanged: targetProfile.id !== currentProfile.id,
-        transcriptDigest: transcript.digest,
-        seedDigest: seed.digest,
-        seedOmittedRecords: seed.omittedRecords,
-      },
-    );
     await this.#ensureSessionObservedLocked(switched.id, signal);
-    // The handoff summary is an ordinary first turn on the new thread, so it
-    // records its own `user_message` and produces an ordinary reply. The
-    // rebinding is already durable at this point, so a seed the new provider
-    // refuses is reported as an undelivered seed rather than raised as a
-    // failed switch the operator would wrongly retry.
-    let seeded: unknown;
-    let seedFailure: string | undefined;
-    try {
-      seeded = await this.#send(
-        switched.id,
-        seed.text,
-        undefined,
-        signal,
-        undefined,
-        "provider_switch",
-      );
-    } catch (error: unknown) {
-      seedFailure = error instanceof CommandFailure
-        ? error.code
-        : error instanceof Error ? error.name : "error";
-      this.recordBackgroundDiagnostic("provider_switch_seed_failed", error);
-    }
-    return {
-      session: this.#store.requireSession(switched.id),
-      from: { provider: fromProvider, preset: fromPreset, account: currentProfile.id },
-      to: { provider: command.provider, preset, account: targetProfile.id },
-      seed: {
-        delivered: seedFailure === undefined,
-        digest: seed.digest,
-        ...(seedFailure === undefined ? {} : { failureCode: seedFailure }),
-        includedRecords: seed.includedRecords,
-        omittedRecords: seed.omittedRecords,
-      },
-      transcriptDigest: transcript.digest,
-      turnId: seededTurnId(seeded),
-      idempotencyKey: key,
-    };
+    return responseFromReceipt(outcome);
   }
 
   /**
@@ -6989,7 +7959,9 @@ export class HraService {
     session: SessionRecord & { providerThreadId: string },
     profile: ProfileRecord,
     signal: AbortSignal,
+    reason = "provider switch",
   ): Promise<void> {
+    this.#assertEstablishedSessionAccount(profile, session);
     const connectionId = this.#sessionProviderConnections.get(session.id) ?? null;
     this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
       accountId: profile.id,
@@ -7000,18 +7972,18 @@ export class HraService {
     this.#appendSessionEvent(authorityFor(this.#paths, profile), session.id, connectionId, {
       type: "connection",
       state: "disconnected",
-      reason: "provider switch",
+      reason,
     });
     this.#sessionProviderConnections.delete(session.id);
     this.#sessionObservationFailures.delete(session.id);
     this.#sessionResubscriptionConnections.delete(session.id);
     this.#sessionsAwaitingResubscription.delete(session.id);
     this.#forgetSessionFactEpoch(session.id);
-    await this.#runtimeForSession(session).endSession({
+    await this.#fencedEffect(async () => await this.#runtimeForSession(session).endSession({
       authority: authorityFor(this.#paths, profile),
       providerThreadId: session.providerThreadId,
       signal,
-    });
+    }));
   }
 
   /*
@@ -7078,7 +8050,7 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertEstablishedSessionAccount(profile, session);
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     if (project !== undefined) await this.#requireUsableProjectRoot(project.rootPath);
     this.#requireLiveProviderObservation(
@@ -7230,7 +8202,7 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertEstablishedSessionAccount(profile, session);
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
@@ -7289,7 +8261,7 @@ export class HraService {
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertEstablishedSessionAccount(profile, session);
     // Custody is proved before anything durable exists, so a queue entry never
     // outlives the attachments it references.
     const attachments = await this.#prepareAttachments(attachmentReferences);
@@ -7321,6 +8293,7 @@ export class HraService {
   #scheduleQueueDispatch(session: SessionRecord): void {
     if (this.#state !== "open") return;
     const profile = this.#store.requireProfile(session.profileId);
+    if (!this.#profileAllowsEstablishedSession(profile, session)) return;
     const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, authorityFor(this.#paths, profile)));
     const tracked = task.then(
       () => undefined,
@@ -7388,7 +8361,7 @@ export class HraService {
         return;
       }
       const profile = this.#store.requireProfile(current.profileId);
-      if (profile.state !== "signed_in") return;
+      if (!this.#profileAllowsEstablishedSession(profile, current)) return;
       await this.#serializeSessionAuthority(current, async () => this.#dispatchNextQueue(current.id, authorityFor(this.#paths, profile)));
       if (this.#store.requireQueue(queueId).state !== "pending") this.#queuePreEffectRetryCounts.delete(queueId);
     })();
@@ -7410,7 +8383,7 @@ export class HraService {
   async #stop(selector: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertEstablishedSessionAccount(profile, session);
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
@@ -7494,7 +8467,7 @@ export class HraService {
           resolution: "abandoned",
         });
         await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
-      this.#resumeSessionWorkAfterRecovery(resolved);
+        this.#resumeSessionWorkAfterRecovery(resolved);
         return {
           session: resolved,
           recovery: {
@@ -7509,7 +8482,7 @@ export class HraService {
         throw new CommandFailure("RECOVERY_REQUIRED", "The status quarantine has no exact provider-thread binding. Run `hra session abandon` to release only the local authority.");
       }
       const profile = this.#store.requireProfile(session.profileId);
-      this.#assertSignedIn(profile);
+      this.#assertEstablishedSessionAccount(profile, session);
       const projection = await this.#readExactSessionProjection({ ...session, providerThreadId: session.providerThreadId }, profile, false, signal);
       const resolved = this.#store.resolveSessionStatusRecovery({
         sessionId: session.id,
@@ -7551,6 +8524,14 @@ export class HraService {
     if (originalState !== "effect_started" && originalState !== "ambiguous") {
       throw new CommandFailure("CONFLICT", "The mutation authority is already settled.");
     }
+    if (attempt.evidence.evidence.kind === "session.switch") {
+      return await this.#resolveProviderSwitchRecovery(
+        session,
+        attempt,
+        action,
+        signal,
+      );
+    }
 
     if (session.providerThreadId === undefined) {
       if (attempt.kind !== "session.start" || attempt.sessionStartId !== session.id) {
@@ -7572,8 +8553,16 @@ export class HraService {
     }
 
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
-    if (profile.processGeneration !== attempt.authorityGeneration) {
+    this.#assertEstablishedSessionAccount(profile, session);
+    const authorityCurrent = attempt.evidence.evidence.kind === "session.start"
+      ? this.#store.isSessionMutationProviderAuthorityCurrent({
+          attemptId: attempt.id,
+          profileId: profile.id,
+          provider: session.provider,
+          originGeneration: attempt.authorityGeneration,
+        })
+      : profile.processGeneration === attempt.authorityGeneration;
+    if (!authorityCurrent) {
       throw new CommandFailure("RECOVERY_REQUIRED", "The account generation changed after the uncertain session effect.");
     }
     const projection = await this.#readExactSessionProjection({ ...session, providerThreadId: session.providerThreadId }, profile, false, signal);
@@ -7614,6 +8603,561 @@ export class HraService {
     await this.#reconcileCommittedSessionFactsMemory(resolved);
       this.#resumeSessionWorkAfterRecovery(resolved);
     return { session: resolved, projection, idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false } };
+  }
+
+  async #resolveProviderSwitchRecovery(
+    session: SessionRecord,
+    attempt: MutationAttemptRecord,
+    action: "recover" | "abandon",
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const evidenceRecord = attempt.evidence;
+    if (evidenceRecord === undefined || evidenceRecord.evidence.kind !== "session.switch") {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The provider switch has no exact immutable recovery evidence.");
+    }
+    const evidence = evidenceRecord.evidence;
+    const originalState = attempt.originalState ?? attempt.state;
+    if (originalState !== "effect_started" && originalState !== "ambiguous") {
+      throw new CommandFailure("CONFLICT", "The provider-switch authority is already settled.");
+    }
+    for (const authority of [
+      {
+        profileId: evidence.sourceProfileId,
+        provider: evidence.sourceProvider,
+        originGeneration: evidence.sourceProcessGeneration,
+      },
+      {
+        profileId: evidence.targetProfileId,
+        provider: evidence.targetProvider,
+        originGeneration: evidence.targetProcessGeneration,
+      },
+    ] as const) {
+      if (!this.#store.isSessionMutationProviderAuthorityCurrent({
+        attemptId: attempt.id,
+        ...authority,
+      })) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "A provider authority changed without an exact switch-recovery successor receipt.",
+        );
+      }
+    }
+    const sourceProfile = this.#store.requireProfileById(evidence.sourceProfileId);
+    const targetProfile = this.#store.requireProfileById(evidence.targetProfileId);
+    const readDetached = async (
+      profile: ProfileRecord,
+      provider: Provider,
+      providerThreadId: string,
+      detail: boolean,
+    ): Promise<CodexSessionProjection> => {
+      const projection = await this.#fencedEffect(async () =>
+        await this.#sessionRuntime(provider).readSession({
+          authority: authorityFor(this.#paths, profile),
+          providerThreadId,
+          detail,
+          signal,
+        }));
+      if (projection.providerThreadId !== providerThreadId) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider returned a different thread than the immutable switch receipt names.",
+        );
+      }
+      return projection;
+    };
+    const endDetachedTarget = async (providerThreadId: string): Promise<void> => {
+      await this.#fencedEffect(async () => await this.#sessionRuntime(evidence.targetProvider).endSession({
+        authority: authorityFor(this.#paths, targetProfile),
+        providerThreadId,
+        signal,
+      }));
+      this.#store.recordSessionProviderSwitchTargetReleased({
+        attemptId: attempt.id,
+        sessionId: session.id,
+        providerThreadId,
+      });
+    };
+    const providerState = (projection: CodexSessionProjection) => ({
+      providerThreadId: projection.providerThreadId,
+      title: projection.title,
+      status: projection.status,
+      ...(projection.activeTurnId === undefined ? {} : { activeTurnId: projection.activeTurnId }),
+      ...(projection.providerUpdatedAt === undefined
+        ? {}
+        : { providerUpdatedAt: projection.providerUpdatedAt }),
+    } as const);
+    const finish = async (
+      resolved: SessionRecord,
+      resolution: "proven_applied" | "abandoned",
+      projection?: CodexSessionProjection,
+      extra: Record<string, unknown> = {},
+    ): Promise<unknown> => {
+      await this.#reconcileCommittedSessionFactsMemory(
+        resolved,
+        resolution === "abandoned" ? "abandon" : undefined,
+      );
+      this.#resumeSessionWorkAfterRecovery(resolved);
+      return {
+        session: resolved,
+        ...(projection === undefined ? {} : { projection }),
+        idempotencyKey: attempt.idempotencyKey,
+        recovery: {
+          resolved: true,
+          resolution,
+          providerEffectRetried: false,
+          ...extra,
+        },
+      };
+    };
+
+    let current = this.#store.requireSession(session.id);
+    let progress = this.#store.readSessionProviderSwitchProgress(attempt.id);
+    const sourceBound = (): boolean =>
+      current.profileId === evidence.sourceProfileId
+      && current.provider === evidence.sourceProvider
+      && current.providerThreadId === evidence.sourceProviderThreadId;
+    const targetBound = (): boolean =>
+      progress.targetProviderThreadId !== undefined
+      && current.profileId === evidence.targetProfileId
+      && current.provider === evidence.targetProvider
+      && current.providerThreadId === progress.targetProviderThreadId;
+    if (!sourceBound() && !targetBound()) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session binding matches neither immutable side of the provider switch.",
+      );
+    }
+    const crossedDaemonRestart = evidence.daemonGeneration === undefined
+      || evidence.daemonGeneration !== this.#daemonGeneration;
+    const sourceClaudeStateUnavailable = crossedDaemonRestart
+      && evidence.sourceProvider === "claude"
+      && !progress.sourceReleased;
+    const targetClaudeStateUnavailable = crossedDaemonRestart
+      && evidence.targetProvider === "claude"
+      && !progress.targetReleased;
+    if (sourceClaudeStateUnavailable || targetClaudeStateUnavailable) {
+      if (action === "recover") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider switch crossed a daemon restart with unreleased Claude state. Claude sessions are process-local and the new daemon cannot read, resume, or release that prior process. No provider effect was replayed; run `hra session abandon` only if you accept a provider-state-unknown settlement.",
+        );
+      }
+
+      const sourceReleased = progress.sourceReleased;
+      const targetAddressable = progress.targetProviderThreadId !== undefined;
+      let targetReleased = progress.targetReleased;
+      let targetStateUnknown = targetClaudeStateUnavailable || (!targetAddressable && !targetReleased);
+      let sourceStateUnknown = !sourceReleased;
+      let sourceObserved = false;
+      let observedSourceProviderUpdatedAt: number | null | undefined;
+      if (!sourceReleased && evidence.sourceProvider === "codex") {
+        try {
+          const sourceProjection = await readDetached(
+            sourceProfile,
+            evidence.sourceProvider,
+            evidence.sourceProviderThreadId,
+            false,
+          );
+          sourceStateUnknown = false;
+          sourceObserved = true;
+          observedSourceProviderUpdatedAt = sourceProjection.providerUpdatedAt ?? null;
+        } catch (error: unknown) {
+          if (error instanceof DaemonAuthoritySafetyError) throw error;
+          this.recordBackgroundDiagnostic("provider_switch_source_abandon_failed", error);
+        }
+      }
+      if (
+        progress.targetProviderThreadId !== undefined
+        && !targetReleased
+        && !targetClaudeStateUnavailable
+      ) {
+        try {
+          await endDetachedTarget(progress.targetProviderThreadId);
+          targetReleased = true;
+        } catch (error: unknown) {
+          if (error instanceof DaemonAuthoritySafetyError) throw error;
+          targetStateUnknown = true;
+          this.recordBackgroundDiagnostic("provider_switch_target_abandon_failed", error);
+        }
+      }
+      if (!targetReleased) targetStateUnknown = true;
+      const providerStateDeleted = sourceReleased && targetReleased;
+      const providerStateUnknown = sourceStateUnknown || targetStateUnknown;
+      const unaddressableTargetMayExist = !targetAddressable && !targetReleased;
+      const resolved = this.#store.resolveSessionMutation({
+        attemptId: attempt.id,
+        expectedOriginalState: originalState,
+        expectedEvidenceDigest: evidenceRecord.digest,
+        resolution: "abandoned",
+        resolutionEvidence: {
+          action: "user_abandon",
+          source: "claude_process_local_restart_boundary",
+          daemonGeneration: this.#daemonGeneration,
+          effectDaemonGeneration: evidence.daemonGeneration ?? null,
+          providerEffectRetried: false,
+          providerStateDeleted,
+          providerStateUnknown,
+          sourceReleased,
+          sourceObserved,
+          sourceStateUnknown,
+          targetAddressable,
+          targetReleased,
+          targetStateUnknown,
+          unaddressableTargetMayExist,
+          ...(observedSourceProviderUpdatedAt === undefined
+            ? {}
+            : { observedSourceProviderUpdatedAt }),
+        },
+        acknowledgeProviderStateUnknown: true,
+      });
+      return await finish(resolved, "abandoned", undefined, {
+        providerStateDeleted,
+        providerStateUnknown,
+        sourceReleased,
+        sourceObserved,
+        sourceStateUnknown,
+        targetAddressable,
+        targetReleased,
+        targetStateUnknown,
+        unaddressableTargetMayExist,
+      });
+    }
+    if (targetBound() && !progress.sourceReleased) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The target is locally bound without a durable source-release receipt.",
+      );
+    }
+    if (progress.sourceReleased && progress.seedTurnId === undefined) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The source-release receipt exists without a durable seeded-turn receipt.",
+      );
+    }
+
+    if (action === "abandon") {
+      let targetReleased = progress.targetReleased;
+      const sourceReleased = progress.sourceReleased;
+      const targetAddressable = progress.targetProviderThreadId !== undefined;
+      if (progress.targetProviderThreadId !== undefined && !targetReleased) {
+        try {
+          await endDetachedTarget(progress.targetProviderThreadId);
+          targetReleased = true;
+        } catch (error: unknown) {
+          if (error instanceof DaemonAuthoritySafetyError) throw error;
+          this.recordBackgroundDiagnostic("provider_switch_target_abandon_failed", error);
+        }
+      }
+      if (sourceBound() && !sourceReleased && targetReleased) {
+        try {
+          const sourceProjection = await readDetached(
+            sourceProfile,
+            evidence.sourceProvider,
+            evidence.sourceProviderThreadId,
+            false,
+          );
+          const resolved = this.#store.resolveSessionMutation({
+            attemptId: attempt.id,
+            expectedOriginalState: originalState,
+            expectedEvidenceDigest: evidenceRecord.digest,
+            resolution: "abandoned",
+            resolutionEvidence: {
+              action: "user_abandon",
+              providerEffectRetried: false,
+              sourceRetained: true,
+              targetReleased: true,
+            },
+            provider: providerState(sourceProjection),
+          });
+          return await finish(resolved, "abandoned", sourceProjection, {
+            providerStateDeleted: false,
+            sourceRetained: true,
+            targetAddressable,
+          });
+        } catch (error: unknown) {
+          if (error instanceof DaemonAuthoritySafetyError) throw error;
+          this.recordBackgroundDiagnostic("provider_switch_source_abandon_failed", error);
+        }
+      }
+      const providerStateDeleted = targetReleased && sourceReleased;
+      const resolved = this.#store.resolveSessionMutation({
+        attemptId: attempt.id,
+        expectedOriginalState: originalState,
+        expectedEvidenceDigest: evidenceRecord.digest,
+        resolution: "abandoned",
+        resolutionEvidence: {
+          action: "user_abandon",
+          providerEffectRetried: false,
+          providerStateDeleted,
+          targetAddressable,
+          unaddressableTargetMayExist: !targetAddressable,
+        },
+        acknowledgeProviderStateUnknown: true,
+      });
+      return await finish(resolved, "abandoned", undefined, {
+        providerStateDeleted,
+        targetAddressable,
+        unaddressableTargetMayExist: !targetAddressable,
+      });
+    }
+
+    if (progress.targetProviderThreadId === undefined) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The target start has no exact provider-thread receipt. Run `hra session abandon` only if you accept that an unaddressable target may still exist.",
+      );
+    }
+    const targetThreadId = progress.targetProviderThreadId;
+    if (progress.targetReleased) {
+      if (progress.sourceReleased) {
+        const resolved = this.#store.resolveSessionMutation({
+          attemptId: attempt.id,
+          expectedOriginalState: originalState,
+          expectedEvidenceDigest: evidenceRecord.digest,
+          resolution: "abandoned",
+          resolutionEvidence: {
+            source: "durable_release_receipts",
+            sourceReleased: true,
+            targetReleased: true,
+          },
+        });
+        return await finish(resolved, "abandoned", undefined, { providerStateDeleted: true });
+      }
+      if (!sourceBound()) {
+        throw new CommandFailure("RECOVERY_REQUIRED", "A released target no longer has the expected source binding.");
+      }
+      const sourceProjection = await readDetached(
+        sourceProfile,
+        evidence.sourceProvider,
+        evidence.sourceProviderThreadId,
+        false,
+      );
+      const resolved = this.#store.resolveSessionMutation({
+        attemptId: attempt.id,
+        expectedOriginalState: originalState,
+        expectedEvidenceDigest: evidenceRecord.digest,
+        resolution: "abandoned",
+        resolutionEvidence: {
+          source: "target_release_and_source_read",
+          targetReleased: true,
+          providerUpdatedAt: sourceProjection.providerUpdatedAt ?? null,
+        },
+        provider: providerState(sourceProjection),
+      });
+      return await finish(resolved, "abandoned", sourceProjection, { providerStateDeleted: false });
+    }
+
+    let targetProjection: CodexSessionProjection | undefined;
+    if (progress.seed === undefined) {
+      await endDetachedTarget(targetThreadId);
+      const sourceProjection = await readDetached(
+        sourceProfile,
+        evidence.sourceProvider,
+        evidence.sourceProviderThreadId,
+        false,
+      );
+      const resolved = this.#store.resolveSessionMutation({
+        attemptId: attempt.id,
+        expectedOriginalState: originalState,
+        expectedEvidenceDigest: evidenceRecord.digest,
+        resolution: "abandoned",
+        resolutionEvidence: { source: "target_released_before_seed", targetReleased: true },
+        provider: providerState(sourceProjection),
+      });
+      return await finish(resolved, "abandoned", sourceProjection, { providerStateDeleted: false });
+    }
+    if (
+      progress.seed.clientMessageId !== attempt.id
+      || digestTranscriptSeed(progress.seed.text) !== evidence.seedDigest
+    ) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The durable target seed intent does not match the immutable switch evidence.");
+    }
+    if (progress.seedTurnId === undefined) {
+      targetProjection = await readDetached(
+        targetProfile,
+        evidence.targetProvider,
+        targetThreadId,
+        true,
+      );
+      const matches = (targetProjection.messages ?? []).filter((message) =>
+        message.role === "user"
+        && message.clientId === attempt.id
+        && message.turnId !== undefined);
+      if (matches.length === 1) {
+        const omission = targetProjection.omission;
+        const provesUniqueMatch = omission !== undefined
+          && !omission.hasMoreOlderTurns
+          && omission.omittedMessages === 0
+          && omission.truncatedMessages === 0
+          && omission.unreadItemTurnIds.length === 0
+          && omission.incompleteTurnIds.length === 0;
+        if (!provesUniqueMatch) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The bounded target read cannot prove that the seed match is unique, so the source was left intact.",
+          );
+        }
+        const turnId = matches[0]?.turnId;
+        if (turnId === undefined) throw new Error("Provider-switch seed proof lost its turn id.");
+        const summaries = (targetProjection.turnSummaries ?? []).filter((turn) => turn.id === turnId);
+        const summary = summaries.length === 1 ? summaries[0] : undefined;
+        if (summary === undefined) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The target names the seed message but does not provide one exact turn-status proof.",
+          );
+        }
+        this.#store.recordSessionProviderSwitchSeedResult({
+          attemptId: attempt.id,
+          sessionId: session.id,
+          providerThreadId: targetThreadId,
+          runtimeProfile: progress.seed.runtimeProfile,
+          turnId,
+          turnStatus: summary.status,
+        });
+        progress = this.#store.readSessionProviderSwitchProgress(attempt.id);
+      } else if (matches.length === 0) {
+        const omission = targetProjection.omission;
+        const provesAbsence = omission !== undefined
+          && !omission.hasMoreOlderTurns
+          && omission.omittedMessages === 0
+          && omission.truncatedMessages === 0
+          && omission.unreadItemTurnIds.length === 0
+          && omission.incompleteTurnIds.length === 0;
+        if (!provesAbsence) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The bounded target read cannot prove that the seed was absent, so it was not replayed or cleaned up.",
+          );
+        }
+        await endDetachedTarget(targetThreadId);
+        const sourceProjection = await readDetached(
+          sourceProfile,
+          evidence.sourceProvider,
+          evidence.sourceProviderThreadId,
+          false,
+        );
+        const resolved = this.#store.resolveSessionMutation({
+          attemptId: attempt.id,
+          expectedOriginalState: originalState,
+          expectedEvidenceDigest: evidenceRecord.digest,
+          resolution: "abandoned",
+          resolutionEvidence: { source: "complete_target_read", seedAbsent: true, targetReleased: true },
+          provider: providerState(sourceProjection),
+        });
+        return await finish(resolved, "abandoned", sourceProjection, { providerStateDeleted: false });
+      } else {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The target contains multiple messages for one provider-switch seed authority.",
+        );
+      }
+    }
+    if (progress.seedTurnId === undefined || progress.seedTurnStatus === undefined) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The target seed result is still not durably proven.");
+    }
+    if (!progress.sourceReleased) {
+      if (!sourceBound()) {
+        throw new CommandFailure("RECOVERY_REQUIRED", "The source release is unproven and the source is no longer bound.");
+      }
+      try {
+        await this.#endProviderSession(
+          { ...current, providerThreadId: evidence.sourceProviderThreadId },
+          sourceProfile,
+          signal,
+        );
+      } catch {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The source provider release is still unproven; the seeded target was left intact.",
+        );
+      }
+      try {
+        this.#store.recordSessionProviderSwitchSourceReleased({
+          attemptId: attempt.id,
+          sessionId: session.id,
+        });
+      } catch {
+        current = this.#store.requireSession(session.id);
+        this.#store.bindSessionProviderSwitchRecoveryTarget({
+          attemptId: attempt.id,
+          sessionId: session.id,
+          expectedSessionRevision: current.revision,
+          title: targetProjection?.title ?? current.title,
+          ...(targetProjection?.providerUpdatedAt === undefined
+            ? {}
+            : { providerUpdatedAt: targetProjection.providerUpdatedAt }),
+          recordSourceReleased: true,
+        });
+      }
+      progress = this.#store.readSessionProviderSwitchProgress(attempt.id);
+      current = this.#store.requireSession(session.id);
+    }
+    if (!progress.sourceReleased || progress.targetReleased) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The provider-switch release receipts changed before target adoption.");
+    }
+    if (sourceBound()) {
+      this.#store.bindSessionProviderSwitchRecoveryTarget({
+        attemptId: attempt.id,
+        sessionId: session.id,
+        expectedSessionRevision: current.revision,
+        title: targetProjection?.title ?? current.title,
+        ...(targetProjection?.providerUpdatedAt === undefined
+          ? {}
+          : { providerUpdatedAt: targetProjection.providerUpdatedAt }),
+      });
+      current = this.#store.requireSession(session.id);
+    }
+    if (!targetBound()) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The seeded target could not be bound to the recovering session.");
+    }
+    targetProjection = await readDetached(
+      targetProfile,
+      evidence.targetProvider,
+      targetThreadId,
+      false,
+    );
+    const receipt = sessionSwitchReceiptSchema.parse({
+      from: {
+        account: evidence.sourceProfileId,
+        preset: evidence.sourcePreset,
+        provider: evidence.sourceProvider,
+      },
+      providerThreadId: targetThreadId,
+      request: {
+        accountId: evidence.requestedAccountId,
+        preset: evidence.requestedPreset,
+        provider: evidence.targetProvider,
+      },
+      seed: {
+        digest: evidence.seedDigest,
+        includedRecords: evidence.seedIncludedRecords,
+        omittedRecords: evidence.seedOmittedRecords,
+        status: progress.seedTurnStatus,
+      },
+      sessionId: session.id,
+      to: {
+        account: evidence.targetProfileId,
+        preset: evidence.targetPreset,
+        provider: evidence.targetProvider,
+      },
+      transcriptDigest: evidence.transcriptDigest,
+      turnId: progress.seedTurnId,
+    });
+    const resolved = this.#store.resolveSessionMutation({
+      attemptId: attempt.id,
+      expectedOriginalState: originalState,
+      expectedEvidenceDigest: evidenceRecord.digest,
+      resolution: "proven_applied",
+      resolutionEvidence: {
+        source: "target_read_after_source_release",
+        providerUpdatedAt: targetProjection.providerUpdatedAt ?? null,
+        seedTurnId: progress.seedTurnId,
+      },
+      receipt,
+      provider: providerState(targetProjection),
+    });
+    return await finish(resolved, "proven_applied", targetProjection);
   }
 
   #proveSessionMutation(attempt: MutationAttemptRecord, sessionId: SessionRecord["id"], projection: CodexSessionProjection): { receipt: unknown; evidence: unknown } | null {
@@ -7662,7 +9206,7 @@ export class HraService {
   ): Promise<unknown> {
     if (session.providerThreadId === undefined) throw new CommandFailure("RECOVERY_REQUIRED", "The queued effect has no exact provider-thread binding.");
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertEstablishedSessionAccount(profile, session);
     if (profile.processGeneration !== record.evidence.profileGeneration) {
       throw new CommandFailure("RECOVERY_REQUIRED", "The account generation changed after the uncertain queued effect.");
     }
@@ -7708,6 +9252,7 @@ export class HraService {
   }
 
   async #readExactSessionProjection(session: BoundSessionRecord, profile: ProfileRecord, detail: boolean, signal: AbortSignal): Promise<CodexSessionProjection> {
+    if (session.provider === "claude") this.#assertClaudeIsolationAccepted();
     const projection = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, detail, signal }));
     if (projection.providerThreadId !== session.providerThreadId) {
       throw new CommandFailure("RECOVERY_REQUIRED", "Codex returned a projection for a different provider thread.");
@@ -7759,6 +9304,89 @@ export class HraService {
     }
     if (profile.state !== "signed_in") {
       throw new CommandFailure("INTERACTION_REQUIRED", `Sign in to ${profile.label} with \`hra account login ${profile.id}\` before using its Codex runtime.`);
+    }
+  }
+
+  /**
+   * A profile's durable state is Codex account state. Claude authentication is
+   * owned by Claude Code inside the same provider-neutral profile directory,
+   * so admitting a new Claude effect must ask that provider without mutating
+   * the Codex state machine.
+   */
+  async #assertProviderSignedIn(
+    profile: ProfileRecord,
+    provider: Provider,
+    signal: AbortSignal,
+  ): Promise<Readonly<{
+    profileId: ProfileRecord["id"];
+    processGeneration: number;
+    provider: Provider;
+    signedIn: true;
+  }>> {
+    if (provider === "codex") {
+      this.#assertSignedIn(profile);
+      return {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        provider,
+        signedIn: true,
+      };
+    }
+    const unsettledLogin = this.#unsettledClaudeLogin(profile);
+    if (unsettledLogin !== undefined) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "A foreground Claude login still owns this account. Join or explicitly resolve that exact login before starting another Claude provider effect.",
+        this.#claudeLoginRecovery(unsettledLogin),
+      );
+    }
+    this.#assertClaudeIsolationAccepted();
+    const account = await this.#fencedEffect(async () => await this.#claude.readAccount({
+      authority: authorityFor(this.#paths, profile),
+      signal,
+    }));
+    if (account.signedIn) {
+      return {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        provider,
+        signedIn: true,
+      };
+    }
+    const nextCommand = `hra account login ${profile.id} --provider claude`;
+    throw new CommandFailure(
+      "INTERACTION_REQUIRED",
+      `Sign in with \`${nextCommand}\` before using this account's Claude runtime.`,
+      {
+        accountSelector: profile.id,
+        accountState: "signed_out",
+        nextCommand,
+        provider: "claude",
+      },
+    );
+  }
+
+  /** Provider-touch admission for an established session. */
+  #profileAllowsEstablishedSession(
+    profile: ProfileRecord,
+    session: Pick<SessionRecord, "provider">,
+  ): boolean {
+    return session.provider === "claude"
+      ? this.#platform === "linux"
+      : profile.state === "signed_in";
+  }
+
+  /** Established Claude sessions ignore Codex auth state, but not platform custody. */
+  #assertEstablishedSessionAccount(
+    profile: ProfileRecord,
+    session: Pick<SessionRecord, "provider">,
+  ): void {
+    if (session.provider === "claude") {
+      this.#assertClaudeIsolationAccepted();
+      return;
+    }
+    if (!this.#profileAllowsEstablishedSession(profile, session)) {
+      this.#assertSignedIn(profile);
     }
   }
 
@@ -7858,6 +9486,8 @@ export class HraService {
   async #dispatchNextQueue(sessionId: SessionRecord["id"], authority: ProfileAuthority): Promise<void> {
     const session = this.#store.requireSession(sessionId);
     if (session.state !== "idle" || session.providerThreadId === undefined) return;
+    const admittedProfile = this.#store.requireProfile(session.profileId);
+    if (!this.#profileAllowsEstablishedSession(admittedProfile, session)) return;
     const boundSession: BoundSessionRecord = { ...session, providerThreadId: session.providerThreadId };
     const queued = this.#store.nextPendingQueue(session.id);
     if (queued === null) return;
@@ -8033,6 +9663,22 @@ export class HraService {
     }
   }
 
+  async #serializeProfileAuthorities<T>(
+    profileIds: readonly ProfileRecord["id"][],
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    const ordered = [...new Set(profileIds)].sort();
+    const acquire = async (index: number): Promise<T> => {
+      const profileId = ordered[index];
+      if (profileId === undefined) return await operation();
+      return await this.#serialize(
+        `account:${profileId}`,
+        async () => acquire(index + 1),
+      );
+    };
+    return await acquire(0);
+  }
+
   async #applyOrderedAccountFact(
     profileId: ProfileRecord["id"],
     operation: () => Promise<void> | void,
@@ -8057,12 +9703,37 @@ export class HraService {
     void tracked.then(() => this.#background.delete(tracked));
   }
 
+  #sessionRecoveryProfileIds(session: Pick<SessionRecord, "id" | "profileId">): readonly ProfileRecord["id"][] {
+    const ids = new Set<ProfileRecord["id"]>([session.profileId]);
+    for (const attempt of this.#store.listUnsettledMutations({ sessionId: session.id })) {
+      const evidence = attempt.evidence?.evidence;
+      if (evidence?.kind !== "session.switch") continue;
+      ids.add(evidence.sourceProfileId);
+      ids.add(evidence.targetProfileId);
+    }
+    return [...ids];
+  }
+
   async #serializeSessionAuthority<T>(
     session: Pick<SessionRecord, "id" | "profileId">,
     operation: () => Promise<T> | T,
     options: Readonly<{ allowDuringProjectionRecovery?: boolean }> = {},
   ): Promise<T> {
-    return await this.#serialize(`account:${session.profileId}`, async () =>
+    return await this.#serializeSessionAuthorityAcrossProfiles(
+      session,
+      [session.profileId],
+      operation,
+      options,
+    );
+  }
+
+  async #serializeSessionAuthorityAcrossProfiles<T>(
+    session: Pick<SessionRecord, "id" | "profileId">,
+    profileIds: readonly ProfileRecord["id"][],
+    operation: () => Promise<T> | T,
+    options: Readonly<{ allowDuringProjectionRecovery?: boolean }> = {},
+  ): Promise<T> {
+    return await this.#serializeProfileAuthorities(profileIds, async () =>
       this.#serialize(`session:${session.id}`, async () => {
         if (options.allowDuringProjectionRecovery !== true) {
           const unsettled = await this.#cloud.isCompactProjectionRecoveryUnsettled(session.id);
@@ -8089,7 +9760,7 @@ export class HraService {
     }
   }
 
-  async #effect<T>(input: { kind: string; authorityId: string; authorityGeneration: number; request: unknown; idempotencyKey: string | undefined; beginEffect?(attemptId: MutationAttemptRecord["id"]): Promise<void> | void; effect(attemptId: string): Promise<T>; receipt(result: T): unknown; restore(receipt: unknown): T; commit?(attemptId: MutationAttemptRecord["id"], result: T, receipt: unknown): Promise<void> | void; onAmbiguous?: (result: T | undefined) => void }): Promise<T> {
+  async #effect<T>(input: { kind: string; authorityId: string; authorityGeneration: number; request: unknown; idempotencyKey: string | undefined; beginEffect?(attemptId: MutationAttemptRecord["id"]): Promise<void> | void; effect(attemptId: MutationAttemptRecord["id"]): Promise<T>; receipt(result: T): unknown; restore(receipt: unknown): T; commit?(attemptId: MutationAttemptRecord["id"], result: T, receipt: unknown): Promise<void> | void; onAmbiguous?: (result: T | undefined) => void }): Promise<T> {
     const attempt = this.#store.prepareMutation(input);
     if (attempt.replay) {
       if (attempt.state === "applied") return input.restore(attempt.result);

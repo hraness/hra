@@ -669,13 +669,18 @@ WHEN EXISTS (
     )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_SESSION_ATTEMPT_AUTHORITY'); END;
+DROP TRIGGER IF EXISTS work_profile_attempt_authority_guard;
 CREATE TRIGGER IF NOT EXISTS work_profile_attempt_authority_guard
 BEFORE UPDATE OF state,process_generation ON profiles
 WHEN EXISTS (
   SELECT 1 FROM work_attempts AS a
+  JOIN sessions AS s ON s.id=a.worker_session_id
   WHERE a.account_id=OLD.id
     AND a.state IN ('claimed','dispatching','running')
-    AND (NEW.state!='signed_in' OR NEW.process_generation!=a.account_generation)
+    AND (
+      NEW.process_generation!=a.account_generation
+      OR (NEW.state!='signed_in' AND s.provider!='claude')
+    )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_PROFILE_ATTEMPT_AUTHORITY'); END;
 
@@ -712,6 +717,7 @@ CREATE TRIGGER IF NOT EXISTS work_signals_no_delete
 BEFORE DELETE ON work_signals
 WHEN NOT EXISTS (SELECT 1 FROM work_purge_authority WHERE work_id=OLD.work_id)
 BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_IMMUTABLE'); END;
+DROP TRIGGER IF EXISTS work_signal_member_guard;
 CREATE TRIGGER IF NOT EXISTS work_signal_member_guard
 BEFORE INSERT ON work_signals
 WHEN NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND session_id=NEW.from_session_id)
@@ -719,7 +725,8 @@ WHEN NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND sessio
   OR NOT EXISTS (
     SELECT 1 FROM sessions AS s JOIN profiles AS p ON p.id=s.profile_id
     WHERE s.id=NEW.to_session_id AND s.state IN ('active','idle')
-      AND p.state='signed_in' AND p.process_generation=NEW.target_account_generation
+      AND p.state!='removed' AND (s.provider='claude' OR p.state='signed_in')
+      AND p.process_generation=NEW.target_account_generation
   )
 BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_MEMBER_INVALID'); END;
 CREATE TRIGGER IF NOT EXISTS work_receipts_no_update
@@ -1009,6 +1016,9 @@ const assertWorkSchemaShape = (database: Database): void => {
     if (!triggers.has(name)) throw new Error(`WORK_SCHEMA_MISSING_TRIGGER:${name}`);
   }
   const requiredColumns: Readonly<Record<string, readonly string[]>> = {
+    // Current work authority guards inspect the provider on their parent
+    // session, so a merely present trigger is not a usable work schema.
+    sessions: ["provider"],
     work_release_tombstones: [
       "work_id", "release_idempotency_key", "release_request_digest", "client_ref_digest",
       "terminal_kind", "final_revision", "final_head_hash", "discarded_counts_json",
@@ -1955,7 +1965,8 @@ export class WorkStore {
        WHERE t.id=? AND t.work_id=?
          AND t.account_id=s.profile_id AND t.project_id=s.project_id
          AND t.preset=s.preset AND t.fast=s.fast_enabled
-         AND s.state IN ('active','idle') AND p.state='signed_in'
+         AND s.state IN ('active','idle') AND p.state!='removed'
+         AND (s.provider='claude' OR p.state='signed_in')
          AND p.process_generation=?`,
     ).get(
       effect.targetSessionId,
@@ -1977,7 +1988,8 @@ export class WorkStore {
        WHERE w.id=? AND w.work_id=? AND w.to_session_id=? AND w.mode=?
          AND w.target_account_generation=?
          AND p.process_generation=w.target_account_generation
-         AND s.state IN ('active','idle') AND p.state='signed_in'`,
+         AND s.state IN ('active','idle') AND p.state!='removed'
+         AND (s.provider='claude' OR p.state='signed_in')`,
     ).get(
       effect.signalId,
       effect.workId,
@@ -3511,7 +3523,8 @@ export class WorkStore {
        FROM sessions AS s
        JOIN profiles AS p ON p.id=s.profile_id
        WHERE s.id=? AND s.profile_id=? AND s.project_id=? AND s.preset=? AND s.fast_enabled=?
-         AND s.state IN ('active','idle') AND p.state='signed_in'`,
+         AND s.state IN ('active','idle') AND p.state!='removed'
+         AND (s.provider='claude' OR p.state='signed_in')`,
     ).get(
       actorSessionId,
       task.account_id,
@@ -3533,7 +3546,8 @@ export class WorkStore {
        JOIN profiles AS p ON p.id=s.profile_id
        JOIN work_members AS m ON m.work_id=? AND m.session_id=s.id
        WHERE s.id=? AND s.profile_id=? AND s.project_id=? AND s.preset=? AND s.fast_enabled=?
-         AND s.state IN ('active','idle') AND p.state='signed_in'
+         AND s.state IN ('active','idle') AND p.state!='removed'
+         AND (s.provider='claude' OR p.state='signed_in')
          AND p.process_generation=?`,
     ).get(
       attempt.work_id,
@@ -3550,6 +3564,7 @@ export class WorkStore {
   prepareProfileAuthorityChange(
     profileId: string,
     expectedGeneration: number,
+    provider?: "codex" | "claude",
   ): readonly string[] {
     const prepare = this.#database.transaction((): readonly string[] => {
       const profile = this.#database.query(
@@ -3559,11 +3574,13 @@ export class WorkStore {
         throw new WorkStoreError("REVISION_CONFLICT");
       }
       const attempts = this.#database.query(
-        `SELECT * FROM work_attempts
-         WHERE account_id=? AND account_generation=?
-           AND state IN ('claimed','dispatching','running')
-         ORDER BY work_id,created_at,id`,
-      ).all(profileId, expectedGeneration) as AttemptRow[];
+        `SELECT a.* FROM work_attempts AS a
+         JOIN sessions AS s ON s.id=a.worker_session_id
+         WHERE a.account_id=? AND a.account_generation=?
+           AND a.state IN ('claimed','dispatching','running')
+           AND (? IS NULL OR s.provider=?)
+         ORDER BY a.work_id,a.created_at,a.id`,
+      ).all(profileId, expectedGeneration, provider ?? null, provider ?? null) as AttemptRow[];
       const workIds = [...new Set(attempts.map((attempt) => attempt.work_id))].sort();
       const now = this.#tick();
       for (const attempt of attempts) {
@@ -3629,12 +3646,17 @@ export class WorkStore {
     return prepare.immediate();
   }
 
-  assertProfileCanChangeAuthority(profileId: string): void {
+  assertProfileCanChangeAuthority(
+    profileId: string,
+    provider?: "codex" | "claude",
+  ): void {
     const live = this.#database.query(
-      `SELECT 1 AS present FROM work_attempts
-       WHERE account_id=? AND state IN ('claimed','dispatching','running')
+      `SELECT 1 AS present FROM work_attempts AS a
+       JOIN sessions AS s ON s.id=a.worker_session_id
+       WHERE a.account_id=? AND a.state IN ('claimed','dispatching','running')
+         AND (? IS NULL OR s.provider=?)
        LIMIT 1`,
-    ).get(profileId) as { present: number } | null;
+    ).get(profileId, provider ?? null, provider ?? null) as { present: number } | null;
     if (live !== null) throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
   }
 
@@ -5164,7 +5186,8 @@ export class WorkStore {
     const targetAuthority = this.#database.query(
       `SELECT p.process_generation AS account_generation
        FROM sessions AS s JOIN profiles AS p ON p.id=s.profile_id
-       WHERE s.id=? AND s.state IN ('active','idle') AND p.state='signed_in'`,
+       WHERE s.id=? AND s.state IN ('active','idle') AND p.state!='removed'
+         AND (s.provider='claude' OR p.state='signed_in')`,
     ).get(operation.targetSessionId) as { account_generation: number } | null;
     if (
       targetAuthority === null

@@ -22,12 +22,14 @@ import type { CommandResponse, LocalCommand } from "../src/domain/contracts";
 import { readDaemonAuthorityReceipt } from "../src/daemon/daemon-lock";
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { resolveStatePaths } from "../src/storage/paths";
+import { HRA_VERSION } from "../src/version";
 import {
   acceptanceInstallationDescriptorSchema,
   createAcceptanceInstallation,
   type AcceptanceInstallationDescriptor,
 } from "./live-acceptance-installation";
 import {
+  assertCurrentLiveAcceptancePackageVersion,
   assertAcceptanceDescriptorLayout,
   createLiveAcceptanceLayout,
   LIVE_ACCEPTANCE_CONTROL_FD,
@@ -365,6 +367,9 @@ describe("source-only live acceptance isolation", () => {
       "live-source-status:status --porcelain=v1 --untracked-files=all",
     ]);
     expect(attestation.sourceRevision).toBe(sourceRevision);
+    expect(attestation.packageVersion).toBe(HRA_VERSION);
+    expect(() => assertCurrentLiveAcceptancePackageVersion(HRA_VERSION)).not.toThrow();
+    expect(() => assertCurrentLiveAcceptancePackageVersion("0.1.0")).toThrow("input_invalid");
   });
 
   test("rejects both unbounded event-stream aliases at the worker boundary", () => {
@@ -406,12 +411,17 @@ describe("source-only live acceptance isolation", () => {
   test("places both runtime probes around the live run and before durable evidence", async () => {
     const source = await readFile(join(import.meta.dir, "live-acceptance.ts"), "utf8");
     const main = source.slice(source.indexOf("export const liveAcceptanceMain"));
+    const packageVersionGuard = main.indexOf(
+      "assertCurrentLiveAcceptancePackageVersion(attestation.packageVersion)",
+    );
     const open = main.indexOf("openLiveRuntimeAttestationBoundary(");
     const start = main.indexOf("startLiveAcceptanceRun({");
     const firstClose = main.indexOf("runtimeBoundary?.close()", start);
     const firstPersist = main.indexOf("persistLiveAcceptanceEvidence(", firstClose);
     const secondClose = main.indexOf("runtimeBoundary?.close()", firstClose + 1);
     const secondPersist = main.indexOf("persistLiveAcceptanceEvidence(", secondClose);
+    expect(packageVersionGuard).toBeGreaterThan(-1);
+    expect(packageVersionGuard).toBeLessThan(open);
     expect(open).toBeGreaterThan(-1);
     expect(open).toBeLessThan(start);
     expect(firstClose).toBeGreaterThan(start);

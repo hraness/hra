@@ -34,8 +34,11 @@ import {
   type InteractionRecord,
 } from "../domain/interactions";
 import {
+  deviceCommandLoginResultLifetimeMs,
   deviceRegistryLimits,
+  isRelayedLoginUserCode,
   isRelayedLoginUrl,
+  type DeviceCommandLoginStatus,
   type DeviceCommandPayload,
   type DeviceRegistryPayload,
   type DeviceRegistryScheduledTask,
@@ -972,6 +975,23 @@ function terminalSessionState(session: SessionRecord): "active" | "idle" | "term
   if (session.state === "idle") return "idle";
   if (session.state === "terminal") return "terminal";
   return null;
+}
+
+/**
+ * A profile's durable state is Codex authentication state. Claude owns its
+ * authentication in the isolated runtime home, so an already-established
+ * Claude session remains authoritative while that Codex projection is signed
+ * out (including generation zero).
+ */
+function profileAllowsEstablishedSession(
+  profile: ProfileRecord,
+  session: SessionRecord,
+  platform: NodeJS.Platform,
+): boolean {
+  return profile.state !== "removed"
+    && (session.provider === "claude"
+      ? platform === "linux"
+      : profile.state === "signed_in" && profile.processGeneration >= 1);
 }
 
 function parseStoredEvents(value: string): readonly CompactSessionEvent[] {
@@ -2457,6 +2477,7 @@ export type StateBackedCloudDaemonAdapterOptions = Readonly<{
   /** Display name for this machine in the device registry (default: the host name). */
   machineLabel?: string;
   now?: () => number;
+  platform?: NodeJS.Platform;
   paths: StatePaths;
   /** Read-only Codex Desktop automations source for the scheduled-task registry. */
   readCodexAutomations?: () => Promise<readonly CodexAutomation[]>;
@@ -2523,9 +2544,11 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   readonly #machineLabel: string;
   readonly #readCodexAutomations: () => Promise<readonly CodexAutomation[]>;
   readonly #registryNow: () => number;
+  readonly #platform: NodeJS.Platform;
 
   constructor(options: StateBackedCloudDaemonAdapterOptions) {
     this.#liveThinking = options.liveThinking ?? false;
+    this.#platform = options.platform ?? process.platform;
     this.#registryNow = options.now ?? Date.now;
     this.#machineLabel = registryLabel(options.machineLabel ?? hostname(), "This machine");
     // Without an injected custody the adapter reports no key and refuses to
@@ -3019,8 +3042,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       session.id !== sessionPublicId
       || session.providerThreadId === undefined
       || session.state !== "idle"
-      || profile.state !== "signed_in"
-      || profile.processGeneration < 1
+      || !profileAllowsEstablishedSession(profile, session, this.#platform)
       || (expected !== undefined && (
         profile.id !== expected.profileId
         || profile.processGeneration !== expected.profileGeneration
@@ -3053,7 +3075,11 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       if (state === null || session.providerThreadId === undefined) continue;
       const profile = this.#store.requireProfileById(session.profileId);
       if (profile.state === "removed") continue;
-      const canReadProvider = profile.state === "signed_in" && profile.processGeneration >= 1;
+      const canReadProvider = profileAllowsEstablishedSession(
+        profile,
+        session,
+        this.#platform,
+      );
       if (profile.state === "signed_in" && !canReadProvider) continue;
       let includeHead = canReadProvider;
       if (cache !== null) {
@@ -3426,8 +3452,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         || session.providerThreadId === undefined
         || session.state === "starting"
         || session.state === "recovery_required"
-        || profile.state !== "signed_in"
-        || profile.processGeneration < 1
+        || !profileAllowsEstablishedSession(profile, session, this.#platform)
       ) return Promise.resolve(null);
       return Promise.resolve({
         localSessionId: session.id,
@@ -3461,7 +3486,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         || session.providerThreadId !== input.authority.providerThreadId
         || session.state === "starting"
         || session.state === "recovery_required"
-        || profile.state !== "signed_in"
+        || !profileAllowsEstablishedSession(profile, session, this.#platform)
       ) return { code: "LOCAL_AUTHORITY_CHANGED", state: "failed" };
 
       // Hosted attachments are materialized into the same local
@@ -3650,12 +3675,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
           return await this.#startSessionForDevice(input.payload, input.idempotencyKey, input.signal);
         case "account_login_start":
           return await this.#startAccountLoginRelay(
-            input.payload.accountPublicId,
+            input.payload,
             input.idempotencyKey,
             input.signal,
           );
         case "account_login_status":
-          return this.#accountLoginStatus();
+          return this.#accountLoginStatus(input.payload);
         case "usage_refresh":
           return await this.#refreshUsageForDevice(input.signal);
       }
@@ -3732,34 +3757,83 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   }
 
   async #startAccountLoginRelay(
-    accountPublicId: string,
+    payload: Extract<DeviceCommandPayload, { kind: "account_login_start" }>,
     idempotencyKey: string,
     signal: AbortSignal,
   ): Promise<CloudDeviceCommandExecutionResult> {
+    const currentHandoff = payload.handoffVersion === 2;
     const response = await this.#executeLocal({
-      account: accountPublicId,
-      deviceCode: false,
+      account: payload.accountPublicId,
+      // A browser on another device cannot complete Codex's loopback browser
+      // login. The web lane is therefore always the managed device-code flow.
+      deviceCode: currentHandoff,
       idempotencyKey: deriveDeviceEffectKey(idempotencyKey, "account-login"),
       kind: "account.login",
     }, { signal });
-    const loginUrl = relayedLoginUrlFrom(response);
-    // A login whose provider URL is a loopback callback cannot be completed on
-    // another device. Rather than relay something that cannot work, the command
-    // fails closed and the browser falls back to status polling and the CLI.
-    if (loginUrl === null) return { code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" };
+    if (!currentHandoff) {
+      const loginUrl = relayedLoginUrlFrom(response);
+      if (loginUrl === null) {
+        return { code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" };
+      }
+      return {
+        code: "APPLIED",
+        result: {
+          expiresAt: this.#registryNow() + deviceCommandLoginResultLifetimeMs,
+          kind: "account_login_start",
+          loginUrl,
+        },
+        singleUseResult: true,
+        state: "applied",
+      };
+    }
+    const handoff = relayedLoginHandoffFrom(response);
+    // Both values are required to complete Codex device authorization. Refuse
+    // an incomplete or unsafe handoff rather than spending the single-use read
+    // on a login the requesting browser cannot finish.
+    if (handoff === null) return { code: "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", state: "failed" };
     return {
       code: "APPLIED",
       result: {
-        expiresAt: this.#registryNow() + relayedLoginLifetimeMs,
+        expiresAt: this.#registryNow() + deviceCommandLoginResultLifetimeMs,
+        handoffVersion: 2,
         kind: "account_login_start",
-        loginUrl,
+        loginUrl: handoff.loginUrl,
+        userCode: handoff.userCode,
       },
       singleUseResult: true,
       state: "applied",
     };
   }
 
-  #accountLoginStatus(): CloudDeviceCommandExecutionResult {
+  #accountLoginStatus(
+    payload: Extract<DeviceCommandPayload, { kind: "account_login_status" }>,
+  ): CloudDeviceCommandExecutionResult {
+    if ("accountPublicId" in payload) {
+      const profile = this.#store.requireProfile(payload.accountPublicId);
+      const status: DeviceCommandLoginStatus = profile.state === "login_pending"
+        ? "pending"
+        : profile.state === "signed_in"
+          ? "signed_in"
+          : profile.state === "recovery_required"
+            ? "failed"
+            : "idle";
+      const instruction = status === "pending"
+        ? `A login is in progress for this account. Finish its existing browser or device-code handoff, or cancel it with \`hra account login-cancel ${profile.id}\`.`
+        : status === "signed_in"
+          ? "This account is signed in on this machine."
+          : status === "failed"
+            ? `This account needs local recovery. Inspect it with \`hra account show ${profile.id}\` before starting another login.`
+            : `No login is in progress for this account. Start one on this machine with \`hra account login ${profile.id}\`.`;
+      return {
+        code: "APPLIED",
+        result: { instruction, kind: "account_login_status", status },
+        state: "applied",
+      };
+    }
+
+    // Compatibility for an account-less request from a legacy browser. The
+    // current app never uses this machine-wide view because multiple profiles
+    // may independently have a login in progress.
     const pending = this.#store.listProfiles()
       .some((profile) => profile.state === "login_pending");
     return {
@@ -3794,8 +3868,14 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   }
 }
 
-/** How long a relayed provider login URL stays usable. */
-const relayedLoginLifetimeMs = 5 * 60 * 1_000;
+/** Legacy URL-only relay used only for an unversioned pre-update requester. */
+function relayedLoginUrlFrom(value: unknown): string | null {
+  if (!isRecord(value) || !isRecord(value.login)) return null;
+  const loginUrl: unknown = value.login.verificationUrl;
+  return value.login.status === "pending" && isRelayedLoginUrl(loginUrl)
+    ? loginUrl
+    : null;
+}
 
 /**
  * A second effect key derived from the device command's own public id. The
@@ -3826,13 +3906,20 @@ function requireStartedSessionId(value: unknown): string {
 }
 
 /**
- * The relayable provider login URL, or null when the daemon's login response
- * has none or offers one that cannot be completed on another device.
+ * The complete relayable provider device-code handoff, or null when the
+ * daemon's login response is incomplete or unsafe for another device.
  */
-function relayedLoginUrlFrom(value: unknown): string | null {
+function relayedLoginHandoffFrom(
+  value: unknown,
+): Readonly<{ loginUrl: string; userCode: string }> | null {
   if (!isRecord(value) || !isRecord(value.login)) return null;
-  const url: unknown = value.login.verificationUrl;
-  return isRelayedLoginUrl(url) ? url : null;
+  const loginUrl: unknown = value.login.verificationUrl;
+  const userCode: unknown = value.login.userCode;
+  return value.login.status === "pending"
+    && isRelayedLoginUrl(loginUrl)
+    && isRelayedLoginUserCode(userCode)
+    ? { loginUrl, userCode }
+    : null;
 }
 
 type RemoteInteractionVerification =

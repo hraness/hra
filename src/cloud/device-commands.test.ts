@@ -5,6 +5,7 @@ import {
   compareDeviceAuthority,
   deviceCommandAuthorityTransitionDisposition,
   deviceCommandRecoveryAdmitted,
+  deviceCommandRecoveryReplayAdmitted,
   sameDeviceAuthority,
 } from "./device-commands";
 
@@ -145,6 +146,34 @@ describe("device command authority", () => {
       staleAuthority: authority(1, 1),
       state: "applied",
       terminalState: "ambiguous",
+    })).toBe(false);
+  });
+
+  test("replays a recovery terminal only through an exact or strictly intervening authority", () => {
+    expect(deviceCommandRecoveryReplayAdmitted({
+      boundAuthority: authority(2, 1),
+      recoveryAuthority: authority(2, 1),
+      staleAuthority: authority(1, 1),
+    })).toBe(true);
+    expect(deviceCommandRecoveryReplayAdmitted({
+      boundAuthority: authority(2, 1),
+      recoveryAuthority: authority(3, 1),
+      staleAuthority: authority(1, 1),
+    })).toBe(true);
+    expect(deviceCommandRecoveryReplayAdmitted({
+      boundAuthority: authority(2, 1),
+      recoveryAuthority: authority(1, 1),
+      staleAuthority: authority(1, 1),
+    })).toBe(false);
+    expect(deviceCommandRecoveryReplayAdmitted({
+      boundAuthority: authority(1, 1),
+      recoveryAuthority: authority(3, 1),
+      staleAuthority: authority(1, 1),
+    })).toBe(false);
+    expect(deviceCommandRecoveryReplayAdmitted({
+      boundAuthority: authority(3, 1),
+      recoveryAuthority: authority(2, 1),
+      staleAuthority: authority(1, 1),
     })).toBe(false);
   });
 });

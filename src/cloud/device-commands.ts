@@ -142,3 +142,21 @@ export function deviceCommandRecoveryAdmitted(input: Readonly<{
     ? input.terminalState !== "applied"
     : input.terminalState === "ambiguous";
 }
+
+/**
+ * A recovery terminal may outlive the boot that wrote it when the response is
+ * lost. The next boot may accept that exact terminal without rewriting it only
+ * when its bound authority is either the current recovery authority or a
+ * strictly intervening authority between the journal's stale boot and this one.
+ * Result code and keyed digest equality are checked by the hosted mutation.
+ */
+export function deviceCommandRecoveryReplayAdmitted(input: Readonly<{
+  boundAuthority: AuthorityTuple;
+  recoveryAuthority: AuthorityTuple;
+  staleAuthority: AuthorityTuple;
+}>): boolean {
+  if (sameDeviceAuthority(input.boundAuthority, input.recoveryAuthority)) return true;
+  return compareDeviceAuthority(input.boundAuthority, input.staleAuthority) === "after"
+    && compareDeviceAuthority(input.recoveryAuthority, input.boundAuthority) === "after"
+    && compareDeviceAuthority(input.recoveryAuthority, input.staleAuthority) === "after";
+}

@@ -53,7 +53,7 @@ describe("public content contract", () => {
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init --yes",
       installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.5.0/hraness-hra-0.5.0.tgz",
+        "https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz",
       ),
       links: {
         github: "https://github.com/hraness/hra",
@@ -135,12 +135,12 @@ describe("public content contract", () => {
     });
     expect(structured).not.toHaveProperty("softwareVersion");
     expect(publicContent.description).toContain("current source");
-    expect(publicContent.description).toContain("published v0.5.0 is Codex-only");
+    expect(publicContent.description).toContain("v0.6.0 is release-ready");
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
     expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · current source: Codex + Claude Code · published v0.5.0: Codex-only · hra.sh",
+      alt: "HRA · Codex + Claude Code · v0.6.0 release-ready · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -232,7 +232,7 @@ describe("public content contract", () => {
 
   test("highlights documentation commands without touching classified hero code", () => {
     const html = renderSiteHtml();
-    expect(html).toContain('<code class="hra-inline-code">v0.5.0</code>');
+    expect(html).toContain('<code class="hra-inline-code">v0.6.0</code>');
     expect(html).toContain('<pre class="command-list" tabindex="0"><code class="syntax-code language-shell">');
     expect(html).toContain('<pre class="install-command" tabindex="0"><code class="syntax-code language-shell">');
     expect(html).toContain('class="syntax-token syntax-token--command"');
@@ -243,28 +243,32 @@ describe("public content contract", () => {
     expect(html).not.toMatch(/<code>(?:.|\n)*?<\/code>/u);
   });
 
-  test("distinguishes the current source from the live Codex-only release", () => {
-    expect(publicReleaseState).toBe("live");
+  test("marks the local release candidate release-ready while the website and hosted sync stay live", () => {
+    expect(publicReleaseState).toBe("release-ready");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "live",
+      betaTag: "release-ready",
       githubRepository: "live",
       hostedSync: "live",
       website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("The immutable local CLI v0.5.0 is live for macOS and Linux and is Codex-only");
-    for (const surface of [renderReadmeMarkdown().replaceAll("`", ""), htmlVisibleText(renderSiteHtml())]) {
-      expect(surface).toContain("Immutable v0.5.0 local CLI is live and Codex-only; hosted sync live as an open beta");
-      expect(surface).toContain("uses the published immutable v0.5.0 GitHub Release");
-      expect(surface).toContain("installs the Codex-only public CLI");
-      expect(surface).toContain("current source adds end-to-end Claude Code and provider portability");
-      expect(surface).toContain("claims no later immutable CLI release");
+    expect(renderReadmeMarkdown()).toContain("The local CLI v0.6.0 is release-ready");
+    for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
+      expect(surface).toContain("Immutable local CLI release candidate; hosted sync live as an open beta");
+      expect(surface).toContain("works once GitHub exposes the immutable");
+      expect(surface).toContain("candidate becomes public only after exact admission");
       expect(surface).not.toContain("beta-not-yet-live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("CLI installs through the exact command above but is Codex-only");
-      expect(surface).toContain("Claude Code execution and provider switching remain unreleased");
+      expect(surface).toContain("become installable through the exact command above once its GitHub Release exists");
       expect(surface).not.toContain("Beta not yet live");
+      expect(surface).not.toContain("No published `v0.6.0` tag currently exposes these commands");
     }
-    expect(renderLlmsText()).toContain("Install the live v0.5.0 Codex-only beta");
+    expect(renderLlmsText()).toContain("Install after the v0.6.0 beta tag is live");
+    expect(renderLlmsText()).not.toContain("Install the live v0.6.0 beta");
+    const html = htmlVisibleText(renderSiteHtml());
+    expect(html).toContain("What does this release candidate include?");
+    expect(html).toContain("including provider switching and provider-owned sign-in flows");
+    expect(html).not.toContain("immutable v0.6.0 local CLI is live");
+    expect(html).not.toContain("v0.6.0 local CLI is live for macOS and Linux and is Codex-only");
   });
 
   test("states one hosted sign-up claim everywhere and switches it in one place", () => {
@@ -380,13 +384,19 @@ describe("public content contract", () => {
       expect(surface).toContain("hra account show personal");
       expect(surface).toContain("hra account login-cancel");
       expect(surface).toContain("exact current-generation provider login");
-      expect(surface).toContain("Verification URLs and device codes never enter HRA state, logs, or ordinary output");
+      expect(surface).toContain("Verification URLs and user codes never enter local durable HRA state, logs, or ordinary command output");
+      expect(surface).toContain("account-key-encrypted, one-read hosted result");
+      expect(surface).toContain("always selects device-code mode");
       expect(surface).toContain("--handoff-file /absolute/private/login.json --json");
       expect(surface).toContain("A same-key replay never claims or rewrites a handoff");
       expect(surface).toContain("after completion or cancellation it reports the terminal account state");
-      expect(surface).toContain("Claude Code sign-in");
-      expect(surface).toContain("HRA does not implement Claude Code sign-in, sign-out, account listing, usage, provider-side session listing, rename, resume, plugin discovery, desktop switching, or protected turn inspection");
-      expect(surface).toContain("never reads, copies, or forwards the Claude credential");
+      expect(surface).toContain("hra account login personal --provider claude");
+      expect(surface).toContain("CLAUDE_CONFIG_DIR");
+      expect(surface).toContain("Claude exposes no HRA device-code, handoff-file, or web-linking protocol");
+      expect(surface).toContain("retains the one-child fence even if Claude reports signed in");
+      expect(surface).toContain("After confirming that original child has exited");
+      expect(surface).toContain("recovery does not stop Claude or read, change, or delete a credential");
+      expect(surface).not.toContain("HRA does not implement Claude Code sign-in");
     }
   });
 
@@ -530,10 +540,18 @@ describe("public content contract", () => {
   test("keeps the full privacy boundary on the readme, site, and policy page", () => {
     const sentinelClaims = [
       "Codex account labels and observed provider email and plan metadata when cloud sync is enabled.",
-      "Codex or Claude Code credentials, provider profile or configuration files, plugin credentials, or OAuth material.",
+      "Claude Code account identity and usage are not projected.",
+      "validates one bounded Claude Code authentication-status response transiently",
+      "never retains, returns, projects, or uploads the identity or usage fields",
+      "For an explicitly requested Codex web login, the provider HTTPS verification URL and separate one-time user code.",
+      "encrypts both to the account key before upload",
+      "deletes the hosted handoff on that read or after five minutes",
+      "OAuth access or refresh tokens, authorization codes, PKCE verifiers, provider cookies, or the private device code.",
       "Raw reasoning, hidden chain of thought, or approval secrets.",
       "Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.",
-      "Provider login and request IDs, permission values, MCP field contracts, protected answers, or response digests.",
+      "Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.",
+      "does not programmatically write decrypted provider or session text to the clipboard",
+      "browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text",
       "Email access alone does not recover that key.",
       "an uncontested, unrevoked copy can impersonate that device",
       "HRA uses Convex to authenticate the HRA identity",
@@ -568,7 +586,7 @@ describe("public content contract", () => {
     expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("| bun -e '");
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.5.0/hraness-hra-0.5.0.tgz",
+      "-- https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");
@@ -579,11 +597,14 @@ describe("public content contract", () => {
       expect(surface).toContain("HRA requires Bun 1.3.14");
       expect(surface).toContain("curl with HTTPS and TLS 1.2 support");
       expect(surface).toContain("support macOS and Linux");
+      expect(surface).toContain("Codex effects run on both platforms");
+      expect(surface).toContain("Claude Code effects run on Linux only");
+      expect(surface).toContain("refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance");
       expect(surface).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
       expect(surface).toContain("hra-install-safe");
       expect(surface).toContain("fresh random private staging root");
       expect(surface).toContain("GitHub repository ID 1343008607");
-      expect(surface).toContain("published immutable v0.5.0 release");
+      expect(surface).toContain("published immutable v0.6.0 release");
       expect(surface).toContain("immutable release metadata");
       expect(surface).toContain("verified in-memory snapshot");
       expect(surface).toContain("bounded package-file manifest");
@@ -601,7 +622,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
       expect(surface).toContain("Do not install a moving branch");
-      expect(surface).toContain("verified repair installation of v0.5.0");
+      expect(surface).toContain("verified repair installation of v0.6.0");
       expect(surface).toContain("replace the tagged preflight and release archive references together");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
@@ -734,6 +755,9 @@ describe("public content contract", () => {
       "$HOME/Library/Application Support/HRA Control Plane v1",
       "$HOME/.local/state/hra-control-plane-v1",
       "explicitly accepts permanent loss",
+      "Claude Code configuration directories",
+      "provider-managed system credential storage",
+      "sign out through Claude Code before deletion",
       "move only the exact platform directory to Trash",
       "Do not move or remove the state directory's parent.",
       "obtain explicit destructive approval",

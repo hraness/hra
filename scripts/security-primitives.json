@@ -16,7 +16,7 @@
   },
   "src/cli.ts": {
     "mode0600": 3,
-    "mode0700": 4,
+    "mode0700": 3,
     "assertCurrent": 5,
     "redactCompleteSensitiveText": 1
   },
@@ -52,7 +52,7 @@
     "O_NOFOLLOW": 1
   },
   "src/daemon/claude-runtime-adapter.ts": {
-    "assertCurrent": 4
+    "assertCurrent": 5
   },
   "src/daemon/codex-runtime-adapter.ts": {
     "redactCompleteSensitiveText": 1
@@ -69,7 +69,7 @@
     "validateOwnedFile": 6
   },
   "src/daemon/service.ts": {
-    "assertCurrent": 56
+    "assertCurrent": 60
   },
   "src/daemon/session-event-cursor.ts": {
     "timingSafeEqual": 1
@@ -138,7 +138,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 77,
+    "immediateTransaction": 88,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 2

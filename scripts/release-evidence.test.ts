@@ -16,6 +16,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { HRA_VERSION } from "../src/version";
+
 import {
   canonicalDigest,
   canonicalJson,
@@ -67,6 +69,31 @@ describe("release evidence canonicalization", () => {
     expect(canonicalDigest([1, 2])).not.toBe(canonicalDigest([2, 1]));
     expect(canonicalJson({ Ω: 6, é: 5, a: 4, _: 3, A: 2, "!": 1 }))
       .toBe('{"!":1,"A":2,"_":3,"a":4,"é":5,"Ω":6}');
+  });
+
+  test("parses both historical and current package versions for durable live evidence", () => {
+    const historical = liveEvidence();
+    const { selfDigest: _historicalDigest, ...unsigned } = historical;
+    const current = withSelfDigest({ ...unsigned, packageVersion: HRA_VERSION });
+
+    expect(_historicalDigest).toHaveLength(64);
+    expect(liveAcceptanceEvidenceDocumentSchema.parse(historical).packageVersion).toBe("0.1.0");
+    expect(liveAcceptanceEvidenceDocumentSchema.parse(current).packageVersion).toBe(HRA_VERSION);
+    for (const packageVersion of [
+      "01.2.3",
+      "1.02.3",
+      "1.2.03",
+      "v1.2.3",
+      "1.2",
+      "1.2.3-rc.1",
+      "1.2.3+build",
+      `${"1".repeat(129)}.2.3`,
+    ]) {
+      expect(liveAcceptanceEvidenceDocumentSchema.safeParse({
+        ...current,
+        packageVersion,
+      }).success).toBe(false);
+    }
   });
 
   test("rejects incoherent chained deploy evidence even with a valid self digest", () => {

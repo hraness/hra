@@ -97,6 +97,7 @@ CREATE TABLE sessions(
   id TEXT PRIMARY KEY,
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   project_id TEXT NOT NULL REFERENCES projects(id),
+  provider TEXT NOT NULL DEFAULT 'codex',
   preset TEXT NOT NULL,
   fast_enabled INTEGER NOT NULL,
   state TEXT NOT NULL
@@ -505,6 +506,26 @@ describe("WorkStore schema and atomic plans", () => {
     );
   });
 
+  test("rejects current work guards against a pre-provider session schema", () => {
+    const database = new Database(":memory:", { strict: true });
+    databases.push(database);
+    database.exec("PRAGMA foreign_keys=ON;");
+    const legacyParentSchema = parentSchema.replace(
+      "  provider TEXT NOT NULL DEFAULT 'codex',\n",
+      "",
+    );
+    expect(legacyParentSchema).not.toBe(parentSchema);
+    database.exec(legacyParentSchema);
+    database.exec(WORK_SCHEMA_SQL);
+
+    expect(() => assertWorkSchema(database)).toThrow(
+      "WORK_SCHEMA_STALE:sessions.provider",
+    );
+    expect(() => assertReadonlyWorkSchema(database)).toThrow(
+      "WORK_SCHEMA_STALE:sessions.provider",
+    );
+  });
+
   test("replays an exact UUID result and rejects changed semantic intent", () => {
     const value = fixture();
     const key = randomUUID();
@@ -598,6 +619,86 @@ describe("WorkStore schema and atomic plans", () => {
 });
 
 describe("WorkStore claims, fences, and prepared effects", () => {
+  test("keeps established Claude work authoritative while the Codex profile is signed out", () => {
+    const value = fixture();
+    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
+      .run(value.accountId);
+    value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
+      .run(value.accountId);
+
+    const created = createWork(value);
+    join(value, created.work.id, created.work.revision, value.actorSessionId);
+    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+    const claimed = claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+    expect(claimed.attempt.accountGeneration).toBe(0);
+
+    const dispatchKey = randomUUID();
+    value.store.apply({
+      kind: "attempt.dispatch",
+      idempotencyKey: dispatchKey,
+      workId: created.work.id,
+      attemptId: claimed.attempt.id,
+      expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence,
+      actorSessionId: value.actorSessionId,
+      attemptCapability: capability,
+      targetSessionId: value.actorSessionId,
+      mode: "send",
+    });
+    expect(value.store.authorizePreparedEffect(dispatchKey)).toMatchObject({ executable: true });
+
+    const signalKey = randomUUID();
+    const signal = value.store.apply({
+      kind: "signal.send",
+      idempotencyKey: signalKey,
+      workId: created.work.id,
+      senderSessionId: value.actorSessionId,
+      senderCapability: capability,
+      targetSessionId: value.reviewerSessionId,
+      mode: "queue",
+      body: "Claude remains reachable independently of Codex authentication.",
+    });
+    if (signal.kind !== "signal.send") throw new Error("unexpected result");
+    expect(signal.signal.accountGeneration).toBe(0);
+    expect(value.store.authorizePreparedEffect(signalKey)).toMatchObject({ executable: true });
+  });
+
+  test("does not retire active Claude work for a Codex-only state transition", () => {
+    const value = fixture();
+    value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
+      .run(value.accountId);
+    const created = createWork(value);
+    const claimed = claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+
+    expect(value.store.prepareProfileAuthorityChange(value.accountId, 1, "codex")).toEqual([]);
+    expect(() => value.database.query("UPDATE profiles SET state='signed_out' WHERE id=?")
+      .run(value.accountId)).not.toThrow();
+    expect(value.store.snapshot(created.work.id).tasks[0]).toMatchObject({
+      activeAttemptId: claimed.attempt.id,
+      status: "claimed",
+    });
+  });
+
+  test("still refuses Codex work authority while the Codex profile is signed out", () => {
+    const value = fixture();
+    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
+      .run(value.accountId);
+    const created = createWork(value);
+    expect(() => claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+  });
+
   test("CAS claims a ready task once and increments its committed fence", () => {
     const value = fixture();
     const created = createWork(value);

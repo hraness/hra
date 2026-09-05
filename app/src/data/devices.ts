@@ -116,13 +116,24 @@ export const serverClockTickMs = 30_000;
  * live machine as offline. `presence:current` carries the server's own `now`
  * with the reader's presence row, which gives the offset to correct by.
  */
-export function useServerNow(): number {
+export type ServerClock = Readonly<{ now: number; ready: boolean }>;
+export type ServerClockAnchor = Readonly<{ monotonicAt: number; serverNow: number }>;
+
+export function projectServerClockNow(
+  anchor: ServerClockAnchor,
+  monotonicNow: number,
+): number {
+  const elapsed = Math.max(0, monotonicNow - anchor.monotonicAt);
+  return Math.min(Number.MAX_SAFE_INTEGER, anchor.serverNow + elapsed);
+}
+
+export function useServerClock(): ServerClock {
   const value = useQuery(presenceCurrent, {});
-  const [tick, setTick] = useState(() => Date.now());
-  const [offset, setOffset] = useState(0);
+  const [tick, setTick] = useState(() => performance.now());
+  const [anchor, setAnchor] = useState<ServerClockAnchor | null>(null);
 
   useEffect(() => {
-    const timer = setInterval(() => { setTick(Date.now()); }, serverClockTickMs);
+    const timer = setInterval(() => { setTick(performance.now()); }, serverClockTickMs);
     return () => { clearInterval(timer); };
   }, []);
 
@@ -130,10 +141,21 @@ export function useServerNow(): number {
   const serverNow = presence?.serverNow ?? null;
   useEffect(() => {
     if (serverNow === null) return;
-    setOffset(serverNow - Date.now());
+    const monotonicAt = performance.now();
+    setAnchor({ monotonicAt, serverNow });
+    setTick(monotonicAt);
   }, [serverNow]);
 
-  return tick + offset;
+  return {
+    now: anchor === null ? Date.now() : projectServerClockNow(anchor, tick),
+    // Do not let a browser-clock-dependent effect run during the render where
+    // the first hosted timestamp arrived but its offset is not anchored yet.
+    ready: anchor !== null,
+  };
+}
+
+export function useServerNow(): number {
+  return useServerClock().now;
 }
 
 export type DeviceView = DeviceRow & Readonly<{
