@@ -23,6 +23,9 @@ const authority: ProfileAuthority = {
   generation: 3,
   codexHome: instance.codexHome,
   desktopUserData: instance.desktopUserData,
+  provider: "codex",
+  providerAccountId: profileId,
+  bindingGeneration: 1,
 };
 
 const capability: ChatGptBundleCapability = {

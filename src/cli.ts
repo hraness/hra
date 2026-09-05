@@ -151,7 +151,7 @@ import {
 import { PinnedClaudeRuntimeManager } from "./daemon/claude-runtime-adapter";
 import { PinnedCodexRuntimeManager } from "./daemon/codex-runtime-adapter";
 import { HraFactsMemoryLifecycle } from "./daemon/facts-memory-lifecycle";
-import { UnavailableCloudControl, type ClaudeRuntimePort, type CloudControlPort, type CodexRuntimePort, type CompactProjectionRecoveryBlocker } from "./daemon/ports";
+import { UnavailableCloudControl, type ClaudeRuntimePort, type CloudControlPort, type CodexRuntimePort, type CompactProjectionRecoveryBlocker, type ProfileAuthority } from "./daemon/ports";
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { CommandFailure, HraService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
@@ -3096,6 +3096,37 @@ async function joinBeforeDeadline<T>(operation: string, promise: Promise<T>, dea
   }
 }
 
+/** Exact live provider authority predicate shared by both daemon runtime managers. */
+export function isExactProviderRuntimeAuthorityCurrent(
+  store: Pick<StateStore, "requireProfile" | "requireProviderAccountAuthority">,
+  expectedProvider: Provider,
+  authority: ProfileAuthority,
+): boolean {
+  try {
+    if (
+      authority.provider !== expectedProvider
+      || authority.providerAccountId === undefined
+      || authority.bindingGeneration === undefined
+    ) return false;
+    const profile = store.requireProfile(authority.id);
+    if (profile.state === "removed") return false;
+    if (expectedProvider === "codex" && profile.processGeneration !== authority.generation) {
+      return false;
+    }
+    const providerAuthority = store.requireProviderAccountAuthority(
+      profile.id,
+      expectedProvider,
+    );
+    return providerAuthority.profileId === authority.id
+      && providerAuthority.provider === expectedProvider
+      && providerAuthority.providerAccountId === authority.providerAccountId
+      && providerAuthority.bindingGeneration === authority.bindingGeneration
+      && providerAuthority.processGeneration === authority.generation;
+  } catch {
+    return false;
+  }
+}
+
 export async function runDaemon(
   installation: HraInstallation = createProductionInstallation(),
 ): Promise<number> {
@@ -3187,14 +3218,8 @@ export async function runDaemon(
           }
         : {}),
       credentialStorePreflight: installation.credentialStorePreflight,
-      isCurrent: (authority) => {
-        try {
-          const profile = activeStore.requireProfile(authority.id);
-          return profile.processGeneration === authority.generation && profile.state !== "removed";
-        } catch {
-          return false;
-        }
-      },
+      isCurrent: (authority) =>
+        isExactProviderRuntimeAuthorityCurrent(activeStore, "codex", authority),
       observer: {
         account: async (authority, account) => {
           await serviceReference.current?.observeCodexAccount(authority, account);
@@ -3225,14 +3250,8 @@ export async function runDaemon(
         mkdirSync(dir, { mode: 0o700, recursive: true });
         return dir;
       },
-      isCurrent: (authority) => {
-        try {
-          const profile = activeStore.requireProfile(authority.id);
-          return profile.processGeneration === authority.generation && profile.state !== "removed";
-        } catch {
-          return false;
-        }
-      },
+      isCurrent: (authority) =>
+        isExactProviderRuntimeAuthorityCurrent(activeStore, "claude", authority),
       observer: {
         fact: async (authority, fact) => {
           await serviceReference.current?.observeClaudeFact(authority, fact);

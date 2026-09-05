@@ -29,6 +29,7 @@ import {
   MemoryCloudDaemonJournal,
   MemoryCloudSessionSyncCursor,
   parseCloudDaemonJournal,
+  unprovableProviderAuthorityProjectionRecoveryCode,
   type CloudCommandJournalEntry,
   type CloudDaemonJournalState,
   type CloudDaemonJournalInputState,
@@ -75,6 +76,7 @@ function doneLocalSessionPage(
 }
 const usageServerAdmissionMinIntervalMs = 24 * 60 * 60 * 1_000;
 const userPublicId = "user_12345678";
+const providerAccountId = "acct_00000000000000000000000000000001" as const;
 const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
 
 function uuidV7(sequence: number, now: number = fixedNow): string {
@@ -979,7 +981,8 @@ class FakeLocal implements CloudDaemonLocalSourcePort {
   readonly events: CompactSessionEvent[];
   readonly sessionPublicId: string;
   readonly state: "idle" | "terminal";
-  profileGeneration = 1;
+  bindingGeneration = 1;
+  processGeneration = 1;
 
   constructor(
     sessionPublicId: string,
@@ -1027,9 +1030,12 @@ class FakeLocal implements CloudDaemonLocalSourcePort {
   async resolveCommandAuthority(input: { sessionPublicId: string }) {
     if (input.sessionPublicId !== this.sessionPublicId) return null;
     return {
+      bindingGeneration: this.bindingGeneration,
       localSessionId: this.sessionPublicId,
-      profileGeneration: this.profileGeneration,
-      profileId: "account_12345678",
+      processGeneration: this.processGeneration,
+      profileId: providerAccountId,
+      provider: "codex" as const,
+      providerAccountId,
       providerThreadId: "thread_12345678",
     };
   }
@@ -1062,9 +1068,12 @@ class EmptyLocal implements CloudDaemonLocalSourcePort {
   async resolveCommandAuthority(input: { sessionPublicId: string }) {
     if (input.sessionPublicId !== this.sessionPublicId) return null;
     return {
+      bindingGeneration: 1,
       localSessionId: input.sessionPublicId,
-      profileGeneration: 1,
-      profileId: "account_12345678",
+      processGeneration: 1,
+      profileId: providerAccountId,
+      provider: "codex" as const,
+      providerAccountId,
       providerThreadId: "thread_12345678",
     };
   }
@@ -1188,9 +1197,12 @@ class StalledProjectionLocal implements CloudDaemonLocalSourcePort {
   async resolveCommandAuthority(input: { sessionPublicId: string }) {
     if (input.sessionPublicId !== this.sessionPublicId) return null;
     return {
+      bindingGeneration: 1,
       localSessionId: this.sessionPublicId,
-      profileGeneration: 1,
-      profileId: "account_12345678",
+      processGeneration: 1,
+      profileId: providerAccountId,
+      provider: "codex" as const,
+      providerAccountId,
       providerThreadId: "thread_12345678",
     };
   }
@@ -1264,8 +1276,11 @@ class RecoveryLocal extends EmptyLocal {
       baselineCompletedTurns: [{ bodyDigest: "a".repeat(64), turnId: "turn_12345678" }],
       baselineInteractions: this.baselineInteractions,
       localAuthority: {
-        profileGeneration: 1,
-        profileId: "account_12345678",
+        bindingGeneration: 1,
+        processGeneration: 1,
+        profileId: providerAccountId,
+        provider: "codex" as const,
+        providerAccountId,
         providerThreadId: "thread_12345678",
         providerUpdatedAt: fixedNow,
         sessionRevision: 1,
@@ -3074,6 +3089,59 @@ describe("cloud daemon bridge", () => {
     }
   });
 
+  test("quarantines provider-unbound legacy recovery evidence without replay", async () => {
+    const cloud = new FakeCloud();
+    cloud.failEpochAfterEffectOnce = true;
+    const sessionPublicId = "session_recover_legacy_provider_0001";
+    await installRecoverableHead(cloud, sessionPublicId);
+    const local = new RecoveryLocal(sessionPublicId);
+    const journal = new MemoryCloudDaemonJournal();
+    const daemon = bridge({ cloud, device: "device_11111111", journal, local });
+    const input = {
+      acknowledgeGap: true as const,
+      idempotencyKey: uuidV7(910),
+      sessionPublicId,
+      signal: new AbortController().signal,
+    };
+    await expect(daemon.recoverCompactProjection(input)).rejects.toThrow(
+      "lost compact epoch response",
+    );
+    const observed = await journal.read();
+    const current = observed.state.projectionRecoveries[0];
+    if (current === undefined) throw new Error("missing recovery fixture");
+    if (!("processGeneration" in current.localAuthority)) {
+      throw new Error("missing provider-bound recovery fixture");
+    }
+    const legacyLocalAuthority = {
+      profileGeneration: current.localAuthority.processGeneration,
+      profileId: current.localAuthority.profileId,
+      providerThreadId: current.localAuthority.providerThreadId,
+      providerUpdatedAt: current.localAuthority.providerUpdatedAt,
+      sessionRevision: current.localAuthority.sessionRevision,
+    };
+    expect(await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      projectionRecoveries: [{
+        ...current,
+        localAuthority: legacyLocalAuthority,
+      } as typeof current],
+    })).not.toBeNull();
+    const mutationCalls = cloud.epochMutationCalls;
+
+    const cycled = await daemon.cycle(new AbortController().signal);
+    expect(cycled.errors.join(" ")).toContain("provider-unbound legacy effect");
+    expect(cloud.epochMutationCalls).toBe(mutationCalls);
+    expect(local.discardedRecoveryKeys).toContain(input.idempotencyKey);
+    expect((await journal.read()).state).toMatchObject({
+      projectionRecoveries: [],
+      projectionRecoveryReceipts: [{
+        idempotencyKey: input.idempotencyKey,
+        phase: "rejected",
+        rejectionCode: unprovableProviderAuthorityProjectionRecoveryCode,
+      }],
+    });
+  });
+
   test("keeps remote provider commands pending while exact projection recovery is unsettled", async () => {
     const cloud = new FakeCloud();
     cloud.failEpochAfterEffectOnce = true;
@@ -4586,7 +4654,7 @@ describe("cloud daemon bridge", () => {
     expect(JSON.stringify(result)).not.toContain("\u001b");
   });
 
-  test("fails a no-effect prepared command after authority changes, then releases FIFO", async () => {
+  test("fails a no-effect prepared command after provider process authority changes, then releases FIFO", async () => {
     const cloud = new FakeCloud();
     const executor = new RecordingExecutor();
     const journal = new MemoryCloudDaemonJournal();
@@ -4609,7 +4677,20 @@ describe("cloud daemon bridge", () => {
     );
     cloud.failPrepareOnce = true;
     await adapter.cycle(new AbortController().signal);
-    expect((await journal.read()).state.commands[0]).toMatchObject({ phase: "prepared" });
+    const preparedEntry = (await journal.read()).state.commands[0];
+    expect(preparedEntry).toMatchObject({
+      localAuthority: {
+        bindingGeneration: 1,
+        localSessionId: sessionPublicId,
+        processGeneration: 1,
+        profileId: providerAccountId,
+        provider: "codex",
+        providerAccountId,
+        providerThreadId: "thread_12345678",
+      },
+      phase: "prepared",
+    });
+    expect(preparedEntry?.localAuthority).not.toHaveProperty("profileGeneration");
     const laterCommandPublicId = uuidV7(6);
     await cloud.enqueue(
       "device_22222222",
@@ -4633,7 +4714,7 @@ describe("cloud daemon bridge", () => {
         updatedAt: cloud.now + index + 1,
       });
     }
-    local.profileGeneration = 2;
+    local.processGeneration = 2;
     const changed = await adapter.cycle(new AbortController().signal);
     expect(changed.errors).toEqual([]);
     expect(executor.calls).toHaveLength(0);

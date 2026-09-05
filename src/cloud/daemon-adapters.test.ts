@@ -29,6 +29,7 @@ import {
 } from "../domain/usage-metrics";
 import type {
   ClaudeRuntimePort,
+  ClaudeAccountReadinessProjection,
   CodexAccountProjection,
   CodexRuntimePort,
   CodexSessionProjection,
@@ -231,9 +232,14 @@ async function fixture(): Promise<Readonly<{
 function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, input: Readonly<{
   fast: boolean;
   preset: "low" | "high" | "ultra";
-}>): Readonly<{ attemptId: `attempt_${string}`; profile: Parameters<StateStore["recordSessionRuntimeProfile"]>[0]["profile"] }> {
+}>): Readonly<{
+  attemptId: `attempt_${string}`;
+  profile: Parameters<StateStore["recordSessionRuntimeProfile"]>[0]["profile"];
+  providerAuthority: ReturnType<StateStore["requireProviderAccountAuthority"]>;
+}> {
   const session = value.store.requireSession(value.sessionId);
   const profile = value.store.requireProfileById(session.profileId);
+  const providerAuthority = value.store.requireProviderAccountAuthority(profile.id, "codex");
   const runtime = {
     profileId: profile.id,
     processGeneration: profile.processGeneration,
@@ -267,9 +273,10 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
       runtimeProfile: runtime,
     },
     profileGeneration: profile.processGeneration,
+    providerAuthority,
     sessionId: session.id,
   });
-  return { attemptId: attempt.id as `attempt_${string}`, profile: runtime };
+  return { attemptId: attempt.id as `attempt_${string}`, profile: runtime, providerAuthority };
 }
 
 async function materializeScheduledTaskQueue(
@@ -304,6 +311,7 @@ async function materializeScheduledTaskQueue(
   if (occurrence === undefined) throw new Error("Expected a scheduled task queue occurrence.");
   const current = value.store.requireSession(value.sessionId);
   const profile = value.store.requireProfileById(current.profileId);
+  const providerAuthority = value.store.requireProviderAccountAuthority(profile.id, "codex");
   if (current.providerThreadId === undefined) throw new Error("Expected a bound session.");
   const runtime = {
     profileId: profile.id,
@@ -325,6 +333,7 @@ async function materializeScheduledTaskQueue(
     queueId: occurrence.queue.id,
     sessionId: current.id,
     profileGeneration: profile.processGeneration,
+    providerAuthority,
     evidence: {
       kind: "queue.dispatch",
       queueId: occurrence.queue.id,
@@ -345,6 +354,7 @@ async function materializeScheduledTaskQueue(
     queueId: occurrence.queue.id,
     expectedEvidenceDigest: evidence.digest,
     expectedSessionRevision: current.revision,
+    providerAuthority,
     applyResponseState: false,
     turnId: input.turnId,
     turnStatus: "completed",
@@ -361,14 +371,18 @@ function admitCloudInteraction(
 ): void {
   const session = value.store.requireSession(value.sessionId);
   const profile = value.store.requireProfileById(session.profileId);
+  const providerAuthority = value.store.requireSessionProviderAuthority(session.id);
   value.store.admitInteraction({
     authority: {
       approvalId: null,
+      bindingGeneration: providerAuthority.bindingGeneration,
       connectionId,
       itemId: null,
       method: "mcp/elicitation/create",
       processGeneration: profile.processGeneration,
       profileId: profile.id,
+      provider: providerAuthority.provider,
+      providerAccountId: providerAuthority.providerAccountId,
       requestDigest: "d".repeat(64),
       requestId: { type: "string", value: `request_${publicId}` },
       threadId: session.providerThreadId ?? null,
@@ -403,7 +417,9 @@ afterEach(async () => {
  */
 class FakeClaude implements ClaudeRuntimePort {
   readonly provider = "claude" as const;
+  afterReadSession: (() => void) | undefined;
   readSessionCalls = 0;
+  readonly readSessionAuthorities: ProfileAuthority[] = [];
   projection: CodexSessionProjection = {
     messages: [
       { role: "user", text: "Summarise the diff", turnId: "turn_claude_1" },
@@ -424,15 +440,25 @@ class FakeClaude implements ClaudeRuntimePort {
     }],
   };
 
-  async readSession(): Promise<CodexSessionProjection> {
+  async readSession(
+    input: Parameters<ClaudeRuntimePort["readSession"]>[0],
+  ): Promise<CodexSessionProjection> {
     this.readSessionCalls += 1;
+    this.readSessionAuthorities.push(input.authority);
+    this.afterReadSession?.();
     return this.projection;
   }
   endSession(): Promise<void> { return Promise.resolve(); }
   #unused(): never { throw new Error("unused"); }
   pinnedVersion(): string { return this.#unused(); }
-  interactionAuthority(): never { return this.#unused(); }
-  readAccount(): Promise<CodexAccountProjection> { return Promise.reject(this.#unused()); }
+  interactionAuthority(
+    _authority: ProfileAuthority,
+    _providerThreadId: string,
+    _requestId: string,
+  ): never { return this.#unused(); }
+  readAccount(): Promise<ClaudeAccountReadinessProjection> {
+    return Promise.resolve({ observedAt: 1_050, readiness: "signed_in" });
+  }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unused()); }
   startSession(): Promise<never> { return Promise.reject(this.#unused()); }
   observeSession(): ReturnType<ClaudeRuntimePort["observeSession"]> { return Promise.reject(this.#unused()); }
@@ -454,6 +480,20 @@ describe("state-backed cloud daemon adapter", () => {
     const profile = value.store.requireProfileById(
       value.store.requireSession(value.sessionId).profileId,
     );
+    const claudeAccount = value.store.requireProviderAccountForProfile(
+      profile.id,
+      "claude",
+    );
+    const firstClaudeProcess = value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: claudeAccount.processGeneration,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    const claudeAuthority = value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: firstClaudeProcess.processGeneration,
+      profileId: profile.id,
+      provider: "claude",
+    });
     const starting = value.store.createSession({
       fastEnabled: false,
       preset: "fable-max",
@@ -461,6 +501,10 @@ describe("state-backed cloud daemon adapter", () => {
       provider: "claude",
       title: "Claude work",
     });
+    expect(value.store.requireProviderAccountForProfile(profile.id, "claude").readiness)
+      .toBe("unverified");
+    expect(value.store.requireSessionProviderAuthority(starting.id).routingProvenance)
+      .toBe("explicit");
     const bound = value.store.bindSession({
       expectedRevision: starting.revision,
       providerThreadId: "thread_claude_0001",
@@ -479,7 +523,7 @@ describe("state-backed cloud daemon adapter", () => {
       outputFormat: "stream-json" as const,
       permissionMode: "default" as const,
       preset: "fable-max" as const,
-      processGeneration: profile.processGeneration,
+      processGeneration: claudeAuthority.processGeneration,
       profileId: profile.id,
       reasoningEffort: "max" as const,
     };
@@ -490,13 +534,14 @@ describe("state-backed cloud daemon adapter", () => {
         clientMessageId: queued.id,
         kind: "queue.dispatch",
         messageDigest: sha256("Summarise the diff"),
-        profileGeneration: profile.processGeneration,
+        profileGeneration: claudeAuthority.processGeneration,
         providerThreadId: "thread_claude_0001",
         queueId: queued.id,
         runtimeProfile: claudeProfile,
         sessionId: bound.id,
       },
-      profileGeneration: profile.processGeneration,
+      profileGeneration: claudeAuthority.processGeneration,
+      providerAuthority: claudeAuthority,
       queueId: queued.id,
       sessionId: bound.id,
     });
@@ -504,6 +549,7 @@ describe("state-backed cloud daemon adapter", () => {
       applyResponseState: false,
       expectedEvidenceDigest: evidence.digest,
       expectedSessionRevision: bound.revision,
+      providerAuthority: claudeAuthority,
       queueId: queued.id,
       receipt: { turnId: "turn_claude_1" },
       runtimeProfile: claudeProfile,
@@ -512,10 +558,14 @@ describe("state-backed cloud daemon adapter", () => {
     });
 
     const claude = new FakeClaude();
+    const remoteAuthorities: unknown[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
       claude,
       codex: value.codex,
-      executeRemote: () => Promise.resolve({}),
+      executeRemote: (_command, expected) => {
+        remoteAuthorities.push(expected);
+        return Promise.resolve({});
+      },
       paths: value.paths,
       store: value.store,
     });
@@ -523,6 +573,15 @@ describe("state-backed cloud daemon adapter", () => {
       const signal = new AbortController().signal;
       await adapter.listSessions({ limit: 25, signal });
       expect(claude.readSessionCalls).toBe(1);
+      expect(claudeAuthority.processGeneration).toBe(2);
+      expect(profile.processGeneration).toBe(1);
+      expect(claude.readSessionAuthorities).toMatchObject([{
+        bindingGeneration: claudeAuthority.bindingGeneration,
+        generation: claudeAuthority.processGeneration,
+        id: profile.id,
+        provider: "claude",
+        providerAccountId: claudeAuthority.providerAccountId,
+      }]);
       const events = await adapter.readCompactEvents({
         afterSequence: 0,
         limit: 128,
@@ -544,6 +603,58 @@ describe("state-backed cloud daemon adapter", () => {
         model: "fable-max",
         runtimeMs: 2_374,
       });
+      const commandAuthority = await adapter.resolveCommandAuthority({
+        sessionPublicId: bound.id,
+        signal,
+      });
+      expect(commandAuthority).toMatchObject({
+        bindingGeneration: claudeAuthority.bindingGeneration,
+        localSessionId: bound.id,
+        processGeneration: 2,
+        profileId: profile.id,
+        provider: "claude",
+        providerAccountId: claudeAuthority.providerAccountId,
+        providerThreadId: "thread_claude_0001",
+      });
+      expect(commandAuthority).not.toHaveProperty("profileGeneration");
+      expect(await adapter.execute({
+        authority: commandAuthority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-00000000c101",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "stop" },
+        sessionPublicId: bound.id,
+        signal,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      expect(remoteAuthorities).toMatchObject([{
+        bindingGeneration: claudeAuthority.bindingGeneration,
+        processGeneration: 2,
+        profileId: profile.id,
+        provider: "claude",
+        providerAccountId: claudeAuthority.providerAccountId,
+        providerThreadId: "thread_claude_0001",
+        sessionId: bound.id,
+      }]);
+      expect(remoteAuthorities[0]).not.toHaveProperty("profileGeneration");
+
+      claude.afterReadSession = () => {
+        value.store.advanceProviderAccountProcessGeneration({
+          expectedProcessGeneration: claudeAuthority.processGeneration,
+          profileId: profile.id,
+          provider: "claude",
+        });
+      };
+      await adapter.listSessions({ limit: 25, signal });
+      expect(claude.readSessionAuthorities[1]).toMatchObject({
+        generation: claudeAuthority.processGeneration,
+        provider: "claude",
+        providerAccountId: claudeAuthority.providerAccountId,
+      });
+      await expect(adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: bound.id,
+        signal,
+      })).rejects.toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
     } finally {
       adapter.close();
       value.store.close();
@@ -851,6 +962,7 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const session = value.store.requireSession(value.sessionId);
     const profile = value.store.requireProfileById(session.profileId);
+    const providerAuthority = value.store.requireSessionProviderAuthority(session.id);
     const interactionId = "70000000-0000-4000-8000-000000000001";
     const providerRequestId = "provider_request_private_12345678";
     const providerTurnId = "provider_turn_private_12345678";
@@ -861,11 +973,14 @@ describe("state-backed cloud daemon adapter", () => {
     value.store.admitInteraction({
       authority: {
         approvalId: providerApprovalId,
+        bindingGeneration: providerAuthority.bindingGeneration,
         connectionId: "80000000-0000-4000-8000-000000000001",
         itemId: providerItemId,
         method: "mcp/elicitation/create",
         processGeneration: profile.processGeneration,
         profileId: profile.id,
+        provider: providerAuthority.provider,
+        providerAccountId: providerAuthority.providerAccountId,
         requestDigest: "d".repeat(64),
         requestId: { type: "string", value: providerRequestId },
         threadId: session.providerThreadId ?? null,
@@ -1801,6 +1916,7 @@ describe("state-backed cloud daemon adapter", () => {
       applyResponseState: false,
       attemptId: binding.attemptId,
       expectedSessionRevision: value.store.requireSession(value.sessionId).revision,
+      providerAuthority: binding.providerAuthority,
       receipt: { turnId: "turn_0001" },
       runtimeProfile: binding.profile,
       sessionId: value.sessionId as `sess_${string}`,
@@ -1855,6 +1971,7 @@ describe("state-backed cloud daemon adapter", () => {
         applyResponseState: false,
         attemptId: binding.attemptId,
         expectedSessionRevision: value.store.requireSession(value.sessionId).revision,
+        providerAuthority: binding.providerAuthority,
         receipt: { turnId: "turn_0001" },
         runtimeProfile: binding.profile,
         sessionId: value.sessionId as `sess_${string}`,
@@ -2219,16 +2336,20 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const session = value.store.requireSession(value.sessionId);
     const profile = value.store.requireProfileById(session.profileId);
+    const providerAuthority = value.store.requireSessionProviderAuthority(session.id);
     const interactionId = "70000000-0000-4000-8000-000000000101";
     const privateRequestId = "provider_request_private_recovery";
     value.store.admitInteraction({
       authority: {
         approvalId: "provider_approval_private_recovery",
+        bindingGeneration: providerAuthority.bindingGeneration,
         connectionId: "80000000-0000-4000-8000-000000000101",
         itemId: "provider_item_private_recovery",
         method: "mcp/elicitation/create",
         processGeneration: profile.processGeneration,
         profileId: profile.id,
+        provider: providerAuthority.provider,
+        providerAccountId: providerAuthority.providerAccountId,
         requestDigest: "d".repeat(64),
         requestId: { type: "string", value: privateRequestId },
         threadId: session.providerThreadId ?? null,
@@ -3247,9 +3368,14 @@ describe("state-backed cloud daemon adapter", () => {
   test("dispatches only under the exact local profile and provider authority", async () => {
     const value = await fixture();
     const commands: LocalCommand[] = [];
+    const expectedAuthorities: unknown[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
-      executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
+      executeRemote: (command, expected) => {
+        commands.push(command);
+        expectedAuthorities.push(expected);
+        return Promise.resolve({});
+      },
       paths: value.paths,
       store: value.store,
     });
@@ -3271,6 +3397,15 @@ describe("state-backed cloud daemon adapter", () => {
         session: value.sessionId,
         message: "Continue",
         idempotencyKey: "00000000-0000-7000-8000-000000000001",
+      }]);
+      expect(expectedAuthorities).toMatchObject([{
+        bindingGeneration: (authority as CloudLocalCommandAuthority).bindingGeneration,
+        processGeneration: (authority as CloudLocalCommandAuthority).processGeneration,
+        profileId: (authority as CloudLocalCommandAuthority).profileId,
+        provider: "codex",
+        providerAccountId: (authority as CloudLocalCommandAuthority).providerAccountId,
+        providerThreadId: "thread_0001",
+        sessionId: value.sessionId,
       }]);
 
       expect(await adapter.execute({
@@ -3299,6 +3434,47 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       })).toEqual({ code: "LOCAL_AUTHORITY_CHANGED", state: "failed" });
       expect(commands).toHaveLength(2);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("refuses a remote command after its provider binding generation changes", async () => {
+    const value = await fixture();
+    const commands: LocalCommand[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: (command) => {
+        commands.push(command);
+        return Promise.resolve({});
+      },
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const authority = await adapter.resolveCommandAuthority({
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      if (authority === null) throw new Error("missing provider authority fixture");
+      const profile = value.store.requireProfileById(authority.profileId);
+      expect(value.store.setProfileState(
+        profile.id,
+        profile.processGeneration,
+        "signed_out",
+      )).toBe(true);
+
+      expect(await adapter.execute({
+        authority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000b1",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "stop" },
+        sessionPublicId: value.sessionId,
+        signal,
+      })).toEqual({ code: "LOCAL_AUTHORITY_CHANGED", state: "failed" });
+      expect(commands).toEqual([]);
     } finally {
       adapter.close();
       value.store.close();
@@ -3511,14 +3687,18 @@ describe("remote interaction detail and the decisions it licenses", () => {
     value.setNow(Date.now());
     const session = value.store.requireSession(value.sessionId);
     const profile = value.store.requireProfileById(session.profileId);
+    const providerAuthority = value.store.requireSessionProviderAuthority(session.id);
     value.store.admitInteraction({
       authority: {
         approvalId: null,
+        bindingGeneration: providerAuthority.bindingGeneration,
         connectionId: `90000000-0000-4000-8000-${suffix}`,
         itemId: null,
         method: "item/commandExecution/requestApproval",
         processGeneration: profile.processGeneration,
         profileId: profile.id,
+        provider: providerAuthority.provider,
+        providerAccountId: providerAuthority.providerAccountId,
         requestDigest: "e".repeat(64),
         requestId: { type: "string", value: `request_${publicId}` },
         threadId: session.providerThreadId ?? null,
@@ -4228,6 +4408,11 @@ describe("device command execution", () => {
       });
       expect(world.executed.map((command) => command.kind))
         .toEqual(["session.start", "session.send"]);
+      expect(world.executed[0]).toMatchObject({
+        account: world.account.id,
+        kind: "session.start",
+        provider: "codex",
+      });
       // One device command, two local effects, two distinct derived keys.
       const keys = world.executed.map((command) =>
         (command as { idempotencyKey?: string }).idempotencyKey);

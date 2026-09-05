@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 
 import { presetRequirements } from "../domain/presets.ts";
+import { codexProviderAccountIdSchema } from "../domain/provider-accounts.ts";
 import {
   INTERACTION_MAX_PENDING_MS,
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
@@ -257,6 +258,9 @@ export function codexNotificationDisposition(
 export interface CodexAuthority {
   readonly profileId: string;
   readonly processGeneration: number;
+  readonly provider: "codex";
+  readonly providerAccountId: string;
+  readonly bindingGeneration: number;
 }
 
 export const HRA_DYNAMIC_TOOL_NAMESPACE = "hra";
@@ -2729,14 +2733,18 @@ export function parseBrokeredCodexServerRequest(input: {
   readonly method: BrokeredCodexServerRequestMethod;
   readonly params: unknown;
 }): ParsedBrokeredCodexServerRequest {
+  const authority = validateAuthority(input.authority);
   const privateParams = parseCanonicalParams(input.params);
   const threadId = identifier(privateParams.threadId, "server request thread id");
   const turnId = nullableRequestIdentifier(privateParams.turnId, "server request turn id");
   const itemId = nullableRequestIdentifier(privateParams.itemId, "server request item id");
   const approvalId = nullableRequestIdentifier(privateParams.approvalId, "server request approval id");
   const provider: ProviderInteractionAuthority = {
-    profileId: input.authority.profileId,
-    processGeneration: input.authority.processGeneration,
+    profileId: authority.profileId,
+    processGeneration: authority.processGeneration,
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
     connectionId: input.connectionId,
     requestId: input.requestId,
     method: input.method,
@@ -3383,7 +3391,21 @@ export function validateAuthority(authority: CodexAuthority): CodexAuthority {
   if (!Number.isSafeInteger(authority.processGeneration) || authority.processGeneration < 1) {
     throw new CodexError("INVALID_INPUT", "process generation must be a positive integer");
   }
-  return { profileId, processGeneration: authority.processGeneration };
+  if (
+    authority.provider !== "codex"
+    || !codexProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+    || !Number.isSafeInteger(authority.bindingGeneration)
+    || authority.bindingGeneration < 1
+  ) {
+    throw new CodexError("INVALID_INPUT", "Codex provider-account authority is invalid");
+  }
+  return {
+    profileId,
+    processGeneration: authority.processGeneration,
+    provider: "codex",
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+  };
 }
 
 export function boundedPageLimit(value: number | undefined, max = 200): number {

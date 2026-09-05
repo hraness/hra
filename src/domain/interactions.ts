@@ -1,6 +1,12 @@
 import { z } from "zod";
 
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
+import {
+  claudeProviderAccountIdSchema,
+  codexProviderAccountIdSchema,
+  providerAccountIdSchema,
+} from "./provider-accounts";
+import { providerSchema } from "./presets";
 import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "./values";
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
@@ -82,7 +88,7 @@ export type InteractionIntendedTerminalState = z.infer<
 /** HRA never leaves an admitted provider callback pending longer than 30 minutes. */
 export const INTERACTION_MAX_PENDING_MS = 30 * 60 * 1_000;
 
-export const providerInteractionAuthoritySchema = z.object({
+const providerInteractionAuthorityFields = {
   profileId: profileIdSchema,
   processGeneration: z.number().int().nonnegative(),
   connectionId: z.string().uuid(),
@@ -93,7 +99,82 @@ export const providerInteractionAuthoritySchema = z.object({
   turnId: nullableProviderIdentifierSchema,
   itemId: nullableProviderIdentifierSchema,
   approvalId: nullableProviderIdentifierSchema,
-}).strict();
+} as const;
+
+/**
+ * Decode-only compatibility schema for immutable pre-provider-account
+ * interaction evidence. Live callers must use
+ * `providerInteractionAuthoritySchema` below.
+ */
+export const legacyProviderInteractionAuthoritySchema = z.object({
+  ...providerInteractionAuthorityFields,
+  provider: providerSchema.optional(),
+  providerAccountId: providerAccountIdSchema.optional(),
+  bindingGeneration: z.number().int().positive().optional(),
+}).strict().superRefine((authority, context) => {
+  const providerFields = [
+    authority.provider,
+    authority.providerAccountId,
+    authority.bindingGeneration,
+  ];
+  const present = providerFields.filter((value) => value !== undefined).length;
+  if (present !== 0 && present !== providerFields.length) {
+    context.addIssue({
+      code: "custom",
+      message: "Provider-account interaction authority must be complete.",
+    });
+    return;
+  }
+  if (
+    authority.provider === "codex"
+    && !codexProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Codex interaction authority requires a Codex provider-account id.",
+    });
+  }
+  if (
+    authority.provider === "claude"
+    && !claudeProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Claude interaction authority requires a Claude provider-account id.",
+    });
+  }
+});
+
+export type LegacyProviderInteractionAuthority = z.infer<
+  typeof legacyProviderInteractionAuthoritySchema
+>;
+
+/** Exact provider-account authority required by every live interaction seam. */
+export const providerInteractionAuthoritySchema = z.object({
+  ...providerInteractionAuthorityFields,
+  provider: providerSchema,
+  providerAccountId: providerAccountIdSchema,
+  bindingGeneration: z.number().int().positive(),
+}).strict().superRefine((authority, context) => {
+  if (
+    authority.provider === "codex"
+    && !codexProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Codex interaction authority requires a Codex provider-account id.",
+    });
+  }
+  if (
+    authority.provider === "claude"
+    && !claudeProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Claude interaction authority requires a Claude provider-account id.",
+    });
+  }
+});
 
 export type ProviderInteractionAuthority = z.infer<typeof providerInteractionAuthoritySchema>;
 

@@ -1,5 +1,6 @@
 import type { AttachmentManifestEntry, PreparedAttachment } from "../domain/attachments";
 import type { Preset, Provider } from "../domain/presets";
+import type { ProviderAccountId } from "../domain/provider-accounts";
 import type {
   EffectiveClaudeRuntimeProfile,
   EffectiveRuntimeProfile,
@@ -15,11 +16,18 @@ import type {
 } from "../domain/interactions";
 import type { ProfileId, ProjectId, SessionId } from "../domain/values";
 
-export type ProfileAuthority = {
+type ProfileAuthorityBase = {
   id: ProfileId;
   generation: number;
   codexHome: string;
   desktopUserData: string;
+};
+
+/** Exact provider-account authority required at every live runtime boundary. */
+export type ProfileAuthority = ProfileAuthorityBase & {
+  provider: Provider;
+  providerAccountId: ProviderAccountId;
+  bindingGeneration: number;
 };
 
 /**
@@ -41,6 +49,12 @@ export type CodexAccountProjection = {
   signedIn: boolean;
   email?: string;
   plan?: string;
+};
+
+/** Bounded HRA observation; Claude exposes no admitted stable account identity. */
+export type ClaudeAccountReadinessProjection = {
+  readiness: "signed_in" | "signed_out" | "unverified";
+  observedAt: number;
 };
 
 export type CodexLoginOutcome =
@@ -211,14 +225,18 @@ export interface SessionRuntimePort<Profile> {
  */
 export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRuntimeProfile> {
   readonly provider: "claude";
-  readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
+  readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<ClaudeAccountReadinessProjection>;
   pinnedVersion(): string;
   /**
    * The exact durable authority one pending Claude control request binds.
    * Codex publishes its own request authority on the notification; Claude's
    * control request carries only an id, so the daemon asks the port for it.
    */
-  interactionAuthority(providerThreadId: string, requestId: string): ProviderInteractionAuthority;
+  interactionAuthority(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+    requestId: string,
+  ): ProviderInteractionAuthority;
 }
 
 export interface CodexRuntimePort extends SessionRuntimePort<EffectiveRuntimeProfile> {
@@ -379,7 +397,11 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
       + "inside the account's isolated Claude profile.",
     );
   }
-  interactionAuthority(): ProviderInteractionAuthority { return this.#unavailable(); }
+  interactionAuthority(
+    _authority: ProfileAuthority,
+    _providerThreadId: string,
+    _requestId: string,
+  ): ProviderInteractionAuthority { return this.#unavailable(); }
   pinnedVersion(): string { return this.#unavailable(); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }

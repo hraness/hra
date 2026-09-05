@@ -251,7 +251,10 @@ type ClaudeFixture = Readonly<{
 }>;
 
 async function claudeFixture(
-  options: Readonly<{ resolveRuntime?: () => Promise<PinnedClaudeRuntime> }> = {},
+  options: Readonly<{
+    immediatelyEndProcess?: boolean;
+    resolveRuntime?: () => Promise<PinnedClaudeRuntime>;
+  }> = {},
 ): Promise<ClaudeFixture> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-")));
   roots.push(home);
@@ -270,7 +273,16 @@ async function claudeFixture(
     isCurrent: (authority) => {
       try {
         const profile = store.requireProfile(authority.id);
-        return profile.processGeneration === authority.generation && profile.state !== "removed";
+        const provider = store.requireProviderAccountAuthority(
+          authority.id,
+          authority.provider,
+        );
+        return profile.state !== "removed"
+          && provider.profileId === authority.id
+          && provider.provider === authority.provider
+          && provider.providerAccountId === authority.providerAccountId
+          && provider.bindingGeneration === authority.bindingGeneration
+          && provider.processGeneration === authority.generation;
       } catch {
         return false;
       }
@@ -283,6 +295,7 @@ async function claudeFixture(
     processFactory: () => {
       const process = new FakeClaudeProcess();
       processes.push(process);
+      if (options.immediatelyEndProcess === true) process.terminate();
       return process;
     },
     resolveRuntime: options.resolveRuntime ?? (async () => pinnedRuntime),
@@ -328,7 +341,7 @@ const settle = async (): Promise<void> => {
 
 const eventBodies = async (
   value: ClaudeFixture,
-  sessionId: `sess_${string}`,
+  sessionId: string,
 ): Promise<readonly Record<string, unknown>[]> => {
   const page = await value.service.execute(
     { kind: "session.events", limit: 200, session: sessionId, waitMs: 0 },
@@ -587,6 +600,84 @@ describe("Claude sessions on the local authority", () => {
     expect(bodies.find((body) => body.type === "turn_completed")).toMatchObject({
       status: "interrupted",
     });
+  });
+
+  test("terminalizes only the Claude session whose transport is lost", async () => {
+    const value = await claudeFixture();
+    const account = await signedInClaudeAccount(value, "Claude transport loss");
+    const idle = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const active = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Keep working",
+      session: active.session.id,
+    }, { signal });
+    const profileBefore = value.store.requireProfile(account);
+    const claudeBefore = value.store.requireProviderAccountAuthority(account, "claude");
+    const activeProcess = value.processes[1];
+    if (activeProcess === undefined) throw new Error("Expected the active Claude process.");
+
+    activeProcess.terminate();
+    await settle();
+
+    expect(value.store.requireSession(active.session.id).state).toBe("terminal");
+    expect(value.store.requireSession(idle.session.id).state).not.toBe("terminal");
+    expect(value.store.requireProviderAccountAuthority(account, "claude").processGeneration)
+      .toBe(claudeBefore.processGeneration);
+    expect(value.store.requireProfile(account).processGeneration)
+      .toBe(profileBefore.processGeneration);
+    const events = await eventBodies(value, active.session.id);
+    expect(events.some((body) =>
+      body.type === "connection" && body.state === "disconnected"
+    )).toBe(true);
+    expect(events.some((body) =>
+      body.type === "gap" && body.reason === "provider_disconnect"
+    )).toBe(true);
+    const idleEvents = await eventBodies(value, idle.session.id);
+    expect(idleEvents.some((body) =>
+      body.type === "connection" && body.state === "disconnected"
+    )).toBe(false);
+  });
+
+  test("terminalizes an early Claude exit before its first observation binds a connection", async () => {
+    const value = await claudeFixture({ immediatelyEndProcess: true });
+    const account = await signedInClaudeAccount(value, "Claude early transport loss");
+    const providerBefore = value.store.requireProviderAccountAuthority(account, "claude");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: string; state: string } };
+    await settle();
+
+    expect(started.session.state).toBe("terminal");
+    expect(value.store.requireSession(started.session.id).state).toBe("terminal");
+    const captured = value.store.requireSessionProviderAuthority(started.session.id);
+    expect(captured.processGeneration).toBe(providerBefore.processGeneration + 1);
+    expect(value.store.requireProviderAccountAuthority(account, "claude").processGeneration)
+      .toBe(captured.processGeneration);
+    const events = await eventBodies(value, started.session.id);
+    expect(events.some((body) =>
+      body.type === "connection" && body.state === "disconnected"
+    )).toBe(true);
+    expect(events.some((body) =>
+      body.type === "gap" && body.reason === "provider_disconnect"
+    )).toBe(true);
   });
 
   test("refuses the Claude provider with the pinned version when no binary is admitted", async () => {

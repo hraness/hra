@@ -4,6 +4,7 @@ import type {
   InteractionKind,
   ProviderInteractionAuthority,
 } from "../domain/interactions";
+import type { ProviderAccountAuthority } from "../domain/provider-accounts";
 
 /**
  * One Claude fact with the session identity the runtime manager binds to it.
@@ -41,6 +42,7 @@ const REMEMBERED_INTERACTION_LIMIT = 1_024;
  */
 export class ClaudeSessionFactTranslator {
   readonly #authorityFor: (
+    authority: ProviderAccountAuthority,
     providerThreadId: string,
     requestId: string,
   ) => ProviderInteractionAuthority;
@@ -51,7 +53,11 @@ export class ClaudeSessionFactTranslator {
 
   constructor(input: {
     /** The exact provider authority the manager binds to a pending request. */
-    authorityFor: (providerThreadId: string, requestId: string) => ProviderInteractionAuthority;
+    authorityFor: (
+      authority: ProviderAccountAuthority,
+      providerThreadId: string,
+      requestId: string,
+    ) => ProviderInteractionAuthority;
     now: () => number;
   }) {
     this.#authorityFor = input.authorityFor;
@@ -59,8 +65,11 @@ export class ClaudeSessionFactTranslator {
   }
 
   /** Empty for a fact the neutral timeline has no place for. */
-  translate(fact: ClaudeSessionFact): readonly CodexFact[] {
-    const single = this.#translate(fact);
+  translate(
+    authority: ProviderAccountAuthority,
+    fact: ClaudeSessionFact,
+  ): readonly CodexFact[] {
+    const single = this.#translate(authority, fact);
     if (single === null) return [];
     // A text stream is only readable once its item has been announced: the
     // daemon's streaming redactor protects a delta whose item it never saw
@@ -69,6 +78,7 @@ export class ClaudeSessionFactTranslator {
     // pair Codex emits around its own agent message and reasoning items.
     if (single.type === "assistantDelta" || single.type === "reasoningSummaryDelta") {
       const opened = this.#openItem(
+        authority,
         fact.providerThreadId,
         single.itemId,
         single.type === "assistantDelta" ? "agentMessage" : "reasoning",
@@ -76,10 +86,10 @@ export class ClaudeSessionFactTranslator {
       return opened === null ? [single] : [{ ...opened, ...this.#itemFrame(fact, single) }, single];
     }
     if (single.type === "turnCompleted") {
-      return [...this.#closeItems(fact, single.turn.id), single];
+      return [...this.#closeItems(authority, fact, single.turn.id), single];
     }
     if (single.type === "turnStarted") {
-      this.#openItems.delete(fact.providerThreadId);
+      this.#openItems.delete(this.#sessionKey(authority, fact.providerThreadId));
       return [single];
     }
     return [single];
@@ -99,23 +109,30 @@ export class ClaudeSessionFactTranslator {
 
   /** Announces one item once, returning null when it is already open. */
   #openItem(
+    authority: ProviderAccountAuthority,
     providerThreadId: string,
     itemId: string,
     itemKind: string,
   ): Readonly<{ itemKind: string; type: "itemStarted" }> | null {
-    let items = this.#openItems.get(providerThreadId);
+    const sessionKey = this.#sessionKey(authority, providerThreadId);
+    let items = this.#openItems.get(sessionKey);
     if (items === undefined) {
       items = new Map();
-      this.#openItems.set(providerThreadId, items);
+      this.#openItems.set(sessionKey, items);
     }
     if (items.has(itemId)) return null;
     items.set(itemId, itemKind);
     return { itemKind, type: "itemStarted" };
   }
 
-  #closeItems(fact: ClaudeSessionFact, turnId: string): readonly CodexFact[] {
-    const items = this.#openItems.get(fact.providerThreadId);
-    this.#openItems.delete(fact.providerThreadId);
+  #closeItems(
+    authority: ProviderAccountAuthority,
+    fact: ClaudeSessionFact,
+    turnId: string,
+  ): readonly CodexFact[] {
+    const sessionKey = this.#sessionKey(authority, fact.providerThreadId);
+    const items = this.#openItems.get(sessionKey);
+    this.#openItems.delete(sessionKey);
     if (items === undefined) return [];
     return [...items].map(([itemId, itemKind]) => ({
       connectionId: fact.connectionId,
@@ -128,7 +145,10 @@ export class ClaudeSessionFactTranslator {
     }));
   }
 
-  #translate(fact: ClaudeSessionFact): CodexFact | null {
+  #translate(
+    authority: ProviderAccountAuthority,
+    fact: ClaudeSessionFact,
+  ): CodexFact | null {
     const threadId = fact.providerThreadId;
     const connectionId = fact.connectionId;
     switch (fact.type) {
@@ -209,19 +229,29 @@ export class ClaudeSessionFactTranslator {
               type: "itemStarted",
             };
       case "interactionRequested": {
-        const authority = this.#authorityFor(threadId, fact.requestId);
-        this.#remember(threadId, fact.requestId, { authority, kind: fact.kind });
+        const interactionAuthority = this.#authorityFor(
+          authority,
+          threadId,
+          fact.requestId,
+        );
+        if (!this.#interactionMatchesAuthority(interactionAuthority, authority)) {
+          throw new Error("CLAUDE_INTERACTION_PROVIDER_AUTHORITY_MISMATCH");
+        }
+        this.#remember(authority, threadId, fact.requestId, {
+          authority: interactionAuthority,
+          kind: fact.kind,
+        });
         return {
           blocking: fact.blocking,
           connectionId,
           display: fact.display,
           kind: fact.kind,
-          provider: authority,
+          provider: interactionAuthority,
           type: "interactionRequested",
         };
       }
       case "interactionCanceled": {
-        const remembered = this.#forget(threadId, fact.requestId);
+        const remembered = this.#forget(authority, threadId, fact.requestId);
         if (remembered === undefined) return null;
         return {
           connectionId,
@@ -254,6 +284,8 @@ export class ClaudeSessionFactTranslator {
           turnId: fact.turnId ?? "",
           type: "providerError",
         };
+      case "providerDisconnected":
+        return { connectionId, reason: fact.reason, type: "providerDisconnected" };
       case "protocolNotice":
         return { connectionId, method: fact.event, type: "protocolNotice" };
       // The turn summary's exact runtime and result text reach the projection
@@ -266,25 +298,72 @@ export class ClaudeSessionFactTranslator {
   }
 
   /** Drops every pending request a closed or replaced session remembered. */
-  forgetSession(providerThreadId: string): void {
-    const prefix = `${providerThreadId} `;
+  forgetSession(
+    authority: ProviderAccountAuthority,
+    providerThreadId: string,
+  ): void {
+    const sessionKey = this.#sessionKey(authority, providerThreadId);
+    this.#openItems.delete(sessionKey);
+    const prefix = `${sessionKey}:`;
     for (const key of [...this.#remembered.keys()]) {
       if (key.startsWith(prefix)) this.#remembered.delete(key);
     }
   }
 
-  #remember(providerThreadId: string, requestId: string, value: RememberedInteraction): void {
+  #remember(
+    authority: ProviderAccountAuthority,
+    providerThreadId: string,
+    requestId: string,
+    value: RememberedInteraction,
+  ): void {
     if (this.#remembered.size >= REMEMBERED_INTERACTION_LIMIT) {
       const oldest = this.#remembered.keys().next();
       if (!oldest.done) this.#remembered.delete(oldest.value);
     }
-    this.#remembered.set(`${providerThreadId} ${requestId}`, value);
+    this.#remembered.set(this.#requestKey(authority, providerThreadId, requestId), value);
   }
 
-  #forget(providerThreadId: string, requestId: string): RememberedInteraction | undefined {
-    const key = `${providerThreadId} ${requestId}`;
+  #forget(
+    authority: ProviderAccountAuthority,
+    providerThreadId: string,
+    requestId: string,
+  ): RememberedInteraction | undefined {
+    const key = this.#requestKey(authority, providerThreadId, requestId);
     const value = this.#remembered.get(key);
     this.#remembered.delete(key);
     return value;
+  }
+
+  #sessionKey(
+    authority: ProviderAccountAuthority,
+    providerThreadId: string,
+  ): string {
+    return JSON.stringify([
+      authority.profileId,
+      authority.provider,
+      authority.providerAccountId,
+      authority.bindingGeneration,
+      authority.processGeneration,
+      providerThreadId,
+    ]);
+  }
+
+  #requestKey(
+    authority: ProviderAccountAuthority,
+    providerThreadId: string,
+    requestId: string,
+  ): string {
+    return `${this.#sessionKey(authority, providerThreadId)}:${JSON.stringify(requestId)}`;
+  }
+
+  #interactionMatchesAuthority(
+    interaction: ProviderInteractionAuthority,
+    authority: ProviderAccountAuthority,
+  ): boolean {
+    return interaction.profileId === authority.profileId
+      && interaction.provider === authority.provider
+      && interaction.providerAccountId === authority.providerAccountId
+      && interaction.bindingGeneration === authority.bindingGeneration
+      && interaction.processGeneration === authority.processGeneration;
   }
 }

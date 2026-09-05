@@ -5,6 +5,10 @@ import { link, lstat, open, realpath, unlink, type FileHandle } from "node:fs/pr
 import { z } from "zod";
 
 import type { CodexAccountProjection, DesktopSwitchPort, ProfileAuthority } from "../daemon/ports.ts";
+import {
+  providerAccountAuthoritySchema,
+  type ProviderAccountAuthority,
+} from "../domain/provider-accounts.ts";
 import { profileIdSchema } from "../domain/values.ts";
 import type { StatePaths } from "../storage/paths.ts";
 import { inspectChatGptBundle } from "./bundle.ts";
@@ -37,21 +41,44 @@ const accountKeySchema = z
   .transform((value) => value.normalize("NFKC").toLocaleLowerCase("en-US"));
 const diagnosticCodeSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/u);
 
-const authorityBindingSchema = z
-  .object({
-    profileId: profileIdSchema,
-    processGeneration: z.number().int().positive(),
-  })
-  .strict();
-
 const planBindingShape = {
   idempotencyKey: idempotencyKeySchema,
   switchGeneration: z.number().int().positive(),
   sourceProfileId: profileIdSchema.nullable(),
   sourceProcessGeneration: z.number().int().positive().nullable(),
+  sourceProviderAuthority: providerAccountAuthoritySchema.nullable(),
   targetProfileId: profileIdSchema,
   targetProcessGeneration: z.number().int().positive(),
+  targetProviderAuthority: providerAccountAuthoritySchema,
 } as const;
+
+const refinePlanBinding = (
+  value: z.infer<z.ZodObject<typeof planBindingShape>>,
+  context: z.RefinementCtx,
+): void => {
+  if (
+    (value.sourceProfileId === null) !== (value.sourceProcessGeneration === null) ||
+    (value.sourceProfileId === null) !== (value.sourceProviderAuthority === null)
+  ) {
+    context.addIssue({ code: "custom", message: "Desktop source authority is incomplete." });
+  }
+  if (
+    value.targetProviderAuthority.provider !== "codex" ||
+    value.targetProviderAuthority.profileId !== value.targetProfileId ||
+    value.targetProviderAuthority.processGeneration !== value.targetProcessGeneration
+  ) {
+    context.addIssue({ code: "custom", message: "Desktop target authority is inconsistent." });
+  }
+  if (
+    value.sourceProviderAuthority !== null && (
+      value.sourceProviderAuthority.provider !== "codex" ||
+      value.sourceProviderAuthority.profileId !== value.sourceProfileId ||
+      value.sourceProviderAuthority.processGeneration !== value.sourceProcessGeneration
+    )
+  ) {
+    context.addIssue({ code: "custom", message: "Desktop source authority is inconsistent." });
+  }
+};
 
 const accountProjectionSchema = z
   .object({
@@ -92,7 +119,8 @@ const readyPlanSchema = z
     journalStage: z.enum(["new", "prepared"]),
     expectedAccountKey: accountKeySchema,
   })
-  .strict();
+  .strict()
+  .superRefine(refinePlanBinding);
 
 const appliedPlanSchema = z
   .object({
@@ -101,7 +129,8 @@ const appliedPlanSchema = z
     expectedAccountKey: accountKeySchema,
     activeAccount: accountProjectionSchema,
   })
-  .strict();
+  .strict()
+  .superRefine(refinePlanBinding);
 
 const recoveryPlanSchema = z
   .object({
@@ -109,7 +138,8 @@ const recoveryPlanSchema = z
     ...planBindingShape,
     diagnostic: diagnosticCodeSchema,
   })
-  .strict();
+  .strict()
+  .superRefine(refinePlanBinding);
 
 const switchPlanSchema = z.discriminatedUnion("status", [
   readyPlanSchema,
@@ -122,14 +152,8 @@ type ReadySwitchPlan = z.infer<typeof readyPlanSchema>;
 
 type DesktopSwitchBeginInput = {
   readonly idempotencyKey: string;
-  readonly requestedSource?: Readonly<{
-    profileId: string;
-    processGeneration: number;
-  }>;
-  readonly target: Readonly<{
-    profileId: string;
-    processGeneration: number;
-  }>;
+  readonly requestedSource?: ProviderAccountAuthority;
+  readonly target: ProviderAccountAuthority;
 };
 
 export interface LocalDesktopSwitchStorePort extends DesktopRecoveryStorePort {
@@ -142,9 +166,8 @@ export interface LocalDesktopSwitchStorePort extends DesktopRecoveryStorePort {
   readDesktopSwitchReplay(input: DesktopSwitchBeginInput): unknown;
   beginDesktopSwitch(input: DesktopSwitchBeginInput): Promise<unknown>;
   prepareDesktopSwitchJournal(entry: DesktopSwitchJournalEntry): Promise<void>;
-  advanceDesktopSwitchJournal(input: {
+  advanceDesktopSwitchJournal(input: DesktopSwitchGeneration & {
     readonly idempotencyKey: string;
-    readonly switchGeneration: number;
     readonly stage: DesktopSwitchStage;
     readonly launchedPid?: number;
     readonly diagnostic?: string;
@@ -409,24 +432,28 @@ function desktopSwitchBeginInput(
       ? {}
       : {
           requestedSource: {
-            profileId: source.id,
-            processGeneration: source.generation,
+            ...providerAuthorityFromProfile(source),
           },
         }),
     target: {
-      profileId: target.id,
-      processGeneration: target.generation,
+      ...providerAuthorityFromProfile(target),
     },
   };
 }
 
 function switchGenerationBinding(plan: ReadySwitchPlan): DesktopSwitchGeneration {
+  return desktopGenerationBinding(plan);
+}
+
+function desktopGenerationBinding(plan: DesktopSwitchGeneration): DesktopSwitchGeneration {
   return {
     switchGeneration: plan.switchGeneration,
     sourceProfileId: plan.sourceProfileId,
     sourceProcessGeneration: plan.sourceProcessGeneration,
+    sourceProviderAuthority: plan.sourceProviderAuthority,
     targetProfileId: plan.targetProfileId,
     targetProcessGeneration: plan.targetProcessGeneration,
+    targetProviderAuthority: plan.targetProviderAuthority,
   };
 }
 
@@ -594,15 +621,14 @@ class StoreDesktopSwitchJournal {
   }
 
   async advance(
-    idempotencyKey: string,
-    switchGeneration: number,
+    binding: DesktopSwitchGeneration & { readonly idempotencyKey: string },
     stage: DesktopSwitchStage,
     details?: { readonly launchedPid?: number; readonly safeReason?: string },
   ): Promise<void> {
     try {
       await this.#store.advanceDesktopSwitchJournal({
-        idempotencyKey,
-        switchGeneration,
+        ...desktopGenerationBinding(binding),
+        idempotencyKey: binding.idempotencyKey,
         stage,
         ...(details?.launchedPid === undefined ? {} : { launchedPid: details.launchedPid }),
         ...(details?.safeReason === undefined
@@ -621,8 +647,8 @@ class StoreDesktopSwitchJournal {
   async recovery(plan: ReadySwitchPlan, diagnostic: string): Promise<void> {
     try {
       await this.#store.advanceDesktopSwitchJournal({
+        ...switchGenerationBinding(plan),
         idempotencyKey: plan.idempotencyKey,
-        switchGeneration: plan.switchGeneration,
         stage: "recovery-required",
         diagnostic: diagnosticCodeSchema.parse(diagnostic),
       });
@@ -749,8 +775,10 @@ function controllerRequest(
     switchGeneration: plan.switchGeneration,
     sourceProfileId: plan.sourceProfileId,
     sourceProcessGeneration: plan.sourceProcessGeneration,
+    sourceProviderAuthority: plan.sourceProviderAuthority,
     targetProfileId: plan.targetProfileId,
     targetProcessGeneration: plan.targetProcessGeneration,
+    targetProviderAuthority: plan.targetProviderAuthority,
     expectedAccountKey: plan.expectedAccountKey,
     stateRoot,
     baseEnvironment,
@@ -766,7 +794,8 @@ function assertPlanBinding(
   if (
     plan.idempotencyKey !== idempotencyKey ||
     plan.targetProfileId !== target.id ||
-    plan.targetProcessGeneration !== target.generation
+    plan.targetProcessGeneration !== target.generation ||
+    !sameProviderAuthority(plan.targetProviderAuthority, providerAuthorityFromProfile(target))
   ) {
     throw new DesktopSwitchError(
       "RECOVERY_REQUIRED",
@@ -775,9 +804,16 @@ function assertPlanBinding(
   }
   if (
     (plan.sourceProfileId === null) !== (plan.sourceProcessGeneration === null) ||
+    (plan.sourceProfileId === null) !== (plan.sourceProviderAuthority === null) ||
+    (source === undefined) !== (plan.sourceProviderAuthority === null) ||
     (source !== undefined &&
       (plan.sourceProfileId !== source.id ||
-        plan.sourceProcessGeneration !== source.generation))
+        plan.sourceProcessGeneration !== source.generation ||
+        plan.sourceProviderAuthority === null ||
+        !sameProviderAuthority(
+          plan.sourceProviderAuthority,
+          providerAuthorityFromProfile(source),
+        )))
   ) {
     throw new DesktopSwitchError(
       "RECOVERY_REQUIRED",
@@ -787,10 +823,10 @@ function assertPlanBinding(
 }
 
 function assertProfileAuthority(stateRoot: string, authority: ProfileAuthority): void {
-  authorityBindingSchema.parse({
-    profileId: authority.id,
-    processGeneration: authority.generation,
-  });
+  const providerAuthority = providerAuthorityFromProfile(authority);
+  if (providerAuthority.provider !== "codex") {
+    throw new DesktopSwitchError("INVALID_PROFILE", "desktop switching requires Codex authority");
+  }
   const expected = deriveDesktopProfilePaths(stateRoot, authority.id);
   if (
     expected.codexHome !== authority.codexHome ||
@@ -801,6 +837,27 @@ function assertProfileAuthority(stateRoot: string, authority: ProfileAuthority):
       "desktop profile paths do not match the local authority",
     );
   }
+}
+
+function providerAuthorityFromProfile(authority: ProfileAuthority): ProviderAccountAuthority {
+  return providerAccountAuthoritySchema.parse({
+    providerAccountId: authority.providerAccountId,
+    profileId: authority.id,
+    provider: authority.provider,
+    bindingGeneration: authority.bindingGeneration,
+    processGeneration: authority.generation,
+  });
+}
+
+function sameProviderAuthority(
+  left: ProviderAccountAuthority,
+  right: ProviderAccountAuthority,
+): boolean {
+  return left.providerAccountId === right.providerAccountId &&
+    left.profileId === right.profileId &&
+    left.provider === right.provider &&
+    left.bindingGeneration === right.bindingGeneration &&
+    left.processGeneration === right.processGeneration;
 }
 
 function assertLocalSwitchPaths(paths: Pick<StatePaths, "root" | "switchLock">): void {

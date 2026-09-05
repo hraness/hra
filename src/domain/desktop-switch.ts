@@ -1,6 +1,8 @@
 // Durable shapes of the macOS desktop account-switch journal. Storage persists
 // them and the desktop state machine produces them; neither imports the other.
 
+import type { ProviderAccountAuthority } from "./provider-accounts.ts";
+
 export interface DesktopProfilePaths {
   readonly profileRoot: string;
   readonly codexHome: string;
@@ -11,8 +13,10 @@ export interface DesktopSwitchGeneration {
   readonly switchGeneration: number;
   readonly sourceProfileId: string | null;
   readonly sourceProcessGeneration: number | null;
+  readonly sourceProviderAuthority: ProviderAccountAuthority | null;
   readonly targetProfileId: string;
   readonly targetProcessGeneration: number;
+  readonly targetProviderAuthority: ProviderAccountAuthority;
 }
 
 export type DesktopSwitchStage =

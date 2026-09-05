@@ -23,6 +23,12 @@ import { readCodexAutomations, type CodexAutomation } from "../codex/automations
 import { isNetworkOrExternalPermission } from "../daemon/autorespond";
 import { parseAccountUsage, parseRateLimits, type RateLimitSnapshot } from "../codex/protocol";
 import type { LocalCommand } from "../domain/contracts";
+import type {
+  ProviderAccountAuthority,
+  ProviderAccountId,
+  ProviderAccountReadiness,
+} from "../domain/provider-accounts";
+import type { Provider } from "../domain/presets";
 import {
   classifyPermissionCategory,
   computeInteractionCommandClass,
@@ -62,6 +68,7 @@ import { HRA_VERSION } from "../version";
 import type {
   InteractionListPosition,
   ProfileRecord,
+  SessionProviderAuthority,
   SessionRecord,
   StateStore,
 } from "../storage/state-store";
@@ -156,8 +163,11 @@ type LocalExecuteCommand = (
 type LocalExecuteRemote = (
   command: ProviderRemoteLocalCommand,
   expected: Readonly<{
+    bindingGeneration: number;
     processGeneration: number;
     profileId: ProfileRecord["id"];
+    provider: Provider;
+    providerAccountId: ProviderAccountId;
     providerThreadId: string;
     sessionId: SessionRecord["id"];
   }>,
@@ -338,8 +348,11 @@ export type CompactProjectionBaseline = Readonly<{
 }>;
 
 export type CompactProjectionLocalAuthority = Readonly<{
-  profileGeneration: number;
+  bindingGeneration: number;
+  processGeneration: number;
   profileId: string;
+  provider: Provider;
+  providerAccountId: ProviderAccountId;
   providerUpdatedAt: number | null;
   providerThreadId: string;
   sessionRevision: number;
@@ -600,14 +613,44 @@ export async function materializeRemoteAttachments(
   return { kind: "materialized", values };
 }
 
-function authorityFor(paths: StatePaths, profileId: Parameters<typeof profilePaths>[1], generation: number): ProfileAuthority {
-  const owned = profilePaths(paths, profileId);
+function authorityFor(
+  paths: StatePaths,
+  providerAuthority: ProviderAccountAuthority,
+): ProfileAuthority {
+  const owned = profilePaths(paths, providerAuthority.profileId);
   return {
-    id: profileId,
-    generation,
+    id: providerAuthority.profileId,
+    generation: providerAuthority.processGeneration,
     codexHome: owned.codexHome,
     desktopUserData: owned.desktopUserData,
+    bindingGeneration: providerAuthority.bindingGeneration,
+    provider: providerAuthority.provider,
+    providerAccountId: providerAuthority.providerAccountId,
   };
+}
+
+function providerAccountAuthorityOf(
+  authority: SessionProviderAuthority,
+): ProviderAccountAuthority {
+  return {
+    bindingGeneration: authority.bindingGeneration,
+    processGeneration: authority.processGeneration,
+    profileId: authority.profileId,
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+  };
+}
+
+function providerAccountCanReadExistingSession(
+  authority: SessionProviderAuthority,
+  readiness: ProviderAccountReadiness,
+): boolean {
+  return readiness === "signed_in"
+    || (
+      authority.provider === "claude"
+      && readiness === "unverified"
+      && authority.routingProvenance === "explicit"
+    );
 }
 
 function sha256(value: string): string {
@@ -2587,10 +2630,10 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   }
 
   /** The provider port that owns one session's live projection reads. */
-  #sessionRuntime(session: SessionRecord): {
+  #sessionRuntime(provider: Provider): {
     readSession: CodexRuntimePort["readSession"];
   } {
-    if (session.provider !== "claude") return this.#codex;
+    if (provider !== "claude") return this.#codex;
     const claude = this.#claude;
     if (claude === undefined) {
       throw new Error("This daemon composes no Claude Code runtime for that session.");
@@ -2652,7 +2695,9 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         || this.#cacheStatus.code === "CACHE_UNSAFE_AUTHORITY"
       )
     ) throw new Error("Cloud projection recovery refuses unsafe cache authority.");
-    const { profile, session } = this.#requireRecoverySession(input.sessionPublicId);
+    const { profile, providerAuthority, session } = this.#requireRecoverySession(
+      input.sessionPublicId,
+    );
     if (
       this.#store.listUnsettledMutations({ sessionId: session.id }).length > 0
       || this.#store.listUnsettledQueueEffects(session.id).length > 0
@@ -2661,16 +2706,19 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         || entry.state === "dispatching"
         || entry.state === "ambiguous")
     ) throw new Error("Cloud projection recovery requires settled local session effects.");
-    const projection = await this.#sessionRuntime(session).readSession({
-      authority: authorityFor(this.#paths, profile.id, profile.processGeneration),
+    const projection = await this.#sessionRuntime(providerAuthority.provider).readSession({
+      authority: authorityFor(this.#paths, providerAuthority),
       providerThreadId: session.providerThreadId,
       detail: false,
       signal: input.signal,
     });
     throwIfAborted(input.signal);
     const current = this.#requireRecoverySession(input.sessionPublicId, {
-      profileGeneration: profile.processGeneration,
+      bindingGeneration: providerAuthority.bindingGeneration,
+      processGeneration: providerAuthority.processGeneration,
       profileId: profile.id,
+      provider: providerAuthority.provider,
+      providerAccountId: providerAuthority.providerAccountId,
       providerThreadId: session.providerThreadId,
       providerUpdatedAt: projection.providerUpdatedAt ?? null,
       sessionRevision: session.revision,
@@ -2703,8 +2751,11 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       baselineCompletedTurns: turns.map((turn) => turn.baseline),
       baselineInteractions: parseRecoveryBaselineInteractions(baselineInteractions),
       localAuthority: {
-        profileGeneration: profile.processGeneration,
+        bindingGeneration: providerAuthority.bindingGeneration,
+        processGeneration: providerAuthority.processGeneration,
         profileId: profile.id,
+        provider: providerAuthority.provider,
+        providerAccountId: providerAuthority.providerAccountId,
         providerThreadId: session.providerThreadId,
         providerUpdatedAt: projection.providerUpdatedAt ?? null,
         sessionRevision: session.revision,
@@ -3012,24 +3063,38 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   #requireRecoverySession(
     sessionPublicId: string,
     expected?: CompactProjectionLocalAuthority,
-  ): Readonly<{ profile: ProfileRecord; session: SessionRecord & { providerThreadId: string } }> {
+  ): Readonly<{
+    profile: ProfileRecord;
+    providerAuthority: ProviderAccountAuthority;
+    session: SessionRecord & { providerThreadId: string };
+  }> {
     const session = this.#store.requireSession(sessionPublicId);
-    const profile = this.#store.requireProfileById(session.profileId);
+    const sessionAuthority = this.#store.requireSessionProviderAuthority(session.id);
+    const providerAuthority = providerAccountAuthorityOf(sessionAuthority);
+    const providerAccount = this.#store.assertProviderAccountAuthorityCurrent(providerAuthority);
+    const profile = this.#store.requireProfileById(providerAuthority.profileId);
     if (
       session.id !== sessionPublicId
+      || session.profileId !== providerAuthority.profileId
       || session.providerThreadId === undefined
       || session.state !== "idle"
-      || profile.state !== "signed_in"
-      || profile.processGeneration < 1
+      || !providerAccountCanReadExistingSession(sessionAuthority, providerAccount.readiness)
       || (expected !== undefined && (
-        profile.id !== expected.profileId
-        || profile.processGeneration !== expected.profileGeneration
+        providerAuthority.bindingGeneration !== expected.bindingGeneration
+        || profile.id !== expected.profileId
+        || providerAuthority.processGeneration !== expected.processGeneration
+        || providerAuthority.provider !== expected.provider
+        || providerAuthority.providerAccountId !== expected.providerAccountId
         || session.providerThreadId !== expected.providerThreadId
         || session.providerUpdatedAt !== (expected.providerUpdatedAt ?? undefined)
         || session.revision !== expected.sessionRevision
       ))
     ) throw new Error("Cloud projection recovery local authority changed.");
-    return { profile, session: session as SessionRecord & { providerThreadId: string } };
+    return {
+      profile,
+      providerAuthority,
+      session: session as SessionRecord & { providerThreadId: string },
+    };
   }
 
   hasActiveTurn(): boolean {
@@ -3053,8 +3118,23 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       if (state === null || session.providerThreadId === undefined) continue;
       const profile = this.#store.requireProfileById(session.profileId);
       if (profile.state === "removed") continue;
-      const canReadProvider = profile.state === "signed_in" && profile.processGeneration >= 1;
-      if (profile.state === "signed_in" && !canReadProvider) continue;
+      let providerAuthority: ProviderAccountAuthority | undefined;
+      let canReadProvider = false;
+      try {
+        const sessionAuthority = this.#store.requireSessionProviderAuthority(session.id);
+        const candidate = providerAccountAuthorityOf(sessionAuthority);
+        const account = this.#store.assertProviderAccountAuthorityCurrent(candidate);
+        if (
+          candidate.profileId === session.profileId
+          && providerAccountCanReadExistingSession(sessionAuthority, account.readiness)
+        ) {
+          providerAuthority = candidate;
+          canReadProvider = true;
+        }
+      } catch {
+        // Provider-unbound legacy sessions remain locally readable from the
+        // compact cache but cannot trigger a fresh provider read.
+      }
       let includeHead = canReadProvider;
       if (cache !== null) {
         if (!canReadProvider) {
@@ -3076,14 +3156,44 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         } else {
           let projectionError: Error | undefined;
           try {
-            const projection = await this.#sessionRuntime(session).readSession({
-              authority: authorityFor(this.#paths, profile.id, profile.processGeneration),
+            if (providerAuthority === undefined) {
+              throw new Error("The session has no current provider-account authority.");
+            }
+            const projection = await this.#sessionRuntime(providerAuthority.provider).readSession({
+              authority: authorityFor(this.#paths, providerAuthority),
               providerThreadId: session.providerThreadId,
               detail: false,
               signal: input.signal,
             });
             throwIfAborted(input.signal);
-            if (projection.providerThreadId !== session.providerThreadId) {
+            const currentSession = this.#store.requireSession(session.id);
+            const currentSessionAuthority = this.#store.requireSessionProviderAuthority(
+              currentSession.id,
+            );
+            const currentProviderAuthority = providerAccountAuthorityOf(
+              currentSessionAuthority,
+            );
+            const currentProviderAccount = this.#store.assertProviderAccountAuthorityCurrent(
+              providerAuthority,
+            );
+            if (
+              projection.providerThreadId !== session.providerThreadId
+              || currentSession.revision !== session.revision
+              || currentSession.profileId !== session.profileId
+              || currentSession.providerThreadId !== session.providerThreadId
+              || currentProviderAuthority.bindingGeneration
+                !== providerAuthority.bindingGeneration
+              || currentProviderAuthority.processGeneration
+                !== providerAuthority.processGeneration
+              || currentProviderAuthority.profileId !== providerAuthority.profileId
+              || currentProviderAuthority.provider !== providerAuthority.provider
+              || currentProviderAuthority.providerAccountId
+                !== providerAuthority.providerAccountId
+              || !providerAccountCanReadExistingSession(
+                currentSessionAuthority,
+                currentProviderAccount.readiness,
+              )
+            ) {
               throw new Error("The provider runtime returned a session under different authority.");
             }
             for (const turn of completedProjectionTurns(this.#store, session, projection)) {
@@ -3420,19 +3530,25 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     if (input.signal.aborted) return Promise.reject(input.signal.reason);
     try {
       const session = this.#store.requireSession(input.sessionPublicId);
-      const profile = this.#store.requireProfileById(session.profileId);
+      const sessionAuthority = this.#store.requireSessionProviderAuthority(session.id);
+      const providerAuthority = providerAccountAuthorityOf(sessionAuthority);
+      const providerAccount = this.#store.assertProviderAccountAuthorityCurrent(providerAuthority);
+      const profile = this.#store.requireProfileById(providerAuthority.profileId);
       if (
         session.id !== input.sessionPublicId
+        || session.profileId !== providerAuthority.profileId
         || session.providerThreadId === undefined
         || session.state === "starting"
         || session.state === "recovery_required"
-        || profile.state !== "signed_in"
-        || profile.processGeneration < 1
+        || !providerAccountCanReadExistingSession(sessionAuthority, providerAccount.readiness)
       ) return Promise.resolve(null);
       return Promise.resolve({
+        bindingGeneration: providerAuthority.bindingGeneration,
         localSessionId: session.id,
-        profileGeneration: profile.processGeneration,
+        processGeneration: providerAuthority.processGeneration,
         profileId: profile.id,
+        provider: providerAuthority.provider,
+        providerAccountId: providerAuthority.providerAccountId,
         providerThreadId: session.providerThreadId,
       });
     } catch {
@@ -3450,18 +3566,36 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
   }>): Promise<CloudCommandExecutionResult> {
     if (input.signal.aborted) throw input.signal.reason;
     try {
-      const session = this.#store.requireSession(input.sessionPublicId);
-      const profile = this.#store.requireProfileById(session.profileId);
+      const context = (() => {
+        try {
+          const session = this.#store.requireSession(input.sessionPublicId);
+          const sessionAuthority = this.#store.requireSessionProviderAuthority(session.id);
+          const providerAuthority = providerAccountAuthorityOf(sessionAuthority);
+          const providerAccount = this.#store.assertProviderAccountAuthorityCurrent(
+            providerAuthority,
+          );
+          const profile = this.#store.requireProfileById(providerAuthority.profileId);
+          return { profile, providerAccount, providerAuthority, session, sessionAuthority };
+        } catch {
+          return null;
+        }
+      })();
+      if (context === null) return { code: "LOCAL_AUTHORITY_CHANGED", state: "failed" };
+      const { profile, providerAccount, providerAuthority, session, sessionAuthority } = context;
       if (
         session.id !== input.sessionPublicId
         || session.id !== input.authority.localSessionId
+        || session.profileId !== providerAuthority.profileId
         || profile.id !== input.authority.profileId
-        || profile.processGeneration !== input.authority.profileGeneration
+        || providerAuthority.bindingGeneration !== input.authority.bindingGeneration
+        || providerAuthority.provider !== input.authority.provider
+        || providerAuthority.providerAccountId !== input.authority.providerAccountId
+        || providerAuthority.processGeneration !== input.authority.processGeneration
         || session.providerThreadId === undefined
         || session.providerThreadId !== input.authority.providerThreadId
         || session.state === "starting"
         || session.state === "recovery_required"
-        || profile.state !== "signed_in"
+        || !providerAccountCanReadExistingSession(sessionAuthority, providerAccount.readiness)
       ) return { code: "LOCAL_AUTHORITY_CHANGED", state: "failed" };
 
       // Hosted attachments are materialized into the same local
@@ -3550,8 +3684,11 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
           }
       }
       await this.#executeRemote(command, {
-        processGeneration: profile.processGeneration,
+        bindingGeneration: providerAuthority.bindingGeneration,
+        processGeneration: providerAuthority.processGeneration,
         profileId: profile.id,
+        provider: providerAuthority.provider,
+        providerAccountId: providerAuthority.providerAccountId,
         providerThreadId: session.providerThreadId,
         sessionId: session.id,
       }, { signal: input.signal });
@@ -3694,6 +3831,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         kind: "session.start",
         preset: payload.preset,
         project: payload.projectPublicId,
+        provider: payload.provider,
       }, { signal });
       sessionPublicId = requireStartedSessionId(started);
     } catch (error: unknown) {

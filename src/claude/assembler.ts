@@ -84,6 +84,10 @@ export type ClaudeFact =
       readonly message: string;
       readonly terminal: boolean;
     }
+  | {
+      readonly type: "providerDisconnected";
+      readonly reason: "eof" | "protocol_fault";
+    }
   | { readonly type: "protocolNotice"; readonly event: string };
 
 type SubagentState = {

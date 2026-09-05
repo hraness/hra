@@ -1,6 +1,8 @@
 import { lstat, realpath } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 
+import { z } from "zod";
+
 import { ClaudeError } from "./errors.ts";
 import {
   CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
@@ -27,7 +29,21 @@ export type ClaudeVersionProbe = (input: {
   readonly executablePath: string;
   readonly configDir: string;
   readonly environment: Readonly<Record<string, string | undefined>>;
+  /** Tests and callers may lower, but never raise, the production bound. */
+  readonly timeoutMs?: number;
 }) => Promise<string>;
+
+export type ClaudeAuthReadiness = "signed_in" | "signed_out" | "unverified";
+
+export type ClaudeAuthStatusProbe = (input: {
+  readonly executablePath: string;
+  readonly configDir: string;
+  readonly environment?: Readonly<Record<string, string | undefined>>;
+  readonly signal?: AbortSignal;
+  /** Tests and callers may lower, but never raise, the production bounds. */
+  readonly maxOutputBytes?: number;
+  readonly timeoutMs?: number;
+}) => Promise<ClaudeAuthReadiness>;
 
 export interface ResolvePinnedClaudeRuntimeOptions {
   /** Absolute path to the `claude` executable. Located on PATH when omitted. */
@@ -40,6 +56,18 @@ export interface ResolvePinnedClaudeRuntimeOptions {
 
 const versionPattern = /\b(\d{1,5}\.\d{1,5}\.\d{1,5})\b/u;
 const sha256Pattern = /^[0-9a-f]{64}$/u;
+const CLAUDE_PROBE_TIMEOUT_MS = 5_000;
+const CLAUDE_VERSION_OUTPUT_BYTES = 256;
+const CLAUDE_AUTH_STATUS_OUTPUT_BYTES = 4 * 1_024;
+const claudeSignedOutAuthStatusSchema = z.object({
+  analyticsDisabled: z.boolean(),
+  apiProvider: z.literal("firstParty"),
+  authMethod: z.literal("none"),
+  loggedIn: z.literal(false),
+  // This value is deliberately validated and dropped. It is local path data,
+  // not account identity or readiness evidence.
+  projectsDirectory: z.string().min(1).max(4_096),
+}).strict();
 const hasExactKeys = (
   value: Readonly<Record<string, unknown>>,
   expected: readonly string[],
@@ -115,23 +143,170 @@ export function buildPinnedClaudeRuntimeArgv(input: {
   ];
 }
 
-/** Reads `claude --version` inside the isolated home, bounded and non-interactive. */
-export const spawnClaudeVersionProbe: ClaudeVersionProbe = async (input) => {
+type BoundedProbeResult = Readonly<{
+  exitCode: number;
+  output: Uint8Array;
+}>;
+
+const loweredPositiveBound = (requested: number | undefined, maximum: number): number =>
+  requested === undefined
+    ? maximum
+    : Number.isSafeInteger(requested) && requested > 0
+      ? Math.min(requested, maximum)
+      : maximum;
+
+/**
+ * Runs one read-only Claude inspection without retaining provider output past
+ * the call. The byte cap is applied before concatenation or UTF-8 decoding,
+ * and every timeout, overflow, spawn failure, or non-piped stdout fails
+ * closed. An explicit caller cancellation remains cancellation rather than an
+ * account observation.
+ */
+async function runBoundedClaudeProbe(input: {
+  readonly argv: readonly [string, ...string[]];
+  readonly configDir: string;
+  readonly environment: Readonly<Record<string, string | undefined>>;
+  readonly maxOutputBytes: number;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs: number;
+}): Promise<BoundedProbeResult | null> {
+  input.signal?.throwIfAborted();
   const env = allowlistedEnvironment(input.environment);
   env.CLAUDE_CONFIG_DIR = input.configDir;
   env.NO_COLOR = "1";
-  const child = Bun.spawn([input.executablePath, "--version"], {
-    env,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "ignore",
+
+  let child: ReturnType<typeof Bun.spawn>;
+  try {
+    child = Bun.spawn([...input.argv], {
+      env,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+  } catch {
+    return null;
+  }
+
+  const stdout = child.stdout;
+  if (stdout === undefined || typeof stdout === "number") {
+    child.kill("SIGKILL");
+    await child.exited.catch(() => undefined);
+    return null;
+  }
+
+  const state: { canceled: boolean; invalid: boolean } = {
+    canceled: false,
+    invalid: false,
+  };
+  const terminate = (): void => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // A process that exited between observation and termination is already
+      // in the desired state.
+    }
+  };
+  const onAbort = (): void => {
+    state.canceled = true;
+    terminate();
+  };
+  input.signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => {
+    state.invalid = true;
+    terminate();
+  }, input.timeoutMs);
+  timer.unref();
+
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  const reader = stdout.getReader();
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) break;
+      if (result.value.byteLength === 0) continue;
+      byteLength += result.value.byteLength;
+      if (byteLength > input.maxOutputBytes) {
+        state.invalid = true;
+        terminate();
+        break;
+      }
+      chunks.push(result.value);
+    }
+    const exitCode = await child.exited;
+    input.signal?.throwIfAborted();
+    if (state.invalid || state.canceled) return null;
+    const output = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      output.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { exitCode, output };
+  } catch {
+    state.invalid = true;
+    terminate();
+    input.signal?.throwIfAborted();
+    return null;
+  } finally {
+    clearTimeout(timer);
+    input.signal?.removeEventListener("abort", onAbort);
+    reader.releaseLock();
+    if (state.invalid || state.canceled) {
+      terminate();
+      await child.exited.catch(() => undefined);
+    }
+  }
+}
+
+/** Reads `claude --version` inside the isolated home, bounded and non-interactive. */
+export const spawnClaudeVersionProbe: ClaudeVersionProbe = async (input) => {
+  const result = await runBoundedClaudeProbe({
+    argv: [input.executablePath, "--version"],
+    configDir: input.configDir,
+    environment: input.environment,
+    maxOutputBytes: CLAUDE_VERSION_OUTPUT_BYTES,
+    timeoutMs: loweredPositiveBound(input.timeoutMs, CLAUDE_PROBE_TIMEOUT_MS),
   });
-  const text = await new Response(child.stdout).text();
-  const code = await child.exited;
-  if (code !== 0) {
+  if (result === null || result.exitCode !== 0) {
     throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable did not report a version");
   }
-  return text.slice(0, 256);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(result.output);
+  } catch {
+    throw new ClaudeError("RUNTIME_MISMATCH", "the Claude Code executable did not report a version");
+  }
+};
+
+/**
+ * Admits only the exact unauthenticated matrix observed from pinned Claude
+ * 2.1.260 in a fresh isolated configuration. No authenticated shape has been
+ * reviewed, so exit 0 always remains unverified. The parsed object and its
+ * path-bearing field are dropped before returning.
+ */
+export const spawnClaudeAuthStatusProbe: ClaudeAuthStatusProbe = async (input) => {
+  const result = await runBoundedClaudeProbe({
+    argv: [input.executablePath, "auth", "status", "--json"],
+    configDir: input.configDir,
+    environment: input.environment ?? process.env,
+    maxOutputBytes: loweredPositiveBound(
+      input.maxOutputBytes,
+      CLAUDE_AUTH_STATUS_OUTPUT_BYTES,
+    ),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    timeoutMs: loweredPositiveBound(input.timeoutMs, CLAUDE_PROBE_TIMEOUT_MS),
+  });
+  if (result === null || result.exitCode !== 1) return "unverified";
+
+  try {
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(result.output);
+    const parsed: unknown = JSON.parse(decoded);
+    return claudeSignedOutAuthStatusSchema.safeParse(parsed).success
+      ? "signed_out"
+      : "unverified";
+  } catch {
+    return "unverified";
+  }
 };
 
 /**

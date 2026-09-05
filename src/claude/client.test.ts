@@ -309,8 +309,18 @@ describe("Claude stream client", () => {
       "turnStarted",
       "providerError",
       "turnCompleted",
+      "providerDisconnected",
     ]);
-    expect(facts.at(-1)).toMatchObject({ status: "failed" });
+    expect(facts.at(-2)).toMatchObject({ status: "failed" });
+    expect(facts.at(-1)).toMatchObject({ reason: "eof" });
+    await client.close();
+  });
+
+  test("reports an unexpected disconnect while idle", async () => {
+    const { client, facts, process } = open();
+    process.end();
+    await settle();
+    expect(facts).toEqual([{ reason: "eof", type: "providerDisconnected" }]);
     await client.close();
   });
 

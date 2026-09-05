@@ -7,6 +7,7 @@ import type {
   DesktopRecoveryBinding,
   DesktopRecoveryResolution,
 } from "../domain/desktop-switch.ts";
+import { providerAccountAuthoritySchema } from "../domain/provider-accounts.ts";
 import { profileIdSchema } from "../domain/values.ts";
 import { CODEX_ELECTRON_USER_DATA_PATH, CODEX_HOME } from "./bundle.ts";
 import { deriveDesktopProfilePaths } from "./profile.ts";
@@ -64,9 +65,46 @@ const bindingShape = {
   switchGeneration: z.number().int().positive(),
   sourceProfileId: profileIdSchema.nullable(),
   sourceProcessGeneration: z.number().int().positive().nullable(),
+  sourceProviderAuthority: providerAccountAuthoritySchema.nullable(),
   targetProfileId: profileIdSchema,
   targetProcessGeneration: z.number().int().positive(),
+  targetProviderAuthority: providerAccountAuthoritySchema,
 } as const;
+
+const refineBinding = (
+  value: {
+    sourceProfileId: string | null;
+    sourceProcessGeneration: number | null;
+    sourceProviderAuthority: z.infer<typeof providerAccountAuthoritySchema> | null;
+    targetProfileId: string;
+    targetProcessGeneration: number;
+    targetProviderAuthority: z.infer<typeof providerAccountAuthoritySchema>;
+  },
+  context: z.RefinementCtx,
+): void => {
+  if (
+    (value.sourceProfileId === null) !== (value.sourceProcessGeneration === null) ||
+    (value.sourceProfileId === null) !== (value.sourceProviderAuthority === null)
+  ) {
+    context.addIssue({ code: "custom", message: "Desktop source authority is incomplete." });
+  }
+  if (
+    value.targetProviderAuthority.provider !== "codex" ||
+    value.targetProviderAuthority.profileId !== value.targetProfileId ||
+    value.targetProviderAuthority.processGeneration !== value.targetProcessGeneration
+  ) {
+    context.addIssue({ code: "custom", message: "Desktop target authority is inconsistent." });
+  }
+  if (
+    value.sourceProviderAuthority !== null && (
+      value.sourceProviderAuthority.provider !== "codex" ||
+      value.sourceProviderAuthority.profileId !== value.sourceProfileId ||
+      value.sourceProviderAuthority.processGeneration !== value.sourceProcessGeneration
+    )
+  ) {
+    context.addIssue({ code: "custom", message: "Desktop source authority is inconsistent." });
+  }
+};
 
 const recoveryRequiredPlanSchema = z
   .object({
@@ -87,7 +125,8 @@ const recoveryRequiredPlanSchema = z
     launchedPid: z.number().int().positive().nullable(),
     expectedAccountKey: z.string().trim().email().max(320),
   })
-  .strict();
+  .strict()
+  .superRefine(refineBinding);
 
 const resolvedPlanSchema = z
   .object({
@@ -98,19 +137,19 @@ const resolvedPlanSchema = z
     resolvedAt: z.number().int().nonnegative(),
     activeAccount: accountSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(refineBinding);
 
 const recoveryPlanSchema = z.union([
   z.object({ status: z.literal("none") }).strict(),
   z
     .object({
       status: z.literal("in_progress"),
-      idempotencyKey: z.string().uuid(),
-      switchGeneration: z.number().int().positive(),
-      targetProfileId: profileIdSchema,
+      ...bindingShape,
       phase: z.enum(["prepared", "quit_started", "quit_confirmed", "launch_started", "verify_started"]),
     })
-    .strict(),
+    .strict()
+    .superRefine(refineBinding),
   recoveryRequiredPlanSchema,
   resolvedPlanSchema,
 ]);
@@ -282,6 +321,9 @@ export class DesktopSwitchRecoveryController {
             authority: {
               id: plan.targetProfileId,
               generation: plan.targetProcessGeneration,
+              provider: plan.targetProviderAuthority.provider,
+              providerAccountId: plan.targetProviderAuthority.providerAccountId,
+              bindingGeneration: plan.targetProviderAuthority.bindingGeneration,
               codexHome: targetPaths.codexHome,
               desktopUserData: targetPaths.desktopUserData,
             },
@@ -422,8 +464,10 @@ function binding(plan: z.infer<typeof recoveryRequiredPlanSchema>): DesktopRecov
     switchGeneration: plan.switchGeneration,
     sourceProfileId: plan.sourceProfileId,
     sourceProcessGeneration: plan.sourceProcessGeneration,
+    sourceProviderAuthority: plan.sourceProviderAuthority,
     targetProfileId: plan.targetProfileId,
     targetProcessGeneration: plan.targetProcessGeneration,
+    targetProviderAuthority: plan.targetProviderAuthority,
   };
 }
 

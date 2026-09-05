@@ -13,6 +13,7 @@ import {
   EDITOR_ENVIRONMENT_KEYS,
   HUMAN_SESSION_WATCH_BOOTSTRAP_MAXIMUM_BYTES,
   initialize,
+  isExactProviderRuntimeAuthorityCurrent,
   main,
   protectedTerminalControlLibrariesForPlatform,
   protectedTerminalInputQueueForPlatform,
@@ -316,6 +317,70 @@ const exactStopDependencies = (
 });
 
 describe("CLI entry point", () => {
+  test("requires exact child authority while allowing Claude and Codex generations to diverge", () => {
+    const profileId = "acct_00000000000000000000000000000000" as const;
+    let profileGeneration = 7;
+    let claudeGeneration = 3;
+    const codexAuthority = () => ({
+      providerAccountId: profileId,
+      profileId,
+      provider: "codex" as const,
+      bindingGeneration: 2,
+      processGeneration: profileGeneration,
+    });
+    const claudeAuthority = () => ({
+      providerAccountId: "pact_00000000000000000000000000000000" as const,
+      profileId,
+      provider: "claude" as const,
+      bindingGeneration: 5,
+      processGeneration: claudeGeneration,
+    });
+    const store = {
+      requireProfile: () => ({ id: profileId, processGeneration: profileGeneration, state: "signed_in" }),
+      requireProviderAccountAuthority: (_selector: string, provider: "codex" | "claude") =>
+        provider === "codex" ? codexAuthority() : claudeAuthority(),
+    } as unknown as Pick<StateStore, "requireProfile" | "requireProviderAccountAuthority">;
+    const live = (provider: "codex" | "claude") => {
+      const authority = provider === "codex" ? codexAuthority() : claudeAuthority();
+      return {
+        id: profileId,
+        generation: authority.processGeneration,
+        provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
+        codexHome: "/profiles/account/codex-home",
+        desktopUserData: "/profiles/account/desktop-user-data",
+      } as const;
+    };
+
+    expect(isExactProviderRuntimeAuthorityCurrent(store, "codex", live("codex"))).toBe(true);
+    expect(isExactProviderRuntimeAuthorityCurrent(store, "claude", live("claude"))).toBe(true);
+    expect(isExactProviderRuntimeAuthorityCurrent(store, "claude", live("codex"))).toBe(false);
+    expect(isExactProviderRuntimeAuthorityCurrent(store, "codex", live("claude"))).toBe(false);
+    claudeGeneration = 11;
+    expect(isExactProviderRuntimeAuthorityCurrent(store, "claude", live("claude"))).toBe(true);
+    expect(isExactProviderRuntimeAuthorityCurrent(store, "claude", {
+      ...live("claude"),
+      bindingGeneration: 4,
+    })).toBe(false);
+    expect(isExactProviderRuntimeAuthorityCurrent(store, "codex", {
+      id: profileId,
+      generation: profileGeneration,
+      codexHome: "/profiles/account/codex-home",
+      desktopUserData: "/profiles/account/desktop-user-data",
+    } as never)).toBe(false);
+    expect(isExactProviderRuntimeAuthorityCurrent(store, "codex", {
+      ...live("codex"),
+      providerAccountId: undefined,
+    } as never)).toBe(false);
+
+    profileGeneration = 8;
+    expect(isExactProviderRuntimeAuthorityCurrent(store, "codex", {
+      ...live("codex"),
+      generation: 7,
+    })).toBe(false);
+  });
+
   test("reads root status locally without daemon autostart or transport", async () => {
     const captured = capture();
     let daemonCalls = 0;
@@ -4044,6 +4109,7 @@ describe("CLI entry point", () => {
           sessionId: session.id,
           accountId: profile.id,
           providerGeneration: profile.processGeneration,
+          providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
           providerConnectionId: null,
           body: { type: "turn_started", turnId: "low-entropy-turn" },
         });

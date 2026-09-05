@@ -5,7 +5,11 @@ import { CodexAppServerClient, type CodexAppServerClientOptions } from "./client
 import { CodexError } from "./errors.ts";
 import { record, string } from "./parse.ts";
 import { spawnBunCodexProcess, type CodexProcess } from "./process.ts";
-import { PINNED_CODEX_VERSION, type CodexAuthority } from "./protocol.ts";
+import {
+  PINNED_CODEX_VERSION,
+  validateAuthority,
+  type CodexAuthority,
+} from "./protocol.ts";
 
 export interface PinnedCodexRuntime {
   readonly packageRoot: string;
@@ -298,6 +302,17 @@ async function locatePackageJson(options: ResolvePinnedCodexRuntimeOptions): Pro
   }
 }
 
-export function codexAuthority(profileId: string, processGeneration: number): CodexAuthority {
-  return { profileId, processGeneration };
+export function codexAuthority(input: Readonly<{
+  profileId: string;
+  processGeneration: number;
+  providerAccountId: string;
+  bindingGeneration: number;
+}>): CodexAuthority {
+  return validateAuthority({
+    profileId: input.profileId,
+    processGeneration: input.processGeneration,
+    provider: "codex",
+    providerAccountId: input.providerAccountId,
+    bindingGeneration: input.bindingGeneration,
+  });
 }

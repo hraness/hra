@@ -57,6 +57,13 @@ import {
   type Provider,
 } from "../domain/presets";
 import {
+  providerAccountAuthoritySchema,
+  providerAccountIdSchema,
+  type ProviderAccountId,
+  type ProviderAccountAuthority,
+  type ProviderAccountReadiness,
+} from "../domain/provider-accounts";
+import {
   reviewedRuntimeProfileSchema,
   type ReviewedRuntimeProfile,
 } from "../domain/runtime-profile";
@@ -148,6 +155,7 @@ import {
   type AccountRateLimitResetPolicyRecord,
   type ProfileRecord,
   type SessionRecord,
+  type SessionProviderAuthority,
   type StateStore,
   type StoredMessageAttachment,
 } from "../storage/state-store";
@@ -557,9 +565,24 @@ class InteractionPersistenceBoundaryError extends Error {
   }
 }
 
-const authorityFor = (paths: StatePaths, profile: ProfileRecord): ProfileAuthority => {
+const authorityFor = (
+  paths: StatePaths,
+  profile: ProfileRecord,
+  providerAuthority: ProviderAccountAuthority,
+): ProfileAuthority => {
   const owned = profilePaths(paths, profile.id);
-  return { id: profile.id, generation: profile.processGeneration, codexHome: owned.codexHome, desktopUserData: owned.desktopUserData };
+  if (providerAuthority.profileId !== profile.id) {
+    throw new Error("Provider-account authority does not match its profile.");
+  }
+  return {
+    id: profile.id,
+    generation: providerAuthority.processGeneration,
+    codexHome: owned.codexHome,
+    desktopUserData: owned.desktopUserData,
+    provider: providerAuthority.provider,
+    providerAccountId: providerAuthority.providerAccountId,
+    bindingGeneration: providerAuthority.bindingGeneration,
+  };
 };
 
 /**
@@ -827,6 +850,15 @@ const classifyBackgroundDiagnosticCause = (error: unknown): BackgroundDiagnostic
 
 /** Upper bound on remembered per-session fact epochs; oldest entries are dropped first. */
 const SESSION_FACT_EPOCH_LIMIT = 4_096;
+/** Upper bound on exact Claude exits that race their durable session-start commit. */
+const PENDING_CLAUDE_DISCONNECT_LIMIT = 1_024;
+
+type PendingClaudeDisconnect = Readonly<{
+  authority: ProfileAuthority;
+  connectionId: string;
+  providerThreadId: string;
+  reason: "eof" | "protocol_fault";
+}>;
 
 export class HraService {
   readonly #store: StateStore;
@@ -862,6 +894,7 @@ export class HraService {
   readonly #backgroundDiagnostics = new Map<BackgroundDiagnosticCode, BackgroundDiagnostic>();
   #lastBackgroundDiagnostic: BackgroundDiagnostic | null = null;
   readonly #sessionProviderConnections = new Map<string, string>();
+  readonly #pendingClaudeDisconnects = new Map<string, PendingClaudeDisconnect>();
   readonly #sessionObservationFailures = new Map<string, string>();
   readonly #sessionResubscriptionConnections = new Map<string, string>();
   readonly #sessionsAwaitingResubscription = new Set<string>();
@@ -908,8 +941,16 @@ export class HraService {
     this.#codex = input.codex;
     this.#claude = input.claude ?? new UnavailableClaudeRuntime(CLAUDE_PIN);
     this.#claudeFacts = new ClaudeSessionFactTranslator({
-      authorityFor: (providerThreadId, requestId) =>
-        this.#claude.interactionAuthority(providerThreadId, requestId),
+      authorityFor: (providerAuthority, providerThreadId, requestId) =>
+        this.#claude.interactionAuthority(
+          authorityFor(
+            this.#paths,
+            this.#store.requireProfileById(providerAuthority.profileId),
+            providerAuthority,
+          ),
+          providerThreadId,
+          requestId,
+        ),
       now: () => this.#now(),
     });
     this.#cloud = input.cloud;
@@ -969,6 +1010,311 @@ export class HraService {
     this.#now = input.now ?? Date.now;
     this.#desktop = input.desktop;
     this.#requestStop = input.requestStop;
+  }
+
+  /** Resolve a current provider child authority without conflating its
+   * binding generation with the profile's runtime-process generation. */
+  #providerAuthority(
+    profile: Pick<ProfileRecord, "id" | "processGeneration">,
+    provider: Provider,
+  ): ProviderAccountAuthority {
+    const authority = this.#store.requireProviderAccountAuthority(profile.id, provider);
+    if (provider === "codex" && authority.processGeneration !== profile.processGeneration) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "Provider account process authority changed before dispatch.",
+      );
+    }
+    return authority;
+  }
+
+  #profileAuthority(profile: ProfileRecord, provider: Provider): ProfileAuthority {
+    return authorityFor(this.#paths, profile, this.#providerAuthority(profile, provider));
+  }
+
+  #providerAccountAuthority(authority: ProfileAuthority): ProviderAccountAuthority {
+    return providerAccountAuthoritySchema.parse({
+      providerAccountId: authority.providerAccountId,
+      profileId: authority.id,
+      provider: authority.provider,
+      bindingGeneration: authority.bindingGeneration,
+      processGeneration: authority.generation,
+    });
+  }
+
+  #profileAuthorityIsCurrent(authority: ProfileAuthority): boolean {
+    try {
+      const profile = this.#store.requireProfileById(authority.id);
+      if (profile.state === "removed") return false;
+      const current = this.#store.requireProviderAccountAuthority(
+        profile.id,
+        authority.provider,
+      );
+      return current.profileId === authority.id
+        && current.provider === authority.provider
+        && current.providerAccountId === authority.providerAccountId
+        && current.bindingGeneration === authority.bindingGeneration
+        && current.processGeneration === authority.generation
+        && (
+          authority.provider !== "codex"
+          || profile.processGeneration === authority.generation
+        );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * A disconnect reaches this predicate only after full binding authority was
+   * proved at callback admission. While it waits in the account FIFO, an
+   * earlier admitted login fact may advance only the binding generation. The
+   * disconnect still retires that exact provider process, but it cannot cross
+   * a profile, provider-account, provider, or process-generation change.
+   */
+  #admittedProviderProcessAuthorityIsCurrent(authority: ProfileAuthority): boolean {
+    try {
+      const profile = this.#store.requireProfileById(authority.id);
+      if (profile.state === "removed") return false;
+      const current = this.#store.requireProviderAccountAuthority(
+        profile.id,
+        authority.provider,
+      );
+      return current.providerAccountId === authority.providerAccountId
+        && current.profileId === authority.id
+        && current.provider === authority.provider
+        && current.processGeneration === authority.generation
+        && (
+          authority.provider !== "codex"
+          || profile.processGeneration === authority.generation
+        );
+    } catch {
+      return false;
+    }
+  }
+
+  #sessionProviderAuthority(
+    session: Pick<SessionRecord, "id" | "profileId" | "provider">,
+  ): ProviderAccountAuthority {
+    let bound: SessionProviderAuthority;
+    try {
+      bound = this.#store.requireSessionProviderAuthority(session.id);
+    } catch (error: unknown) {
+      if (
+        error instanceof Error
+        && error.message.startsWith("SESSION_PROVIDER_AUTHORITY_")
+      ) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Session provider-account authority is unavailable or quarantined.",
+          { sessionId: session.id, reason: error.message },
+        );
+      }
+      throw error;
+    }
+    if (
+      bound.profileId !== session.profileId
+      || bound.provider !== session.provider
+    ) throw new CommandFailure("RECOVERY_REQUIRED", "Session provider-account authority is inconsistent.");
+    return {
+      providerAccountId: bound.providerAccountId,
+      profileId: bound.profileId,
+      provider: bound.provider,
+      bindingGeneration: bound.bindingGeneration,
+      processGeneration: bound.processGeneration,
+    };
+  }
+
+  #capturedSessionProviderAuthority(
+    session: Pick<SessionRecord, "id" | "profileId" | "provider">,
+  ): ProviderAccountAuthority {
+    let bound: SessionProviderAuthority;
+    try {
+      bound = this.#store.requireCapturedSessionProviderAuthority(session.id);
+    } catch (error: unknown) {
+      if (
+        error instanceof Error
+        && error.message.startsWith("SESSION_PROVIDER_AUTHORITY_")
+      ) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Session provider-account authority is unavailable or quarantined.",
+          { sessionId: session.id, reason: error.message },
+        );
+      }
+      throw error;
+    }
+    if (bound.profileId !== session.profileId || bound.provider !== session.provider) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "Session provider-account authority is inconsistent.",
+      );
+    }
+    return {
+      providerAccountId: bound.providerAccountId,
+      profileId: bound.profileId,
+      provider: bound.provider,
+      bindingGeneration: bound.bindingGeneration,
+      processGeneration: bound.processGeneration,
+    };
+  }
+
+  #primaryMutationProviderAuthority(
+    attempt: Pick<MutationAttemptRecord, "id" | "authorityGeneration">,
+  ): ProviderAccountAuthority | null {
+    const authorities = this.#store.readMutationProviderAuthorities(attempt.id);
+    const primary = authorities.find((value) => value.role === "primary");
+    return primary !== undefined
+      && primary.authority.processGeneration === attempt.authorityGeneration
+      ? primary.authority
+      : null;
+  }
+
+  #sameProviderAccountBinding(
+    left: ProviderAccountAuthority,
+    right: ProviderAccountAuthority,
+  ): boolean {
+    return left.providerAccountId === right.providerAccountId
+      && left.profileId === right.profileId
+      && left.provider === right.provider
+      && left.bindingGeneration === right.bindingGeneration;
+  }
+
+  #sessionAuthority(
+    session: Pick<SessionRecord, "id" | "profileId" | "provider">,
+  ): ProfileAuthority {
+    const providerAuthority = this.#sessionProviderAuthority(session);
+    const profile = this.#store.requireProfileById(session.profileId);
+    return authorityFor(this.#paths, profile, providerAuthority);
+  }
+
+  #authorityMatchesSession(
+    authority: ProfileAuthority,
+    session: Pick<SessionRecord, "id" | "profileId" | "provider">,
+  ): boolean {
+    if (authority.id !== session.profileId || !this.#profileAuthorityIsCurrent(authority)) {
+      return false;
+    }
+    try {
+      const expected = this.#store.requireSessionProviderAuthority(session.id);
+      return authority.provider === expected.provider
+        && authority.providerAccountId === expected.providerAccountId
+        && authority.bindingGeneration === expected.bindingGeneration
+        && authority.generation === expected.processGeneration;
+    } catch {
+      return false;
+    }
+  }
+
+  #interactionAuthority(record: Pick<InteractionRecord, "authority" | "sessionId">): ProfileAuthority {
+    if (record.sessionId !== null) {
+      const session = this.#store.requireSession(record.sessionId);
+      const authority = this.#sessionAuthority(session);
+      if (
+        record.authority.profileId !== authority.id
+        || record.authority.processGeneration !== authority.generation
+        || record.authority.provider !== authority.provider
+        || record.authority.providerAccountId !== authority.providerAccountId
+        || record.authority.bindingGeneration !== authority.bindingGeneration
+      ) throw new CommandFailure("RECOVERY_REQUIRED", "Interaction provider-account authority is stale.");
+      return authority;
+    }
+    const profile = this.#store.requireProfileById(record.authority.profileId);
+    const authority = this.#profileAuthority(profile, record.authority.provider);
+    if (
+      record.authority.processGeneration !== authority.generation
+      || record.authority.providerAccountId !== authority.providerAccountId
+      || record.authority.bindingGeneration !== authority.bindingGeneration
+    ) throw new CommandFailure("RECOVERY_REQUIRED", "Interaction provider-account authority is stale.");
+    return authority;
+  }
+
+  #assertProviderReady(
+    profile: ProfileRecord,
+    authority: ProviderAccountAuthority,
+    options: Readonly<{
+      userInitiatedStart?: boolean;
+      session?: Pick<SessionRecord, "id" | "profileId" | "provider">;
+    }> = {},
+  ): void {
+    const provider = authority.provider;
+    const account = this.#store.requireProviderAccountForProfile(profile.id, provider);
+    if (
+      account.id !== authority.providerAccountId
+      || account.bindingGeneration !== authority.bindingGeneration
+      || account.processGeneration !== authority.processGeneration
+    ) throw new CommandFailure("CONFLICT", "Provider account authority changed before dispatch.");
+    if (account.readiness === "signed_in") return;
+    if (provider === "claude" && account.readiness === "unverified") {
+      if (options.userInitiatedStart === true) return;
+      if (options.session !== undefined) {
+        const bound = this.#store.requireSessionProviderAuthority(options.session.id);
+        if (
+          bound.routingProvenance === "explicit"
+          && bound.providerAccountId === authority.providerAccountId
+          && bound.profileId === authority.profileId
+          && bound.provider === authority.provider
+          && bound.bindingGeneration === authority.bindingGeneration
+          && bound.processGeneration === authority.processGeneration
+        ) return;
+      }
+      throw new CommandFailure(
+        "INTERACTION_REQUIRED",
+        "Claude readiness is unverified; only a user-initiated start or an existing explicitly bound session may attempt this binding.",
+        { accountSelector: profile.id, provider, readiness: account.readiness },
+      );
+    }
+    if (account.readiness === "recovery_required") {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        `The ${provider} binding for ${profile.label} requires reconciliation before another provider operation.`,
+      );
+    }
+    if (provider === "codex") {
+      this.#assertSignedIn(profile);
+      return;
+    }
+    const state: ProviderAccountReadiness = account.readiness;
+    throw new CommandFailure(
+      "INTERACTION_REQUIRED",
+      `Sign in to Claude inside ${profile.label}'s isolated Claude configuration before using this binding.`,
+      { accountSelector: profile.id, provider, readiness: state },
+    );
+  }
+
+  async #prepareProviderForSessionStart(
+    initialProfile: ProfileRecord,
+    provider: Provider,
+    signal: AbortSignal,
+  ): Promise<Readonly<{ profile: ProfileRecord; providerAuthority: ProviderAccountAuthority }>> {
+    let profile = initialProfile;
+    let providerAuthority = this.#providerAuthority(profile, provider);
+    if (providerAuthority.processGeneration === 0) {
+      providerAuthority = this.#store.advanceProviderAccountProcessGeneration({
+        profileId: profile.id,
+        provider,
+        expectedProcessGeneration: 0,
+      });
+      profile = this.#store.requireProfileById(profile.id);
+    }
+    if (provider === "claude") {
+      const before = providerAuthority;
+      const observed = await this.#fencedEffect(async () => await this.#claude.readAccount({
+        authority: authorityFor(this.#paths, profile, before),
+        signal,
+      }));
+      await this.#daemonAuthority.assertCurrent();
+      this.#store.observeProviderAccountReadiness({
+        profileId: profile.id,
+        provider,
+        expectedBindingGeneration: before.bindingGeneration,
+        readiness: observed.readiness,
+        observedAt: observed.observedAt,
+      });
+      profile = this.#store.requireProfileById(profile.id);
+      providerAuthority = this.#providerAuthority(profile, provider);
+    }
+    this.#assertProviderReady(profile, providerAuthority, { userInitiatedStart: true });
+    return { profile, providerAuthority };
   }
 
   async execute(command: LocalCommand, context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void }): Promise<unknown> {
@@ -1360,11 +1706,15 @@ export class HraService {
               }
               const session = this.#requireBoundSession(selected.id);
               const profile = this.#store.requireProfile(session.profileId);
+              const providerAuthority = this.#sessionProviderAuthority(session);
               return await this.#recoverCompactProjection({
                 acknowledgeGap: command.acknowledgeGap,
+                bindingGeneration: providerAuthority.bindingGeneration,
                 idempotencyKey: command.idempotencyKey,
-                processGeneration: profile.processGeneration,
+                processGeneration: providerAuthority.processGeneration,
                 profileId: profile.id,
+                provider: providerAuthority.provider,
+                providerAccountId: providerAuthority.providerAccountId,
                 providerThreadId: session.providerThreadId,
                 sessionId: session.id,
               }, context.signal);
@@ -1549,7 +1899,7 @@ export class HraService {
 
   async executeRemote(
     command: RemoteSessionCommand,
-    expectedAuthority: { sessionId: SessionRecord["id"]; profileId: ProfileRecord["id"]; processGeneration: number; providerThreadId: string },
+    expectedAuthority: { sessionId: SessionRecord["id"]; profileId: ProfileRecord["id"]; processGeneration: number; provider: Provider; providerAccountId: ProviderAccountId; bindingGeneration: number; providerThreadId: string },
     context: { signal: AbortSignal },
   ): Promise<unknown> {
     const finish = this.#beginOperation();
@@ -1580,7 +1930,7 @@ export class HraService {
 
   async #executeRemoteAdmitted(
     command: RemoteSessionCommand,
-    expectedAuthority: { sessionId: SessionRecord["id"]; profileId: ProfileRecord["id"]; processGeneration: number; providerThreadId: string },
+    expectedAuthority: { sessionId: SessionRecord["id"]; profileId: ProfileRecord["id"]; processGeneration: number; provider: Provider; providerAccountId: ProviderAccountId; bindingGeneration: number; providerThreadId: string },
     context: { signal: AbortSignal },
   ): Promise<unknown> {
     const expected = z
@@ -1588,6 +1938,9 @@ export class HraService {
         sessionId: sessionIdSchema,
         profileId: profileIdSchema,
         processGeneration: z.number().int().nonnegative(),
+        provider: providerSchema,
+        providerAccountId: providerAccountIdSchema,
+        bindingGeneration: z.number().int().positive(),
         providerThreadId: z.string().min(1).max(200),
       })
       .strict()
@@ -1599,14 +1952,42 @@ export class HraService {
       await this.#daemonAuthority.assertCurrent();
       const session = this.#store.requireSession(expected.sessionId);
       const profile = this.#store.requireProfileById(expected.profileId);
+      let providerAuthority: SessionProviderAuthority;
+      try {
+        providerAuthority = this.#store.requireSessionProviderAuthority(session.id);
+      } catch (error: unknown) {
+        if (error instanceof Error && error.message === "SESSION_PROVIDER_AUTHORITY_STALE") {
+          // Preserve the readiness-specific refusal when sign-out invalidated
+          // the session. A signed-in replacement still conflicts with the
+          // frozen remote tuple and never inherits its command.
+          const current = this.#providerAuthority(profile, expected.provider);
+          this.#assertProviderReady(profile, current, { session });
+          throw new CommandFailure(
+            "CONFLICT",
+            "The remote command authority changed before dispatch.",
+          );
+        }
+        if (error instanceof Error && error.message.startsWith("SESSION_PROVIDER_AUTHORITY_")) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The remote session lacks usable exact provider-account authority.",
+          );
+        }
+        throw error;
+      }
       if (
         session.profileId !== expected.profileId
         || session.providerThreadId !== expected.providerThreadId
-        || profile.processGeneration !== expected.processGeneration
+        || (expected.provider === "codex"
+          && profile.processGeneration !== expected.processGeneration)
+        || providerAuthority.provider !== expected.provider
+        || providerAuthority.providerAccountId !== expected.providerAccountId
+        || providerAuthority.bindingGeneration !== expected.bindingGeneration
+        || providerAuthority.processGeneration !== expected.processGeneration
       ) {
         throw new CommandFailure("CONFLICT", "The remote command authority changed before dispatch.");
       }
-      this.#assertSignedIn(profile);
+      this.#assertProviderReady(profile, providerAuthority, { session });
       switch (command.kind) {
         case "session.send": return await this.#send(session.id, command.message, command.idempotencyKey, context.signal, undefined, "human", command.attachments ?? []);
         case "session.queue": return await this.#queue(session.id, command.message, command.idempotencyKey, undefined, command.attachments ?? []);
@@ -1648,7 +2029,7 @@ export class HraService {
     (afterResponse ?? ((callback) => setTimeout(callback, 0)))(this.#requestStop);
   }
 
-  #failStopAfterResetJournalFailure(message: string): void {
+  #failClosedAndStop(message: string): void {
     this.#state = "closing";
     this.#interactionDeadlineAbort.abort(new Error(message));
     this.#interactionDeadlineWake?.();
@@ -2027,13 +2408,12 @@ export class HraService {
     current: InteractionRecord,
     signal: AbortSignal,
   ): Promise<void> {
-    const profile = this.#store.requireProfileById(current.authority.profileId);
     const runtime = this.#runtimeForInteraction(current);
     let responseDigest: string;
     try {
       await this.#daemonAuthority.assertCurrent();
       const validated = await runtime.validateInteractionTimeout({
-        authority: authorityFor(this.#paths, profile),
+        authority: this.#interactionAuthority(current),
         provider: current.authority,
         signal,
       });
@@ -2073,7 +2453,7 @@ export class HraService {
     try {
       await this.#daemonAuthority.assertCurrent();
       await runtime.timeoutInteraction({
-        authority: authorityFor(this.#paths, profile),
+        authority: this.#interactionAuthority(prepared),
         provider: prepared.authority,
         signal,
       });
@@ -2142,16 +2522,64 @@ export class HraService {
    * therefore provider-agnostic by construction.
    */
   async observeClaudeFact(authority: ProfileAuthority, fact: ClaudeSessionFact): Promise<void> {
-    let translated: readonly CodexFact[];
+    const finish = this.#beginFactOperation();
+    if (finish === null) return;
     try {
-      translated = this.#claudeFacts.translate(fact);
+      await this.#daemonAuthority.assertCurrent();
+      if (!this.#profileAuthorityIsCurrent(authority)) return;
+      const session = this.#store.findSessionByProviderThread(
+        authority.id,
+        fact.providerThreadId,
+      );
+      if (session === null) {
+        if (fact.type === "providerDisconnected") {
+          this.#rememberPendingClaudeDisconnect({
+            authority,
+            connectionId: fact.connectionId,
+            providerThreadId: fact.providerThreadId,
+            reason: fact.reason,
+          });
+        }
+        return;
+      }
+      if (!this.#authorityMatchesSession(authority, session)) return;
+      const currentConnectionId = this.#sessionProviderConnections.get(session.id);
+      if (currentConnectionId !== undefined && currentConnectionId !== fact.connectionId) return;
+      if (currentConnectionId === undefined) {
+        // A newly launched Claude subprocess can exit after its durable start
+        // commits but before the first observation installs the connection.
+        // Its manager-stamped thread and exact provider authority are enough
+        // to bind that first fact without guessing from mutable account state.
+        if (session.state === "terminal" || session.state === "recovery_required") return;
+        this.#ensureSessionProviderConnection(authority, session, fact.connectionId);
+      } else if (
+        (session.state === "terminal" || session.state === "recovery_required")
+        && fact.type !== "providerDisconnected"
+      ) {
+        return;
+      }
+      let translated: readonly CodexFact[];
+      try {
+        translated = this.#claudeFacts.translate(
+          this.#providerAccountAuthority(authority),
+          fact,
+        );
+      } catch (error: unknown) {
+        // A control request whose authority the runtime can no longer prove is
+        // a dropped fact, never a fault on a live session.
+        this.recordBackgroundDiagnostic("claude_fact_untranslatable", error);
+        return;
+      }
+      for (const neutral of translated) {
+        await this.#observeCodexFactAdmitted(authority, neutral);
+      }
     } catch (error: unknown) {
-      // A control request whose authority the runtime can no longer prove is
-      // a dropped fact, never a fault on a live session.
-      this.recordBackgroundDiagnostic("claude_fact_untranslatable", error);
-      return;
+      if (error instanceof InteractionPersistenceBoundaryError) this.#scheduleStop();
+      if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+      throw error;
+    } finally {
+      finish();
     }
-    for (const neutral of translated) await this.observeCodexFact(authority, neutral);
   }
 
   /** The port that runs one provider's sessions, turns, and interactions. */
@@ -2160,9 +2588,9 @@ export class HraService {
   }
 
   #runtimeForSession(
-    session: Readonly<{ provider: Provider }>,
+    session: Pick<SessionRecord, "id" | "profileId" | "provider">,
   ): SessionRuntimePort<ReviewedRuntimeProfile> {
-    return this.#sessionRuntime(session.provider);
+    return this.#sessionRuntime(this.#sessionProviderAuthority(session).provider);
   }
 
   /**
@@ -2176,24 +2604,19 @@ export class HraService {
       authority: ProviderInteractionAuthority;
     }>,
   ): SessionRuntimePort<ReviewedRuntimeProfile> {
-    if (record.sessionId !== null) {
-      try {
-        return this.#runtimeForSession(this.#store.requireSession(record.sessionId));
-      } catch {
-        // Fall through to the durable method name below.
-      }
-    }
-    return this.#sessionRuntime(
-      record.authority.method.startsWith("claude/") ? "claude" : "codex",
-    );
+    return this.#sessionRuntime(record.authority.provider);
   }
 
   /** Refuses a Codex-only capability on a session bound to another provider. */
-  #requireCodexSession(session: Readonly<{ provider: Provider }>, capability: string): void {
-    if (session.provider === "codex") return;
+  #requireCodexSession(
+    session: Pick<SessionRecord, "id" | "profileId" | "provider">,
+    capability: string,
+  ): void {
+    const provider = this.#sessionProviderAuthority(session).provider;
+    if (provider === "codex") return;
     throw new CommandFailure(
       "INVALID_INPUT",
-      `The ${session.provider} provider does not support ${capability}. `
+      `The ${provider} provider does not support ${capability}. `
       + "It is available on Codex sessions only.",
     );
   }
@@ -2208,10 +2631,14 @@ export class HraService {
       if (
         call.authority.profileId !== authority.id
         || call.authority.processGeneration !== authority.generation
+        || call.authority.provider !== authority.provider
+        || call.authority.providerAccountId !== authority.providerAccountId
+        || call.authority.bindingGeneration !== authority.bindingGeneration
       ) throw new Error("CONVERSATION_AUTOMATION_AUTHORITY_MISMATCH");
       const profile = this.#store.requireProfileById(authority.id);
       if (
-        profile.processGeneration !== authority.generation
+        !this.#profileAuthorityIsCurrent(authority)
+        || authority.provider !== "codex"
         || profile.state !== "signed_in"
       ) throw new Error("CONVERSATION_AUTOMATION_AUTHORITY_STALE");
       const session = this.#store.findSessionByProviderThread(authority.id, call.threadId);
@@ -2219,6 +2646,7 @@ export class HraService {
         session === null
         || session.state === "terminal"
         || session.state === "recovery_required"
+        || !this.#authorityMatchesSession(authority, session)
         || !this.#store.isConversationAutomationEnabled(session.id, call.threadId)
       ) {
         throw new Error("CONVERSATION_AUTOMATION_SESSION_UNAVAILABLE");
@@ -2233,12 +2661,13 @@ export class HraService {
             call.threadId,
           );
           if (
-            currentProfile.processGeneration !== authority.generation
+            !this.#profileAuthorityIsCurrent(authority)
             || currentProfile.state !== "signed_in"
             || currentSession === null
             || currentSession.id !== session.id
             || currentSession.state === "terminal"
             || currentSession.state === "recovery_required"
+            || !this.#authorityMatchesSession(authority, currentSession)
             || !this.#store.isConversationAutomationEnabled(currentSession.id, call.threadId)
           ) throw new Error("CONVERSATION_AUTOMATION_AUTHORITY_STALE");
           switch (call.operation.mode) {
@@ -2311,12 +2740,15 @@ export class HraService {
       this.#state !== "open"
       || call.authority.profileId !== authority.id
       || call.authority.processGeneration !== authority.generation
+      || call.authority.provider !== authority.provider
+      || call.authority.providerAccountId !== authority.providerAccountId
+      || call.authority.bindingGeneration !== authority.bindingGeneration
     ) return;
     try {
       const profile = this.#store.requireProfileById(authority.id);
       const session = this.#store.findSessionByProviderThread(authority.id, call.threadId);
       if (
-        profile.processGeneration === authority.generation
+        this.#profileAuthorityIsCurrent(authority)
         && profile.state === "signed_in"
         && session !== null
         && session.state !== "terminal"
@@ -2342,7 +2774,8 @@ export class HraService {
         return;
       }
       if (
-        profile.processGeneration !== authority.generation
+        !this.#profileAuthorityIsCurrent(authority)
+        || authority.provider !== "codex"
         || this.#profileHasProjectionRecoveryInFlight(profile.id)
       ) return;
       const recoveryUnsettled = await this.#cloud
@@ -2358,7 +2791,7 @@ export class HraService {
           throw error;
         }
         if (
-          current.processGeneration !== authority.generation
+          !this.#profileAuthorityIsCurrent(authority)
           || this.#profileHasProjectionRecoveryInFlight(profile.id)
         ) return;
         const blocked = await this.#cloud
@@ -2416,24 +2849,25 @@ export class HraService {
     } catch {
       return;
     }
-    if (profile.processGeneration !== authority.generation || profile.state === "removed") return;
+    if (!this.#profileAuthorityIsCurrent(authority)) return;
     if (fact.type === "providerDisconnected") {
       await this.#applyOrderedAccountFact(profile.id, () => {
-        let current: ProfileRecord;
         try {
-          current = this.#store.requireProfileById(authority.id);
+          this.#store.requireProfileById(authority.id);
         } catch (error: unknown) {
           if (error instanceof SelectionError && error.code === "NOT_FOUND") return;
           throw error;
         }
-        if (current.processGeneration !== authority.generation) return;
+        if (!this.#admittedProviderProcessAuthorityIsCurrent(authority)) return;
         this.#handleProviderDisconnected(authority, fact.connectionId, fact.reason);
-        const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
-          authority.id,
-          authority.generation,
-          this.#work,
-        );
-        this.#notifyAffectedWork(retirement.affectedWorkIds);
+        if (authority.provider === "codex") {
+          const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
+            authority.id,
+            authority.generation,
+            this.#work,
+          );
+          this.#notifyAffectedWork(retirement.affectedWorkIds);
+        }
         this.#wakeSessionTaskPump();
       });
       return;
@@ -2479,6 +2913,9 @@ export class HraService {
       if (
         fact.provider.profileId !== authority.id
         || fact.provider.processGeneration !== authority.generation
+        || fact.provider.provider !== authority.provider
+        || fact.provider.providerAccountId !== authority.providerAccountId
+        || fact.provider.bindingGeneration !== authority.bindingGeneration
         || fact.provider.connectionId !== fact.connectionId
       ) throw new Error("INTERACTION_FACT_AUTHORITY_MISMATCH");
       if (
@@ -2492,6 +2929,9 @@ export class HraService {
       const session = fact.provider.threadId === null
         ? null
         : this.#store.findSessionByProviderThread(authority.id, fact.provider.threadId);
+      if (session !== null && !this.#authorityMatchesSession(authority, session)) {
+        throw new Error("INTERACTION_SESSION_PROVIDER_AUTHORITY_MISMATCH");
+      }
       if (session !== null) this.#ensureSessionProviderConnection(authority, session, fact.connectionId);
       const admitted = this.#store.admitInteraction({
         publicId: randomUUID(),
@@ -2558,7 +2998,7 @@ export class HraService {
       for (const [sessionId, connectionId] of this.#sessionProviderConnections) {
         if (connectionId !== fact.connectionId) continue;
         const session = this.#store.requireSession(sessionId);
-        if (session.profileId !== authority.id) continue;
+        if (!this.#authorityMatchesSession(authority, session)) continue;
         this.#appendSessionEvent(authority, session.id, connectionId, {
           type: "protocol_incompatible",
           method: fact.method,
@@ -2574,6 +3014,7 @@ export class HraService {
       || (session.state === "terminal" && fact.type !== "threadDeleted")
       || (session.state === "recovery_required" && fact.type !== "threadDeleted")
     ) return;
+    if (!this.#authorityMatchesSession(authority, session)) return;
     this.#ensureSessionProviderConnection(authority, session, fact.connectionId);
     if (fact.type === "threadDeleted") {
       await this.#applyProviderThreadDeletion(authority, fact, session);
@@ -2633,6 +3074,7 @@ export class HraService {
       sessionId: current.id,
       accountId: authority.id,
       providerGeneration: authority.generation,
+      providerAuthority: this.#providerAccountAuthority(authority),
       providerConnectionId: fact.connectionId ?? null,
     }));
     this.#bumpSessionFactEpoch(current.id);
@@ -2640,6 +3082,8 @@ export class HraService {
       accountId: authority.id,
       providerConnectionId: fact.connectionId ?? null,
       providerGeneration: authority.generation,
+      providerAuthority: this.#providerAccountAuthority(authority),
+      source: "provider_thread_deleted",
       sessionId: current.id,
     });
     if (terminal.event !== undefined) this.#eventWaiters.notify(current.id);
@@ -2936,9 +3380,8 @@ export class HraService {
         revision: snapshot.revision,
       });
       const session = this.#store.requireSession(sessionId);
-      const profile = this.#store.requireProfile(session.profileId);
       this.#appendSessionEvent(
-        authorityFor(this.#paths, profile),
+        this.#sessionAuthority(session),
         sessionId,
         this.#sessionProviderConnections.get(sessionId) ?? null,
         body,
@@ -2957,20 +3400,46 @@ export class HraService {
     const parsedConnection = connectionId === null || connectionId === undefined
       ? null
       : z.string().uuid().parse(connectionId);
+    const providerAuthority = this.#sessionProviderAuthority(
+      this.#store.requireSession(sessionId),
+    );
+    if (
+      providerAuthority.profileId !== authority.id
+      || providerAuthority.provider !== authority.provider
+      || providerAuthority.providerAccountId !== authority.providerAccountId
+      || providerAuthority.bindingGeneration !== authority.bindingGeneration
+      || providerAuthority.processGeneration !== authority.generation
+    ) throw new Error("SESSION_EVENT_PROVIDER_AUTHORITY_MISMATCH");
     this.#persistSessionEventWrites(this.#eventRedactor.accept({
       sessionId,
       accountId: authority.id,
       providerGeneration: authority.generation,
       providerConnectionId: parsedConnection,
       body,
+      providerAuthority,
     }));
   }
 
   #persistSessionEventWrites(writes: readonly SessionEventWrite[]): void {
     for (const write of writes) {
+      const currentProviderAuthority = this.#sessionProviderAuthority(
+        this.#store.requireSession(write.sessionId),
+      );
+      if (
+        write.providerAuthority.profileId !== write.accountId
+        || write.providerAuthority.processGeneration !== write.providerGeneration
+        || currentProviderAuthority.profileId !== write.providerAuthority.profileId
+        || currentProviderAuthority.provider !== write.providerAuthority.provider
+        || currentProviderAuthority.providerAccountId
+          !== write.providerAuthority.providerAccountId
+        || currentProviderAuthority.bindingGeneration
+          !== write.providerAuthority.bindingGeneration
+        || currentProviderAuthority.processGeneration
+          !== write.providerAuthority.processGeneration
+      ) throw new Error("SESSION_EVENT_PROVIDER_AUTHORITY_MISMATCH");
       this.#store.appendPublicSessionEvent(write);
       this.#eventWaiters.notify(write.sessionId);
-      this.#trackSessionState(write);
+      this.#trackSessionState(write, write.providerAuthority);
     }
   }
 
@@ -2980,7 +3449,10 @@ export class HraService {
    * latest state and appended as one `session_state` event. Failures here are
    * background diagnostics, never a reason to drop the originating event.
    */
-  #trackSessionState(write: SessionEventWrite): void {
+  #trackSessionState(
+    write: SessionEventWrite,
+    providerAuthority: ProviderAccountAuthority,
+  ): void {
     if (write.body.type === "session_state") return;
     try {
       if (this.#sessionStateTracker.snapshot(write.sessionId) === null) {
@@ -3018,7 +3490,7 @@ export class HraService {
         lastActivityAt: snapshot.lastActivityAt,
         revision: snapshot.revision,
       });
-      this.#store.appendPublicSessionEvent({ ...write, body });
+      this.#store.appendPublicSessionEvent({ ...write, body, providerAuthority });
       this.#eventWaiters.notify(write.sessionId);
       // A prose approval is only ever answered for a turn that just ended and
       // left no pending provider interaction behind.
@@ -3079,28 +3551,100 @@ export class HraService {
       && (latest.body.reason === "provider_restart" || latest.body.reason === "provider_disconnect");
   }
 
+  #claudeDisconnectKey(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+  ): string {
+    return JSON.stringify([
+      authority.id,
+      authority.provider,
+      authority.providerAccountId,
+      authority.bindingGeneration,
+      authority.generation,
+      providerThreadId,
+    ]);
+  }
+
+  #rememberPendingClaudeDisconnect(disconnect: PendingClaudeDisconnect): void {
+    if (disconnect.authority.provider !== "claude") return;
+    const key = this.#claudeDisconnectKey(
+      disconnect.authority,
+      disconnect.providerThreadId,
+    );
+    if (
+      !this.#pendingClaudeDisconnects.has(key)
+      && this.#pendingClaudeDisconnects.size >= PENDING_CLAUDE_DISCONNECT_LIMIT
+    ) {
+      // Losing an exact pre-commit disconnect could leave a durable session
+      // looking live after its subprocess is gone. Stop under the daemon fence
+      // instead of evicting any retained authority or guessing which session
+      // an overflowed callback belonged to.
+      this.#failClosedAndStop(
+        "The pending Claude disconnect authority boundary exceeded its bounded capacity.",
+      );
+      return;
+    }
+    this.#pendingClaudeDisconnects.set(key, disconnect);
+  }
+
+  #drainPendingClaudeDisconnect(session: SessionRecord): void {
+    if (session.provider !== "claude" || session.providerThreadId === undefined) return;
+    const providerAuthority = this.#capturedSessionProviderAuthority(session);
+    const authority = authorityFor(
+      this.#paths,
+      this.#store.requireProfileById(providerAuthority.profileId),
+      providerAuthority,
+    );
+    const key = this.#claudeDisconnectKey(authority, session.providerThreadId);
+    const pending = this.#pendingClaudeDisconnects.get(key);
+    if (pending === undefined) return;
+    this.#pendingClaudeDisconnects.delete(key);
+    if (
+      session.state === "terminal"
+      || session.state === "recovery_required"
+      || !this.#profileAuthorityIsCurrent(authority)
+      || pending.connectionId.length === 0
+    ) return;
+    const currentConnectionId = this.#sessionProviderConnections.get(session.id);
+    if (currentConnectionId !== undefined && currentConnectionId !== pending.connectionId) return;
+    if (currentConnectionId === undefined) {
+      this.#ensureSessionProviderConnection(authority, session, pending.connectionId);
+    }
+    this.#handleProviderDisconnected(authority, pending.connectionId, pending.reason);
+  }
+
   #handleProviderDisconnected(
     authority: ProfileAuthority,
     connectionId: string,
     reason: "eof" | "process_exit" | "closed" | "protocol_fault",
   ): void {
+    const providerAuthority = this.#providerAccountAuthority(authority);
     const terminal = this.#store.expireGenerationInteractions({
       profileId: authority.id,
       processGeneration: authority.generation,
       connectionId,
+      providerAuthority,
     });
     for (const interaction of terminal) this.#appendInteractionState(interaction);
-    for (const [sessionId, activeConnectionId] of [...this.#sessionProviderConnections]) {
-      if (activeConnectionId !== connectionId) continue;
-      const session = this.#store.requireSession(sessionId);
-      if (session.profileId !== authority.id) continue;
-      this.#appendSessionEvent(authority, session.id, connectionId, {
+    // Codex shares one connection across its account runtime, while each
+    // Claude session owns a distinct subprocess/connection. In both cases the
+    // connection map is the exact loss boundary: account/daemon retirement is
+    // handled separately by #retireClosedRuntimeAuthorities.
+    const affectedSessions = [...this.#sessionProviderConnections]
+      .filter(([, activeConnectionId]) => activeConnectionId === connectionId)
+      .flatMap(([sessionId]) => {
+        const session = this.#store.requireSession(sessionId);
+        return this.#authorityMatchesSession(authority, session) ? [session] : [];
+      });
+    for (const session of affectedSessions) {
+      const sessionConnectionId = connectionId;
+      this.#appendSessionEvent(authority, session.id, sessionConnectionId, {
         type: "connection",
         state: "disconnected",
         reason,
       });
       const position = this.#store.eventStreamPosition(session.id);
-      this.#appendSessionEvent(authority, session.id, connectionId, {
+      this.#appendSessionEvent(authority, session.id, sessionConnectionId, {
         type: "gap",
         reason: reason === "protocol_fault" ? "protocol_incompatible" : "provider_disconnect",
         fromSequence: position.observedThroughSequence + 1,
@@ -3109,32 +3653,64 @@ export class HraService {
       this.#sessionProviderConnections.delete(session.id);
       this.#sessionObservationFailures.delete(session.id);
       this.#sessionResubscriptionConnections.delete(session.id);
-      this.#sessionsAwaitingResubscription.add(session.id);
+      if (authority.provider === "claude") {
+        const terminalized = this.#store.terminalizeSessionFromProviderDeletion({
+          accountId: authority.id,
+          providerConnectionId: sessionConnectionId,
+          providerGeneration: authority.generation,
+          providerAuthority,
+          source: "provider_transport_lost",
+          sessionId: session.id,
+        });
+        for (const interaction of terminalized.interactions) {
+          this.#appendInteractionState(interaction);
+        }
+        if (session.providerThreadId !== undefined) {
+          this.#claudeFacts.forgetSession(providerAuthority, session.providerThreadId);
+        }
+        this.#sessionsAwaitingResubscription.delete(session.id);
+      } else {
+        this.#sessionsAwaitingResubscription.add(session.id);
+      }
     }
   }
 
-  #prepareAccountLoginProviderRetirements(
-    profileId: ProfileRecord["id"],
-    processGeneration: number,
+  #prepareCodexProviderRetirements(
+    sourceProviderAuthority: ProviderAccountAuthority,
   ): readonly Readonly<{
     connectionId: string;
+    providerAuthority: ProviderAccountAuthority;
     releasedEvents: readonly SessionEventWrite[];
     sessionId: SessionRecord["id"];
   }>[] {
     const retirements: Array<Readonly<{
       connectionId: string;
+      providerAuthority: ProviderAccountAuthority;
       releasedEvents: readonly SessionEventWrite[];
       sessionId: SessionRecord["id"];
     }>> = [];
     for (const [sessionId, connectionId] of this.#sessionProviderConnections) {
       const session = this.#store.requireSession(sessionId);
-      if (session.profileId !== profileId) continue;
+      if (
+        session.profileId !== sourceProviderAuthority.profileId
+        || session.provider !== sourceProviderAuthority.provider
+      ) continue;
+      const providerAuthority = this.#capturedSessionProviderAuthority(session);
+      if (
+        providerAuthority.profileId !== sourceProviderAuthority.profileId
+        || providerAuthority.provider !== sourceProviderAuthority.provider
+        || providerAuthority.providerAccountId !== sourceProviderAuthority.providerAccountId
+        || providerAuthority.processGeneration !== sourceProviderAuthority.processGeneration
+        || providerAuthority.bindingGeneration !== sourceProviderAuthority.bindingGeneration
+      ) throw new Error("ACCOUNT_PROVIDER_RETIREMENT_AUTHORITY_MISMATCH");
       retirements.push({
         connectionId,
+        providerAuthority,
         releasedEvents: this.#eventRedactor.interruptSession({
-          accountId: profileId,
+          accountId: sourceProviderAuthority.profileId,
           providerConnectionId: connectionId,
-          providerGeneration: processGeneration,
+          providerGeneration: providerAuthority.processGeneration,
+          providerAuthority,
           sessionId,
         }),
         sessionId,
@@ -3143,7 +3719,7 @@ export class HraService {
     return retirements;
   }
 
-  #applyAccountLoginProviderRetirements(
+  #applyCodexProviderRetirements(
     retirements: readonly Readonly<{
       connectionId: string;
       sessionId: SessionRecord["id"];
@@ -3152,7 +3728,7 @@ export class HraService {
   ): void {
     for (const retirement of retirements) {
       if (this.#sessionProviderConnections.get(retirement.sessionId) !== retirement.connectionId) {
-        throw new Error("ACCOUNT_LOGIN_RETIREMENT_CONNECTION_CHANGED");
+        throw new Error("ACCOUNT_PROVIDER_RETIREMENT_CONNECTION_CHANGED");
       }
       this.#sessionProviderConnections.delete(retirement.sessionId);
       this.#sessionObservationFailures.delete(retirement.sessionId);
@@ -3160,6 +3736,44 @@ export class HraService {
       this.#sessionsAwaitingResubscription.add(retirement.sessionId);
     }
     for (const sessionId of retiredSessionIds) this.#eventWaiters.notify(sessionId);
+  }
+
+  #changeCodexProfileStateWithProviderRetirement(input: Readonly<{
+    profile: ProfileRecord;
+    state: ProfileRecord["state"];
+    identity?: Readonly<{ email?: string; plan?: string }>;
+  }>): ReturnType<StateStore["setProfileStateWithProviderRetirement"]> {
+    try {
+      const providerAuthority = this.#providerAuthority(input.profile, "codex");
+      const retirements = this.#prepareCodexProviderRetirements(
+        providerAuthority,
+      );
+      const changed = this.#store.setProfileStateWithProviderRetirement({
+        profileId: input.profile.id,
+        expectedGeneration: input.profile.processGeneration,
+        state: input.state,
+        providerAuthority,
+        providerRetirements: retirements,
+        workStore: this.#work,
+        ...(input.identity === undefined ? {} : { identity: input.identity }),
+      });
+      if (!changed.changed) {
+        throw new Error("Profile state authority changed during provider retirement.");
+      }
+      this.#applyCodexProviderRetirements(
+        retirements,
+        changed.retiredSessionIds,
+      );
+      return changed;
+    } catch (error: unknown) {
+      // Redactor interruption consumes bounded in-memory custody. If either
+      // exact-authority validation or the atomic database transition fails,
+      // stop this daemon rather than continue with a partially drained stream.
+      this.#failClosedAndStop(
+        "The Codex provider retirement did not commit with its profile-state transition.",
+      );
+      throw error;
+    }
   }
 
   #eventBodyForCodexFact(
@@ -3329,7 +3943,7 @@ export class HraService {
     } catch {
       return false;
     }
-    if (profile.processGeneration !== authority.generation || profile.state !== "signed_in") return false;
+    if (!this.#profileAuthorityIsCurrent(authority)) return false;
     const current = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
     if (
       current === null
@@ -3337,7 +3951,17 @@ export class HraService {
       || current.state === "terminal"
       || (current.state === "recovery_required" && fact.type !== "threadDeleted")
       || this.#projectionRecoveriesInFlight.has(current.id)
+      || !this.#authorityMatchesSession(authority, current)
     ) return false;
+    try {
+      this.#assertProviderReady(
+        profile,
+        this.#providerAccountAuthority(authority),
+        { session: current },
+      );
+    } catch {
+      return false;
+    }
     this.#bumpSessionFactEpoch(current.id);
     if (fact.type === "threadDeleted") return false;
     if (fact.type === "turnStarted") {
@@ -3350,6 +3974,7 @@ export class HraService {
         profileId: authority.id,
         processGeneration: authority.generation,
         turnId: fact.turn.id,
+        providerAuthority: this.#providerAccountAuthority(authority),
       })) this.#appendInteractionState(interaction);
       this.#store.reconcileSessionFromProvider({ sessionId: current.id, state: "idle", activeTurnId: null });
       return true;
@@ -3412,13 +4037,21 @@ export class HraService {
 
   #retireClosedRuntimeAuthorities(): void {
     const projectionErrors: unknown[] = [];
-    for (const profile of this.#store.listProfiles()) {
-      if (profile.processGeneration === 0) continue;
+    for (const account of this.#store.listProviderAccounts()) {
+      if (account.processGeneration === 0) continue;
+      const providerAuthority: ProviderAccountAuthority = {
+        providerAccountId: account.id,
+        profileId: account.profileId,
+        provider: account.provider,
+        bindingGeneration: account.bindingGeneration,
+        processGeneration: account.processGeneration,
+      };
       let terminal: readonly InteractionRecord[];
       try {
         terminal = this.#store.expireGenerationInteractions({
-          profileId: profile.id,
-          processGeneration: profile.processGeneration,
+          profileId: account.profileId,
+          processGeneration: account.processGeneration,
+          providerAuthority,
         });
       } catch (error: unknown) {
         projectionErrors.push(error);
@@ -3431,61 +4064,85 @@ export class HraService {
           projectionErrors.push(error);
         }
       }
-      const authority = authorityFor(this.#paths, profile);
-      for (const [sessionId, connectionId] of [...this.#sessionProviderConnections]) {
-        let session: SessionRecord;
+      const sessions = this.#store.listSessionsForProviderAuthority(
+        providerAuthority,
+        { nonterminalOnly: true },
+      );
+      for (const session of sessions) {
+        const connectionId = this.#sessionProviderConnections.get(session.id) ?? null;
         try {
-          session = this.#store.requireSession(sessionId);
-        } catch (error: unknown) {
-          projectionErrors.push(error);
-          this.#sessionProviderConnections.delete(sessionId);
-          this.#sessionObservationFailures.delete(sessionId);
-          this.#sessionResubscriptionConnections.delete(sessionId);
-          this.#sessionsAwaitingResubscription.delete(sessionId);
-          continue;
-        }
-        if (session.profileId !== profile.id) continue;
-        try {
-          this.#appendSessionEvent(authority, session.id, connectionId, {
-            type: "connection",
-            state: "disconnected",
-            reason: "closed",
-          });
-          const position = this.#store.eventStreamPosition(session.id);
-          this.#appendSessionEvent(authority, session.id, connectionId, {
-            type: "gap",
-            reason: "provider_disconnect",
-            fromSequence: position.observedThroughSequence + 1,
-            throughSequence: position.observedThroughSequence + 1,
-          });
+          if (connectionId !== null) {
+            const authority = authorityFor(
+              this.#paths,
+              this.#store.requireProfileById(account.profileId),
+              providerAuthority,
+            );
+            this.#appendSessionEvent(authority, session.id, connectionId, {
+              type: "connection",
+              state: "disconnected",
+              reason: "closed",
+            });
+            const position = this.#store.eventStreamPosition(session.id);
+            this.#appendSessionEvent(authority, session.id, connectionId, {
+              type: "gap",
+              reason: "provider_disconnect",
+              fromSequence: position.observedThroughSequence + 1,
+              throughSequence: position.observedThroughSequence + 1,
+            });
+          }
+          if (account.provider === "claude") {
+            const closed = this.#store.terminalizeSessionFromProviderDeletion({
+              accountId: account.profileId,
+              providerConnectionId: connectionId,
+              providerGeneration: account.processGeneration,
+              providerAuthority,
+              source: "provider_transport_lost",
+              sessionId: session.id,
+            });
+            for (const interaction of closed.interactions) {
+              this.#appendInteractionState(interaction);
+            }
+            if (session.providerThreadId !== undefined) {
+              this.#claudeFacts.forgetSession(providerAuthority, session.providerThreadId);
+            }
+          }
         } catch (error: unknown) {
           projectionErrors.push(error);
         } finally {
-          this.#sessionProviderConnections.delete(sessionId);
-          this.#sessionObservationFailures.delete(sessionId);
-          this.#sessionResubscriptionConnections.delete(sessionId);
-          this.#sessionsAwaitingResubscription.delete(sessionId);
+          this.#sessionProviderConnections.delete(session.id);
+          this.#sessionObservationFailures.delete(session.id);
+          this.#sessionResubscriptionConnections.delete(session.id);
+          this.#sessionsAwaitingResubscription.delete(session.id);
         }
       }
       try {
-        const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
-          profile.id,
-          profile.processGeneration,
-          this.#work,
-        );
-        this.#notifyAffectedWork(retirement.affectedWorkIds);
+        if (account.provider === "codex") {
+          const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
+            account.profileId,
+            account.processGeneration,
+            this.#work,
+          );
+          this.#notifyAffectedWork(retirement.affectedWorkIds);
+        } else {
+          this.#store.advanceProviderAccountProcessGeneration({
+            profileId: account.profileId,
+            provider: account.provider,
+            expectedProcessGeneration: account.processGeneration,
+          });
+        }
       } catch (error: unknown) {
         projectionErrors.push(error);
       }
     }
     this.#sessionProviderConnections.clear();
+    this.#pendingClaudeDisconnects.clear();
     this.#sessionObservationFailures.clear();
     this.#sessionResubscriptionConnections.clear();
     this.#sessionsAwaitingResubscription.clear();
     if (projectionErrors.length > 0) {
       throw new AggregateError(
         projectionErrors,
-        "The closed Codex runtime could not retire every durable provider authority.",
+        "The closed provider runtimes could not retire every durable provider authority.",
       );
     }
   }
@@ -3696,7 +4353,7 @@ export class HraService {
         ? undefined
         : await this.#requireUsableProjectRoot(project.rootPath);
       return await this.#codex.listPlugins({
-        authority: authorityFor(this.#paths, profile),
+        authority: this.#profileAuthority(profile, "codex"),
         ...(projectRoot === undefined ? {} : { projectRoot }),
         forceRefetch: refresh,
         signal,
@@ -3777,7 +4434,7 @@ export class HraService {
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettledForProfile(profile.id);
     await this.#daemonAuthority.assertCurrent();
-    const account = await this.#fencedEffect(async () => await this.#codex.readAccount({ authority: authorityFor(this.#paths, profile), signal }));
+    const account = await this.#fencedEffect(async () => await this.#codex.readAccount({ authority: this.#profileAuthority(profile, "codex"), signal }));
     if (projectionRecoveryUnsettled) {
       return {
         account: this.#publicProfile(profile),
@@ -3794,7 +4451,13 @@ export class HraService {
     }
     if (profile.state === "recovery_required") {
       const unsettled = this.#store.listUnsettledMutations({ authorityId: profile.id })
-        .filter((attempt) => attempt.authorityGeneration === profile.processGeneration && (attempt.kind === "account.login" || attempt.kind === "account.logout"));
+        .filter((attempt) => {
+          if (attempt.kind !== "account.login" && attempt.kind !== "account.logout") return false;
+          const providerAuthority = this.#primaryMutationProviderAuthority(attempt);
+          return providerAuthority !== null
+            && providerAuthority.profileId === profile.id
+            && providerAuthority.provider === "codex";
+        });
       if (unsettled.length === 0) {
         const reconciled = this.#store.reconcileProfileRecoveryFromAccountRead({
           profileId: profile.id,
@@ -3881,7 +4544,13 @@ export class HraService {
    */
   #resolveUnsettledLoginCancellations(profile: ProfileRecord, account: CodexAccountProjection): void {
     for (const attempt of this.#store.listUnsettledMutations({ authorityId: profile.id })) {
-      if (attempt.kind !== "account.login-cancel" || attempt.authorityGeneration !== profile.processGeneration) continue;
+      if (attempt.kind !== "account.login-cancel") continue;
+      const providerAuthority = this.#primaryMutationProviderAuthority(attempt);
+      if (
+        providerAuthority === null
+        || providerAuthority.profileId !== profile.id
+        || providerAuthority.provider !== "codex"
+      ) continue;
       const originalState = attempt.originalState ?? attempt.state;
       if (originalState !== "effect_started" && originalState !== "ambiguous") continue;
       this.#store.resolveLoginCancelMutation({
@@ -3914,7 +4583,19 @@ export class HraService {
     if (current.processGeneration !== targetGeneration && !canBegin && !canReplayReboundPending) {
       throw new CommandFailure("CONFLICT", "The login attempt belongs to a stale account generation.");
     }
-    const authority = { ...current, processGeneration: targetGeneration };
+    const sourceProviderAuthority = this.#providerAuthority(current, "codex");
+    // A successful login advances both process and provider binding authority.
+    // Replays must therefore compare against the immutable authority recorded
+    // on the original attempt, while fresh attempts still prove the live
+    // source binding before any provider effect can begin.
+    const providerAuthorities = prior === null
+      ? [{
+          role: "source" as const,
+          authority: sourceProviderAuthority,
+          provenance: "account_login_source",
+        }]
+      : this.#store.readMutationProviderAuthorities(prior.id);
+    let loginProviderAuthority: ProviderAccountAuthority | undefined;
     try {
       const result = await this.#effect({
         kind: "account.login",
@@ -3922,24 +4603,29 @@ export class HraService {
         authorityGeneration: targetGeneration,
         request: { deviceCode },
         idempotencyKey: key,
+        providerAuthorities,
         beginEffect: (attemptId) => {
           try {
-            const retirements = this.#prepareAccountLoginProviderRetirements(
-              current.id,
-              current.processGeneration,
+            const retirements = this.#prepareCodexProviderRetirements(
+              sourceProviderAuthority,
             );
             const begun = this.#store.beginAccountMutationEffect({
               attemptId,
               profileId: current.id,
               profileGeneration: targetGeneration,
+              providerAuthority: sourceProviderAuthority,
               evidence: { kind: "account.login", method: deviceCode ? "device_code" : "browser" },
               providerRetirements: retirements,
               workStore: this.#work,
             });
             this.#notifyAffectedWork(begun.affectedWorkIds);
-            this.#applyAccountLoginProviderRetirements(
+            this.#applyCodexProviderRetirements(
               retirements,
               begun.retiredSessionIds,
+            );
+            loginProviderAuthority = this.#store.requireProviderAccountAuthority(
+              current.id,
+              "codex",
             );
           } catch (error: unknown) {
             // Preparing the retirement drains bounded redactor custody. A
@@ -3956,7 +4642,19 @@ export class HraService {
             throw error;
           }
         },
-        effect: async () => await this.#fencedEffect(async () => await this.#codex.login({ authority: authorityFor(this.#paths, authority), method: deviceCode ? "device_code" : "browser", signal })),
+        effect: async () => {
+          const effectAuthority = loginProviderAuthority;
+          if (
+            effectAuthority === undefined
+            || effectAuthority.processGeneration !== targetGeneration
+          ) throw new Error("Login provider-account authority was not advanced before dispatch.");
+          const effectProfile = this.#store.requireProfileById(current.id);
+          return await this.#fencedEffect(async () => await this.#codex.login({
+            authority: authorityFor(this.#paths, effectProfile, effectAuthority),
+            method: deviceCode ? "device_code" : "browser",
+            signal,
+          }));
+        },
         receipt: (value) => loginReceiptSchema.parse(value.status === "pending"
           ? { status: "pending", loginId: value.loginId }
           : { status: "signed_in", account: value.account }),
@@ -4065,21 +4763,24 @@ export class HraService {
         { idempotencyKey: key },
       );
     }
-    const authority = authorityFor(this.#paths, profile);
+    const providerAuthority = this.#providerAuthority(profile, "codex");
+    const authority = authorityFor(this.#paths, profile, providerAuthority);
     // The attempt is recorded before the provider call, like every other Codex
     // mutation, so a crash between dispatch and settlement is visible to
     // restart recovery instead of leaving an unledgered cancellation.
     const receipt = await this.#effect({
       kind: "account.login-cancel",
       authorityId: profile.id,
-      authorityGeneration: profile.processGeneration,
+      authorityGeneration: providerAuthority.processGeneration,
       request: { loginId: login.loginId },
       idempotencyKey: key,
+      providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "account_login_cancel" }],
       beginEffect: (attemptId) => {
         this.#store.beginLoginCancelMutationEffect({
           attemptId,
           profileId: profile.id,
           processGeneration: profile.processGeneration,
+          providerAuthority,
           loginId: login.loginId,
         });
       },
@@ -4136,6 +4837,18 @@ export class HraService {
     await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
     this.#work.assertProfileCanChangeAuthority(profile.id);
     const key = idempotencyKey ?? randomUUID();
+    const prior = this.#store.readMutation(key);
+    const providerAuthority = this.#providerAuthority(profile, "codex");
+    // Logout settlement can advance the Codex binding. Preserve terminal
+    // idempotency by replaying against the attempt's original evidence rather
+    // than comparing it with the post-logout binding generation.
+    const providerAuthorities = prior === null
+      ? [{
+          role: "primary" as const,
+          authority: providerAuthority,
+          provenance: "account_logout",
+        }]
+      : this.#store.readMutationProviderAuthorities(prior.id);
     if (profile.state === "recovery_required") {
       throw new CommandFailure("RECOVERY_REQUIRED", "This account has an indeterminate logout. Run `hra account show` to reconcile its exact provider state before another logout.");
     }
@@ -4145,18 +4858,20 @@ export class HraService {
       authorityGeneration: profile.processGeneration,
       request: {},
       idempotencyKey: key,
+      providerAuthorities,
       beginEffect: (attemptId) => {
         const begun = this.#store.beginAccountMutationEffect({
           attemptId,
           profileId: profile.id,
-          profileGeneration: profile.processGeneration,
+          profileGeneration: providerAuthority.processGeneration,
+          providerAuthority,
           evidence: { kind: "account.logout", baselineSignedIn: profile.state !== "signed_out" },
           workStore: this.#work,
         });
         this.#notifyAffectedWork(begun.affectedWorkIds);
       },
       effect: async () => {
-        if (profile.state !== "signed_out") await this.#fencedEffect(async () => await this.#codex.logout({ authority: authorityFor(this.#paths, profile), signal }));
+        if (profile.state !== "signed_out") await this.#fencedEffect(async () => await this.#codex.logout({ authority: authorityFor(this.#paths, profile, providerAuthority), signal }));
         return { loggedOut: true as const };
       },
       receipt: (value) => logoutReceiptSchema.parse(value),
@@ -4166,17 +4881,11 @@ export class HraService {
     const current = this.#store.requireProfile(profile.id);
     const stateChange = current.state === "signed_out"
       ? null
-      : this.#store.setProfileStateWithWorkRetirement(
-          profile.id,
-          profile.processGeneration,
-          "signed_out",
-          this.#work,
-        );
+      : this.#changeCodexProfileStateWithProviderRetirement({
+          profile: current,
+          state: "signed_out",
+        });
     if (stateChange !== null) this.#notifyAffectedWork(stateChange.affectedWorkIds);
-    if (stateChange !== null && !stateChange.changed) {
-      this.#quarantineProfile(profile);
-      throw new CommandFailure("RECOVERY_REQUIRED", "Codex logged out, but its local account state could not be committed. Run `hra account show` to reconcile it.");
-    }
     return { account: this.#publicProfile(this.#store.requireProfile(profile.id)), idempotencyKey: key };
   }
 
@@ -4327,7 +5036,7 @@ export class HraService {
     try {
       snapshot = await this.#fencedEffect(async () =>
         await this.#codex.readUsage({
-          authority: authorityFor(this.#paths, verifiedProfile),
+          authority: this.#profileAuthority(verifiedProfile, "codex"),
           signal,
         }));
     } catch (error: unknown) {
@@ -4492,6 +5201,7 @@ export class HraService {
       dispatchProfile.processGeneration !== profile.processGeneration
       || accountFingerprintForProfile(dispatchProfile) !== accountFingerprint
     ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
+    const dispatchProviderAuthority = this.#providerAuthority(dispatchProfile, "codex");
     const dispatchPolicyDecision = this.#store.authorizeAccountRateLimitResetPolicy({
       profileId: dispatchProfile.id,
       processGeneration: dispatchProfile.processGeneration,
@@ -4561,14 +5271,18 @@ export class HraService {
     }
 
     signal.throwIfAborted();
-    const begun = this.#store.beginAccountRateLimitReset(attempt.idempotencyKey);
+    const begun = this.#store.beginAccountRateLimitReset(
+      attempt.idempotencyKey,
+      dispatchProviderAuthority,
+    );
     if (begun.state !== "effect_started") {
       throw new Error("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
     }
     let outcome: Awaited<ReturnType<CodexRuntimePort["consumeRateLimitReset"]>>;
     try {
+      this.#store.assertProviderAccountAuthorityCurrent(dispatchProviderAuthority);
       outcome = await this.#codex.consumeRateLimitReset({
-        authority: authorityFor(this.#paths, dispatchProfile),
+        authority: authorityFor(this.#paths, dispatchProfile, dispatchProviderAuthority),
         idempotencyKey: attempt.idempotencyKey,
         signal,
       });
@@ -4582,7 +5296,7 @@ export class HraService {
         // determinate failures return through the ordinary window gates.
         this.#store.deferAccountRateLimitReset(attempt.idempotencyKey, retryState);
       } catch (journalError: unknown) {
-        this.#failStopAfterResetJournalFailure(
+        this.#failClosedAndStop(
           "Automatic reset recovery evidence could not be committed.",
         );
         throw new AggregateError(
@@ -4602,7 +5316,7 @@ export class HraService {
     try {
       this.#store.settleAccountRateLimitReset(attempt.idempotencyKey, outcome);
     } catch (journalError: unknown) {
-      this.#failStopAfterResetJournalFailure(
+      this.#failClosedAndStop(
         "An automatic reset outcome could not be committed.",
       );
       throw new AggregateError(
@@ -4623,7 +5337,7 @@ export class HraService {
   }): Promise<string> {
     const account = await this.#fencedEffect(async () =>
       await this.#codex.readAccount({
-        authority: authorityFor(this.#paths, input.profile),
+        authority: this.#profileAuthority(input.profile, "codex"),
         signal: input.signal,
       }));
     const verifiedEmail = !account.signedIn || account.email === undefined
@@ -4807,7 +5521,11 @@ export class HraService {
     const desktop = this.#desktop;
     const target = this.#store.requireProfile(selector);
     if (target.state !== "signed_in") throw new CommandFailure("CONFLICT", "The target account is not signed in.");
-    const result = await this.#fencedEffect(async () => await desktop.switchAccount({ idempotencyKey, target: authorityFor(this.#paths, target), signal }));
+    const result = await this.#fencedEffect(async () => await desktop.switchAccount({
+      idempotencyKey,
+      target: this.#profileAuthority(target, "codex"),
+      signal,
+    }));
     if (result.status === "recovery_required") {
       throw new CommandFailure(
         "RECOVERY_REQUIRED",
@@ -4829,9 +5547,12 @@ export class HraService {
   async #recoverCompactProjection(
     expected: Readonly<{
       acknowledgeGap: true;
+      bindingGeneration: number;
       idempotencyKey: string;
       processGeneration: number;
       profileId: ProfileRecord["id"];
+      provider: Provider;
+      providerAccountId: ProviderAccountId;
       providerThreadId: string;
       sessionId: SessionRecord["id"];
     }>,
@@ -4840,14 +5561,18 @@ export class HraService {
     await this.#daemonAuthority.assertCurrent();
     const session = this.#requireBoundSession(expected.sessionId);
     const profile = this.#store.requireProfileById(expected.profileId);
+    const providerAuthority = this.#sessionProviderAuthority(session);
     if (
       session.profileId !== expected.profileId
       || session.providerThreadId !== expected.providerThreadId
-      || profile.processGeneration !== expected.processGeneration
+      || providerAuthority.provider !== expected.provider
+      || providerAuthority.providerAccountId !== expected.providerAccountId
+      || providerAuthority.bindingGeneration !== expected.bindingGeneration
+      || providerAuthority.processGeneration !== expected.processGeneration
     ) {
       throw new CommandFailure("CONFLICT", "The projection recovery authority changed before admission.");
     }
-    this.#assertSignedIn(profile);
+    this.#assertProviderReady(profile, providerAuthority, { session });
     if (session.state !== "idle" || session.activeTurnId !== undefined) {
       throw new CommandFailure("CONFLICT", "Projection recovery requires an idle session with no active turn.");
     }
@@ -4949,52 +5674,78 @@ export class HraService {
   ): Promise<PublicProviderObservation> {
     let session = this.#store.requireSession(selector);
     const profile = this.#store.requireProfileById(session.profileId);
-    if (session.providerThreadId === undefined) {
-      return {
-        basis: "local_state",
-        coverage: "not_attempted",
-        freshness: "unknown",
-        observedAt: this.#now(),
-        profileGeneration: profile.processGeneration,
-        reason: "unbound",
-        source: "codex_app_server",
-        state: "not_applicable",
-      };
-    }
     if (session.state === "terminal") {
+      const providerAuthority = this.#capturedSessionProviderAuthority(session);
       await this.#cleanupTerminalFactsMemory(session);
       return {
         basis: "local_state",
         coverage: "not_attempted",
         freshness: "unknown",
         observedAt: this.#now(),
-        profileGeneration: profile.processGeneration,
+        profileGeneration: providerAuthority.processGeneration,
         reason: "terminal",
         source: "codex_app_server",
         state: "not_applicable",
       };
     }
+    if (session.providerThreadId === undefined) {
+      const providerAuthority = this.#capturedSessionProviderAuthority(session);
+      return {
+        basis: "local_state",
+        coverage: "not_attempted",
+        freshness: "unknown",
+        observedAt: this.#now(),
+        profileGeneration: providerAuthority.processGeneration,
+        reason: "unbound",
+        source: "codex_app_server",
+        state: "not_applicable",
+      };
+    }
     if (session.state === "recovery_required") {
+      const providerAuthority = this.#capturedSessionProviderAuthority(session);
       return {
         basis: "local_state",
         code: "session_quarantined",
         coverage: "partial",
         freshness: "fresh",
         observedAt: this.#now(),
-        profileGeneration: profile.processGeneration,
+        profileGeneration: providerAuthority.processGeneration,
         source: "codex_app_server",
         state: "recovery_required",
       };
     }
+    const historicalObservation = this.#store
+      .readHistoricalSessionObservationAuthority(session.id);
+    if (historicalObservation !== null) {
+      const currentAccount = this.#store.requireProviderAccountById(
+        historicalObservation.authority.providerAccountId,
+      );
+      return {
+        basis: "local_state",
+        code: currentAccount.readiness === "signed_out"
+          ? "account_signed_out"
+          : "authority_retired",
+        coverage: "unavailable",
+        freshness: "fresh",
+        observedAt: this.#now(),
+        profileGeneration: historicalObservation.authority.processGeneration,
+        source: "codex_app_server",
+        state: "unavailable",
+      };
+    }
+    const providerAuthority = this.#sessionProviderAuthority(session);
     await this.#ensureFactsMemory(session);
-    if (profile.state !== "signed_in") {
+    try {
+      this.#assertProviderReady(profile, providerAuthority, { session });
+    } catch (error: unknown) {
+      if (!(error instanceof CommandFailure)) throw error;
       return {
         basis: "local_state",
         code: "account_signed_out",
         coverage: "unavailable",
         freshness: "fresh",
         observedAt: this.#now(),
-        profileGeneration: profile.processGeneration,
+        profileGeneration: providerAuthority.processGeneration,
         source: "codex_app_server",
         state: "unavailable",
       };
@@ -5007,7 +5758,7 @@ export class HraService {
     await this.#daemonAuthority.assertCurrent();
     const observationFactEpoch = this.#snapshotSessionFactEpoch(session.id);
     const providerThreadId = session.providerThreadId;
-    const authority = authorityFor(this.#paths, profile);
+    const authority = this.#sessionAuthority(session);
     let observation: CodexSessionObservation;
     try {
       observation = await this.#fencedEffect(async () => await this.#runtimeForSession(session).observeSession({
@@ -5029,7 +5780,7 @@ export class HraService {
           coverage: "unavailable",
           freshness: "fresh",
           observedAt: this.#now(),
-          profileGeneration: this.#currentProfileGeneration(authority),
+          profileGeneration: this.#currentProviderGeneration(authority),
           source: "codex_app_server",
           state: "unavailable",
         };
@@ -5048,20 +5799,18 @@ export class HraService {
         coverage: "unavailable",
         freshness: "fresh",
         observedAt: this.#now(),
-        profileGeneration: profile.processGeneration,
+        profileGeneration: providerAuthority.processGeneration,
         source: "codex_app_server",
         state: "unavailable",
       };
     }
     await this.#daemonAuthority.assertCurrent();
     session = this.#store.requireSession(session.id);
-    const currentProfile = this.#store.requireProfileById(profile.id);
     if (
       session.profileId !== profile.id
       || session.providerThreadId === undefined
       || session.providerThreadId !== observation.projection.providerThreadId
-      || currentProfile.processGeneration !== profile.processGeneration
-      || currentProfile.state !== "signed_in"
+      || !this.#authorityMatchesSession(authority, session)
     ) {
       if (
         this.#currentObservationSession(authority, session.id, providerThreadId) !== null
@@ -5073,7 +5822,7 @@ export class HraService {
         coverage: "unavailable",
         freshness: "fresh",
         observedAt: this.#now(),
-        profileGeneration: currentProfile.processGeneration,
+        profileGeneration: this.#currentProviderGeneration(authority),
         source: "codex_app_server",
         state: "unavailable",
       };
@@ -5119,7 +5868,7 @@ export class HraService {
       freshness: "fresh",
       mode,
       observedAt: this.#now(),
-      profileGeneration: profile.processGeneration,
+      profileGeneration: providerAuthority.processGeneration,
       source: "codex_app_server",
       state: "live",
     };
@@ -5131,24 +5880,40 @@ export class HraService {
     providerThreadId: string,
   ): SessionRecord | null {
     try {
-      const profile = this.#store.requireProfileById(authority.id);
       const session = this.#store.requireSession(sessionId);
-      return profile.processGeneration === authority.generation
-        && profile.state === "signed_in"
-        && session.profileId === authority.id
+      const binding = this.#store.requireProviderAccountForProfile(
+        session.profileId,
+        session.provider,
+      );
+      const sessionAuthority = this.#store.requireSessionProviderAuthority(session.id);
+      const dispatchable = binding.readiness === "signed_in"
+        || (
+          binding.provider === "claude"
+          && binding.readiness === "unverified"
+          && sessionAuthority.routingProvenance === "explicit"
+        );
+      return this.#authorityMatchesSession(authority, session)
+        && dispatchable
         && session.providerThreadId === providerThreadId
         && session.state !== "terminal"
         ? session
         : null;
     } catch (error: unknown) {
       if (error instanceof SelectionError && error.code === "NOT_FOUND") return null;
+      if (
+        error instanceof Error
+        && error.message.startsWith("SESSION_PROVIDER_AUTHORITY_")
+      ) return null;
       throw error;
     }
   }
 
-  #currentProfileGeneration(authority: ProfileAuthority): number {
+  #currentProviderGeneration(authority: ProfileAuthority): number {
     try {
-      return this.#store.requireProfileById(authority.id).processGeneration;
+      return this.#store.requireProviderAccountAuthority(
+        authority.id,
+        authority.provider,
+      ).processGeneration;
     } catch (error: unknown) {
       if (error instanceof SelectionError && error.code === "NOT_FOUND") {
         return authority.generation;
@@ -5860,6 +6625,13 @@ export class HraService {
       sessionId: interaction.sessionId,
       accountId: interaction.authority.profileId,
       providerGeneration: interaction.authority.processGeneration,
+      providerAuthority: {
+        providerAccountId: interaction.authority.providerAccountId,
+        profileId: interaction.authority.profileId,
+        provider: interaction.authority.provider,
+        bindingGeneration: interaction.authority.bindingGeneration,
+        processGeneration: interaction.authority.processGeneration,
+      },
       providerConnectionId: interaction.authority.connectionId,
       body: {
         type: "interaction_state",
@@ -6046,12 +6818,11 @@ export class HraService {
           "This interaction has no complete approval authority available for protected inspection.",
         );
       }
-      const profile = this.#store.requireProfileById(current.authority.profileId);
       let authority: Awaited<ReturnType<CodexRuntimePort["inspectInteractionAuthority"]>>;
       try {
         await this.#daemonAuthority.assertCurrent();
         authority = await this.#runtimeForInteraction(current).inspectInteractionAuthority({
-          authority: authorityFor(this.#paths, profile),
+          authority: this.#interactionAuthority(current),
           provider: current.authority,
           kind: current.kind,
           signal,
@@ -6130,13 +6901,12 @@ export class HraService {
         await this.#rejectManualResolutionAtDeadline(current);
       }
       this.#assertResolutionMatches(current, command.resolution);
-      const profile = this.#store.requireProfileById(current.authority.profileId);
       const runtime = this.#runtimeForInteraction(current);
       let responseDigest: string;
       try {
         await this.#daemonAuthority.assertCurrent();
         const validated = await runtime.validateInteractionResolution({
-          authority: authorityFor(this.#paths, profile),
+          authority: this.#interactionAuthority(current),
           provider: current.authority,
           kind: current.kind,
           resolution: command.resolution,
@@ -6201,7 +6971,7 @@ export class HraService {
           await this.#rejectPreparedManualResolutionAtDeadline(prepared);
         }
         await runtime.resolveInteraction({
-          authority: authorityFor(this.#paths, profile),
+          authority: this.#interactionAuthority(prepared),
           provider: prepared.authority,
           kind: prepared.kind,
           resolution: command.resolution,
@@ -6282,14 +7052,13 @@ export class HraService {
       || prepared.intendedTerminalState === null
       || prepared.intendedTerminalState === "expired"
     ) throw new Error("INTERACTION_MANUAL_RESPONSE_NOT_PREPARED");
-    const profile = this.#store.requireProfileById(prepared.authority.profileId);
     const runtime = this.#runtimeForInteraction(prepared);
     const signal = this.#interactionDeadlineAbort.signal;
     let timeoutResponseDigest: string;
     try {
       await this.#daemonAuthority.assertCurrent();
       const validated = await runtime.validateInteractionTimeout({
-        authority: authorityFor(this.#paths, profile),
+        authority: this.#interactionAuthority(prepared),
         provider: prepared.authority,
         signal,
       });
@@ -6334,7 +7103,7 @@ export class HraService {
     try {
       await this.#daemonAuthority.assertCurrent();
       await runtime.timeoutInteraction({
-        authority: authorityFor(this.#paths, profile),
+        authority: this.#interactionAuthority(timeoutPrepared),
         provider: timeoutPrepared.authority,
         signal,
       });
@@ -6489,8 +7258,10 @@ export class HraService {
         },
       };
     }
+    const providerAuthority = this.#providerAuthority(profile, "codex");
+    const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
     const remote = await this.#fencedEffect(async () => await this.#codex.listSessions({
-      authority: authorityFor(this.#paths, profile),
+      authority: runtimeAuthority,
       limit,
       ...(decodedCursor === undefined ? {} : { cursor: decodedCursor.providerCursor }),
       signal,
@@ -6518,7 +7289,7 @@ export class HraService {
     for (const projection of remote.sessions) {
       const projectId = projection.projectRoot === undefined ? undefined : projects.find((project) => project.rootPath === projection.projectRoot)?.id;
       const session = this.#store.upsertProviderSession({
-        profileId: profile.id,
+        providerAuthority,
         providerThreadId: projection.providerThreadId,
         ...(projectId === undefined ? {} : { projectId }),
         title: projection.title,
@@ -6561,11 +7332,27 @@ export class HraService {
 
   async #showSession(selector: string, detail: boolean, signal: AbortSignal): Promise<unknown> {
     const session = this.#store.requireSession(selector);
+    if (session.state === "terminal") {
+      const providerObservation = await this.#ensureSessionObservedLocked(
+        session.id,
+        signal,
+      );
+      return {
+        session: this.#store.requireSession(session.id),
+        effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null,
+        providerObservation,
+        ...(session.provider === "claude"
+          ? {
+              next: "Start a new Claude session; the pinned Claude transport cannot resume or replay this terminal thread after daemon loss.",
+            }
+          : {}),
+      };
+    }
     if (session.providerThreadId === undefined) return { session, effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null };
     const providerThreadId = session.providerThreadId;
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
-    if (session.state !== "terminal" && session.state !== "recovery_required") {
+    this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
+    if (session.state !== "recovery_required") {
       this.#requireLiveProviderObservation(
         await this.#ensureSessionObservedLocked(session.id, signal),
       );
@@ -6573,7 +7360,7 @@ export class HraService {
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettled(session.id);
     await this.#daemonAuthority.assertCurrent();
-    const observed = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: authorityFor(this.#paths, profile), providerThreadId, detail, signal }));
+    const observed = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: this.#sessionAuthority(session), providerThreadId, detail, signal }));
     const projection = this.#withAttachmentManifests(session.id, observed);
     if (projectionRecoveryUnsettled || this.#projectionRecoveriesInFlight.has(session.id)) {
       const runtimeProfile = this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null;
@@ -6603,24 +7390,32 @@ export class HraService {
   }
 
   async #startSession(command: Extract<LocalCommand, { kind: "session.start" }>, signal: AbortSignal): Promise<unknown> {
-    const profile = this.#store.requireProfile(command.account);
-    this.#assertSignedIn(profile);
-    const project = command.project === undefined ? this.#store.listProjects().find((candidate) => candidate.default) : this.#store.requireProject(command.project);
-    if (project === undefined) throw new CommandFailure("INTERACTION_REQUIRED", "Add or select a project directory before starting a session.");
-    await this.#requireUsableProjectRoot(project.rootPath);
+    let profile = this.#store.requireProfile(command.account);
     const provider = command.provider ?? "codex";
-    // A preset the chosen provider cannot run is refused here, before any
-    // durable placeholder or provider effect exists.
+    // Reject an incoherent provider/preset pair before consulting or starting
+    // that provider's runtime. Validation is a local admission decision and
+    // must not be masked by an unavailable optional runtime.
     if (!isPresetSupportedByProvider(provider, command.preset)) {
       throw new CommandFailure(
         "INVALID_INPUT",
         new PresetProviderMismatchError(provider, command.preset).message,
       );
     }
+    const preparedProvider = await this.#prepareProviderForSessionStart(
+      profile,
+      provider,
+      signal,
+    );
+    profile = preparedProvider.profile;
+    const providerAuthority = preparedProvider.providerAuthority;
+    const project = command.project === undefined ? this.#store.listProjects().find((candidate) => candidate.default) : this.#store.requireProject(command.project);
+    if (project === undefined) throw new CommandFailure("INTERACTION_REQUIRED", "Add or select a project directory before starting a session.");
+    await this.#requireUsableProjectRoot(project.rootPath);
     // The session binds this provider's port for its whole life: the durable
     // session-start evidence carries whichever provider's reviewed profile the
     // port proves, and every later turn, steer, stop, and interaction on this
-    // session is routed back to the same port by `sessions.provider`.
+    // session is routed back to the same port by its immutable provider-account
+    // authority sidecar.
     const runtime = this.#sessionRuntime(provider);
     const key = command.idempotencyKey ?? randomUUID();
     let localSessionId: SessionRecord["id"] | undefined;
@@ -6632,15 +7427,20 @@ export class HraService {
     const outcome = await this.#effect<z.infer<typeof sessionStartReceiptSchema>>({
       kind: "session.start",
       authorityId: profile.id,
-      authorityGeneration: profile.processGeneration,
+      authorityGeneration: providerAuthority.processGeneration,
       request: { projectId: project.id, preset: command.preset, fast: command.fast },
       idempotencyKey: key,
+      providerAuthorities: [{
+        role: "primary",
+        authority: providerAuthority,
+        provenance: "session_start",
+      }],
       beginEffect: async (attemptId) => {
         clientMessageId = attemptId;
         review = await this.#fencedEffect(async () => {
           const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
           return await runtime.reviewSessionStart({
-            authority: authorityFor(this.#paths, profile),
+            authority: authorityFor(this.#paths, profile, providerAuthority),
             projectRoot,
             preset: command.preset,
             fast: command.fast,
@@ -6650,7 +7450,9 @@ export class HraService {
         const local = this.#store.beginSessionStartEffect({
           attemptId,
           profileId: profile.id,
-          profileGeneration: profile.processGeneration,
+          profileGeneration: providerAuthority.processGeneration,
+          providerAuthority,
+          routing: "explicit",
           projectId: project.id,
           provider,
           preset: command.preset,
@@ -6674,7 +7476,7 @@ export class HraService {
           startedProjection = await this.#fencedEffect(async () => {
             const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
             return await runtime.startSession({
-              authority: authorityFor(this.#paths, profile),
+              authority: authorityFor(this.#paths, profile, providerAuthority),
               projectRoot,
               review: runtimeReview,
               signal,
@@ -6703,6 +7505,7 @@ export class HraService {
           attemptId,
           sessionId: local.id,
           expectedSessionRevision: local.revision,
+          providerAuthority,
           providerThreadId: startedProjection.providerThreadId,
           state: startedProjection.status,
           ...(startedProjection.activeTurnId === undefined ? {} : { activeTurnId: startedProjection.activeTurnId }),
@@ -6715,6 +7518,7 @@ export class HraService {
         if (localSessionId !== undefined) this.#quarantineSession(localSessionId);
       },
     });
+    this.#drainPendingClaudeDisconnect(this.#store.requireSession(outcome.sessionId));
     try {
       await this.#ensureFactsMemory(this.#store.requireSession(outcome.sessionId));
     } catch (error: unknown) {
@@ -6797,10 +7601,17 @@ export class HraService {
   ): Promise<unknown> {
     const session = this.#requireBoundSession(command.session);
     const currentProfile = this.#store.requireProfile(session.profileId);
-    const targetProfile = command.account === undefined
+    let targetProfile = command.account === undefined
       ? currentProfile
       : this.#store.requireProfile(command.account);
-    this.#assertSignedIn(targetProfile);
+    const sourceProviderAuthority = this.#sessionProviderAuthority(session);
+    const preparedTarget = await this.#prepareProviderForSessionStart(
+      targetProfile,
+      command.provider,
+      signal,
+    );
+    targetProfile = preparedTarget.profile;
+    const targetProviderAuthority = preparedTarget.providerAuthority;
     if (
       session.provider === command.provider
       && targetProfile.id === currentProfile.id
@@ -6854,10 +7665,14 @@ export class HraService {
     let started:
       | (CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile })
       | undefined;
+    const switchProviderAuthorities = [
+      { role: "source" as const, authority: sourceProviderAuthority, provenance: "session_switch_source" },
+      { role: "target" as const, authority: targetProviderAuthority, provenance: "session_switch_target" },
+    ];
     const outcome = await this.#effect<z.infer<typeof sessionSwitchReceiptSchema>>({
       kind: "session.switch",
       authorityId: session.id,
-      authorityGeneration: targetProfile.processGeneration,
+      authorityGeneration: targetProviderAuthority.processGeneration,
       request: {
         provider: command.provider,
         preset,
@@ -6865,13 +7680,20 @@ export class HraService {
         seedDigest: seed.digest,
       },
       idempotencyKey: key,
+      providerAuthorities: switchProviderAuthorities,
+      beginEffect: (attemptId) => {
+        this.#store.beginPreparedMutationEffect({
+          attemptId,
+          providerAuthorities: switchProviderAuthorities,
+        });
+      },
       effect: async () => {
         // The target thread is started before the source is released. A target
         // that refuses then leaves the session exactly where it was, still
         // observed and still runnable, instead of stranding it with a released
         // thread it can no longer resume.
         review = await this.#fencedEffect(async () => await runtime.reviewSessionStart({
-          authority: authorityFor(this.#paths, targetProfile),
+          authority: authorityFor(this.#paths, targetProfile, targetProviderAuthority),
           ...(projectRoot === undefined ? {} : { projectRoot }),
           preset,
           fast: session.fastEnabled,
@@ -6879,14 +7701,14 @@ export class HraService {
         }));
         const runtimeReview = review;
         started = await this.#fencedEffect(async () => await runtime.startSession({
-          authority: authorityFor(this.#paths, targetProfile),
+          authority: authorityFor(this.#paths, targetProfile, targetProviderAuthority),
           ...(projectRoot === undefined ? {} : { projectRoot }),
           review: runtimeReview,
           signal,
         }));
         // Now release the outgoing provider: a per-session runtime process is
         // stopped rather than left running behind an abandoned thread.
-        await this.#endProviderSession(session, currentProfile, signal);
+        await this.#endProviderSession(session, signal);
         return {
           providerThreadId: started.providerThreadId,
           sessionId: session.id,
@@ -6906,6 +7728,7 @@ export class HraService {
           expectedSessionRevision: current.revision,
           provider: command.provider,
           profileId: targetProfile.id,
+          providerAuthority: targetProviderAuthority,
           preset,
           providerThreadId: started.providerThreadId,
           state: started.status,
@@ -6926,7 +7749,7 @@ export class HraService {
 
     const switched = this.#store.requireSession(outcome.sessionId);
     this.#appendSessionEvent(
-      authorityFor(this.#paths, targetProfile),
+      authorityFor(this.#paths, targetProfile, targetProviderAuthority),
       switched.id,
       null,
       {
@@ -6987,17 +7810,18 @@ export class HraService {
    */
   async #endProviderSession(
     session: SessionRecord & { providerThreadId: string },
-    profile: ProfileRecord,
     signal: AbortSignal,
   ): Promise<void> {
+    const authority = this.#sessionAuthority(session);
     const connectionId = this.#sessionProviderConnections.get(session.id) ?? null;
     this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
-      accountId: profile.id,
+      accountId: authority.id,
       providerConnectionId: connectionId,
-      providerGeneration: profile.processGeneration,
+      providerGeneration: authority.generation,
+      providerAuthority: this.#providerAccountAuthority(authority),
       sessionId: session.id,
     }));
-    this.#appendSessionEvent(authorityFor(this.#paths, profile), session.id, connectionId, {
+    this.#appendSessionEvent(authority, session.id, connectionId, {
       type: "connection",
       state: "disconnected",
       reason: "provider switch",
@@ -7007,11 +7831,20 @@ export class HraService {
     this.#sessionResubscriptionConnections.delete(session.id);
     this.#sessionsAwaitingResubscription.delete(session.id);
     this.#forgetSessionFactEpoch(session.id);
-    await this.#runtimeForSession(session).endSession({
-      authority: authorityFor(this.#paths, profile),
-      providerThreadId: session.providerThreadId,
-      signal,
-    });
+    try {
+      await this.#runtimeForSession(session).endSession({
+        authority,
+        providerThreadId: session.providerThreadId,
+        signal,
+      });
+    } finally {
+      if (authority.provider === "claude") {
+        this.#claudeFacts.forgetSession(
+          this.#providerAccountAuthority(authority),
+          session.providerThreadId,
+        );
+      }
+    }
   }
 
   /*
@@ -7078,7 +7911,9 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
+    const providerAuthority = this.#sessionProviderAuthority(session);
+    const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     if (project !== undefined) await this.#requireUsableProjectRoot(project.rootPath);
     this.#requireLiveProviderObservation(
@@ -7093,7 +7928,7 @@ export class HraService {
     let dispatchSessionRevision: number | undefined;
     let dispatchFactEpoch: number | undefined;
     let startedResult: { turnId: string; status: "completed" | "interrupted" | "failed" | "inProgress"; effectiveRuntimeProfile: ReviewedRuntimeProfile } | undefined;
-    const result = await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, effect: async (attemptId) => {
+    const result = await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_send" }], effect: async (attemptId) => {
       if (baseline === undefined || review === undefined) throw new Error("Session send lost its exact pre-effect provider baseline or runtime review.");
       const runtimeReview = review;
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
@@ -7102,7 +7937,7 @@ export class HraService {
           ? undefined
           : await this.#requireUsableProjectRoot(project.rootPath);
         return await this.#runtimeForSession(session).startTurn({
-          authority: authorityFor(this.#paths, profile),
+          authority: runtimeAuthority,
           providerThreadId: session.providerThreadId,
           ...(projectRoot === undefined ? {} : { projectRoot }),
           review: runtimeReview,
@@ -7121,7 +7956,7 @@ export class HraService {
           ? undefined
           : await this.#requireUsableProjectRoot(project.rootPath);
         return await this.#runtimeForSession(session).reviewTurnStart({
-          authority: authorityFor(this.#paths, profile),
+          authority: runtimeAuthority,
           providerThreadId: session.providerThreadId,
           ...(projectRoot === undefined ? {} : { projectRoot }),
           preset: session.preset,
@@ -7139,7 +7974,8 @@ export class HraService {
       this.#store.beginSessionMutationEffect({
         attemptId,
         sessionId: session.id,
-        profileGeneration: profile.processGeneration,
+        profileGeneration: providerAuthority.processGeneration,
+        providerAuthority,
         evidence: {
           kind: "session.send",
           providerThreadId: session.providerThreadId,
@@ -7164,6 +8000,7 @@ export class HraService {
         attemptId,
         sessionId: session.id,
         expectedSessionRevision: dispatchSessionRevision,
+        providerAuthority,
         applyResponseState: this.#currentSessionFactEpoch(session.id) === dispatchFactEpoch,
         turnId: startedResult.turnId,
         turnStatus: startedResult.status,
@@ -7203,7 +8040,7 @@ export class HraService {
     try {
       const text = message.slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS);
       this.#appendSessionEvent(
-        authorityFor(this.#paths, profile),
+        this.#sessionAuthority(this.#store.requireSession(sessionId)),
         sessionId,
         this.#sessionProviderConnections.get(sessionId) ?? null,
         {
@@ -7230,17 +8067,19 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
+    const providerAuthority = this.#sessionProviderAuthority(session);
+    const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let activeTurnId: string | undefined;
-    const result = await this.#effect({ kind: "session.steer", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, effect: async (attemptId) => {
+    const result = await this.#effect({ kind: "session.steer", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_steer" }], effect: async (attemptId) => {
       if (activeTurnId === undefined) throw new CommandFailure("CONFLICT", "The session has no active turn to steer.");
       const turnId = activeTurnId;
-      await this.#fencedEffect(async () => await this.#runtimeForSession(session).steer({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, message, ...(attachments.values.length === 0 ? {} : { attachments: attachments.values }), clientMessageId: attemptId, signal }));
+      await this.#fencedEffect(async () => await this.#runtimeForSession(session).steer({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, activeTurnId: turnId, message, ...(attachments.values.length === 0 ? {} : { attachments: attachments.values }), clientMessageId: attemptId, signal }));
       return { steered: true as const, activeTurnId: turnId };
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
@@ -7250,7 +8089,8 @@ export class HraService {
       this.#store.beginSessionMutationEffect({
         attemptId,
         sessionId: session.id,
-        profileGeneration: profile.processGeneration,
+        profileGeneration: providerAuthority.processGeneration,
+        providerAuthority,
         evidence: {
           kind: "session.steer",
           providerThreadId: session.providerThreadId,
@@ -7289,14 +8129,15 @@ export class HraService {
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
+    const providerAuthority = this.#sessionProviderAuthority(session);
     // Custody is proved before anything durable exists, so a queue entry never
     // outlives the attachments it references.
     const attachments = await this.#prepareAttachments(attachmentReferences);
     const key = idempotencyKey ?? randomUUID();
     // Work authorization and durable enqueue are one synchronous fence boundary.
     beforeEffect?.();
-    const queued = this.#store.enqueueIdempotent({ sessionId: session.id, profileGeneration: profile.processGeneration, message, idempotencyKey: key });
+    const queued = this.#store.enqueueIdempotent({ sessionId: session.id, profileGeneration: providerAuthority.processGeneration, providerAuthority, message, idempotencyKey: key });
     if (attachments.stored.length > 0) {
       this.#store.recordMessageAttachments({
         attachments: attachments.stored,
@@ -7320,8 +8161,7 @@ export class HraService {
 
   #scheduleQueueDispatch(session: SessionRecord): void {
     if (this.#state !== "open") return;
-    const profile = this.#store.requireProfile(session.profileId);
-    const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, authorityFor(this.#paths, profile)));
+    const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, this.#sessionAuthority(session)));
     const tracked = task.then(
       () => undefined,
       (error: unknown) => this.recordBackgroundDiagnostic("queue_dispatch_failed", error),
@@ -7388,8 +8228,12 @@ export class HraService {
         return;
       }
       const profile = this.#store.requireProfile(current.profileId);
-      if (profile.state !== "signed_in") return;
-      await this.#serializeSessionAuthority(current, async () => this.#dispatchNextQueue(current.id, authorityFor(this.#paths, profile)));
+      try {
+        this.#assertProviderReady(profile, this.#sessionProviderAuthority(current), { session: current });
+      } catch {
+        return;
+      }
+      await this.#serializeSessionAuthority(current, async () => this.#dispatchNextQueue(current.id, this.#sessionAuthority(current)));
       if (this.#store.requireQueue(queueId).state !== "pending") this.#queuePreEffectRetryCounts.delete(queueId);
     })();
     const tracked = task.then(
@@ -7410,17 +8254,19 @@ export class HraService {
   async #stop(selector: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
+    const providerAuthority = this.#sessionProviderAuthority(session);
+    const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let activeTurnId: string | null = null;
-    const result = await this.#effect({ kind: "session.stop", authorityId: session.id, authorityGeneration: profile.processGeneration, request: {}, idempotencyKey: key, effect: async () => {
+    const result = await this.#effect({ kind: "session.stop", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: {}, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_stop" }], effect: async () => {
       if (activeTurnId === null) return { stopped: false as const, activeTurnId: null };
       const turnId = activeTurnId;
-      await this.#fencedEffect(async () => await this.#runtimeForSession(session).interrupt({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, activeTurnId: turnId, signal }));
+      await this.#fencedEffect(async () => await this.#runtimeForSession(session).interrupt({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, activeTurnId: turnId, signal }));
       return { stopped: true as const, activeTurnId: turnId };
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
@@ -7428,7 +8274,8 @@ export class HraService {
       this.#store.beginSessionMutationEffect({
         attemptId,
         sessionId: session.id,
-        profileGeneration: profile.processGeneration,
+        profileGeneration: providerAuthority.processGeneration,
+        providerAuthority,
         evidence: {
           kind: "session.stop",
           providerThreadId: session.providerThreadId,
@@ -7452,15 +8299,18 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     this.#requireCodexSession(session, "renaming a provider thread");
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
+    const providerAuthority = this.#sessionProviderAuthority(session);
+    const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
-    await this.#effect({ kind: "session.rename", authorityId: session.id, authorityGeneration: profile.processGeneration, request: { name }, idempotencyKey: key, effect: async () => { await this.#fencedEffect(async () => await this.#codex.rename({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, name, signal })); return { renamed: true as const }; }, beginEffect: async (attemptId) => {
+    await this.#effect({ kind: "session.rename", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { name }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_rename" }], effect: async () => { await this.#fencedEffect(async () => await this.#codex.rename({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, name, signal })); return { renamed: true as const }; }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       this.#store.beginSessionMutationEffect({
         attemptId,
         sessionId: session.id,
-        profileGeneration: profile.processGeneration,
+        profileGeneration: providerAuthority.processGeneration,
+        providerAuthority,
         evidence: {
           kind: "session.rename",
           providerThreadId: session.providerThreadId,
@@ -7481,6 +8331,29 @@ export class HraService {
 
   async #resolveSessionRecovery(selector: string, action: "recover" | "abandon", signal: AbortSignal): Promise<unknown> {
     const session = this.#store.requireSession(selector);
+    if (this.#store.hasUnsettledLegacyProviderAuthorityQuarantineForSession(session.id)) {
+      if (action !== "abandon") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "This legacy session or queued effect has no provable provider-account authority. Run `hra session abandon` to release only HRA's local custody; no provider effect will be replayed.",
+        );
+      }
+      const resolved = this.#store.abandonLegacyProviderAuthorityQuarantinedSession({
+        sessionId: session.id,
+        expectedRevision: session.revision,
+      });
+      await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
+      this.#resumeSessionWorkAfterRecovery(resolved);
+      return {
+        session: resolved,
+        recovery: {
+          resolved: true,
+          resolution: "abandoned",
+          providerEffectRetried: false,
+          providerStateDeleted: false,
+        },
+      };
+    }
     if (session.state !== "recovery_required") {
       throw new CommandFailure("CONFLICT", "The session does not currently require recovery.");
     }
@@ -7509,7 +8382,7 @@ export class HraService {
         throw new CommandFailure("RECOVERY_REQUIRED", "The status quarantine has no exact provider-thread binding. Run `hra session abandon` to release only the local authority.");
       }
       const profile = this.#store.requireProfile(session.profileId);
-      this.#assertSignedIn(profile);
+      this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
       const projection = await this.#readExactSessionProjection({ ...session, providerThreadId: session.providerThreadId }, profile, false, signal);
       const resolved = this.#store.resolveSessionStatusRecovery({
         sessionId: session.id,
@@ -7544,12 +8417,46 @@ export class HraService {
       return await this.#resolveQueueRecovery(session, queueEffect, action, signal);
     }
     const attempt = unsettled[0];
-    if (attempt?.evidence === undefined) {
-      throw new CommandFailure("RECOVERY_REQUIRED", "The mutation has no immutable pre-effect evidence and cannot be reconciled automatically.");
+    if (attempt === undefined) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The mutation recovery authority disappeared.");
     }
     const originalState = attempt.originalState ?? attempt.state;
     if (originalState !== "effect_started" && originalState !== "ambiguous") {
       throw new CommandFailure("CONFLICT", "The mutation authority is already settled.");
+    }
+    if (attempt.kind === "session.switch") {
+      if (action !== "abandon") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "This provider switch has no Phase 2 resume journal. Run `hra session abandon` to release only HRA's local custody; no provider effect will be replayed.",
+        );
+      }
+      const resolved = this.#store.abandonSessionSwitchMutation({
+        attemptId: attempt.id,
+        expectedOriginalState: originalState,
+        expectedSessionRevision: session.revision,
+        resolutionEvidence: {
+          action: "user_abandon",
+          providerEffectRetried: false,
+          providerStateDeleted: false,
+        },
+        sessionId: session.id,
+      });
+      await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
+      this.#resumeSessionWorkAfterRecovery(resolved);
+      return {
+        session: resolved,
+        idempotencyKey: attempt.idempotencyKey,
+        recovery: {
+          resolved: true,
+          resolution: "abandoned",
+          providerEffectRetried: false,
+          providerStateDeleted: false,
+        },
+      };
+    }
+    if (attempt.evidence === undefined) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The mutation has no immutable pre-effect evidence and cannot be reconciled automatically.");
     }
 
     if (session.providerThreadId === undefined) {
@@ -7572,10 +8479,13 @@ export class HraService {
     }
 
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
-    if (profile.processGeneration !== attempt.authorityGeneration) {
-      throw new CommandFailure("RECOVERY_REQUIRED", "The account generation changed after the uncertain session effect.");
-    }
+    const currentProviderAuthority = this.#sessionProviderAuthority(session);
+    const effectProviderAuthority = this.#primaryMutationProviderAuthority(attempt);
+    if (
+      effectProviderAuthority === null
+      || !this.#sameProviderAccountBinding(effectProviderAuthority, currentProviderAuthority)
+    ) throw new CommandFailure("RECOVERY_REQUIRED", "The immutable provider binding changed after the uncertain session effect.");
+    this.#assertProviderReady(profile, currentProviderAuthority, { session });
     const projection = await this.#readExactSessionProjection({ ...session, providerThreadId: session.providerThreadId }, profile, false, signal);
     const provider = {
       providerThreadId: projection.providerThreadId,
@@ -7662,10 +8572,14 @@ export class HraService {
   ): Promise<unknown> {
     if (session.providerThreadId === undefined) throw new CommandFailure("RECOVERY_REQUIRED", "The queued effect has no exact provider-thread binding.");
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
-    if (profile.processGeneration !== record.evidence.profileGeneration) {
-      throw new CommandFailure("RECOVERY_REQUIRED", "The account generation changed after the uncertain queued effect.");
-    }
+    const currentProviderAuthority = this.#sessionProviderAuthority(session);
+    const effectProviderAuthority = this.#store.readQueueProviderAuthority(record.queueId);
+    if (
+      effectProviderAuthority === null
+      || effectProviderAuthority.processGeneration !== record.evidence.profileGeneration
+      || !this.#sameProviderAccountBinding(effectProviderAuthority, currentProviderAuthority)
+    ) throw new CommandFailure("RECOVERY_REQUIRED", "The immutable provider binding changed after the uncertain queued effect.");
+    this.#assertProviderReady(profile, currentProviderAuthority, { session });
     const projection = await this.#readExactSessionProjection({ ...session, providerThreadId: session.providerThreadId }, profile, false, signal);
     const provider = {
       providerThreadId: projection.providerThreadId,
@@ -7708,7 +8622,8 @@ export class HraService {
   }
 
   async #readExactSessionProjection(session: BoundSessionRecord, profile: ProfileRecord, detail: boolean, signal: AbortSignal): Promise<CodexSessionProjection> {
-    const projection = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, detail, signal }));
+    if (profile.id !== session.profileId) throw new Error("Session profile authority mismatch.");
+    const projection = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: this.#sessionAuthority(session), providerThreadId: session.providerThreadId, detail, signal }));
     if (projection.providerThreadId !== session.providerThreadId) {
       throw new CommandFailure("RECOVERY_REQUIRED", "Codex returned a projection for a different provider thread.");
     }
@@ -7727,11 +8642,11 @@ export class HraService {
     const session = this.#requireBoundSession(sessionSelector);
     this.#requireCodexSession(session, "protected turn inspection");
     const profile = this.#store.requireProfile(session.profileId);
-    this.#assertSignedIn(profile);
+    this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
-    return await this.#fencedEffect(async () => await this.#codex.inspectTurn({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, turnId, signal }));
+    return await this.#fencedEffect(async () => await this.#codex.inspectTurn({ authority: this.#sessionAuthority(session), providerThreadId: session.providerThreadId, turnId, signal }));
   }
 
   #requireBoundSession(selector: string): BoundSessionRecord {
@@ -7769,20 +8684,15 @@ export class HraService {
     }
     const stateChange = current.state === "recovery_required"
       ? null
-      : this.#store.setProfileStateWithWorkRetirement(
-          profile.id,
-          profile.processGeneration,
-          "recovery_required",
-          this.#work,
-          {
+      : this.#changeCodexProfileStateWithProviderRetirement({
+          profile: current,
+          state: "recovery_required",
+          identity: {
             ...(current.providerEmail === undefined ? {} : { email: current.providerEmail }),
             ...(current.providerPlan === undefined ? {} : { plan: current.providerPlan }),
           },
-        );
+        });
     if (stateChange !== null) this.#notifyAffectedWork(stateChange.affectedWorkIds);
-    if (stateChange !== null && !stateChange.changed) {
-      throw new Error("Account could not be quarantined after an indeterminate provider effect.");
-    }
     return this.#store.requireProfile(profile.id);
   }
 
@@ -7859,6 +8769,13 @@ export class HraService {
     const session = this.#store.requireSession(sessionId);
     if (session.state !== "idle" || session.providerThreadId === undefined) return;
     const boundSession: BoundSessionRecord = { ...session, providerThreadId: session.providerThreadId };
+    const providerAuthority = this.#sessionProviderAuthority(session);
+    if (
+      authority.provider !== providerAuthority.provider
+      || authority.providerAccountId !== providerAuthority.providerAccountId
+      || authority.bindingGeneration !== providerAuthority.bindingGeneration
+      || authority.generation !== providerAuthority.processGeneration
+    ) throw new CommandFailure("RECOVERY_REQUIRED", "Queued dispatch provider-account authority changed.");
     const queued = this.#store.nextPendingQueue(session.id);
     if (queued === null) return;
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
@@ -7894,6 +8811,7 @@ export class HraService {
         queueId: queued.id,
         sessionId: session.id,
         profileGeneration: authority.generation,
+        providerAuthority,
         evidence: {
           kind: "queue.dispatch",
           queueId: queued.id,
@@ -7929,6 +8847,7 @@ export class HraService {
         queueId: queued.id,
         expectedEvidenceDigest: evidence.digest,
         expectedSessionRevision: dispatchRevision,
+        providerAuthority,
         applyResponseState: this.#currentSessionFactEpoch(session.id) === dispatchFactEpoch,
         turnId: result.turnId,
         turnStatus: result.status,
@@ -7968,7 +8887,7 @@ export class HraService {
   }
 
   #scheduleUsageRefresh(authority: ProfileAuthority): void {
-    if (this.#state !== "open") return;
+    if (this.#state !== "open" || authority.provider === "claude") return;
     if (this.#usageRefreshes.has(authority.id)) {
       this.#usageRefreshDirty.add(authority.id);
       return;
@@ -7984,13 +8903,13 @@ export class HraService {
           return;
         }
         if (
-          profile.processGeneration !== authority.generation
+          !this.#profileAuthorityIsCurrent(authority)
           || profile.state !== "signed_in"
         ) return;
         await this.#serialize(`account:${profile.id}`, async () => {
           const current = this.#store.requireProfileById(profile.id);
           if (
-            current.processGeneration !== authority.generation
+            !this.#profileAuthorityIsCurrent(authority)
             || current.state !== "signed_in"
           ) return;
           await this.#usage(
@@ -8089,7 +9008,7 @@ export class HraService {
     }
   }
 
-  async #effect<T>(input: { kind: string; authorityId: string; authorityGeneration: number; request: unknown; idempotencyKey: string | undefined; beginEffect?(attemptId: MutationAttemptRecord["id"]): Promise<void> | void; effect(attemptId: string): Promise<T>; receipt(result: T): unknown; restore(receipt: unknown): T; commit?(attemptId: MutationAttemptRecord["id"], result: T, receipt: unknown): Promise<void> | void; onAmbiguous?: (result: T | undefined) => void }): Promise<T> {
+  async #effect<T>(input: { kind: string; authorityId: string; authorityGeneration: number; request: unknown; idempotencyKey: string | undefined; providerAuthorities?: readonly Readonly<{ role: "primary" | "source" | "target"; authority: ProviderAccountAuthority; provenance: string }>[]; beginEffect?(attemptId: MutationAttemptRecord["id"]): Promise<void> | void; effect(attemptId: string): Promise<T>; receipt(result: T): unknown; restore(receipt: unknown): T; commit?(attemptId: MutationAttemptRecord["id"], result: T, receipt: unknown): Promise<void> | void; onAmbiguous?: (result: T | undefined) => void }): Promise<T> {
     const attempt = this.#store.prepareMutation(input);
     if (attempt.replay) {
       if (attempt.state === "applied") return input.restore(attempt.result);

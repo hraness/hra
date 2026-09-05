@@ -13,6 +13,7 @@ Question: does a detached daemon spawning the runtime under a per-profile `CLAUD
 Recorded so far (2026-09-02, Claude Code 2.1.258, macOS):
 
 - A fresh, empty, mode-0700 `CLAUDE_CONFIG_DIR` fully isolates configuration. `claude auth status` runs non-interactively inside it, reports `loggedIn: false`, creates only `.claude.json`, a lock directory, and `backups/`, and does not touch or prompt for the Keychain.
+- A sanitized credential-free probe of exact Claude Code `2.1.260` recorded exit `1` and the exact, order-insensitive key set `analyticsDisabled`, `apiProvider`, `authMethod`, `loggedIn`, `projectsDirectory`, with types boolean/string/string/boolean/string. The admitted authority literals are `loggedIn: false`, `authMethod: "none"`, and `apiProvider: "firstParty"`; the bounded projects-directory string is validated and discarded. HRA admits only that exit/shape as signed out. Exit `0` and every other shape remain `unverified` because no authenticated auth-status shape has been admitted. No raw path, payload, credential, or identity was retained.
 - The machine's login keychain holds one item for the default configuration, service `Claude Code-credentials`.
 
 Pending, requires the owner to sign in interactively inside an isolated profile home:

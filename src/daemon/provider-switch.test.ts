@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -185,6 +186,8 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
   readonly provider = "claude" as const;
   readonly calls: string[] = [];
   readonly seededMessages: string[] = [];
+  interactionAuthorityCalls = 0;
+  readiness: "signed_in" | "signed_out" | "unverified" = "signed_in";
   startSessionError?: Error;
   #turns = 0;
   projection: CodexSessionProjection = {
@@ -195,8 +198,9 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
   };
 
   pinnedVersion(): string { return CLAUDE_PIN; }
-  async readAccount(): Promise<CodexAccountProjection> {
-    return { signedIn: true, email: "person@example.com" };
+  async readAccount() {
+    this.calls.push("read-account");
+    return { readiness: this.readiness, observedAt: 2_000 };
   }
   async close(): Promise<void> {}
   async reviewSessionStart(
@@ -260,7 +264,14 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
   async steer(): Promise<void> { this.calls.push("steer"); }
   async interrupt(): Promise<void> { this.calls.push("interrupt"); }
   #unsupported(): never { throw new Error("This fixture does not drive that Claude capability."); }
-  interactionAuthority(): never { return this.#unsupported(); }
+  interactionAuthority(
+    _authority: ProfileAuthority,
+    _providerThreadId: string,
+    _requestId: string,
+  ): never {
+    this.interactionAuthorityCalls += 1;
+    return this.#unsupported();
+  }
   inspectInteractionAuthority(): Promise<never> { return Promise.reject(this.#unsupported()); }
   validateInteractionResolution(): Promise<never> { return Promise.reject(this.#unsupported()); }
   resolveInteraction(): Promise<never> { return Promise.reject(this.#unsupported()); }
@@ -293,6 +304,7 @@ type Fixture = Readonly<{
   claude: SwitchFakeClaude;
   codex: SwitchFakeCodex;
   documents: string;
+  paths: ReturnType<typeof resolveStatePaths>;
   service: HraService;
   store: StateStore;
 }>;
@@ -319,7 +331,25 @@ async function fixture(): Promise<Fixture> {
     store,
   });
   services.push(service);
-  return { claude, codex, documents, service, store };
+  return { claude, codex, documents, paths, service, store };
+}
+
+function liveAuthorityFor(
+  store: StateStore,
+  profileSelector: string,
+  provider: "codex" | "claude" = "codex",
+): ProfileAuthority {
+  const profile = store.requireProfile(profileSelector);
+  const authority = store.requireProviderAccountAuthority(profile.id, provider);
+  return {
+    id: authority.profileId,
+    generation: authority.processGeneration,
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+    codexHome: "unused",
+    desktopUserData: "unused",
+  };
 }
 
 async function codexSession(value: Fixture): Promise<Readonly<{
@@ -354,6 +384,190 @@ const transcriptOf = async (
 ));
 
 describe("provider portability", () => {
+  test("drops a stale Claude callback before translator state or runtime authority lookup", async () => {
+    const value = await fixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Stale Claude callback" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute(
+      { kind: "project.add", label: "Claude docs", path: value.documents },
+      { signal },
+    );
+    const started = await value.service.execute({
+      account: added.account.id,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const providerThreadId = value.store.requireSession(started.session.id).providerThreadId;
+    if (providerThreadId === undefined) throw new Error("Expected one bound Claude thread.");
+    const staleAuthority = liveAuthorityFor(value.store, added.account.id, "claude");
+    const current = value.store.requireProviderAccountAuthority(added.account.id, "claude");
+    value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: current.processGeneration,
+      profileId: current.profileId,
+      provider: "claude",
+    });
+    const before = value.store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: started.session.id,
+    }).events.length;
+
+    await value.service.observeClaudeFact(staleAuthority, {
+      blocking: true,
+      connectionId: "30000000-0000-4000-8000-000000000002",
+      display: {
+        availableDecisions: ["once", "decline"],
+        commandClass: "shell",
+        kind: "command_approval",
+        reason: null,
+        summary: "Run a command",
+        workingDirectory: null,
+      },
+      itemId: "same-item",
+      kind: "command_approval",
+      providerThreadId,
+      request: {
+        blockedPath: null,
+        decisionReasonType: null,
+        description: null,
+        displayName: "Shell",
+        input: { command: "true" },
+        permissionSuggestionCount: 0,
+        questions: null,
+        requiresUserInteraction: false,
+        subtype: "can_use_tool",
+        toolName: "Shell",
+        toolUseId: "same-item",
+      },
+      requestId: "same-request",
+      turnId: "same-turn",
+      type: "interactionRequested",
+    });
+    await value.service.observeClaudeFact(staleAuthority, {
+      connectionId: "30000000-0000-4000-8000-000000000002",
+      providerThreadId,
+      requestId: "same-request",
+      type: "interactionCanceled",
+    });
+
+    expect(value.claude.interactionAuthorityCalls).toBe(0);
+    expect(value.store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: started.session.id,
+    }).events).toHaveLength(before);
+  });
+
+  test("does not route a provider notice into another provider session with the same profile generation", async () => {
+    const value = await fixture();
+    const { accountId } = await codexSession(value);
+    const claude = await value.service.execute({
+      account: accountId,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const before = value.store.listSessionEvents({
+      sessionId: claude.session.id,
+      afterSequence: 0,
+    }).events.length;
+
+    await value.service.observeCodexFact(liveAuthorityFor(value.store, accountId, "codex"), {
+      connectionId: "30000000-0000-4000-8000-000000000002",
+      method: "provider/unknown-notification",
+      type: "protocolNotice",
+    });
+
+    const after = value.store.listSessionEvents({
+      sessionId: claude.session.id,
+      afterSequence: 0,
+    }).events;
+    expect(after).toHaveLength(before);
+    expect(after.some((event) => event.body.type === "protocol_incompatible")).toBe(false);
+  });
+
+  test("keeps Claude readiness independent and binds a new session to the observed generation", async () => {
+    const value = await fixture();
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Claude only" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await value.service.execute(
+      { kind: "project.add", label: "Claude docs", path: value.documents },
+      { signal },
+    );
+
+    value.claude.readiness = "unverified";
+    const unverifiedStarted = await value.service.execute({
+      account: added.account.id,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    expect(value.claude.calls).toEqual([
+      "read-account",
+      "review-session",
+      "start-session",
+      "observe",
+    ]);
+    expect(value.store.requireProviderAccountForProfile(
+      added.account.id,
+      "codex",
+    )).toMatchObject({ bindingGeneration: 1, readiness: "signed_out" });
+    const unverified = value.store.requireProviderAccountForProfile(
+      added.account.id,
+      "claude",
+    );
+    expect(unverified).toMatchObject({ bindingGeneration: 1, readiness: "unverified" });
+    expect(value.store.requireSessionProviderAuthority(unverifiedStarted.session.id)).toMatchObject({
+      bindingGeneration: 1,
+      processGeneration: 1,
+      provider: "claude",
+      providerAccountId: unverified.id,
+      routingProvenance: "explicit",
+      appliedPointerRevision: null,
+    });
+    await expect(value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "continue under the explicitly bound unverified authority",
+      session: unverifiedStarted.session.id,
+    }, { signal })).resolves.toMatchObject({ session: { id: unverifiedStarted.session.id } });
+
+    value.claude.readiness = "signed_in";
+    value.claude.projection = {
+      ...value.claude.projection,
+      providerThreadId: "claude-thread-2",
+      providerUpdatedAt: 21,
+    };
+    const started = await value.service.execute({
+      account: added.account.id,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const observed = value.store.requireProviderAccountForProfile(
+      added.account.id,
+      "claude",
+    );
+    expect(observed).toMatchObject({ bindingGeneration: 2, readiness: "signed_in" });
+    expect(value.store.requireSessionProviderAuthority(started.session.id)).toMatchObject({
+      bindingGeneration: 2,
+      processGeneration: 1,
+      provider: "claude",
+      providerAccountId: observed.id,
+      routingProvenance: "explicit",
+      appliedPointerRevision: null,
+    });
+    expect(() => value.store.requireSessionProviderAuthority(unverifiedStarted.session.id))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+  });
+
   test("owns the transcript: a sent message and a tool call are HRA's own records", async () => {
     const value = await fixture();
     const { accountId, sessionId } = await codexSession(value);
@@ -362,12 +576,7 @@ describe("provider portability", () => {
       { signal },
     );
     const profile = value.store.requireProfileById(accountId);
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const threadId = value.store.requireSession(sessionId).providerThreadId;
     if (threadId === undefined) throw new Error("Expected a bound session.");
     const turnId = "codex-turn-1";
@@ -498,6 +707,39 @@ describe("provider portability", () => {
     expect(value.claude.seededMessages.at(-1)).toBe("carry on");
   });
 
+  test("releases a Claude session under its captured generation when the Codex mirror diverges", async () => {
+    const value = await fixture();
+    const { accountId, sessionId } = await codexSession(value);
+    await value.service.execute(
+      { idempotencyKey: crypto.randomUUID(), kind: "session.switch", provider: "claude", session: sessionId },
+      { signal },
+    );
+    const claudeAuthority = value.store.requireSessionProviderAuthority(sessionId);
+    const codexBefore = value.store.requireProviderAccountAuthority(accountId, "codex");
+    value.store.advanceProfileGeneration(accountId, codexBefore.processGeneration);
+    const codexAfter = value.store.requireProviderAccountAuthority(accountId, "codex");
+    expect(codexAfter.processGeneration).not.toBe(claudeAuthority.processGeneration);
+    value.codex.projection = {
+      providerThreadId: "codex-thread-2",
+      title: "Returned session",
+      status: "idle",
+      providerUpdatedAt: 30,
+    };
+
+    await expect(value.service.execute(
+      { idempotencyKey: crypto.randomUUID(), kind: "session.switch", provider: "codex", session: sessionId },
+      { signal },
+    )).resolves.toMatchObject({
+      from: { provider: "claude" },
+      to: { provider: "codex" },
+    });
+    expect(value.claude.calls).toContain("end-session");
+    expect(value.store.requireSession(sessionId)).toMatchObject({
+      provider: "codex",
+      providerThreadId: "codex-thread-2",
+    });
+  });
+
   test("refuses a switch during an active turn and a preset the target cannot run", async () => {
     const value = await fixture();
     const { sessionId } = await codexSession(value);
@@ -547,6 +789,322 @@ describe("provider portability", () => {
     expect(value.codex.endedThreads).toEqual(["codex-thread-1"]);
   });
 
+  test("quarantines a crash-adjacent provider switch and permits only exact local abandon", async () => {
+    const value = await fixture();
+    const { accountId, sessionId } = await codexSession(value);
+    value.claude.projection = {
+      ...value.claude.projection,
+      providerThreadId: "claude-readiness-thread",
+    };
+    await value.service.execute({
+      account: accountId,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal });
+    const source = value.store.requireSessionProviderAuthority(sessionId);
+    const target = value.store.requireProviderAccountAuthority(accountId, "claude");
+    const sourceAuthority = {
+      providerAccountId: source.providerAccountId,
+      profileId: source.profileId,
+      provider: source.provider,
+      bindingGeneration: source.bindingGeneration,
+      processGeneration: source.processGeneration,
+    } as const;
+    const providerAuthorities = [
+      { role: "source" as const, authority: sourceAuthority, provenance: "session_switch_source" },
+      { role: "target" as const, authority: target, provenance: "session_switch_target" },
+    ];
+    const key = "00000000-0000-4000-8000-0000000006c1";
+    const attempt = value.store.prepareMutation({
+      kind: "session.switch",
+      authorityId: sessionId,
+      authorityGeneration: target.processGeneration,
+      request: {
+        provider: "claude",
+        preset: "fable-max",
+        targetProfileId: accountId,
+        seedDigest: "a".repeat(64),
+      },
+      idempotencyKey: key,
+      providerAuthorities,
+    });
+    value.store.beginPreparedMutationEffect({
+      attemptId: attempt.id,
+      providerAuthorities,
+    });
+    const captured = value.store.readMutationProviderAuthorities(attempt.id);
+    const callsBeforeRestart = {
+      claude: [...value.claude.calls],
+      codex: [...value.codex.calls],
+    };
+
+    const daemonGeneration = value.store.nextDaemonGeneration(`boot_${"a".repeat(32)}`);
+    const restarted = new HraService({
+      claude: value.claude,
+      cloud: new OfflineCloud(),
+      codex: value.codex,
+      daemonAuthority: { assertCurrent: async () => {}, close: () => {} },
+      daemonGeneration,
+      paths: value.paths,
+      requestStop: () => undefined,
+      store: value.store,
+    });
+    services.push(restarted);
+    await restarted.recover();
+    expect(value.store.requireSession(sessionId)).toMatchObject({ state: "recovery_required" });
+    expect(value.store.readMutation(key)).toMatchObject({
+      state: "ambiguous",
+      result: { code: "CLAUDE_DAEMON_RESTART_NO_RESUME" },
+    });
+    expect(value.store.readMutationProviderAuthorities(attempt.id)).toEqual(captured);
+    await expect(restarted.execute({ kind: "session.recover", session: sessionId }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.claude.calls).toEqual(callsBeforeRestart.claude);
+    expect(value.codex.calls).toEqual(callsBeforeRestart.codex);
+
+    await expect(restarted.execute({ kind: "session.abandon", session: sessionId }, { signal }))
+      .resolves.toMatchObject({
+        idempotencyKey: key,
+        session: { state: "terminal" },
+        recovery: {
+          resolved: true,
+          resolution: "abandoned",
+          providerEffectRetried: false,
+          providerStateDeleted: false,
+        },
+      });
+    expect(value.store.readMutation(key)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: {
+        kind: "abandoned",
+        evidence: {
+          action: "user_abandon",
+          providerEffectRetried: false,
+          providerStateDeleted: false,
+        },
+      },
+    });
+    expect(value.store.readMutationProviderAuthorities(attempt.id)).toEqual(captured);
+    expect(value.claude.calls).toEqual(callsBeforeRestart.claude);
+    expect(value.codex.calls).toEqual(callsBeforeRestart.codex);
+  });
+
+  test("terminally settles active idle and unbound Claude authority on daemon loss without provider replay", async () => {
+    const value = await fixture();
+    const unrelated = await codexSession(value);
+    const added = await value.service.execute(
+      { kind: "account.add", label: "Claude restart authority" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+
+    value.claude.projection = {
+      providerThreadId: "claude-idle-restart",
+      title: "Claude idle restart",
+      status: "idle",
+      providerUpdatedAt: 30,
+    };
+    const idle = await value.service.execute({
+      account: added.account.id,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    value.claude.projection = {
+      providerThreadId: "claude-active-restart",
+      title: "Claude active restart",
+      status: "active",
+      activeTurnId: "claude-active-turn",
+      providerUpdatedAt: 31,
+    };
+    const active = await value.service.execute({
+      account: added.account.id,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+
+    const project = value.store.listProjects()[0];
+    if (project === undefined) throw new Error("Expected the fixture project.");
+    const claudeAuthority = value.store.requireProviderAccountAuthority(added.account.id, "claude");
+    const reviewed = claudeProfile(liveAuthorityFor(value.store, added.account.id, "claude"));
+    const startKey = "00000000-0000-4000-8000-0000000006d1";
+    const startAttempt = value.store.prepareMutation({
+      kind: "session.start",
+      authorityId: added.account.id,
+      authorityGeneration: claudeAuthority.processGeneration,
+      request: { projectId: project.id, preset: "fable-max", fast: false },
+      idempotencyKey: startKey,
+      providerAuthorities: [{
+        role: "primary",
+        authority: claudeAuthority,
+        provenance: "session_start",
+      }],
+    });
+    const unbound = value.store.beginSessionStartEffect({
+      attemptId: startAttempt.id,
+      profileId: added.account.id,
+      profileGeneration: claudeAuthority.processGeneration,
+      projectId: project.id,
+      provider: "claude",
+      preset: "fable-max",
+      fastEnabled: false,
+      providerAuthority: claudeAuthority,
+      evidence: {
+        kind: "session.start",
+        projectId: project.id,
+        clientMessageId: null,
+        messageDigest: null,
+        runtimeProfile: reviewed,
+      },
+    });
+
+    const idleSession = value.store.requireSession(idle.session.id);
+    const idleAuthority = value.store.requireSessionProviderAuthority(idle.session.id);
+    const idleProviderAuthority = {
+      providerAccountId: idleAuthority.providerAccountId,
+      profileId: idleAuthority.profileId,
+      provider: idleAuthority.provider,
+      bindingGeneration: idleAuthority.bindingGeneration,
+      processGeneration: idleAuthority.processGeneration,
+    } as const;
+    const sendKey = "00000000-0000-4000-8000-0000000006d2";
+    const sendAttempt = value.store.prepareMutation({
+      kind: "session.send",
+      authorityId: idle.session.id,
+      authorityGeneration: idleAuthority.processGeneration,
+      request: { message: "uncertain Claude send" },
+      idempotencyKey: sendKey,
+      providerAuthorities: [{
+        role: "primary",
+        authority: idleProviderAuthority,
+        provenance: "session_send",
+      }],
+    });
+    value.store.beginSessionMutationEffect({
+      attemptId: sendAttempt.id,
+      sessionId: idle.session.id,
+      profileGeneration: idleAuthority.processGeneration,
+      providerAuthority: idleProviderAuthority,
+      evidence: {
+        kind: "session.send",
+        providerThreadId: idleSession.providerThreadId as string,
+        baseline: { providerUpdatedAt: 30, status: "idle", activeTurnId: null },
+        clientMessageId: sendAttempt.id,
+        messageDigest: createHash("sha256").update("uncertain Claude send").digest("hex"),
+        runtimeProfile: reviewed,
+      },
+    });
+    const dispatching = value.store.enqueue(idle.session.id, "uncertain Claude queue");
+    value.store.beginQueueEffect({
+      queueId: dispatching.id,
+      sessionId: idle.session.id,
+      profileGeneration: idleAuthority.processGeneration,
+      providerAuthority: idleProviderAuthority,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: dispatching.id,
+        sessionId: idle.session.id,
+        providerThreadId: idleSession.providerThreadId as string,
+        profileGeneration: idleAuthority.processGeneration,
+        baseline: { providerUpdatedAt: 30, status: "idle", activeTurnId: null },
+        clientMessageId: dispatching.id,
+        messageDigest: createHash("sha256").update("uncertain Claude queue").digest("hex"),
+        runtimeProfile: reviewed,
+      },
+    });
+    const pending = value.store.enqueue(active.session.id, "pending Claude queue");
+    const captured = {
+      dispatching: value.store.readQueueProviderAuthority(dispatching.id),
+      send: value.store.readMutationProviderAuthorities(sendAttempt.id),
+      start: value.store.readMutationProviderAuthorities(startAttempt.id),
+    };
+    const claudeCallsBeforeRestart = [...value.claude.calls];
+
+    const daemonGeneration = value.store.nextDaemonGeneration(`boot_${"b".repeat(32)}`);
+    for (const sessionId of [idle.session.id, active.session.id, unbound.id]) {
+      expect(value.store.requireSession(sessionId)).toMatchObject({ state: "terminal" });
+      expect(() => value.store.requireSessionProviderAuthority(sessionId))
+        .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+      const restartEvents = value.store.listSessionEvents({ sessionId, afterSequence: 0 }).events;
+      expect(restartEvents.filter((event) =>
+        event.body.type === "connection"
+          && event.body.state === "disconnected"
+          && event.body.reason === "daemon_restart_no_resume"))
+        .toHaveLength(1);
+      expect(restartEvents.filter((event) =>
+        event.body.type === "gap" && event.body.reason === "provider_restart"))
+        .toHaveLength(1);
+      const terminal = restartEvents.filter((event) =>
+        event.body.type === "session_status" && event.body.status === "terminal");
+      expect(terminal).toHaveLength(1);
+      expect(terminal[0]).toMatchObject({
+        accountId: added.account.id,
+        providerGeneration: claudeAuthority.processGeneration,
+      });
+      expect(value.store.listUnsettledMutations({ sessionId })).toEqual([]);
+      expect(value.store.listUnsettledQueueEffects(sessionId)).toEqual([]);
+    }
+    expect(value.store.readMutation(sendKey)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: {
+        kind: "abandoned",
+        evidence: { outcome: "indeterminate", providerEffectRetried: false },
+      },
+    });
+    expect(value.store.readMutation(startKey)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "abandoned", evidence: { outcome: "indeterminate" } },
+    });
+    expect(value.store.readQueueEffect(dispatching.id)).toMatchObject({
+      resolution: {
+        kind: "abandoned",
+        evidence: { outcome: "indeterminate", providerEffectRetried: false },
+      },
+    });
+    expect(value.store.requireQueue(dispatching.id)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireQueue(pending.id)).toMatchObject({ state: "cancelled" });
+    expect(value.store.readMutationProviderAuthorities(sendAttempt.id)).toEqual(captured.send);
+    expect(value.store.readMutationProviderAuthorities(startAttempt.id)).toEqual(captured.start);
+    expect(value.store.readQueueProviderAuthority(dispatching.id)).toEqual(captured.dispatching);
+
+    const restarted = new HraService({
+      claude: value.claude,
+      cloud: new OfflineCloud(),
+      codex: value.codex,
+      daemonAuthority: { assertCurrent: async () => {}, close: () => {} },
+      daemonGeneration,
+      paths: value.paths,
+      requestStop: () => undefined,
+      store: value.store,
+    });
+    services.push(restarted);
+    await restarted.recover();
+    for (const sessionId of [idle.session.id, active.session.id, unbound.id]) {
+      await expect(restarted.execute({ kind: "session.status", session: sessionId }, { signal }))
+        .resolves.toMatchObject({
+          advisory: { execution: "terminal" },
+          providerObservation: { reason: "terminal", state: "not_applicable" },
+        });
+      await expect(restarted.execute({ kind: "session.show", session: sessionId, detail: false }, { signal }))
+        .resolves.toMatchObject({
+          session: { state: "terminal" },
+          providerObservation: { reason: "terminal", state: "not_applicable" },
+          next: expect.stringMatching(/Start a new Claude session/u),
+        });
+    }
+    expect(value.claude.calls).toEqual(claudeCallsBeforeRestart);
+    await expect(restarted.execute({ kind: "session.status", session: unrelated.sessionId }, { signal }))
+      .resolves.toMatchObject({ providerObservation: { state: "live" } });
+    expect(value.claude.calls).toEqual(claudeCallsBeforeRestart);
+  });
+
   test("refuses a switch to the provider the session already runs", async () => {
     const value = await fixture();
     const { sessionId } = await codexSession(value);
@@ -569,12 +1127,7 @@ describe("provider portability", () => {
     const threadId = value.store.requireSession(sessionId).providerThreadId;
     if (threadId === undefined) throw new Error("Expected a bound session.");
     for (const type of ["itemStarted", "itemCompleted"] as const) {
-      await value.service.observeCodexFact({
-        id: profile.id,
-        generation: profile.processGeneration,
-        codexHome: "unused",
-        desktopUserData: "unused",
-      }, {
+      await value.service.observeCodexFact(liveAuthorityFor(value.store, profile.id), {
         connectionId: "30000000-0000-4000-8000-000000000001",
         threadId,
         turnId: "codex-turn-1",

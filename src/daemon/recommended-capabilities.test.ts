@@ -27,6 +27,9 @@ const base = (): CodexCapabilitySnapshot => ({
 const authority = {
   id: "acct_00000000000000000000000000000000" as never,
   generation: 7,
+  provider: "codex" as const,
+  providerAccountId: "acct_00000000000000000000000000000000" as never,
+  bindingGeneration: 1,
   codexHome: "/profiles/a/codex-home",
   desktopUserData: "/profiles/a/desktop-user-data",
 };

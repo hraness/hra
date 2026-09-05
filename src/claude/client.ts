@@ -177,12 +177,14 @@ export class ClaudeStreamClient {
   }
 
   async #readStdout(): Promise<void> {
+    let disconnectReason: "eof" | "protocol_fault" = "eof";
     try {
       for await (const chunk of this.#process.stdout) {
         for (const value of this.#decoder.push(chunk)) await this.#dispatch(value);
       }
       for (const value of this.#decoder.finish()) await this.#dispatch(value);
     } catch (error: unknown) {
+      disconnectReason = "protocol_fault";
       this.#onSafeDiagnostic?.(
         error instanceof ClaudeError
           ? `claude stream fault: ${error.code}`
@@ -193,6 +195,7 @@ export class ClaudeStreamClient {
       for (const fact of this.#assembler.abandonTurn("the Claude stream ended")) {
         await this.#onFact(fact);
       }
+      await this.#onFact({ reason: disconnectReason, type: "providerDisconnected" });
     }
   }
 

@@ -28,7 +28,21 @@ const authority = {
   generation: 1,
   codexHome: join(tmpdir(), "hra-fake"),
   desktopUserData: join(tmpdir(), "hra-fake-desktop"),
+  provider: "codex",
+  providerAccountId: "acct_00000000000000000000000000000000",
+  bindingGeneration: 1,
 } as const;
+
+const clientAuthority = (
+  source: ProfileAuthority = authority,
+  processGeneration = source.generation,
+) => ({
+  profileId: source.id,
+  processGeneration,
+  provider: "codex" as const,
+  providerAccountId: source.providerAccountId,
+  bindingGeneration: source.bindingGeneration,
+});
 
 const CREDENTIAL_STORE_PREFLIGHT = Object.freeze({
   cliAuth: "file",
@@ -64,10 +78,7 @@ function createRuntimeManager(input: TestRuntimeManagerOptions): PinnedCodexRunt
               });
             }
             mutable.resumeThread ??= async (threadId: string) => ({
-              authority: {
-                profileId: options.authority.profileId,
-                processGeneration: options.authority.processGeneration,
-              },
+              authority: options.authority,
               value: makeThread([], threadId),
             });
             return client;
@@ -105,16 +116,35 @@ const makeThread = (turns: readonly CodexTurn[], id = "thread-1"): CodexThread =
 });
 
 describe("PinnedCodexRuntimeManager", () => {
+  test("rejects another provider before launching a Codex client", async () => {
+    let launches = 0;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => {
+        launches += 1;
+        throw new Error("must not launch");
+      },
+    });
+    await expect(manager.readAccount({
+      authority: {
+        ...authority,
+        provider: "claude",
+        providerAccountId: "pact_00000000000000000000000000000000",
+      },
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(launches).toBe(0);
+    await manager.close();
+  });
+
   test("single-flights an exact resumed thread observation by generation and connection", async () => {
     let resumeCalls = 0;
     let releaseResume!: () => void;
     let markResumeEntered!: () => void;
     const resumeGate = new Promise<void>((resolve) => { releaseResume = resolve; });
     const resumeEntered = new Promise<void>((resolve) => { markResumeEntered = resolve; });
-    const providerAuthority = {
-      profileId: authority.id,
-      processGeneration: authority.generation,
-    };
+    const providerAuthority = clientAuthority();
     const connectionId = "71000000-0000-4000-8000-000000000001";
     const fake = {
       state: "ready",
@@ -167,10 +197,7 @@ describe("PinnedCodexRuntimeManager", () => {
     let resumeCalls = 0;
     let readCalls = 0;
     let turnListCalls = 0;
-    const providerAuthority = {
-      profileId: authority.id,
-      processGeneration: authority.generation,
-    };
+    const providerAuthority = clientAuthority();
     const connectionId = "71000000-0000-4000-8000-000000000004";
     const providerThreadId = "thread-refresh";
     let current = makeThread([], providerThreadId);
@@ -242,10 +269,7 @@ describe("PinnedCodexRuntimeManager", () => {
   test("propagates a fresh projection-read error without replaying the cached resume", async () => {
     let resumeCalls = 0;
     let readCalls = 0;
-    const providerAuthority = {
-      profileId: authority.id,
-      processGeneration: authority.generation,
-    };
+    const providerAuthority = clientAuthority();
     const providerThreadId = "thread-read-failure";
     const readError = new CodexError("REMOTE_ERROR", "Codex rejected thread/read.");
     const fake = {
@@ -336,7 +360,7 @@ describe("PinnedCodexRuntimeManager", () => {
       readThread: async () => {
         readCalls += 1;
         return {
-          authority: { profileId: authority.id, processGeneration: authority.generation },
+          authority: clientAuthority(),
           value: makeThread([], providerThreadId),
         };
       },
@@ -363,7 +387,7 @@ describe("PinnedCodexRuntimeManager", () => {
     }
     expect(resumeCalls).toBe(1);
     await onFact?.({
-      authority: { profileId: authority.id, processGeneration: authority.generation },
+      authority: clientAuthority(),
       value: {
         type: "threadNameUpdated",
         threadId: providerThreadId,
@@ -385,10 +409,7 @@ describe("PinnedCodexRuntimeManager", () => {
 
   test("forwards Codex thread-list cursors and preserves the provider continuation", async () => {
     let requested: Parameters<CodexAppServerClient["listThreads"]>[0] | undefined;
-    const providerAuthority = {
-      profileId: authority.id,
-      processGeneration: authority.generation,
-    };
+    const providerAuthority = clientAuthority();
     const fake = {
       state: "ready",
       listThreads: async (options: Parameters<CodexAppServerClient["listThreads"]>[0]) => {
@@ -430,7 +451,7 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       accountRead: async () => ({
-        authority: { profileId: authority.id, processGeneration: authority.generation },
+        authority: clientAuthority(),
         value: { account: null, requiresOpenaiAuth: true },
       }),
       close: async () => undefined,
@@ -489,7 +510,7 @@ describe("PinnedCodexRuntimeManager", () => {
       state: "ready",
       connectionId: exactConnectionId,
       accountRead: async () => ({
-        authority: { profileId: authority.id, processGeneration: authority.generation },
+        authority: clientAuthority(),
         value: { account: null, requiresOpenaiAuth: true },
       }),
       close: async () => undefined,
@@ -524,7 +545,7 @@ describe("PinnedCodexRuntimeManager", () => {
     const connectionId = fake.connectionId;
     expect(connectionId).toBe(exactConnectionId);
     const call = {
-      authority: { profileId: authority.id, processGeneration: authority.generation },
+      authority: clientAuthority(),
       connectionId,
       requestId: { type: "string", value: "tool-request" },
       requestDigest: "a".repeat(64),
@@ -557,6 +578,15 @@ describe("PinnedCodexRuntimeManager", () => {
     await launched.onConversationAutomationToolResponseWritten(staleConnectionCall);
     expect(handled).toEqual([call]);
     expect(responseWritten).toEqual([call]);
+    const staleBindingCall = {
+      ...call,
+      authority: { ...call.authority, bindingGeneration: 2 },
+    };
+    await expect(launched.onConversationAutomationToolCall(staleBindingCall))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    await launched.onConversationAutomationToolResponseWritten(staleBindingCall);
+    expect(handled).toEqual([call]);
+    expect(responseWritten).toEqual([call]);
     await manager.close();
   });
 
@@ -565,11 +595,11 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       accountRead: async () => ({
-        authority: { profileId: authority.id, processGeneration: authority.generation },
+        authority: clientAuthority(),
         value: { account: null, requiresOpenaiAuth: true },
       }),
       startManagedLogin: async () => ({
-        authority: { profileId: authority.id, processGeneration: authority.generation },
+        authority: clientAuthority(),
         value: {
           type: "chatgptDeviceCode" as const,
           loginId: "provider-login-exact",
@@ -580,7 +610,7 @@ describe("PinnedCodexRuntimeManager", () => {
       cancelManagedLogin: async (loginId: string) => {
         canceled.push(loginId);
         return {
-          authority: { profileId: authority.id, processGeneration: authority.generation },
+          authority: clientAuthority(),
           value: { status: "canceled" as const },
         };
       },
@@ -624,7 +654,7 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       get state() { return state; },
       accountRead: async () => ({
-        authority: { profileId: authority.id, processGeneration: authority.generation },
+        authority: clientAuthority(),
         value: {
           account: { type: "chatgpt", email: "person@example.com", planType: "pro" },
           requiresOpenaiAuth: true,
@@ -654,7 +684,7 @@ describe("PinnedCodexRuntimeManager", () => {
     if (launched === undefined) throw new Error("Missing launch fixture.");
     if (launched.onFact === undefined) throw new Error("Missing fact observer fixture.");
     await launched.onFact({
-      authority: { profileId: authority.id, processGeneration: authority.generation },
+      authority: clientAuthority(),
       value: {
         type: "providerDisconnected",
         connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
@@ -674,6 +704,111 @@ describe("PinnedCodexRuntimeManager", () => {
     await manager.close();
   });
 
+  test("allows a new binding at the same process generation while fencing the exact ended authority", async () => {
+    const originalAuthority = {
+      ...authority,
+      provider: "codex",
+      providerAccountId: authority.id,
+      bindingGeneration: 1,
+    } as const;
+    const rotatedAuthority = {
+      ...originalAuthority,
+      bindingGeneration: 2,
+    } as const;
+    const launches: number[] = [];
+    const closed: number[] = [];
+    let originalOnFact: LaunchPinnedCodexOptions["onFact"];
+    const makeClient = (
+      bindingGeneration: number,
+      providerAuthority: LaunchPinnedCodexOptions["authority"],
+    ) => ({
+      state: "ready",
+      connectionId: `71000000-0000-4000-8000-${String(bindingGeneration).padStart(12, "0")}`,
+      accountUsage: async () => ({
+        authority: providerAuthority,
+        value: {
+          summary: {
+            lifetimeTokens: bindingGeneration,
+            peakDailyTokens: null,
+            longestRunningTurnSec: null,
+            currentStreakDays: null,
+            longestStreakDays: null,
+          },
+          dailyUsageBuckets: null,
+        },
+      }),
+      accountRateLimits: async () => ({
+        authority: providerAuthority,
+        value: {
+          primary: {
+            limitId: null,
+            limitName: null,
+            primary: null,
+            secondary: null,
+            planType: null,
+            rateLimitReachedType: null,
+          },
+          byLimitId: null,
+        },
+      }),
+      close: async () => { closed.push(bindingGeneration); },
+    }) as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async (options) => {
+        const bindingGeneration = options.authority.bindingGeneration;
+        if (bindingGeneration === undefined) throw new Error("Missing binding generation fixture.");
+        launches.push(bindingGeneration);
+        if (bindingGeneration === originalAuthority.bindingGeneration) {
+          originalOnFact = options.onFact;
+        }
+        return makeClient(bindingGeneration, options.authority);
+      },
+    });
+
+    await manager.readUsage({
+      authority: originalAuthority,
+      signal: new AbortController().signal,
+    });
+    if (originalOnFact === undefined) throw new Error("Missing original fact observer fixture.");
+    await originalOnFact({
+      authority: {
+        profileId: originalAuthority.id,
+        processGeneration: originalAuthority.generation,
+        provider: originalAuthority.provider,
+        providerAccountId: originalAuthority.providerAccountId,
+        bindingGeneration: originalAuthority.bindingGeneration,
+      },
+      value: {
+        type: "providerDisconnected",
+        connectionId: "71000000-0000-4000-8000-000000000001",
+        reason: "process_exit",
+      },
+    });
+
+    await expect(manager.readUsage({
+      authority: rotatedAuthority,
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({
+      payload: { usage: { summary: { lifetimeTokens: 2 } } },
+    });
+    await expect(manager.readUsage({
+      authority: rotatedAuthority,
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({
+      payload: { usage: { summary: { lifetimeTokens: 2 } } },
+    });
+    await expect(manager.readUsage({
+      authority: originalAuthority,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+
+    expect(launches).toEqual([1, 2]);
+    expect(closed).toEqual([1]);
+    await manager.close();
+  });
+
   test("routes interaction responses only to the exact live connection and generation", async () => {
     const connectionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
     const calls: unknown[] = [];
@@ -689,7 +824,7 @@ describe("PinnedCodexRuntimeManager", () => {
       get state() { return clientState; },
       connectionId,
       accountRead: async () => ({
-        authority: { profileId: authority.id, processGeneration: authority.generation },
+        authority: clientAuthority(),
         value: { account: { type: "chatgpt", email: "person@example.com", planType: "pro" }, requiresOpenaiAuth: true },
       }),
       resolveInteraction: async (input: unknown) => {
@@ -737,8 +872,11 @@ describe("PinnedCodexRuntimeManager", () => {
     });
     await manager.readAccount({ authority, signal: new AbortController().signal });
     const provider = {
+      bindingGeneration: authority.bindingGeneration,
       profileId: authority.id,
       processGeneration: authority.generation,
+      provider: authority.provider,
+      providerAccountId: authority.providerAccountId,
       connectionId,
       requestId: { type: "number" as const, value: 7 },
       method: "item/fileChange/requestApproval",
@@ -896,10 +1034,7 @@ describe("PinnedCodexRuntimeManager", () => {
     };
     const requests: unknown[] = [];
     const credentialStoreChecks: string[] = [];
-    const providerAuthority = {
-      profileId: authority.id,
-      processGeneration: authority.generation,
-    };
+    const providerAuthority = clientAuthority();
     const fake = {
       state: "ready",
       assertCredentialStores: async (cwd: string) => {
@@ -960,7 +1095,7 @@ describe("PinnedCodexRuntimeManager", () => {
     let emitDeletionDuringContextualDiscovery = false;
     let onFact: LaunchPinnedCodexOptions["onFact"];
     let sandboxWritableRoots = ["/workspace/project"];
-    const providerAuthority = { profileId: authority.id, processGeneration: authority.generation };
+    const providerAuthority = clientAuthority();
     const connectionId = "71000000-0000-4000-8000-000000000006";
     const capabilities = (suffix: string): CodexCapabilitySnapshot => ({
       models: [{
@@ -1544,12 +1679,12 @@ describe("PinnedCodexRuntimeManager", () => {
       state: "ready",
       readThread: async (threadId: string, includeTurns: boolean) => {
         calls.push({ method: "read", threadId, includeTurns });
-        return { authority: { profileId: authority.id, processGeneration: 1 }, value: makeThread([]) };
+        return { authority: clientAuthority(authority, 1), value: makeThread([]) };
       },
       listThreadTurns: async (options: unknown) => {
         calls.push({ method: "turns", options });
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: {
             data: [makeTurn("new", [{ type: "agentMessage", id: "a", text: "new" }]), makeTurn("old", [{ type: "userMessage", id: "u", clientId: "client-old", text: ["old"] }])],
             nextCursor: "older",
@@ -1566,7 +1701,7 @@ describe("PinnedCodexRuntimeManager", () => {
               { turnId: "new", item: { type: "fileChange", id: "file", status: "completed", changedPaths: ["/workspace/project/src/index.ts"] } },
               { turnId: "new", item: { type: "commandExecution", id: "command", command: "git status", cwd: "/workspace/project", status: "completed", exitCode: 0, durationMs: 5 } },
             ];
-        return { authority: { profileId: authority.id, processGeneration: 1 }, value: { data, nextCursor: null, backwardsCursor: null } };
+        return { authority: clientAuthority(authority, 1), value: { data, nextCursor: null, backwardsCursor: null } };
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
@@ -1599,14 +1734,14 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       readThread: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: legacyMetadata,
       }),
       listThreadTurns: async (options: { itemsView: "notLoaded" | "summary" | "full" }) => {
         calls.push({ method: "turns", options });
         if (options.itemsView === "full") throw new Error("legacy session reads must not request the full multi-turn view");
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: {
             data: options.itemsView === "summary"
               ? recentDescending
@@ -1658,11 +1793,11 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       readThread: async (threadId: string) => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: makeThread([], threadId),
       }),
       listThreadTurns: async (options: { threadId: string; itemsView: "notLoaded" | "summary" }) => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: {
           data: [makeTurn(`${options.threadId}-turn`, options.itemsView === "summary"
             ? [{ type: "agentMessage", id: `${options.threadId}-answer`, text: options.threadId }]
@@ -1677,7 +1812,7 @@ describe("PinnedCodexRuntimeManager", () => {
           throw new CodexRemoteError(-32_601, "request failed");
         }
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: {
             data: [{ turnId: options.turnId, item: { type: "agentMessage", id: "answer", text: "paginated" } }],
             nextCursor: null,
@@ -1718,18 +1853,18 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       readThread: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: makeThread([]),
       }),
       listThreadTurns: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: { data: [makeTurn("long-complete", [])], nextCursor: null, backwardsCursor: null },
       }),
       listThreadItems: async (options: { cursor?: string | null; sortDirection: "asc" | "desc"; turnId: string }) => {
         calls.push(options);
         if (options.sortDirection === "asc" && options.cursor === undefined) {
           return {
-            authority: { profileId: authority.id, processGeneration: 1 },
+            authority: clientAuthority(authority, 1),
             value: {
               data: [
                 { turnId: options.turnId, item: { type: "userMessage", id: "user", clientId: "client", text: ["question"] } },
@@ -1744,7 +1879,7 @@ describe("PinnedCodexRuntimeManager", () => {
           };
         }
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: {
             data: [
               { turnId: options.turnId, item: { type: "agentMessage", id: "final", text: oversizedAnswer } },
@@ -1797,11 +1932,11 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       readThread: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: makeThread([]),
       }),
       listThreadTurns: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: { data: [...chronologicalTurns].reverse(), nextCursor: null, backwardsCursor: null },
       }),
       listThreadItems: async (options: { cursor?: string | null; sortDirection: "asc" | "desc"; turnId: string }) => {
@@ -1829,7 +1964,7 @@ describe("PinnedCodexRuntimeManager", () => {
                 ...tailReasoning,
               ];
           return {
-            authority: { profileId: authority.id, processGeneration: 1 },
+            authority: clientAuthority(authority, 1),
             value: { data, nextCursor: "unread-tail", backwardsCursor: null },
           };
         }
@@ -1849,7 +1984,7 @@ describe("PinnedCodexRuntimeManager", () => {
               item: { type: "reasoning", id: `page-${String(pageIndex)}-reason-${String(index)}`, summary: [] },
             }));
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: {
             data,
             nextCursor: `${options.turnId}-cursor-${String(pageIndex + 1)}`,
@@ -1895,18 +2030,18 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       readThread: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: makeThread([]),
       }),
       listThreadTurns: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: { data: [makeTurn("byte-bounded", [])], nextCursor: null, backwardsCursor: null },
       }),
       listThreadItems: async (options: { cursor?: string | null; sortDirection: "asc" | "desc" }) => {
         calls.push(options);
         if (options.sortDirection === "desc") {
           return {
-            authority: { profileId: authority.id, processGeneration: 1 },
+            authority: clientAuthority(authority, 1),
             value: {
               data: [
                 { turnId: "byte-bounded", item: { type: "agentMessage", id: "final-answer", text: huge } },
@@ -1922,7 +2057,7 @@ describe("PinnedCodexRuntimeManager", () => {
           };
         }
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: {
             data: [
               { turnId: "byte-bounded", item: { type: "userMessage", id: "head-user", clientId: "client-byte", text: ["retain the final answer"] } },
@@ -1973,18 +2108,18 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       readThread: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: makeThread([]),
       }),
       listThreadTurns: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: { data: [...chronologicalTurns].reverse(), nextCursor: null, backwardsCursor: null },
       }),
       listThreadItems: async (options: { cursor?: string | null; sortDirection: "asc" | "desc"; turnId: string }) => {
         calls.push(options);
         if (options.sortDirection === "asc" && options.turnId === "turn-later") {
           return {
-            authority: { profileId: authority.id, processGeneration: 1 },
+            authority: clientAuthority(authority, 1),
             value: {
               data: [
                 { turnId: options.turnId, item: { type: "userMessage", id: "later-head-user", clientId: "later-client", text: ["later question"] } },
@@ -1997,7 +2132,7 @@ describe("PinnedCodexRuntimeManager", () => {
         }
         if (options.sortDirection === "asc") {
           return {
-            authority: { profileId: authority.id, processGeneration: 1 },
+            authority: clientAuthority(authority, 1),
             value: {
               data: [
                 { turnId: options.turnId, item: { type: "userMessage", id: "older-head-user", clientId: "original-client", text: ["original question"] } },
@@ -2010,7 +2145,7 @@ describe("PinnedCodexRuntimeManager", () => {
         }
         if (options.turnId === "turn-later") {
           return {
-            authority: { profileId: authority.id, processGeneration: 1 },
+            authority: clientAuthority(authority, 1),
             value: {
               data: [{ turnId: options.turnId, item: { type: "agentMessage", id: "later-final", text: "later final" } }],
               nextCursor: "later-unread-tail",
@@ -2019,7 +2154,7 @@ describe("PinnedCodexRuntimeManager", () => {
           };
         }
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: {
             data: [
               { turnId: options.turnId, item: { type: "agentMessage", id: "older-final", text: "older final" } },
@@ -2069,17 +2204,17 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       readThread: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: makeThread([]),
       }),
       listThreadTurns: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: { data: [makeTurn("cyclic", [])], nextCursor: null, backwardsCursor: null },
       }),
       listThreadItems: async () => {
         page += 1;
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: {
             data: [{ turnId: "cyclic", item: { type: "reasoning", id: `reason-${String(page)}`, summary: [] } }],
             nextCursor: "same-cursor",
@@ -2112,16 +2247,16 @@ describe("PinnedCodexRuntimeManager", () => {
       state: "ready",
       readThread: async (threadId: string, includeTurns: boolean) => {
         calls.push({ method: "read", threadId, includeTurns });
-        return { authority: { profileId: authority.id, processGeneration: 1 }, value: makeThread([]) };
+        return { authority: clientAuthority(authority, 1), value: makeThread([]) };
       },
       listThreadTurns: async (options: unknown) => {
         calls.push({ method: "turns", options });
-        return { authority: { profileId: authority.id, processGeneration: 1 }, value: { data: [target], nextCursor: null, backwardsCursor: "back" } };
+        return { authority: clientAuthority(authority, 1), value: { data: [target], nextCursor: null, backwardsCursor: "back" } };
       },
       listThreadItems: async (options: unknown) => {
         calls.push({ method: "items", options });
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: {
             data: [
               { turnId: "target", item: { type: "agentMessage", id: "answer", text: "done" } },
@@ -2170,25 +2305,25 @@ describe("PinnedCodexRuntimeManager", () => {
     const fake = {
       state: "ready",
       readThread: async () => ({
-        authority: { profileId: authority.id, processGeneration: 1 },
+        authority: clientAuthority(authority, 1),
         value: { ...makeThread([]), historyMode: "legacy" as const },
       }),
       listThreadTurns: async (options: { cursor?: string | null; limit: number; itemsView: "notLoaded" | "full" }) => {
         calls.push(options);
         if (options.itemsView === "full") {
           return {
-            authority: { profileId: authority.id, processGeneration: 1 },
+            authority: clientAuthority(authority, 1),
             value: { data: [fullTarget], nextCursor: null, backwardsCursor: "target-anchor" },
           };
         }
         if (options.limit === 1) {
           return {
-            authority: { profileId: authority.id, processGeneration: 1 },
+            authority: clientAuthority(authority, 1),
             value: { data: [newer], nextCursor: "before-target", backwardsCursor: "newer-anchor" },
           };
         }
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: { data: [newer, target], nextCursor: null, backwardsCursor: "newer-anchor" },
         };
       },
@@ -2231,7 +2366,7 @@ describe("PinnedCodexRuntimeManager", () => {
       state: "ready",
       accountRead: async (refreshToken = false) => {
         if (!refreshToken) {
-          return { authority: { profileId: authority.id, processGeneration: 1 }, value: { account: { type: "chatgpt", email: "initial@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
+          return { authority: clientAuthority(authority, 1), value: { account: { type: "chatgpt", email: "initial@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
         }
         refreshCalls += 1;
         if (refreshCalls === 1) {
@@ -2239,7 +2374,7 @@ describe("PinnedCodexRuntimeManager", () => {
           throw new Error("transient refresh failure");
         }
         signalTrailing();
-        return { authority: { profileId: authority.id, processGeneration: 1 }, value: { account: { type: "chatgpt", email: "fresh@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
+        return { authority: clientAuthority(authority, 1), value: { account: { type: "chatgpt", email: "fresh@example.com", planType: "pro" }, requiresOpenaiAuth: true } };
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
@@ -2252,7 +2387,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
     });
     await manager.readAccount({ authority, signal: new AbortController().signal });
-    const providerAuthority = { profileId: authority.id, processGeneration: 1 };
+    const providerAuthority = clientAuthority(authority, 1);
     await onFact?.({ authority: providerAuthority, value: { type: "accountUpdated", authMode: "chatgpt", planType: "pro" } });
     await Promise.resolve();
     expect(refreshCalls).toBe(1);
@@ -2273,7 +2408,7 @@ describe("PinnedCodexRuntimeManager", () => {
       accountRead: async (refreshToken = false) => {
         if (refreshToken) refreshCalls += 1;
         return {
-          authority: { profileId: authority.id, processGeneration: 1 },
+          authority: clientAuthority(authority, 1),
           value: { account: null, requiresOpenaiAuth: true },
         };
       },
@@ -2302,7 +2437,7 @@ describe("PinnedCodexRuntimeManager", () => {
       success: false,
     } as const;
     await onFact?.({
-      authority: { profileId: authority.id, processGeneration: 1 },
+      authority: clientAuthority(authority, 1),
       value: failed,
     });
     await manager.close();
@@ -2320,7 +2455,7 @@ describe("PinnedCodexRuntimeManager", () => {
     let closeCalls = 0;
     const observedFacts: CodexFact[] = [];
     const observedAccounts: CodexAccountProjection[] = [];
-    const providerAuthority = { profileId: authority.id, processGeneration: authority.generation };
+    const providerAuthority = clientAuthority();
     const fake = {
       state: "ready",
       accountRead: async () => ({ authority: providerAuthority, value: { account: { type: "chatgpt", email: "ready@example.com", planType: "pro" }, requiresOpenaiAuth: true } }),
@@ -2370,7 +2505,7 @@ describe("PinnedCodexRuntimeManager", () => {
     const refreshStarted = new Promise<void>((resolve) => { signalRefreshStarted = resolve; });
     let closeCalls = 0;
     const observed: CodexAccountProjection[] = [];
-    const providerAuthority = { profileId: authority.id, processGeneration: authority.generation };
+    const providerAuthority = clientAuthority();
     const fake = {
       state: "ready",
       accountRead: async (refreshToken = false) => {
@@ -2410,9 +2545,9 @@ describe("PinnedCodexRuntimeManager", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const fake = {
       state: "ready",
-      accountUsage: async () => ({ authority: { profileId: authority.id, processGeneration: 1 }, value: { summary: { lifetimeTokens: 1, peakDailyTokens: null, longestRunningTurnSec: null, currentStreakDays: null, longestStreakDays: null }, dailyUsageBuckets: null } }),
-      accountRateLimits: async () => ({ authority: { profileId: authority.id, processGeneration: 1 }, value: { primary: { limitId: null, limitName: null, primary: null, secondary: null, planType: null, rateLimitReachedType: null }, byLimitId: null } }),
-      listThreads: async () => ({ authority: { profileId: authority.id, processGeneration: 1 }, value: { data: [], nextCursor: null, backwardsCursor: null } }),
+      accountUsage: async () => ({ authority: clientAuthority(authority, 1), value: { summary: { lifetimeTokens: 1, peakDailyTokens: null, longestRunningTurnSec: null, currentStreakDays: null, longestStreakDays: null }, dailyUsageBuckets: null } }),
+      accountRateLimits: async () => ({ authority: clientAuthority(authority, 1), value: { primary: { limitId: null, limitName: null, primary: null, secondary: null, planType: null, rateLimitReachedType: null }, byLimitId: null } }),
+      listThreads: async () => ({ authority: clientAuthority(authority, 1), value: { data: [], nextCursor: null, backwardsCursor: null } }),
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
     const manager = createRuntimeManager({
@@ -2438,8 +2573,8 @@ describe("PinnedCodexRuntimeManager", () => {
     const closed: number[] = [];
     const makeClient = (generation: number) => ({
       state: "ready",
-      accountUsage: async () => ({ authority: { profileId: authority.id, processGeneration: generation }, value: { summary: { lifetimeTokens: generation, peakDailyTokens: null, longestRunningTurnSec: null, currentStreakDays: null, longestStreakDays: null }, dailyUsageBuckets: null } }),
-      accountRateLimits: async () => ({ authority: { profileId: authority.id, processGeneration: generation }, value: { primary: { limitId: null, limitName: null, primary: null, secondary: null, planType: null, rateLimitReachedType: null }, byLimitId: null } }),
+      accountUsage: async () => ({ authority: clientAuthority(authority, generation), value: { summary: { lifetimeTokens: generation, peakDailyTokens: null, longestRunningTurnSec: null, currentStreakDays: null, longestStreakDays: null }, dailyUsageBuckets: null } }),
+      accountRateLimits: async () => ({ authority: clientAuthority(authority, generation), value: { primary: { limitId: null, limitName: null, primary: null, secondary: null, planType: null, rateLimitReachedType: null }, byLimitId: null } }),
       close: async () => { closed.push(generation); },
     }) as unknown as CodexAppServerClient;
     const manager = createRuntimeManager({
@@ -2477,8 +2612,8 @@ describe("PinnedCodexRuntimeManager", () => {
     const makeClient = (generation: number) => ({
       state: "ready",
       connectionId: `connection-${generation}`,
-      accountUsage: async () => ({ authority: { profileId: authority.id, processGeneration: generation }, value: { summary: { lifetimeTokens: generation, peakDailyTokens: null, longestRunningTurnSec: null, currentStreakDays: null, longestStreakDays: null }, dailyUsageBuckets: null } }),
-      accountRateLimits: async () => ({ authority: { profileId: authority.id, processGeneration: generation }, value: { primary: { limitId: null, limitName: null, primary: null, secondary: null, planType: null, rateLimitReachedType: null }, byLimitId: null } }),
+      accountUsage: async () => ({ authority: clientAuthority(authority, generation), value: { summary: { lifetimeTokens: generation, peakDailyTokens: null, longestRunningTurnSec: null, currentStreakDays: null, longestStreakDays: null }, dailyUsageBuckets: null } }),
+      accountRateLimits: async () => ({ authority: clientAuthority(authority, generation), value: { primary: { limitId: null, limitName: null, primary: null, secondary: null, planType: null, rateLimitReachedType: null }, byLimitId: null } }),
       close: async () => { closed.push(generation); },
     }) as unknown as CodexAppServerClient;
     const manager = createRuntimeManager({

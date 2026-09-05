@@ -7,6 +7,7 @@ import {
   addCloudProjectionRecovery,
   advanceCloudSessionRemoteCursor,
   assertCloudDaemonJournalFutureCapacity,
+  cloudCommandLocalAuthorityDigest,
   cloudProjectionRecoveryReceiptResult,
   cloudProjectionRecoveryWindowMs,
   CloudDaemonJournalRecoveryBlocker,
@@ -16,15 +17,18 @@ import {
   CustodyCloudSessionSyncCursor,
   emptyCloudDaemonJournal,
   emptyCloudSessionSyncCursor,
+  hasUnsettledCompactProjectionRecovery,
   hasUnsettledCompactProjectionRecoveryForProfile,
   invalidIdempotencyProjectionRecoveryCode,
   isIdentityBoundCloudProjectionRecovery,
+  isProviderBoundCloudProjectionRecoveryLocalAuthority,
   matchesCloudProjectionRecoveryIdentity,
   parseCloudDaemonJournal,
   parseCloudSessionSyncCursor,
   parseCloudProjectionRecoveryEntry,
   parseCloudProjectionRecoveryTerminalReceipt,
   providerDeletionProjectionRecoveryCode,
+  quarantineUnprovableProviderProjectionRecoveries,
   pruneExpiredCloudProjectionRecoveryReceipts,
   sameCloudProjectionRecoveryEntry,
   sameCloudProjectionRecoveryTerminalReceipt,
@@ -40,6 +44,7 @@ import {
   type LegacyCloudDaemonJournalV2State,
   type LegacyCloudProjectionRecoveryJournalEntry,
   type PendingCloudUsageAccount,
+  unprovableProviderAuthorityProjectionRecoveryCode,
 } from "./daemon-journal";
 
 const fixedNow = 1_700_000_000_000;
@@ -87,8 +92,11 @@ function recovery(
     idempotencyKey: uuidV7(index * 2 + 1),
     lineageCommitment: digest("a"),
     localAuthority: {
-      profileGeneration: index + 1,
-      profileId: `profile_${index.toString().padStart(8, "0")}`,
+      bindingGeneration: index + 1,
+      processGeneration: index + 1,
+      profileId: `acct_${index.toString(16).padStart(32, "0")}`,
+      provider: "codex" as const,
+      providerAccountId: `acct_${index.toString(16).padStart(32, "0")}` as const,
       providerUpdatedAt: fixedNow + index,
       providerThreadId: `thread/${index}`,
       sessionRevision: index + 1,
@@ -133,11 +141,30 @@ function terminalReceipt(
 function withoutIdentity(
   entry: CloudProjectionRecoveryJournalEntry,
 ): Omit<CloudProjectionRecoveryJournalEntry, "sourceDevicePublicId" | "userPublicId"> {
-  return Object.fromEntries(Object.entries(entry).filter(([key]) =>
-    key !== "sourceDevicePublicId" && key !== "userPublicId")) as Omit<
+  const topLevel = Object.fromEntries(Object.entries(entry).filter(([key]) =>
+    key !== "sourceDevicePublicId" && key !== "userPublicId"));
+  return topLevel as Omit<
       CloudProjectionRecoveryJournalEntry,
       "sourceDevicePublicId" | "userPublicId"
     >;
+}
+
+function withoutProviderAuthority(
+  entry: CloudProjectionRecoveryJournalEntry,
+): CloudProjectionRecoveryJournalEntry {
+  if (!isProviderBoundCloudProjectionRecoveryLocalAuthority(entry.localAuthority)) {
+    throw new Error("Expected provider-bound recovery fixture.");
+  }
+  return parseCloudProjectionRecoveryEntry({
+    ...entry,
+    localAuthority: {
+      profileGeneration: entry.localAuthority.processGeneration,
+      profileId: entry.localAuthority.profileId,
+      providerThreadId: entry.localAuthority.providerThreadId,
+      providerUpdatedAt: entry.localAuthority.providerUpdatedAt,
+      sessionRevision: entry.localAuthority.sessionRevision,
+    },
+  });
 }
 
 function stateWith(
@@ -156,6 +183,15 @@ function stateWith(
 }
 
 function command(index: number): CloudCommandJournalEntry {
+  const localAuthority = {
+    bindingGeneration: index + 1,
+    localSessionId: `session_${index.toString().padStart(8, "0")}`,
+    processGeneration: index + 1,
+    profileId: `acct_${index.toString(16).padStart(32, "0")}`,
+    provider: "codex" as const,
+    providerAccountId: `acct_${index.toString(16).padStart(32, "0")}` as const,
+    providerThreadId: `thread_${index.toString().padStart(8, "0")}`,
+  };
   return {
     authority: {
       bootGeneration: index + 1,
@@ -164,11 +200,19 @@ function command(index: number): CloudCommandJournalEntry {
     },
     commandPublicId: uuidV7(index + 1),
     kind: "stop",
-    localAuthorityDigest: digest("1"),
+    localAuthority,
+    localAuthorityDigest: cloudCommandLocalAuthorityDigest(localAuthority),
     payloadDigest: digest("2"),
     sessionPublicId: `session_${index.toString().padStart(8, "0")}`,
     phase: "prepared",
   };
+}
+
+function withoutCommandProviderAuthority(
+  entry: CloudCommandJournalEntry,
+): CloudCommandJournalEntry {
+  return Object.fromEntries(Object.entries(entry).filter(([key]) =>
+    key !== "localAuthority")) as CloudCommandJournalEntry;
 }
 
 function pendingUsageAccount(metadataCiphertextCharacters: number): PendingCloudUsageAccount {
@@ -194,7 +238,10 @@ function pendingUsageAccount(metadataCiphertextCharacters: number): PendingCloud
   };
 }
 
-const capacityCommands = Array.from({ length: 100 }, (_, index) => command(index));
+const capacityCommands = Array.from(
+  { length: 100 },
+  (_, index) => withoutCommandProviderAuthority(command(index)),
+);
 const settledCapacityCommands = capacityCommands.slice(0, 70).map((entry) => ({
   ...entry,
   phase: "terminal" as const,
@@ -245,9 +292,9 @@ function legacyJournalAtRawBytes(targetBytes: number): LegacyCloudDaemonJournalS
 }
 
 function legacyV2JournalAtRawBytes(targetBytes: number): LegacyCloudDaemonJournalV2State {
-  const active = withoutIdentity(
+  const active = withoutIdentity(withoutProviderAuthority(
     recovery(73, "prepared"),
-  ) as LegacyCloudProjectionRecoveryJournalEntry;
+  )) as LegacyCloudProjectionRecoveryJournalEntry;
   const build = (metadataCiphertextCharacters: number): LegacyCloudDaemonJournalV2State => ({
     commands: capacityCommands,
     pendingUsageAccount: pendingUsageAccount(metadataCiphertextCharacters),
@@ -486,6 +533,48 @@ describe("cloud daemon journal", () => {
     });
   });
 
+  test("binds every new command journal entry to exact provider process authority", () => {
+    const prepared = command(101);
+    const preparedAuthority = prepared.localAuthority;
+    if (preparedAuthority === null || preparedAuthority === undefined) {
+      throw new Error("Expected provider-bound command authority fixture.");
+    }
+    const admitted = addCloudCommandJournalEntry(emptyCloudDaemonJournal(), prepared);
+    expect(admitted.commands).toEqual([prepared]);
+    expect(parseCloudDaemonJournal(jsonClone(admitted))).toEqual(admitted);
+
+    expect(() => addCloudCommandJournalEntry(
+      emptyCloudDaemonJournal(),
+      withoutCommandProviderAuthority(prepared),
+    )).toThrow("Cloud command provider authority is unbound.");
+    expect(() => parseCloudDaemonJournal({
+      ...admitted,
+      commands: [{
+        ...prepared,
+        localAuthority: {
+          ...preparedAuthority,
+          processGeneration: 103,
+        },
+      }],
+    })).toThrow("Cloud daemon journal is corrupt.");
+    expect(() => parseCloudDaemonJournal({
+      ...admitted,
+      commands: [{ ...prepared, localAuthority: undefined }],
+    })).toThrow("Cloud daemon journal is corrupt.");
+    const mismatchedAuthority = {
+      ...preparedAuthority,
+      localSessionId: "session_another01",
+    } as const;
+    expect(() => parseCloudDaemonJournal({
+      ...admitted,
+      commands: [{
+        ...prepared,
+        localAuthority: mismatchedAuthority,
+        localAuthorityDigest: cloudCommandLocalAuthorityDigest(mismatchedAuthority),
+      }],
+    })).toThrow("Cloud daemon journal is corrupt.");
+  });
+
   test("round-trips every active recovery phase and bounded baseline length", () => {
     fc.assert(fc.property(
       fc.constantFrom("prepared", "effect_started", "applied" as const),
@@ -660,7 +749,7 @@ describe("cloud daemon journal", () => {
       { ...prepared, sourceCacheId: "short" },
       { ...prepared, sourceDevicePublicId: null },
       { ...prepared, userPublicId: null },
-      { ...prepared, localAuthority: { ...prepared.localAuthority, profileGeneration: 0 } },
+      { ...prepared, localAuthority: { ...prepared.localAuthority, processGeneration: 0 } },
       { ...prepared, localAuthority: { ...prepared.localAuthority, profileId: "short" } },
       { ...prepared, localAuthority: { ...prepared.localAuthority, providerThreadId: "bad\nthread" } },
       { ...prepared, localAuthority: { ...prepared.localAuthority, providerThreadId: "x".repeat(321) } },
@@ -719,10 +808,15 @@ describe("cloud daemon journal", () => {
   });
 
   test("migrates v2 active evidence and terminal outcomes without inventing identity", () => {
-    const prepared = withoutIdentity(recovery(60, "prepared"));
-    const applied = withoutIdentity(recovery(61, "applied"));
-    const activated = { ...withoutIdentity(recovery(62, "applied")), cacheActivated: true };
-    const rejectedBase = withoutIdentity(recovery(63, "effect_started"));
+    const prepared = withoutIdentity(withoutProviderAuthority(recovery(60, "prepared")));
+    const applied = withoutIdentity(withoutProviderAuthority(recovery(61, "applied")));
+    const activated = {
+      ...withoutIdentity(withoutProviderAuthority(recovery(62, "applied"))),
+      cacheActivated: true,
+    };
+    const rejectedBase = withoutIdentity(withoutProviderAuthority(
+      recovery(63, "effect_started"),
+    ));
     const rejected = {
       ...rejectedBase,
       phase: "rejected" as const,
@@ -752,7 +846,7 @@ describe("cloud daemon journal", () => {
     expect(hasUnsettledCompactProjectionRecoveryForProfile(
       migrated,
       prepared.localAuthority.profileId,
-    )).toBe(true);
+    )).toBe(false);
     expect(() => transitionCloudProjectionRecovery(
       migrated,
       migrated.projectionRecoveries[0] as CloudProjectionRecoveryJournalEntry,
@@ -763,6 +857,40 @@ describe("cloud daemon journal", () => {
       fixedNow + 100,
     )).toThrow("Cloud projection recovery identity is unbound.");
     expect(parseCloudDaemonJournal(jsonClone(migrated))).toEqual(migrated);
+  });
+
+  test("decodes legacy local authority but quarantines it instead of inferring a provider", () => {
+    const current = recovery(64, "prepared");
+    const legacy = withoutProviderAuthority(current);
+    expect(isProviderBoundCloudProjectionRecoveryLocalAuthority(
+      legacy.localAuthority,
+    )).toBe(false);
+    expect(hasUnsettledCompactProjectionRecovery(
+      stateWith([legacy]),
+      legacy.sessionPublicId,
+    )).toBe(false);
+    expect(hasUnsettledCompactProjectionRecoveryForProfile(
+      stateWith([legacy]),
+      legacy.localAuthority.profileId,
+    )).toBe(false);
+    expect(() => addCloudProjectionRecovery(
+      stateWith([]),
+      legacy,
+      fixedNow + 64,
+    )).toThrow("provider authority is unbound");
+
+    const retained = recovery(65, "effect_started");
+    const quarantined = quarantineUnprovableProviderProjectionRecoveries(
+      stateWith([legacy, retained]),
+      fixedNow + 500,
+    );
+    expect(quarantined.projectionRecoveries).toEqual([retained]);
+    expect(quarantined.projectionRecoveryReceipts).toMatchObject([{
+      idempotencyKey: legacy.idempotencyKey,
+      phase: "rejected",
+      rejectionCode: unprovableProviderAuthorityProjectionRecoveryCode,
+      sessionPublicId: legacy.sessionPublicId,
+    }]);
   });
 
   test("keeps terminal receipts outside the 25-active capacity", () => {
@@ -1588,6 +1716,95 @@ describe("cloud daemon journal", () => {
     expect(await reopened.isCompactProjectionRecoveryUnsettledForProfile(
       pending.localAuthority.profileId,
     )).toBe(false);
+  });
+
+  test("an offline blocker durably quarantines providerless recovery through a CAS race", async () => {
+    const custody = new MemoryCustody();
+    const writer = new CustodyCloudDaemonJournal(custody);
+    const providerless = withoutProviderAuthority(recovery(320, "effect_started"));
+    const providerBound = recovery(321, "prepared");
+    expect(await writer.compareAndSwap(null, stateWith([providerless]))).not.toBeNull();
+
+    let injectedConcurrentWrite = false;
+    const blocker = new CloudDaemonJournalRecoveryBlocker({
+      read: () => writer.read(),
+      compareAndSwap: async (expectedGeneration, state) => {
+        if (!injectedConcurrentWrite) {
+          injectedConcurrentWrite = true;
+          const observed = await writer.read();
+          expect(observed.generation).toBe(expectedGeneration);
+          expect(await writer.compareAndSwap(expectedGeneration, {
+            ...observed.state,
+            projectionRecoveries: [...observed.state.projectionRecoveries, providerBound],
+          })).not.toBeNull();
+          return null;
+        }
+        return writer.compareAndSwap(expectedGeneration, state);
+      },
+    }, { now: () => fixedNow + 500 });
+    const signal = new AbortController().signal;
+
+    expect(await blocker.readCompactProjectionRecoveryReceipt({
+      idempotencyKey: providerless.idempotencyKey,
+      sessionPublicId: providerless.sessionPublicId,
+      signal,
+    })).toEqual({
+      result: {
+        idempotencyKey: providerless.idempotencyKey,
+        phase: "rejected",
+        rejectionCode: unprovableProviderAuthorityProjectionRecoveryCode,
+        sessionPublicId: providerless.sessionPublicId,
+      },
+      status: "found",
+    });
+    expect(await blocker.isCompactProjectionRecoveryUnsettled(
+      providerless.sessionPublicId,
+    )).toBe(false);
+    expect(await blocker.isCompactProjectionRecoveryUnsettledForProfile(
+      providerless.localAuthority.profileId,
+    )).toBe(false);
+    expect(await blocker.isCompactProjectionRecoveryUnsettled(
+      providerBound.sessionPublicId,
+    )).toBe(true);
+    expect(await blocker.isCompactProjectionRecoveryUnsettledForProfile(
+      providerBound.localAuthority.profileId,
+    )).toBe(true);
+
+    const quarantined = await writer.read();
+    expect(quarantined.state.projectionRecoveries).toEqual([providerBound]);
+    expect(quarantined.state.projectionRecoveryReceipts).toEqual([
+      expect.objectContaining({
+        idempotencyKey: providerless.idempotencyKey,
+        phase: "rejected",
+        rejectionCode: unprovableProviderAuthorityProjectionRecoveryCode,
+        sessionPublicId: providerless.sessionPublicId,
+      }),
+    ]);
+    expect(await blocker.isCompactProjectionRecoveryUnsettled(
+      providerless.sessionPublicId,
+    )).toBe(false);
+    expect((await writer.read()).generation).toBe(quarantined.generation);
+  });
+
+  test("providerless recovery quarantine stops after eight CAS conflicts", async () => {
+    const providerless = withoutProviderAuthority(recovery(322, "prepared"));
+    const observed = {
+      generation: 9,
+      state: stateWith([providerless]),
+    };
+    let compareAndSwapCalls = 0;
+    const blocker = new CloudDaemonJournalRecoveryBlocker({
+      read: async () => structuredClone(observed),
+      compareAndSwap: async () => {
+        compareAndSwapCalls += 1;
+        return null;
+      },
+    }, { now: () => fixedNow + 500 });
+
+    await expect(blocker.isCompactProjectionRecoveryUnsettled(
+      providerless.sessionPublicId,
+    )).rejects.toThrow("Cloud projection recovery journal changed concurrently.");
+    expect(compareAndSwapCalls).toBe(8);
   });
 
   test("a reopened blocker supersedes only recoveries whose local session is terminal", async () => {

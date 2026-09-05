@@ -2000,7 +2000,10 @@ function validateThreadStartResult(
 function sameAuthority(left: CodexAuthority, right: CodexAuthority): boolean {
   return (
     left.profileId === right.profileId &&
-    left.processGeneration === right.processGeneration
+    left.processGeneration === right.processGeneration &&
+    left.provider === right.provider &&
+    left.providerAccountId === right.providerAccountId &&
+    left.bindingGeneration === right.bindingGeneration
   );
 }
 
@@ -2010,6 +2013,9 @@ function sameProviderInteractionAuthority(
 ): boolean {
   return left.profileId === right.profileId
     && left.processGeneration === right.processGeneration
+    && left.provider === right.provider
+    && left.providerAccountId === right.providerAccountId
+    && left.bindingGeneration === right.bindingGeneration
     && left.connectionId === right.connectionId
     && providerRequestIdKey(left.requestId) === providerRequestIdKey(right.requestId)
     && left.method === right.method

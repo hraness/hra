@@ -98,7 +98,7 @@ const legacyProviderObservationSchema = z.discriminatedUnion("state", [
   z.object({
     state: z.literal("unavailable"),
     profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    code: z.enum(["account_signed_out", "resume_unavailable"]),
+    code: z.enum(["account_signed_out", "authority_retired", "resume_unavailable"]),
   }).passthrough(),
   z.object({
     state: z.literal("recovery_required"),

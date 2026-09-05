@@ -545,6 +545,9 @@ function prepareNestedSend(
   effect: Extract<WorkPreparedEffect, { kind: "dispatch" }>,
 ) {
   const message = workPreparedEffectMessage(effect);
+  const sessionAuthority = value.store.requireSessionProviderAuthority(
+    effect.targetSessionId,
+  );
   return {
     attempt: value.store.prepareMutation({
       kind: "session.send",
@@ -552,6 +555,17 @@ function prepareNestedSend(
       authorityGeneration: effect.accountGeneration,
       request: { message },
       idempotencyKey: effect.nestedMutationKey,
+      providerAuthorities: [{
+        role: "primary",
+        authority: {
+          provider: sessionAuthority.provider,
+          providerAccountId: sessionAuthority.providerAccountId,
+          profileId: sessionAuthority.profileId,
+          bindingGeneration: sessionAuthority.bindingGeneration,
+          processGeneration: sessionAuthority.processGeneration,
+        },
+        provenance: "session_send",
+      }],
     }),
     message,
   };
@@ -568,9 +582,16 @@ function beginNestedSend(
   if (session.state !== "idle" && session.state !== "active" && session.state !== "terminal") {
     throw new Error("Expected an observed provider session.");
   }
+  const providerAuthority = value.store.requireProviderAccountAuthority(
+    actor.accountId,
+    "codex",
+  );
   const runtimeProfile = effectiveRuntimeProfile({
     id: actor.accountId,
     generation: effect.accountGeneration,
+    provider: providerAuthority.provider,
+    providerAccountId: providerAuthority.providerAccountId,
+    bindingGeneration: providerAuthority.bindingGeneration,
     codexHome: value.paths.profiles,
     desktopUserData: value.paths.profiles,
   });
@@ -578,6 +599,7 @@ function beginNestedSend(
     attemptId: nested.attempt.id,
     sessionId: actor.sessionId,
     profileGeneration: effect.accountGeneration,
+    providerAuthority,
     evidence: {
       kind: "session.send",
       providerThreadId: session.providerThreadId,
@@ -591,7 +613,7 @@ function beginNestedSend(
       runtimeProfile,
     },
   });
-  return { runtimeProfile, session };
+  return { providerAuthority, runtimeProfile, session };
 }
 
 describe("HraService work protocol", () => {
@@ -924,6 +946,7 @@ describe("HraService work protocol", () => {
       attemptId: nested.attempt.id,
       sessionId: actor.sessionId,
       expectedSessionRevision: begun.session.revision,
+      providerAuthority: begun.providerAuthority,
       applyResponseState: true,
       turnId: "provider-turn-before-restart",
       turnStatus: "inProgress",
@@ -1170,11 +1193,18 @@ describe("HraService work protocol", () => {
       const profileBefore = value.store.requireProfileById(claimedActor.accountId);
       if (retirementMode === "provider_disconnect") {
         const owned = profilePaths(value.paths, profileBefore.id);
+        const providerAuthority = value.store.requireProviderAccountAuthority(
+          profileBefore.id,
+          "codex",
+        );
         await value.service.observeCodexFact({
           id: profileBefore.id,
           generation: profileBefore.processGeneration,
           codexHome: owned.codexHome,
           desktopUserData: owned.desktopUserData,
+          provider: providerAuthority.provider,
+          providerAccountId: providerAuthority.providerAccountId,
+          bindingGeneration: providerAuthority.bindingGeneration,
         }, {
           type: "providerDisconnected",
           connectionId: "30000000-0000-4000-8000-000000000901",

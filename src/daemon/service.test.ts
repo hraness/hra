@@ -33,6 +33,7 @@ import {
   publicInteractionSchema,
   type InteractionRecord,
   type InteractionResolution,
+  type ProviderInteractionAuthority,
   type PublicInteraction,
 } from "../domain/interactions";
 import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
@@ -577,6 +578,7 @@ class FakeCloud implements CloudControlPort {
 
 class FakeDesktop implements DesktopSwitchPort {
   readonly calls: string[] = [];
+  readonly switchInputs: Array<Parameters<DesktopSwitchPort["switchAccount"]>[0]> = [];
   recovery: unknown = {
     status: "resolved_not_applied",
     idempotencyKey: "00000000-0000-4000-8000-000000000601",
@@ -589,8 +591,11 @@ class FakeDesktop implements DesktopSwitchPort {
   current: unknown = { status: "none" };
   currentError?: unknown;
 
-  async switchAccount(input: { idempotencyKey: string }): Promise<{ status: "applied"; idempotencyKey: string }> {
+  async switchAccount(
+    input: Parameters<DesktopSwitchPort["switchAccount"]>[0],
+  ): Promise<{ status: "applied"; idempotencyKey: string }> {
     this.calls.push("switch");
+    this.switchInputs.push(input);
     return { status: "applied", idempotencyKey: input.idempotencyKey };
   }
 
@@ -729,6 +734,75 @@ async function createIdleSession(
   return { sessionId: started.session.id };
 }
 
+function remoteAuthorityFor(
+  store: StateStore,
+  sessionId: string,
+) {
+  const session = store.requireSession(sessionId);
+  if (session.providerThreadId === undefined) throw new Error("Expected provider binding.");
+  const authority = store.requireSessionProviderAuthority(session.id);
+  return {
+    sessionId: session.id,
+    profileId: authority.profileId,
+    processGeneration: authority.processGeneration,
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+    providerThreadId: session.providerThreadId,
+  };
+}
+
+function liveAuthorityFor(
+  store: StateStore,
+  profileSelector: string,
+  provider: "codex" | "claude" = "codex",
+  paths: Readonly<{ codexHome?: string; desktopUserData?: string }> = {},
+): ProfileAuthority {
+  const profile = store.requireProfile(profileSelector);
+  const authority = store.requireProviderAccountAuthority(profile.id, provider);
+  return {
+    id: authority.profileId,
+    generation: authority.processGeneration,
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+    codexHome: paths.codexHome ?? "unused",
+    desktopUserData: paths.desktopUserData ?? "unused",
+  };
+}
+
+function codexInteractionBinding(
+  store: StateStore,
+  profileSelector: string,
+) {
+  const profile = store.requireProfile(profileSelector);
+  const authority = store.requireProviderAccountAuthority(profile.id, "codex");
+  return {
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+  };
+}
+
+function interactionAuthorityFor(
+  authority: ProfileAuthority,
+  value: Omit<ProviderInteractionAuthority,
+    | "profileId"
+    | "processGeneration"
+    | "provider"
+    | "providerAccountId"
+    | "bindingGeneration">,
+): ProviderInteractionAuthority {
+  return {
+    ...value,
+    profileId: authority.id,
+    processGeneration: authority.generation,
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+  };
+}
+
 function seedUnsettledInteractionStates(
   value: Awaited<ReturnType<typeof fixture>>,
   sessionId: `sess_${string}`,
@@ -739,12 +813,16 @@ function seedUnsettledInteractionStates(
   const profile = value.store.requireProfileById(session.profileId);
   if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
   const providerThreadId = session.providerThreadId;
+  const liveAuthority = liveAuthorityFor(value.store, profile.id);
   const admit = (state: "pending" | "prepared" | "written") => value.store.admitInteraction({
     publicId: crypto.randomUUID(),
     sessionId,
     authority: {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
+      provider: liveAuthority.provider,
+      providerAccountId: liveAuthority.providerAccountId,
+      bindingGeneration: liveAuthority.bindingGeneration,
       connectionId,
       requestId: { type: "string", value: `${prefix}-${state}` },
       method: "item/fileChange/requestApproval",
@@ -796,18 +874,11 @@ async function seedResolvableInteraction(
   const profile = value.store.requireProfileById(session.profileId);
   if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
   const connectionId = crypto.randomUUID();
-  const authority: ProfileAuthority = {
-    id: profile.id,
-    generation: profile.processGeneration,
-    codexHome: "unused",
-    desktopUserData: "unused",
-  };
+  const authority = liveAuthorityFor(value.store, profile.id);
   await value.service.observeCodexFact(authority, {
     type: "interactionRequested",
     connectionId,
-    provider: {
-      profileId: profile.id,
-      processGeneration: profile.processGeneration,
+    provider: interactionAuthorityFor(authority, {
       connectionId,
       requestId: { type: "string", value: requestId },
       method: "item/commandExecution/requestApproval",
@@ -816,7 +887,7 @@ async function seedResolvableInteraction(
       turnId: `turn-${requestId}`,
       itemId: `item-${requestId}`,
       approvalId: null,
-    },
+    }),
     kind: "command_approval",
     blocking: true,
     display: {
@@ -1058,6 +1129,48 @@ describe("HraService", () => {
     expect(desktop.calls).toEqual(["recover", "current"]);
     expect(doctor.desktop.recovery).toBe(desktop.current);
     expect(doctor.problems).toContain("A desktop switch is unresolved. Run `hra account switch-recover`.");
+  });
+
+  test("does not claim the active provider default is the running desktop source", async () => {
+    const desktop = new FakeDesktop();
+    const { service, store } = await fixture(desktop);
+    const source = await service.execute(
+      { kind: "account.add", label: "New-work default" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { account: source.account.id, deviceCode: false, kind: "account.login" },
+      { signal },
+    );
+    const target = await service.execute(
+      { kind: "account.add", label: "Desktop target" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { account: target.account.id, deviceCode: false, kind: "account.login" },
+      { signal },
+    );
+    const state = store.readProviderAccountState("codex");
+    store.activateProviderAccount({
+      provider: "codex",
+      expectedPointerRevision: state.pointerRevision,
+      providerAccountId: source.account.id,
+    });
+
+    await service.execute({
+      account: target.account.id,
+      idempotencyKey: crypto.randomUUID(),
+      kind: "account.switch",
+    }, { signal });
+
+    expect(store.readProviderAccountState("codex").activeProviderAccountId).toBe(source.account.id);
+    expect(desktop.switchInputs).toHaveLength(1);
+    expect(desktop.switchInputs[0]?.source).toBeUndefined();
+    expect(desktop.switchInputs[0]?.target).toMatchObject({
+      id: target.account.id,
+      provider: "codex",
+      providerAccountId: target.account.id,
+    });
   });
 
   test("doctor closes dependency failures without repeating arbitrary runtime diagnostics", async () => {
@@ -2120,7 +2233,10 @@ describe("HraService", () => {
 
     const crashFactsMemory = new FakeFactsMemoryLifecycle();
     const otherSession = value.store.upsertProviderSession({
-      profileId: session.profileId,
+      providerAuthority: value.store.requireProviderAccountAuthority(
+        session.profileId,
+        "codex",
+      ),
       providerThreadId: "provider-thread-crash-terminal",
       providerUpdatedAt: 1,
       state: "idle",
@@ -2128,7 +2244,10 @@ describe("HraService", () => {
     });
     if (otherSession.providerThreadId === undefined) throw new Error("Expected provider binding.");
     value.store.upsertProviderSession({
-      profileId: otherSession.profileId,
+      providerAuthority: value.store.requireProviderAccountAuthority(
+        otherSession.profileId,
+        "codex",
+      ),
       providerThreadId: otherSession.providerThreadId,
       providerUpdatedAt: (otherSession.providerUpdatedAt ?? 0) + 1,
       state: "terminal",
@@ -2234,12 +2353,7 @@ describe("HraService", () => {
       enabled: true,
       kind: "session.fast",
       session: session.id,
-    }, {
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
-      providerThreadId: session.providerThreadId,
-      sessionId: session.id,
-    }, { signal });
+    }, remoteAuthorityFor(value.store, session.id), { signal });
     expect(factsMemory.sweeps).toContain(now);
     expect(factsMemory.ensures.at(-1)).toEqual({
       expiresAt: now + FACTS_MEMORY_SESSION_TTL_MS,
@@ -2280,12 +2394,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected provider binding.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     await value.service.observeCodexFact(authority, {
       type: "threadStatusChanged",
       threadId: session.providerThreadId,
@@ -2309,14 +2418,14 @@ describe("HraService", () => {
     });
 
     const poisoned = value.store.upsertProviderSession({
-      profileId: profile.id,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       providerThreadId: "provider-terminal-poisoned",
       providerUpdatedAt: 1,
       state: "terminal",
       title: "Poisoned terminal memory",
     });
     const healthy = value.store.upsertProviderSession({
-      profileId: profile.id,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       providerThreadId: "provider-terminal-healthy",
       providerUpdatedAt: 1,
       state: "terminal",
@@ -2905,6 +3014,21 @@ describe("HraService", () => {
     const legacy = new Database(value.paths.database, { create: false, strict: true });
     try {
       legacy.exec("PRAGMA foreign_keys=OFF");
+      legacy.exec(`
+        DROP TRIGGER IF EXISTS profiles_process_generation_provider_mirror;
+        DROP TRIGGER IF EXISTS session_events_account_authority_guard;
+        DROP TABLE IF EXISTS account_rate_limit_reset_provider_authorities;
+        DROP TABLE IF EXISTS account_scoped_provider_authorities;
+        DROP TABLE IF EXISTS session_event_provider_authorities;
+        DROP TABLE IF EXISTS interaction_provider_authorities;
+        DROP TABLE IF EXISTS queue_provider_authorities;
+        DROP TABLE IF EXISTS mutation_provider_authorities;
+        DROP TABLE IF EXISTS runtime_profile_provider_authorities;
+        DROP TABLE IF EXISTS session_provider_authorities;
+        DROP TABLE IF EXISTS provider_account_states;
+        DROP TABLE IF EXISTS legacy_provider_authority_quarantines;
+        DROP TABLE IF EXISTS provider_accounts;
+      `);
       const resetTriggers = legacy.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name GLOB 'account_rate_limit_reset_*'
@@ -2965,10 +3089,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }]);
     } finally {
       inspector.close(false);
     }
@@ -3046,12 +3170,10 @@ describe("HraService", () => {
     await restarted.recover();
     const profile = store.requireProfileById(added.account.id);
     const owned = profilePaths(value.paths, profile.id);
-    await restarted.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: owned.codexHome,
-      desktopUserData: owned.desktopUserData,
-    }, { type: "rateLimitsUpdated" });
+    await restarted.observeCodexFact(
+      liveAuthorityFor(store, profile.id, "codex", owned),
+      { type: "rateLimitsUpdated" },
+    );
     await restarted.settled();
     expect(restartedCodex.calls).toEqual(["readAccount", "usage", "readAccount"]);
     expect(restartedCodex.resetIdempotencyKeys).toEqual([]);
@@ -3138,12 +3260,10 @@ describe("HraService", () => {
     );
     const profile = store.requireProfileById(added.account.id);
     const owned = profilePaths(paths, profile.id);
-    await service.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: owned.codexHome,
-      desktopUserData: owned.desktopUserData,
-    }, { type: "rateLimitsUpdated" });
+    await service.observeCodexFact(
+      liveAuthorityFor(store, profile.id, "codex", owned),
+      { type: "rateLimitsUpdated" },
+    );
     await service.settled();
 
     const passive = await service.execute({
@@ -4033,12 +4153,7 @@ describe("HraService", () => {
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     const profile = store.requireProfileById(added.account.id);
     const owned = profilePaths(paths, profile.id);
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: owned.codexHome,
-      desktopUserData: owned.desktopUserData,
-    };
+    const authority = liveAuthorityFor(store, profile.id, "codex", owned);
     codex.usageResult = {
       revision: 1,
       observedAt: 2_000,
@@ -4442,7 +4557,7 @@ describe("HraService", () => {
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.beforeStartTurnReturn = async () => service.observeCodexFact(authority, { type: "turnStarted", threadId: started.session.providerThreadId, turn: { id: "turn-next", items: [], status: "inProgress", startedAt: 1, completedAt: null, durationMs: null } });
     expect(await service.execute({ kind: "session.send", session: started.session.id, message: "race" }, { signal })).toMatchObject({ session: { state: "active", activeTurnId: "turn-next" } });
     expect(store.latestSessionRuntimeProfile(started.session.id as `sess_${string}`)).toMatchObject({ revision: 2, sourceKind: "turn_start" });
@@ -4453,7 +4568,7 @@ describe("HraService", () => {
   });
 
   test("refreshes the exact turn profile after the provider baseline and immediately before dispatch", async () => {
-    const { service, codex, documents } = await fixture();
+    const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Review order" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
@@ -4468,7 +4583,7 @@ describe("HraService", () => {
     delete (codex.readProjection as { activeTurnId?: string }).activeTurnId;
     codex.turnEffectTrace.length = 0;
     await service.observeCodexFact(
-      { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" },
+      liveAuthorityFor(store, added.account.id as `acct_${string}`),
       { type: "turnCompleted", threadId: started.session.providerThreadId, turn: { id: "active-turn", items: [], status: "completed", startedAt: 1, completedAt: 2, durationMs: 1 } },
     );
     await service.settled();
@@ -4513,22 +4628,13 @@ describe("HraService", () => {
     let release!: () => void;
     const recoveryGate = new Promise<void>((resolve) => { release = resolve; });
     cloud.beforeProjectionRecoveryReturn = async () => {
-      await value.service.observeCodexFact({
-        codexHome: "unused",
-        desktopUserData: "unused",
-        generation: recoveryProfile.processGeneration,
-        id: recoveryProfile.id,
-      }, {
+      const recoveryAuthority = liveAuthorityFor(value.store, recoveryProfile.id);
+      await value.service.observeCodexFact(recoveryAuthority, {
         name: "must not cross the recovery fence",
         threadId: recoverySession.providerThreadId as string,
         type: "threadNameUpdated",
       });
-      await value.service.observeCodexAccount({
-        codexHome: "unused",
-        desktopUserData: "unused",
-        generation: recoveryProfile.processGeneration,
-        id: recoveryProfile.id,
-      }, { signedIn: false });
+      await value.service.observeCodexAccount(recoveryAuthority, { signedIn: false });
       entered();
       await recoveryGate;
     };
@@ -4685,25 +4791,15 @@ describe("HraService", () => {
       archived: false,
       limit: 25,
     }, { signal })).resolves.toMatchObject({ recovery: { required: true } });
+    const observerAuthority = liveAuthorityFor(value.store, profile.id);
     await value.service.observeCodexFact(
-      {
-        codexHome: "unused",
-        desktopUserData: "unused",
-        generation: profile.processGeneration,
-        id: profile.id,
-      },
+      observerAuthority,
       {
         name: "must not mutate the session",
         threadId: sessionBefore.providerThreadId as string,
         type: "threadNameUpdated",
       },
     );
-    const observerAuthority = {
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    } as const;
     await value.service.observeCodexAccount(observerAuthority, {
       signedIn: false,
     });
@@ -4765,12 +4861,7 @@ describe("HraService", () => {
     cloud.unsettledProjectionProfiles.add(profile.id);
     const providerWritesBefore = providerMutationCalls(value.codex);
 
-    await value.service.observeCodexFact({
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    }, {
+    await value.service.observeCodexFact(liveAuthorityFor(value.store, profile.id), {
       threadId: session.providerThreadId,
       turn: {
         completedAt: 2,
@@ -4806,12 +4897,9 @@ describe("HraService", () => {
       signalRead();
       await readGate;
     };
-    const staleFact = value.service.observeCodexFact({
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    }, {
+    const staleFact = value.service.observeCodexFact(
+      liveAuthorityFor(value.store, profile.id),
+      {
       threadId: session.providerThreadId,
       turn: {
         completedAt: null,
@@ -4822,7 +4910,8 @@ describe("HraService", () => {
         status: "inProgress",
       },
       type: "turnStarted",
-    });
+      },
+    );
 
     await readStarted;
     value.store.advanceProfileGeneration(profile.id, profile.processGeneration);
@@ -4853,16 +4942,14 @@ describe("HraService", () => {
       signalRead();
       await readGate;
     };
-    const staleFact = value.service.observeCodexFact({
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    }, {
+    const staleFact = value.service.observeCodexFact(
+      liveAuthorityFor(value.store, profile.id),
+      {
       name: "must not apply after logout",
       threadId: session.providerThreadId,
       type: "threadNameUpdated",
-    });
+      },
+    );
 
     await readStarted;
     expect(value.store.setProfileState(profile.id, profile.processGeneration, "signed_out")).toBe(true);
@@ -4883,12 +4970,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound recovery session.");
-    const authority: ProfileAuthority = {
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "32000000-0000-4000-8000-000000000099";
     let entered!: () => void;
     const recoveryEntered = new Promise<void>((resolve) => { entered = resolve; });
@@ -4920,18 +5002,16 @@ describe("HraService", () => {
         workingDirectory: null,
       },
       kind: "command_approval",
-      provider: {
+      provider: interactionAuthorityFor(authority, {
         approvalId: null,
         connectionId,
         itemId: "item-delete-race",
         method: "item/commandExecution/requestApproval",
-        processGeneration: profile.processGeneration,
-        profileId: profile.id,
         requestDigest: "9".repeat(64),
         requestId: { type: "number", value: 99 },
         threadId: session.providerThreadId,
         turnId: "turn-delete-race",
-      },
+      }),
       type: "interactionRequested",
     });
     await value.service.observeCodexFact(authority, {
@@ -5008,6 +5088,7 @@ describe("HraService", () => {
       accountId: profile.id,
       providerConnectionId: null,
       providerGeneration: profile.processGeneration,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       sessionId: session.id,
     }).changed).toBe(true);
     await value.service.close();
@@ -5081,6 +5162,7 @@ describe("HraService", () => {
     const unrelatedSessionId = unrelatedStarted.session.id;
     const affectedSession = value.store.requireSession(affectedSessionId);
     const affectedProfile = value.store.requireProfile(affectedSession.profileId);
+    const affectedAuthority = liveAuthorityFor(value.store, affectedProfile.id);
     if (affectedSession.providerThreadId === undefined) throw new Error("Expected a bound test session.");
     const idempotencyKey = "018bcfe5-6800-7000-8000-000000000881";
     const epochPublicId = "018bcfe5-6800-7000-8000-000000000882";
@@ -5094,8 +5176,11 @@ describe("HraService", () => {
       idempotencyKey,
       lineageCommitment: "b".repeat(64),
       localAuthority: {
-        profileGeneration: affectedProfile.processGeneration,
+        bindingGeneration: affectedAuthority.bindingGeneration,
+        processGeneration: affectedAuthority.generation,
         profileId: affectedProfile.id,
+        provider: affectedAuthority.provider,
+        providerAccountId: affectedAuthority.providerAccountId,
         providerUpdatedAt: 10,
         providerThreadId: affectedSession.providerThreadId,
         sessionRevision: affectedSession.revision,
@@ -5121,12 +5206,16 @@ describe("HraService", () => {
     const blocker = new CloudDaemonJournalRecoveryBlocker(journal);
     const providerWritesBefore = providerMutationCalls(value.codex);
     await value.service.close();
+    const offlineDaemonGeneration = value.store.nextDaemonGeneration(
+      `boot_${"8".repeat(32)}`,
+    );
 
     const offlineAuthority = new FakeDaemonAuthority();
     const offlineService = new HraService({
       cloud: new UnavailableCloudControl(blocker),
       codex: value.codex,
       daemonAuthority: offlineAuthority,
+      daemonGeneration: offlineDaemonGeneration,
       paths: value.paths,
       requestStop: () => undefined,
       store: value.store,
@@ -5142,11 +5231,12 @@ describe("HraService", () => {
       kind: "session.fast",
       session: affectedSessionId,
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    await expect(offlineService.execute({
+    const offlineShow = await offlineService.execute({
       detail: false,
       kind: "session.show",
       session: affectedSessionId,
-    }, { signal })).resolves.toBeDefined();
+    }, { signal });
+    expect(offlineShow).toBeDefined();
     await expect(offlineService.execute({
       enabled: true,
       kind: "session.fast",
@@ -5161,6 +5251,9 @@ describe("HraService", () => {
     expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
     expect(await blocker.isCompactProjectionRecoveryUnsettled(affectedSessionId)).toBe(true);
     await offlineService.close();
+    const restoredDaemonGeneration = value.store.nextDaemonGeneration(
+      `boot_${"9".repeat(32)}`,
+    );
 
     const configuredCloud = new FakeCloud();
     configuredCloud.projectionRecoveryBlocker = blocker;
@@ -5204,16 +5297,18 @@ describe("HraService", () => {
       cloud: configuredCloud,
       codex: value.codex,
       daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration: restoredDaemonGeneration,
       paths: value.paths,
       requestStop: () => undefined,
       store: value.store,
     });
-    await expect(restoredService.execute({
+    const restoredProjection = await restoredService.execute({
       acknowledgeGap: true,
       idempotencyKey,
       kind: "sync.projection-recover",
       session: affectedSessionId,
-    }, { signal })).resolves.toBe(configuredCloud.projectionRecoveryResult);
+    }, { signal });
+    expect(restoredProjection).toBe(configuredCloud.projectionRecoveryResult);
     expect(configuredCloud.projectionRecoveries).toHaveLength(1);
     expect(await blocker.isCompactProjectionRecoveryUnsettled(affectedSessionId)).toBe(false);
     await expect(restoredService.execute({
@@ -5312,7 +5407,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const queued = store.enqueue(started.session.id, "after completion");
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.beforeStartTurnReturn = async () => {
       delete codex.beforeStartTurnReturn;
       codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
@@ -5350,7 +5445,7 @@ describe("HraService", () => {
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const first = store.enqueue(started.session.id, "first queued");
     const second = store.enqueue(started.session.id, "second queued");
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.beforeStartTurnReturn = async () => {
       delete codex.beforeStartTurnReturn;
       codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
@@ -5379,7 +5474,10 @@ describe("HraService", () => {
     const show = service.execute({ kind: "session.show", session: started.session.id, detail: false }, { signal });
     await readStarted;
     delete codex.beforeReadSessionReturn;
-    codex.runtimeProfileOverride = { ...runtimeProfile({ id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" }), observedAt: 3_000 };
+    codex.runtimeProfileOverride = {
+      ...runtimeProfile(liveAuthorityFor(store, added.account.id as `acct_${string}`)),
+      observedAt: 3_000,
+    };
     const send = service.execute({ kind: "session.send", session: started.session.id, message: "after read" }, { signal });
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(0);
@@ -5399,7 +5497,10 @@ describe("HraService", () => {
     await service.execute({ kind: "session.queue", session: started.session.id, message: "second" }, { signal });
     codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
     delete (codex.readProjection as { activeTurnId?: string }).activeTurnId;
-    await service.observeCodexFact({ id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" }, { type: "turnCompleted", threadId: started.session.providerThreadId, turn: { id: "turn-initial", items: [], status: "completed", startedAt: 1, completedAt: 2, durationMs: 1 } });
+    await service.observeCodexFact(
+      liveAuthorityFor(store, added.account.id as `acct_${string}`),
+      { type: "turnCompleted", threadId: started.session.providerThreadId, turn: { id: "turn-initial", items: [], status: "completed", startedAt: 1, completedAt: 2, durationMs: 1 } },
+    );
     await service.settled();
     expect(store.listQueue(started.session.id as `sess_${string}`)[0]).toMatchObject({ state: "applied" });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "active", activeTurnId: "turn-next-2" });
@@ -5419,7 +5520,7 @@ describe("HraService", () => {
     const second = await service.execute({ kind: "session.queue", session: started.session.id, message: "continues" }, { signal }) as { queued: { id: `queue_${string}` } };
     expect(store.requireQueue(first.queued.id)).toMatchObject({ state: "pending" });
     expect(store.requireQueue(second.queued.id)).toMatchObject({ state: "pending" });
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.turnStatus = "completed";
     codex.startTurnErrorOnce = new Error("determinate rejection");
     codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
@@ -5445,7 +5546,7 @@ describe("HraService", () => {
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     const project = await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal }) as { project: { id: string } };
     const imported = store.upsertProviderSession({
-      profileId: added.account.id,
+      providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
       providerThreadId: "provider-thread",
       title: "Imported without project",
       state: "idle",
@@ -5634,7 +5735,7 @@ describe("HraService", () => {
     await entered;
     const remote = service.executeRemote(
       { kind: "session.send", session: session.id, message: "must remain fenced", idempotencyKey: "00000000-0000-4000-8000-000000000702" },
-      { sessionId: session.id, profileId: profile.id, processGeneration: profile.processGeneration, providerThreadId: session.providerThreadId },
+      remoteAuthorityFor(store, session.id),
       { signal },
     );
     releaseLogout();
@@ -5650,7 +5751,6 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
-    const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
     let entered!: () => void;
     const providerVisible = new Promise<void>((resolve) => { entered = resolve; });
@@ -5670,12 +5770,7 @@ describe("HraService", () => {
       idempotencyKey: "00000000-0000-4000-8000-000000000712",
       kind: "session.fast",
       session: session.id,
-    }, {
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
-      providerThreadId: session.providerThreadId,
-      sessionId: session.id,
-    }, { signal }).finally(() => { remoteSettled = true; });
+    }, remoteAuthorityFor(store, session.id), { signal }).finally(() => { remoteSettled = true; });
     await Bun.sleep(0);
     expect(remoteSettled).toBe(false);
     expect(store.requireSession(session.id).fastEnabled).toBe(false);
@@ -5693,7 +5788,6 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
-    const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
     let entered!: () => void;
     const providerVisible = new Promise<void>((resolve) => { entered = resolve; });
@@ -5708,12 +5802,7 @@ describe("HraService", () => {
       kind: "session.preset",
       preset: "ultra",
       session: session.id,
-    }, {
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
-      providerThreadId: session.providerThreadId,
-      sessionId: session.id,
-    }, { signal }).then(() => null, (error: unknown) => error);
+    }, remoteAuthorityFor(store, session.id), { signal }).then(() => null, (error: unknown) => error);
     await Bun.sleep(0);
     daemonAuthority.invalidate();
     release();
@@ -5758,12 +5847,7 @@ describe("HraService", () => {
       idempotencyKey,
     }, { signal });
 
-    await service.observeCodexAccount({
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    await service.observeCodexAccount(liveAuthorityFor(store, added.account.id), {
       signedIn: true,
       email: "completed@example.com",
       plan: "Plus",
@@ -6001,14 +6085,17 @@ describe("HraService", () => {
       profileId: added.account.id,
       processGeneration: 1,
       loginId: "provider-login-crashed-cancel",
+      providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
     });
+    const capturedAuthority = store.readMutationProviderAuthorities(attempt.id);
     expect(store.readMutation(idempotencyKey)).toMatchObject({
       state: "effect_started",
       evidence: { evidence: { kind: "account.login-cancel", loginId: "provider-login-crashed-cancel" } },
     });
-    // A crash leaves the effect-started attempt behind without the graceful
-    // close that retires the profile generation, so the first service is not
-    // closed before the restarted one recovers over the same store.
+    // A crash advances the live provider process fence. Recovery must still
+    // classify and reconcile the immutable old-generation cancellation
+    // without replaying it or rebinding its sidecar.
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
     const restarted = new HraService({
@@ -6017,20 +6104,146 @@ describe("HraService", () => {
       codex: restartedCodex,
       cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
       requestStop: () => undefined,
     });
     await restarted.recover();
-    expect(store.requireProfile(added.account.id)).toMatchObject({ processGeneration: 1, state: "recovery_required" });
+    expect(store.requireProfile(added.account.id)).toMatchObject({ processGeneration: 2, state: "recovery_required" });
     expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous", result: { code: "DAEMON_RESTART" } });
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAuthority);
 
     const shown = await restarted.execute({ kind: "account.show", account: added.account.id }, { signal });
     expect(shown).toMatchObject({
-      account: { processGeneration: 1, state: "signed_out" },
+      account: { processGeneration: 2, state: "signed_out" },
       recovery: { cleared: true, required: false, resolution: "provider_state_reconciled" },
     });
     expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "reconciled", originalState: "ambiguous" });
     expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    expect(store.listUnsettledMutations({ authorityId: added.account.id })).toEqual([]);
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAuthority);
     expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "logout")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "readAccount")).toHaveLength(1);
+    await restarted.close();
+    await service.close();
+  });
+
+  test("reconciles retired-generation login and logout attempts from current exact account reads without replay", async () => {
+    const value = await fixture();
+    const { service, store } = value;
+    const loginProfile = await service.execute(
+      { kind: "account.add", label: "Crashed login rollover" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    const loginSource = store.requireProviderAccountAuthority(loginProfile.account.id, "codex");
+    const loginKey = "00000000-0000-4000-8000-000000000135";
+    const login = store.prepareMutation({
+      kind: "account.login",
+      authorityId: loginProfile.account.id,
+      authorityGeneration: 1,
+      request: { deviceCode: false },
+      idempotencyKey: loginKey,
+      providerAuthorities: [{
+        role: "source",
+        authority: loginSource,
+        provenance: "account_login_source",
+      }],
+    });
+    store.beginAccountMutationEffect({
+      attemptId: login.id,
+      profileId: loginProfile.account.id,
+      profileGeneration: 1,
+      providerAuthority: loginSource,
+      evidence: { kind: "account.login", method: "browser" },
+    });
+
+    const logoutProfile = await service.execute(
+      { kind: "account.add", label: "Crashed logout rollover" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { kind: "account.login", account: logoutProfile.account.id, deviceCode: false },
+      { signal },
+    );
+    const logoutAuthority = store.requireProviderAccountAuthority(logoutProfile.account.id, "codex");
+    const logoutKey = "00000000-0000-4000-8000-000000000136";
+    const logout = store.prepareMutation({
+      kind: "account.logout",
+      authorityId: logoutProfile.account.id,
+      authorityGeneration: logoutAuthority.processGeneration,
+      request: {},
+      idempotencyKey: logoutKey,
+      providerAuthorities: [{
+        role: "primary",
+        authority: logoutAuthority,
+        provenance: "account_logout",
+      }],
+    });
+    store.beginAccountMutationEffect({
+      attemptId: logout.id,
+      profileId: logoutProfile.account.id,
+      profileGeneration: logoutAuthority.processGeneration,
+      providerAuthority: logoutAuthority,
+      evidence: { kind: "account.logout", baselineSignedIn: true },
+    });
+    const captured = {
+      login: store.readMutationProviderAuthorities(login.id),
+      logout: store.readMutationProviderAuthorities(logout.id),
+    };
+
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"f".repeat(32)}`);
+    const restartedCodex = new FakeCodex();
+    const restarted = new HraService({
+      store,
+      paths: value.paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(store.requireProfile(loginProfile.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "recovery_required",
+    });
+    expect(store.requireProfile(logoutProfile.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "recovery_required",
+    });
+
+    restartedCodex.accountProjection = {
+      signedIn: true,
+      email: "recovered-login@example.com",
+      plan: "Plus",
+    };
+    await expect(restarted.execute({ kind: "account.show", account: loginProfile.account.id }, { signal }))
+      .resolves.toMatchObject({
+        account: { processGeneration: 2, state: "signed_in" },
+        recovery: { cleared: true, required: false, resolution: "proven_applied" },
+      });
+    restartedCodex.accountProjection = { signedIn: false };
+    await expect(restarted.execute({ kind: "account.show", account: logoutProfile.account.id }, { signal }))
+      .resolves.toMatchObject({
+        account: { processGeneration: 2, state: "signed_out" },
+        recovery: { cleared: true, required: false, resolution: "proven_applied" },
+      });
+    expect(store.readMutation(loginKey)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "proven_applied" },
+    });
+    expect(store.readMutation(logoutKey)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "proven_applied" },
+    });
+    expect(store.readMutationProviderAuthorities(login.id)).toEqual(captured.login);
+    expect(store.readMutationProviderAuthorities(logout.id)).toEqual(captured.logout);
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "logout")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "readAccount")).toHaveLength(2);
     await restarted.close();
     await service.close();
   });
@@ -6130,12 +6343,7 @@ describe("HraService", () => {
       deviceCode: false,
       idempotencyKey,
     }, { signal });
-    const authority = {
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    } as const;
+    const authority = liveAuthorityFor(store, added.account.id);
 
     await service.observeCodexFact(authority, {
       type: "loginCompleted",
@@ -6248,12 +6456,7 @@ describe("HraService", () => {
       deviceCode: false,
     }, { signal });
     await Bun.sleep(0);
-    const fact = service.observeCodexFact({
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    const fact = service.observeCodexFact(liveAuthorityFor(store, added.account.id), {
       type: "loginCompleted",
       loginId: "provider-login-race",
       success: false,
@@ -6272,7 +6475,8 @@ describe("HraService", () => {
       providerStatus: "canceled",
       status: "canceled",
     });
-    await expect(freshLogin).resolves.toMatchObject({
+    const freshLoginResult = await freshLogin;
+    expect(freshLoginResult).toMatchObject({
       account: { processGeneration: 2, state: "signed_in" },
       login: { status: "signed_in" },
     });
@@ -6310,12 +6514,7 @@ describe("HraService", () => {
       accountReadStarted();
       await accountReadGate;
     };
-    const authority = {
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    } as const;
+    const authority = liveAuthorityFor(store, added.account.id);
 
     const accountShow = service.execute({
       kind: "account.show",
@@ -6399,7 +6598,21 @@ describe("HraService", () => {
       kind: "account.logout",
       account: seeded.authority.id,
     }, { signal });
-    expect(value.store.requireInteraction(seeded.interaction.publicId).state).toBe("pending");
+    expect(value.store.requireInteraction(seeded.interaction.publicId).state).toBe("expired");
+    const logoutEvents = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+      limit: 100,
+    }).events;
+    expect(logoutEvents.flatMap((event) =>
+      event.body.type === "assistant_delta" ? [event.body.text] : []))
+      .toEqual(["[protected]"]);
+    expect(logoutEvents.filter((event) =>
+      event.body.type === "connection" && event.body.state === "disconnected"))
+      .toHaveLength(1);
+    expect(logoutEvents.filter((event) =>
+      event.body.type === "gap" && event.body.reason === "provider_disconnect"))
+      .toHaveLength(1);
     let releaseFreshLogin!: () => void;
     let freshLoginPreflightStarted!: () => void;
     const freshLoginGate = new Promise<void>((resolve) => {
@@ -6432,17 +6645,17 @@ describe("HraService", () => {
       deviceCode: false,
     }, { signal });
     await preflightStarted;
-    expect(value.store.requireInteraction(seeded.interaction.publicId).state).toBe("pending");
+    expect(value.store.requireInteraction(seeded.interaction.publicId).state).toBe("expired");
     expect(value.store.listSessionEvents({
       sessionId,
       afterSequence: 0,
       limit: 100,
-    }).events.map((event) => event.body)).not.toContainEqual(expect.objectContaining({
-      type: "connection",
-      state: "disconnected",
-    }));
+    }).events.filter((event) =>
+      event.body.type === "connection" && event.body.state === "disconnected"))
+      .toHaveLength(1);
     releaseFreshLogin();
-    await expect(freshLogin).resolves.toMatchObject({
+    const retiredFreshLoginResult = await freshLogin;
+    expect(retiredFreshLoginResult).toMatchObject({
       account: { processGeneration: 2, state: "signed_in" },
       login: { status: "signed_in" },
     });
@@ -6521,11 +6734,12 @@ describe("HraService", () => {
       status: "signed_in",
       account: { signedIn: true, email: "fresh@example.com", plan: "Plus" },
     };
-    await expect(value.service.execute({
+    const terminalLoginResult = await value.service.execute({
       kind: "account.login",
       account: profile.id,
       deviceCode: false,
-    }, { signal })).resolves.toMatchObject({
+    }, { signal });
+    expect(terminalLoginResult).toMatchObject({
       account: { processGeneration: profile.processGeneration + 1, state: "signed_in" },
       login: { status: "signed_in" },
     });
@@ -6548,7 +6762,7 @@ describe("HraService", () => {
     ));
   });
 
-  test("recovers a lost pending-login response across daemon generation rollover by exact cancellation and fresh login", async () => {
+  test("retires a lost pending-login response across daemon rollover before exact read reconciliation", async () => {
     const { service, codex, store, paths } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Restart login" }, { signal }) as { account: { id: `acct_${string}` } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000119";
@@ -6570,10 +6784,16 @@ describe("HraService", () => {
       loginId: "provider-login-restart",
       processGeneration: 1,
     });
+    const originalAttempt = store.readMutation(idempotencyKey);
+    if (originalAttempt === null) throw new Error("Expected the pending login mutation.");
+    const capturedProviderAuthorities = store.readMutationProviderAuthorities(originalAttempt.id);
 
-    store.nextDaemonGeneration(`boot_${"a".repeat(32)}`);
-    const rebound = store.readPendingLoginAuthority(added.account.id, 2);
-    expect(rebound).toMatchObject({ loginId: "provider-login-restart", processGeneration: 2 });
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"a".repeat(32)}`);
+    expect(store.requireProfile(added.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "recovery_required",
+    });
+    expect(store.readPendingLoginAuthority(added.account.id, 2)).toBeNull();
     expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
 
     const restartedCodex = new FakeCodex();
@@ -6585,58 +6805,32 @@ describe("HraService", () => {
       codex: restartedCodex,
       cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
       requestStop: () => undefined,
     });
+    await restarted.recover();
     expect(await restarted.execute({
       kind: "account.show",
       account: added.account.id,
     }, { signal })).toMatchObject({
-      account: { processGeneration: 2, state: "login_pending" },
-      login: {
-        status: "pending",
-        loginId: "provider-login-restart",
-        next: `hra account login-cancel ${added.account.id}`,
-      },
+      account: { processGeneration: 2, state: "signed_out" },
+      recovery: { cleared: true, required: false, resolution: "provider_state_reconciled" },
     });
-    const replay = await restarted.execute({
+    await expect(restarted.execute({
       kind: "account.login",
       account: added.account.id,
       deviceCode: true,
       idempotencyKey,
-    }, { signal }) as { account: { processGeneration: number }; login: Record<string, unknown> };
-    expect(replay.account.processGeneration).toBe(2);
-    expect(replay.login).toEqual({
-      status: "pending",
-      loginId: "provider-login-restart",
-      next: `hra account login-cancel ${added.account.id}`,
-    });
-    expect(JSON.stringify(replay)).not.toContain("PRIVATE-CODE");
-    expect(JSON.stringify(replay)).not.toContain("private=handoff");
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
-
-    expect(() => store.settlePendingLogin({
-      profileId: added.account.id,
-      processGeneration: 2,
-      loginId: "wrong-provider-login",
-      providerStatus: "not_found",
-      provider: { signedIn: false },
-    })).toThrow("LOGIN_CANCEL_AUTHORITY_MISMATCH");
-
-    const canceled = await restarted.execute({
-      kind: "account.login-cancel",
-      account: added.account.id,
-    }, { signal }) as { account: { state: string }; providerStatus: string; status: string };
-    expect(canceled).toMatchObject({
-      account: { state: "signed_out" },
-      providerStatus: "not_found",
-      status: "canceled",
-    });
-    expect(restartedCodex.calls).toContain(`login-cancel:${added.account.id}:2:provider-login-restart`);
     expect(await restarted.execute({
       kind: "account.login-cancel",
       account: added.account.id,
     }, { signal })).toMatchObject({ status: "already_settled" });
-    expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+    const attempt = store.readMutation(idempotencyKey);
+    if (attempt === null) throw new Error("Expected the retired login mutation.");
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedProviderAuthorities);
 
     restartedCodex.loginResult = {
       status: "signed_in",
@@ -6663,38 +6857,37 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
   });
 
-  test("preserves exact pending-login cancellation authority across an unexpected provider disconnect", async () => {
+  test("retires pending-login cancellation authority across an unexpected provider disconnect", async () => {
     const { service, codex, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Disconnected login" }, { signal }) as { account: { id: `acct_${string}` } };
     codex.loginResult = { status: "pending", loginId: "provider-login-disconnected" };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
-    await service.observeCodexFact({
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    await service.observeCodexFact(liveAuthorityFor(store, added.account.id), {
       type: "providerDisconnected",
       connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
       reason: "process_exit",
     });
     expect(store.requireProfile(added.account.id)).toMatchObject({
       processGeneration: 2,
-      state: "login_pending",
+      state: "recovery_required",
     });
-    expect(store.readPendingLoginAuthority(added.account.id, 2)).toMatchObject({
-      loginId: "provider-login-disconnected",
-    });
+    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    expect(store.readPendingLoginAuthority(added.account.id, 2)).toBeNull();
     codex.accountProjection = { signedIn: false };
     codex.cancelLoginResult = { status: "not_found" };
     await expect(service.execute({
       kind: "account.login-cancel",
       account: added.account.id,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+    await expect(service.execute({
+      kind: "account.show",
+      account: added.account.id,
     }, { signal })).resolves.toMatchObject({
-      account: { state: "signed_out" },
-      status: "canceled",
+      account: { processGeneration: 2, state: "signed_out" },
+      recovery: { cleared: true, required: false, resolution: "provider_state_reconciled" },
     });
-    expect(codex.calls).toContain(`login-cancel:${added.account.id}:2:provider-login-disconnected`);
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
   });
 
   test("rejects an idempotency key reused across account authorities without mutating the second account", async () => {
@@ -6887,6 +7080,61 @@ describe("HraService", () => {
     expect(await service.execute({ kind: "session.stop", session: started.session.id, idempotencyKey: "00000000-0000-4000-8000-000000000406" }, { signal })).toMatchObject({ stopped: true });
   });
 
+  test("reconciles a retired-generation send from immutable evidence after daemon rollover without replay", async () => {
+    const value = await fixture();
+    const { service, codex, documents, store } = value;
+    const added = await service.execute({ kind: "account.add", label: "Rollover causal send" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Rollover docs", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const key = "00000000-0000-4000-8000-00000000040a";
+    codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
+    await expect(service.execute({ kind: "session.send", session: started.session.id, message: "causal across rollover", idempotencyKey: key }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    const attempt = store.readMutation(key);
+    if (attempt === null) throw new Error("Expected the ambiguous send attempt.");
+    const capturedAttemptAuthority = store.readMutationProviderAuthorities(attempt.id);
+    const oldSessionAuthority = store.requireSessionProviderAuthority(started.session.id);
+    const providerProjection = codex.readProjection;
+
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"d".repeat(32)}`);
+    expect(store.requireSessionProviderAuthority(started.session.id)).toMatchObject({
+      bindingGeneration: oldSessionAuthority.bindingGeneration,
+      processGeneration: oldSessionAuthority.processGeneration + 1,
+      providerAccountId: oldSessionAuthority.providerAccountId,
+    });
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAttemptAuthority);
+    const restartedCodex = new FakeCodex();
+    restartedCodex.readProjection = { ...providerProjection, providerUpdatedAt: 10 };
+    const restarted = new HraService({
+      store,
+      paths: value.paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
+
+    await expect(restarted.execute({ kind: "session.recover", session: started.session.id }, { signal }))
+      .resolves.toMatchObject({
+        idempotencyKey: key,
+        session: { state: "active", activeTurnId: "turn-next" },
+        recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false },
+      });
+    expect(store.readMutation(key)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "proven_applied" },
+    });
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAttemptAuthority);
+    expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "read")).toHaveLength(1);
+    await restarted.close();
+  });
+
   test("rejects noncausal recovery proof and releases an unbound start only by explicit abandon", async () => {
     const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Abandon start" }, { signal }) as { account: { id: string } };
@@ -6916,7 +7164,7 @@ describe("HraService", () => {
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
     expect(store.listUnsettledMutations({ sessionId: started.session.id })).toHaveLength(0);
@@ -6938,7 +7186,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "continue after recovery");
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: 12 };
 
@@ -6958,7 +7206,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "never dispatched");
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     const readsBefore = codex.calls.filter((call) => call === "read").length;
 
@@ -6967,6 +7215,58 @@ describe("HraService", () => {
       recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false },
     });
     expect(store.requireQueue(pending.id)).toMatchObject({ state: "cancelled" });
+    expect(codex.calls.filter((call) => call === "read")).toHaveLength(readsBefore);
+  });
+
+  test("abandons quarantined legacy queue authority locally without a provider read", async () => {
+    const value = await fixture();
+    const { service, codex, store, paths } = value;
+    const { sessionId } = await createIdleSession(value, "Legacy queue abandon");
+    const pending = store.enqueue(sessionId, "cancel locally");
+    const ambiguous = store.enqueue(sessionId, "preserve ambiguous evidence");
+    const injector = new Database(paths.database, { create: false, strict: true });
+    try {
+      injector.query(
+        `INSERT INTO legacy_provider_authority_quarantines(
+           scope_kind,scope_id,reason,recorded_at
+         ) VALUES ('queue',?,'unsettled_provider_authority_unproved',?)`,
+      ).run(pending.id, Date.now());
+      injector.query(
+        `INSERT INTO legacy_provider_authority_quarantines(
+           scope_kind,scope_id,reason,recorded_at
+         ) VALUES ('queue',?,'unsettled_provider_authority_unproved',?)`,
+      ).run(ambiguous.id, Date.now());
+      injector.query(
+        "UPDATE queue_entries SET state='dispatching' WHERE id=?",
+      ).run(ambiguous.id);
+      injector.query(
+        "UPDATE queue_entries SET state='ambiguous' WHERE id=?",
+      ).run(ambiguous.id);
+    } finally {
+      injector.close(false);
+    }
+    store.quarantineSession(sessionId);
+    const readsBefore = codex.calls.filter((call) => call === "read").length;
+
+    await expect(service.execute({
+      kind: "session.recover",
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(codex.calls.filter((call) => call === "read")).toHaveLength(readsBefore);
+    await expect(service.execute({
+      kind: "session.abandon",
+      session: sessionId,
+    }, { signal })).resolves.toMatchObject({
+      session: { state: "terminal" },
+      recovery: {
+        resolved: true,
+        resolution: "abandoned",
+        providerEffectRetried: false,
+        providerStateDeleted: false,
+      },
+    });
+    expect(store.requireQueue(pending.id)).toMatchObject({ state: "cancelled" });
+    expect(store.requireQueue(ambiguous.id)).toMatchObject({ state: "ambiguous" });
     expect(codex.calls.filter((call) => call === "read")).toHaveLength(readsBefore);
   });
 
@@ -7211,6 +7511,10 @@ describe("HraService", () => {
       queueId: queued.id,
       sessionId: started.session.id,
       profileGeneration: 1,
+      providerAuthority: store.requireProviderAccountAuthority(
+        added.account.id as `acct_${string}`,
+        "codex",
+      ),
       evidence: {
         kind: "queue.dispatch",
         queueId: queued.id,
@@ -7220,7 +7524,7 @@ describe("HraService", () => {
         baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
         clientMessageId: queued.id,
         messageDigest: createHash("sha256").update("uncertain").digest("hex"),
-        runtimeProfile: runtimeProfile({ id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" }),
+        runtimeProfile: runtimeProfile(liveAuthorityFor(store, added.account.id as `acct_${string}`)),
       },
     });
     await service.recover();
@@ -7251,11 +7555,55 @@ describe("HraService", () => {
     expect(store.readQueueEffect(queued.queued.id)).toMatchObject({ resolution: { kind: "proven_applied" } });
     expect(store.latestSessionRuntimeProfile(started.session.id)).toMatchObject({ revision: 2, sourceKind: "queue_start", sourceId: queued.queued.id });
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     expect(await service.execute({ kind: "session.recover", session: started.session.id }, { signal })).toMatchObject({
       recovery: { resolution: "provider_state_reconciled" },
     });
+  });
+
+  test("reconciles a retired-generation queued dispatch after daemon rollover without replay", async () => {
+    const value = await fixture();
+    const { service, codex, documents, store } = value;
+    const added = await service.execute({ kind: "account.add", label: "Rollover queue" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Rollover queue docs", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 47);
+    const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "queue across rollover" }, { signal }) as { queued: { id: `queue_${string}` } };
+    await service.settled();
+    const capturedQueueAuthority = store.readQueueProviderAuthority(queued.queued.id);
+    const providerProjection = codex.readProjection;
+
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
+    expect(store.readQueueProviderAuthority(queued.queued.id)).toEqual(capturedQueueAuthority);
+    const restartedCodex = new FakeCodex();
+    restartedCodex.readProjection = { ...providerProjection, providerUpdatedAt: 10 };
+    const restarted = new HraService({
+      store,
+      paths: value.paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
+
+    await expect(restarted.execute({ kind: "session.recover", session: started.session.id }, { signal }))
+      .resolves.toMatchObject({
+        queueId: queued.queued.id,
+        session: { state: "active", activeTurnId: "turn-next" },
+        recovery: { resolution: "proven_applied", providerEffectRetried: false },
+      });
+    expect(store.readQueueEffect(queued.queued.id)).toMatchObject({
+      resolution: { kind: "proven_applied" },
+    });
+    expect(store.readQueueProviderAuthority(queued.queued.id)).toEqual(capturedQueueAuthority);
+    expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "read")).toHaveLength(1);
+    await restarted.close();
   });
 
   test("rejects signed-out runtime effects before creating sessions or usage observations", async () => {
@@ -7320,17 +7668,48 @@ describe("HraService", () => {
   });
 
   test("reconciles an ambiguous logout only from an exact account read without replay", async () => {
-    const { service, codex, documents, store } = await fixture();
+    const value = await fixture();
+    const { service, codex, documents, store } = value;
     const added = await service.execute({ kind: "account.add", label: "Logout recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const seeded = await seedResolvableInteraction(
+      value,
+      started.session.id as `sess_${string}`,
+      "ambiguous-logout-retirement",
+    );
     codex.logoutError = new IndeterminateCodexEffectError("account/logout", 43);
     const command = { kind: "account.logout" as const, account: added.account.id, idempotencyKey: "00000000-0000-4000-8000-000000000501" };
 
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     const quarantined = store.requireProfile(added.account.id);
     expect(quarantined).toMatchObject({ state: "recovery_required", processGeneration: 1, providerEmail: "person@example.com" });
+    expect(store.requireInteraction(seeded.interaction.publicId).state).toBe("expired");
+    const quarantinedEvents = store.listSessionEvents({
+      sessionId: started.session.id as `sess_${string}`,
+      afterSequence: 0,
+      limit: 100,
+    }).events;
+    expect(quarantinedEvents.filter((event) =>
+      event.body.type === "connection" && event.body.state === "disconnected"))
+      .toHaveLength(1);
+    expect(quarantinedEvents.filter((event) =>
+      event.body.type === "gap" && event.body.reason === "provider_disconnect"))
+      .toHaveLength(1);
+    await service.observeCodexFact(seeded.authority, {
+      type: "providerDisconnected",
+      connectionId: seeded.interaction.authority.connectionId,
+      reason: "closed",
+    });
+    await service.settled();
+    expect(store.listSessionEvents({
+      sessionId: started.session.id as `sess_${string}`,
+      afterSequence: 0,
+      limit: 100,
+    }).events.filter((event) =>
+      event.body.type === "connection" && event.body.state === "disconnected"))
+      .toHaveLength(1);
     expect(store.setProfileState(quarantined.id, quarantined.processGeneration, "signed_in", { email: "notification@example.com" })).toBe(false);
 
     await expect(service.execute({ kind: "session.send", session: started.session.id, message: "blocked", idempotencyKey: "00000000-0000-4000-8000-000000000502" }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -7393,12 +7772,7 @@ describe("HraService", () => {
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
     const providerThreadId = session.providerThreadId;
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "3a000000-0000-4000-8000-000000000001";
     value.codex.observationConnectionId = connectionId;
     await value.service.observeCodexFact(authority, {
@@ -7471,12 +7845,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "30000000-0000-4000-8000-000000000001";
     value.codex.observationConnectionId = connectionId;
     await value.service.observeCodexFact(authority, {
@@ -7645,6 +8014,7 @@ describe("HraService", () => {
         sessionId,
         accountId: profile.id,
         providerGeneration: profile.processGeneration,
+        providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
         providerConnectionId: null,
         body: {
           type: "warning",
@@ -7652,13 +8022,7 @@ describe("HraService", () => {
           message: `age ${localState} without append`,
         },
       });
-      if (localState === "idle_signed_out") {
-        expect(value.store.setProfileState(
-          profile.id,
-          profile.processGeneration,
-          "signed_out",
-        )).toBe(true);
-      } else {
+      if (localState === "terminal") {
         value.store.setSessionTurnState({
           sessionId,
           expectedRevision: session.revision,
@@ -7672,6 +8036,28 @@ describe("HraService", () => {
         sequence: 0,
       });
       const providerReadsBefore = value.codex.observedThreads.length;
+      let observedThroughBeforeRead = event.sequence;
+
+      // A signed-out historical stream is readable only after an exact
+      // disconnect retirement was durably recorded under its captured
+      // authority. The subsequent readiness change is local and must not
+      // cause a provider observation.
+      if (localState === "idle_signed_out") {
+        const authority = liveAuthorityFor(value.store, profile.id);
+        await value.service.observeCodexFact(authority, {
+          type: "providerDisconnected",
+          connectionId: value.codex.observationConnectionId,
+          reason: "process_exit",
+        });
+        const retired = value.store.requireProfileById(profile.id);
+        expect(value.store.setProfileState(
+          retired.id,
+          retired.processGeneration,
+          "signed_out",
+        )).toBe(true);
+        observedThroughBeforeRead = value.store
+          .eventStreamPosition(sessionId).observedThroughSequence;
+      }
 
       currentTime += SESSION_EVENT_RETAIN_AGE_MS + 1;
 
@@ -7686,18 +8072,18 @@ describe("HraService", () => {
       expect(page.gap).toEqual({
         reason: "retention_age",
         requestedSequence: 0,
-        retainedFromSequence: event.sequence + 1,
+        retainedFromSequence: observedThroughBeforeRead + 1,
       });
       expect(value.eventCursors.decode(page.nextCursor)).toEqual({
         version: 1,
         sessionId,
         streamEpoch: event.streamEpoch,
-        sequence: event.sequence,
+        sequence: observedThroughBeforeRead,
       });
       expect(value.store.eventStreamPosition(sessionId)).toEqual({
         streamEpoch: event.streamEpoch,
-        floorSequence: event.sequence + 1,
-        observedThroughSequence: event.sequence,
+        floorSequence: observedThroughBeforeRead + 1,
+        observedThroughSequence: observedThroughBeforeRead,
       });
       expect(value.codex.observedThreads).toHaveLength(providerReadsBefore);
     }
@@ -7822,10 +8208,26 @@ describe("HraService", () => {
     const { sessionId } = await createIdleSession(value, "Provider variants");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
+    const terminalSession = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
+      providerThreadId: "provider-terminal-observation",
+      title: "Terminal provider observation",
+      state: "terminal",
+    });
     const observeCallsBeforeNonLiveStatuses = value.codex.calls.filter(
       (call) => call === "observe",
     ).length;
-    expect(value.store.setProfileState(profile.id, profile.processGeneration, "signed_out")).toBe(true);
+    await value.service.observeCodexFact(liveAuthorityFor(value.store, profile.id), {
+      type: "providerDisconnected",
+      connectionId: value.codex.observationConnectionId,
+      reason: "process_exit",
+    });
+    const retiredProfile = value.store.requireProfileById(profile.id);
+    expect(value.store.setProfileState(
+      retiredProfile.id,
+      retiredProfile.processGeneration,
+      "signed_out",
+    )).toBe(true);
     const signedOut = sessionStatusSchema.parse(await value.service.execute({
       kind: "session.status",
       session: sessionId,
@@ -7862,12 +8264,6 @@ describe("HraService", () => {
     });
     expect(quarantined.advisory.attention).toBe("recovery_required");
 
-    const terminalSession = value.store.upsertProviderSession({
-      profileId: profile.id,
-      providerThreadId: "provider-terminal-observation",
-      title: "Terminal provider observation",
-      state: "terminal",
-    });
     const terminal = sessionStatusSchema.parse(await value.service.execute({
       kind: "session.status",
       session: terminalSession.id,
@@ -7889,6 +8285,32 @@ describe("HraService", () => {
     expect(value.codex.calls.filter((call) => call === "observe")).toHaveLength(
       observeCallsBeforeNonLiveStatuses,
     );
+  });
+
+  test("rejects a stale local observation without exact historical retirement evidence", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Unproved retired observation");
+    const session = value.store.requireSession(sessionId);
+    const captured = value.store.requireSessionProviderAuthority(sessionId);
+    value.store.advanceProfileGeneration(session.profileId, captured.processGeneration);
+    const advanced = value.store.requireProfileById(session.profileId);
+    expect(value.store.setProfileState(
+      advanced.id,
+      advanced.processGeneration,
+      "signed_out",
+    )).toBe(true);
+    const providerReadsBefore = value.codex.observedThreads.length;
+
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      details: { reason: "SESSION_PROVIDER_AUTHORITY_STALE" },
+    });
+    expect(value.codex.observedThreads).toHaveLength(providerReadsBefore);
+    expect(value.store.requireCapturedSessionProviderAuthority(sessionId))
+      .toMatchObject(captured);
   });
 
   test("does not append an old-generation warning when resume retirement advances authority", async () => {
@@ -7923,12 +8345,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "30000000-0000-4000-8000-000000000002";
     const providerArgumentsSecret = "MCP-ARGUMENT-SECRET-MUST-NOT-PERSIST";
     const providerResultSecret = "MCP-RESULT-SECRET-MUST-NOT-PERSIST";
@@ -8048,12 +8465,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "32000000-0000-4000-8000-000000000001";
     factsMemory.ensures.length = 0;
     await value.service.observeCodexFact(authority, {
@@ -8107,6 +8519,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "number", value: 41 },
         method: "item/commandExecution/requestApproval",
@@ -8163,12 +8578,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const privatePath = ["", "Users", "alice", "private", "key"].join("/");
     const sentinel = `Bearer PROVIDER_EVENT_SECRET at ${privatePath}`;
     const parsed = parseFact("warning", {
@@ -8205,12 +8615,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "32000000-0000-4000-8000-000000000001";
     const observe = async (fact: CodexFact): Promise<void> =>
       await value.service.observeCodexFact(authority, { ...fact, connectionId });
@@ -8278,6 +8683,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string", value: "confidentiality-request" },
         method: "item/tool/requestUserInput",
@@ -8353,12 +8761,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "33000000-0000-4000-8000-000000000001";
     await expect(value.service.observeCodexFact(authority, {
       type: "interactionRequested",
@@ -8366,6 +8769,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string", value: "unsafe-exact-key" },
         method: "item/tool/requestUserInput",
@@ -8655,17 +9061,15 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const privateTurnId = `${["", "Users", "person", "private"].join("/")}/api_key=INTERACTION-TURN-SECRET`;
     const privateItemId = "token=INTERACTION-ITEM-SECRET";
     const provider = {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
+      provider: authority.provider,
+      providerAccountId: authority.providerAccountId,
+      bindingGeneration: authority.bindingGeneration,
       connectionId: "40000000-0000-4000-8000-000000000001",
       requestId: { type: "string" as const, value: "approval-request-1" },
       method: "item/commandExecution/requestApproval",
@@ -8748,6 +9152,7 @@ describe("HraService", () => {
       sessionId,
       accountId: profile.id,
       providerGeneration: profile.processGeneration,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       providerConnectionId: provider.connectionId,
       body: { type: "turn_started", turnId: privateTurnId },
     });
@@ -9188,6 +9593,7 @@ describe("HraService", () => {
         authority: {
           profileId: profile.id,
           processGeneration: profile.processGeneration,
+          ...codexInteractionBinding(value.store, profile.id),
           connectionId: "74000000-0000-4000-8000-999999999999",
           requestId: { type: "number", value: index },
           method: "item/commandExecution/requestApproval",
@@ -9395,12 +9801,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "42000000-0000-4000-8000-000000000001";
     const requests = [
       {
@@ -9475,6 +9876,9 @@ describe("HraService", () => {
         provider: {
           profileId: profile.id,
           processGeneration: profile.processGeneration,
+          provider: authority.provider,
+          providerAccountId: authority.providerAccountId,
+          bindingGeneration: authority.bindingGeneration,
           connectionId,
           requestId: { type: "number", value: index + 1 },
           method: request.method,
@@ -9519,12 +9923,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const providerThreadId = session.providerThreadId;
     const connectionId = "43000000-0000-4000-8000-000000000001";
     const cases = [
@@ -9624,6 +10023,9 @@ describe("HraService", () => {
           provider: {
             profileId: profile.id,
             processGeneration: profile.processGeneration,
+            provider: authority.provider,
+            providerAccountId: authority.providerAccountId,
+            bindingGeneration: authority.bindingGeneration,
             connectionId,
             requestId: { type: "string", value: requestId },
             method: interactionCase.method,
@@ -9707,12 +10109,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "44000000-0000-4000-8000-000000000001";
     await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
@@ -9720,6 +10117,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string", value: "validation-deadline" },
         method: "item/commandExecution/requestApproval",
@@ -9782,17 +10182,16 @@ describe("HraService", () => {
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
     const connectionId = "45000000-0000-4000-8000-000000000001";
-    await value.service.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    const authority = liveAuthorityFor(value.store, profile.id);
+    await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
       connectionId,
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string", value: "prepare-deadline" },
         method: "item/commandExecution/requestApproval",
@@ -9850,12 +10249,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "46000000-0000-4000-8000-000000000001";
     const admit = async (requestId: string, requestedAt: number, deadlineAt: number) => {
       await value.service.observeCodexFact(authority, {
@@ -9864,6 +10258,9 @@ describe("HraService", () => {
         provider: {
           profileId: profile.id,
           processGeneration: profile.processGeneration,
+          provider: authority.provider,
+          providerAccountId: authority.providerAccountId,
+          bindingGeneration: authority.bindingGeneration,
           connectionId,
           requestId: { type: "string", value: requestId },
           method: "item/commandExecution/requestApproval",
@@ -9957,6 +10354,7 @@ describe("HraService", () => {
       authority: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        ...codexInteractionBinding(value.store, profile.id),
         connectionId: "46100000-0000-4000-8000-000000000001",
         requestId: { type: "string", value: "automatic-timeout-persistence" },
         method: "item/commandExecution/requestApproval",
@@ -10026,6 +10424,7 @@ describe("HraService", () => {
       authority: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        ...codexInteractionBinding(value.store, profile.id),
         connectionId: "46150000-0000-4000-8000-000000000001",
         requestId: { type: "string", value: "automatic-timeout-terminal-event" },
         method: "item/commandExecution/requestApproval",
@@ -10175,12 +10574,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const originalExpire = value.store.expireInteraction.bind(value.store);
     (value.store as unknown as { expireInteraction: StateStore["expireInteraction"] }).expireInteraction = () => {
       throw new Error("injected durable terminalization fault");
@@ -10196,6 +10590,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "number", value: 1 },
         method: "item/commandExecution/requestApproval",
@@ -10233,17 +10630,15 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "45000000-0000-4000-8000-000000000001";
     const request = async (requestId: string) => {
       const provider = {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string" as const, value: requestId },
         method: "item/permissions/requestApproval",
@@ -10359,17 +10754,15 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "50000000-0000-4000-8000-000000000001";
     const request = async (requestId: string) => {
       const provider = {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string" as const, value: requestId },
         method: "item/commandExecution/requestApproval",
@@ -10431,6 +10824,11 @@ describe("HraService", () => {
       ...authority,
       generation: authority.generation + 1,
     };
+    const eventsAfterDisconnect = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: null,
+      limit: 200,
+    }).events;
     const replacementConnectionId = "50000000-0000-4000-8000-000000000099";
     await value.service.observeCodexFact(replacementAuthority, {
       type: "itemStarted",
@@ -10462,6 +10860,7 @@ describe("HraService", () => {
       afterSequence: null,
       limit: 200,
     }).events;
+    expect(eventsAfterReplacement).toEqual(eventsAfterDisconnect);
     await value.service.observeCodexFact(authority, {
       type: "assistantDelta",
       connectionId,
@@ -10475,8 +10874,10 @@ describe("HraService", () => {
       afterSequence: null,
       limit: 200,
     }).events).toEqual(eventsAfterReplacement);
-    expect(JSON.stringify(eventsAfterReplacement)).toContain("new generation visible");
+    expect(JSON.stringify(eventsAfterReplacement)).not.toContain("new generation visible");
     expect(JSON.stringify(eventsAfterReplacement)).not.toContain("stale generation hidden");
+    expect(() => value.store.requireSessionProviderAuthority(sessionId))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
     expect(value.store.requireInteraction(second.publicId)).toMatchObject({
       state: "expired",
       revision: 2,
@@ -10501,12 +10902,7 @@ describe("HraService", () => {
       "clean-shutdown",
     );
     const originalGeneration = seeded.profile.processGeneration;
-    const authority: ProfileAuthority = {
-      id: seeded.profile.id,
-      generation: originalGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, seeded.profile.id);
     await value.service.observeCodexFact(authority, {
       type: "assistantDelta",
       connectionId,
@@ -10569,6 +10965,10 @@ describe("HraService", () => {
       ...authority,
       generation: originalGeneration + 1,
     };
+    const eventsAfterShutdown = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events;
     await restarted.observeCodexFact(replacementAuthority, {
       type: "itemStarted",
       connectionId: replacementConnectionId,
@@ -10598,6 +10998,7 @@ describe("HraService", () => {
       sessionId,
       afterSequence: 0,
     }).events;
+    expect(afterReplacement).toEqual(eventsAfterShutdown);
     await restarted.observeCodexFact(authority, {
       type: "assistantDelta",
       connectionId,
@@ -10608,8 +11009,10 @@ describe("HraService", () => {
     });
     expect(value.store.listSessionEvents({ sessionId, afterSequence: 0 }).events)
       .toEqual(afterReplacement);
-    expect(JSON.stringify(afterReplacement)).toContain("replacement generation visible");
+    expect(JSON.stringify(afterReplacement)).not.toContain("replacement generation visible");
     expect(JSON.stringify(afterReplacement)).not.toContain("stale generation hidden");
+    expect(() => value.store.requireSessionProviderAuthority(sessionId))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
     await restarted.close();
   });
 
@@ -10623,6 +11026,38 @@ describe("HraService", () => {
       "crash-restart",
     );
     const originalGeneration = seeded.profile.processGeneration;
+    const originalSessionAuthority = value.store.requireSessionProviderAuthority(sessionId);
+    const originalProviderAuthority = {
+      provider: originalSessionAuthority.provider,
+      providerAccountId: originalSessionAuthority.providerAccountId,
+      profileId: originalSessionAuthority.profileId,
+      bindingGeneration: originalSessionAuthority.bindingGeneration,
+      processGeneration: originalSessionAuthority.processGeneration,
+    } as const;
+    const originalRuntimeAuthority = liveAuthorityFor(
+      value.store,
+      seeded.profile.id,
+    );
+    const stalePreparedKey = "52000000-0000-4000-8000-000000000099";
+    const stalePrepared = value.store.prepareMutation({
+      kind: "session.send",
+      authorityId: sessionId,
+      authorityGeneration: originalSessionAuthority.processGeneration,
+      request: { message: "must remain fenced after restart" },
+      idempotencyKey: stalePreparedKey,
+      providerAuthorities: [{
+        role: "primary",
+        authority: originalProviderAuthority,
+        provenance: "session_send",
+      }],
+    });
+    expect(stalePrepared).toMatchObject({ state: "prepared", replay: false });
+    const staleQueue = value.store.enqueue(
+      sessionId,
+      "queued input must remain fenced after restart",
+    );
+    expect(value.store.readQueueProviderAuthority(staleQueue.id))
+      .toMatchObject(originalProviderAuthority);
     const oldStoreIndex = stores.indexOf(value.store);
     if (oldStoreIndex < 0) throw new Error("Expected the fixture store to be tracked.");
     value.daemonAuthority.invalidate();
@@ -10637,6 +11072,20 @@ describe("HraService", () => {
     expect(daemonGeneration).toBe(1);
     expect(restartedStore.requireProfileById(seeded.profile.id).processGeneration)
       .toBe(originalGeneration + 1);
+    const reboundSessionAuthority = restartedStore.requireSessionProviderAuthority(sessionId);
+    expect(reboundSessionAuthority).toMatchObject({
+      provider: originalSessionAuthority.provider,
+      providerAccountId: originalSessionAuthority.providerAccountId,
+      profileId: originalSessionAuthority.profileId,
+      bindingGeneration: originalSessionAuthority.bindingGeneration,
+      processGeneration: originalSessionAuthority.processGeneration + 1,
+    });
+    expect(restartedStore.readMutation(stalePreparedKey))
+      .toMatchObject({ state: "cancelled" });
+    expect(restartedStore.requireQueue(staleQueue.id))
+      .toMatchObject({ state: "cancelled" });
+    expect(restartedStore.readQueueProviderAuthority(staleQueue.id))
+      .toMatchObject(originalProviderAuthority);
     expect(restartedStore.requireInteraction(seeded.pending.publicId)).toMatchObject({
       state: "expired",
       revision: 2,
@@ -10691,6 +11140,34 @@ describe("HraService", () => {
       limit: 200,
       waitMs: 0,
     }, { signal })).resolves.toMatchObject({ events: [] });
+    const eventsBeforeOldCallback = restartedStore.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events;
+    await restarted.observeCodexFact(
+      originalRuntimeAuthority,
+      {
+        type: "assistantDelta",
+        connectionId: "52000000-0000-4000-8000-000000000001",
+        threadId: seeded.session.providerThreadId as string,
+        turnId: "old-restart-turn",
+        itemId: "old-restart-item",
+        text: "stale callback must stay fenced",
+      },
+    );
+    expect(restartedStore.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events).toEqual(eventsBeforeOldCallback);
+    const providerCallsBeforeStalePrepared = restartedCodex.calls.length;
+    await expect(restarted.execute({
+      kind: "session.send",
+      session: sessionId,
+      message: "must remain fenced after restart",
+      idempotencyKey: stalePreparedKey,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(restartedCodex.calls.slice(providerCallsBeforeStalePrepared))
+      .not.toContain("send");
     const restartEvents = restartedStore.listSessionEvents({
       sessionId,
       afterSequence: 0,
@@ -10703,6 +11180,7 @@ describe("HraService", () => {
     expect(resubscribed).toMatchObject({
       body: { type: "connection", state: "resubscribed" },
       providerConnectionId: restartedCodex.observationConnectionId,
+      providerGeneration: originalSessionAuthority.processGeneration + 1,
     });
     await restarted.close();
   });
@@ -10726,12 +11204,7 @@ describe("HraService", () => {
       signalFactAdmitted();
       await factGate;
     };
-    const authority: ProfileAuthority = {
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(store, added.account.id);
     const fact = service.observeCodexFact(authority, {
       type: "turnCompleted",
       threadId: started.session.providerThreadId,
@@ -10778,12 +11251,7 @@ describe("HraService autorespond", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = "46000000-0000-4000-8000-000000000001";
     await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
@@ -10791,6 +11259,9 @@ describe("HraService autorespond", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string" as const, value: requestId },
         method: "item/commandExecution/requestApproval",
@@ -10889,12 +11360,7 @@ describe("HraService prose autorespond", () => {
     const profile = value.store.requireProfileById(session.profileId);
     const threadId = session.providerThreadId;
     if (threadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     await value.service.observeCodexFact(authority, {
       type: "turnStarted",
       threadId,
@@ -11189,7 +11655,7 @@ describe("HraService prose autorespond", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     await value.service.observeCodexFact(
-      { id: profile.id, generation: profile.processGeneration, codexHome: "unused", desktopUserData: "unused" },
+      liveAuthorityFor(value.store, profile.id),
       {
         type: "turnCompleted",
         threadId: session.providerThreadId as string,

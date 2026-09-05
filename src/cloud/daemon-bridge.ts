@@ -1,5 +1,8 @@
 import { parseAuthSignInResult } from "./authSession";
 import {
+  providerAccountAuthoritySchema,
+} from "../domain/provider-accounts";
+import {
   createConvexCloudTransport,
   type CloudArgs,
   type CloudMutation,
@@ -39,12 +42,14 @@ import {
 } from "./crypto";
 import {
   type CloudCommandJournalEntry,
+  type CloudCommandLocalAuthority,
   type CloudDaemonJournalPort,
   type CloudDaemonJournalState,
   type CloudDeviceCommandJournalEntry,
   type CloudProjectionRecoveryAppliedResponse,
   type CloudProjectionRecoveryBaselineInteraction,
   type CloudProjectionRecoveryJournalEntry,
+  type CloudProjectionRecoveryLocalAuthority,
   type CloudProjectionRecoveryTerminalReceipt,
   type CloudSessionSyncCursorObservation,
   type CloudSessionSyncCursorPort,
@@ -56,6 +61,7 @@ import {
   advanceCloudSessionRemoteCursor,
   assertCloudDaemonJournalFutureCapacity,
   cloudProjectionRecoveryReceiptResult,
+  cloudCommandLocalAuthorityDigest,
   completePendingCloudUsageAccount,
   createCloudProjectionRecoveryTerminalReceipt,
   CustodyCloudDaemonJournal,
@@ -63,10 +69,13 @@ import {
   hasUnsettledCompactProjectionRecovery,
   hasUnsettledCompactProjectionRecoveryForProfile,
   invalidIdempotencyProjectionRecoveryCode,
+  isProviderBoundCloudCommandLocalAuthority,
+  isProviderBoundCloudProjectionRecoveryLocalAuthority,
   matchesCloudProjectionRecoveryIdentity,
   parseCloudProjectionRecoveryEntry,
   providerDeletionProjectionRecoveryCode,
   pruneExpiredCloudProjectionRecoveryReceipts,
+  quarantineUnprovableProviderProjectionRecoveries,
   removeCloudDeviceCommandJournalEntry,
   supersedeCloudProjectionRecoveryForProviderDeletion,
   terminalizeUnreservedPreparedCloudCommands,
@@ -209,12 +218,7 @@ export type CloudLocalUsageSnapshot = Readonly<{
   sourceRevision: number;
 }>;
 
-export type CloudLocalCommandAuthority = Readonly<{
-  localSessionId: string;
-  profileGeneration: number;
-  profileId: string;
-  providerThreadId: string;
-}>;
+export type CloudLocalCommandAuthority = CloudCommandLocalAuthority;
 
 export interface CloudDaemonLocalSourcePort {
   activateCompactProjectionRecovery?(input: Readonly<{
@@ -224,13 +228,7 @@ export interface CloudDaemonLocalSourcePort {
     boundaryTailDigest: string;
     compactStreamEpoch: number;
     idempotencyKey: string;
-    localAuthority: Readonly<{
-      profileGeneration: number;
-      profileId: string;
-      providerThreadId: string;
-      providerUpdatedAt: number | null;
-      sessionRevision: number;
-    }>;
+    localAuthority: CloudProjectionRecoveryLocalAuthority;
     replacementCacheId: string;
     sessionPublicId: string;
     signal: AbortSignal;
@@ -259,13 +257,7 @@ export interface CloudDaemonLocalSourcePort {
   }>): Promise<Readonly<{
     baselineCompletedTurns: readonly Readonly<{ bodyDigest: string; turnId: string }>[];
     baselineInteractions: readonly CloudProjectionRecoveryBaselineInteraction[];
-    localAuthority: Readonly<{
-      profileGeneration: number;
-      profileId: string;
-      providerThreadId: string;
-      providerUpdatedAt: number | null;
-      sessionRevision: number;
-    }>;
+    localAuthority: CloudProjectionRecoveryLocalAuthority;
     replacementCacheId: string;
     sessionPublicId: string;
     sourceCacheId: string | null;
@@ -277,13 +269,7 @@ export interface CloudDaemonLocalSourcePort {
     boundaryTailDigest: string;
     compactStreamEpoch: number;
     idempotencyKey: string;
-    localAuthority: Readonly<{
-      profileGeneration: number;
-      profileId: string;
-      providerThreadId: string;
-      providerUpdatedAt: number | null;
-      sessionRevision: number;
-    }>;
+    localAuthority: CloudProjectionRecoveryLocalAuthority;
     replacementCacheId: string;
     sessionPublicId: string;
     signal: AbortSignal;
@@ -1705,6 +1691,7 @@ function sameCommandJournalEntry(
 ): boolean {
   return left.commandPublicId === right.commandPublicId
     && left.kind === right.kind
+    && JSON.stringify(left.localAuthority) === JSON.stringify(right.localAuthority)
     && left.localAuthorityDigest === right.localAuthorityDigest
     && left.payloadDigest === right.payloadDigest
     && left.phase === right.phase
@@ -1922,16 +1909,44 @@ function validateUsage(value: CloudLocalUsageSnapshot): CloudLocalUsageSnapshot 
 function validateLocalCommandAuthority(
   value: CloudLocalCommandAuthority | null,
 ): CloudLocalCommandAuthority {
+  const providerAuthority = value === null
+    ? null
+    : providerAccountAuthoritySchema.safeParse({
+        bindingGeneration: value.bindingGeneration,
+        processGeneration: value.processGeneration,
+        profileId: value.profileId,
+        provider: value.provider,
+        providerAccountId: value.providerAccountId,
+      });
   if (
     value === null
+    || !hasExactKeys(value, [
+      "bindingGeneration",
+      "localSessionId",
+      "processGeneration",
+      "profileId",
+      "provider",
+      "providerAccountId",
+      "providerThreadId",
+    ])
+    || providerAuthority === null
+    || !providerAuthority.success
+    || providerAuthority.data.processGeneration < 1
     || !isOpaqueIdentifier(value.localSessionId)
-    || !isSafePositiveInteger(value.profileGeneration)
-    || !isOpaqueIdentifier(value.profileId)
     || typeof value.providerThreadId !== "string"
     || value.providerThreadId.length < 1
     || value.providerThreadId.length > 200
+    || /[\0\r\n]/u.test(value.providerThreadId)
   ) throw new Error("Local provider command authority is unavailable.");
-  return value;
+  return {
+    bindingGeneration: providerAuthority.data.bindingGeneration,
+    localSessionId: value.localSessionId,
+    processGeneration: providerAuthority.data.processGeneration,
+    profileId: providerAuthority.data.profileId,
+    provider: providerAuthority.data.provider,
+    providerAccountId: providerAuthority.data.providerAccountId,
+    providerThreadId: value.providerThreadId,
+  };
 }
 
 async function encryptPrivateJson(
@@ -2114,8 +2129,27 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         )).page;
         const headById = new Map(heads.map((head) => [head.publicId, head]));
         const leases = new Map<string, CloudLease>();
-        const recoveryJournal = await this.#journal.read();
+        let recoveryJournal = await this.#journal.read();
         await this.#assertDaemonCurrent(signal);
+        const unprovableRecoveries = recoveryJournal.state.projectionRecoveries.filter((entry) =>
+          !isProviderBoundCloudProjectionRecoveryLocalAuthority(entry.localAuthority));
+        if (unprovableRecoveries.length > 0) {
+          recoveryJournal = await this.#mutateJournal((state) =>
+            quarantineUnprovableProviderProjectionRecoveries(state, this.#now()));
+          for (const entry of unprovableRecoveries) {
+            try {
+              await this.#local.discardCompactProjectionRecovery?.({
+                idempotencyKey: entry.idempotencyKey,
+                sessionPublicId: entry.sessionPublicId,
+              });
+            } catch (error: unknown) {
+              result.errors.push(`projection recovery quarantine: ${normalizeError(error)}`);
+            }
+          }
+          result.errors.push(
+            `projection recovery: quarantined ${String(unprovableRecoveries.length)} provider-unbound legacy effect${unprovableRecoveries.length === 1 ? "" : "s"}.`,
+          );
+        }
         const projectionRecoveryBlockedSessionIds = new Set(
           recoveryJournal.state.projectionRecoveries
             .map((entry) => entry.sessionPublicId),
@@ -2523,11 +2557,24 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       await this.#assertDaemonCurrent(input.signal);
       const identity = await this.#identity.requireActive(input.signal);
       await this.#assertDaemonCurrent(input.signal);
-      const observed = await this.#journal.read();
+      let observed = await this.#journal.read();
       await this.#assertDaemonCurrent(input.signal);
       const requestedAt = this.#now();
       if (!isSafeNonNegativeInteger(requestedAt)) {
         throw new CloudProjectionRecoveryAdmissionError("idempotency_authority_invalid");
+      }
+      const unprovableRecoveries = observed.state.projectionRecoveries.filter((entry) =>
+        !isProviderBoundCloudProjectionRecoveryLocalAuthority(entry.localAuthority));
+      if (unprovableRecoveries.length > 0) {
+        observed = await this.#mutateJournal((state) =>
+          quarantineUnprovableProviderProjectionRecoveries(state, requestedAt));
+        for (const entry of unprovableRecoveries) {
+          await this.#local.discardCompactProjectionRecovery?.({
+            idempotencyKey: entry.idempotencyKey,
+            sessionPublicId: entry.sessionPublicId,
+          });
+        }
+        await this.#assertDaemonCurrent(input.signal);
       }
       const currentState = pruneExpiredCloudProjectionRecoveryReceipts(
         observed.state,
@@ -2750,11 +2797,14 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     boundaryTailDigest: string;
     compactStreamEpoch: number;
     idempotencyKey: string;
-    localAuthority: CloudProjectionRecoveryJournalEntry["localAuthority"];
+    localAuthority: CloudProjectionRecoveryLocalAuthority;
     replacementCacheId: string;
     sessionPublicId: string;
     sourceCacheId: string | null;
   }> {
+    if (!isProviderBoundCloudProjectionRecoveryLocalAuthority(entry.localAuthority)) {
+      throw new Error("Cloud projection recovery provider authority is unprovable.");
+    }
     return {
       baselineCompletedTurns: entry.baselineCompletedTurns,
       baselineInteractions: entry.baselineInteractions ?? [],
@@ -4188,7 +4238,8 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           authority: authorityOf(lease),
           commandPublicId: command.publicId,
           kind: command.kind,
-          localAuthorityDigest: await sha256Hex(JSON.stringify(localAuthority)),
+          localAuthority,
+          localAuthorityDigest: cloudCommandLocalAuthorityDigest(localAuthority),
           payloadDigest,
           phase: "prepared",
           sessionPublicId: command.sessionPublicId,
@@ -4238,6 +4289,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           authority: exact.boundAuthority,
           commandPublicId: command.publicId,
           kind: command.kind,
+          localAuthority: null,
           localAuthorityDigest: await sha256Hex(
             "hra-control-plane-cloud-command-missing-local-journal:v1",
           ),
@@ -4316,14 +4368,13 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           continue;
         }
         if (
-          entry.localAuthorityDigest
-          === await sha256Hex("hra-control-plane-cloud-command-missing-local-journal:v1")
+          !isProviderBoundCloudCommandLocalAuthority(entry.localAuthority)
         ) {
           await this.#failPreparedWithoutEffect(
             entry,
             resumed,
             lease,
-            "LOCAL_JOURNAL_EVIDENCE_MISSING_BEFORE_EFFECT",
+            "LOCAL_PROVIDER_AUTHORITY_UNPROVABLE_BEFORE_EFFECT",
           );
           continue;
         }
@@ -4336,7 +4387,10 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         if (localAuthority.localSessionId !== entry.sessionPublicId) {
           throw new Error("Local provider command authority does not match its cloud session.");
         }
-        if (await sha256Hex(JSON.stringify(localAuthority)) !== entry.localAuthorityDigest) {
+        if (
+          cloudCommandLocalAuthorityDigest(localAuthority) !== entry.localAuthorityDigest
+          || JSON.stringify(localAuthority) !== JSON.stringify(entry.localAuthority)
+        ) {
           await this.#failPreparedWithoutEffect(
             entry,
             resumed,
@@ -4433,7 +4487,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       || current.payloadDigest !== payloadDigest
       || current.kind !== command.kind
       || current.sessionPublicId !== sessionPublicId
-      || current.localAuthorityDigest !== await sha256Hex(JSON.stringify(localAuthority))
+      || !isProviderBoundCloudCommandLocalAuthority(current.localAuthority)
+      || current.localAuthorityDigest !== cloudCommandLocalAuthorityDigest(localAuthority)
+      || JSON.stringify(current.localAuthority) !== JSON.stringify(localAuthority)
     ) throw new Error("Prepared cloud command journal does not match its request.");
     const prepared = await this.#mutation("commands:prepare", {
       authority,

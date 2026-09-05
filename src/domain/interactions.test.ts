@@ -7,6 +7,7 @@ import {
   interactionRecordSchema,
   protectedInteractionDetailDocumentSchema,
   mcpFormFieldSchema,
+  legacyProviderInteractionAuthoritySchema,
   providerInteractionAuthoritySchema,
   providerRequestIdSchema,
   permissionCategoryIsNetworkOrExternal,
@@ -18,6 +19,11 @@ import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import { createProfileId, createSessionId } from "./values";
 
 const providerIdentifierKey = Buffer.alloc(32, 0x41);
+const codexProviderAuthority = {
+  provider: "codex" as const,
+  providerAccountId: "acct_00000000000000000000000000000000",
+  bindingGeneration: 1,
+};
 
 describe("provider interactions", () => {
   test("binds complete protected authority to one live public revision and kind", () => {
@@ -64,6 +70,7 @@ describe("provider interactions", () => {
 
   test("allows nullable MCP context while keeping method, digest, connection, and generation exact", () => {
     const authority = providerInteractionAuthoritySchema.parse({
+      ...codexProviderAuthority,
       profileId: createProfileId(),
       processGeneration: 4,
       connectionId: crypto.randomUUID(),
@@ -78,12 +85,34 @@ describe("provider interactions", () => {
     expect(authority.turnId).toBeNull();
   });
 
+  test("keeps providerless interaction authority at the decode-only legacy boundary", () => {
+    const providerless = {
+      profileId: createProfileId(),
+      processGeneration: 4,
+      connectionId: crypto.randomUUID(),
+      requestId: { type: "string" as const, value: "legacy-1" },
+      method: "item/tool/requestUserInput",
+      requestDigest: "d".repeat(64),
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "item-1",
+      approvalId: null,
+    };
+    expect(legacyProviderInteractionAuthoritySchema.parse(providerless)).toEqual(providerless);
+    expect(() => providerInteractionAuthoritySchema.parse(providerless)).toThrow();
+    expect(() => legacyProviderInteractionAuthoritySchema.parse({
+      ...providerless,
+      provider: "codex",
+    })).toThrow();
+  });
+
   test("durable records contain sanitized display and response digest, not response secrets", () => {
     const value = {
       version: 1 as const,
       publicId: crypto.randomUUID(),
       sessionId: createSessionId(),
       authority: {
+        ...codexProviderAuthority,
         profileId: createProfileId(),
         processGeneration: 1,
         connectionId: crypto.randomUUID(),

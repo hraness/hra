@@ -28,6 +28,16 @@ const sourceId = "acct_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
 const targetId = "acct_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as const;
 const idempotencyKey = "11111111-1111-4111-8111-111111111111";
 
+function providerAuthority(profileId: typeof sourceId | typeof targetId, processGeneration: number) {
+  return {
+    providerAccountId: profileId,
+    profileId,
+    provider: "codex" as const,
+    bindingGeneration: 1,
+    processGeneration,
+  };
+}
+
 const capability: ChatGptBundleCapability = {
   status: "supported-experimental",
   bundlePath: "/Applications/ChatGPT.app",
@@ -57,12 +67,18 @@ async function fixture() {
   const source: ProfileAuthority = {
     id: sourceId,
     generation: 2,
+    provider: "codex",
+    providerAccountId: sourceId,
+    bindingGeneration: 1,
     codexHome: join(paths.profiles, sourceId, "codex-home"),
     desktopUserData: join(paths.profiles, sourceId, "desktop-user-data"),
   };
   const target: ProfileAuthority = {
     id: targetId,
     generation: 3,
+    provider: "codex",
+    providerAccountId: targetId,
+    bindingGeneration: 1,
     codexHome: join(paths.profiles, targetId, "codex-home"),
     desktopUserData: join(paths.profiles, targetId, "desktop-user-data"),
   };
@@ -76,8 +92,10 @@ function readyPlan() {
     switchGeneration: 7,
     sourceProfileId: sourceId,
     sourceProcessGeneration: 2,
+    sourceProviderAuthority: providerAuthority(sourceId, 2),
     targetProfileId: targetId,
     targetProcessGeneration: 3,
+    targetProviderAuthority: providerAuthority(targetId, 3),
     journalStage: "new",
     expectedAccountKey: "person@example.com",
   } as const;
@@ -213,8 +231,8 @@ describe("LocalDesktopSwitchPort", () => {
     expect(stored.began).toEqual([
       {
         idempotencyKey,
-        requestedSource: { profileId: sourceId, processGeneration: 2 },
-        target: { profileId: targetId, processGeneration: 3 },
+        requestedSource: providerAuthority(sourceId, 2),
+        target: providerAuthority(targetId, 3),
       },
     ]);
     expect(stored.prepared).toHaveLength(1);
@@ -243,8 +261,10 @@ describe("LocalDesktopSwitchPort", () => {
       switchGeneration: 7,
       sourceProfileId: null,
       sourceProcessGeneration: null,
+      sourceProviderAuthority: null,
       targetProfileId: targetId,
       targetProcessGeneration: 3,
+      targetProviderAuthority: providerAuthority(targetId, 3),
       expectedAccountKey: "person@example.com",
       activeAccount: { signedIn: true, email: "person@example.com" },
     });
@@ -284,10 +304,12 @@ describe("LocalDesktopSwitchPort", () => {
       status: "recovery_required",
       idempotencyKey,
       switchGeneration: 7,
-      sourceProfileId: sourceId,
-      sourceProcessGeneration: 2,
+      sourceProfileId: null,
+      sourceProcessGeneration: null,
+      sourceProviderAuthority: null,
       targetProfileId: targetId,
       targetProcessGeneration: 3,
+      targetProviderAuthority: providerAuthority(targetId, 3),
       diagnostic: "LAUNCH_REQUESTED_INDETERMINATE",
     });
     const effects = fakeProcess();
@@ -322,8 +344,10 @@ describe("LocalDesktopSwitchPort", () => {
       switchGeneration: 7,
       sourceProfileId: null,
       sourceProcessGeneration: null,
+      sourceProviderAuthority: null,
       targetProfileId: targetId,
       targetProcessGeneration: 3,
+      targetProviderAuthority: providerAuthority(targetId, 3),
       expectedAccountKey: "person@example.com",
       activeAccount: { signedIn: true, email: "different@example.com" },
     });
@@ -353,7 +377,11 @@ describe("LocalDesktopSwitchPort", () => {
 
   test("rejects a mismatched durable binding after read-only preflight and before app effects", async () => {
     const { paths, target } = await fixture();
-    const stored = fakeStore({ ...readyPlan(), targetProcessGeneration: 4 });
+    const stored = fakeStore({
+      ...readyPlan(),
+      targetProcessGeneration: 4,
+      targetProviderAuthority: providerAuthority(targetId, 4),
+    });
     let inspected = false;
     const error = await new LocalDesktopSwitchPort({
       paths,
@@ -656,6 +684,34 @@ describe("LocalDesktopSwitchPort", () => {
         lock: { withLock: async (effect) => effect() },
       }).switchAccount({ idempotencyKey, target, signal: controller.signal }),
     ).rejects.toThrow("cancelled");
+    expect(stored.began).toHaveLength(0);
+  });
+
+  test("rejects non-Codex target authority before durable planning", async () => {
+    const { paths, target } = await fixture();
+    const stored = fakeStore();
+    const claudeTarget: ProfileAuthority = {
+      ...target,
+      provider: "claude",
+      providerAccountId: `pact_${"c".repeat(32)}`,
+    };
+    const error = await new LocalDesktopSwitchPort({
+      paths,
+      store: stored.store,
+      runtime: {
+        observeDesktopInstanceAccount: () => Promise.reject(new Error("must not read")),
+      },
+      bundle: { inspect: () => Promise.reject(new Error("must not inspect")) },
+      process: fakeProcess().process,
+      lock: { withLock: async (effect) => effect() },
+    }).switchAccount({
+      idempotencyKey,
+      target: claudeTarget,
+      signal: new AbortController().signal,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(DesktopSwitchError);
+    expect((error as DesktopSwitchError).code).toBe("INVALID_PROFILE");
     expect(stored.began).toHaveLength(0);
   });
 });

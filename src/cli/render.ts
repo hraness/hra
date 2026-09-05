@@ -1367,6 +1367,13 @@ const renderSessionStatus = (data: unknown): string => {
     `Interactions: ${String(root.interactions.pendingCount)} pending, ${String(root.interactions.responseInFlightCount)} response in flight`,
     `Events: through ${String(root.eventStream.observedThroughSequence)}, retained from ${String(root.eventStream.floorSequence)}`,
   );
+  if (
+    root.advisory.execution === "terminal"
+    && providerObservation.state === "not_applicable"
+    && providerObservation.reason === "terminal"
+  ) {
+    rows.push("Next: start a new session; HRA will not resume or replay this terminal provider thread.");
+  }
   if (root.interactions.pending.length > 0) {
     rows.push(
       "",

@@ -18,6 +18,8 @@ import {
   buildPinnedClaudeRuntimeArgv,
   locateClaudeExecutable,
   resolvePinnedClaudeRuntime,
+  spawnClaudeAuthStatusProbe,
+  spawnClaudeVersionProbe,
 } from "./runtime";
 
 const roots: string[] = [];
@@ -36,6 +38,15 @@ const fakeExecutable = async (): Promise<Readonly<{ configDir: string; path: str
   const root = await scratch();
   const path = join(root, "claude");
   await writeFile(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  return { configDir: join(root, "config"), path };
+};
+
+const scriptedExecutable = async (
+  script: string,
+): Promise<Readonly<{ configDir: string; path: string }>> => {
+  const root = await scratch();
+  const path = join(root, "claude");
+  await writeFile(path, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
   return { configDir: join(root, "config"), path };
 };
 
@@ -206,6 +217,89 @@ describe("pinned Claude runtime", () => {
     await expect(locateClaudeExecutable({ PATH: directory })).resolves.toBe(path);
     await expect(locateClaudeExecutable({ PATH: "relative/bin" })).rejects.toThrow(ClaudeError);
     await expect(locateClaudeExecutable({})).rejects.toThrow(ClaudeError);
+  });
+
+  test("keeps every exit-zero authenticated shape unverified", async () => {
+    const { configDir, path } = await scriptedExecutable(`
+if [ "$1:$2:$3" != "auth:status:--json" ] || [ -z "$CLAUDE_CONFIG_DIR" ] || [ -n "$ANTHROPIC_API_KEY" ]; then
+  exit 9
+fi
+printf '%s' '{"analyticsDisabled":false,"apiProvider":"firstParty","authMethod":"claude.ai","loggedIn":true,"projectsDirectory":"/isolated/projects","email":"must-not-escape@example.com","orgId":null,"orgName":null,"subscriptionType":null}'
+`);
+    await expect(spawnClaudeAuthStatusProbe({
+      configDir,
+      environment: { ...process.env, ANTHROPIC_API_KEY: "must-not-reach-child" },
+      executablePath: path,
+    })).resolves.toBe("unverified");
+  });
+
+  test("admits only the exact pinned exit-one signed-out matrix", async () => {
+    const { configDir, path } = await scriptedExecutable(`
+printf '%s' '{"projectsDirectory":"/isolated/projects","loggedIn":false,"authMethod":"none","analyticsDisabled":false,"apiProvider":"firstParty"}'
+exit 1
+`);
+    await expect(spawnClaudeAuthStatusProbe({ configDir, executablePath: path }))
+      .resolves.toBe("signed_out");
+  });
+
+  test("maps shape drift, other exits, oversized, and timed-out auth output to unverified", async () => {
+    const malformed = await scriptedExecutable("printf '%s' '{\"loggedIn\":false}'; exit 1");
+    const nonzero = await scriptedExecutable("printf '%s' '{\"loggedIn\":true}'; exit 7");
+    const extra = await scriptedExecutable("printf '%s' '{\"analyticsDisabled\":false,\"apiProvider\":\"firstParty\",\"authMethod\":\"none\",\"loggedIn\":false,\"projectsDirectory\":\"/isolated/projects\",\"email\":null}'; exit 1");
+    const exitZero = await scriptedExecutable("printf '%s' '{\"analyticsDisabled\":false,\"apiProvider\":\"firstParty\",\"authMethod\":\"none\",\"loggedIn\":false,\"projectsDirectory\":\"/isolated/projects\"}'");
+    const oversized = await scriptedExecutable(`
+printf '%s' '{"loggedIn":true,"padding":"'
+i=0
+while [ "$i" -lt 256 ]; do printf x; i=$((i + 1)); done
+printf '%s' '"}'
+`);
+    const timedOut = await scriptedExecutable("while :; do :; done");
+    await expect(spawnClaudeAuthStatusProbe({
+      configDir: malformed.configDir,
+      executablePath: malformed.path,
+    })).resolves.toBe("unverified");
+    await expect(spawnClaudeAuthStatusProbe({
+      configDir: nonzero.configDir,
+      executablePath: nonzero.path,
+    })).resolves.toBe("unverified");
+    await expect(spawnClaudeAuthStatusProbe({
+      configDir: extra.configDir,
+      executablePath: extra.path,
+    })).resolves.toBe("unverified");
+    await expect(spawnClaudeAuthStatusProbe({
+      configDir: exitZero.configDir,
+      executablePath: exitZero.path,
+    })).resolves.toBe("unverified");
+    await expect(spawnClaudeAuthStatusProbe({
+      configDir: oversized.configDir,
+      executablePath: oversized.path,
+      maxOutputBytes: 64,
+    })).resolves.toBe("unverified");
+    await expect(spawnClaudeAuthStatusProbe({
+      configDir: timedOut.configDir,
+      executablePath: timedOut.path,
+      timeoutMs: 20,
+    })).resolves.toBe("unverified");
+  });
+
+  test("bounds version output and preserves caller cancellation", async () => {
+    const oversized = await scriptedExecutable(`
+i=0
+while [ "$i" -lt 300 ]; do printf x; i=$((i + 1)); done
+`);
+    await expect(spawnClaudeVersionProbe({
+      configDir: oversized.configDir,
+      environment: process.env,
+      executablePath: oversized.path,
+    })).rejects.toThrow("did not report a version");
+
+    const controller = new AbortController();
+    controller.abort(new Error("caller stopped auth refresh"));
+    await expect(spawnClaudeAuthStatusProbe({
+      configDir: oversized.configDir,
+      executablePath: oversized.path,
+      signal: controller.signal,
+    })).rejects.toThrow("caller stopped auth refresh");
   });
 
   test("keeps the pinned model id equal to the fable-max preset requirement", () => {

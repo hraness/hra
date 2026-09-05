@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import type { ClaudeProcess, PinnedClaudeRuntime } from "../claude/index";
+import type {
+  ClaudeAuthStatusProbe,
+  ClaudeProcess,
+  PinnedClaudeRuntime,
+} from "../claude/index";
 import {
   CLAUDE_PIN,
   CLAUDE_PIN_EFFORT,
@@ -23,6 +27,9 @@ const authority: ProfileAuthority = {
   desktopUserData: "/var/hra/profiles/acct/desktop",
   generation: 3,
   id: "acct_00000000000000000000000000000000",
+  provider: "claude",
+  providerAccountId: "pact_00000000000000000000000000000000",
+  bindingGeneration: 1,
 };
 
 class FakeClaudeProcess implements ClaudeProcess {
@@ -83,7 +90,10 @@ const settle = async (): Promise<void> => {
   await new Promise((resolve) => { setTimeout(resolve, 1); });
 };
 
-const harness = (options: { isCurrent?: () => boolean } = {}) => {
+const harness = (options: {
+  isCurrent?: (authority: ProfileAuthority) => boolean;
+  probeAuthStatus?: ClaudeAuthStatusProbe;
+} = {}) => {
   const facts: ClaudeSessionFact[] = [];
   const processes: FakeClaudeProcess[] = [];
   const manager = new PinnedClaudeRuntimeManager({
@@ -91,6 +101,7 @@ const harness = (options: { isCurrent?: () => boolean } = {}) => {
     isCurrent: options.isCurrent ?? (() => true),
     now: () => 1_700_000_000_000,
     observer: { fact: (_authority, fact) => { facts.push(fact); } },
+    probeAuthStatus: options.probeAuthStatus ?? (async () => "signed_out"),
     processFactory: () => {
       const process = new FakeClaudeProcess();
       processes.push(process);
@@ -142,6 +153,73 @@ const startTurn = async (
 };
 
 describe("pinned Claude runtime manager", () => {
+  test("rejects another provider before reviewing or spawning Claude", async () => {
+    const { manager, processes } = harness();
+    await expect(manager.reviewSessionStart({
+      authority: {
+        ...authority,
+        provider: "codex",
+        providerAccountId: "acct_00000000000000000000000000000000",
+      },
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toThrow("authority changed");
+    expect(processes).toHaveLength(0);
+    await manager.close();
+  });
+
+  test("observes bounded Claude readiness without inferring account identity from live sessions", async () => {
+    let readiness: "signed_in" | "signed_out" | "unverified" = "signed_in";
+    const probes: Array<Parameters<ClaudeAuthStatusProbe>[0]> = [];
+    const { manager } = harness({
+      probeAuthStatus: async (input) => {
+        probes.push(input);
+        return readiness;
+      },
+    });
+
+    await expect(manager.readAccount({ authority, signal: signal() })).resolves.toEqual({
+      observedAt: 1_700_000_000_000,
+      readiness: "signed_in",
+    });
+    expect(probes[0]).toMatchObject({
+      configDir: CONFIG_DIR,
+      executablePath: runtime.executablePath,
+    });
+
+    await startSession(manager);
+    readiness = "unverified";
+    await expect(manager.readAccount({ authority, signal: signal() })).resolves.toEqual({
+      observedAt: 1_700_000_000_000,
+      readiness: "unverified",
+    });
+    expect(probes).toHaveLength(2);
+    await manager.close();
+  });
+
+  test("reports unverified when the pinned runtime cannot be admitted for an auth observation", async () => {
+    let probed = false;
+    const manager = new PinnedClaudeRuntimeManager({
+      configDirFor: () => CONFIG_DIR,
+      isCurrent: () => true,
+      now: () => 1_700_000_000_123,
+      observer: { fact: () => undefined },
+      probeAuthStatus: async () => {
+        probed = true;
+        return "signed_in";
+      },
+      resolveRuntime: async () => { throw new Error("not installed"); },
+    });
+    await expect(manager.readAccount({ authority, signal: signal() })).resolves.toEqual({
+      observedAt: 1_700_000_000_123,
+      readiness: "unverified",
+    });
+    expect(probed).toBe(false);
+    await manager.close();
+  });
+
   test("reviews, starts, runs, and completes one full turn", async () => {
     const { facts, manager, processes } = harness();
     const review = await manager.reviewSessionStart({
@@ -316,7 +394,7 @@ describe("pinned Claude runtime manager", () => {
 
     // Answering goes through the provider authority, which fences the exact
     // request the daemon recorded.
-    const bashAuthority = manager.interactionAuthority(providerThreadId, "r-bash");
+    const bashAuthority = manager.interactionAuthority(authority, providerThreadId, "r-bash");
     expect(typeof bashAuthority.connectionId).toBe("string");
     expect(bashAuthority).toMatchObject({
       itemId: "toolu_r-bash",
@@ -354,7 +432,7 @@ describe("pinned Claude runtime manager", () => {
 
     // A session-scoped grant is refused: Claude's control response can only
     // ever authorise this one tool use.
-    const editAuthority = manager.interactionAuthority(providerThreadId, "r-edit");
+    const editAuthority = manager.interactionAuthority(authority, providerThreadId, "r-edit");
     await expect(manager.resolveInteraction({
       authority,
       deadlineAt: 1_700_000_100_000,
@@ -378,7 +456,7 @@ describe("pinned Claude runtime manager", () => {
     });
 
     // A question is answered by id; the wire map is keyed by question text.
-    const askAuthority = manager.interactionAuthority(providerThreadId, "r-ask");
+    const askAuthority = manager.interactionAuthority(authority, providerThreadId, "r-ask");
     await manager.resolveInteraction({
       authority,
       deadlineAt: 1_700_000_100_000,
@@ -411,7 +489,7 @@ describe("pinned Claude runtime manager", () => {
       type: "control_request",
     });
     await settle();
-    const provider = manager.interactionAuthority(providerThreadId, "req-1");
+    const provider = manager.interactionAuthority(authority, providerThreadId, "req-1");
     const validated = await manager.validateInteractionTimeout({ authority, provider, signal: signal() });
     expect(validated.responseDigest).toMatch(/^[a-f0-9]{64}$/u);
     await manager.timeoutInteraction({ authority, provider, signal: signal() });
@@ -471,6 +549,182 @@ describe("pinned Claude runtime manager", () => {
       providerThreadId,
       signal: signal(),
     })).rejects.toThrow("another authority");
+    await manager.close();
+  });
+
+  test("drops a callback before mutating projection state after authority retirement", async () => {
+    let current = true;
+    const { facts, manager, processes } = harness({ isCurrent: () => current });
+    const providerThreadId = await startSession(manager);
+    const turnId = await startTurn(manager, providerThreadId, "keep running");
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+    facts.length = 0;
+    current = false;
+    process.emit(
+      {
+        message: {
+          content: [{ text: "stale reply", type: "text" }],
+          id: "msg_stale",
+          model: CLAUDE_PIN_MODEL,
+          role: "assistant",
+          type: "message",
+        },
+        parent_tool_use_id: null,
+        session_id: "stale-session",
+        type: "assistant",
+      },
+      {
+        duration_ms: 1,
+        is_error: false,
+        num_turns: 1,
+        result: "stale reply",
+        session_id: "stale-session",
+        stop_reason: "end_turn",
+        terminal_reason: "completed",
+        type: "result",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    );
+    await settle();
+    expect(facts).toEqual([]);
+
+    // Re-enable only to inspect the in-memory object. Real generations are
+    // monotonic; this proves the rejected callback did not mutate it first.
+    current = true;
+    const projection = await manager.readSession({
+      authority,
+      detail: true,
+      providerThreadId,
+      signal: signal(),
+    });
+    expect(projection.status).toBe("active");
+    expect(projection.activeTurnId).toBe(turnId);
+    expect(projection.messages?.map((message) => message.text)).toEqual(["keep running"]);
+    await manager.close();
+  });
+
+  test("retires an idle session when its Claude transport disconnects", async () => {
+    const { facts, manager, processes } = harness();
+    const providerThreadId = await startSession(manager);
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+    process.terminate();
+    await settle();
+
+    expect(facts.at(-1)).toMatchObject({
+      providerThreadId,
+      reason: "eof",
+      type: "providerDisconnected",
+    });
+    await expect(manager.readSession({
+      authority,
+      detail: false,
+      providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("not running on this daemon");
+    await manager.close();
+  });
+
+  test("fences reviews, sessions, and interactions on provider-account generation", async () => {
+    const boundAuthority: ProfileAuthority = {
+      ...authority,
+      bindingGeneration: 7,
+      provider: "claude",
+      providerAccountId: "pact_11111111111111111111111111111111",
+    };
+    const { manager, processes } = harness();
+    const review = await manager.reviewSessionStart({
+      authority: boundAuthority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    const started = await manager.startSession({
+      authority: boundAuthority,
+      review,
+      signal: signal(),
+    });
+    const turnReview = await manager.reviewTurnStart({
+      authority: boundAuthority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    });
+    await manager.startTurn({
+      authority: boundAuthority,
+      clientMessageId: "client-bound",
+      message: "work",
+      providerThreadId: started.providerThreadId,
+      review: turnReview,
+      signal: signal(),
+    });
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+    process.emit({
+      request: {
+        display_name: "Bash",
+        input: { command: "true" },
+        subtype: "can_use_tool",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bound",
+      },
+      request_id: "req-bound",
+      type: "control_request",
+    });
+    await settle();
+
+    const interaction = manager.interactionAuthority(
+      boundAuthority,
+      started.providerThreadId,
+      "req-bound",
+    );
+    expect(interaction).toMatchObject({
+      bindingGeneration: 7,
+      processGeneration: 3,
+      provider: "claude",
+      providerAccountId: boundAuthority.providerAccountId,
+    });
+    expect(() => manager.interactionAuthority(
+      { ...boundAuthority, bindingGeneration: 8 },
+      started.providerThreadId,
+      "req-bound",
+    )).toThrow("another authority");
+    await expect(manager.validateInteractionResolution({
+      authority: boundAuthority,
+      kind: "command_approval",
+      provider: { ...interaction, bindingGeneration: 8 },
+      resolution: { decision: "once", kind: "approval_decision" },
+      signal: signal(),
+    })).rejects.toThrow("interaction authority changed");
+    await expect(manager.readSession({
+      authority: { ...boundAuthority, bindingGeneration: 8 },
+      detail: false,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("another authority");
+    const staleReview = await manager.reviewSessionStart({
+      authority: boundAuthority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    await expect(manager.startSession({
+      authority: { ...boundAuthority, bindingGeneration: 8 },
+      review: staleReview,
+      signal: signal(),
+    })).rejects.toThrow("runtime review belongs to another authority");
+    await expect(manager.reviewSessionStart({
+      authority: { ...boundAuthority, provider: "codex" },
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toThrow("account authority changed");
     await manager.close();
   });
 

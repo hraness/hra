@@ -171,6 +171,16 @@ describe("observation contract", () => {
       {
         source: "codex_app_server",
         basis: "local_state",
+        state: "unavailable",
+        coverage: "unavailable",
+        freshness: "fresh",
+        profileGeneration: 1,
+        observedAt: 2,
+        code: "authority_retired",
+      },
+      {
+        source: "codex_app_server",
+        basis: "local_state",
         state: "recovery_required",
         coverage: "partial",
         freshness: "fresh",
