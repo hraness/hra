@@ -402,19 +402,31 @@ describe("device command payloads", () => {
     })).toBeNull();
   });
 
-  test("a relayed device-code handoff has a safe URL and a closed user code", () => {
-    expect(isRelayedLoginUrl("https://auth.example.test/device")).toBe(true);
+  test("a relayed device-code handoff uses the exact Codex URL and a closed user code", () => {
+    expect(isRelayedLoginUrl("https://auth.openai.com/codex/device")).toBe(true);
+    expect(isRelayedLoginUrl("https://auth.openai.com/codex/device/")).toBe(false);
+    expect(isRelayedLoginUrl("https://auth.openai.com/codex/device?continue=1")).toBe(false);
+    expect(isRelayedLoginUrl("https://auth.openai.com/codex/device#continue")).toBe(false);
+    expect(isRelayedLoginUrl("https://auth.openai.com:443/codex/device")).toBe(false);
+    expect(isRelayedLoginUrl("https://AUTH.OPENAI.COM/codex/device")).toBe(false);
+    expect(isRelayedLoginUrl("https://auth.openai.com/codex/%64evice")).toBe(false);
+    expect(isRelayedLoginUrl("https://auth.openai.com.evil.example/codex/device")).toBe(false);
+    expect(isRelayedLoginUrl("https://auth-openai.com/codex/device")).toBe(false);
+    expect(isRelayedLoginUrl("https://auth.open\u0430i.com/codex/device")).toBe(false);
+    expect(isRelayedLoginUrl("https://chatgpt.com/codex/device")).toBe(false);
+    expect(isRelayedLoginUrl("https://10.0.0.1/codex/device")).toBe(false);
+    expect(isRelayedLoginUrl("https://169.254.169.254/codex/device")).toBe(false);
+    expect(isRelayedLoginUrl("https://[fd00::1]/codex/device")).toBe(false);
     expect(isRelayedLoginUrl("http://localhost:1455/callback")).toBe(false);
     expect(isRelayedLoginUrl("https://localhost/callback")).toBe(false);
     expect(isRelayedLoginUrl("https://localhost./callback")).toBe(false);
     expect(isRelayedLoginUrl("https://127.0.0.2/callback")).toBe(false);
     expect(isRelayedLoginUrl("https://[::1]/callback")).toBe(false);
     expect(isRelayedLoginUrl("https://[::ffff:127.0.0.1]/callback")).toBe(false);
-    expect(isRelayedLoginUrl("https://user:pass@auth.example.test/")).toBe(false);
+    expect(isRelayedLoginUrl("https://user:pass@auth.openai.com/codex/device")).toBe(false);
     expect(isRelayedLoginUrl("javascript:alert(1)")).toBe(false);
-    expect(isRelayedLoginUrl(
-      `https://auth.example.test/${"a".repeat(deviceCommandLimits.loginUrlCharacters)}`,
-    )).toBe(false);
+    expect(isRelayedLoginUrl(`https://auth.openai.com/${"a".repeat(2_048)}`)).toBe(false);
+    expect(isRelayedLoginUrl(new URL("https://auth.openai.com/codex/device"))).toBe(false);
     expect(isRelayedLoginUserCode("ABCD-EFGH")).toBe(true);
     expect(isRelayedLoginUserCode("ABCD EFGH")).toBe(false);
     expect(isRelayedLoginUserCode("abcd-efgh")).toBe(false);
@@ -430,14 +442,14 @@ describe("device command payloads", () => {
       expiresAt: 1,
       handoffVersion: 2,
       kind: "account_login_start",
-      loginUrl: "https://auth.example.test/device",
+      loginUrl: "https://auth.openai.com/codex/device",
       userCode: "ABCD-EFGH",
     })).not.toBeNull();
     expect(parseDeviceCommandResultPayload({
       expiresAt: 1,
       handoffVersion: 2,
       kind: "account_login_start",
-      loginUrl: "http://auth.example.test/device",
+      loginUrl: "http://auth.openai.com/codex/device",
       userCode: "ABCD-EFGH",
     })).toBeNull();
     // Legacy URL-only results still parse so an updated web client can consume
@@ -445,20 +457,20 @@ describe("device command payloads", () => {
     expect(parseDeviceCommandResultPayload({
       expiresAt: 1,
       kind: "account_login_start",
-      loginUrl: "https://auth.example.test/device",
+      loginUrl: "https://auth.openai.com/codex/device",
     })).not.toBeNull();
     expect(parseDeviceCommandResultPayload({
       expiresAt: 1,
       handoffVersion: 2,
       kind: "account_login_start",
-      loginUrl: "https://auth.example.test/device",
+      loginUrl: "https://auth.openai.com/codex/device",
       userCode: "not a device code",
     })).toBeNull();
     expect(parseDeviceCommandResultPayload({
       expiresAt: 1,
       handoffVersion: 1,
       kind: "account_login_start",
-      loginUrl: "https://auth.example.test/device",
+      loginUrl: "https://auth.openai.com/codex/device",
       userCode: "ABCD-EFGH",
     })).toBeNull();
     expect(parseDeviceCommandResultPayload({
@@ -495,7 +507,7 @@ describe("device command payloads", () => {
       expiresAt: 1_760_000_000_000,
       handoffVersion: 2,
       kind: "account_login_start",
-      loginUrl: "https://auth.example.test/device",
+      loginUrl: "https://auth.openai.com/codex/device",
       userCode: "ABCD-EFGH",
     } as const;
     const resultEnvelope = await encryptDeviceCommandResult(result, key, resultAuthority);

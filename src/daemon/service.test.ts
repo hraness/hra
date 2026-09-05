@@ -1588,6 +1588,17 @@ describe("HraService", () => {
     expect(value.claudeReadCalls()).toBe(0);
     await expect(value.service.execute({
       account: profile.id,
+      attemptId: attempt.id,
+      idempotencyKey: recoveryKey,
+      kind: "account.claude-login.complete",
+      outcome: { state: "joined", exitCode: 0, interruptedBy: null },
+      providerGeneration: profile.processGeneration,
+    }, { signal })).rejects.toMatchObject(expectedPlatformRefusal);
+    expect(value.claudeReadCalls()).toBe(0);
+    expect(value.providerSessionCalls).toEqual([]);
+    expect(value.store.readMutation(recoveryKey)).toMatchObject({ state: "effect_started" });
+    await expect(value.service.execute({
+      account: profile.id,
       acknowledgeChildExited: true,
       attemptId: attempt.id,
       idempotencyKey: recoveryKey,
