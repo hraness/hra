@@ -534,6 +534,58 @@ describe("Claude sessions on the local authority", () => {
     expect(process.written.some((line) => line.includes("interrupt"))).toBe(true);
   });
 
+  test("refuses Fast enable locally and remotely before metadata changes", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude Fast refusal");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const session = value.store.requireSession(started.session.id);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound Claude session.");
+
+    await expect(value.service.execute({
+      enabled: true,
+      kind: "session.fast",
+      session: session.id,
+    }, { signal })).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+      message: "Fast mode is available only for Codex sessions.",
+    });
+    expect(value.store.requireSession(session.id).fastEnabled).toBe(false);
+
+    await expect(value.service.executeRemote({
+      enabled: true,
+      kind: "session.fast",
+      session: session.id,
+    }, {
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      providerThreadId: session.providerThreadId,
+      sessionId: session.id,
+    }, { signal })).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+      message: "Fast mode is available only for Codex sessions.",
+    });
+    expect(value.store.requireSession(session.id).fastEnabled).toBe(false);
+
+    const invalid = value.store.updateSessionMetadata({
+      expectedRevision: value.store.requireSession(session.id).revision,
+      fastEnabled: true,
+      sessionId: session.id,
+    });
+    expect(invalid.fastEnabled).toBe(true);
+    await expect(value.service.execute({
+      enabled: false,
+      kind: "session.fast",
+      session: session.id,
+    }, { signal })).resolves.toMatchObject({ session: { fastEnabled: false } });
+  });
+
   test("runs one whole session: start, turn, deltas, approval, steer, completion", async () => {
     const value = await claudeFixture();
     const account = await authenticatedClaudeAccount(value, "Claude");

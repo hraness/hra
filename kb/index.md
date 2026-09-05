@@ -9,6 +9,7 @@ type: index
 
 - [HRA v1](plans/hra-v1.md)
 - [HRA v2](plans/hra-v2.md)
+- [Model routing and bounded autonomy](plans/model-routing-autonomy.md)
 
 ## Notes
 
@@ -30,5 +31,7 @@ type: index
 - [[plans/hra-v1|HRA v1]] — Status: in-progress. Release plan for a persistent Codex control plane for humans and agents, with isolated accounts, bounded work coordination, durable interactions and event streams, device…
 
 - [[plans/hra-v2|HRA v2]] — Status: proposed. Provider-neutral control plane for humans and agent swarms: CLI contract v2, web surface, decomposition, typed routing, Claude provider, public surface rewrite.
+
+- [[plans/model-routing-autonomy|Model routing and bounded autonomy]] - Status: in-progress. Ultra defaults, conservative shadow routing, notification timing, shared remote-action policy, and evidence-gated autonomy.
 
 <!-- kb:catalog:end -->

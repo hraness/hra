@@ -3189,7 +3189,7 @@ describe("CodexAppServerClient", () => {
           result: {
             thread,
             cwd: "/workspace/project",
-            model: "gpt-5.6-sol",
+            model: "gpt-6-astra",
             modelProvider: "openai",
             reasoningEffort: "max",
             serviceTier: "default",
@@ -3214,7 +3214,7 @@ describe("CodexAppServerClient", () => {
     await client.initialize();
     const result = await client.startThread({
       cwd: "/workspace/project",
-      preset: { alias: "high", model: "gpt-5.6-sol", effort: "max", serviceTier: null, fast: false },
+      preset: { alias: "high", model: "gpt-6-astra", effort: "max", serviceTier: null, fast: false },
       policy: { review: "auto_review", permissionProfile: ":workspace", writableRoots: ["/workspace/project"] },
     });
     expect(result.value.activePermissionProfile?.id).toBe(":workspace");
@@ -3222,7 +3222,7 @@ describe("CodexAppServerClient", () => {
       id: 3,
       method: "thread/start",
       params: {
-        model: "gpt-5.6-sol",
+        model: "gpt-6-astra",
         serviceTier: null,
         cwd: "/workspace/project",
         permissions: ":workspace",
@@ -3247,7 +3247,7 @@ describe("CodexAppServerClient", () => {
         target.respond({ id: message.id, result: {
           thread: { id: "thread-unsafe", sessionId: "thread-unsafe", preview: "", ephemeral: false, historyMode: "paginated", modelProvider: "openai", createdAt: 1, updatedAt: 1, status: { type: "idle" }, cwd: "/workspace/project", name: null, turns: [] },
           cwd: "/workspace/project",
-          model: "gpt-5.6-sol",
+          model: "gpt-6-astra",
           modelProvider: "openai",
           reasoningEffort: "max",
           serviceTier: "default",
@@ -3271,7 +3271,7 @@ describe("CodexAppServerClient", () => {
     await client.initialize();
     await expect(client.startThread({
       cwd: "/workspace/project",
-      preset: { alias: "high", model: "gpt-5.6-sol", effort: "max", serviceTier: null, fast: false },
+      preset: { alias: "high", model: "gpt-6-astra", effort: "max", serviceTier: null, fast: false },
       policy: { review: "auto_review", permissionProfile: ":workspace", writableRoots: ["/workspace/project"] },
     })).rejects.toMatchObject({ code: "INDETERMINATE_EFFECT", operation: "thread/start" });
     await client.close();

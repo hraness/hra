@@ -11,6 +11,11 @@ const drainDeviceRevocation = makeFunctionReference<
   Readonly<{ limit: number }>,
   unknown
 >("deviceRevocation:drain");
+const drainAttentionNotifications = makeFunctionReference<
+  "action",
+  Readonly<{ limit: number }>,
+  unknown
+>("attentionNotificationDelivery:drain");
 const cleanupExpired = makeFunctionReference<
   "mutation",
   Readonly<{ limit: number }>,
@@ -30,5 +35,11 @@ const cleanupExpired = makeFunctionReference<
 crons.interval("bounded cloud retention", { minutes: 15 }, cleanupExpired, { limit: 200 });
 crons.interval("account deletion drain", { minutes: 1 }, drainAccountDeletion, { limit: 200 });
 crons.interval("device revocation drain", { minutes: 1 }, drainDeviceRevocation, { limit: 200 });
+crons.interval(
+  "attention notification delivery",
+  { minutes: 1 },
+  drainAttentionNotifications,
+  { limit: 10 },
+);
 
 export default crons;

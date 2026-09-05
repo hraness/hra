@@ -20,6 +20,8 @@ relations:
 
 Status: proposed plan, revision 3 (2026-09-02). Not yet adopted. `hra-v1.md` remains the plan of record until the owner adopts this file. Revision 1 was reviewed adversarially from three angles (engineering feasibility, product fit, security and invariants) and revision 2 by a consolidated verification pass; every finding and its disposition is in the review log at the end.
 
+Authority update (2026-09-04): Phase 8A of [Model routing and bounded autonomy](model-routing-autonomy.md) supersedes this proposal's blind remote-approval design. Current remote interaction policy may decline an offered command, permission, or file-change request, and may answer only a provider-proven, non-secret closed-choice user question contract. All grants and accepts, free-text and Other responses, and MCP answers remain on the execution device. The older approval work items below remain historical proposal context only.
+
 Source evidence: six independent audits of the `v0.1.6` tree (commit `86648e8`) covering the agent-facing CLI, the web surface, architecture and robustness, model routing and swarm coordination research, the Codex provider seam, and marketing and documentation. Load-bearing findings are restated here with `file:line` citations so this plan stands alone. The web UX contract derived from the audit is committed as [Web surface UX contract](../notes/web-ux.md).
 
 Every work item carries a tier. `P0` is the minimum lovable cut and ships first. `P1` follows. `P2` runs only when a lane is idle. If the swarm falls behind, `P2` is dropped first, then `P1`, never `P0`.

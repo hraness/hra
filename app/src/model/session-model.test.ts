@@ -178,34 +178,43 @@ describe("sessionModelReducer", () => {
     expect(resolved.pendingInteractions).toEqual([]);
   });
 
-  test("carries the projected interaction detail and nulls what an older writer omits", () => {
+  test("carries only the v2 remote policy as action authority", () => {
     const detailed = foldCompact([{
-      availableDecisions: ["once", "decline"],
       blocking: true,
-      commandClass: "git commit",
       detailMarkdown: "- Runs: git commit",
-      detailVersion: 1,
+      detailVersion: 2,
       headline: "Allow git commit",
       interactionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3302",
       interactionKind: "command_approval",
       kind: "interaction_state",
       label: "Command approval",
+      remotePolicy: {
+        actions: ["decline"],
+        deadlineAt: 30_000,
+        questions: [],
+        reasonCodes: ["COMMAND_APPROVAL_LOCAL_ONLY"],
+        version: 2,
+      },
       revision: 1,
       sequence: 1,
       state: "pending",
       summary: "Codex requests command approval",
     }]);
     expect(detailed.pendingInteractions[0]).toMatchObject({
-      availableDecisions: ["once", "decline"],
-      commandClass: "git commit",
       detailMarkdown: "- Runs: git commit",
       headline: "Allow git commit",
       label: "Command approval",
-      questions: null,
+      remotePolicy: {
+        actions: ["decline"],
+        deadlineAt: 30_000,
+      },
     });
 
-    const plain = foldCompact([{
+    const legacy = foldCompact([{
+      availableDecisions: ["once", "decline"],
       blocking: true,
+      commandClass: "git commit",
+      detailVersion: 1,
       interactionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3303",
       interactionKind: "command_approval",
       kind: "interaction_state",
@@ -214,13 +223,38 @@ describe("sessionModelReducer", () => {
       state: "pending",
       summary: "run the build",
     }]);
-    expect(plain.pendingInteractions[0]).toMatchObject({
-      availableDecisions: null,
-      commandClass: null,
+    expect(legacy.pendingInteractions[0]).toMatchObject({
       detailMarkdown: null,
       headline: null,
       label: null,
-      questions: null,
+      remotePolicy: null,
+    });
+  });
+
+  test("response-prepared interactions leave the actionable pending set", () => {
+    const pending = foldCompact([{
+      blocking: true,
+      interactionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3304",
+      interactionKind: "user_input",
+      kind: "interaction_state",
+      revision: 1,
+      sequence: 1,
+      state: "pending",
+      summary: "Codex needs an answer",
+    }]);
+    const prepared = foldCompact([{
+      blocking: true,
+      interactionId: "3f2504e0-4f89-41d3-9a0c-0305e82c3304",
+      interactionKind: "user_input",
+      kind: "interaction_state",
+      revision: 2,
+      sequence: 2,
+      state: "response_prepared",
+      summary: "Codex needs an answer",
+    }], pending);
+    expect(prepared.pendingInteractions).toEqual([]);
+    expect(prepared.interactionRevisions).toEqual({
+      "3f2504e0-4f89-41d3-9a0c-0305e82c3304": 2,
     });
   });
 

@@ -1,10 +1,11 @@
 import type { AttachmentManifestEntry, PreparedAttachment } from "../domain/attachments";
-import type { Preset, Provider } from "../domain/presets";
+import type { Preset, PresetRequirement, Provider } from "../domain/presets";
 import type {
   EffectiveClaudeRuntimeProfile,
   EffectiveRuntimeProfile,
 } from "../domain/runtime-profile";
 import type { AccountRateLimitResetOutcome } from "../domain/usage-metrics";
+import type { NotificationEmailHostedAuthority } from "../domain/contracts";
 import type { CodexTurnStatus } from "../codex/protocol";
 import type { CodexPluginCatalog } from "../codex/protocol";
 import type {
@@ -153,7 +154,7 @@ export type CodexSessionPage = {
  */
 export interface SessionRuntimePort<Profile> {
   readonly provider: Provider;
-  reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
+  reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; requirement: PresetRequirement; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
   /** Releases a review that never reached its matching start effect. */
   discardRuntimeReview(review: RuntimeStartReviewOf<Profile>): void;
   startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: Profile }>;
@@ -167,7 +168,7 @@ export interface SessionRuntimePort<Profile> {
    * thread stays exactly where it is on the provider.
    */
   endSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<void>;
-  reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
+  reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; requirement: PresetRequirement; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
   // `attachments` is absent unless the message carried one, so every
   // existing text-only turn reaches the provider byte for byte as before.
   startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; message: string; attachments?: readonly PreparedAttachment[]; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurnStatus; effectiveRuntimeProfile: Profile }>;
@@ -297,6 +298,16 @@ export interface DesktopSwitchPort {
 export interface CloudControlPort {
   status(signal: AbortSignal): Promise<unknown>;
   sync(signal: AbortSignal): Promise<unknown>;
+  observeAttentionNotificationAuthority?(
+    signal: AbortSignal,
+  ): Promise<NotificationEmailHostedAuthority>;
+  invalidateAttentionNotificationAuthority?(input: {
+    localNotificationPolicyRevision: number;
+    signal: AbortSignal;
+  }): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >>;
   isCompactProjectionRecoveryUnsettledForProfile(profileId: ProfileId): Promise<boolean>;
   isCompactProjectionRecoveryUnsettled(sessionPublicId: SessionId): Promise<boolean>;
   supersedeCompactProjectionRecoveryForProviderDeletion(sessionPublicId: SessionId): Promise<{ superseded: boolean }>;

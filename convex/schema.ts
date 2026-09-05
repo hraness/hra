@@ -6,6 +6,12 @@ import {
   accountBindingState,
   accountDeletionCategory,
   accountDeletionState,
+  attentionNotificationInteractionKind,
+  attentionNotificationOutcomeCode,
+  attentionNotificationRemoteAction,
+  attentionNotificationServiceState,
+  attentionNotificationState,
+  attentionNotificationSuppressionReason,
   authAdmissionState,
   authAttemptKind,
   authSubjectAdmittedBy,
@@ -107,6 +113,12 @@ export default defineSchema({
     .index("by_public_id", ["publicId"]),
   devices: defineTable({
     activatedAt: v.optional(v.number()),
+    attentionNotificationAuthority: v.optional(v.object({
+      consentLeaseUntil: v.number(),
+      globalNotificationGeneration: v.number(),
+      localNotificationPolicyRevision: v.number(),
+      reconciliationSequence: v.number(),
+    })),
     authEpoch: v.number(),
     createdAt: v.number(),
     credentialGeneration: v.optional(v.number()),
@@ -190,6 +202,9 @@ export default defineSchema({
     devicePublicId: v.string(),
     envelope: encryptedEnvelope,
     keyVersion: v.number(),
+    notificationEmailEnvelope: v.optional(encryptedEnvelope),
+    notificationHoursEnvelope: v.optional(encryptedEnvelope),
+    notificationPolicyRevision: v.optional(v.number()),
     revision: v.number(),
     updatedAt: v.number(),
     userId: v.id("users"),
@@ -405,6 +420,155 @@ export default defineSchema({
       "idempotencyKey",
     ])
     .index("by_user", ["userId"]),
+  attentionNotificationOutbox: defineTable({
+    allowedWindowEnd: v.number(),
+    claimCapacityReservation: v.optional(v.union(
+      v.literal("0".repeat(16 * 1_024)),
+      v.literal("0".repeat(4 * 1_024)),
+      v.literal("0".repeat(3 * 1_024)),
+    )),
+    claimDeadline: v.number(),
+    coalesceAfter: v.number(),
+    consentLeaseUntil: v.number(),
+    createdAt: v.number(),
+    delivery: v.optional(v.object({
+      attemptCount: v.number(),
+      body: v.optional(v.object({
+        text: v.string(),
+        version: v.literal(1),
+      })),
+      bodyDigest: v.string(),
+      claimedAt: v.number(),
+      deadline: v.number(),
+      effectStartedAt: v.number(),
+      firstAttemptAt: v.number(),
+      generation: v.number(),
+      id: v.string(),
+      idempotencyKey: v.string(),
+      lastAttemptAt: v.number(),
+      leaderRowId: v.id("attentionNotificationOutbox"),
+      nextAttemptAt: v.optional(v.number()),
+      outcomeCode: v.optional(attentionNotificationOutcomeCode),
+      outcomeDigest: v.optional(v.string()),
+      recipientDigest: v.string(),
+      settledAt: v.optional(v.number()),
+    })),
+    executionAuthority: v.object({
+      bootGeneration: v.number(),
+      bootId: v.string(),
+      fence: v.number(),
+    }),
+    faultCapacityAnchor: v.optional(v.id("attentionNotificationOutbox")),
+    globalNotificationGeneration: v.number(),
+    interactionId: v.string(),
+    interactionKind: attentionNotificationInteractionKind,
+    interactionRevision: v.number(),
+    interactionDeadline: v.number(),
+    localNotificationPolicyRevision: v.number(),
+    nonterminal: v.boolean(),
+    reconciliationSequence: v.number(),
+    remoteActions: v.array(attentionNotificationRemoteAction),
+    retrySuppressedAt: v.optional(v.number()),
+    retrySuppressionReason: v.optional(attentionNotificationSuppressionReason),
+    revocationObservedAt: v.optional(v.number()),
+    sessionId: v.id("sessionHeads"),
+    sessionPublicId: v.string(),
+    sourceDeviceId: v.id("devices"),
+    state: attentionNotificationState,
+    terminalCleanupAfter: v.optional(v.number()),
+    updatedAt: v.number(),
+    userId: v.id("users"),
+  })
+    .index("by_user_source_session_and_interaction", [
+      "userId",
+      "sourceDeviceId",
+      "sessionId",
+      "interactionId",
+    ])
+    .index("by_user_and_interaction", ["userId", "interactionId"])
+    .index("by_source_device_and_reconciliation", [
+      "sourceDeviceId",
+      "reconciliationSequence",
+    ])
+    .index("by_source_device_nonterminal_and_revocation", [
+      "sourceDeviceId",
+      "nonterminal",
+      "revocationObservedAt",
+    ])
+    .index("by_state_and_coalesce_after", ["state", "coalesceAfter"])
+    .index("by_state_and_claim_deadline", ["state", "claimDeadline"])
+    .index("by_state_and_next_attempt_at", ["state", "delivery.nextAttemptAt"])
+    .index("by_state_and_delivery_deadline", ["state", "delivery.deadline"])
+    .index("by_state_and_cleanup_after", ["state", "terminalCleanupAfter"])
+    .index("by_delivery_id", ["delivery.id"])
+    .index("by_delivery_leader_row_id", ["delivery.leaderRowId"])
+    .index("by_fault_capacity_anchor", ["faultCapacityAnchor"])
+    .index("by_user_state_and_coalesce_after", [
+      "userId",
+      "state",
+      "coalesceAfter",
+    ])
+    .index("by_user_and_claimed_at", ["userId", "delivery.claimedAt"])
+    .index("by_source_device_and_claimed_at", [
+      "sourceDeviceId",
+      "delivery.claimedAt",
+    ])
+    .index("by_user", ["userId"]),
+  attentionNotificationSafetyFaults: defineTable({
+    anchorRowId: v.id("attentionNotificationOutbox"),
+    capacityReservation: v.optional(v.union(
+      v.literal("0".repeat(4 * 1_024)),
+      v.literal("0".repeat(3 * 1_024)),
+      v.literal("0".repeat(2 * 1_024)),
+    )),
+    cleanupRowId: v.optional(v.id("attentionNotificationOutbox")),
+    createdAt: v.number(),
+    deliveryId: v.string(),
+    deliveryGeneration: v.optional(v.number()),
+    faultId: v.optional(v.string()),
+    observedAt: v.optional(v.number()),
+    quarantineCompletedAt: v.optional(v.number()),
+    quarantineState: v.optional(v.union(
+      v.literal("not_required"),
+      v.literal("pending"),
+      v.literal("complete"),
+    )),
+    reason: v.optional(v.union(
+      v.literal("invalid_idempotent_request"),
+      v.literal("stored_delivery_corrupt"),
+    )),
+    resultDigest: v.optional(v.string()),
+    reviewedAt: v.optional(v.number()),
+    reviewMutationId: v.optional(v.string()),
+    slot: v.number(),
+    state: v.union(
+      v.literal("reserved"),
+      v.literal("latched"),
+      v.literal("reviewed"),
+    ),
+    terminalCleanupAfter: v.optional(v.number()),
+    updatedAt: v.number(),
+    userId: v.id("users"),
+  })
+    .index("by_identity", [
+      "userId",
+      "anchorRowId",
+      "deliveryGeneration",
+      "reason",
+      "resultDigest",
+    ])
+    .index("by_fault_id", ["faultId"])
+    .index("by_cleanup_row", ["cleanupRowId"])
+    .index("by_state_and_observed_at", ["state", "observedAt"])
+    .index("by_state_and_cleanup_after", ["state", "terminalCleanupAfter"])
+    .index("by_delivery_and_state", ["deliveryId", "state", "slot"])
+    .index("by_anchor_and_slot", ["anchorRowId", "slot"])
+    .index("by_reason_quarantine_state_and_observed_at", [
+      "reason",
+      "quarantineState",
+      "observedAt",
+    ])
+    .index("by_user", ["userId"]),
   codexAccounts: defineTable({
     createdAt: v.number(),
     encryptedMetadata: encryptedEnvelope,
@@ -486,6 +650,7 @@ export default defineSchema({
       v.literal("command_enqueued"),
       v.literal("command_terminal"),
       v.literal("account_key_rotated"),
+      v.literal("attention_notification_safety_fault"),
     ),
     userId: v.id("users"),
   })
@@ -545,6 +710,9 @@ export default defineSchema({
     userRecords: v.number(),
   }).index("by_key", ["key"]),
   serviceControl: defineTable({
+    attentionNotificationGeneration: v.optional(v.number()),
+    attentionNotificationLastMutationId: v.optional(v.string()),
+    attentionNotifications: v.optional(attentionNotificationServiceState),
     authAdmissionGeneration: v.number(),
     authAdmissions: authAdmissionState,
     bootstrapAcceptedAt: v.optional(v.number()),

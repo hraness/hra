@@ -133,6 +133,16 @@ describe("hosted preflight status operator", () => {
 
   test("requires exactly one complete fixed Convex target tuple", () => {
     expect(parseHostedStatusArguments(statusArguments)).toEqual({
+      requireAttentionInactive: false,
+      requirePassed: false,
+      sourceCommit,
+      target,
+    });
+    expect(parseHostedStatusArguments([
+      ...statusArguments,
+      "--require-attention-inactive",
+    ])).toEqual({
+      requireAttentionInactive: true,
       requirePassed: false,
       sourceCommit,
       target,
@@ -146,6 +156,127 @@ describe("hosted preflight status operator", () => {
       ...statusArguments,
     ])).toThrow("usage_invalid");
     expect(() => parseHostedStatusArguments(targetArguments)).toThrow("usage_invalid");
+    expect(() => parseHostedStatusArguments([
+      ...statusArguments,
+      "--require-attention-inactive",
+      "--require-attention-inactive",
+    ])).toThrow("usage_invalid");
+  });
+
+  test("proves the deployed attention runtime is inactive through one bounded named read", async () => {
+    const requests: CommandRequest[] = [];
+    const verifications: ConvexTarget[] = [];
+    const stdout: string[] = [];
+    const exitCode = await executeHostedStatus({
+      arguments: [
+        ...statusArguments,
+        "--require-passed",
+        "--require-attention-inactive",
+      ],
+      readAttestation: async () => ({ runtimeSourceCommit: sourceCommit, state: "bound" }),
+      runner: statusRunner([
+        { exitCode: 0, stderr: "", stdout: requiredEnvironmentNames.join("\n") },
+        { exitCode: 0, stderr: "", stdout: acceptedBootstrap },
+        {
+          exitCode: 0,
+          stderr: "",
+          stdout: '{"generation":2,"newIdentityAdmissions":"open","state":"open","updatedAt":1}',
+        },
+        {
+          exitCode: 0,
+          stderr: "",
+          stdout: '{"generation":0,"globalState":"absent","outboxOccupancy":0,"safetyFaultOccupancy":0}',
+        },
+      ], requests),
+      stderr: { write: () => true },
+      stdout: outputWriter(stdout),
+      verifyTarget: exactTargetVerifier(verifications),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(verifications).toHaveLength(10);
+    expect(requests).toHaveLength(4);
+    expect(requests[3]?.phase).toBe("hosted-status-attention-inactive-read");
+    expect(requests[3]?.arguments.slice(1)).toEqual([
+      "run",
+      "attentionNotificationControl:inactiveDeploymentStatus",
+      "{}",
+      "--deployment",
+      target.deploymentName,
+    ]);
+    expect(requests[3]?.containment).toBe("authority");
+    expect(requests[3]?.stdin).toBe("");
+    expect(JSON.parse(stdout.join(""))).toMatchObject({
+      attentionNotifications: {
+        generation: 0,
+        globalState: "absent",
+        outboxOccupancy: 0,
+        safetyFaultOccupancy: 0,
+        state: "inactive",
+      },
+      status: "live",
+    });
+  });
+
+  test("fails the inactive requirement on any hosted occupancy", async () => {
+    const stdout: string[] = [];
+    const exitCode = await executeHostedStatus({
+      arguments: [...statusArguments, "--require-attention-inactive"],
+      readAttestation: async () => ({ runtimeSourceCommit: sourceCommit, state: "bound" }),
+      runner: statusRunner([
+        { exitCode: 0, stderr: "", stdout: requiredEnvironmentNames.join("\n") },
+        { exitCode: 0, stderr: "", stdout: acceptedBootstrap },
+        {
+          exitCode: 0,
+          stderr: "",
+          stdout: '{"generation":2,"newIdentityAdmissions":"open","state":"open","updatedAt":1}',
+        },
+        {
+          exitCode: 0,
+          stderr: "",
+          stdout: '{"generation":0,"globalState":"absent","outboxOccupancy":1,"safetyFaultOccupancy":0}',
+        },
+      ]),
+      stderr: { write: () => true },
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => undefined,
+    });
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(stdout.join(""))).toMatchObject({
+      attentionNotifications: { outboxOccupancy: 1, state: "not_inactive" },
+    });
+  });
+
+  test("refuses an incoherent attention readback", async () => {
+    const stderr: string[] = [];
+    const exitCode = await executeHostedStatus({
+      arguments: [...statusArguments, "--require-attention-inactive"],
+      readAttestation: async () => ({ runtimeSourceCommit: sourceCommit, state: "bound" }),
+      runner: statusRunner([
+        { exitCode: 0, stderr: "", stdout: requiredEnvironmentNames.join("\n") },
+        { exitCode: 0, stderr: "", stdout: acceptedBootstrap },
+        {
+          exitCode: 0,
+          stderr: "",
+          stdout: '{"generation":2,"newIdentityAdmissions":"open","state":"open","updatedAt":1}',
+        },
+        {
+          exitCode: 0,
+          stderr: "provider-secret",
+          stdout: '{"generation":1,"globalState":"absent","outboxOccupancy":0,"safetyFaultOccupancy":0}',
+        },
+      ]),
+      stderr: outputWriter(stderr),
+      stdout: { write: () => true },
+      verifyTarget: async () => undefined,
+    });
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "attention_status_invalid",
+      schemaVersion: 1,
+      status: "refused",
+    });
+    expect(stderr.join("")).not.toContain("provider-secret");
   });
 
   test("reports only bounded preflight facts after authority-contained reads", async () => {

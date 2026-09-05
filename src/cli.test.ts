@@ -108,23 +108,18 @@ class CliClaudeLoginSignalSource implements ClaudeLoginSignalSource {
   }
 }
 
-// An install written by an older HRA build: the newest migration row is gone and
-// `user_version` still names the schema that build stamped. The migration code
-// still supports 34, so a writable open must carry it forward to 35.
+// An install written by the released main build: the notification migrations are
+// absent and `user_version` still names the provider-switch schema it stamped.
+// A writable open must carry that v35 authority forward to v38.
 const downgradeStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
     database.exec(`
-      PRAGMA foreign_keys=OFF;
-      DROP TABLE session_provider_switch_source_releases;
-      DROP TABLE session_provider_switch_seed_results;
-      DROP TABLE session_provider_switch_seed_intents;
-      DROP TABLE session_provider_switch_target_releases;
-      DROP TABLE session_provider_switch_targets;
-      DROP TABLE session_mutation_authority_rebinds;
-      DELETE FROM migrations WHERE version=35;
-      PRAGMA user_version=34;
-      PRAGMA foreign_keys=ON;
+      DROP TABLE attention_email_policy;
+      DROP TABLE notification_hours;
+      DELETE FROM migrations WHERE version=37;
+      DELETE FROM migrations WHERE version=36;
+      PRAGMA user_version=35;
     `);
   } finally {
     database.close(false);
@@ -136,7 +131,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
-    database.exec("PRAGMA user_version=36");
+    database.exec("PRAGMA user_version=39");
   } finally {
     database.close(false);
   }
@@ -5306,6 +5301,14 @@ describe("CLI entry point", () => {
           interactionId: "70000000-0000-4000-8000-000000000001",
           interactionKind: "permission_approval",
           kind: "interaction_state",
+          detailVersion: 2,
+          remotePolicy: {
+            actions: ["decline"],
+            deadlineAt: Number.MAX_SAFE_INTEGER,
+            questions: [],
+            reasonCodes: ["PERMISSION_APPROVAL_LOCAL_ONLY"],
+            version: 1,
+          },
           revision: 3,
           sequence: 2,
           state: "pending",
@@ -5335,8 +5338,85 @@ describe("CLI entry point", () => {
     expect(rendered).toContain("\\u{202e}");
     expect(rendered).toContain("Interaction 70000000-0000-4000-8000-000000000001  permission approval");
     expect(rendered).toContain("pending  revision 3  blocking");
-    expect(rendered).toContain("Decide remotely with `hra remote resolve");
-    expect(rendered).toContain("--interaction 70000000-0000-4000-8000-000000000001 --revision 3 --decision once|decline|cancel");
+    expect(rendered).toContain("Decline remotely with `hra remote resolve");
+    expect(rendered).toContain("--interaction 70000000-0000-4000-8000-000000000001 --revision 3 --decision decline");
+    expect(rendered).not.toContain("--decision once");
+    expect(rendered).not.toContain("cancel");
+  });
+
+  test("remote pending guidance fails closed to parsed policy and its deadline", () => {
+    const human = capture();
+    renderRemoteSuccess({ kind: "remote.show", session: "session_12345678" }, {
+      complete: true,
+      createdAt: 1,
+      events: [
+        {
+          blocking: true,
+          interactionId: "70000000-0000-4000-8000-000000000002",
+          interactionKind: "command_approval",
+          kind: "interaction_state",
+          revision: 1,
+          sequence: 1,
+          state: "pending",
+          summary: "Legacy projection without remote authority",
+        },
+        {
+          blocking: true,
+          detailVersion: 2,
+          interactionId: "70000000-0000-4000-8000-000000000003",
+          interactionKind: "user_input",
+          kind: "interaction_state",
+          remotePolicy: {
+            actions: ["answer"],
+            deadlineAt: Number.MAX_SAFE_INTEGER,
+            questions: [{
+              allowsOther: false,
+              header: "Region",
+              id: "region",
+              kind: "user_input",
+              options: [{ description: "Primary", label: "East" }],
+              question: "Which region?",
+            }],
+            reasonCodes: [],
+            version: 2,
+          },
+          revision: 1,
+          sequence: 2,
+          state: "pending",
+          summary: "Choose a region",
+        },
+        {
+          blocking: true,
+          detailVersion: 2,
+          interactionId: "70000000-0000-4000-8000-000000000004",
+          interactionKind: "permission_approval",
+          kind: "interaction_state",
+          remotePolicy: {
+            actions: ["decline"],
+            deadlineAt: 0,
+            questions: [],
+            reasonCodes: ["PERMISSION_APPROVAL_LOCAL_ONLY"],
+            version: 2,
+          },
+          revision: 1,
+          sequence: 3,
+          state: "pending",
+          summary: "Expired permission request",
+        },
+      ],
+      executionDevicePublicId: "device_12345678",
+      metadata: { name: "Policy guidance", note: null },
+      publicId: "session_12345678",
+      state: "idle",
+      updatedAt: 2,
+    }, false, human.output);
+
+    const rendered = human.read().stdout;
+    expect(rendered).toContain("No remote action is available. Resolve this interaction on the execution device.");
+    expect(rendered).toContain("Answer remotely in the HRA app, or resolve this interaction on the execution device.");
+    expect(rendered).toContain("The remote-action deadline has passed. Resolve this interaction on the execution device.");
+    expect(rendered).not.toContain("hra remote resolve");
+    expect(rendered).not.toContain("cancel");
   });
 
   test("remote human output reduces recovered interactions to the safest latest revision", () => {
@@ -5530,7 +5610,7 @@ describe("CLI entry point", () => {
       const initialized = capture();
       expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
       downgradeStateSchema(installation.paths.database);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(34);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(35);
 
       const started = capture();
       expect(await main(["daemon", "start", "--json"], started.output, input)).toBe(0);
@@ -5542,7 +5622,7 @@ describe("CLI entry point", () => {
       });
       expect(started.read().stderr).toBe("");
       expect(daemonStarts).toBe(1);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(35);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(38);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5566,13 +5646,13 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: { nextCommand: "hra daemon start" },
-          message: "The local state schema needs a migration (34 to 35); start the daemon to migrate it.",
+          message: "The local state schema needs a migration (35 to 38); start the daemon to migrate it.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
-      expect(stateSchemaVersion(installation.paths.database)).toBe(34);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(35);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5598,14 +5678,14 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: "This HRA build is older than the local state schema (36 vs 35); install the newer HRA.",
+          message: "This HRA build is older than the local state schema (39 vs 38); install the newer HRA.",
         },
         ok: false,
         version: 1,
       });
       expect(captured.read().stderr).toBe("");
       expect(daemonStarts).toBe(0);
-      expect(stateSchemaVersion(installation.paths.database)).toBe(36);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(39);
     } finally {
       await rm(runRoot, { force: true, recursive: true });
     }
@@ -5627,7 +5707,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["The local state schema needs a migration (34 to 35). Run `hra daemon start` to migrate it."],
+          problems: ["The local state schema needs a migration (35 to 38). Run `hra daemon start` to migrate it."],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -5654,7 +5734,7 @@ describe("CLI entry point", () => {
         error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["This HRA build is older than the local state schema (36 vs 35). Install the newer HRA."],
+          problems: ["This HRA build is older than the local state schema (39 vs 38). Install the newer HRA."],
           state: { database: "invalid", initialized: false },
         },
       });

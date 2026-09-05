@@ -20,19 +20,25 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { readCodexAutomations, type CodexAutomation } from "../codex/automations";
-import { isNetworkOrExternalPermission } from "../daemon/autorespond";
 import { parseAccountUsage, parseRateLimits, type RateLimitSnapshot } from "../codex/protocol";
-import type { LocalCommand } from "../domain/contracts";
+import type {
+  LocalCommand,
+  NotificationEmailHostedAuthority,
+} from "../domain/contracts";
 import {
   classifyPermissionCategory,
-  computeInteractionCommandClass,
   computeInteractionPresentation,
-  computeRemoteAvailableDecisions,
-  computeRemoteInteractionQuestions,
-  mcpFieldIsRemotelyAnswerable,
   type InteractionDisplay,
   type InteractionRecord,
 } from "../domain/interactions";
+import {
+  deriveRemoteInteractionPolicy,
+  remoteInteractionAnswerLimits,
+  remoteInteractionJsonFitsProviderLimit,
+  type RemoteInteractionAction,
+  type RemoteInteractionPolicy,
+} from "../domain/remote-interaction-policy";
+import { containsSecretShapedText } from "../domain/text-safety";
 import {
   deviceCommandLoginResultLifetimeMs,
   deviceRegistryLimits,
@@ -45,6 +51,7 @@ import {
   type RemoteCommandPayload,
 } from "./payloads";
 import { isCodexRuntimeProfile } from "../domain/runtime-profile";
+import type { NotificationHoursPolicy } from "../domain/notification-hours";
 import { providerUsagePayload } from "../domain/usage-metrics";
 import type { SessionEvent } from "../domain/session-events";
 import { queueIdSchema, sessionIdSchema } from "../domain/values";
@@ -86,6 +93,7 @@ import type {
   CloudCommandExecutionResult,
   CloudCommandExecutorPort,
   CloudDaemonBridge,
+  CloudDeviceRegistryProjection,
   CloudDeviceCommandExecutionResult,
   CloudDeviceCommandExecutorPort,
   CloudDaemonLocalSourcePort,
@@ -94,6 +102,7 @@ import type {
   CloudLocalSessionPage,
   CloudLocalUsageSnapshot,
 } from "./daemon-bridge";
+import type { LocalAttentionNotificationSnapshot } from "./attention-notifications";
 import type { CloudSyncCadenceStatus } from "./daemon-lifecycle";
 import type {
   CloudRemoteCommandReceipt,
@@ -105,6 +114,7 @@ import type {
 } from "./local-control";
 import {
   COMPACT_INTERACTION_DETAIL_VERSION,
+  COMPACT_REMOTE_INTERACTION_POLICY_VERSION,
   compactInteractionDetailLimits,
   detailProjectionIsSafe,
   isCompactInteractionBaselineShape,
@@ -114,6 +124,7 @@ import {
   parseCompactSessionEvents,
   type CompactInteractionDecision,
   type CompactInteractionQuestion,
+  type CompactRemoteInteractionPolicy,
   type CompactAttachment,
   type CompactMessageActor,
   type CompactSessionEvent,
@@ -187,6 +198,7 @@ type CompactSessionEventBody =
       kind: "interaction_state";
       label?: string;
       questions?: readonly CompactInteractionQuestion[];
+      remotePolicy?: CompactRemoteInteractionPolicy;
       revision: number;
       state: InteractionRecord["state"];
       summary: string;
@@ -738,7 +750,10 @@ function projectionLine(label: string, value: string, maximum = 240): string | n
   return text.length === 0 || name.length === 0 ? null : `- ${name}: ${text}`;
 }
 
-function interactionDetailMarkdown(display: InteractionDisplay): string {
+function interactionDetailMarkdown(
+  display: InteractionDisplay,
+  remotePolicy: RemoteInteractionPolicy,
+): string {
   const lines: (string | null)[] = [];
   switch (display.kind) {
     case "command_approval":
@@ -756,9 +771,8 @@ function interactionDetailMarkdown(display: InteractionDisplay): string {
       lines.push("- HRA cannot show the exact affected paths for this provider version.");
       break;
     case "permission_approval": {
-      // The categories are classed, never named: a permission value never
-      // enters the projection, and the class is what a remote decision is
-      // taken on and re-verified against.
+      // Categories are classed for presentation only, never named. Exact
+      // values remain local, and no category can grant remote authority.
       const classes = [...new Set(display.requested
         .map((permission) => classifyPermissionCategory(permission.name)))].sort();
       lines.push(projectionLine(
@@ -780,14 +794,15 @@ function interactionDetailMarkdown(display: InteractionDisplay): string {
       // An MCP form is declared as possibly carrying protected values, and its
       // server name and field names are provider text. Neither the server nor
       // an unanswerable field is named here; only the fields this device could
-      // actually fill are named at all, and they are named by the `questions`
-      // list rather than by this prose.
-      const answerable = (display.fields ?? []).filter(mcpFieldIsRemotelyAnswerable).length;
-      const total = display.fields?.length ?? 0;
+      // actually fill are named at all, and they are named by the policy's
+      // `questions` list rather than by this prose. Reachability comes only
+      // from the shared policy action set: optional unsupported fields and
+      // policy bounds must never be reinterpreted by a presentation helper.
       lines.push("- This form may contain protected values.");
-      lines.push(answerable === 0 || answerable !== total
-        ? "- It is completed on the machine running the session."
-        : `- ${String(answerable)} text value${answerable === 1 ? "" : "s"} can be answered from here.`);
+      const answerable = remotePolicy.questions.length;
+      lines.push(remotePolicy.actions.includes("answer")
+        ? `- ${String(answerable)} text value${answerable === 1 ? "" : "s"} can be answered from here.`
+        : "- It is completed on the machine running the session.");
       break;
     }
   }
@@ -798,13 +813,11 @@ function interactionDetailMarkdown(display: InteractionDisplay): string {
 }
 
 type CompactInteractionDetailBody = Readonly<{
-  availableDecisions?: readonly CompactInteractionDecision[];
-  commandClass?: string;
   detailMarkdown?: string;
   detailVersion?: number;
   headline?: string;
   label?: string;
-  questions?: readonly CompactInteractionQuestion[];
+  remotePolicy?: CompactRemoteInteractionPolicy;
 }>;
 
 /**
@@ -820,58 +833,36 @@ type CompactInteractionDetailBody = Readonly<{
  * drops the whole detail block, which leaves the browser with the base event
  * and therefore with no buttons.
  */
-function compactInteractionDetail(display: InteractionDisplay): CompactInteractionDetailBody {
+function compactInteractionDetail(
+  interaction: Pick<InteractionRecord, "deadlineAt" | "display" | "kind" | "state">,
+  now: number,
+): CompactInteractionDetailBody {
+  const { display } = interaction;
   const presentation = computeInteractionPresentation(display);
-  const commandClass = computeInteractionCommandClass(display);
-  const decisions = computeRemoteAvailableDecisions(display)
-    .slice(0, compactInteractionDetailLimits.decisions);
-  // A user-input question is listed whether or not it is secret, so the reader
-  // knows what is being asked and gets no input for the secret ones. An MCP
-  // form field is different: its name is provider text on a form declared as
-  // possibly protected, so only the fields this device could actually fill are
-  // named at all.
-  const provided = display.kind === "mcp_elicitation"
-    ? computeRemoteInteractionQuestions(display).filter((question) => !question.secret)
-    : computeRemoteInteractionQuestions(display);
-  // A question id is the provider's exact identifier and is never rewritten:
-  // an id that bounding or redaction would change cannot be answered remotely,
-  // and one unusable id drops the whole list rather than offering the browser
-  // a partial answer set the daemon's id-matching rule would then refuse.
-  const questions = provided.length > compactInteractionDetailLimits.questions
-    || provided.some((question) =>
-      question.id.length === 0
-      || boundedLine(question.id, compactInteractionDetailLimits.questionIdCharacters)
-        !== question.id)
-    ? []
-    : provided.map((question) => {
-        const label = boundedLine(
-          question.label,
-          compactInteractionDetailLimits.questionLabelCharacters,
-        );
-        return {
-          id: question.id,
-          label: label.length === 0 ? question.id : label,
-          secret: question.secret,
-        };
-      });
+  const policy = deriveRemoteInteractionPolicy({
+    deadlineAt: interaction.deadlineAt,
+    display,
+    state: interaction.state,
+  }, now);
+  const remotePolicy: CompactRemoteInteractionPolicy = {
+    actions: [...policy.actions],
+    deadlineAt: policy.deadlineAt,
+    questions: policy.questions.map((question) => ({
+      ...question,
+      options: question.options.map((option) => ({ ...option })),
+    })),
+    reasonCodes: [...policy.reasonCodes],
+    version: COMPACT_REMOTE_INTERACTION_POLICY_VERSION,
+  };
   const candidate: CompactInteractionDetailBody = {
-    ...(decisions.length === 0 ? {} : { availableDecisions: decisions }),
-    ...(commandClass === null
-      ? {}
-      : {
-          commandClass: boundedLine(
-            commandClass,
-            compactInteractionDetailLimits.commandClassCharacters,
-          ),
-        }),
-    detailMarkdown: interactionDetailMarkdown(display),
+    detailMarkdown: interactionDetailMarkdown(display, policy),
     detailVersion: COMPACT_INTERACTION_DETAIL_VERSION,
     headline: boundedLine(
       presentation.headline,
       compactInteractionDetailLimits.headlineCharacters,
     ),
     label: boundedLine(presentation.label, compactInteractionDetailLimits.labelCharacters),
-    ...(questions.length === 0 ? {} : { questions }),
+    remotePolicy,
   };
   if (!detailProjectionIsSafe(candidate)) return {};
   // Last gate: the wire parser itself. A detail block the compact parser would
@@ -881,12 +872,12 @@ function compactInteractionDetail(display: InteractionDisplay): CompactInteracti
   const probe = parseCompactSessionEvent({
     blocking: true,
     interactionId: "00000000-0000-4000-8000-000000000000",
-    interactionKind: display.kind,
+    interactionKind: interaction.kind,
     kind: "interaction_state",
     revision: 1,
     sequence: 1,
-    state: "pending",
-    summary: compactInteractionSummary(display.kind),
+    state: interaction.state,
+    summary: compactInteractionSummary(interaction.kind),
     ...candidate,
   });
   if (probe === null || probe.kind !== "interaction_state") return {};
@@ -1722,13 +1713,33 @@ class CloudProjectionCache {
     return scan.immediate();
   }
 
-  ingestInteraction(sessionPublicId: string, interaction: InteractionRecord): void {
+  ingestInteraction(
+    sessionPublicId: string,
+    interaction: InteractionRecord,
+    now: number,
+  ): void {
     if (interaction.sessionId !== sessionPublicId) {
       throw new Error("The cloud projection interaction belongs to another session.");
     }
     const recordId = `hraix_${sha256(`${interaction.publicId}:${String(interaction.revision)}`)}`;
+    const existing = this.#database.query(
+      `SELECT turn_id,start_sequence,event_count,digest,events_json
+       FROM projection_turns WHERE session_id=? AND turn_id=?`,
+    ).get(sessionPublicId, recordId) as ProjectionStoredTurnRow | null;
+    if (existing !== null) {
+      const projected = verifiedInteractionEvent(parseVerifiedStoredEvents(existing));
+      if (
+        projected === null
+        || projected.interactionId !== interaction.publicId
+        || projected.revision !== interaction.revision
+      ) throw new ProjectionStreamRecoveryError();
+      // The first projection of a revision is immutable. This preserves an
+      // already-journalled v1 body across upgrade and prevents an unchanged
+      // revision from changing digest merely because its deadline passed.
+      return;
+    }
     this.ingestTurn(sessionPublicId, recordId, [{
-      ...compactInteractionDetail(interaction.display),
+      ...compactInteractionDetail(interaction, now),
       blocking: interaction.blocking,
       interactionId: interaction.publicId,
       interactionKind: interaction.kind,
@@ -2713,7 +2724,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
           throw new Error("Cloud projection recovery interaction authority changed.");
         }
         return {
-          ...compactInteractionDetail(interaction.display),
+          ...compactInteractionDetail(interaction, this.#registryNow()),
           blocking: interaction.blocking,
           interactionId: interaction.publicId,
           interactionKind: interaction.kind,
@@ -3086,7 +3097,9 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         if (!canReadProvider) {
           try {
             for (const interaction of observedProjectionInteractions(this.#store, cache, session)) {
-              if (interaction.terminalAt !== null) cache.ingestInteraction(session.id, interaction);
+              if (interaction.terminalAt !== null) {
+                cache.ingestInteraction(session.id, interaction, this.#registryNow());
+              }
             }
             this.#projectionErrors.delete(session.id);
             includeHead = cache.hasUncommittedEvents(session.id);
@@ -3129,7 +3142,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
               ?? observedProjectionInteractions(this.#store, cache, session)
                 .filter((interaction) => interaction.terminalAt !== null);
             for (const interaction of interactions) {
-              cache.ingestInteraction(session.id, interaction);
+              cache.ingestInteraction(session.id, interaction, this.#registryNow());
             }
             if (current !== null) {
               cache.advanceInteractionDiscoveryCursor(
@@ -3268,7 +3281,9 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
    * than failing the whole registry, and a Codex thread that is not one of
    * this daemon's sessions projects a null session id.
    */
-  async readDeviceRegistry(input: Readonly<{ signal: AbortSignal }>): Promise<DeviceRegistryPayload> {
+  async #buildDeviceRegistryProjection(
+    input: Readonly<{ signal: AbortSignal }>,
+  ): Promise<CloudDeviceRegistryProjection> {
     if (input.signal.aborted) throw input.signal.reason;
     const sessions = this.#store.listSessions(100, undefined, true);
     const sessionByProviderThread = new Map<string, string>();
@@ -3326,8 +3341,19 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
         sessionPublicId,
       });
     }
+    const proseAutorespondConfigured = await this.#gatewayKeyCustody.hasKey();
+    throwIfAborted(input.signal);
     const deviceCommandPolicy = this.#store.readDeviceCommandPolicy();
-    return {
+    // These synchronous reads each validate the composite row, and there is no
+    // await between them. Comparing the shared revision makes a commit by a
+    // second local process between the reads fail closed instead of publishing
+    // consent from one revision with hours from another.
+    const notificationHours = this.#store.readNotificationHours();
+    const notificationEmail = this.#store.readNotificationEmailPolicy();
+    if (notificationHours.revision !== notificationEmail.revision) {
+      throw new Error("NOTIFICATION_POLICY_REVISION_DIVERGED");
+    }
+    const registry = {
       accountLinkingAllowed: deviceCommandPolicy.accountLinkingAllowed,
       accounts,
       daemonVersion: registryLabel(HRA_VERSION, "unknown", deviceRegistryLimits.versionCharacters),
@@ -3337,11 +3363,81 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       heartbeatAt: this.#registryNow(),
       machineLabel: this.#machineLabel,
       projects,
-      proseAutorespondConfigured: await this.#gatewayKeyCustody.hasKey(),
+      proseAutorespondConfigured,
       scheduledTasks,
       showThinkingDefault: this.#store.readDefaultShowThinking(),
       version: 1,
+    } satisfies DeviceRegistryPayload;
+    return {
+      notificationEmail,
+      notificationHours,
+      notificationPolicyRevision: notificationEmail.revision,
+      registry,
     };
+  }
+
+  async readDeviceRegistry(input: Readonly<{ signal: AbortSignal }>): Promise<DeviceRegistryPayload> {
+    return (await this.#buildDeviceRegistryProjection(input)).registry;
+  }
+
+  async readDeviceRegistryProjection(
+    input: Readonly<{ signal: AbortSignal }>,
+  ): Promise<CloudDeviceRegistryProjection> {
+    return await this.#buildDeviceRegistryProjection(input);
+  }
+
+  async readAttentionNotificationSnapshot(input: Readonly<{
+    limit: number;
+    now: number;
+    signal: AbortSignal;
+  }>): Promise<LocalAttentionNotificationSnapshot> {
+    if (input.signal.aborted) throw input.signal.reason;
+    const snapshot = this.#store.readAttentionNotificationSnapshot({
+      limit: input.limit,
+      now: input.now,
+    });
+    // The two rows share one transactional revision. There is no await
+    // between these reads, and a cross-process commit between them is caught
+    // by the exact comparison rather than producing torn consent authority.
+    const notificationHours = this.#store.readNotificationHours();
+    const notificationEmail = this.#store.readNotificationEmailPolicy();
+    if (notificationHours.revision !== notificationEmail.revision) {
+      throw new Error("NOTIFICATION_POLICY_REVISION_DIVERGED");
+    }
+    const candidates = snapshot.status === "overflow"
+      ? []
+      : snapshot.interactions.map((interaction) => {
+          if (interaction.sessionId === null) {
+            throw new Error("ATTENTION_NOTIFICATION_SESSION_AUTHORITY_MISSING");
+          }
+          const policy = deriveRemoteInteractionPolicy({
+            deadlineAt: interaction.deadlineAt,
+            display: interaction.display,
+            state: interaction.state,
+          }, input.now);
+          return {
+            interactionDeadline: interaction.deadlineAt,
+            interactionId: interaction.publicId,
+            interactionKind: interaction.kind,
+            interactionRevision: interaction.revision,
+            remoteActions: [...policy.actions],
+            sessionPublicId: interaction.sessionId,
+          };
+        });
+    throwIfAborted(input.signal);
+    return {
+      candidates,
+      notificationEmail,
+      notificationHours,
+      notificationPolicyRevision: notificationEmail.revision,
+      observedAt: snapshot.observedAt,
+      status: snapshot.status,
+    };
+  }
+
+  async readNotificationHours(input: Readonly<{ signal: AbortSignal }>): Promise<NotificationHoursPolicy> {
+    if (input.signal.aborted) throw input.signal.reason;
+    return this.#store.readNotificationHours();
   }
 
   recordCompactUploadIntent(input: CompactUploadCheckpoint): Promise<void> {
@@ -3563,7 +3659,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
             };
             break;
           case "resolve_interaction": {
-            const verified = verifyRemoteInteraction(this.#store, session.id, input.payload, Date.now());
+            const verified = verifyRemoteInteraction(
+              this.#store,
+              session.id,
+              input.payload,
+              this.#registryNow(),
+            );
             if (verified.kind === "refused") return { code: verified.code, state: "failed" };
             command = {
               kind: "interaction.resolve",
@@ -3683,9 +3784,31 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
           return this.#accountLoginStatus(input.payload);
         case "usage_refresh":
           return await this.#refreshUsageForDevice(input.signal);
+        case "set_notification_hours":
+          this.#store.updateNotificationHours({
+            endMinute: input.payload.endMinute,
+            expectedRevision: input.payload.expectedRevision,
+            startMinute: input.payload.startMinute,
+            timeZone: input.payload.timeZone,
+            version: input.payload.version,
+          });
+          return { code: "APPLIED", state: "applied" };
       }
     } catch (error: unknown) {
-      const code = isRecord(error) && typeof error.code === "string" ? error.code : "UNKNOWN";
+      const message = error instanceof Error
+        ? error.message
+        : isRecord(error) && typeof error.message === "string"
+        ? error.message
+        : typeof error === "string"
+        ? error
+        : "";
+      const code = isRecord(error) && typeof error.code === "string"
+        ? error.code
+        : message === "NOTIFICATION_HOURS_REVISION_CONFLICT"
+        ? "NOTIFICATION_HOURS_REVISION_CONFLICT"
+        : message === "NOTIFICATION_HOURS_REVISION_EXHAUSTED"
+        ? "NOTIFICATION_HOURS_REVISION_EXHAUSTED"
+        : "UNKNOWN";
       if (code === "RECOVERY_REQUIRED" || code === "INTERNAL" || code === "UNKNOWN") {
         return { code: `LOCAL_${code}`.slice(0, 64), state: "ambiguous" };
       }
@@ -3907,25 +4030,12 @@ type RemoteInteractionVerification =
   | Readonly<{ kind: "verified"; resolution: Extract<LocalCommand, { kind: "interaction.resolve" }>["resolution"] }>;
 
 /*
- * Remote decisions are verified against the local interaction record before
- * the ordinary resolve path runs: the interaction must exist, belong to the
- * command's session, still be pending at the requested revision, be inside
- * its deadline, and the decision must be one the provider offered. Session
- * scope is never accepted remotely, and questions marked secret are refused.
- *
- * What each kind admits, and the code every refusal carries:
- *
- * | kind                 | decision                                   | answers                                     |
- * | -------------------- | ------------------------------------------ | ------------------------------------------- |
- * | command_approval     | provider's `availableDecisions`, class re-verified | INTERACTION_ANSWERS_NOT_REMOTE      |
- * | file_change_approval | `decline` only (no diff exists to judge)    | INTERACTION_ANSWERS_NOT_REMOTE              |
- * | permission_approval  | `once`/`decline`, workspace-only class only | INTERACTION_ANSWERS_NOT_REMOTE              |
- * | user_input           | INTERACTION_DECISION_NOT_REMOTE            | non-secret questions, exact provider ids    |
- * | mcp_elicitation      | INTERACTION_DECISION_NOT_REMOTE            | plain-text `form` fields, exact field names |
- *
- * The class a remote approval is taken on is recomputed here from the live
- * record rather than trusted from the projection, and the revision check binds
- * that record to the one the requesting device actually saw.
+ * The final custodian gate first binds the request to one live session,
+ * interaction revision, pending state, and deadline. It then recomputes the
+ * same pure policy the compact projection used. No mirrored kind matrix can
+ * grant an action: the requested canonical action must be a member of that
+ * exact live policy before its answer values are validated and translated to
+ * the ordinary local resolution.
  */
 function verifyRemoteInteraction(
   store: StateStore,
@@ -3943,130 +4053,98 @@ function verifyRemoteInteraction(
   if (interaction.state !== "pending") return { kind: "refused", code: "INTERACTION_ALREADY_RESOLVED" };
   if (interaction.revision !== payload.revision) return { kind: "refused", code: "INTERACTION_REVISION_STALE" };
   if (now >= interaction.deadlineAt) return { kind: "refused", code: "INTERACTION_EXPIRED" };
-  return "decision" in payload
-    ? verifyRemoteInteractionDecision(interaction.display, payload.decision)
-    : verifyRemoteInteractionAnswers(interaction.display, payload.answers);
+  if ("decision" in payload && payload.decision === "cancel") {
+    return { kind: "refused", code: "INTERACTION_CANCEL_NOT_REMOTE" };
+  }
+  const requestedAction: RemoteInteractionAction | "approve_once" = "answers" in payload
+    ? "answer"
+    : payload.decision === "once"
+      ? "approve_once"
+      : "decline";
+  const policy = deriveRemoteInteractionPolicy({
+    deadlineAt: interaction.deadlineAt,
+    display: interaction.display,
+    state: interaction.state,
+  }, now);
+  if (requestedAction === "approve_once" || !policy.actions.includes(requestedAction)) {
+    return {
+      kind: "refused",
+      code: unavailableRemoteInteractionCode(interaction.display, requestedAction, policy.reasonCodes),
+    };
+  }
+  if (requestedAction === "answer" && "answers" in payload) {
+    return verifyRemoteInteractionAnswers(policy.questions, payload.answers);
+  }
+  if (requestedAction === "decline") {
+    return { kind: "verified", resolution: { kind: "approval_decision", decision: "decline" } };
+  }
+  return { kind: "refused", code: "INTERACTION_DECISION_UNAVAILABLE" };
 }
 
-function verifyRemoteInteractionDecision(
+function unavailableRemoteInteractionCode(
   display: InteractionDisplay,
-  decision: "once" | "decline" | "cancel",
-): RemoteInteractionVerification {
-  // `parseRemoteCommandPayload` cannot encode session scope, so this is depth
-  // rather than a live path: it keeps the refusal explicit at the boundary
-  // that would otherwise have to trust the parser.
-  if ((decision as string) === "session") {
-    return { kind: "refused", code: "INTERACTION_SESSION_SCOPE_NOT_REMOTE" };
+  requestedAction: RemoteInteractionAction | "approve_once",
+  reasonCodes: readonly string[],
+): string {
+  if (requestedAction === "answer") {
+    if (
+      display.kind === "user_input"
+      && reasonCodes.includes("USER_INPUT_SECRET_QUESTION")
+    ) return "INTERACTION_SECRET_ANSWER_REFUSED";
+    return display.kind === "mcp_elicitation"
+      ? "INTERACTION_ELICITATION_NOT_REMOTE"
+      : "INTERACTION_ANSWERS_NOT_REMOTE";
   }
   if (display.kind === "user_input" || display.kind === "mcp_elicitation") {
-    return { kind: "refused", code: "INTERACTION_DECISION_NOT_REMOTE" };
+    return "INTERACTION_DECISION_NOT_REMOTE";
+  }
+  if (display.kind === "file_change_approval" && requestedAction === "approve_once") {
+    return "INTERACTION_FILE_CHANGE_ACCEPT_NOT_REMOTE";
   }
   if (display.kind === "permission_approval") {
-    if (decision !== "once" && decision !== "decline") {
-      return { kind: "refused", code: "INTERACTION_PERMISSION_DECISION_UNAVAILABLE" };
-    }
-    // Re-verification at apply time: the class exists only when every
-    // requested category is recognisably workspace-local. A network, MCP, or
-    // unrecognised category has no class and therefore no remote decision,
-    // whichever way the decision points.
-    if (
-      computeInteractionCommandClass(display) === null
-      || isNetworkOrExternalPermission(display)
-    ) {
-      return { kind: "refused", code: "INTERACTION_PERMISSION_CLASS_UNVERIFIED" };
-    }
-    return decision === "decline"
-      ? { kind: "verified", resolution: { kind: "approval_decision", decision } }
-      : {
-          kind: "verified",
-          resolution: {
-            kind: "permission_grant",
-            permissions: display.requested.map((permission) => permission.name),
-            scope: null,
-          },
-        };
+    return "INTERACTION_PERMISSION_APPROVAL_LOCAL_ONLY";
   }
-  if (display.kind === "file_change_approval" && decision !== "decline") {
-    // The pinned provider callback exposes no diff and no affected paths, so
-    // nothing a device could have read justifies accepting one.
-    return { kind: "refused", code: "INTERACTION_FILE_CHANGE_ACCEPT_NOT_REMOTE" };
+  if (display.kind === "command_approval" && requestedAction === "approve_once") {
+    return "INTERACTION_COMMAND_APPROVAL_LOCAL_ONLY";
   }
-  if (!display.availableDecisions.includes(decision)) {
-    return { kind: "refused", code: "INTERACTION_DECISION_UNAVAILABLE" };
-  }
-  if (
-    display.kind === "command_approval"
-    && decision === "once"
-    && computeInteractionCommandClass(display) === null
-  ) {
-    return { kind: "refused", code: "INTERACTION_COMMAND_CLASS_UNVERIFIED" };
-  }
-  return { kind: "verified", resolution: { kind: "approval_decision", decision } };
+  return "INTERACTION_DECISION_UNAVAILABLE";
 }
 
 function verifyRemoteInteractionAnswers(
-  display: InteractionDisplay,
+  questions: ReturnType<typeof deriveRemoteInteractionPolicy>["questions"],
   submitted: Readonly<Record<string, Readonly<{ answers: readonly string[] }>>>,
 ): RemoteInteractionVerification {
-  if (display.kind !== "user_input" && display.kind !== "mcp_elicitation") {
-    return { kind: "refused", code: "INTERACTION_ANSWERS_NOT_REMOTE" };
+  const known = new Map(questions.map((question) => [question.id, question]));
+  const submittedAnswers = new Map(Object.entries(submitted));
+  if ([...submittedAnswers.keys()].some((id) => !known.has(id))) {
+    return { kind: "refused", code: "INTERACTION_ANSWER_CONSTRAINT_FAILED" };
   }
-  const questions = computeRemoteInteractionQuestions(display);
-  const secret = new Set(
-    questions.filter((question) => question.secret).map((question) => question.id),
-  );
-  for (const questionId of Object.keys(submitted)) {
-    if (secret.has(questionId)) {
-      return { kind: "refused", code: "INTERACTION_SECRET_ANSWER_REFUSED" };
+  if (questions.length === 0 || submittedAnswers.size !== questions.length) {
+    return { kind: "refused", code: "INTERACTION_ANSWER_CONSTRAINT_FAILED" };
+  }
+  for (const question of questions) {
+    const values = submittedAnswers.get(question.id)?.answers;
+    if (
+      question.options.length === 0
+      || values === undefined
+      || values.length !== 1
+      || values[0]?.length === 0
+      || values.some((value) =>
+        value.length > remoteInteractionAnswerLimits.codeUnits
+        || containsSecretShapedText(value)
+        || !question.options.some((option) => option.label === value))
+    ) {
+      return { kind: "refused", code: "INTERACTION_ANSWER_CONSTRAINT_FAILED" };
     }
   }
-  if (display.kind === "user_input") {
-    // The local resolve path requires an answer for every question the
-    // provider asked, so one secret question makes the whole set unanswerable
-    // from a device: a complete set would have to carry the secret value and
-    // an incomplete one would be refused there instead of here.
-    if (secret.size > 0) {
-      return { kind: "refused", code: "INTERACTION_SECRET_ANSWER_REFUSED" };
-    }
-    // The id-matching rule itself stays where it already lives, on the local
-    // resolve path, so a remote answer is held to exactly the same rule a
-    // local one is.
-    const answers = Object.fromEntries(
-      Object.entries(submitted).map(([questionId, answer]) => [
-        questionId,
-        { answers: [...answer.answers] },
-      ]),
-    );
-    return { kind: "verified", resolution: { kind: "user_answers", answers } };
+  const answers = Object.fromEntries(questions.map((question) => [
+    question.id,
+    { answers: [...(submittedAnswers.get(question.id)?.answers ?? [])] },
+  ]));
+  if (!remoteInteractionJsonFitsProviderLimit(answers)) {
+    return { kind: "refused", code: "INTERACTION_ANSWER_CONSTRAINT_FAILED" };
   }
-  // An MCP form is answerable from a device only when HRA can complete it at
-  // all and every value it needs is plain text: a typed field cannot be
-  // reconstructed from a text answer, and a missing required field would fail
-  // the provider's own contract after the decision had already been taken.
-  if (display.mode !== "form" || display.fields === undefined || questions.length === 0) {
-    return { kind: "refused", code: "INTERACTION_ELICITATION_NOT_REMOTE" };
-  }
-  const known = new Set(questions.map((question) => question.id));
-  if (Object.keys(submitted).some((name) => !known.has(name))) {
-    return { kind: "refused", code: "INTERACTION_ELICITATION_NOT_REMOTE" };
-  }
-  const content: Record<string, string> = {};
-  for (const field of display.fields) {
-    const answer = submitted[field.name];
-    if (answer === undefined) {
-      if (field.required) return { kind: "refused", code: "INTERACTION_ELICITATION_NOT_REMOTE" };
-      continue;
-    }
-    const [value] = answer.answers;
-    if (answer.answers.length !== 1 || typeof value !== "string") {
-      return { kind: "refused", code: "INTERACTION_ELICITATION_NOT_REMOTE" };
-    }
-    content[field.name] = value;
-  }
-  return {
-    kind: "verified",
-    resolution: { kind: "mcp_submission", action: "accept", content },
-  };
+  return { kind: "verified", resolution: { kind: "user_answers", answers } };
 }
 
 export class BridgedCloudControl implements CloudControlPort, CloudRemoteControlPort {
@@ -4109,6 +4187,32 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
     return isRecord(status)
       ? { ...status, ...additions }
       : { control: status, ...additions };
+  }
+  async observeAttentionNotificationAuthority(
+    signal: AbortSignal,
+  ): Promise<NotificationEmailHostedAuthority> {
+    if (this.#bridge.observeAttentionNotificationAuthority !== undefined) {
+      return await this.#bridge.observeAttentionNotificationAuthority(signal);
+    }
+    if (this.#control.observeAttentionNotificationAuthority !== undefined) {
+      return await this.#control.observeAttentionNotificationAuthority(signal);
+    }
+    return { state: "not_observed" };
+  }
+  async invalidateAttentionNotificationAuthority(input: {
+    localNotificationPolicyRevision: number;
+    signal: AbortSignal;
+  }): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    if (this.#bridge.invalidateAttentionNotificationAuthority !== undefined) {
+      return await this.#bridge.invalidateAttentionNotificationAuthority(input);
+    }
+    if (this.#control.invalidateAttentionNotificationAuthority !== undefined) {
+      return await this.#control.invalidateAttentionNotificationAuthority(input);
+    }
+    throw new Error("Hosted attention notification invalidation is unavailable.");
   }
   async auth(input: { email: string; code?: string; invite?: string; signal: AbortSignal }): Promise<unknown> {
     if (input.code !== undefined) {

@@ -14,7 +14,7 @@ import { useComposerAttachments } from "../data/composer-attachments";
 import { holdSentAttachment } from "../data/sent-attachments";
 import { useSessionHead } from "../data/session-heads";
 import { useSessionModel } from "../data/session-model-hook";
-import type { ModelPreset, RemoteCommandPayload } from "../hra/cloud";
+import type { RemoteCommandPayload } from "../hra/cloud";
 import { cn } from "../lib/cn";
 import {
   attachmentAcceptAttribute,
@@ -31,18 +31,21 @@ import {
   providerSwitchSupported,
   type SessionProvider,
 } from "../model/provider-switch";
+import {
+  presetChoices,
+  presetLabels,
+  sessionFastCommand,
+  sessionFastCommandNotice,
+} from "../model/settings-commands";
 import { deriveTranscript } from "../model/transcript";
-import { shortSessionLabel } from "../model/session-view";
+import {
+  interactionCommandPublicId,
+  interactionInstanceKey,
+  shortSessionLabel,
+} from "../model/session-view";
 import { navigateBack } from "../routing/router";
 
 type ApprovalMode = "auto:all" | "auto:workspace" | "manual";
-
-const presetOptions: readonly (readonly [ModelPreset, string])[] = [
-  ["low", "Sol Low"],
-  ["high", "Sol High"],
-  ["ultra", "Sol Ultra"],
-  ["fable-max", "Claude Fable Max"],
-];
 
 const approvalOptions: readonly (readonly [ApprovalMode, string])[] = [
   ["auto:all", "Auto (all)"],
@@ -104,12 +107,19 @@ export function SessionScreen({
   const submit = useSubmitCommand();
 
   const [menuOpen, setMenuOpen] = useState(false);
-  const [preset, setPreset] = useState<ModelPreset>("ultra");
   const [approvalMode, setApprovalMode] = useState<ApprovalMode | null>(null);
+  const [fastRequest, setFastRequest] = useState<Readonly<{
+    commandPublicId: string;
+    enabled: boolean;
+    sessionPublicId: string;
+  }> | null>(null);
   const [message, setMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [decisionCommandId, setDecisionCommandId] = useState<string | null>(null);
+  const [decisionCommand, setDecisionCommand] = useState<Readonly<{
+    interactionKey: string;
+    publicId: string;
+  }> | null>(null);
   const [provider, setProvider] = useState<SessionProvider | null>(null);
   const [providerCommandId, setProviderCommandId] = useState<string | null>(null);
   const attach = useComposerAttachments();
@@ -128,6 +138,10 @@ export function SessionScreen({
   const interaction = model.pendingInteractions.find((entry) => entry.blocking)
     ?? model.pendingInteractions.at(-1)
     ?? null;
+  const currentInteractionKey = interaction === null
+    ? null
+    : interactionInstanceKey(interaction);
+  const decisionCommandId = interactionCommandPublicId(decisionCommand, interaction);
 
   const run = useCallback(async (payload: RemoteCommandPayload): Promise<string | null> => {
     if (head === null) return null;
@@ -165,6 +179,14 @@ export function SessionScreen({
   }, [entries]);
 
   const providerCommand = useCommandState(providerCommandId);
+  const fastRequestForSession = fastRequest?.sessionPublicId === sessionPublicId
+    ? fastRequest
+    : null;
+  const fastCommand = useCommandState(fastRequestForSession?.commandPublicId ?? null);
+  const fastNotice = sessionFastCommandNotice(
+    fastCommand,
+    fastRequestForSession?.enabled ?? null,
+  );
   const providerDisabledReason = providerSwitchDisabledReason({
     sending,
     supported: providerSwitchSupported(),
@@ -255,10 +277,16 @@ export function SessionScreen({
           <InteractionPanel
             commandPublicId={decisionCommandId}
             interaction={interaction}
-            onResolve={(payload) => {
-              void run(payload).then((commandPublicId) => {
-                setDecisionCommandId(commandPublicId);
-              });
+            key={interactionInstanceKey(interaction)}
+            onResolve={async (payload) => {
+              const commandPublicId = await run(payload);
+              if (commandPublicId !== null && currentInteractionKey !== null) {
+                setDecisionCommand({
+                  interactionKey: currentInteractionKey,
+                  publicId: commandPublicId,
+                });
+              }
+              return commandPublicId;
             }}
             submitting={sending}
           />
@@ -329,20 +357,55 @@ export function SessionScreen({
 
       <Sheet label="Session menu" onClose={() => { setMenuOpen(false); }} open={menuOpen}>
         <h2 className="text-base font-semibold">Model</h2>
+        <p className="mt-1 text-xs text-ink-muted">
+          Applies to future turns. The daemon holds the current value; this browser
+          does not infer or highlight it.
+        </p>
         <div className="mt-2 flex flex-col gap-2">
-          {presetOptions.map(([value, label]) => (
+          {presetChoices.map((value) => (
             <ChoiceRow
               key={value}
-              label={label}
+              label={presetLabels[value]}
               onSelect={() => {
-                setPreset(value);
                 setMenuOpen(false);
                 void run({ kind: "set_model", preset: value });
               }}
-              selected={preset === value}
+              selected={false}
             />
           ))}
         </div>
+
+        <h2 className="mt-4 text-base font-semibold">Fast (Codex only)</h2>
+        <p className="mt-1 text-xs text-ink-muted">
+          Applies to future turns; Claude Code has no Fast mode. The daemon holds the
+          current value, so this browser highlights only a change the machine confirmed.
+        </p>
+        <div className="mt-2 flex flex-col gap-2">
+          {([true, false] as const).map((enabled) => (
+            <ChoiceRow
+              disabled={head === null || sending || model.turnActive}
+              key={String(enabled)}
+              label={enabled ? "On" : "Off"}
+              onSelect={() => {
+                setMenuOpen(false);
+                const requestedSessionPublicId = sessionPublicId;
+                void run(sessionFastCommand(enabled)).then((commandPublicId) => {
+                  if (commandPublicId === null) return;
+                  setFastRequest({
+                    commandPublicId,
+                    enabled,
+                    sessionPublicId: requestedSessionPublicId,
+                  });
+                });
+              }}
+              selected={fastNotice?.applied === true && fastRequestForSession?.enabled === enabled}
+            />
+          ))}
+        </div>
+        {fastNotice === null ? null : (
+          <p className="mt-2 text-xs text-ink-muted" role="status">{fastNotice.text}</p>
+        )}
+
         <h2 className="mt-4 text-base font-semibold">Approvals</h2>
         <p className="mt-1 text-xs text-ink-muted">
           Applies to this session. The daemon holds the current value, so nothing

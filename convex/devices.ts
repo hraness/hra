@@ -836,6 +836,7 @@ export const revoke = mutation({
     if (presence !== null && presence.userId !== authority.userId) rejectAuthority();
     const now = Date.now();
     const devicePatch = {
+      attentionNotificationAuthority: undefined,
       credentialGeneration: credentialGeneration + 1,
       revision: target.revision + 1,
       revokedAt: now,
@@ -910,6 +911,9 @@ function publicRegistry(registry: Readonly<{
   devicePublicId: string;
   envelope: Parameters<typeof parseEncryptedEnvelope>[0];
   keyVersion: number;
+  notificationEmailEnvelope?: Parameters<typeof parseEncryptedEnvelope>[0];
+  notificationHoursEnvelope?: Parameters<typeof parseEncryptedEnvelope>[0];
+  notificationPolicyRevision?: number;
   revision: number;
   updatedAt: number;
 }>) {
@@ -917,6 +921,15 @@ function publicRegistry(registry: Readonly<{
     devicePublicId: registry.devicePublicId,
     envelope: registry.envelope,
     keyVersion: registry.keyVersion,
+    ...(registry.notificationEmailEnvelope === undefined
+      ? {}
+      : { notificationEmailEnvelope: registry.notificationEmailEnvelope }),
+    ...(registry.notificationHoursEnvelope === undefined
+      ? {}
+      : { notificationHoursEnvelope: registry.notificationHoursEnvelope }),
+    ...(registry.notificationPolicyRevision === undefined
+      ? {}
+      : { notificationPolicyRevision: registry.notificationPolicyRevision }),
     revision: registry.revision,
     updatedAt: registry.updatedAt,
   };
@@ -931,6 +944,9 @@ export const updateRegistry = mutation({
     envelope: encryptedEnvelope,
     expectedRevision: v.number(),
     keyVersion: v.number(),
+    notificationEmailEnvelope: v.optional(encryptedEnvelope),
+    notificationHoursEnvelope: v.optional(encryptedEnvelope),
+    notificationPolicyRevision: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     const authority = await requireDeviceAuthority(ctx);
@@ -938,6 +954,23 @@ export const updateRegistry = mutation({
       parseEncryptedEnvelope(args.envelope, cloudLimits.registryCiphertextCharacters) === null
       || !isSafePositiveInteger(args.keyVersion)
       || args.keyVersion !== args.envelope.keyVersion
+      || (args.notificationEmailEnvelope !== undefined
+        && (parseEncryptedEnvelope(
+          args.notificationEmailEnvelope,
+          cloudLimits.notificationEmailCiphertextCharacters,
+        ) === null || args.notificationEmailEnvelope.keyVersion !== args.keyVersion))
+      || (args.notificationHoursEnvelope !== undefined
+        && (parseEncryptedEnvelope(
+          args.notificationHoursEnvelope,
+          cloudLimits.notificationHoursCiphertextCharacters,
+        ) === null || args.notificationHoursEnvelope.keyVersion !== args.keyVersion))
+      || (args.notificationPolicyRevision !== undefined
+        && !isSafePositiveInteger(args.notificationPolicyRevision))
+      || (args.notificationPolicyRevision === undefined
+        && args.notificationEmailEnvelope !== undefined)
+      || (args.notificationPolicyRevision !== undefined
+        && (args.notificationEmailEnvelope === undefined
+          || args.notificationHoursEnvelope === undefined))
       || !isSafeNonNegativeInteger(args.expectedRevision)
     ) rejectAuthority();
     const matches = await ctx.db
@@ -946,6 +979,14 @@ export const updateRegistry = mutation({
       .take(2);
     if (matches.length > 1) rejectAuthority();
     const existing = matches[0];
+    const notificationPolicyHighWaterRevision = Math.max(
+      existing?.notificationPolicyRevision ?? 0,
+      authority.device.attentionNotificationAuthority?.localNotificationPolicyRevision ?? 0,
+    );
+    if (
+      args.notificationPolicyRevision !== undefined
+      && args.notificationPolicyRevision < notificationPolicyHighWaterRevision
+    ) rejectAuthority();
     const now = Date.now();
     if (existing === undefined) {
       if (args.expectedRevision !== 0) throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
@@ -955,6 +996,15 @@ export const updateRegistry = mutation({
         devicePublicId: authority.device.publicId,
         envelope: args.envelope,
         keyVersion: args.keyVersion,
+        ...(args.notificationEmailEnvelope === undefined
+          ? {}
+          : { notificationEmailEnvelope: args.notificationEmailEnvelope }),
+        ...(args.notificationHoursEnvelope === undefined
+          ? {}
+          : { notificationHoursEnvelope: args.notificationHoursEnvelope }),
+        ...(args.notificationPolicyRevision === undefined
+          ? {}
+          : { notificationPolicyRevision: args.notificationPolicyRevision }),
         revision: 1,
         updatedAt: now,
         userId: authority.userId,
@@ -973,6 +1023,11 @@ export const updateRegistry = mutation({
     const patch = {
       envelope: args.envelope,
       keyVersion: args.keyVersion,
+      // An omitted envelope is an intentional old-daemon capability signal:
+      // patching undefined clears a stale value after downgrade.
+      notificationEmailEnvelope: args.notificationEmailEnvelope,
+      notificationHoursEnvelope: args.notificationHoursEnvelope,
+      notificationPolicyRevision: args.notificationPolicyRevision,
       revision: existing.revision + 1,
       updatedAt: now,
     } as const;

@@ -43,6 +43,17 @@ import {
   type ProviderInteractionAuthority,
 } from "../domain/interactions";
 import {
+  canonicalizeNotificationTimeZone,
+  notificationHoursPolicySchema,
+  notificationHoursUpdateSchema,
+  type NotificationHoursPolicy,
+  type NotificationHoursUpdate,
+} from "../domain/notification-hours";
+import {
+  notificationEmailPolicySchema,
+  type NotificationEmailPolicy,
+} from "../domain/notification-email";
+import {
   ROOT_STATUS_ATTENTION_LIMIT,
   SESSION_STATUS_PENDING_SUMMARY_LIMIT,
   assertRootStatusBound,
@@ -54,12 +65,17 @@ import {
 } from "../domain/observation";
 import {
   assertPresetSupportedByProvider,
+  currentPresetContract,
+  legacyPresetContract,
   presetForProviderTier,
+  presetContractSchema,
+  presetRequirementForContract,
   presetSchema,
   presetTiers,
   presetTierSchema,
   providerSchema,
   type Preset,
+  type PresetRequirement,
   type Provider,
 } from "../domain/presets";
 import {
@@ -183,6 +199,20 @@ export type InteractionListPage = Readonly<{
   nextPosition: InteractionListPosition | null;
 }>;
 
+export const ATTENTION_NOTIFICATION_SNAPSHOT_LIMIT = 64;
+
+export type AttentionNotificationSnapshot =
+  | Readonly<{
+      interactions: readonly InteractionRecord[];
+      observedAt: number;
+      status: "complete";
+    }>
+  | Readonly<{
+      interactions: readonly [];
+      observedAt: number;
+      status: "overflow";
+    }>;
+
 export type InteractionPersistenceBoundaryEffect = "known_unsent" | "possibly_sent";
 
 export type InteractionPersistenceBoundaryQuarantine = Readonly<{
@@ -224,6 +254,7 @@ const sessionRowSchema = z.object({
   // Stored as the provider-neutral tier: the column's SQLite CHECK predates
   // multi-provider presets, so `provider` plus this tier names the preset.
   preset: presetTierSchema,
+  preset_contract: presetContractSchema,
   fast_enabled: z.union([z.literal(0), z.literal(1)]),
   state: sessionStateSchema,
   active_turn_id: z.string().nullable(),
@@ -847,7 +878,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 35;
+const currentSchemaVersion = 38;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -884,6 +915,7 @@ export type SecurityScrubCheckpointPolicy = Readonly<{
   attempts: number;
   backoffMs: number;
 }>;
+export type MachineTimeZoneResolver = () => string;
 const securityScrubCheckpointPolicySchema = z.object({
   busyTimeoutMs: z.number().int().min(1).max(stateBusyTimeoutMs),
   attempts: z.number().int().min(1).max(3),
@@ -893,6 +925,13 @@ const defaultSecurityScrubCheckpointPolicy: SecurityScrubCheckpointPolicy = {
   busyTimeoutMs: stateBusyTimeoutMs,
   attempts: 3,
   backoffMs: 100,
+};
+const defaultMachineTimeZoneResolver: MachineTimeZoneResolver = () => {
+  const timeZone: unknown = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (typeof timeZone !== "string" || timeZone.length === 0) {
+    throw new Error("MACHINE_TIME_ZONE_UNAVAILABLE");
+  }
+  return timeZone;
 };
 
 type StateDatabaseFileIdentity = Readonly<{ device: number; inode: number }>;
@@ -1025,6 +1064,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   note TEXT NOT NULL DEFAULT '' CHECK(length(CAST(note AS BLOB)) <= 16384),
   provider TEXT NOT NULL DEFAULT 'codex' CHECK(provider IN ('codex','claude')),
   preset TEXT NOT NULL CHECK(preset IN ('low','high','ultra')),
+  preset_contract INTEGER NOT NULL DEFAULT ${legacyPresetContract} CHECK(preset_contract IN (1,2)),
   fast_enabled INTEGER NOT NULL CHECK(fast_enabled IN (0,1)),
   state TEXT NOT NULL CHECK(state IN ('starting','active','idle','terminal','recovery_required')),
   active_turn_id TEXT,
@@ -2570,6 +2610,180 @@ BEFORE DELETE ON session_mutation_authority_rebinds
 BEGIN SELECT RAISE(ABORT, 'session mutation authority rebind is immutable'); END;
 `;
 
+const schemaVersion36NotificationHours = `
+CREATE TABLE IF NOT EXISTS notification_hours (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  version INTEGER NOT NULL CHECK(version = 1),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  start_minute INTEGER NOT NULL CHECK(start_minute BETWEEN 0 AND 1439),
+  end_minute INTEGER NOT NULL CHECK(end_minute BETWEEN 0 AND 1439 AND end_minute != start_minute),
+  time_zone TEXT NOT NULL CHECK(length(CAST(time_zone AS BLOB)) BETWEEN 1 AND 255),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS notification_hours_insert_guard
+BEFORE INSERT ON notification_hours
+WHEN EXISTS(SELECT 1 FROM notification_hours WHERE singleton=1)
+BEGIN SELECT RAISE(ABORT, 'notification hours already exists'); END;
+CREATE TRIGGER IF NOT EXISTS notification_hours_update_guard
+BEFORE UPDATE ON notification_hours
+WHEN NEW.singleton != OLD.singleton
+  OR NEW.version != OLD.version
+  OR NEW.created_at != OLD.created_at
+  OR NEW.revision != OLD.revision + 1
+  OR NEW.updated_at < OLD.updated_at
+BEGIN SELECT RAISE(ABORT, 'invalid notification hours transition'); END;
+CREATE TRIGGER IF NOT EXISTS notification_hours_delete_guard
+BEFORE DELETE ON notification_hours
+BEGIN SELECT RAISE(ABORT, 'notification hours cannot be deleted'); END;
+`;
+
+const schemaVersion36NotificationHoursObjects = [
+  { name: "notification_hours", table: "notification_hours", type: "table" },
+  {
+    name: "notification_hours_insert_guard",
+    table: "notification_hours",
+    type: "trigger",
+  },
+  {
+    name: "notification_hours_update_guard",
+    table: "notification_hours",
+    type: "trigger",
+  },
+  {
+    name: "notification_hours_delete_guard",
+    table: "notification_hours",
+    type: "trigger",
+  },
+] as const;
+
+const notificationHoursRowSchema = z.object({
+  version: z.literal(1),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  start_minute: z.number().int().min(0).max(1_439),
+  end_minute: z.number().int().min(0).max(1_439),
+  time_zone: z.string().min(1).max(255),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const mapNotificationHoursPolicy = (value: unknown): NotificationHoursPolicy => {
+  const row = notificationHoursRowSchema.parse(value);
+  if (row.updated_at < row.created_at) {
+    throw new Error("NOTIFICATION_HOURS_ROW_INVALID");
+  }
+  const policy = notificationHoursPolicySchema.parse({
+    version: row.version,
+    revision: row.revision,
+    startMinute: row.start_minute,
+    endMinute: row.end_minute,
+    timeZone: row.time_zone,
+  });
+  if (policy.timeZone !== row.time_zone) {
+    throw new Error("NOTIFICATION_HOURS_TIME_ZONE_NOT_CANONICAL");
+  }
+  return policy;
+};
+
+const assertNotificationHoursPolicy = (database: Database): void => {
+  assertSchemaVersion36NotificationHoursObjects(database);
+  const row = database.query(
+    `SELECT version,revision,start_minute,end_minute,time_zone,created_at,updated_at
+     FROM notification_hours WHERE singleton=1`,
+  ).get();
+  if (row === null) throw new Error("NOTIFICATION_HOURS_POLICY_MISSING");
+  try {
+    mapNotificationHoursPolicy(row);
+  } catch (error: unknown) {
+    throw new Error("NOTIFICATION_HOURS_POLICY_INVALID", { cause: error });
+  }
+};
+
+const applySchemaVersion36NotificationHours = (
+  database: Database,
+  migratedAt: number,
+  resolveMachineTimeZone: () => string,
+): void => {
+  database.exec(schemaVersion36NotificationHours);
+  const existing = database.query(
+    "SELECT 1 FROM notification_hours WHERE singleton=1",
+  ).get();
+  if (existing === null) {
+    const timeZone = canonicalizeNotificationTimeZone(resolveMachineTimeZone());
+    database.query(
+      `INSERT INTO notification_hours(
+         singleton,version,revision,start_minute,end_minute,time_zone,created_at,updated_at
+       ) VALUES (1,1,1,600,1320,?,?,?)`,
+    ).run(timeZone, migratedAt, migratedAt);
+  }
+  assertNotificationHoursPolicy(database);
+};
+
+const schemaVersion37AttentionEmailPolicy = `
+CREATE TABLE IF NOT EXISTS attention_email_policy (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  version INTEGER NOT NULL CHECK(version = 1),
+  enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS attention_email_policy_insert_guard
+BEFORE INSERT ON attention_email_policy
+WHEN EXISTS(SELECT 1 FROM attention_email_policy WHERE singleton=1)
+BEGIN SELECT RAISE(ABORT, 'attention email policy already exists'); END;
+CREATE TRIGGER IF NOT EXISTS attention_email_policy_update_guard
+BEFORE UPDATE ON attention_email_policy
+WHEN NEW.singleton != OLD.singleton
+  OR NEW.version != OLD.version
+  OR NEW.created_at != OLD.created_at
+  OR NEW.revision != OLD.revision + 1
+  OR NEW.updated_at < OLD.updated_at
+BEGIN SELECT RAISE(ABORT, 'invalid attention email policy transition'); END;
+CREATE TRIGGER IF NOT EXISTS attention_email_policy_delete_guard
+BEFORE DELETE ON attention_email_policy
+BEGIN SELECT RAISE(ABORT, 'attention email policy cannot be deleted'); END;
+`;
+
+const schemaVersion37AttentionEmailPolicyObjects = [
+  { name: "attention_email_policy", table: "attention_email_policy", type: "table" },
+  {
+    name: "attention_email_policy_insert_guard",
+    table: "attention_email_policy",
+    type: "trigger",
+  },
+  {
+    name: "attention_email_policy_update_guard",
+    table: "attention_email_policy",
+    type: "trigger",
+  },
+  {
+    name: "attention_email_policy_delete_guard",
+    table: "attention_email_policy",
+    type: "trigger",
+  },
+] as const;
+
+const attentionEmailPolicyRowSchema = z.object({
+  version: z.literal(1),
+  enabled: z.union([z.literal(0), z.literal(1)]),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const mapNotificationEmailPolicy = (value: unknown): NotificationEmailPolicy => {
+  const row = attentionEmailPolicyRowSchema.parse(value);
+  if (row.updated_at < row.created_at) {
+    throw new Error("ATTENTION_EMAIL_POLICY_ROW_INVALID");
+  }
+  return notificationEmailPolicySchema.parse({
+    enabled: row.enabled === 1,
+    revision: row.revision,
+    version: row.version,
+  });
+};
+
 /** Per-session attachment-carrying message sources kept for projection. */
 export const MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP = 200;
 
@@ -2816,6 +3030,259 @@ const sqliteSchemaObjectRowSchema = z.object({
 
 const normalizeSqlStructure = (sql: string): string =>
   sql.replace(/\s+/gu, " ").trim().replace(/;$/u, "");
+
+const schemaVersion36NotificationHoursObjectSql = (
+  object: (typeof schemaVersion36NotificationHoursObjects)[number],
+): string => {
+  const marker = object.type === "table"
+    ? `CREATE TABLE IF NOT EXISTS ${object.name}`
+    : `CREATE TRIGGER IF NOT EXISTS ${object.name}`;
+  const start = schemaVersion36NotificationHours.indexOf(marker);
+  const terminator = object.type === "table" ? ") STRICT;" : "END;";
+  const end = schemaVersion36NotificationHours.indexOf(terminator, start);
+  if (start < 0 || end < 0) {
+    throw new Error("STATE_SCHEMA_V36_NOTIFICATION_HOURS_DEFINITION_INVALID");
+  }
+  return schemaVersion36NotificationHours.slice(start, end + terminator.length);
+};
+
+const assertSchemaVersion36NotificationHoursObjects = (
+  database: Database,
+): void => {
+  const names = schemaVersion36NotificationHoursObjects
+    .map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== schemaVersion36NotificationHoursObjects.length) {
+    throw new Error("STATE_SCHEMA_V36_NOTIFICATION_HOURS_STRUCTURE_INVALID");
+  }
+  for (const expected of schemaVersion36NotificationHoursObjects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    const observedSql = observed?.sql.replace(/\bIF NOT EXISTS\b/giu, "");
+    const expectedSql = schemaVersion36NotificationHoursObjectSql(expected)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observedSql ?? "")
+        !== normalizeSqlStructure(expectedSql)
+    ) throw new Error("STATE_SCHEMA_V36_NOTIFICATION_HOURS_STRUCTURE_INVALID");
+  }
+};
+
+const schemaVersion37AttentionEmailPolicyObjectSql = (
+  object: (typeof schemaVersion37AttentionEmailPolicyObjects)[number],
+): string => {
+  const marker = object.type === "table"
+    ? `CREATE TABLE IF NOT EXISTS ${object.name}`
+    : `CREATE TRIGGER IF NOT EXISTS ${object.name}`;
+  const start = schemaVersion37AttentionEmailPolicy.indexOf(marker);
+  const terminator = object.type === "table" ? ") STRICT;" : "END;";
+  const end = schemaVersion37AttentionEmailPolicy.indexOf(terminator, start);
+  if (start < 0 || end < 0) {
+    throw new Error("STATE_SCHEMA_V37_ATTENTION_EMAIL_DEFINITION_INVALID");
+  }
+  return schemaVersion37AttentionEmailPolicy.slice(
+    start,
+    end + terminator.length,
+  );
+};
+
+const assertSchemaVersion37AttentionEmailPolicyObjects = (
+  database: Database,
+): void => {
+  const names = schemaVersion37AttentionEmailPolicyObjects
+    .map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== schemaVersion37AttentionEmailPolicyObjects.length) {
+    throw new Error("STATE_SCHEMA_V37_ATTENTION_EMAIL_STRUCTURE_INVALID");
+  }
+  for (const expected of schemaVersion37AttentionEmailPolicyObjects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    const observedSql = observed?.sql.replace(/\bIF NOT EXISTS\b/giu, "");
+    const expectedSql = schemaVersion37AttentionEmailPolicyObjectSql(expected)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observedSql ?? "")
+        !== normalizeSqlStructure(expectedSql)
+    ) throw new Error("STATE_SCHEMA_V37_ATTENTION_EMAIL_STRUCTURE_INVALID");
+  }
+};
+
+const assertAttentionEmailPolicy = (database: Database): NotificationEmailPolicy => {
+  assertSchemaVersion37AttentionEmailPolicyObjects(database);
+  const row = database.query(
+    `SELECT version,enabled,revision,created_at,updated_at
+     FROM attention_email_policy WHERE singleton=1`,
+  ).get();
+  if (row === null) throw new Error("ATTENTION_EMAIL_POLICY_MISSING");
+  try {
+    return mapNotificationEmailPolicy(row);
+  } catch (error: unknown) {
+    throw new Error("ATTENTION_EMAIL_POLICY_INVALID", { cause: error });
+  }
+};
+
+const assertCompositeNotificationPolicy = (database: Database): void => {
+  assertNotificationHoursPolicy(database);
+  const attentionEmail = assertAttentionEmailPolicy(database);
+  const hoursRow = database.query(
+    "SELECT revision FROM notification_hours WHERE singleton=1",
+  ).get();
+  const hoursRevision = z.object({
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  }).strict().parse(hoursRow).revision;
+  if (hoursRevision !== attentionEmail.revision) {
+    throw new Error("NOTIFICATION_POLICY_REVISION_DIVERGED");
+  }
+};
+
+const hasExactAttachedSchemaObjects = (
+  database: Database,
+  table: "attention_email_policy" | "notification_hours",
+  expectedNames: readonly string[],
+): boolean => {
+  const rows = z.object({ name: z.string() }).strict().array().parse(
+    database.query(
+      `SELECT name FROM sqlite_master
+       WHERE name NOT LIKE 'sqlite_%' AND (name=? OR tbl_name=?)
+       ORDER BY name`,
+    ).all(table, table),
+  );
+  return rows.length === expectedNames.length
+    && rows.every((row, index) => row.name === expectedNames[index]);
+};
+
+/**
+ * The notification feature branch briefly stamped hours as v35 and email as
+ * v36 before main assigned v35 to provider-switch custody. Only that exact,
+ * internally consistent schema may carry an already-enabled local opt-in
+ * across the renumbering. The hosted global gate remains a separate authority.
+ */
+const isExactLegacyFeatureVersion36 = (
+  database: Database,
+  initialVersion: number,
+): boolean => {
+  if (initialVersion !== 36) return false;
+  const migrationRows = z.object({ version: z.number().int() }).strict().array().parse(
+    database.query(
+      "SELECT version FROM migrations WHERE version BETWEEN 35 AND 37 ORDER BY version",
+    ).all(),
+  );
+  if (
+    migrationRows.length !== 2
+    || migrationRows[0]?.version !== 35
+    || migrationRows[1]?.version !== 36
+  ) return false;
+
+  const providerObjectNames = schemaVersion35Objects.map((object) => object.name);
+  const placeholders = providerObjectNames.map(() => "?").join(",");
+  const providerObjectCount = z.object({ count: z.number().int().nonnegative() })
+    .strict().parse(database.query(
+      `SELECT COUNT(*) AS count FROM sqlite_master WHERE name IN (${placeholders})`,
+    ).get(...providerObjectNames)).count;
+  if (providerObjectCount !== 0) return false;
+
+  const hoursObjectNames = schemaVersion36NotificationHoursObjects
+    .map((object) => object.name).sort();
+  const emailObjectNames = schemaVersion37AttentionEmailPolicyObjects
+    .map((object) => object.name).sort();
+  if (
+    !hasExactAttachedSchemaObjects(database, "notification_hours", hoursObjectNames)
+    || !hasExactAttachedSchemaObjects(database, "attention_email_policy", emailObjectNames)
+  ) return false;
+
+  assertCompositeNotificationPolicy(database);
+  return true;
+};
+
+const applySchemaVersion37AttentionEmailPolicy = (
+  database: Database,
+  migratedAt: number,
+  allowExistingEnabledPolicy = false,
+): void => {
+  database.exec(schemaVersion37AttentionEmailPolicy);
+  const existing = database.query(
+    "SELECT 1 FROM attention_email_policy WHERE singleton=1",
+  ).get();
+  if (existing === null) {
+    const hoursRow = database.query(
+      "SELECT revision FROM notification_hours WHERE singleton=1",
+    ).get();
+    const revision = z.object({
+      revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    }).strict().parse(hoursRow).revision;
+    database.query(
+      `INSERT INTO attention_email_policy(
+         singleton,version,enabled,revision,created_at,updated_at
+       ) VALUES (1,1,0,?,?,?)`,
+    ).run(revision, migratedAt, migratedAt);
+  } else if (assertAttentionEmailPolicy(database).enabled && !allowExistingEnabledPolicy) {
+    // Canonical schema v36 never shipped an opt-in. Only an exactly recognized
+    // feature-v36 database may retain the explicit local choice it already held.
+    throw new Error("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
+  }
+  assertCompositeNotificationPolicy(database);
+};
+
+// Preset aliases are durable user intent, but their exact model mapping has
+// changed once. Existing and provider-imported rows retain the legacy mapping;
+// HRA-created or explicitly reselected rows are stamped current at their write
+// boundary. `works` is installed by WorkStore in the same database and carries
+// the same contract so a claim cannot reinterpret its route mid-flight.
+const schemaVersion38SessionPresetContractColumn =
+  `ALTER TABLE sessions ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT ${legacyPresetContract} `
+  + `CHECK(preset_contract IN (${legacyPresetContract},${currentPresetContract}))`;
+const schemaVersion38WorkPresetContractColumn =
+  `ALTER TABLE works ADD COLUMN preset_contract INTEGER NOT NULL DEFAULT ${legacyPresetContract} `
+  + `CHECK(preset_contract IN (${legacyPresetContract},${currentPresetContract}))`;
+
+const applySchemaVersion38PresetContracts = (database: Database): void => {
+  if (!hasTableColumn(database, "sessions", "preset_contract")) {
+    database.exec(schemaVersion38SessionPresetContractColumn);
+  }
+  const workTableExists = database.query(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'",
+  ).get() !== null;
+  if (workTableExists && !hasTableColumn(database, "works", "preset_contract")) {
+    database.exec(schemaVersion38WorkPresetContractColumn);
+  }
+};
+
+const assertSchemaVersion38PresetContracts = (database: Database): void => {
+  if (!hasTableColumn(database, "sessions", "preset_contract")) {
+    throw new Error("STATE_SCHEMA_V38_SESSION_PRESET_CONTRACT_MISSING");
+  }
+  if (database.query(
+    `SELECT 1 FROM sessions
+     WHERE preset_contract IS NULL OR preset_contract NOT IN (${legacyPresetContract},${currentPresetContract})
+     LIMIT 1`,
+  ).get() !== null) {
+    throw new Error("STATE_SCHEMA_V38_SESSION_PRESET_CONTRACT_INVALID");
+  }
+  const workTableExists = database.query(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'",
+  ).get() !== null;
+  if (workTableExists && !hasTableColumn(database, "works", "preset_contract")) {
+    throw new Error("STATE_SCHEMA_V38_WORK_PRESET_CONTRACT_MISSING");
+  }
+  if (workTableExists && database.query(
+    `SELECT 1 FROM works
+     WHERE preset_contract IS NULL OR preset_contract NOT IN (${legacyPresetContract},${currentPresetContract})
+     LIMIT 1`,
+  ).get() !== null) {
+    throw new Error("STATE_SCHEMA_V38_WORK_PRESET_CONTRACT_INVALID");
+  }
+};
 
 const assertSchemaVersion24Objects = (database: Database): void => {
   const names = schemaVersion24Objects.map((object) => `'${object.name}'`).join(",");
@@ -3640,6 +4107,7 @@ const migrateWritableDatabase = (
   database: Database,
   now: () => number,
   securityScrubCheckpoint: SecurityScrubCheckpointPolicy = defaultSecurityScrubCheckpointPolicy,
+  resolveMachineTimeZone: MachineTimeZoneResolver = defaultMachineTimeZoneResolver,
 ): void => {
   const initialVersion = readUserVersion(database);
   if (initialVersion > currentSchemaVersion) {
@@ -3653,6 +4121,10 @@ const migrateWritableDatabase = (
   const securityScrubPending = database.transaction(() => {
     let redacted = false;
     let version = initialVersion;
+    const exactLegacyFeatureVersion36 = isExactLegacyFeatureVersion36(
+      database,
+      initialVersion,
+    );
     // v9-v12 databases may have committed URL-bearing MCP records or their
     // superseded bytes without retaining evidence that WAL truncation finished.
     // Materializing the v13 authority inside this transaction makes the byte
@@ -3680,6 +4152,12 @@ const migrateWritableDatabase = (
     // trigger. Heal every pre-v32 database before any later migration can force
     // that validation; v32 remains the migration that stamps the column.
     if (version < 32) applySchemaVersion32(database);
+
+    // Current WorkStore guards name both preset-contract columns. Install the
+    // additive v38 authority before any older migration replays the current
+    // work schema; the ordered v38 block below remains the ledger/version
+    // stamp.
+    applySchemaVersion38PresetContracts(database);
 
     if (version < 2) {
       // Early development builds accidentally stamped this column as schema v1.
@@ -4079,6 +4557,50 @@ const migrateWritableDatabase = (
       version = 35;
     }
 
+    // Main shipped provider-switch progress as v35. Apply and assert it before
+    // either notification migration so feature-v35/v36 databases converge to
+    // the same physical schema within this transaction.
+    applySchemaVersion35ProviderSwitchProgress(database);
+    assertSchemaVersion35Objects(database);
+
+    if (version < 36) {
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      applySchemaVersion36NotificationHours(
+        database,
+        migratedAt,
+        resolveMachineTimeZone,
+      );
+      database.query(
+        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(36, migratedAt);
+      database.exec("PRAGMA user_version = 36");
+      version = 36;
+    }
+
+    if (version < 37) {
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      applySchemaVersion37AttentionEmailPolicy(
+        database,
+        migratedAt,
+        exactLegacyFeatureVersion36,
+      );
+      database.query(
+        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(37, migratedAt);
+      database.exec("PRAGMA user_version = 37");
+      version = 37;
+    }
+
+    if (version < 38) {
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      applySchemaVersion38PresetContracts(database);
+      database.query(
+        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(38, migratedAt);
+      database.exec("PRAGMA user_version = 38");
+      version = 38;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -4106,8 +4628,10 @@ const migrateWritableDatabase = (
     rebuildSchemaVersion24(database);
     assertSchemaVersion24Objects(database);
     ensureSessionEventProjectionVersion(database);
+    applySchemaVersion38PresetContracts(database);
     database.exec(WORK_SCHEMA_SQL);
     assertWorkSchema(database);
+    assertSchemaVersion38PresetContracts(database);
     database.exec(schemaVersion27);
     ensureUsagePollFailureAccountFingerprint(database);
     database.exec(schemaVersion28);
@@ -4120,6 +4644,10 @@ const migrateWritableDatabase = (
     applySchemaVersion33DeviceCommands(database);
     applySchemaVersion34Attachments(database);
     applySchemaVersion35ProviderSwitchProgress(database);
+    assertSchemaVersion35Objects(database);
+    database.exec(schemaVersion36NotificationHours);
+    database.exec(schemaVersion37AttentionEmailPolicy);
+    assertCompositeNotificationPolicy(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -4174,6 +4702,34 @@ const mapSession = (row: unknown): SessionRecord => {
     createdAt: parsed.created_at,
     updatedAt: parsed.updated_at,
   };
+};
+
+const assertRuntimeProfileRequirement = (
+  profile: ReviewedRuntimeProfile,
+  preset: Preset,
+  requirement: PresetRequirement,
+  code: string,
+): void => {
+  if (
+    profile.preset !== preset
+    || profile.model !== requirement.model
+    || profile.reasoningEffort !== requirement.effort
+  ) throw new Error(code);
+};
+
+const presetContractForRuntimeProfile = (
+  profile: ReviewedRuntimeProfile,
+  preset: Preset,
+): z.infer<typeof presetContractSchema> => {
+  const current = presetRequirementForContract(preset, currentPresetContract);
+  if (profile.model === current.model && profile.reasoningEffort === current.effort) {
+    return currentPresetContract;
+  }
+  const legacy = presetRequirementForContract(preset, legacyPresetContract);
+  if (profile.model === legacy.model && profile.reasoningEffort === legacy.effort) {
+    return legacyPresetContract;
+  }
+  throw new Error("SESSION_RUNTIME_PROFILE_PRESET_CONTRACT_UNADMITTED");
 };
 
 const sessionEventStreamRowSchema = z.object({
@@ -4485,6 +5041,7 @@ export class StateStore {
     now?: () => number;
     beforeDatabaseOpen?: (input: Readonly<{ flags: number; path: string }>) => void;
     publicProviderIdentifierProjector?: PublicProviderIdentifierProjector;
+    resolveMachineTimeZone?: MachineTimeZoneResolver;
     // Test-only. Shortens the scrub checkpoint wait so a pinned-reader test
     // does not spend the production 5 s budget. Never passed by the CLI or daemon.
     securityScrubCheckpoint?: SecurityScrubCheckpointPolicy;
@@ -4511,7 +5068,12 @@ export class StateStore {
       if (!options.readonly) {
         requireWalMode(this.#database, true);
         this.#database.exec("PRAGMA synchronous = FULL;");
-        migrateWritableDatabase(this.#database, this.#now, this.#securityScrubCheckpoint);
+        migrateWritableDatabase(
+          this.#database,
+          this.#now,
+          this.#securityScrubCheckpoint,
+          options.resolveMachineTimeZone ?? defaultMachineTimeZoneResolver,
+        );
       } else {
         const version = readUserVersion(this.#database);
         if (version > currentSchemaVersion) throw new Error(`STATE_SCHEMA_NEWER:${version}:${currentSchemaVersion}`);
@@ -4520,6 +5082,7 @@ export class StateStore {
       }
       assertSchemaVersion24Objects(this.#database);
       assertSchemaVersion35Objects(this.#database);
+      assertSchemaVersion38PresetContracts(this.#database);
       // A readonly open skips the O(rows) foreign_key_check so `hra status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
@@ -4527,6 +5090,7 @@ export class StateStore {
       assertCanonicalLabelKeys(this.#database);
       assertAccountRateLimitResetPolicies(this.#database);
       assertSessionTaskSchema(this.#database);
+      assertCompositeNotificationPolicy(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
@@ -5421,7 +5985,7 @@ export class StateStore {
     const preset = presetSchema.parse(input.preset);
     assertPresetSupportedByProvider(provider, preset);
     const create = this.#database.transaction(() => {
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, provider, presetTiers[preset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(id, input.profileId, input.projectId ?? null, title, provider, presetTiers[preset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(id, now);
     });
     create.immediate();
@@ -5462,6 +6026,147 @@ export class StateStore {
     });
     write.immediate();
     return this.requireSession(parsedSessionId);
+  }
+
+  readNotificationHours(): NotificationHoursPolicy {
+    const row = this.#database.query(
+      `SELECT version,revision,start_minute,end_minute,time_zone,created_at,updated_at
+       FROM notification_hours WHERE singleton=1`,
+    ).get();
+    if (row === null) throw new Error("NOTIFICATION_HOURS_POLICY_MISSING");
+    try {
+      const policy = mapNotificationHoursPolicy(row);
+      const emailRow = this.#database.query(
+        `SELECT version,enabled,revision,created_at,updated_at
+         FROM attention_email_policy WHERE singleton=1`,
+      ).get();
+      if (emailRow === null) throw new Error("ATTENTION_EMAIL_POLICY_MISSING");
+      const emailPolicy = mapNotificationEmailPolicy(emailRow);
+      if (emailPolicy.revision !== policy.revision) {
+        throw new Error("NOTIFICATION_POLICY_REVISION_DIVERGED");
+      }
+      return policy;
+    } catch (error: unknown) {
+      throw new Error("NOTIFICATION_HOURS_POLICY_INVALID", { cause: error });
+    }
+  }
+
+  readNotificationEmailPolicy(): NotificationEmailPolicy {
+    const row = this.#database.query(
+      `SELECT version,enabled,revision,created_at,updated_at
+       FROM attention_email_policy WHERE singleton=1`,
+    ).get();
+    if (row === null) throw new Error("ATTENTION_EMAIL_POLICY_MISSING");
+    try {
+      const policy = mapNotificationEmailPolicy(row);
+      const hoursRow = this.#database.query(
+        "SELECT revision FROM notification_hours WHERE singleton=1",
+      ).get();
+      const hoursRevision = z.object({
+        revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      }).strict().parse(hoursRow).revision;
+      if (hoursRevision !== policy.revision) {
+        throw new Error("NOTIFICATION_POLICY_REVISION_DIVERGED");
+      }
+      return policy;
+    } catch (error: unknown) {
+      throw new Error("ATTENTION_EMAIL_POLICY_INVALID", { cause: error });
+    }
+  }
+
+  updateNotificationHours(
+    input: Readonly<NotificationHoursUpdate & { expectedRevision: number }>,
+  ): NotificationHoursPolicy {
+    const parsedInput = z.object({
+      expectedRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      version: z.literal(1),
+      startMinute: z.number(),
+      endMinute: z.number(),
+      timeZone: z.string(),
+    }).strict().parse(input);
+    const desired = notificationHoursUpdateSchema.parse({
+      version: parsedInput.version,
+      startMinute: parsedInput.startMinute,
+      endMinute: parsedInput.endMinute,
+      timeZone: parsedInput.timeZone,
+    });
+    const updatedAt = unixMillisecondsSchema.parse(this.#now());
+    const write = this.#database.transaction((): NotificationHoursPolicy => {
+      const current = this.readNotificationHours();
+      if (current.revision !== parsedInput.expectedRevision) {
+        throw new Error("NOTIFICATION_HOURS_REVISION_CONFLICT");
+      }
+      if (current.revision >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("NOTIFICATION_HOURS_REVISION_EXHAUSTED");
+      }
+      const result = this.#database.query(
+        `UPDATE notification_hours
+         SET version=?,revision=revision+1,start_minute=?,end_minute=?,time_zone=?,
+           updated_at=MAX(updated_at,?)
+         WHERE singleton=1 AND revision=?`,
+      ).run(
+        desired.version,
+        desired.startMinute,
+        desired.endMinute,
+        desired.timeZone,
+        updatedAt,
+        parsedInput.expectedRevision,
+      );
+      if (result.changes !== 1) {
+        throw new Error("NOTIFICATION_HOURS_REVISION_CONFLICT");
+      }
+      const emailResult = this.#database.query(
+        `UPDATE attention_email_policy
+         SET revision=revision+1,updated_at=MAX(updated_at,?)
+         WHERE singleton=1 AND revision=?`,
+      ).run(updatedAt, parsedInput.expectedRevision);
+      if (emailResult.changes !== 1) {
+        throw new Error("NOTIFICATION_HOURS_REVISION_CONFLICT");
+      }
+      return this.readNotificationHours();
+    });
+    return write.immediate();
+  }
+
+  updateNotificationEmailPolicy(
+    input: Readonly<{ enabled: boolean; expectedRevision: number }>,
+  ): NotificationEmailPolicy {
+    const parsedInput = z.object({
+      enabled: z.boolean(),
+      expectedRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    }).strict().parse(input);
+    const updatedAt = unixMillisecondsSchema.parse(this.#now());
+    const write = this.#database.transaction((): NotificationEmailPolicy => {
+      const current = this.readNotificationEmailPolicy();
+      if (current.revision !== parsedInput.expectedRevision) {
+        throw new Error("ATTENTION_EMAIL_POLICY_REVISION_CONFLICT");
+      }
+      if (current.revision >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("ATTENTION_EMAIL_POLICY_REVISION_EXHAUSTED");
+      }
+      const emailResult = this.#database.query(
+        `UPDATE attention_email_policy
+         SET enabled=?,revision=revision+1,updated_at=MAX(updated_at,?)
+         WHERE singleton=1 AND revision=?`,
+      ).run(
+        parsedInput.enabled ? 1 : 0,
+        updatedAt,
+        parsedInput.expectedRevision,
+      );
+      if (emailResult.changes !== 1) {
+        throw new Error("ATTENTION_EMAIL_POLICY_REVISION_CONFLICT");
+      }
+      const hoursResult = this.#database.query(
+        `UPDATE notification_hours
+         SET revision=revision+1,updated_at=MAX(updated_at,?)
+         WHERE singleton=1 AND revision=?`,
+      ).run(updatedAt, parsedInput.expectedRevision);
+      if (hoursResult.changes !== 1) {
+        throw new Error("ATTENTION_EMAIL_POLICY_REVISION_CONFLICT");
+      }
+      return this.readNotificationEmailPolicy();
+    });
+    return write.immediate();
   }
 
   // --- Settings projection: show thinking and the daemon default preset ----
@@ -5619,6 +6324,44 @@ export class StateStore {
     throw new SelectionError("AMBIGUOUS", rows.map((session) => ({ id: session.id, label: session.title })));
   }
 
+  #requireSessionPresetBinding(sessionId: SessionId): Readonly<{
+    contract: z.infer<typeof presetContractSchema>;
+    preset: Preset;
+    requirement: PresetRequirement;
+  }> {
+    const parsed = sessionRowSchema.parse(
+      this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionIdSchema.parse(sessionId)),
+    );
+    const preset = presetForProviderTier(parsed.provider, parsed.preset);
+    return {
+      contract: parsed.preset_contract,
+      preset,
+      requirement: presetRequirementForContract(preset, parsed.preset_contract),
+    };
+  }
+
+  /** Exact route for execution; the durable contract itself remains internal. */
+  requireSessionPresetRequirement(sessionId: SessionId): Readonly<{
+    preset: Preset;
+    requirement: PresetRequirement;
+  }> {
+    const binding = this.#requireSessionPresetBinding(sessionId);
+    return { preset: binding.preset, requirement: binding.requirement };
+  }
+
+  #assertSessionRuntimeProfileContract(
+    sessionId: SessionId,
+    profile: ReviewedRuntimeProfile,
+  ): void {
+    const binding = this.#requireSessionPresetBinding(sessionId);
+    assertRuntimeProfileRequirement(
+      profile,
+      binding.preset,
+      binding.requirement,
+      "SESSION_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
+    );
+  }
+
   findSessionByProviderThread(profileId: ProfileId, providerThreadId: string): SessionRecord | null {
     const row = this.#database.query("SELECT * FROM sessions WHERE profile_id=? AND provider_thread_id=?").get(profileId, providerThreadId);
     return row === null ? null : mapSession(row);
@@ -5659,6 +6402,10 @@ export class StateStore {
       }
       return record;
     }
+    // Historical source replays remain valid after an explicit contract
+    // upgrade; only a genuinely new durable profile must match today's
+    // session-owned interpretation.
+    this.#assertSessionRuntimeProfileContract(input.sessionId, profile);
     const nextRow = z.object({ revision: z.number().int().nonnegative() }).strict().parse(
       this.#database.query(
         "SELECT COALESCE(MAX(revision),0) AS revision FROM session_runtime_profiles WHERE session_id=?",
@@ -5887,7 +6634,7 @@ export class StateStore {
     if (current === null) {
       const id = createSessionId();
       const create = this.#database.transaction(() => {
-        this.#database.query("INSERT INTO sessions(id,profile_id,project_id,provider_thread_id,title,preset,fast_enabled,state,active_turn_id,provider_updated_at,revision,created_at,updated_at) VALUES (?,?,?,?,?,'high',0,?,?,?,1,?,?)").run(id, input.profileId, input.projectId ?? null, input.providerThreadId, titleSchema.parse(input.title), input.state, input.activeTurnId ?? null, input.providerUpdatedAt ?? null, now, now);
+        this.#database.query("INSERT INTO sessions(id,profile_id,project_id,provider_thread_id,title,preset,preset_contract,fast_enabled,state,active_turn_id,provider_updated_at,revision,created_at,updated_at) VALUES (?,?,?,?,?,'high',?,0,?,?,?,1,?,?)").run(id, input.profileId, input.projectId ?? null, input.providerThreadId, titleSchema.parse(input.title), legacyPresetContract, input.state, input.activeTurnId ?? null, input.providerUpdatedAt ?? null, now, now);
         this.#insertSessionEventStream(id, now);
       });
       create.immediate();
@@ -6572,7 +7319,15 @@ export class StateStore {
 
   updateSessionMetadata(input: { sessionId: SessionId; expectedRevision: number; title?: string; note?: string; preset?: Preset; fastEnabled?: boolean; projectId?: ProjectId | null }): SessionRecord {
     const current = this.requireSession(input.sessionId);
+    const currentPresetBinding = this.#requireSessionPresetBinding(current.id);
     if (current.revision !== input.expectedRevision) throw new Error("Session metadata revision conflict.");
+    // An unsettled provider effect owns the exact runtime profile it reviewed.
+    // Keep that recovery evidence admissible by refusing any route
+    // reinterpretation until recovery has settled it or explicit abandonment
+    // has terminalized the session.
+    if (input.preset !== undefined && current.state === "recovery_required") {
+      throw new Error("SESSION_PRESET_RECOVERY_REQUIRED");
+    }
     const title = input.title === undefined ? current.title : titleSchema.parse(input.title);
     const note = input.note === undefined ? current.note : noteSchema.parse(input.note);
     const preset = input.preset === undefined ? current.preset : presetSchema.parse(input.preset);
@@ -6580,8 +7335,14 @@ export class StateStore {
     assertPresetSupportedByProvider(current.provider, preset);
     const fast = input.fastEnabled === undefined ? current.fastEnabled : input.fastEnabled;
     const project = input.projectId === undefined ? current.projectId ?? null : input.projectId;
+    // Naming the preset is an explicit opt-in to the current mapping, even
+    // when the alias itself did not change. Unrelated metadata preserves the
+    // durable interpretation admitted for this session.
+    const presetContract = input.preset === undefined
+      ? currentPresetBinding.contract
+      : currentPresetContract;
     const now = this.#now();
-    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], fast ? 1 : 0, project, now, current.id, current.revision);
+    const result = this.#database.query("UPDATE sessions SET title=?,note=?,preset=?,preset_contract=?,fast_enabled=?,project_id=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?").run(title, note, presetTiers[preset], presetContract, fast ? 1 : 0, project, now, current.id, current.revision);
     if (result.changes !== 1) throw new Error("Session metadata revision conflict.");
     return this.requireSession(current.id);
   }
@@ -6630,6 +7391,7 @@ export class StateStore {
     if (runtimeProfile.profileId !== profileId) {
       throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_ACCOUNT_MISMATCH");
     }
+    const targetPresetContract = presetContractForRuntimeProfile(runtimeProfile, preset);
     const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
     const seedTurnId = providerThreadIdSchema.parse(input.seedTurnId);
     const now = this.#now();
@@ -6718,7 +7480,7 @@ export class StateStore {
       ) throw new Error("SESSION_PROVIDER_SWITCH_SEED_STATE_MISMATCH");
       const bound = this.#database.query(
         `UPDATE sessions
-         SET provider=?,profile_id=?,preset=?,provider_thread_id=?,state=?,active_turn_id=?,
+         SET provider=?,profile_id=?,preset=?,preset_contract=?,provider_thread_id=?,state=?,active_turn_id=?,
              provider_updated_at=?,revision=revision+1,updated_at=?
          WHERE id=? AND revision=? AND profile_id=? AND provider=?
            AND provider_thread_id=? AND state NOT IN ('recovery_required','terminal')`,
@@ -6726,6 +7488,7 @@ export class StateStore {
         provider,
         profileId,
         presetTiers[preset],
+        targetPresetContract,
         providerThreadId,
         input.state,
         input.activeTurnId ?? null,
@@ -7256,6 +8019,7 @@ export class StateStore {
         || evidence.runtimeProfile.profileId !== authority.profile_id
         || evidence.runtimeProfile.processGeneration !== generation
       ) throw new Error("QUEUE_EFFECT_AUTHORITY_CHANGED");
+      this.#assertSessionRuntimeProfileContract(sessionId, evidence.runtimeProfile);
       this.#database.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?)").run(queueId, canonical, digest, now);
       const changed = this.#database.query("UPDATE queue_entries SET state='dispatching',updated_at=? WHERE id=? AND state='pending'").run(now, queueId);
       if (changed.changes !== 1) throw new Error("QUEUE_EFFECT_AUTHORITY_CHANGED");
@@ -7879,6 +8643,9 @@ export class StateStore {
         || authority.session_state === "recovery_required"
         || authority.session_state === "terminal"
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      if (evidence.kind === "session.send" && evidence.runtimeProfile !== undefined) {
+        this.#assertSessionRuntimeProfileContract(parsedSessionId, evidence.runtimeProfile);
+      }
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
       if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
@@ -7926,6 +8693,14 @@ export class StateStore {
     assertPresetSupportedByProvider(parsedProvider, parsedPreset);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
     if (evidence.projectId !== parsedProjectId) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
+    if (evidence.runtimeProfile !== undefined) {
+      assertRuntimeProfileRequirement(
+        evidence.runtimeProfile,
+        parsedPreset,
+        presetRequirementForContract(parsedPreset, currentPresetContract),
+        "MUTATION_EFFECT_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
+      );
+    }
     if (evidence.runtimeProfile !== undefined && (
       evidence.runtimeProfile.profileId !== parsedProfileId
       || evidence.runtimeProfile.processGeneration !== parsedGeneration
@@ -7953,7 +8728,7 @@ export class StateStore {
         || authority.profile_state === "removed"
         || (parsedProvider === "codex" && authority.profile_state !== "signed_in")
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedProvider, presetTiers[parsedPreset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
+      this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,preset_contract,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedProvider, presetTiers[parsedPreset], currentPresetContract, input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
       this.#database.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,?)").run(parsedAttemptId, sessionId, now);
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
@@ -7987,6 +8762,12 @@ export class StateStore {
       || evidence.runtimeProfile.processGeneration !== evidence.targetProcessGeneration
       || evidence.runtimeProfile.preset !== evidence.targetPreset
     ) throw new Error("SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_MISMATCH");
+    assertRuntimeProfileRequirement(
+      evidence.runtimeProfile,
+      evidence.targetPreset,
+      presetRequirementForContract(evidence.targetPreset, currentPresetContract),
+      "SESSION_PROVIDER_SWITCH_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH",
+    );
     if (
       providerAuthentication !== undefined
       && (
@@ -8149,6 +8930,8 @@ export class StateStore {
         || runtimeProfile.profileId !== evidence.targetProfileId
         || runtimeProfile.processGeneration !== evidence.targetProcessGeneration
         || runtimeProfile.preset !== evidence.targetPreset
+        || runtimeProfile.model !== evidence.runtimeProfile.model
+        || runtimeProfile.reasoningEffort !== evidence.runtimeProfile.reasoningEffort
         || !this.isSessionMutationProviderAuthorityCurrent({
           attemptId,
           profileId: evidence.targetProfileId,
@@ -8544,6 +9327,10 @@ export class StateStore {
       ) {
         throw new Error("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_MISMATCH");
       }
+      const targetPresetContract = presetContractForRuntimeProfile(
+        evidence.runtimeProfile,
+        evidence.targetPreset,
+      );
       const current = mapSession(this.#database.query("SELECT * FROM sessions WHERE id=?").get(sessionId));
       const sourceBinding = current.profileId === evidence.sourceProfileId
         && current.provider === evidence.sourceProvider
@@ -8574,7 +9361,7 @@ export class StateStore {
       }
       const changed = this.#database.query(
         `UPDATE sessions
-         SET provider=?,profile_id=?,preset=?,provider_thread_id=?,title=?,
+         SET provider=?,profile_id=?,preset=?,preset_contract=?,provider_thread_id=?,title=?,
              state='recovery_required',active_turn_id=NULL,provider_updated_at=?,
              revision=revision+1,updated_at=?
          WHERE id=? AND revision=? AND state!='terminal'`,
@@ -8582,6 +9369,7 @@ export class StateStore {
         evidence.targetProvider,
         evidence.targetProfileId,
         presetTiers[evidence.targetPreset],
+        targetPresetContract,
         authority.target_provider_thread_id,
         titleSchema.parse(input.title),
         input.providerUpdatedAt ?? null,
@@ -11466,6 +12254,28 @@ export class StateStore {
       nextPosition: records.length > limit && last !== undefined
         ? { requestedAt: last.requestedAt, publicId: last.publicId }
         : null,
+    };
+  }
+
+  readAttentionNotificationSnapshot(input: Readonly<{
+    limit: number;
+    now: number;
+  }>): AttentionNotificationSnapshot {
+    const observedAt = unixMillisecondsSchema.parse(input.now);
+    const limit = z.number().int().min(1)
+      .max(ATTENTION_NOTIFICATION_SNAPSHOT_LIMIT).parse(input.limit);
+    const rows = this.#database.query(
+      `SELECT * FROM provider_interactions
+       WHERE state='pending' AND deadline_at>? AND session_id IS NOT NULL
+       ORDER BY deadline_at ASC,requested_at ASC,public_id ASC LIMIT ?`,
+    ).all(observedAt, limit + 1);
+    if (rows.length > limit) {
+      return { interactions: [], observedAt, status: "overflow" };
+    }
+    return {
+      interactions: rows.map(mapInteraction),
+      observedAt,
+      status: "complete",
     };
   }
 

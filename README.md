@@ -24,7 +24,7 @@ Codex on macOS and Linux · Claude Code on Linux · local v0.6.0 release-ready �
 
 ### One request, one account, one session.
 
-1. **Start:** `hra session start personal --provider codex --preset high --json`. Create a Codex session under the account profile you name.
+1. **Start:** `hra session start personal --provider codex --json`. Create an Astra Ultra Codex session under the account profile you name.
 2. **Inspect:** `hra session status <session-id> --json`. Read the session and the cursor where its event stream continues.
 3. **Switch:** `hra session switch <session-id> --provider claude --preset fable-max`. Move the next turns to your signed-in Claude Code profile. The HRA conversation stays intact.
 4. **Direct:** `hra session send <session-id> -- "Review this project."`. Send the next request to that session and provider.
@@ -118,7 +118,7 @@ Complete initialization and the first provider login before this walkthrough. Ac
 Create an idle session, open the persistent shell, select the account and exact returned session ID, then type a request as an ordinary line. HRA sends that line to the selected session and shows safe live updates. `/exit` leaves the daemon running.
 
 ```text
-hra session start personal --provider codex --preset high
+hra session start personal --provider codex
 hra
 /account personal
 /session <session-id>
@@ -130,7 +130,7 @@ Review this project and summarize its current state.
 Read `data.session.id` from the start response. Before sending, call status and read `data.eventStream.cursor` from its version-2 result. Start watch from that exact cursor so the atomic local snapshot and subsequent event stream are contiguous. Keep watch as a long-running subprocess, consume its two output streams independently, and use the exact ID instead of a mutable title in automation.
 
 ```text
-hra session start personal --provider codex --preset high --json
+hra session start personal --provider codex --json
 hra session status <session-id> --json
 hra session send <session-id> -- "Review this project and summarize its current state."
 hra session watch <session-id> --cursor <status-cursor> --jsonl
@@ -315,10 +315,12 @@ For non-streaming `--json` commands, stdout contains exactly one versioned succe
 HRA reviews the bound provider's exact runtime profile immediately before each new provider-native session or turn. An unavailable requirement fails before the provider effect. Every successful start records that exact account generation and effective profile; `hra session show` displays it with the provider-neutral transcript. Codex profiles include the requested model, reasoning effort, service tier, permission profile, computer-use capability, and accessible apps; an empty enabled-app list is reported as empty. Claude Code profiles include the pinned CLI, model, reasoning effort, default permission mode, isolated-config proof, and stream formats. Each provider remains authoritative for its native permissions, tools, and hidden runtime state.
 
 - `low`: Codex Luna Max, currently `gpt-5.6-luna` with `max` reasoning.
-- `high`: Codex Sol Max, currently `gpt-5.6-sol` with `max` reasoning.
-- `ultra`: Codex Sol Ultra, currently `gpt-5.6-sol` with `ultra` reasoning.
+- `high`: Codex Astra Max, currently `gpt-6-astra` with `max` reasoning.
+- `ultra`: Codex Astra Ultra, currently `gpt-6-astra` with `ultra` reasoning.
 - `fable-max`: Claude Code Fable, currently `claude-fable-5-1` with `max` reasoning.
 - `fast on|off`: a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.
+
+New HRA-created Codex sessions and every explicit preset selection use the current mapping above. Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping for `high` and `ultra` until a preset is explicitly selected; metadata edits, restart recovery, and queued work do not reinterpret an established session.
 
 `hra init` reports the required confirmation without changing local state; `hra init --yes` creates your Documents directory when it is absent, verifies that it is a readable, writable, and traversable canonical directory, and accepts it as the default project. Initialization is a one-shot maintenance command: run it before opening the persistent shell. The shell rejects `/init` because its running daemon already owns local state. Codex turns use Codex's `auto_review` path, the exact advertised `:workspace` permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox, network policy, computer use, plugins, and protected turn inspection. Claude Code runs in its default interactive permission mode under the selected project and maps supported tool-use requests into HRA interactions; it does not expose Codex's permission-profile, app, plugin, or protected turn-inspection surfaces.
 
@@ -347,7 +349,7 @@ The machine that created a provider session remains its only executor in v1. It 
 
 Paired machines can read the encrypted projection and submit bounded send, queue, steer, stop, preset, provider-switch, and Codex Fast commands. The origin daemon claims each command by lease generation and idempotency key. Commands remain pending within their deadline while the origin machine is offline; another machine cannot take over or become a second provider writer.
 
-`hra remote show` includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary. Provider request IDs, permission values, MCP fields, protected answers, and response digests remain local. A pending command or file-change approval can be decided from another device with `hra remote resolve <cloud-session> --interaction <id> --revision <n> --decision once|decline|cancel`: the encrypted decision travels as a remote command in its own scheduling lane, and the execution device applies it only when the interaction is still pending at that revision, belongs to that session, is inside its deadline, offers that decision, and the requesting device is still active. Session scope and secret answers never travel remotely. `hra remote send --or-steer` lets the execution device decide whether a message steers the active turn or starts a new one, because a remote view of turn state is always slightly stale.
+`hra remote show` includes interaction events with a public interaction ID, kind, state, revision, blocking status, bounded safe summary, and a nested version 2 remote policy. That policy is the only remote action authority. Provider request IDs, exact commands, permission values, affected paths, MCP fields, protected answers, and response digests remain local. Another device may decline a pending command, permission, or file-change request with `hra remote resolve <cloud-session> --interaction <id> --revision <n> --decision decline`. The web app may answer only a complete non-secret closed-choice user question set whose provider adapter proves exact response translation. Every command, permission, or file-change acceptance or grant, cancel, session scope, free-text or Other response, and every MCP answer stays on the execution machine. A missing policy, nested policy version 1, or unknown policy version exposes no control. The execution daemon rechecks the session, revision, pending state, deadline, requesting device, and exact action membership before using the ordinary local resolution path. `hra remote send --or-steer` lets the execution device decide whether a message steers the active turn or starts a new one, because a remote view of turn state is always slightly stale.
 
 ```text
 hra remote list
@@ -427,6 +429,10 @@ hra doctor [--offline] [--json]
 hra auth login --input-stdin|--input-fd <fd>
 hra auth status|logout
 hra auth delete --acknowledge-erasure
+hra notification-hours status [--json]
+hra notification-hours set --start <HH:MM> --end <HH:MM> --timezone <IANA-zone> --revision <n> [--json]
+hra notification-email status [--json]
+hra notification-email enable|disable --revision <n> [--json]
 hra device list
 hra device pair
 hra device key-loss --acknowledge-no-key-holders
@@ -493,7 +499,7 @@ hra remote show <cloud-session>
 hra remote command <uuidv7>
 hra remote send|queue|steer <cloud-session> <message>
 hra remote send --or-steer <cloud-session> <message>
-hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <once|decline|cancel>
+hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>
 hra remote stop <cloud-session>
 hra remote preset <cloud-session> <low|high|ultra|fable-max>
 hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
@@ -512,7 +518,7 @@ Account, project, and local-session selectors accept an exact ID or an unambiguo
 
 `interaction show` lists each safe requested permission category and each exact question ID. Complete live command and permission authority is available only through the revision-bound protected `interaction inspect` path described above. A permission grant reads `{"permissions":["<requested-name>"]}` and a question response reads `{"answers":{"<question-id>":{"answers":["<answer>"]}}}` through protected input. Those permission-name and question-answer document shapes are Codex-specific. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync. Claude Code tool-use requests map to HRA's provider-neutral interaction kinds and accept only the response choices that exact callback offers.
 
-Every admitted callback carries a local deadline anchored when the provider delivered it. HRA caps the pending interval at 30 minutes and honors a shorter valid provider interval, including an immediate zero interval. At the deadline it writes one provider-neutral timeout error through the same write-ahead ledger, never invents an answer or grant, and quarantines the provider generation if the write may have escaped. `interaction show` displays the safe local deadline; encrypted remote interaction metadata does not include it.
+Every admitted callback carries a local deadline anchored when the provider delivered it. HRA caps the pending interval at 30 minutes and honors a shorter valid provider interval, including an immediate zero interval. At the deadline it writes one provider-neutral timeout error through the same write-ahead ledger, never invents an answer or grant, and quarantines the provider generation if the write may have escaped. `interaction show` displays the safe local deadline; nested remote policy version 2 carries the same absolute deadline so readers can suppress an expired control, while the daemon remains authoritative.
 
 For a standard MCP form, interaction show returns the exact public field contract without defaults or answers. Accept reads one protected document shaped as `{"content":{...}}` from nonterminal stdin or a file descriptor. Decline and cancel accept no content. JSON mode never prompts, and validation failures identify the contract failure without echoing a submitted value.
 

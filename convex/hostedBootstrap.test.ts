@@ -73,7 +73,103 @@ const genesisArguments = (authority: Awaited<ReturnType<typeof prepare>>) => ({
   publicId: authority.publicId,
 });
 
+async function insertOrphanAttentionFault(
+  runtime: TestConvex<typeof schema>,
+  charge: boolean,
+): Promise<void> {
+  await runtime.run(async (ctx) => {
+    const now = Date.now();
+    const userId = await ctx.db.insert("users", {});
+    const deviceId = await ctx.db.insert("devices", {
+      authEpoch: 1,
+      createdAt: now,
+      credentialGeneration: 1,
+      deviceClass: "daemon",
+      encryptedLabel: {
+        algorithm: "A256GCM",
+        ciphertext: "fixture",
+        keyVersion: 1,
+        nonce: "nonce",
+      },
+      keyVersion: 1,
+      publicId: "bootstrap_fault_device",
+      revision: 1,
+      signingPublicKey: "signing-key",
+      status: "active",
+      updatedAt: now,
+      userId,
+      wrappingPublicKey: "wrapping-key",
+    });
+    const sessionId = await ctx.db.insert("sessionHeads", {
+      compactHeadSequence: 0,
+      createdAt: now,
+      detailHeadSequence: 0,
+      executionDeviceId: deviceId,
+      metadataRevision: 0,
+      projectionRevision: 0,
+      publicId: "bootstrap_fault_session",
+      state: "active",
+      updatedAt: now,
+      userId,
+    });
+    const anchorRowId = await ctx.db.insert("attentionNotificationOutbox", {
+      allowedWindowEnd: now + 60_000,
+      claimCapacityReservation: "0".repeat(16 * 1_024),
+      claimDeadline: now + 60_000,
+      coalesceAfter: now,
+      consentLeaseUntil: now + 60_000,
+      createdAt: now,
+      executionAuthority: { bootGeneration: 1, bootId: "boot", fence: 1 },
+      globalNotificationGeneration: 1,
+      interactionDeadline: now + 60_000,
+      interactionId: "bootstrap_fault_interaction",
+      interactionKind: "user_input",
+      interactionRevision: 1,
+      localNotificationPolicyRevision: 1,
+      nonterminal: true,
+      reconciliationSequence: 1,
+      remoteActions: ["answer"],
+      sessionId,
+      sessionPublicId: "bootstrap_fault_session",
+      sourceDeviceId: deviceId,
+      state: "pending",
+      updatedAt: now,
+      userId,
+    });
+    const faultId = await ctx.db.insert("attentionNotificationSafetyFaults", {
+      anchorRowId,
+      capacityReservation: "0".repeat(4 * 1_024),
+      createdAt: now,
+      deliveryId: "01912345-6789-7abc-8def-0123456789f1",
+      slot: 0,
+      state: "reserved",
+      updatedAt: now,
+      userId,
+    });
+    const fault = await ctx.db.get(faultId);
+    if (fault === null) throw new Error("missing bootstrap fault fixture");
+    if (charge) await reserveServiceQuotaForInsert(ctx, fault);
+    await ctx.db.delete(anchorRowId);
+    await ctx.db.delete(sessionId);
+    await ctx.db.delete(deviceId);
+    await ctx.db.delete(userId);
+  });
+}
+
 describe("atomic hosted authority bootstrap", () => {
+  test("refuses hard genesis and status readiness when only a fault-capacity row is dirty", async () => {
+    const runtime = convexTest(schema, modules);
+    const authority = await prepare();
+    await insertOrphanAttentionFault(runtime, false);
+    expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+      occupiedTableCount: 1,
+      serviceControlCount: 0,
+      state: "inconsistent",
+    });
+    await expect(runtime.mutation(hostedGenesis, genesisArguments(authority)))
+      .rejects.toThrow("QUOTA_HARD_GENESIS_NOT_EMPTY");
+  });
+
   test("reports only the exact active first hosted-bootstrap frame as ready", async () => {
     const empty = convexTest(schema, modules);
     expect(await empty.query(hostedBootstrapStatus, {})).toEqual({
@@ -220,6 +316,9 @@ describe("atomic hosted authority bootstrap", () => {
       bootstrapInvitePublicId: authority.publicId,
     });
     expect(rows.control[0]?.bootstrapAcceptedAt).toBeUndefined();
+    expect(rows.control[0]?.attentionNotifications).toBeUndefined();
+    expect(rows.control[0]?.attentionNotificationGeneration).toBeUndefined();
+    expect(rows.control[0]?.attentionNotificationLastMutationId).toBeUndefined();
     const invite = rows.invites[0];
     if (invite === undefined) throw new Error("missing bootstrap invite");
     const inviteBytes = logicalDocumentBytes(invite);
@@ -412,6 +511,21 @@ const readAuthorityRows = async (runtime: TestConvex<typeof schema>) =>
   }));
 
 describe("hosted bootstrap invite reissue", () => {
+  test("refuses reissue when an orphan fault-capacity row makes authority non-pristine", async () => {
+    const runtime = convexTest(schema, modules);
+    const original = await prepare();
+    const replacement = await prepare();
+    await runtime.mutation(hostedGenesis, genesisArguments(original));
+    await expireBootstrapInvite(runtime);
+    await insertOrphanAttentionFault(runtime, true);
+    expect(await runtime.query(hostedBootstrapStatus, {})).toMatchObject({
+      occupiedTableCount: 4,
+      state: "inconsistent",
+    });
+    await expect(runtime.mutation(reissueBootstrapInvite, genesisArguments(replacement)))
+      .rejects.toThrow("HOSTED_BOOTSTRAP_AUTHORITY_REFUSED");
+  });
+
   test("refuses while the bound first invite is still active", async () => {
     const runtime = convexTest(schema, modules);
     const original = await prepare();

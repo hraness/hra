@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import {
+  isAdmittedPresetRequirement,
   presetProviders,
   presetRequirements,
   presetSchema,
@@ -48,9 +49,11 @@ export const effectiveRuntimeProfileSchema = z.object({
   if (presetProviders[value.preset] !== "codex") {
     context.addIssue({ code: "custom", message: "A Codex runtime profile cannot carry another provider's model preset." });
   }
-  const requirement = presetRequirements[value.preset];
-  if (value.model !== requirement.model || value.reasoningEffort !== requirement.effort) {
-    context.addIssue({ code: "custom", message: "The effective model and reasoning effort must match the exact HRA preset." });
+  if (!isAdmittedPresetRequirement(value.preset, {
+    model: value.model,
+    effort: value.reasoningEffort,
+  })) {
+    context.addIssue({ code: "custom", message: "The effective model and reasoning effort must match an admitted exact HRA preset." });
   }
   if ((value.fast && value.serviceTier !== "priority") || (!value.fast && value.serviceTier !== null)) {
     context.addIssue({ code: "custom", message: "Fast mode and the effective service tier are incoherent." });

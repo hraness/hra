@@ -23,6 +23,13 @@ import {
 } from "./bootstrap";
 
 const temporary: string[] = [];
+const validAutoModeProbeLists = {
+  allow: ["default allow"],
+  environment: ["default environment"],
+  hard_deny: ["default hard deny"],
+  soft_deny: ["default soft deny"],
+} as const;
+const validAutoModeProbeOutput = JSON.stringify(validAutoModeProbeLists);
 
 afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
@@ -49,7 +56,8 @@ function fakeClaude(
   root: string,
   version = "2.1.261",
   configExit = 0,
-  configOutput = '{"allow":["default allow"],"environment":["default environment"],"hard_deny":["default hard deny"],"soft_deny":["default soft deny"]}',
+  configOutput = validAutoModeProbeOutput,
+  defaultsOutput = validAutoModeProbeOutput,
 ): Readonly<NodeJS.ProcessEnv> {
   const tools = join(root, "tools");
   mkdirSync(tools, { recursive: true });
@@ -59,8 +67,12 @@ if [ "$1" = "--version" ]; then
   printf '%s\\n' '${version} (Claude Code)'
   exit 0
 fi
-if [ "$1" = "auto-mode" ] && { [ "$2" = "config" ] || [ "$2" = "defaults" ]; }; then
+if [ "$1" = "auto-mode" ] && [ "$2" = "config" ]; then
   printf '%s\\n' '${configOutput}'
+  exit ${configExit}
+fi
+if [ "$1" = "auto-mode" ] && [ "$2" = "defaults" ]; then
+  printf '%s\\n' '${defaultsOutput}'
   exit ${configExit}
 fi
 exit 2
@@ -109,7 +121,7 @@ describe("machine bootstrap", () => {
   "autoMode": {
     "allow": ["Bash(git status)"],
     "soft_deny": ["Never destroy production"],
-    "environment": ["A long generated environment description that should be replaced."]
+    "environment": ["A custom environment constraint that should be preserved.", "$defaults", "$defaults"]
   }
 }
 `;
@@ -188,7 +200,10 @@ describe("machine bootstrap", () => {
     ]);
     expect(parsedClaudeSettings.permissions.deny).toEqual(["Bash(rm -rf *)"]);
     expect(parsedClaudeSettings.autoMode.allow).toEqual(["$defaults", "Bash(git status)"]);
-    expect(parsedClaudeSettings.autoMode.environment).toEqual(["$defaults"]);
+    expect(parsedClaudeSettings.autoMode.environment).toEqual([
+      "$defaults",
+      "A custom environment constraint that should be preserved.",
+    ]);
     expect(parsedClaudeSettings.autoMode.soft_deny).toEqual(["$defaults", "Never destroy production"]);
     const claudeGuidance = readFileSync(join(claudeHome, "CLAUDE.md"), "utf8");
     expect(claudeGuidance).toContain("Keep this too.");
@@ -326,6 +341,90 @@ describe("machine bootstrap", () => {
       reason: "config_unavailable",
       version: "2.1.261",
     });
+  });
+
+  test("accepts empty effective Auto-mode lists but requires nonempty shipped defaults", () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-empty-config-"));
+    temporary.push(root);
+    const emptyLists = JSON.stringify({
+      allow: [],
+      environment: [],
+      hard_deny: [],
+      soft_deny: [],
+    });
+
+    expect(
+      claudeAutoModeCapability(
+        fakeClaude(root, "2.1.261", 0, emptyLists, validAutoModeProbeOutput),
+      ),
+    ).toEqual({ available: true, reason: "available", version: "2.1.261" });
+    for (const key of ["allow", "environment", "hard_deny", "soft_deny"] as const) {
+      const invalidDefaults = JSON.stringify({ ...validAutoModeProbeLists, [key]: [] });
+      expect(
+        claudeAutoModeCapability(
+          fakeClaude(root, "2.1.261", 0, emptyLists, invalidDefaults),
+        ),
+      ).toEqual({ available: false, reason: "config_unavailable", version: "2.1.261" });
+    }
+  });
+
+  test("repairs an empty effective soft deny and detects later drift", () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-soft-deny-"));
+    temporary.push(root);
+    const codexHome = join(root, "codex");
+    const claudeHome = join(root, "claude");
+    const bunBin = join(root, "bin");
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(claudeHome, { recursive: true });
+    mkdirSync(bunBin, { recursive: true });
+    writeFileSync(
+      join(claudeHome, "settings.json"),
+      `${JSON.stringify({ autoMode: { soft_deny: [] } }, null, 2)}\n`,
+    );
+    const modulePath = join(root, "host-resources.js");
+    writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
+    const emptyLists = JSON.stringify({
+      allow: [],
+      environment: [],
+      hard_deny: [],
+      soft_deny: [],
+    });
+    const environment = {
+      ...fakeClaude(root, "2.1.261", 0, emptyLists, validAutoModeProbeOutput),
+      HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+    };
+    const arguments_ = [
+      process.execPath,
+      import.meta.dir + "/bootstrap.ts",
+      "--apply",
+      "--skip-dependency-install",
+      "--codex-home",
+      codexHome,
+      "--claude-home",
+      claudeHome,
+      "--bun-bin",
+      bunBin,
+    ];
+
+    const applied = Bun.spawnSync({ cmd: arguments_, env: environment, stderr: "pipe" });
+    expect(applied.exitCode, applied.stderr.toString()).toBe(0);
+    const settingsPath = join(claudeHome, "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+      autoMode: { soft_deny: unknown };
+    };
+    expect(settings.autoMode.soft_deny).toEqual(["$defaults"]);
+
+    writeFileSync(
+      settingsPath,
+      `${JSON.stringify({ ...settings, autoMode: { ...settings.autoMode, soft_deny: [] } }, null, 2)}\n`,
+    );
+    const checked = Bun.spawnSync({
+      cmd: arguments_.map((argument) => argument === "--apply" ? "--check" : argument),
+      env: environment,
+      stderr: "pipe",
+    });
+    expect(checked.exitCode).toBe(1);
+    expect(checked.stderr.toString()).toContain("Claude settings differ");
   });
 
   test("refuses managed-marker lookalikes inside TOML multiline strings", () => {

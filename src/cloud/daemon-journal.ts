@@ -19,6 +19,13 @@ import {
 } from "./contracts";
 import type { CloudSecretCustodyPort } from "./local-control";
 import {
+  attentionNotificationCandidateLimit,
+  parseAttentionNotificationReconcileReceipt,
+  type AttentionNotificationCompleteRequest,
+  type AttentionNotificationInvalidateRequest,
+  type AttentionNotificationReconcileReceipt,
+} from "./attention-notifications";
+import {
   compactInteractionDetailOf,
   isCompactInteractionBaselineShape,
   parseCompactSessionEvent,
@@ -30,6 +37,8 @@ const journalSlot = "cloud-daemon-journal";
 // them in a separate bounded CAS slot prevents an opaque provider cursor from
 // consuming the effect-recovery journal's reserved terminal capacity.
 const sessionSyncCursorSlot = "cloud-session-sync-cursor";
+const attentionNotificationReconciliationSlot =
+  "cloud-attention-notification-reconciliation";
 const maximumJournalCommands = 100;
 // Device commands are foreground requests from a browser, one or two at a
 // time. A small ceiling keeps their worst-case terminal reservation from
@@ -40,6 +49,7 @@ const maximumProjectionRecoveryBaselineTurns = 128;
 const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumSerializedJournalBytes = 65_536;
 const maximumSerializedSessionSyncCursorBytes = 20_480;
+const maximumSerializedAttentionNotificationReconciliationBytes = 4_096;
 const maximumRemoteSessionCursorCharacters = 16_384;
 // The largest valid device-command result is the bounded login URL plus its
 // code and envelope overhead. Reserve a little over the exact current shape so
@@ -351,6 +361,242 @@ export interface CloudSessionSyncCursorPort {
     expectedGeneration: number | null,
     state: CloudSessionSyncCursorState,
   ): Promise<CloudSessionSyncCursorObservation | null>;
+}
+
+export type CloudAttentionNotificationReconciliationRequest =
+  | AttentionNotificationCompleteRequest
+  | AttentionNotificationInvalidateRequest;
+
+export type CloudAttentionNotificationReconciliationReceipt = Readonly<{
+  receipt: AttentionNotificationReconcileReceipt;
+  request: CloudAttentionNotificationReconciliationRequest;
+}>;
+
+export type CloudAttentionNotificationReconciliationState = Readonly<{
+  devicePublicId: string | null;
+  lastReceipt: CloudAttentionNotificationReconciliationReceipt | null;
+  pending: CloudAttentionNotificationReconciliationRequest | null;
+  userPublicId: string | null;
+  version: 1;
+}>;
+
+export type CloudAttentionNotificationReconciliationObservation = Readonly<{
+  generation: number | null;
+  state: CloudAttentionNotificationReconciliationState;
+}>;
+
+export interface CloudAttentionNotificationReconciliationPort {
+  read(): Promise<CloudAttentionNotificationReconciliationObservation>;
+  compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudAttentionNotificationReconciliationState,
+  ): Promise<CloudAttentionNotificationReconciliationObservation | null>;
+}
+
+export function emptyCloudAttentionNotificationReconciliationState():
+CloudAttentionNotificationReconciliationState {
+  return {
+    devicePublicId: null,
+    lastReceipt: null,
+    pending: null,
+    userPublicId: null,
+    version: 1,
+  };
+}
+
+function parseAttentionNotificationReconciliationRequest(
+  value: unknown,
+): CloudAttentionNotificationReconciliationRequest {
+  if (!isRecord(value) || !isSafePositiveInteger(value.reconciliationSequence)
+    || !isSafePositiveInteger(value.localNotificationPolicyRevision)) {
+    throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  }
+  if (value.mode === "invalidate") {
+    if (!hasExactKeys(value, [
+      "localNotificationPolicyRevision",
+      "mode",
+      "reconciliationSequence",
+    ])) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+    return {
+      localNotificationPolicyRevision: value.localNotificationPolicyRevision,
+      mode: "invalidate",
+      reconciliationSequence: value.reconciliationSequence,
+    };
+  }
+  if (
+    value.mode !== "complete"
+    || !hasExactKeys(value, [
+      "allowedWindowEnd",
+      "candidateCount",
+      "expectedGlobalNotificationGeneration",
+      "localNotificationPolicyRevision",
+      "mode",
+      "reconciliationSequence",
+    ])
+    || !isSafeNonNegativeInteger(value.allowedWindowEnd)
+    || !isSafeNonNegativeInteger(value.candidateCount)
+    || value.candidateCount > attentionNotificationCandidateLimit
+    || !isSafePositiveInteger(value.expectedGlobalNotificationGeneration)
+    || value.reconciliationSequence === Number.MAX_SAFE_INTEGER
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  return {
+    allowedWindowEnd: value.allowedWindowEnd,
+    candidateCount: value.candidateCount,
+    expectedGlobalNotificationGeneration: value.expectedGlobalNotificationGeneration,
+    localNotificationPolicyRevision: value.localNotificationPolicyRevision,
+    mode: "complete",
+    reconciliationSequence: value.reconciliationSequence,
+  };
+}
+
+function parseAttentionNotificationReconciliationReceipt(
+  value: unknown,
+): CloudAttentionNotificationReconciliationReceipt {
+  if (!isRecord(value) || !hasExactKeys(value, ["receipt", "request"])) {
+    throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  }
+  const request = parseAttentionNotificationReconciliationRequest(value.request);
+  const receipt = parseAttentionNotificationReconcileReceipt(value.receipt, request);
+  if (receipt === null) {
+    throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  }
+  return { receipt, request };
+}
+
+export function parseCloudAttentionNotificationReconciliationState(
+  value: unknown,
+): CloudAttentionNotificationReconciliationState {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      "devicePublicId",
+      "lastReceipt",
+      "pending",
+      "userPublicId",
+      "version",
+    ])
+    || value.version !== 1
+    || ((value.devicePublicId === null) !== (value.userPublicId === null))
+    || (value.devicePublicId !== null && !isOpaqueIdentifier(value.devicePublicId))
+    || (value.userPublicId !== null && !isOpaqueIdentifier(value.userPublicId))
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  const pending = value.pending === null
+    ? null
+    : parseAttentionNotificationReconciliationRequest(value.pending);
+  const lastReceipt = value.lastReceipt === null
+    ? null
+    : parseAttentionNotificationReconciliationReceipt(value.lastReceipt);
+  if (
+    value.devicePublicId === null
+    && (pending !== null || lastReceipt !== null)
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  if (
+    pending !== null
+    && lastReceipt !== null
+    && pending.reconciliationSequence
+      <= lastReceipt.request.reconciliationSequence
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  const parsed: CloudAttentionNotificationReconciliationState = {
+    devicePublicId: value.devicePublicId,
+    lastReceipt,
+    pending,
+    userPublicId: value.userPublicId,
+    version: 1,
+  };
+  if (
+    utf8Encoder.encode(JSON.stringify(parsed)).byteLength
+      > maximumSerializedAttentionNotificationReconciliationBytes
+  ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+  return parsed;
+}
+
+export function bindCloudAttentionNotificationReconciliationState(
+  state: CloudAttentionNotificationReconciliationState,
+  userPublicId: string,
+  devicePublicId: string,
+): CloudAttentionNotificationReconciliationState {
+  const parsed = parseCloudAttentionNotificationReconciliationState(state);
+  if (!isOpaqueIdentifier(userPublicId) || !isOpaqueIdentifier(devicePublicId)) {
+    throw new Error("Cloud attention notification reconciliation identity is invalid.");
+  }
+  if (parsed.userPublicId === null) {
+    return parseCloudAttentionNotificationReconciliationState({
+      ...parsed,
+      devicePublicId,
+      userPublicId,
+    });
+  }
+  if (
+    parsed.userPublicId !== userPublicId
+    || parsed.devicePublicId !== devicePublicId
+  ) throw new Error("Cloud attention notification reconciliation identity changed.");
+  return parsed;
+}
+
+export function replaceCloudAttentionNotificationReconciliationDevice(
+  state: CloudAttentionNotificationReconciliationState,
+  userPublicId: string,
+  devicePublicId: string,
+): CloudAttentionNotificationReconciliationState {
+  const parsed = parseCloudAttentionNotificationReconciliationState(state);
+  if (!isOpaqueIdentifier(userPublicId) || !isOpaqueIdentifier(devicePublicId)) {
+    throw new Error("Cloud attention notification reconciliation identity is invalid.");
+  }
+  if (parsed.userPublicId !== userPublicId || parsed.devicePublicId === null) {
+    throw new Error("Cloud attention notification reconciliation identity changed.");
+  }
+  if (parsed.devicePublicId === devicePublicId) {
+    throw new Error("Cloud attention notification reconciliation device did not change.");
+  }
+  return parseCloudAttentionNotificationReconciliationState({
+    devicePublicId,
+    lastReceipt: null,
+    pending: null,
+    userPublicId,
+    version: 1,
+  });
+}
+
+export function setCloudAttentionNotificationPending(
+  state: CloudAttentionNotificationReconciliationState,
+  request: CloudAttentionNotificationReconciliationRequest,
+): CloudAttentionNotificationReconciliationState {
+  const parsed = parseCloudAttentionNotificationReconciliationState(state);
+  if (parsed.userPublicId === null) {
+    throw new Error("Cloud attention notification reconciliation identity is unbound.");
+  }
+  const pending = parseAttentionNotificationReconciliationRequest(request);
+  const priorSequence = Math.max(
+    parsed.pending?.reconciliationSequence ?? 0,
+    parsed.lastReceipt?.request.reconciliationSequence ?? 0,
+  );
+  if (pending.reconciliationSequence <= priorSequence) {
+    if (JSON.stringify(parsed.pending) === JSON.stringify(pending)) return parsed;
+    throw new Error("Cloud attention notification reconciliation sequence did not advance.");
+  }
+  return parseCloudAttentionNotificationReconciliationState({ ...parsed, pending });
+}
+
+export function settleCloudAttentionNotificationReconciliation(
+  state: CloudAttentionNotificationReconciliationState,
+  request: CloudAttentionNotificationReconciliationRequest,
+  receipt: AttentionNotificationReconcileReceipt,
+): CloudAttentionNotificationReconciliationState {
+  const parsed = parseCloudAttentionNotificationReconciliationState(state);
+  const canonicalRequest = parseAttentionNotificationReconciliationRequest(request);
+  const canonicalReceipt = parseAttentionNotificationReconcileReceipt(
+    receipt,
+    canonicalRequest,
+  );
+  if (
+    canonicalReceipt === null
+    || JSON.stringify(parsed.pending) !== JSON.stringify(canonicalRequest)
+  ) throw new Error("Cloud attention notification reconciliation changed concurrently.");
+  return parseCloudAttentionNotificationReconciliationState({
+    ...parsed,
+    lastReceipt: { receipt: canonicalReceipt, request: canonicalRequest },
+    pending: null,
+  });
 }
 
 export function emptyCloudSessionSyncCursor(): CloudSessionSyncCursorState {
@@ -2377,6 +2623,77 @@ export class MemoryCloudSessionSyncCursor implements CloudSessionSyncCursorPort 
   ): Promise<CloudSessionSyncCursorObservation | null> {
     if (expectedGeneration !== this.#generation) return null;
     this.#state = structuredClone(parseCloudSessionSyncCursor(state));
+    this.#generation = this.#generation === null ? 0 : this.#generation + 1;
+    return { generation: this.#generation, state: structuredClone(this.#state) };
+  }
+}
+
+export class CustodyCloudAttentionNotificationReconciliation
+implements CloudAttentionNotificationReconciliationPort {
+  readonly #custody: CloudSecretCustodyPort;
+
+  constructor(custody: CloudSecretCustodyPort) {
+    this.#custody = custody;
+  }
+
+  async read(): Promise<CloudAttentionNotificationReconciliationObservation> {
+    const observation = await this.#custody.read(attentionNotificationReconciliationSlot);
+    if (observation === null) {
+      return {
+        generation: null,
+        state: emptyCloudAttentionNotificationReconciliationState(),
+      };
+    }
+    if (
+      utf8Encoder.encode(observation.value).byteLength
+        > maximumSerializedAttentionNotificationReconciliationBytes
+    ) throw new Error("Cloud attention notification reconciliation state is corrupt.");
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(observation.value) as unknown;
+    } catch {
+      throw new Error("Cloud attention notification reconciliation state is corrupt.");
+    }
+    return {
+      generation: observation.generation,
+      state: parseCloudAttentionNotificationReconciliationState(decoded),
+    };
+  }
+
+  async compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudAttentionNotificationReconciliationState,
+  ): Promise<CloudAttentionNotificationReconciliationObservation | null> {
+    const parsed = parseCloudAttentionNotificationReconciliationState(state);
+    const serialized = JSON.stringify(parsed);
+    const committed = await this.#custody.compareAndSwap(
+      attentionNotificationReconciliationSlot,
+      expectedGeneration,
+      serialized,
+    );
+    return committed === null
+      ? null
+      : { generation: committed.generation, state: parsed };
+  }
+}
+
+export class MemoryCloudAttentionNotificationReconciliation
+implements CloudAttentionNotificationReconciliationPort {
+  #generation: number | null = null;
+  #state = emptyCloudAttentionNotificationReconciliationState();
+
+  async read(): Promise<CloudAttentionNotificationReconciliationObservation> {
+    return { generation: this.#generation, state: structuredClone(this.#state) };
+  }
+
+  async compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudAttentionNotificationReconciliationState,
+  ): Promise<CloudAttentionNotificationReconciliationObservation | null> {
+    if (expectedGeneration !== this.#generation) return null;
+    this.#state = structuredClone(
+      parseCloudAttentionNotificationReconciliationState(state),
+    );
     this.#generation = this.#generation === null ? 0 : this.#generation + 1;
     return { generation: this.#generation, state: structuredClone(this.#state) };
   }

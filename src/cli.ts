@@ -2839,6 +2839,31 @@ const latestRemoteInteractions = (
   return latest;
 };
 
+const remoteInteractionGuidance = (
+  event: RemoteInteractionEvent,
+  now: number,
+): readonly string[] => {
+  const policy = event.remotePolicy;
+  if (policy === undefined) {
+    return ["  No remote action is available. Resolve this interaction on the execution device."];
+  }
+  if (now >= policy.deadlineAt) {
+    return ["  The remote-action deadline has passed. Resolve this interaction on the execution device."];
+  }
+
+  const rows: string[] = [];
+  if (policy.actions.includes("decline")) {
+    rows.push(`  Decline remotely with \`hra remote resolve <session> --interaction ${event.interactionId} --revision ${String(event.revision)} --decision decline\`, or resolve this interaction on the execution device.`);
+  }
+  if (policy.actions.includes("answer")) {
+    rows.push("  Answer remotely in the HRA app, or resolve this interaction on the execution device.");
+  }
+  if (rows.length === 0) {
+    rows.push("  No remote action is available. Resolve this interaction on the execution device.");
+  }
+  return rows;
+};
+
 export function renderRemoteSuccess(
   command: RemoteCliCommand,
   data: unknown,
@@ -2922,6 +2947,7 @@ export function renderRemoteSuccess(
     const currentInteractions = latestRemoteInteractions(session.events);
     const interactionGuidanceAvailable = session.recoveryGap === undefined
       && !session.compactHasRecoveryGap;
+    const guidanceNow = Date.now();
     for (const event of session.events) {
       if (event.kind === "user_message" || event.kind === "assistant_message") {
         rows.push(`${event.kind === "user_message" ? "You" : "Codex"}  ${terminalSafe(event.turnId)}`);
@@ -2937,7 +2963,7 @@ export function renderRemoteSuccess(
         if (!interactionGuidanceAvailable) {
           rows.push("  Interaction action guidance is suppressed while remote recovery settles.");
         } else if (event.state === "pending") {
-          rows.push(`  Decide remotely with \`hra remote resolve <session> --interaction ${event.interactionId} --revision ${String(event.revision)} --decision once|decline|cancel\`, or resolve on the execution device.`);
+          rows.push(...remoteInteractionGuidance(event, guidanceNow));
         } else if (event.state === "response_prepared") {
           rows.push("  A response is durably prepared on the execution device. Do not submit another response.");
         } else if (event.state === "response_written") {

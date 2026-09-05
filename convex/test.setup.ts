@@ -2,6 +2,12 @@ export const modules = {
   "./_generated/server.ts": async () => await import("./server"),
   "./accountDeletion.ts": async () => await import("./accountDeletion"),
   "./account.ts": async () => await import("./account"),
+  "./attentionNotificationControl.ts": async () =>
+    await import("./attentionNotificationControl"),
+  "./attentionNotificationDelivery.ts": async () =>
+    await import("./attentionNotificationDelivery"),
+  "./attentionNotifications.ts": async () =>
+    await import("./attentionNotifications"),
   "./authDelivery.ts": async () => await import("./authDelivery"),
   "./authInvites.ts": async () => await import("./authInvites"),
   "./admissionControl.ts": async () => await import("./admissionControl"),

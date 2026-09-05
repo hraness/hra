@@ -3,8 +3,14 @@ import { makeFunctionReference } from "convex/server";
 import type { Value } from "convex/values";
 import { convexTest } from "convex-test";
 
+import { sha256Hex } from "../src/cloud/crypto";
+import { buildHraAttentionEmailBody } from "./attentionEmail";
+import { reserveAttentionNotificationFaultCapacity } from "./attentionNotificationControl";
+import { attentionNotificationQuotaReservations } from "./attentionNotifications";
 import { commandTerminalRetentionMs } from "./commands";
+import { ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS } from "./lifecyclePolicy";
 import {
+  adjustCommandQuotaForPatch,
   adjustQuotaForPatch,
   initializeAccountUsageQuotaAuthority,
   initializeUserQuotaAuthority,
@@ -17,6 +23,7 @@ import {
 } from "./quota";
 import schema from "./schema";
 import { modules } from "./test.setup";
+import { DEVICE_REVOCATION_RETAINED_SERVICE_TABLES } from "./deviceRevocation";
 
 type Args = Readonly<Record<string, Value>>;
 type DrainResult = Readonly<{
@@ -52,6 +59,9 @@ const revocationStatus = makeFunctionReference<"query", Args, Readonly<{
 }>>("deviceRevocation:status");
 const drainRevocations = makeFunctionReference<"mutation", Args, DrainResult>(
   "deviceRevocation:drain",
+);
+const settleAttentionNotification = makeFunctionReference<"mutation", Args, unknown>(
+  "attentionNotifications:settleAttempt",
 );
 const genesisQuota = makeFunctionReference<"mutation", Record<string, never>, unknown>(
   "quota:genesisHardAuthority",
@@ -131,6 +141,12 @@ async function revocationWorld() {
     const actorDeviceId = await ctx.db.insert("devices", actorDevice);
     const targetDevice = {
       activatedAt: now,
+      attentionNotificationAuthority: {
+        consentLeaseUntil: now + 120_000,
+        globalNotificationGeneration: 1,
+        localNotificationPolicyRevision: 1,
+        reconciliationSequence: 1,
+      },
       authEpoch: 1,
       createdAt: now,
       credentialGeneration: 1,
@@ -376,6 +392,87 @@ async function insertCommandFixtures(world: Awaited<ReturnType<typeof revocation
   });
 }
 
+async function insertNotificationFixtures(world: Awaited<ReturnType<typeof revocationWorld>>) {
+  const now = Date.now();
+  return await world.testRuntime.run(async (ctx) => {
+    const base = {
+      allowedWindowEnd: now + 60_000,
+      claimCapacityReservation: attentionNotificationQuotaReservations.pending,
+      claimDeadline: now + 60_000,
+      coalesceAfter: now - 1,
+      consentLeaseUntil: now + 60_000,
+      createdAt: now,
+      executionAuthority: {
+        bootGeneration: 1,
+        bootId: "boot_revoke_01",
+        fence: 1,
+      },
+      globalNotificationGeneration: 1,
+      interactionDeadline: now + 60_000,
+      interactionKind: "permission_approval" as const,
+      interactionRevision: 1,
+      localNotificationPolicyRevision: 1,
+      nonterminal: true,
+      reconciliationSequence: 1,
+      remoteActions: ["decline"] as ("answer" | "decline")[],
+      sessionId: world.sessionId,
+      sessionPublicId: "session_revoke01",
+      sourceDeviceId: world.targetDeviceId,
+      state: "pending" as const,
+      updatedAt: now,
+      userId: world.userId,
+    };
+    const pending = { ...base, interactionId: "interaction_revoke_pending" };
+    await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, pending);
+    const pendingId = await ctx.db.insert("attentionNotificationOutbox", pending);
+    const started = { ...base, interactionId: "interaction_revoke_started" };
+    await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, started);
+    const startedId = await ctx.db.insert("attentionNotificationOutbox", started);
+    const deliveryId = uuidV7(now, "401");
+    const body = buildHraAttentionEmailBody([{
+      interactionKind: started.interactionKind,
+      sessionPublicId: started.sessionPublicId,
+    }]);
+    const bodyDigest = await sha256Hex(`hra-attention-body:v1\u0000${body.text}`);
+    const recipientDigest = "9".repeat(64);
+    const idempotencyKey = await sha256Hex([
+      "hra-attention-resend:v1",
+      deliveryId,
+      recipientDigest,
+      bodyDigest,
+    ].join("\u0000"));
+    expect(await reserveAttentionNotificationFaultCapacity(ctx, {
+      anchorRowId: startedId,
+      deliveryId,
+      now,
+      userId: world.userId,
+    })).toBe(true);
+    const startedPatch = {
+      claimCapacityReservation: attentionNotificationQuotaReservations.started,
+      delivery: {
+        attemptCount: 1,
+        body,
+        bodyDigest,
+        claimedAt: now,
+        deadline: now + 60_000,
+        effectStartedAt: now,
+        firstAttemptAt: now,
+        generation: 1,
+        id: deliveryId,
+        idempotencyKey,
+        lastAttemptAt: now,
+        leaderRowId: startedId,
+        recipientDigest,
+      },
+      faultCapacityAnchor: startedId,
+      state: "effect_started" as const,
+    };
+    await adjustCommandQuotaForPatch(ctx, world.userId, started, startedPatch);
+    await ctx.db.patch(startedId, startedPatch);
+    return { deliveryId, pendingId, startedId };
+  });
+}
+
 async function drainToCompletion(
   world: Awaited<ReturnType<typeof revocationWorld>>,
   limit = 200,
@@ -415,6 +512,7 @@ describe("status-first device revocation", () => {
       revision: 2,
       status: "revoked",
     });
+    expect(afterFirst.target?.attentionNotificationAuthority).toBeUndefined();
     expect(afterFirst.target?.revokedAt).toBeNumber();
     expect(afterFirst.job).toMatchObject({
       category: "sessions",
@@ -466,6 +564,7 @@ describe("status-first device revocation", () => {
   test("drains more than 500 dependent rows in crash-safe chunks of at most 200", async () => {
     const world = await revocationWorld();
     const commands = await insertCommandFixtures(world);
+    const notifications = await insertNotificationFixtures(world);
     await world.testRuntime.run(async (ctx) => {
       const now = Date.now();
       for (let index = 1; index < 505; index += 1) {
@@ -504,6 +603,18 @@ describe("status-first device revocation", () => {
       },
       keyEnvelope: await ctx.db.get(world.keyEnvelopeId),
       lease: await ctx.db.get(world.leaseId),
+      notifications: {
+        pending: await ctx.db.get(notifications.pendingId),
+        started: await ctx.db.get(notifications.startedId),
+      },
+      notificationFaultCapacity: await ctx.db.query("attentionNotificationSafetyFaults")
+        .withIndex("by_user", (builder) => builder.eq("userId", world.userId))
+        .collect(),
+      nonterminalCommandUsage: await ctx.db.query("storageResourceUsageByUser")
+        .withIndex("by_user_and_resource", (builder) => builder
+          .eq("userId", world.userId)
+          .eq("resource", "nonterminal_command"))
+        .unique(),
       presence: await ctx.db.get(world.presenceId),
       remainingLiveSessions: await ctx.db.query("sessionHeads")
         .withIndex("by_execution_device_and_state", (builder) => builder
@@ -531,6 +642,47 @@ describe("status-first device revocation", () => {
       .toBe((final.commands.prepared?.updatedAt ?? 0) + commandTerminalRetentionMs);
     expect(final.commands.pending).not.toHaveProperty("terminalCleanupAfter");
     expect(final.commands.started).not.toHaveProperty("terminalCleanupAfter");
+    expect(final.notifications.pending).toMatchObject({
+      nonterminal: false,
+      retrySuppressionReason: "device_revoked",
+      state: "cancelled",
+    });
+    expect(final.notifications.pending?.revocationObservedAt).toBeNumber();
+    expect(final.notifications.pending?.terminalCleanupAfter).toBeNumber();
+    expect(final.notifications.pending?.terminalCleanupAfter)
+      .toBe(
+        (final.notifications.pending?.updatedAt ?? 0)
+        + ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+      );
+    expect(final.notifications.started).toMatchObject({
+      nonterminal: true,
+      retrySuppressionReason: "device_revoked",
+      state: "effect_started",
+    });
+    expect(final.notifications.started?.revocationObservedAt).toBeNumber();
+    expect(final.notifications.started?.delivery?.id).toBe(notifications.deliveryId);
+    expect(final.notifications.started?.delivery?.settledAt).toBeUndefined();
+    expect(final.notificationFaultCapacity).toHaveLength(4);
+    expect(final.notificationFaultCapacity.every((row) => row.state === "reserved")).toBe(true);
+    expect(DEVICE_REVOCATION_RETAINED_SERVICE_TABLES)
+      .toEqual(["attentionNotificationSafetyFaults"]);
+    expect(final.nonterminalCommandUsage).toMatchObject({ records: 1 });
+
+    expect(await world.testRuntime.mutation(settleAttentionNotification, {
+      deliveryId: notifications.deliveryId,
+      generation: 1,
+      globalNotificationGeneration: 1,
+      result: { kind: "accepted", providerMessageId: "revoked_device_delivery" },
+    })).toEqual({ kind: "accepted" });
+    expect(await world.testRuntime.run(async (ctx) => ({
+      faults: await ctx.db.query("attentionNotificationSafetyFaults")
+        .withIndex("by_user", (builder) => builder.eq("userId", world.userId))
+        .collect(),
+      notification: await ctx.db.get(notifications.startedId),
+    }))).toMatchObject({
+      faults: [],
+      notification: { nonterminal: false, state: "accepted" },
+    });
 
     expect(await world.actor.query(revocationStatus, {
       jobId: world.revokeRequest.idempotencyKey,

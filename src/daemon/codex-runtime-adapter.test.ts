@@ -14,6 +14,7 @@ import type {
   ConversationAutomationToolCall,
   LaunchPinnedCodexOptions,
 } from "../codex/index";
+import { presetRequirements } from "../domain/presets";
 import {
   classifyCommand,
   normalizeProviderTitle,
@@ -964,9 +965,9 @@ describe("PinnedCodexRuntimeManager", () => {
     const connectionId = "71000000-0000-4000-8000-000000000006";
     const capabilities = (suffix: string): CodexCapabilitySnapshot => ({
       models: [{
-        id: "gpt-5.6-sol",
-        model: "gpt-5.6-sol",
-        displayName: "GPT-5.6 Sol",
+        id: "gpt-6-astra",
+        model: "gpt-6-astra",
+        displayName: "GPT-6 Astra",
         hidden: false,
         supportedReasoningEfforts: ["max", "ultra"],
         defaultReasoningEffort: "max",
@@ -1006,9 +1007,9 @@ describe("PinnedCodexRuntimeManager", () => {
         }
         return { authority: providerAuthority, value: capabilities(discovery <= 2 ? "1" : "2") };
       },
-      resolvePreset: (_snapshot: unknown, alias: string, fast: boolean) => {
+      resolvePreset: (_snapshot: unknown, alias: string, _requirement: unknown, fast: boolean) => {
         events.push(`resolve:${alias}:${String(fast)}`);
-        return { alias, model: "gpt-5.6-sol", effort: "max", serviceTier: fast ? "priority" : null, fast };
+        return { alias, model: "gpt-6-astra", effort: "max", serviceTier: fast ? "priority" : null, fast };
       },
       startThread: async (input: unknown) => {
         events.push(`thread:${JSON.stringify(input)}`);
@@ -1017,7 +1018,7 @@ describe("PinnedCodexRuntimeManager", () => {
           value: {
             thread: { ...makeThread([]), ephemeral },
             cwd: "/workspace/project",
-            model: "gpt-5.6-sol",
+            model: "gpt-6-astra",
             modelProvider: "openai",
             reasoningEffort: "max",
             serviceTier: "priority",
@@ -1088,7 +1089,7 @@ describe("PinnedCodexRuntimeManager", () => {
     const rejectedTurnReviewSignal = new AbortController().signal;
     const invalidatedTurnReviewSignal = new AbortController().signal;
     const turnReviewSignal = new AbortController().signal;
-    const sessionReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: sessionReviewSignal });
+    const sessionReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: true, signal: sessionReviewSignal });
     const started = await manager.startSession({ authority, projectRoot: "/workspace/project", review: sessionReview, signal: sessionStartSignal });
     const pristineObservation = await manager.observeSession({
       authority,
@@ -1116,7 +1117,7 @@ describe("PinnedCodexRuntimeManager", () => {
       resumeCalls: 0,
       turnListCalls: 0,
     });
-    const rejectedTurnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", fast: false, signal: rejectedTurnReviewSignal });
+    const rejectedTurnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: false, signal: rejectedTurnReviewSignal });
     startTurnFailure = new CodexRemoteError(-32_600, "request failed");
     await expect(manager.startTurn({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", review: rejectedTurnReview, message: "rejected", clientMessageId: "client-rejected", signal: new AbortController().signal })).rejects.toBeInstanceOf(CodexRemoteError);
     await manager.readSession({
@@ -1130,7 +1131,7 @@ describe("PinnedCodexRuntimeManager", () => {
       resumeCalls: 0,
       turnListCalls: 1,
     });
-    const invalidatedTurnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", fast: false, signal: invalidatedTurnReviewSignal });
+    const invalidatedTurnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: false, signal: invalidatedTurnReviewSignal });
     startTurnFailure = new CodexRemoteError(-32_600, "request failed");
     emitInvalidatingFactBeforeFailure = true;
     await expect(manager.startTurn({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", review: invalidatedTurnReview, message: "fact then reject", clientMessageId: "client-fact-rejected", signal: new AbortController().signal })).rejects.toBeInstanceOf(CodexRemoteError);
@@ -1145,7 +1146,7 @@ describe("PinnedCodexRuntimeManager", () => {
       resumeCalls: 0,
       turnListCalls: 2,
     });
-    const turnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", fast: false, signal: turnReviewSignal });
+    const turnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: false, signal: turnReviewSignal });
     const turned = await manager.startTurn({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", review: turnReview, message: "continue", clientMessageId: "client-1", signal: new AbortController().signal });
     const postTurnObservation = await manager.observeSession({
       authority,
@@ -1231,7 +1232,7 @@ describe("PinnedCodexRuntimeManager", () => {
       turnListCalls: 3,
     });
     sandboxWritableRoots = [];
-    const legacySandboxReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: new AbortController().signal });
+    const legacySandboxReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: true, signal: new AbortController().signal });
     emitDeletionDuringContextualDiscovery = true;
     await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: legacySandboxReview, signal: new AbortController().signal })).resolves.toMatchObject({ providerThreadId: "thread-1" });
     await expect(manager.observeSession({
@@ -1245,11 +1246,11 @@ describe("PinnedCodexRuntimeManager", () => {
       turnListCalls: 3,
     });
     sandboxWritableRoots = ["/"];
-    const broadRootReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: new AbortController().signal });
+    const broadRootReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: true, signal: new AbortController().signal });
     await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: broadRootReview, signal: new AbortController().signal })).rejects.toBeInstanceOf(IndeterminateCodexEffectError);
     sandboxWritableRoots = ["/workspace/project"];
     ephemeral = true;
-    const rejectedReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: new AbortController().signal });
+    const rejectedReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: true, signal: new AbortController().signal });
     await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: rejectedReview, signal: new AbortController().signal })).rejects.toBeInstanceOf(IndeterminateCodexEffectError);
     await manager.close();
   });

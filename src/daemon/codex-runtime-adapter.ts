@@ -20,7 +20,11 @@ import {
   type ThreadStartResult,
 } from "../codex/index";
 import type { PreparedAttachment } from "../domain/attachments";
-import { assertPresetSupportedByProvider, type Preset } from "../domain/presets";
+import {
+  assertPresetSupportedByProvider,
+  type Preset,
+  type PresetRequirement,
+} from "../domain/presets";
 import { redactAbsolutePaths } from "../domain/text-safety";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import { redactCompleteSensitiveText } from "../sensitive-text";
@@ -867,7 +871,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
-  async reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview> {
+  async reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; requirement: PresetRequirement; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview> {
     return await this.#admit(async () => {
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a session.");
       if (input.signal.aborted) throw input.signal.reason;
@@ -876,6 +880,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       const reviewed = await this.#reviewedPreset(
         running,
         input.preset,
+        input.requirement,
         input.fast,
         input.projectRoot,
         undefined,
@@ -908,6 +913,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         const contextual = await this.#reviewedPreset(
           running,
           preset.alias,
+          {
+            model: reviewed.review.effectiveRuntimeProfile.model,
+            effort: reviewed.review.effectiveRuntimeProfile.reasoningEffort,
+          },
           preset.fast,
           input.projectRoot,
           started.thread.id,
@@ -1035,7 +1044,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
-  async reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview> {
+  async reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; requirement: PresetRequirement; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview> {
     return await this.#admit(async () => {
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a turn.");
       if (input.signal.aborted) throw input.signal.reason;
@@ -1045,6 +1054,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       const reviewed = await this.#reviewedPreset(
         running,
         input.preset,
+        input.requirement,
         input.fast,
         input.projectRoot,
         input.providerThreadId,
@@ -2318,6 +2328,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   async #reviewedPreset(
     running: RunningClient,
     alias: Preset,
+    requirement: PresetRequirement,
     fast: boolean,
     cwd: string,
     threadId: string | undefined,
@@ -2339,7 +2350,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       signal,
     });
     signal.throwIfAborted();
-    const preset = running.client.resolvePreset(capabilities, alias, fast);
+    const preset = running.client.resolvePreset(capabilities, alias, requirement, fast);
     const profile = compileEffectiveRuntimeProfile({
       authority: running.authority,
       capabilities: capabilities.value,

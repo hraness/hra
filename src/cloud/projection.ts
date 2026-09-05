@@ -1,11 +1,23 @@
 import {
+  containsCredentialPrompt,
+  remoteInteractionActionOrder,
+  remoteInteractionPolicyLimits,
+  remoteInteractionPolicyReasonCodeOrder,
+  type RemoteInteractionAction,
+  type RemoteInteractionPolicyReasonCode,
+  type RemoteInteractionProjectedQuestion,
+} from "../domain/remote-interaction-contract";
+import {
   cloudLimits,
   containsAbsolutePath,
+  containsSecretShapedText,
   containsUnsafeTerminalScalar,
+  hasExactKeys,
   isOpaqueIdentifier,
   isRecord,
   isSafeNonNegativeInteger,
   isSafePositiveInteger,
+  snapshotForeignJson,
   type SyncStream,
 } from "./contracts";
 import { decryptBytes, encryptBytes } from "./crypto";
@@ -60,13 +72,35 @@ export type CompactInteractionQuestion = Readonly<{
   secret: boolean;
 }>;
 
+export type CompactRemoteInteractionAction = RemoteInteractionAction;
+export type CompactRemoteInteractionReasonCode = RemoteInteractionPolicyReasonCode;
+export type CompactRemoteInteractionQuestion = RemoteInteractionProjectedQuestion;
+export {
+  remoteInteractionActionOrder,
+  remoteInteractionPolicyReasonCodeOrder,
+} from "../domain/remote-interaction-contract";
+
+/**
+ * Exact action authority for one compact interaction revision. Presentation
+ * fields remain outside this object and can never grant an action.
+ */
+export type CompactRemoteInteractionPolicy = Readonly<{
+  actions: readonly CompactRemoteInteractionAction[];
+  deadlineAt: number;
+  questions: readonly CompactRemoteInteractionQuestion[];
+  reasonCodes: readonly CompactRemoteInteractionReasonCode[];
+  version: 2;
+}>;
+
 /**
  * The detail contract revision. A reader that does not recognise the value
  * ignores every detail field and renders the base event, so a later writer can
  * change the detail shape without breaking this parser and without a reader
  * misreading a field it does not understand.
  */
-export const COMPACT_INTERACTION_DETAIL_VERSION = 1;
+export const LEGACY_COMPACT_INTERACTION_DETAIL_VERSION = 1;
+export const COMPACT_INTERACTION_DETAIL_VERSION = 2;
+export const COMPACT_REMOTE_INTERACTION_POLICY_VERSION = 2;
 
 export const compactInteractionDetailLimits = Object.freeze({
   commandClassCharacters: 128,
@@ -93,7 +127,7 @@ export type CompactInteractionEvent = Readonly<{
   /** The decisions the provider offered, reduced to the remote vocabulary. */
   availableDecisions?: readonly CompactInteractionDecision[];
   blocking: boolean;
-  /** The bounded class a remote approval may be taken on, when there is one. */
+  /** A bounded presentation class. It never grants remote approval authority. */
   commandClass?: string;
   detailMarkdown?: string;
   detailVersion?: number;
@@ -103,6 +137,8 @@ export type CompactInteractionEvent = Readonly<{
   kind: "interaction_state";
   label?: string;
   questions?: readonly CompactInteractionQuestion[];
+  /** Present only on detail v2; absent means there is no remote authority. */
+  remotePolicy?: CompactRemoteInteractionPolicy;
   revision: number;
   sequence: number;
   state: CompactInteractionState;
@@ -165,7 +201,7 @@ export function parseCompactAttachments(value: unknown): readonly CompactAttachm
       || entry.name.includes("/")
       || entry.name.includes("\\")
       || forbiddenDetailKeyPattern.test(entry.name)
-      || forbiddenSecretValuePattern.test(entry.name)
+      || containsSecretShapedText(entry.name)
     ) return null;
     parsed.push({
       byteLength: entry.byteLength,
@@ -234,8 +270,6 @@ const compactInteractionStates = new Set<CompactInteractionState>([
 ]);
 const forbiddenDetailKeyPattern =
   /^(?:approval_secret|credential|env|environment|provider_token|raw_reasoning|tool_arguments|tool_output)$/iu;
-const forbiddenSecretValuePattern =
-  /(?:-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\b(?:sk|re)_[A-Za-z0-9_-]{8,}|\bsk-ant-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9_-]{8,}|\bAKIA[A-Z0-9]{12,}|\bBearer\s+[A-Za-z0-9._~-]{8,})/u;
 
 // A wire event body carries only its required fields plus a small, named set
 // of optional fields for its kind. Any other key is a forward-compatible
@@ -290,7 +324,7 @@ function isBoundedSafeText(
     && value.length <= maximum
     && !containsAbsolutePath(value)
     && !containsUnsafeTerminalScalar(value, allowLineFeeds)
-    && !forbiddenSecretValuePattern.test(value);
+    && !containsSecretShapedText(value);
 }
 
 function parseCompactInteractionQuestions(
@@ -335,6 +369,245 @@ function parseCompactInteractionDecisions(
   return value as readonly CompactInteractionDecision[];
 }
 
+function isCanonicalSubsequence<T extends string>(
+  value: unknown,
+  order: readonly T[],
+  maximum: number,
+): value is readonly T[] {
+  if (!Array.isArray(value) || value.length > maximum) return false;
+  let previous = -1;
+  for (const entry of value) {
+    const index = typeof entry === "string" ? order.indexOf(entry as T) : -1;
+    if (index <= previous) return false;
+    previous = index;
+  }
+  return true;
+}
+
+function parseRemoteUserInputQuestion(
+  value: unknown,
+): Extract<CompactRemoteInteractionQuestion, { readonly kind: "user_input" }> | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["allowsOther", "header", "id", "kind", "options", "question"])
+    || value.kind !== "user_input"
+    || typeof value.allowsOther !== "boolean"
+    || value.allowsOther
+    || !isBoundedSafeText(
+      value.id,
+      remoteInteractionPolicyLimits.questionIdCharacters,
+    )
+    || value.id.length < 1
+    || !isBoundedSafeText(
+      value.header,
+      remoteInteractionPolicyLimits.questionLabelCharacters,
+    )
+    || value.header.length < 1
+    || !isBoundedSafeText(
+      value.question,
+      remoteInteractionPolicyLimits.questionTextCharacters,
+    )
+    || value.question.length < 1
+    || [value.id, value.header, value.question].some(containsCredentialPrompt)
+  ) return null;
+  if (
+    !Array.isArray(value.options)
+    || value.options.length < 1
+    || value.options.length > remoteInteractionPolicyLimits.options
+  ) return null;
+  const options: Array<{ description: string; label: string }> = [];
+  for (const option of value.options) {
+      if (
+        !isRecord(option)
+        || !hasExactKeys(option, ["description", "label"])
+        || !isBoundedSafeText(
+          option.label,
+          remoteInteractionPolicyLimits.optionLabelCharacters,
+        )
+        || option.label.length < 1
+        || !isBoundedSafeText(
+          option.description,
+          remoteInteractionPolicyLimits.optionDescriptionCharacters,
+        )
+        || containsCredentialPrompt(option.label)
+        || containsCredentialPrompt(option.description)
+      ) return null;
+    options.push({ description: option.description, label: option.label });
+  }
+  if (new Set(options.map((option) => option.label)).size !== options.length) return null;
+  return {
+    allowsOther: value.allowsOther,
+    header: value.header,
+    id: value.id,
+    kind: value.kind,
+    options,
+    question: value.question,
+  };
+}
+
+function parseRemotePolicyQuestions(
+  value: unknown,
+): readonly CompactRemoteInteractionQuestion[] | null {
+  if (!Array.isArray(value) || value.length > remoteInteractionPolicyLimits.questions) return null;
+  const parsed: CompactRemoteInteractionQuestion[] = [];
+  let metadataCharacters = 0;
+  for (const candidate of value) {
+    if (!isRecord(candidate)) return null;
+    const question = parseRemoteUserInputQuestion(candidate);
+    if (question === null) return null;
+    parsed.push(question);
+    metadataCharacters += question.id.length + question.header.length + question.question.length
+      + question.options.reduce(
+        (total, option) => total + option.label.length + option.description.length,
+        0,
+      );
+  }
+  return new Set(parsed.map((question) => question.id)).size === parsed.length
+    && new Set(parsed.map((question) => question.question)).size === parsed.length
+    && metadataCharacters <= remoteInteractionPolicyLimits.displayMetadataCharacters
+    ? parsed
+    : null;
+}
+
+function remotePolicyIsCoherent(
+  policy: CompactRemoteInteractionPolicy,
+  interactionKind: CompactInteractionKind,
+  interactionState: CompactInteractionState,
+): boolean {
+  const has = (action: CompactRemoteInteractionAction): boolean =>
+    policy.actions.includes(action);
+  const reason = (code: CompactRemoteInteractionReasonCode): boolean =>
+    policy.reasonCodes.includes(code);
+  const reasonsAreExactly = (expected: readonly CompactRemoteInteractionReasonCode[]): boolean =>
+    policy.reasonCodes.length === expected.length
+      && expected.every((code, index) => policy.reasonCodes[index] === code);
+  const hasGlobalBlock = reason("INTERACTION_NOT_PENDING")
+    || reason("INTERACTION_EXPIRED")
+    || reason("INTERACTION_TIME_INVALID");
+  if (
+    (interactionState !== "pending" && policy.actions.length > 0)
+    || (hasGlobalBlock && policy.actions.length > 0)
+    || (has("answer") !== (policy.questions.length > 0))
+  ) return false;
+  if (hasGlobalBlock) {
+    return policy.actions.length === 0
+      && policy.questions.length === 0
+      && (
+        (interactionState !== "pending"
+          && reasonsAreExactly(["INTERACTION_NOT_PENDING"]))
+        || (interactionState === "pending"
+          && (reasonsAreExactly(["INTERACTION_EXPIRED"])
+            || reasonsAreExactly(["INTERACTION_TIME_INVALID"])))
+      );
+  }
+  if (interactionState !== "pending") return false;
+  switch (interactionKind) {
+    case "command_approval":
+      return !has("answer")
+        && policy.questions.length === 0
+        && (has("decline")
+          ? reasonsAreExactly(["COMMAND_APPROVAL_LOCAL_ONLY"])
+          : reasonsAreExactly([
+              "COMMAND_APPROVAL_LOCAL_ONLY",
+              "COMMAND_DECLINE_NOT_OFFERED",
+            ]));
+    case "file_change_approval":
+      return !has("answer")
+        && policy.questions.length === 0
+        && (has("decline")
+          ? reasonsAreExactly(["FILE_CHANGE_APPROVAL_LOCAL_ONLY"])
+          : reasonsAreExactly([
+              "FILE_CHANGE_APPROVAL_LOCAL_ONLY",
+              "FILE_CHANGE_DECLINE_NOT_OFFERED",
+            ]));
+    case "permission_approval":
+      return !has("answer")
+        && policy.questions.length === 0
+        && has("decline")
+        && (reasonsAreExactly(["PERMISSION_APPROVAL_LOCAL_ONLY"])
+          || reasonsAreExactly([
+            "PERMISSION_APPROVAL_LOCAL_ONLY",
+            "PERMISSION_REQUEST_EMPTY",
+          ]));
+    case "user_input": {
+      if (has("decline")) return false;
+      if (has("answer")) return policy.reasonCodes.length === 0 && policy.questions.length > 0;
+      if (policy.questions.length > 0 || policy.reasonCodes.length === 0) return false;
+      if (reasonsAreExactly(["USER_INPUT_METADATA_UNPROJECTABLE"])) return true;
+      const allowed = new Set<CompactRemoteInteractionReasonCode>([
+        "USER_INPUT_SECRET_QUESTION",
+        "USER_INPUT_FREE_TEXT_LOCAL_ONLY",
+        "USER_INPUT_PROVIDER_CONTRACT_LOCAL_ONLY",
+      ]);
+      return policy.reasonCodes.every((code) => allowed.has(code));
+    }
+    case "mcp_elicitation":
+      return !has("decline")
+        && !has("answer")
+        && policy.questions.length === 0
+        && reason("MCP_ANSWER_LOCAL_ONLY")
+        && policy.reasonCodes.every((code) =>
+          code === "MCP_MODE_UNSUPPORTED"
+          || code === "MCP_FIELDS_MISSING"
+          || code === "MCP_ANSWER_LOCAL_ONLY");
+  }
+}
+
+type ParsedRemotePolicy =
+  | Readonly<{ kind: "known"; policy: CompactRemoteInteractionPolicy }>
+  | Readonly<{ kind: "unknown" }>
+  | null;
+
+function parseCompactRemoteInteractionPolicy(
+  value: unknown,
+  interactionKind: CompactInteractionKind,
+  interactionState: CompactInteractionState,
+): ParsedRemotePolicy {
+  if (!isRecord(value) || !Object.hasOwn(value, "version")) return null;
+  if (!isSafePositiveInteger(value.version)) return null;
+  if (value.version !== COMPACT_REMOTE_INTERACTION_POLICY_VERSION) {
+    let keys: readonly (string | symbol)[];
+    try {
+      keys = Reflect.ownKeys(value);
+    } catch {
+      return null;
+    }
+    return keys.length <= 8 ? { kind: "unknown" } : null;
+  }
+  if (!hasExactKeys(value, [
+    "actions",
+    "deadlineAt",
+    "questions",
+    "reasonCodes",
+    "version",
+  ])) return null;
+  if (
+    !isSafeNonNegativeInteger(value.deadlineAt)
+    || !isCanonicalSubsequence(
+      value.actions,
+      remoteInteractionActionOrder,
+      remoteInteractionPolicyLimits.actions,
+    )
+    || !isCanonicalSubsequence(
+      value.reasonCodes,
+      remoteInteractionPolicyReasonCodeOrder,
+      remoteInteractionPolicyReasonCodeOrder.length,
+    )
+  ) return null;
+  const questions = parseRemotePolicyQuestions(value.questions);
+  if (questions === null) return null;
+  const policy: CompactRemoteInteractionPolicy = {
+    actions: value.actions,
+    deadlineAt: value.deadlineAt,
+    questions,
+    reasonCodes: value.reasonCodes,
+    version: COMPACT_REMOTE_INTERACTION_POLICY_VERSION,
+  };
+  return remotePolicyIsCoherent(policy, interactionKind, interactionState)
+    ? { kind: "known", policy }
+    : null;
+}
+
 /** The optional detail keys, counted into the event's key allowance. */
 export const COMPACT_INTERACTION_DETAIL_KEYS = Object.freeze([
   "availableDecisions",
@@ -344,6 +617,7 @@ export const COMPACT_INTERACTION_DETAIL_KEYS = Object.freeze([
   "headline",
   "label",
   "questions",
+  "remotePolicy",
 ] as const);
 
 const compactInteractionDetailKeys = COMPACT_INTERACTION_DETAIL_KEYS;
@@ -397,16 +671,27 @@ export function isCompactInteractionBaselineShape(
 export function compactInteractionDetailOf(
   event: CompactInteractionEvent,
 ): CompactInteractionDetail {
+  const snapshot = snapshotForeignJson(event);
+  if (!snapshot.ok || !isRecord(snapshot.value)) return {};
+  const captured = snapshot.value as CompactInteractionEvent;
   return {
-    ...(event.availableDecisions === undefined
+    ...(!Object.hasOwn(captured, "availableDecisions") || captured.availableDecisions === undefined
       ? {}
-      : { availableDecisions: event.availableDecisions }),
-    ...(event.commandClass === undefined ? {} : { commandClass: event.commandClass }),
-    ...(event.detailMarkdown === undefined ? {} : { detailMarkdown: event.detailMarkdown }),
-    ...(event.detailVersion === undefined ? {} : { detailVersion: event.detailVersion }),
-    ...(event.headline === undefined ? {} : { headline: event.headline }),
-    ...(event.label === undefined ? {} : { label: event.label }),
-    ...(event.questions === undefined ? {} : { questions: event.questions }),
+      : { availableDecisions: captured.availableDecisions }),
+    ...(!Object.hasOwn(captured, "commandClass") || captured.commandClass === undefined
+      ? {} : { commandClass: captured.commandClass }),
+    ...(!Object.hasOwn(captured, "detailMarkdown") || captured.detailMarkdown === undefined
+      ? {} : { detailMarkdown: captured.detailMarkdown }),
+    ...(!Object.hasOwn(captured, "detailVersion") || captured.detailVersion === undefined
+      ? {} : { detailVersion: captured.detailVersion }),
+    ...(!Object.hasOwn(captured, "headline") || captured.headline === undefined
+      ? {} : { headline: captured.headline }),
+    ...(!Object.hasOwn(captured, "label") || captured.label === undefined
+      ? {} : { label: captured.label }),
+    ...(!Object.hasOwn(captured, "questions") || captured.questions === undefined
+      ? {} : { questions: captured.questions }),
+    ...(!Object.hasOwn(captured, "remotePolicy") || captured.remotePolicy === undefined
+      ? {} : { remotePolicy: captured.remotePolicy }),
   };
 }
 
@@ -421,12 +706,24 @@ export function compactInteractionDetailOf(
  */
 function parseCompactInteractionDetail(
   value: Readonly<Record<string, unknown>>,
+  interactionKind: CompactInteractionKind,
+  interactionState: CompactInteractionState,
 ): CompactInteractionDetail | null {
   if (value.detailVersion !== undefined && !isSafePositiveInteger(value.detailVersion)) return null;
   if (
     value.detailVersion !== undefined
+    && value.detailVersion !== LEGACY_COMPACT_INTERACTION_DETAIL_VERSION
     && value.detailVersion !== COMPACT_INTERACTION_DETAIL_VERSION
   ) return {};
+  const isV2 = value.detailVersion === COMPACT_INTERACTION_DETAIL_VERSION;
+  if (
+    isV2
+    && (value.availableDecisions !== undefined
+      || value.commandClass !== undefined
+      || value.questions !== undefined
+      || value.remotePolicy === undefined)
+  ) return null;
+  if (!isV2 && value.remotePolicy !== undefined) return null;
   const availableDecisions = value.availableDecisions === undefined
     ? undefined
     : parseCompactInteractionDecisions(value.availableDecisions);
@@ -435,6 +732,10 @@ function parseCompactInteractionDetail(
     ? undefined
     : parseCompactInteractionQuestions(value.questions);
   if (questions === null) return null;
+  const remotePolicy = !isV2
+    ? undefined
+    : parseCompactRemoteInteractionPolicy(value.remotePolicy, interactionKind, interactionState);
+  if (remotePolicy === null) return null;
   if (
     (value.commandClass !== undefined
       && (!isBoundedSafeText(
@@ -454,7 +755,7 @@ function parseCompactInteractionDetail(
       && (!isBoundedSafeText(value.label, compactInteractionDetailLimits.labelCharacters)
         || value.label.length < 1))
   ) return null;
-  return {
+  const detail = {
     ...(availableDecisions === undefined ? {} : { availableDecisions }),
     ...(value.commandClass === undefined ? {} : { commandClass: value.commandClass }),
     ...(value.detailMarkdown === undefined
@@ -462,11 +763,17 @@ function parseCompactInteractionDetail(
       : { detailMarkdown: value.detailMarkdown }),
     ...(value.detailVersion === undefined
       ? {}
-      : { detailVersion: COMPACT_INTERACTION_DETAIL_VERSION }),
+      : { detailVersion: value.detailVersion }),
     ...(value.headline === undefined ? {} : { headline: value.headline }),
     ...(value.label === undefined ? {} : { label: value.label }),
     ...(questions === undefined ? {} : { questions }),
+    ...(remotePolicy?.kind === "known" ? { remotePolicy: remotePolicy.policy } : {}),
   };
+  // Optional detail fields are read again while the event is assembled. Copy
+  // them to null-prototype records first so ambient Object.prototype values
+  // cannot masquerade as fields that this parser intentionally omitted.
+  const snapshot = snapshotForeignJson(detail);
+  return snapshot.ok ? snapshot.value as CompactInteractionDetail : null;
 }
 
 function parseGitAction(value: unknown): GitAction | null {
@@ -493,7 +800,7 @@ function parseGitAction(value: unknown): GitAction | null {
         || value.label.length > 120
         || containsAbsolutePath(value.label)
         || containsUnsafeTerminalScalar(value.label)
-        || forbiddenSecretValuePattern.test(value.label)))
+        || containsSecretShapedText(value.label)))
   ) return null;
   return {
     ...(typeof value.commit === "string" ? { commit: value.commit } : {}),
@@ -502,7 +809,7 @@ function parseGitAction(value: unknown): GitAction | null {
   };
 }
 
-export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | null {
+function parseCompactSessionEventUnchecked(value: unknown): CompactSessionEvent | null {
   if (!isRecord(value)) return null;
   if (
     (value.kind === "user_message" || value.kind === "assistant_message")
@@ -512,7 +819,7 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
     && value.text.length <= 64_000
     && !containsAbsolutePath(value.text)
     && !containsUnsafeTerminalScalar(value.text, true)
-    && !forbiddenSecretValuePattern.test(value.text)
+    && !containsSecretShapedText(value.text)
     && isOpaqueIdentifier(value.turnId)
     && (value.kind !== "user_message"
       || value.actor === undefined
@@ -571,7 +878,9 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
     && compactInteractionStates.has(value.state as CompactInteractionState)
     && isBoundedSafeText(value.summary, 512, true)
   ) {
-    const detail = parseCompactInteractionDetail(value);
+    const interactionKind = value.interactionKind as CompactInteractionKind;
+    const interactionState = value.state as CompactInteractionState;
+    const detail = parseCompactInteractionDetail(value, interactionKind, interactionState);
     if (detail === null) return null;
     return {
       ...(detail.availableDecisions === undefined
@@ -587,6 +896,7 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
       kind: value.kind,
       ...(detail.label === undefined ? {} : { label: detail.label }),
       ...(detail.questions === undefined ? {} : { questions: detail.questions }),
+      ...(detail.remotePolicy === undefined ? {} : { remotePolicy: detail.remotePolicy }),
       revision: value.revision,
       sequence: value.sequence,
       state: value.state as CompactInteractionState,
@@ -631,9 +941,21 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
   };
 }
 
-export function parseCompactSessionEvents(value: unknown): readonly CompactSessionEvent[] | null {
+/** Parse one untrusted event without allowing exotic accessors to escape. */
+export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | null {
+  const snapshot = snapshotForeignJson(value);
+  if (!snapshot.ok) return null;
+  const parsed = parseCompactSessionEventUnchecked(snapshot.value);
+  if (parsed === null) return null;
+  // Keep optional fields safe even if Object.prototype is polluted after the
+  // parse returns. Parsed JSON records deliberately have a null prototype.
+  const canonical = snapshotForeignJson(parsed);
+  return canonical.ok ? canonical.value as CompactSessionEvent : null;
+}
+
+function parseCompactSessionEventsUnchecked(value: unknown): readonly CompactSessionEvent[] | null {
   if (!Array.isArray(value) || value.length < 1 || value.length > 256) return null;
-  const parsed = value.map(parseCompactSessionEvent);
+  const parsed = value.map(parseCompactSessionEventUnchecked);
   if (parsed.some((event) => event === null)) return null;
   const events = parsed as CompactSessionEvent[];
   for (let index = 1; index < events.length; index += 1) {
@@ -644,6 +966,16 @@ export function parseCompactSessionEvents(value: unknown): readonly CompactSessi
     }
   }
   return events;
+}
+
+/** Parse an untrusted event list without allowing proxy accessors to escape. */
+export function parseCompactSessionEvents(value: unknown): readonly CompactSessionEvent[] | null {
+  const snapshot = snapshotForeignJson(value);
+  if (!snapshot.ok) return null;
+  const parsed = parseCompactSessionEventsUnchecked(snapshot.value);
+  if (parsed === null) return null;
+  const canonical = snapshotForeignJson(parsed);
+  return canonical.ok ? canonical.value as readonly CompactSessionEvent[] : null;
 }
 
 export function sessionChunkAad(authority: SessionChunkAuthority): Uint8Array {
@@ -916,7 +1248,7 @@ export function detailProjectionIsSafe(value: unknown, depth = 0): boolean {
   if (typeof value === "string") {
     return value.length <= 64_000
       && !containsAbsolutePath(value)
-      && !forbiddenSecretValuePattern.test(value);
+      && !containsSecretShapedText(value);
   }
   if (Array.isArray(value)) {
     return value.length <= 256 && value.every((item) => detailProjectionIsSafe(item, depth + 1));
