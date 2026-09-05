@@ -34,6 +34,7 @@ import {
   type CloudDaemonJournalInputState,
   type CloudDaemonJournalObservation,
   type CloudDaemonJournalPort,
+  type CloudDeviceCommandJournalEntry,
   type CloudProjectionRecoveryBaselineInteraction,
   type CloudSessionSyncCursorPort,
 } from "./daemon-journal";
@@ -161,6 +162,7 @@ type FakeDeviceCommand = {
   kind: DeviceCommandKind;
   payload: EncryptedEnvelope;
   publicId: string;
+  requestDigest: string;
   requestingDevicePublicId: string;
   result?: EncryptedEnvelope;
   resultCode?: string;
@@ -168,6 +170,7 @@ type FakeDeviceCommand = {
   resultDigest?: string;
   singleUseResult?: boolean;
   state: CommandState;
+  targetDevicePublicId: string;
   updatedAt: number;
 };
 
@@ -177,6 +180,9 @@ class FakeCloud {
   offlineMessage = "network offline";
   failMarkAfterEffectOnce = false;
   failPrepareOnce = false;
+  failDeviceMarkAfterEffectOnce = false;
+  failDeviceMarkBeforeEffectOnce = false;
+  failDevicePrepareAfterEffectOnce = false;
   failDevicePrepareBeforeEffectOnce = false;
   failDeviceRecoveryAfterEffectOnce = false;
   revokeDeviceCommandAfterMarkOnce = false;
@@ -210,6 +216,7 @@ class FakeCloud {
   }>> = [];
   sessionHeadListCalls = 0;
   deviceListCalls = 0;
+  deviceCommandPendingListCalls = 0;
   peerDevices: Array<Readonly<Record<string, unknown>>> = [];
   readonly commands = new Map<string, FakeCommand>();
   readonly deviceCommands = new Map<string, FakeDeviceCommand>();
@@ -284,21 +291,37 @@ class FakeCloud {
     payload: DeviceCommandPayload;
     publicId: string;
     requestingDevicePublicId: string;
+    targetDevicePublicId?: string;
   }>): Promise<void> {
+    const deadline = this.now + 60_000;
+    const targetDevicePublicId = input.targetDevicePublicId ?? "device_daemon1";
     const envelope = await encryptDeviceCommand(input.payload, key, {
       entityPublicId: input.publicId,
       keyVersion: 1,
       kind: "device_command",
       userPublicId,
     });
+    const requestDigest = await hmacSha256Hex(
+      key,
+      "device-command-enqueue",
+      JSON.stringify({
+        deadline,
+        expectedTargetDevicePublicId: targetDevicePublicId,
+        kind: input.kind,
+        payload: envelope,
+        publicId: input.publicId,
+      }),
+    );
     this.deviceCommands.set(input.publicId, {
       createdAt: this.now,
-      deadline: this.now + 60_000,
+      deadline,
       kind: input.kind,
       payload: envelope,
       publicId: input.publicId,
+      requestDigest,
       requestingDevicePublicId: input.requestingDevicePublicId,
       state: "pending",
+      targetDevicePublicId,
       updatedAt: this.now,
     });
   }
@@ -784,11 +807,23 @@ class FakeCloud {
           if (command.state !== "pending") throw new Error("DEVICE_COMMAND_TRANSITION_CONFLICT");
           command.boundAuthority = requested;
           command.state = "prepared";
+          if (this.failDevicePrepareAfterEffectOnce) {
+            this.failDevicePrepareAfterEffectOnce = false;
+            throw new Error("lost device command prepare response");
+          }
           return { publicId: command.publicId, replay: false, state: "prepared" };
         }
         if (name === "deviceCommands:markEffectStarted") {
+          if (this.failDeviceMarkBeforeEffectOnce) {
+            this.failDeviceMarkBeforeEffectOnce = false;
+            throw new Error("device command mark unavailable");
+          }
           const command = this.requireDeviceCommand(args.commandPublicId);
           if (command.state === "prepared") command.state = "effect_started";
+          if (this.failDeviceMarkAfterEffectOnce) {
+            this.failDeviceMarkAfterEffectOnce = false;
+            throw new Error("lost device command mark response");
+          }
           if (this.revokeDeviceCommandAfterMarkOnce) {
             this.revokeDeviceCommandAfterMarkOnce = false;
             this.revokedDevices.add(command.requestingDevicePublicId);
@@ -1080,6 +1115,7 @@ class FakeCloud {
               };
         }
         if (name === "deviceCommands:listPendingForTarget") {
+          this.deviceCommandPendingListCalls += 1;
           const commands = [...this.deviceCommands.values()]
             .filter((command) => command.state === "pending")
             .map(publicDeviceCommand);
@@ -1096,8 +1132,8 @@ class FakeCloud {
             ? null
             : {
                 ...publicDeviceCommand(command),
-                requestDigest: "d".repeat(64),
-                targetDevicePublicId: devicePublicId,
+                requestDigest: command.requestDigest,
+                targetDevicePublicId: command.targetDevicePublicId,
               };
         }
         throw new Error(`unexpected query ${name}`);
@@ -5412,6 +5448,236 @@ describe("device command execution", () => {
       userPublicId,
     })).toEqual({ accountsRefreshed: 2, kind: "usage_refresh" });
     // Nothing is left behind: the journal entry is removed once it settles.
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("shares one eight-effect cycle budget across recovery and fresh commands", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    const authority = { bootGeneration: 1, bootId: "boot_12345678", fence: 1 } as const;
+    const recoveryIds = Array.from({ length: 8 }, (_, index) => uuidV7(8_000 + index));
+    const freshIds = Array.from({ length: 8 }, (_, index) => uuidV7(8_100 + index));
+    const recoveries: CloudDeviceCommandJournalEntry[] = [];
+    for (const publicId of [...recoveryIds, ...freshIds]) {
+      await cloud.enqueueDeviceCommand({
+        kind: "usage_refresh",
+        payload: { kind: "usage_refresh" },
+        publicId,
+        requestingDevicePublicId: "device_browser1",
+      });
+      if (!recoveryIds.includes(publicId)) continue;
+      const command = cloud.requireDeviceCommand(publicId);
+      command.boundAuthority = authority;
+      command.state = "prepared";
+      recoveries.push({
+        authority,
+        commandPublicId: publicId,
+        kind: command.kind,
+        payloadDigest: await sha256Hex(JSON.stringify(command.payload)),
+        phase: "prepared",
+        requestingDevicePublicId: command.requestingDevicePublicId,
+      });
+    }
+    const observed = await journal.read();
+    await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      deviceCommands: recoveries,
+    });
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+
+    const first = await daemon.cycle(new AbortController().signal);
+    expect(first.errors).toEqual([]);
+    expect(first.commandsApplied).toBe(8);
+    expect(deviceExecutor.calls.map((call) => call.idempotencyKey)).toEqual(recoveryIds);
+    expect(cloud.deviceCommandPendingListCalls).toBe(0);
+    expect(freshIds.map((publicId) => cloud.requireDeviceCommand(publicId).state))
+      .toEqual(Array.from({ length: 8 }, () => "pending"));
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+
+    const second = await daemon.cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(second.commandsApplied).toBe(8);
+    expect(deviceExecutor.calls).toHaveLength(16);
+    expect(new Set(deviceExecutor.calls.map((call) => call.idempotencyKey)).size).toBe(16);
+    expect(cloud.deviceCommandPendingListCalls).toBe(1);
+    expect(freshIds.map((publicId) => cloud.requireDeviceCommand(publicId).state))
+      .toEqual(Array.from({ length: 8 }, () => "applied"));
+  });
+
+  test("same-boot recovery resumes after prepare committed but its response was lost", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.failDevicePrepareAfterEffectOnce = true;
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+
+    const first = await daemon.cycle(new AbortController().signal);
+    expect(first.errors).toHaveLength(1);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({ state: "prepared" });
+    expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "prepared" }]);
+
+    const second = await daemon.cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(deviceExecutor.calls).toHaveLength(1);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      resultCode: "APPLIED",
+      state: "applied",
+    });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("same-boot recovery refuses an exact read whose enqueue digest is forged", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.failDevicePrepareAfterEffectOnce = true;
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toHaveLength(1);
+    cloud.requireDeviceCommand(commandPublicId).requestDigest = "e".repeat(64);
+
+    const recovered = await daemon.cycle(new AbortController().signal);
+    expect(recovered.errors).toEqual([
+      `device command ${commandPublicId}: Cloud device command recovery identity is invalid.`,
+    ]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId).state).toBe("prepared");
+    expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "prepared" }]);
+  });
+
+  test("same-boot recovery retries prepare after a definite precommit failure", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.failDevicePrepareBeforeEffectOnce = true;
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+
+    const first = await daemon.cycle(new AbortController().signal);
+    expect(first.errors).toHaveLength(1);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({ state: "pending" });
+    expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "prepared" }]);
+
+    const second = await daemon.cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(deviceExecutor.calls).toHaveLength(1);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      resultCode: "APPLIED",
+      state: "applied",
+    });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("same-boot recovery fails closed after mark committed but its response was lost", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.failDeviceMarkAfterEffectOnce = true;
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+
+    const first = await daemon.cycle(new AbortController().signal);
+    expect(first.errors).toHaveLength(1);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({ state: "effect_started" });
+    expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "effect_started" }]);
+
+    const second = await daemon.cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      resultCode: "LOCAL_EFFECT_RECOVERY_REQUIRED",
+      state: "ambiguous",
+    });
+    expect((await journal.read()).state.deviceCommands).toEqual([]);
+  });
+
+  test("same-boot recovery retries mark after a definite precommit failure", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const deviceExecutor = new RecordingDeviceExecutor();
+    await cloud.enqueueDeviceCommand({
+      kind: "usage_refresh",
+      payload: { kind: "usage_refresh" },
+      publicId: commandPublicId,
+      requestingDevicePublicId: "device_browser1",
+    });
+    cloud.failDeviceMarkBeforeEffectOnce = true;
+    const daemon = bridge({
+      cloud,
+      device: "device_daemon1",
+      deviceExecutor,
+      journal,
+      local: new FakeLocal("session_deviceco", events),
+    });
+
+    const first = await daemon.cycle(new AbortController().signal);
+    expect(first.errors).toHaveLength(1);
+    expect(deviceExecutor.calls).toEqual([]);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({ state: "prepared" });
+    expect((await journal.read()).state.deviceCommands).toMatchObject([{ phase: "effect_started" }]);
+
+    const second = await daemon.cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(deviceExecutor.calls).toHaveLength(1);
+    expect(cloud.requireDeviceCommand(commandPublicId)).toMatchObject({
+      resultCode: "APPLIED",
+      state: "applied",
+    });
     expect((await journal.read()).state.deviceCommands).toEqual([]);
   });
 
