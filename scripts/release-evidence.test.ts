@@ -76,6 +76,7 @@ describe("release evidence canonicalization", () => {
     const { selfDigest: _historicalDigest, ...unsigned } = historical;
     const current = withSelfDigest({ ...unsigned, packageVersion: HRA_VERSION });
 
+    expect(_historicalDigest).toHaveLength(64);
     expect(liveAcceptanceEvidenceDocumentSchema.parse(historical).packageVersion).toBe("0.1.0");
     expect(liveAcceptanceEvidenceDocumentSchema.parse(current).packageVersion).toBe(HRA_VERSION);
     for (const packageVersion of [
