@@ -1183,9 +1183,9 @@ export const publicContent: PublicContent = {
         ),
         paragraph(
           code("hra remote show"),
-          text(" includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary. Provider request IDs, permission values, MCP fields, protected answers, and response digests remain local. A pending command or file-change approval can be decided from another device with "),
-          code("hra remote resolve <cloud-session> --interaction <id> --revision <n> --decision once|decline|cancel"),
-          text(": the encrypted decision travels as a remote command in its own scheduling lane, and the execution device applies it only when the interaction is still pending at that revision, belongs to that session, is inside its deadline, offers that decision, and the requesting device is still active. Session scope and secret answers never travel remotely. "),
+          text(" includes interaction events with a public interaction ID, kind, state, revision, blocking status, bounded safe summary, and a nested version 2 remote policy. That policy is the only remote action authority. Provider request IDs, exact commands, permission values, affected paths, MCP fields, protected answers, and response digests remain local. Another device may decline a pending command, permission, or file-change request with "),
+          code("hra remote resolve <cloud-session> --interaction <id> --revision <n> --decision decline"),
+          text(". The web app may answer only a complete non-secret closed-choice user question set whose provider adapter proves exact response translation. Every command, permission, or file-change acceptance or grant, cancel, session scope, free-text or Other response, and every MCP answer stays on the execution machine. A missing policy, nested policy version 1, or unknown policy version exposes no control. The execution daemon rechecks the session, revision, pending state, deadline, requesting device, and exact action membership before using the ordinary local resolution path. "),
           code("hra remote send --or-steer"),
           text(" lets the execution device decide whether a message steers the active turn or starts a new one, because a remote view of turn state is always slightly stale."),
         ),
@@ -1330,7 +1330,7 @@ export const publicContent: PublicContent = {
             "hra remote command <uuidv7>",
             "hra remote send|queue|steer <cloud-session> <message>",
             "hra remote send --or-steer <cloud-session> <message>",
-            "hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <once|decline|cancel>",
+            "hra remote resolve <cloud-session> --interaction <interaction-id> --revision <n> --decision <decline>",
             "hra remote stop <cloud-session>",
             "hra remote preset <cloud-session> <low|high|ultra|fable-max>",
             "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
@@ -1367,7 +1367,7 @@ export const publicContent: PublicContent = {
         paragraph(
           text("Every admitted callback carries a local deadline anchored when the provider delivered it. HRA caps the pending interval at 30 minutes and honors a shorter valid provider interval, including an immediate zero interval. At the deadline it writes one provider-neutral timeout error through the same write-ahead ledger, never invents an answer or grant, and quarantines the provider generation if the write may have escaped. "),
           code("interaction show"),
-          text(" displays the safe local deadline; encrypted remote interaction metadata does not include it."),
+          text(" displays the safe local deadline; nested remote policy version 2 carries the same absolute deadline so readers can suppress an expired control, while the daemon remains authoritative."),
         ),
         paragraph(
           text("For a standard MCP form, interaction show returns the exact public field contract without defaults or answers. Accept reads one protected document shaped as "),

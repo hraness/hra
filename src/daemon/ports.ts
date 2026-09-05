@@ -5,6 +5,7 @@ import type {
   EffectiveRuntimeProfile,
 } from "../domain/runtime-profile";
 import type { AccountRateLimitResetOutcome } from "../domain/usage-metrics";
+import type { NotificationEmailHostedAuthority } from "../domain/contracts";
 import type { CodexTurnStatus } from "../codex/protocol";
 import type { CodexPluginCatalog } from "../codex/protocol";
 import type {
@@ -297,6 +298,16 @@ export interface DesktopSwitchPort {
 export interface CloudControlPort {
   status(signal: AbortSignal): Promise<unknown>;
   sync(signal: AbortSignal): Promise<unknown>;
+  observeAttentionNotificationAuthority?(
+    signal: AbortSignal,
+  ): Promise<NotificationEmailHostedAuthority>;
+  invalidateAttentionNotificationAuthority?(input: {
+    localNotificationPolicyRevision: number;
+    signal: AbortSignal;
+  }): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >>;
   isCompactProjectionRecoveryUnsettledForProfile(profileId: ProfileId): Promise<boolean>;
   isCompactProjectionRecoveryUnsettled(sessionPublicId: SessionId): Promise<boolean>;
   supersedeCompactProjectionRecoveryForProviderDeletion(sessionPublicId: SessionId): Promise<{ superseded: boolean }>;

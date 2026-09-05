@@ -36,6 +36,21 @@ export const presetProviders = {
   "fable-max": "claude",
 } as const satisfies Record<Preset, Provider>;
 
+/** The presets a given provider owns, as a type. */
+export type ProviderPreset<P extends Provider> = {
+  [K in Preset]: (typeof presetProviders)[K] extends P ? K : never;
+}[Preset];
+
+const defaultPresetsByProvider = {
+  claude: "fable-max",
+  codex: "ultra",
+} as const satisfies { readonly [P in Provider]: ProviderPreset<P> };
+
+/** The preset a new session uses when its provider was chosen but no preset was. */
+export const defaultPresetForProvider = <P extends Provider>(
+  provider: P,
+): (typeof defaultPresetsByProvider)[P] => defaultPresetsByProvider[provider];
+
 export const presetTiers = {
   low: "low",
   high: "high",
@@ -68,11 +83,6 @@ export class PresetProviderMismatchError extends Error {
     this.preset = preset;
   }
 }
-
-/** The presets a given provider owns, as a type. */
-export type ProviderPreset<P extends Provider> = {
-  [K in Preset]: (typeof presetProviders)[K] extends P ? K : never;
-}[Preset];
 
 /** Refuses a preset the session's provider cannot run, never ignores it. */
 export function assertPresetSupportedByProvider<P extends Provider>(

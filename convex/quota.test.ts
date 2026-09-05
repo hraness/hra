@@ -341,6 +341,70 @@ describe("hosted quota authority", () => {
     await expect(maintenanceDirty.mutation(genesisHardAuthority, {}))
       .rejects.toThrow("QUOTA_HARD_GENESIS_NOT_EMPTY");
 
+    const outboxDirty = convexTest(schema, modules);
+    await outboxDirty.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", {});
+      const now = Date.now();
+      const deviceId = await ctx.db.insert("devices", {
+        authEpoch: 1,
+        createdAt: now,
+        encryptedLabel: {
+          algorithm: "A256GCM",
+          ciphertext: "notification-genesis-device",
+          keyVersion: 1,
+          nonce: "notification-genesis-nonce",
+        },
+        keyVersion: 1,
+        publicId: "device_notification_genesis",
+        revision: 1,
+        signingPublicKey: "notification-genesis-signing-key",
+        status: "active",
+        updatedAt: now,
+        userId,
+        wrappingPublicKey: "notification-genesis-wrapping-key",
+      });
+      const sessionId = await ctx.db.insert("sessionHeads", {
+        compactHeadSequence: 0,
+        createdAt: now,
+        detailHeadSequence: 0,
+        executionDeviceId: deviceId,
+        metadataRevision: 0,
+        projectionRevision: 0,
+        publicId: "session_notification_genesis",
+        state: "idle",
+        updatedAt: now,
+        userId,
+      });
+      await ctx.db.insert("attentionNotificationOutbox", {
+        allowedWindowEnd: now + 60_000,
+        claimDeadline: now + 60_000,
+        coalesceAfter: now + 60_000,
+        consentLeaseUntil: now + 60_000,
+        createdAt: now,
+        executionAuthority: { bootGeneration: 1, bootId: "boot_genesis", fence: 1 },
+        globalNotificationGeneration: 1,
+        interactionDeadline: now + 60_000,
+        interactionId: "interaction_notification_genesis",
+        interactionKind: "command_approval",
+        interactionRevision: 1,
+        localNotificationPolicyRevision: 1,
+        nonterminal: true,
+        reconciliationSequence: 1,
+        remoteActions: [],
+        sessionId,
+        sessionPublicId: "session_notification_genesis",
+        sourceDeviceId: deviceId,
+        state: "pending",
+        updatedAt: now,
+        userId,
+      });
+      await ctx.db.delete(sessionId);
+      await ctx.db.delete(deviceId);
+      await ctx.db.delete(userId);
+    });
+    await expect(outboxDirty.mutation(genesisHardAuthority, {}))
+      .rejects.toThrow("QUOTA_HARD_GENESIS_NOT_EMPTY");
+
     const historicalShadow = convexTest(schema, modules);
     await historicalShadow.run(async (ctx) => await ctx.db.insert("storageUsageService", {
       enforcement: "shadow",

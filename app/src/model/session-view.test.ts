@@ -1,11 +1,19 @@
 import { describe, expect, test } from "bun:test";
 
-import type { CompactInteractionKind, SessionStateValue } from "../hra/cloud";
+import {
+  remoteInteractionPolicyReasonCodeOrder,
+  type CompactInteractionKind,
+  type CompactRemoteInteractionPolicy,
+  type SessionStateValue,
+} from "../hra/cloud";
 import {
   formatDuration,
   interactionAffordance,
+  interactionCommandPublicId,
+  interactionInstanceKey,
   interactionKindLabel,
   interactionIsLocalOnly,
+  interactionReasonCopy,
   isIdleSession,
   orderSessionCards,
   resolveComposerTarget,
@@ -327,115 +335,115 @@ describe("isIdleSession", () => {
 });
 
 describe("interaction affordances", () => {
-  const pending = (
-    overrides: Partial<Parameters<typeof interactionAffordance>[0]> = {},
-  ): Parameters<typeof interactionAffordance>[0] => ({
-    availableDecisions: null,
-    commandClass: null,
-    interactionKind: "command_approval",
-    questions: null,
+  const policy = (
+    overrides: Partial<CompactRemoteInteractionPolicy> = {},
+  ): CompactRemoteInteractionPolicy => ({
+    actions: [],
+    deadlineAt: 10_000,
+    questions: [],
+    reasonCodes: [],
+    version: 2,
     ...overrides,
   });
 
-  test("every kind has a label and a derivable affordance", () => {
+  test("every interaction kind has a presentation label", () => {
     for (const interactionKind of allInteractionKinds) {
       expect(interactionKindLabel[interactionKind].length).toBeGreaterThan(0);
-      const affordance = interactionAffordance(pending({ interactionKind }));
-      expect(affordance.decisions).toEqual([]);
-      expect(affordance.answerable).toEqual([]);
     }
   });
 
-  test("an interaction projected without detail offers nothing and says so", () => {
-    for (const interactionKind of allInteractionKinds) {
-      const affordance = interactionAffordance(pending({ interactionKind }));
-      expect(interactionIsLocalOnly(affordance)).toBe(true);
-      expect(affordance.reasons.length).toBeGreaterThan(0);
-    }
-  });
-
-  test("a command approval offers approve only with a class the daemon can re-verify", () => {
-    expect(interactionAffordance(pending({
-      availableDecisions: ["once", "decline"],
-      commandClass: "git commit",
-    })).decisions).toEqual(["once", "decline"]);
-    const classless = interactionAffordance(pending({
-      availableDecisions: ["once", "decline"],
-    }));
-    expect(classless.decisions).toEqual(["decline"]);
-    expect(classless.reasons.join(" ")).toContain("command class");
-  });
-
-  test("a decision the provider did not offer never becomes a button", () => {
-    expect(interactionAffordance(pending({
-      availableDecisions: ["decline"],
-      commandClass: "bun test",
-    })).decisions).toEqual(["decline"]);
-  });
-
-  test("a file change approval may only be declined from a browser", () => {
-    const affordance = interactionAffordance(pending({
-      availableDecisions: ["once", "decline"],
-      commandClass: "unused",
-      interactionKind: "file_change_approval",
-    }));
-    expect(affordance.decisions).toEqual(["decline"]);
-    expect(affordance.reasons.join(" ")).toContain("exact diff");
-  });
-
-  test("a permission approval is decidable only with a workspace class", () => {
-    expect(interactionAffordance(pending({
-      availableDecisions: ["once", "decline"],
-      commandClass: "permission:workspace",
-      interactionKind: "permission_approval",
-    })).decisions).toEqual(["once", "decline"]);
-    const external = interactionAffordance(pending({
-      availableDecisions: ["once", "decline"],
-      interactionKind: "permission_approval",
-    }));
-    expect(external.decisions).toEqual([]);
-    expect(interactionIsLocalOnly(external)).toBe(true);
-  });
-
-  test("a secret question is listed and never becomes an answer id", () => {
-    const questions = [
-      { id: "where", label: "Where", secret: false },
-      { id: "token", label: "Token", secret: true },
-    ] as const;
-    // A provider question set is answered whole, so one protected answer
-    // sends the whole question to the machine.
-    const asked = interactionAffordance(pending({ interactionKind: "user_input", questions }));
-    expect(asked.answerable).toEqual([]);
-    expect(asked.locked.map((question) => question.id)).toEqual(["token"]);
-    expect(interactionIsLocalOnly(asked)).toBe(true);
-    expect(asked.reasons.length).toBeGreaterThan(0);
-
-    // An MCP form leaves out what it cannot carry, so its text fields stay
-    // answerable while the protected ones are never offered.
-    const form = interactionAffordance(pending({
-      interactionKind: "mcp_elicitation",
-      questions,
-    }));
-    expect(form.answerable.map((question) => question.id)).toEqual(["where"]);
-    expect(form.decisions).toEqual([]);
-  });
-
-  test("a question set that is entirely secret leaves nothing to answer", () => {
-    const affordance = interactionAffordance(pending({
-      interactionKind: "user_input",
-      questions: [{ id: "token", label: "Token", secret: true }],
-    }));
+  test("old, absent, or unknown policies fail closed", () => {
+    const affordance = interactionAffordance(null, 0);
+    expect(affordance).toEqual({
+      actions: [],
+      questions: [],
+      reachability: "machine_only",
+      reasonCodes: ["REMOTE_POLICY_UNAVAILABLE"],
+    });
     expect(interactionIsLocalOnly(affordance)).toBe(true);
-    expect(affordance.reasons.length).toBeGreaterThan(0);
   });
 
-  test("an approval kind never gains an answer field from a stray question list", () => {
-    const affordance = interactionAffordance(pending({
-      availableDecisions: ["decline"],
-      interactionKind: "file_change_approval",
-      questions: [{ id: "where", label: "Where", secret: false }],
-    }));
-    expect(affordance.answerable).toEqual([]);
+  test("consumes the projected action set without deriving from an interaction kind", () => {
+    const affordance = interactionAffordance(policy({
+      actions: ["decline"],
+      reasonCodes: ["COMMAND_APPROVAL_LOCAL_ONLY"],
+    }), 9_999);
+    expect(affordance.actions).toEqual(["decline"]);
+    expect(affordance.questions).toEqual([]);
+    expect(affordance.reachability).toBe("remote_limited");
+  });
+
+  test("retains exact questions only while answer is projected", () => {
+    const questions = [{
+      allowsOther: false,
+      header: "Region",
+      id: "region",
+      kind: "user_input" as const,
+      options: [{ description: "Primary", label: "East" }],
+      question: "Which region?",
+    }] as const;
+    const affordance = interactionAffordance(policy({
+      actions: ["answer"],
+      questions,
+    }), 1);
+    expect(affordance.actions).toEqual(["answer"]);
+    expect(affordance.questions).toEqual(questions);
+  });
+
+  test("suppresses every control at and after the exact deadline", () => {
+    const actionable = policy({ actions: ["decline"] });
+    expect(interactionAffordance(actionable, 9_999).actions).toEqual(["decline"]);
+    const atDeadline = interactionAffordance(actionable, 10_000);
+    expect(atDeadline.actions).toEqual([]);
+    expect(atDeadline.reasonCodes).toEqual(["INTERACTION_EXPIRED"]);
+    expect(interactionAffordance(actionable, 10_001).actions).toEqual([]);
+    expect(interactionIsLocalOnly(atDeadline)).toBe(true);
+  });
+
+  test("distinguishes partial remote reachability from machine-only requests", () => {
+    const limited = interactionAffordance(policy({
+      actions: ["decline"],
+      reasonCodes: ["COMMAND_APPROVAL_LOCAL_ONLY"],
+    }), 1);
+    expect(limited.reachability).toBe("remote_limited");
+    const machineOnly = interactionAffordance(policy({
+      reasonCodes: ["MCP_ANSWER_LOCAL_ONLY"],
+    }), 1);
+    expect(machineOnly.reachability).toBe("machine_only");
+    expect(interactionIsLocalOnly(machineOnly)).toBe(true);
+  });
+
+  test("has reader copy for every closed policy reason", () => {
+    for (const reason of remoteInteractionPolicyReasonCodeOrder) {
+      expect(interactionReasonCopy[reason].length).toBeGreaterThan(0);
+    }
+    expect(interactionReasonCopy.REMOTE_POLICY_UNAVAILABLE.length).toBeGreaterThan(0);
+  });
+
+  test("keys panel state by exact interaction id and revision", () => {
+    expect(interactionInstanceKey({ interactionId: "interaction-a", revision: 7 }))
+      .toBe("interaction-a:7");
+    expect(interactionInstanceKey({ interactionId: "interaction-a", revision: 8 }))
+      .toBe("interaction-a:8");
+    expect(interactionInstanceKey({ interactionId: "interaction-b", revision: 7 }))
+      .toBe("interaction-b:7");
+  });
+
+  test("does not carry a prior decision command into another panel revision", () => {
+    const command = { interactionKey: "interaction-a:7", publicId: "command-1" };
+    expect(interactionCommandPublicId(command, {
+      interactionId: "interaction-a",
+      revision: 7,
+    })).toBe("command-1");
+    expect(interactionCommandPublicId(command, {
+      interactionId: "interaction-a",
+      revision: 8,
+    })).toBeNull();
+    expect(interactionCommandPublicId(command, {
+      interactionId: "interaction-b",
+      revision: 7,
+    })).toBeNull();
+    expect(interactionCommandPublicId(null, null)).toBeNull();
   });
 });
 

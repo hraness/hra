@@ -9,6 +9,8 @@ import {
   requireDeviceAuthority,
 } from "./authority";
 import { commandTerminalRetentionMs } from "./commands";
+import { ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS } from "./lifecyclePolicy";
+import { attentionNotificationQuotaReservations } from "./attentionNotifications";
 import {
   adjustCommandQuotaForPatch,
   adjustQuotaForPatch,
@@ -27,6 +29,7 @@ const revocationCategoryOrder = [
   "sessions",
   "leases",
   "commands",
+  "notifications",
   "bindings",
   "custody",
   "presence",
@@ -41,6 +44,9 @@ type CleanupResult = Readonly<{
 }>;
 
 export const DEVICE_REVOCATION_SCHEMA_GAPS = Object.freeze([] as const);
+export const DEVICE_REVOCATION_RETAINED_SERVICE_TABLES = Object.freeze([
+  "attentionNotificationSafetyFaults",
+] as const);
 
 function rejectRevocation(): never {
   throw new Error("Device revocation status is unavailable.");
@@ -207,6 +213,64 @@ async function terminalizeCommands(
   return { processed: records.length };
 }
 
+async function suppressAttentionNotifications(
+  ctx: MutationCtx,
+  input: Readonly<{
+    deviceId: Id<"devices">;
+    limit: number;
+    userId: Id<"users">;
+  }>,
+): Promise<CleanupResult> {
+  const records = await ctx.db.query("attentionNotificationOutbox")
+    .withIndex("by_source_device_nonterminal_and_revocation", (builder) => builder
+      .eq("sourceDeviceId", input.deviceId)
+      .eq("nonterminal", true)
+      .eq("revocationObservedAt", undefined))
+    .take(input.limit);
+  const now = Date.now();
+  for (const record of records) {
+    if (record.userId !== input.userId) rejectRevocation();
+    if (
+      record.state === "pending"
+      && record.claimCapacityReservation !== attentionNotificationQuotaReservations.pending
+    ) rejectRevocation();
+    if (
+      record.state === "effect_started"
+      && record.claimCapacityReservation !== (record.retrySuppressedAt === undefined
+        ? attentionNotificationQuotaReservations.started
+        : attentionNotificationQuotaReservations.suppressed)
+    ) rejectRevocation();
+    const suppression = {
+      ...(record.state === "effect_started"
+        ? { claimCapacityReservation: attentionNotificationQuotaReservations.suppressed }
+        : {}),
+      retrySuppressedAt: now,
+      retrySuppressionReason: "device_revoked" as const,
+      revocationObservedAt: now,
+      updatedAt: now,
+    };
+    if (record.state === "pending") {
+      const patch = {
+        ...suppression,
+        claimCapacityReservation: undefined,
+        nonterminal: false,
+        state: "cancelled" as const,
+        terminalCleanupAfter: now + ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+      };
+      await adjustCommandQuotaForPatch(ctx, input.userId, record, patch);
+      await ctx.db.patch(record._id, patch);
+    } else if (record.state === "effect_started") {
+      // The provider call may already exist. Suppress every retry while
+      // retaining the exact generation so its action can still settle it.
+      await adjustCommandQuotaForPatch(ctx, input.userId, record, suppression);
+      await ctx.db.patch(record._id, suppression);
+    } else {
+      rejectRevocation();
+    }
+  }
+  return { processed: records.length };
+}
+
 async function deleteAccountBindings(
   ctx: MutationCtx,
   deviceId: Id<"devices">,
@@ -305,6 +369,8 @@ async function cleanCategory(
       return await deleteLeases(ctx, input.deviceId, input.userId, input.limit);
     case "commands":
       return await terminalizeCommands(ctx, input);
+    case "notifications":
+      return await suppressAttentionNotifications(ctx, input);
     case "bindings":
       return await deleteAccountBindings(ctx, input.deviceId, input.userId, input.limit);
     case "custody":

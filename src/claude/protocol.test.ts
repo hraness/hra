@@ -351,8 +351,28 @@ describe("can_use_tool mapping", () => {
         { description: "Spaces", label: "spaces" },
       ],
       question: "Tabs or spaces?",
+      remoteAnswerable: true,
       secret: false,
     }]);
+  });
+
+  test("withholds remote answer evidence when provider question text is lossy", () => {
+    const rawQuestion = "é".repeat(3_000);
+    const display = claudeInteractionDisplay(request({
+      displayName: "AskUserQuestion",
+      input: {},
+      questions: [{
+        header: "Region",
+        multiSelect: false,
+        options: [{ description: "Europe", label: "eu" }],
+        question: rawQuestion,
+      }],
+      requiresUserInteraction: true,
+      toolName: "AskUserQuestion",
+    }));
+    if (display.kind !== "user_input") throw new Error("expected user input");
+    expect(display.questions[0]?.question).not.toBe(rawQuestion);
+    expect(display.questions[0]?.remoteAnswerable).toBeUndefined();
   });
 
   test("classifies commands without ever projecting the command line", () => {
@@ -403,6 +423,28 @@ describe("control responses", () => {
     expect(claudeAnswerMap(asked, { q0: "tabs" })).toEqual({ "Tabs or spaces?": "tabs" });
     expect(() => claudeAnswerMap(asked, { q0: "not-an-option" })).toThrow(ClaudeError);
     expect(() => claudeAnswerMap(asked, {})).toThrow(ClaudeError);
+    expect(() => claudeAnswerMap(asked, { extra: "tabs", q0: "tabs" })).toThrow(ClaudeError);
+  });
+
+  test("refuses structurally ambiguous answer maps and preserves prototype-shaped questions", () => {
+    const baseQuestion = {
+      header: "Choice",
+      multiSelect: false,
+      options: [{ description: "Safe", label: "yes" }],
+      question: "Continue?",
+    } as const;
+    expect(() => claudeAnswerMap(request({
+      questions: [baseQuestion, baseQuestion],
+    }), { q0: "yes", q1: "yes" })).toThrow(ClaudeError);
+    expect(() => claudeAnswerMap(request({
+      questions: [{ ...baseQuestion, multiSelect: true }],
+    }), { q0: "yes" })).toThrow(ClaudeError);
+
+    const mapped = claudeAnswerMap(request({
+      questions: [{ ...baseQuestion, question: "__proto__" }],
+    }), { q0: "yes" });
+    expect(Object.keys(mapped)).toEqual(["__proto__"]);
+    expect(mapped.__proto__).toBe("yes");
   });
 
   test("writes exactly one newline-terminated JSON line", () => {

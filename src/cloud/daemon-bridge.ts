@@ -1,4 +1,5 @@
 import { parseAuthSignInResult } from "./authSession";
+import type { LocalAttentionNotificationSnapshot } from "./attention-notifications";
 import {
   createConvexCloudTransport,
   type CloudArgs,
@@ -80,6 +81,8 @@ import {
   decryptSessionMetadata,
   encryptDeviceCommandResult,
   encryptDeviceRegistry,
+  encryptNotificationEmail,
+  encryptNotificationHours,
   encryptSessionMetadata,
   encryptUsageProjection,
   parseSessionMetadataPayload,
@@ -90,6 +93,9 @@ import {
   type SessionMetadataPayload,
 } from "./payloads";
 import type { SessionEvent } from "../domain/session-events";
+import type { NotificationEmailHostedAuthority } from "../domain/contracts";
+import type { NotificationEmailPolicy } from "../domain/notification-email";
+import type { NotificationHoursPolicy } from "../domain/notification-hours";
 import { assignDetailSequences, LiveBatcher } from "./live-uploader";
 import {
   decryptCompactEvents,
@@ -216,6 +222,19 @@ export type CloudLocalCommandAuthority = Readonly<{
   providerThreadId: string;
 }>;
 
+/**
+ * One coherent local read of the encrypted registry and the two fields whose
+ * shared revision fences notification consent. The email switch is required
+ * on this preferred port so the bridge can never mistake a legacy payload for
+ * current consent.
+ */
+export type CloudDeviceRegistryProjection = Readonly<{
+  notificationEmail: NotificationEmailPolicy;
+  notificationHours: NotificationHoursPolicy;
+  notificationPolicyRevision: number;
+  registry: DeviceRegistryPayload;
+}>;
+
 export interface CloudDaemonLocalSourcePort {
   activateCompactProjectionRecovery?(input: Readonly<{
     baselineCompletedTurns: readonly Readonly<{ bodyDigest: string; turnId: string }>[];
@@ -324,6 +343,18 @@ export interface CloudDaemonLocalSourcePort {
    * the account key and publishes it to `devices:updateRegistry`.
    */
   readDeviceRegistry?(input: Readonly<{ signal: AbortSignal }>): Promise<DeviceRegistryPayload>;
+  /** Absent on an older daemon; publishing then intentionally clears the outer envelope. */
+  readNotificationHours?(input: Readonly<{ signal: AbortSignal }>): Promise<NotificationHoursPolicy>;
+  /** Preferred atomic/shared-revision projection; legacy readers cannot publish email consent. */
+  readDeviceRegistryProjection?(
+    input: Readonly<{ signal: AbortSignal }>,
+  ): Promise<CloudDeviceRegistryProjection>;
+  /** One sanitized, bounded local authority snapshot at the supplied instant. */
+  readAttentionNotificationSnapshot?(input: Readonly<{
+    limit: number;
+    now: number;
+    signal: AbortSignal;
+  }>): Promise<LocalAttentionNotificationSnapshot>;
   recordCompactUploadIntent?(input: Readonly<{
     cacheId: string;
     digest: string;
@@ -565,6 +596,16 @@ export type CloudLiveTickResult = Readonly<{
 export interface CloudDaemonBridge {
   close?(): Promise<void>;
   cycle(signal: AbortSignal): Promise<CloudDaemonCycleResult>;
+  observeAttentionNotificationAuthority?(
+    signal: AbortSignal,
+  ): Promise<NotificationEmailHostedAuthority>;
+  invalidateAttentionNotificationAuthority?(input: Readonly<{
+    localNotificationPolicyRevision: number;
+    signal: AbortSignal;
+  }>): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >>;
   /** Uploads coalesced live text for sessions this daemon executes; safe to call every second. */
   liveTick?(signal: AbortSignal): Promise<CloudLiveTickResult>;
   /**
@@ -3057,19 +3098,50 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   async #publishDeviceRegistry(
     identity: ActiveCloudIdentity,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<number | null> {
+    const readProjection = this.#local.readDeviceRegistryProjection?.bind(this.#local);
     const readRegistry = this.#local.readDeviceRegistry?.bind(this.#local);
-    if (readRegistry === undefined) return;
-    const payload = await readRegistry({ signal });
+    if (readProjection === undefined && readRegistry === undefined) return null;
+    let payload: DeviceRegistryPayload;
+    let notificationEmail: NotificationEmailPolicy | null;
+    let notificationHours: NotificationHoursPolicy | null;
+    let notificationPolicyRevision: number | undefined;
+    if (readProjection !== undefined) {
+      const projection = await readProjection({ signal });
+      if (
+        !isSafePositiveInteger(projection.notificationPolicyRevision)
+        || projection.notificationEmail.revision !== projection.notificationPolicyRevision
+        || projection.notificationHours.revision !== projection.notificationPolicyRevision
+      ) throw new Error("Local notification policy projection is incoherent.");
+      payload = projection.registry;
+      notificationEmail = projection.notificationEmail;
+      notificationHours = projection.notificationHours;
+      notificationPolicyRevision = projection.notificationPolicyRevision;
+    } else {
+      payload = await (readRegistry as NonNullable<typeof readRegistry>)({ signal });
+      // A legacy source may still publish notification hours for Phase 7, but
+      // it has no coherent composite port and therefore cannot publish email
+      // consent or the server-visible revision fence.
+      notificationEmail = null;
+      const readNotificationHours = this.#local.readNotificationHours?.bind(this.#local);
+      notificationHours = readNotificationHours === undefined
+        ? null
+        : await readNotificationHours({ signal });
+    }
     await this.#assertDaemonCurrent(signal);
-    const digest = await sha256Hex(JSON.stringify({ ...payload, heartbeatAt: 0 }));
+    const digest = await sha256Hex(JSON.stringify({
+      notificationEmail,
+      notificationHours,
+      notificationPolicyRevision,
+      registry: { ...payload, heartbeatAt: 0 },
+    }));
     const now = this.#now();
     const cached = this.#deviceRegistryState;
     if (
       cached !== null
       && cached.digest === digest
       && now - cached.publishedAt < deviceRegistryHeartbeatMs
-    ) return;
+    ) return notificationPolicyRevision ?? null;
     const expectedRevision = cached?.revision ?? await this.#readDeviceRegistryRevision(identity);
     await this.#assertDaemonCurrent(signal);
     const envelope = await encryptDeviceRegistry(payload, identity.accountKey, {
@@ -3078,11 +3150,30 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       kind: "device_registry",
       userPublicId: identity.userPublicId,
     });
+    const notificationHoursEnvelope = notificationHours === null
+      ? undefined
+      : await encryptNotificationHours(notificationHours, identity.accountKey, {
+          entityPublicId: identity.devicePublicId,
+          keyVersion: identity.keyVersion,
+          kind: "notification_hours",
+          userPublicId: identity.userPublicId,
+        });
+    const notificationEmailEnvelope = notificationEmail === null
+      ? undefined
+      : await encryptNotificationEmail(notificationEmail, identity.accountKey, {
+          entityPublicId: identity.devicePublicId,
+          keyVersion: identity.keyVersion,
+          kind: "notification_email",
+          userPublicId: identity.userPublicId,
+        });
     abortBeforeEffect(signal);
     const response = await this.#mutation("devices:updateRegistry", {
       envelope,
       expectedRevision,
       keyVersion: identity.keyVersion,
+      ...(notificationEmailEnvelope === undefined ? {} : { notificationEmailEnvelope }),
+      ...(notificationHoursEnvelope === undefined ? {} : { notificationHoursEnvelope }),
+      ...(notificationPolicyRevision === undefined ? {} : { notificationPolicyRevision }),
     });
     if (
       !isRecord(response)
@@ -3090,6 +3181,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       || !isSafePositiveInteger(response.revision)
     ) throw new Error("Device registry publish response is invalid.");
     this.#deviceRegistryState = { digest, publishedAt: now, revision: response.revision };
+    return notificationPolicyRevision ?? null;
   }
 
   async #readDeviceRegistryRevision(identity: ActiveCloudIdentity): Promise<number> {

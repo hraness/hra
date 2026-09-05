@@ -13,6 +13,8 @@ import {
   deviceCommandNotice,
   hostedLoginHandoffDeadline,
   initialAccountLoginActionState,
+  notificationHoursCommand,
+  parseNotificationClockMinute,
   sessionStartCommand,
   sessionStartTargetHint,
   sessionStartTargetLabel,
@@ -42,6 +44,7 @@ function machine(overrides: Partial<Readonly<{
     status: "login_pending" | "recovery_required" | "signed_in" | "signed_out";
   }>[];
   deviceCommandsAllowed: boolean;
+  deviceStatus: "active" | "pending" | "revoked" | null;
   devicePublicId: string;
   machineLabel: string;
   projects: readonly Readonly<{ label: string; publicId: string }>[];
@@ -67,7 +70,9 @@ function machine(overrides: Partial<Readonly<{
   });
   if (payload === null) throw new Error("registry fixture is not valid");
   return toMachineView({
-    device: null,
+    device: overrides.deviceStatus === null
+      ? null
+      : { online: false, status: overrides.deviceStatus ?? "active" },
     devicePublicId: overrides.devicePublicId ?? "device_studio01",
     now,
     payload,
@@ -223,6 +228,32 @@ describe("account login action gate", () => {
       "018bcfe5-6800-7000-8000-000000000002",
     )).toBe(initialAccountLoginActionState);
   });
+
+  test("builds notification hours with the local policy revision, not a registry revision", () => {
+    expect(notificationHoursCommand({
+      endMinute: 1_320,
+      expectedRevision: 9,
+      startMinute: 600,
+      timeZone: "America/Puerto_Rico",
+      version: 1,
+    })).toMatchObject({ kind: "set_notification_hours", expectedRevision: 9 });
+    expect(() => notificationHoursCommand({
+      endMinute: 600,
+      expectedRevision: 9,
+      startMinute: 600,
+      timeZone: "America/Puerto_Rico",
+      version: 1,
+    })).toThrow();
+  });
+
+  test("strictly parses clock fields instead of normalizing malformed times", () => {
+    expect(parseNotificationClockMinute("00:00")).toBe(0);
+    expect(parseNotificationClockMinute("23:59")).toBe(1_439);
+    expect(parseNotificationClockMinute("00:60")).toBeNull();
+    expect(parseNotificationClockMinute("01:99")).toBeNull();
+    expect(parseNotificationClockMinute("24:00")).toBeNull();
+    expect(parseNotificationClockMinute("1:00")).toBeNull();
+  });
 });
 
 describe("session start targets", () => {
@@ -233,7 +264,7 @@ describe("session start targets", () => {
         accountPublicId: "acct_primary0001",
         deviceCommandsAllowed: true,
         machineLabel: "Studio",
-        machineOnline: false,
+        machineOnline: true,
         projects: [{ label: "Control plane", publicId: "proj_alpha000001" }],
         provider: "codex",
         targetDevicePublicId: "device_studio01",
@@ -243,6 +274,8 @@ describe("session start targets", () => {
 
   test("never offers a target the daemon would refuse", () => {
     expect(sessionStartTargets([machine({ deviceCommandsAllowed: false })])).toEqual([]);
+    expect(sessionStartTargets([machine({ deviceStatus: "revoked" })])).toEqual([]);
+    expect(sessionStartTargets([machine({ deviceStatus: null })])).toEqual([]);
     expect(sessionStartTargets([machine({ projects: [] })])).toEqual([]);
     expect(sessionStartTargets([machine({
       accounts: [
@@ -269,7 +302,7 @@ describe("session start targets", () => {
     });
     if (payload === null) throw new Error("registry fixture is not valid");
     const view = toMachineView({
-      device: null,
+      device: { online: false, status: "active" },
       devicePublicId: "device_older001",
       now,
       payload,
@@ -321,6 +354,8 @@ describe("device command notices", () => {
     expect(notice("failed", "ACCOUNT_LOGIN_NOT_AVAILABLE", "account_login_start")?.text)
       .toContain("only while that account is signed out");
     expect(notice("failed", "DEVICE_COMMAND_DAILY_CAP")?.text).toContain("daily limit");
+    expect(notice("failed", "LOCAL_NOTIFICATION_HOURS_REVISION_EXHAUSTED")?.text)
+      .toContain("revision limit");
     expect(notice("failed", "SOMETHING_NEW")?.text).toBe("The machine refused this request.");
   });
 

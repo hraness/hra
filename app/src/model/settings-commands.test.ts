@@ -12,6 +12,8 @@ import {
   isGatewayKeyShape,
   presetChoices,
   presetLabels,
+  sessionFastCommand,
+  sessionFastCommandNotice,
   settingsCommandLabel,
   showThinkingCommand,
   unarchiveSessionCommand,
@@ -55,6 +57,64 @@ describe("machine default builders", () => {
       expect(accepted(payload)).toEqual(payload);
       expect(presetLabels[preset].length).toBeGreaterThan(0);
     }
+  });
+
+  test("Fast is an explicit session command in both directions", () => {
+    for (const enabled of [true, false]) {
+      const payload = sessionFastCommand(enabled);
+      expect(payload).toEqual({ enabled, kind: "set_fast" });
+      expect(accepted(payload)).toEqual(payload);
+    }
+  });
+
+  test("Fast state is highlighted only after the exact command is applied", () => {
+    const record = (state: string, resultCode: string | null = null) => ({
+      resultCode,
+      state,
+    });
+
+    expect(sessionFastCommandNotice(null, true)).toBeNull();
+    expect(sessionFastCommandNotice(record("pending"), null)).toBeNull();
+    expect(sessionFastCommandNotice(record("pending"), true)).toEqual({
+      applied: false,
+      text: "Waiting for the machine to set Fast on.",
+    });
+    expect(sessionFastCommandNotice(record("effect_started"), false)).toEqual({
+      applied: false,
+      text: "Setting Fast off for future turns.",
+    });
+    expect(sessionFastCommandNotice(record("applied"), true)).toEqual({
+      applied: true,
+      text: "The machine applied Fast on for future turns.",
+    });
+  });
+
+  test("Fast failures and ambiguous outcomes never claim a selected value", () => {
+    const failed = sessionFastCommandNotice({ resultCode: "provider_unavailable", state: "failed" }, true);
+    expect(failed).toEqual({
+      applied: false,
+      text: "The machine refused the Fast change: provider_unavailable.",
+    });
+    expect(sessionFastCommandNotice({ resultCode: null, state: "ambiguous" }, false))
+      .toEqual({
+        applied: false,
+        text: "The machine could not confirm the Fast change. Check the session before trying again.",
+      });
+    expect(sessionFastCommandNotice({ resultCode: null, state: "expired" }, true)?.applied)
+      .toBe(false);
+    expect(sessionFastCommandNotice({ resultCode: null, state: "cancelled" }, true)?.applied)
+      .toBe(false);
+    expect(sessionFastCommandNotice({ resultCode: null, state: "future_state" }, true)?.applied)
+      .toBe(false);
+  });
+
+  test("preset labels name the actual model and effort", () => {
+    expect(presetLabels).toEqual({
+      "fable-max": "Fable Max",
+      high: "Sol Max",
+      low: "Luna Max",
+      ultra: "Sol Ultra",
+    });
   });
 
   test("unarchive is the session scoped archive command with archived false", () => {

@@ -1,5 +1,7 @@
 import { v } from "convex/values";
 
+import { cloudEnvelopeLimits } from "../src/domain/cloud-envelope-contract";
+
 export const authAttemptKind = v.union(v.literal("send"), v.literal("verify"));
 export const authSubjectStatus = v.union(v.literal("active"), v.literal("disabled"));
 export const authAdmissionState = v.union(v.literal("open"), v.literal("frozen"));
@@ -60,6 +62,7 @@ export const deviceCommandKind = v.union(
   v.literal("account_login_start"),
   v.literal("account_login_status"),
   v.literal("usage_refresh"),
+  v.literal("set_notification_hours"),
 );
 /*
  * A session command payload is one opaque encrypted envelope, so the hosted
@@ -71,7 +74,7 @@ export const deviceCommandKind = v.union(
  * spare. Raising the client bounds without raising this one produces a
  * rejected command, not a truncated one.
  */
-export const commandPayloadCiphertextCharacters = 350_000;
+export const commandPayloadCiphertextCharacters = cloudEnvelopeLimits.ciphertextCharacters;
 
 export const commandState = v.union(
   v.literal("pending"),
@@ -82,6 +85,52 @@ export const commandState = v.union(
   v.literal("ambiguous"),
   v.literal("cancelled"),
   v.literal("expired"),
+);
+export const attentionNotificationState = v.union(
+  v.literal("pending"),
+  v.literal("effect_started"),
+  v.literal("accepted"),
+  v.literal("refused"),
+  v.literal("ambiguous"),
+  v.literal("cancelled"),
+  v.literal("expired"),
+);
+export const attentionNotificationInteractionKind = v.union(
+  v.literal("command_approval"),
+  v.literal("file_change_approval"),
+  v.literal("permission_approval"),
+  v.literal("user_input"),
+  v.literal("mcp_elicitation"),
+);
+export const attentionNotificationRemoteAction = v.union(
+  v.literal("decline"),
+  v.literal("answer"),
+);
+export const attentionNotificationOutcomeCode = v.union(
+  v.literal("provider_accepted"),
+  v.literal("provider_refused"),
+  v.literal("retry_exhausted"),
+  v.literal("delivery_deadline_elapsed"),
+  v.literal("idempotency_mismatch"),
+  v.literal("unsettled_effect"),
+  v.literal("stored_delivery_corrupt"),
+);
+// Global notification delivery is disabled when this optional value is absent.
+// A disabled deployment retains its separate generation so a later enablement
+// can advance it instead of reviving rows from an earlier enabled interval.
+export const attentionNotificationServiceState = v.literal("enabled");
+export const attentionNotificationSuppressionReason = v.union(
+  v.literal("source_reconciled"),
+  v.literal("local_policy_changed"),
+  v.literal("global_disabled"),
+  v.literal("interaction_resolved"),
+  v.literal("deadline_expired"),
+  v.literal("account_deletion"),
+  v.literal("device_revoked"),
+  v.literal("consent_expired"),
+  v.literal("execution_authority_changed"),
+  v.literal("recipient_unavailable"),
+  v.literal("service_fault"),
 );
 export const accountBindingState = v.union(v.literal("present"), v.literal("removed"));
 export const usageAdmissionDisposition = v.union(
@@ -118,6 +167,7 @@ export const deviceRevocationCategory = v.union(
   v.literal("sessions"),
   v.literal("leases"),
   v.literal("commands"),
+  v.literal("notifications"),
   v.literal("bindings"),
   v.literal("custody"),
   v.literal("presence"),
@@ -166,6 +216,10 @@ export const maintenanceCategory = v.union(
   v.literal("pending_device_commands"),
   v.literal("device_command_login_results"),
   v.literal("terminal_device_commands"),
+  v.literal("pending_attention_notifications"),
+  v.literal("started_attention_notifications"),
+  v.literal("terminal_attention_notifications"),
+  v.literal("attention_notification_faults"),
   v.literal("security_events"),
   v.literal("usage_snapshots"),
   v.literal("account_deletion_receipts"),

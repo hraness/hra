@@ -5,12 +5,16 @@ import {
   decryptDeviceCommand,
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
+  decryptNotificationEmail,
+  decryptNotificationHours,
   decryptUsageProjection,
   decryptRemoteCommand,
   deviceCommandLimits,
   encryptDeviceCommand,
   encryptDeviceCommandResult,
   encryptDeviceRegistry,
+  encryptNotificationEmail,
+  encryptNotificationHours,
   encryptUsageProjection,
   encryptRemoteCommand,
   isRelayedLoginUserCode,
@@ -129,11 +133,17 @@ describe("closed encrypted payloads", () => {
 describe("remote decision payloads", () => {
   const interactionId = "0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b";
 
-  test("accepts once, decline, and cancel decisions and bounded answer maps", () => {
+  test("accepts legacy decisions plus exact nonempty single-answer maps", () => {
     expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 3, decision: "once" }))
       .toEqual({ decision: "once", interactionId, kind: "resolve_interaction", revision: 3 });
     expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 1, decision: "cancel" }))
       .toMatchObject({ decision: "cancel" });
+    expect(parseRemoteCommandPayload({
+      kind: "resolve_interaction",
+      interactionId,
+      revision: 2,
+      answers: {},
+    })).toBeNull();
     expect(parseRemoteCommandPayload({
       kind: "resolve_interaction",
       interactionId,
@@ -149,13 +159,171 @@ describe("remote decision payloads", () => {
     expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId: "int_1", revision: 1, decision: "once" })).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 0, decision: "once" })).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 1, decision: "once", answers: {} })).toBeNull();
-    expect(parseRemoteCommandPayload({ kind: "resolve_interaction", interactionId, revision: 1, answers: {} })).toBeNull();
+    for (const answers of [[], ["eu", "us"]]) {
+      expect(parseRemoteCommandPayload({
+        answers: { q1: { answers } },
+        interactionId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toBeNull();
+    }
+    expect(parseRemoteCommandPayload({
+      answers: { q1: { answers: [""] } },
+      interactionId,
+      kind: "resolve_interaction",
+      revision: 1,
+    })).toBeNull();
     expect(parseRemoteCommandPayload({
       kind: "resolve_interaction",
       interactionId,
       revision: 1,
-      answers: { q1: { answers: ["/opt/someone/secret"] } },
+      answers: { q1: { answers: [["", "opt", "someone", "secret"].join("/")] } },
     })).toBeNull();
+    for (const value of [
+      `ghp_${"x".repeat(24)}`,
+      `sk_${"x".repeat(24)}`,
+      ["Bearer", "abcdefghijklmnopqrstuvwxyz"].join(" "),
+    ]) {
+      expect(parseRemoteCommandPayload({
+        answers: { q1: { answers: [value] } },
+        interactionId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toBeNull();
+    }
+    expect(parseRemoteCommandPayload({
+      answers: { q1: { answers: ["😀".repeat(10_000)] } },
+      interactionId,
+      kind: "resolve_interaction",
+      revision: 1,
+    })).toBeNull();
+  });
+
+  test("refuses answer sets that cannot fit the hosted command envelope", async () => {
+    const answers = Object.fromEntries(Array.from({ length: 8 }, (_, index) => [
+      `field${String(index)}`,
+      { answers: ["€".repeat(16_384)] },
+    ]));
+    const oversized = {
+      answers,
+      interactionId,
+      kind: "resolve_interaction" as const,
+      revision: 1,
+    };
+    expect(parseRemoteCommandPayload(oversized)).toBeNull();
+    await expectPromiseToReject(
+      encryptRemoteCommand(oversized, randomKeyBytes(), {
+        entityPublicId: "command_12345678",
+        keyVersion: 1,
+        kind: "command",
+        userPublicId: "user_12345678",
+      }),
+      "Invalid remote command payload.",
+    );
+  });
+
+  test("fails closed when an untrusted command object has throwing accessors", () => {
+    const attack = Object.defineProperty({}, "kind", {
+      enumerable: true,
+      get(): never {
+        throw new Error("getter must not escape");
+      },
+    });
+    expect(parseRemoteCommandPayload(attack)).toBeNull();
+
+    const prototype = Object.prototype as Record<string, unknown>;
+    Object.defineProperty(prototype, "kind", {
+      configurable: true,
+      get(): never {
+        throw new Error("prototype getter must not escape");
+      },
+    });
+    let parsed: ReturnType<typeof parseRemoteCommandPayload> = null;
+    try {
+      parsed = parseRemoteCommandPayload({});
+    } finally {
+      delete prototype.kind;
+    }
+    expect(parsed).toBeNull();
+  });
+
+  test("never validates and then rereads a stateful answer accessor", () => {
+    let reads = 0;
+    const answerAttack = Object.defineProperty({}, "answers", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? ["safe"] : [["", "opt", "someone", "secret"].join("/")];
+      },
+    });
+    expect(parseRemoteCommandPayload({
+      answers: { q1: answerAttack },
+      interactionId,
+      kind: "resolve_interaction",
+      revision: 1,
+    })).toBeNull();
+    expect(reads).toBe(0);
+
+    const commandAttack = Object.defineProperty({
+      interactionId,
+      kind: "resolve_interaction",
+      revision: 1,
+    }, "answers", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return {
+          q1: {
+            answers: [reads === 1 ? "safe" : ["", "opt", "someone", "secret"].join("/")],
+          },
+        };
+      },
+    });
+    expect(parseRemoteCommandPayload(commandAttack)).toBeNull();
+    expect(reads).toBe(0);
+  });
+
+  test("canonicalizes answer maps and rejects hidden answer-map keys", () => {
+    const answers = Object.fromEntries([
+      ["__proto__", { answers: ["safe"] }],
+    ]);
+    const parsed = parseRemoteCommandPayload({
+      answers,
+      interactionId,
+      kind: "resolve_interaction",
+      revision: 1,
+    });
+    expect(parsed).toMatchObject({ kind: "resolve_interaction" });
+    if (parsed === null || !("answers" in parsed)) throw new Error("expected answers");
+    expect(Object.keys(parsed.answers)).toEqual(["__proto__"]);
+    expect(parsed.answers.__proto__).toEqual({ answers: ["safe"] });
+    expect(parsed.answers).not.toBe(answers);
+
+    const withSymbol = { q1: { answers: ["safe"] } } as Record<PropertyKey, unknown>;
+    withSymbol[Symbol("hidden")] = true;
+    expect(parseRemoteCommandPayload({
+      answers: withSymbol,
+      interactionId,
+      kind: "resolve_interaction",
+      revision: 1,
+    })).toBeNull();
+  });
+
+  test("returns optional command fields immune to ambient prototype values", () => {
+    const prototype = Object.prototype as Record<string, unknown>;
+    Object.defineProperty(prototype, "preset", {
+      configurable: true,
+      enumerable: true,
+      value: "ultra",
+    });
+    try {
+      const parsed = parseRemoteCommandPayload({ kind: "set_provider", provider: "codex" });
+      expect(parsed).not.toBeNull();
+      expect(parsed && Object.hasOwn(parsed, "preset")).toBe(false);
+      expect(parsed && "preset" in parsed ? parsed.preset : undefined).toBeUndefined();
+    } finally {
+      delete prototype.preset;
+    }
   });
 });
 
@@ -308,6 +476,10 @@ describe("device registry payloads", () => {
   test("refuses unknown versions, unknown keys, and out-of-range members", () => {
     expect(parseDeviceRegistryPayload({ ...registry, version: 2 })).toBeNull();
     expect(parseDeviceRegistryPayload({ ...registry, extra: true })).toBeNull();
+    // Email consent lives in its own revision-bearing envelope. Keeping this
+    // key out of the broad registry preserves the exact v1 contract for old
+    // readers that reject unknown members.
+    expect(parseDeviceRegistryPayload({ ...registry, attentionEmailEnabled: true })).toBeNull();
     expect(parseDeviceRegistryPayload({ ...registry, defaultPreset: "max" })).toBeNull();
     expect(parseDeviceRegistryPayload({ ...registry, defaultApprovalMode: "auto" })).toBeNull();
     expect(parseDeviceRegistryPayload({ ...registry, showThinkingDefault: "on" })).toBeNull();
@@ -332,6 +504,20 @@ describe("device registry payloads", () => {
       ...registry,
       projects: Array.from({ length: 201 }, () => registry.projects[0]),
     })).toBeNull();
+  });
+
+  test("takes one accessor-free snapshot before validating a registry", () => {
+    let getterCalls = 0;
+    const withGetter = { ...registry } as Record<string, unknown>;
+    Object.defineProperty(withGetter, "machineLabel", {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return getterCalls === 1 ? "Studio" : "/private/after-validation";
+      },
+    });
+    expect(parseDeviceRegistryPayload(withGetter)).toBeNull();
+    expect(getterCalls).toBe(0);
   });
 });
 
@@ -368,6 +554,14 @@ describe("device command payloads", () => {
     })).toEqual({ accountPublicId: "account_primary", kind: "account_login_status" });
     expect(parseDeviceCommandPayload({ kind: "usage_refresh" }))
       .toEqual({ kind: "usage_refresh" });
+    expect(parseDeviceCommandPayload({
+      endMinute: 1_320,
+      expectedRevision: 7,
+      kind: "set_notification_hours",
+      startMinute: 600,
+      timeZone: "America/Puerto_Rico",
+      version: 1,
+    })).toMatchObject({ kind: "set_notification_hours", expectedRevision: 7 });
   });
 
   test("refuses an extra key, a wrong scalar, and a session command kind", () => {
@@ -375,6 +569,11 @@ describe("device command payloads", () => {
     expect(parseDeviceCommandPayload({ ...sessionStart, preset: "fable-max" })).toBeNull();
     expect(parseDeviceCommandPayload({ ...sessionStart, provider: "gemini" })).toBeNull();
     expect(parseDeviceCommandPayload({ kind: "send_or_steer", message: "hello" })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      enabled: true,
+      expectedRevision: 1,
+      kind: "set_notification_email",
+    })).toBeNull();
     expect(parseDeviceCommandPayload({ kind: "account_login_status", accountPublicId: "a" }))
       .toBeNull();
     expect(parseDeviceCommandPayload({
@@ -382,6 +581,52 @@ describe("device command payloads", () => {
       handoffVersion: 1,
       kind: "account_login_start",
     })).toBeNull();
+    expect(parseDeviceCommandPayload({
+      endMinute: 600,
+      expectedRevision: 7,
+      kind: "set_notification_hours",
+      startMinute: 600,
+      timeZone: "America/Puerto_Rico",
+      version: 1,
+    })).toBeNull();
+  });
+
+  test("notification hours use their own AAD and strict v1 envelope", async () => {
+    const key = randomKeyBytes();
+    const authority = {
+      entityPublicId: "device_000000000001",
+      keyVersion: 1,
+      kind: "notification_hours",
+      userPublicId: "user_0000000000000001",
+    } as const;
+    const hours = { endMinute: 1_320, revision: 2, startMinute: 600, timeZone: "America/Puerto_Rico", version: 1 } as const;
+    const envelope = await encryptNotificationHours(hours, key, authority);
+    expect(await decryptNotificationHours(envelope, key, authority)).toEqual(hours);
+    await expectPromiseToReject(decryptNotificationHours(envelope, key, { ...authority, kind: "device_registry" }));
+    await expectPromiseToReject(encryptNotificationHours({ ...hours, version: 2 } as never, key, authority));
+  });
+
+  test("notification email uses its own AAD and strict revision-bearing envelope", async () => {
+    const key = randomKeyBytes();
+    const authority = {
+      entityPublicId: "device_000000000001",
+      keyVersion: 1,
+      kind: "notification_email",
+      userPublicId: "user_0000000000000001",
+    } as const;
+    const email = { enabled: true, revision: 2, version: 1 } as const;
+    const envelope = await encryptNotificationEmail(email, key, authority);
+    expect(await decryptNotificationEmail(envelope, key, authority)).toEqual(email);
+    await expectPromiseToReject(decryptNotificationEmail(
+      envelope,
+      key,
+      { ...authority, kind: "notification_hours" },
+    ));
+    await expectPromiseToReject(encryptNotificationEmail(
+      { ...email, revision: 0 },
+      key,
+      authority,
+    ));
   });
 
   test("never accepts a filesystem path as addressing or as a prompt", () => {

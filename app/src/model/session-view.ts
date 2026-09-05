@@ -7,9 +7,11 @@
  * table are all provable under `bun test ./app`.
  */
 import type {
-  CompactInteractionDecision,
   CompactInteractionKind,
-  CompactInteractionQuestion,
+  CompactRemoteInteractionAction,
+  CompactRemoteInteractionPolicy,
+  CompactRemoteInteractionQuestion,
+  CompactRemoteInteractionReasonCode,
   SessionStateValue,
 } from "../hra/cloud";
 
@@ -225,127 +227,113 @@ export const interactionKindLabel: Readonly<Record<CompactInteractionKind, strin
   });
 
 export type InteractionAffordance = Readonly<{
-  /** The questions this device may answer, in provider order. */
-  answerable: readonly CompactInteractionQuestion[];
-  /** The decision buttons this device may show, in display order. */
-  decisions: readonly CompactInteractionDecision[];
-  /** Questions that are shown but never given an input here. */
-  locked: readonly CompactInteractionQuestion[];
-  /** Why anything is withheld, for the "resolve on the machine" note. */
-  reasons: readonly string[];
+  /** Exact actions this reader may offer right now, in wire order. */
+  actions: readonly CompactRemoteInteractionAction[];
+  /** Exact projected questions, present only while `answer` is actionable. */
+  questions: readonly CompactRemoteInteractionQuestion[];
+  /** Why authority is absent or intentionally narrower than the local UI. */
+  reasonCodes: readonly InteractionAvailabilityReason[];
+  reachability: "machine_only" | "remote_available" | "remote_limited";
 }>;
 
-const decisionOrder: readonly CompactInteractionDecision[] = ["once", "decline"];
+export type InteractionAvailabilityReason =
+  | CompactRemoteInteractionReasonCode
+  | "REMOTE_POLICY_UNAVAILABLE";
 
-const orderedDecisions = (
-  offered: readonly CompactInteractionDecision[],
-  allowed: readonly CompactInteractionDecision[],
-): readonly CompactInteractionDecision[] =>
-  decisionOrder.filter((decision) =>
-    offered.includes(decision) && allowed.includes(decision));
+/** Exhaustive reader-safe copy for every shared policy reason. */
+export const interactionReasonCopy: Readonly<Record<InteractionAvailabilityReason, string>> =
+  Object.freeze({
+    COMMAND_APPROVAL_LOCAL_ONLY:
+      "Approving this command needs its complete protected authority on the machine.",
+    COMMAND_DECLINE_NOT_OFFERED: "The provider did not offer a decline action.",
+    FILE_CHANGE_APPROVAL_LOCAL_ONLY:
+      "Approving this file change needs the exact diff on the machine.",
+    FILE_CHANGE_DECLINE_NOT_OFFERED: "The provider did not offer a decline action.",
+    PERMISSION_APPROVAL_LOCAL_ONLY:
+      "Granting this permission needs its protected values on the machine.",
+    INTERACTION_EXPIRED: "The remote-action deadline has passed.",
+    INTERACTION_NOT_PENDING: "This request is no longer pending.",
+    INTERACTION_TIME_INVALID: "The request deadline could not be verified.",
+    MCP_FIELDS_MISSING: "The complete MCP form is unavailable here.",
+    MCP_ANSWER_LOCAL_ONLY:
+      "MCP form values stay on the machine because their sensitivity cannot be verified here.",
+    MCP_MODE_UNSUPPORTED: "This MCP interaction mode is completed on the machine.",
+    PERMISSION_REQUEST_EMPTY: "The permission request has no verifiable category.",
+    REMOTE_POLICY_UNAVAILABLE:
+      "This projection carries no remote-action policy understood by this reader.",
+    USER_INPUT_METADATA_UNPROJECTABLE: "The question cannot be represented exactly here.",
+    USER_INPUT_FREE_TEXT_LOCAL_ONLY: "Free-text answers stay on the machine.",
+    USER_INPUT_PROVIDER_CONTRACT_LOCAL_ONLY:
+      "The provider answer contract cannot be represented exactly here.",
+    USER_INPUT_SECRET_QUESTION: "A protected answer must be entered on the machine.",
+  });
 
 /**
- * What a browser may offer for a pending interaction.
- *
- * This is the mirror of `verifyRemoteInteraction` in
- * `src/cloud/daemon-adapters.ts`: a button appears only where the daemon would
- * accept the decision, so a reader is never offered an action that comes back
- * as a refusal code. The rules, and the projection field each one reads:
- *
- * - `command_approval` accepts `once` and `decline` from the provider's own
- *   `availableDecisions`, and `once` only while a `commandClass` is present:
- *   the daemon recomputes that class at apply time and refuses without one
- *   (`INTERACTION_COMMAND_CLASS_UNVERIFIED`).
- * - `file_change_approval` offers only a refusal. The pinned provider callback
- *   exposes no diff and no affected paths, so nothing this device could have
- *   read would justify accepting
- *   (`INTERACTION_FILE_CHANGE_ACCEPT_NOT_REMOTE`).
- * - `permission_approval` accepts `once` and `decline` only while a
- *   `commandClass` is present, which the daemon emits only when every
- *   requested category is recognisably workspace-local. A network, MCP, or
- *   unrecognised category carries no class and no button
- *   (`INTERACTION_PERMISSION_CLASS_UNVERIFIED`). The exact requested values
- *   never enter the projection either way.
- * - `user_input` and `mcp_elicitation` are answered by the provider's exact
- *   question ids, which the projection now carries. A question marked `secret`
- *   is listed so the reader knows what is being asked and is given no input:
- *   the daemon refuses a secret answer outright
- *   (`INTERACTION_SECRET_ANSWER_REFUSED`).
- *
- * An interaction projected by an older daemon carries none of these fields. It
- * gets no buttons and the note instead, which is the same answer this function
- * gives for anything the daemon would refuse.
+ * What this reader may offer for one pending interaction. The app does not
+ * reconstruct authority from the interaction kind. It consumes only the
+ * parser-validated v2 policy and applies a final local deadline suppression;
+ * the custodian daemon still recomputes the same policy before applying it.
+ * An old daemon, an unknown policy version, or an omitted policy fails closed.
  */
 export function interactionAffordance(
-  interaction: Readonly<{
-    availableDecisions: readonly CompactInteractionDecision[] | null;
-    commandClass: string | null;
-    interactionKind: CompactInteractionKind;
-    questions: readonly CompactInteractionQuestion[] | null;
-  }>,
+  remotePolicy: CompactRemoteInteractionPolicy | null,
+  now = Date.now(),
 ): InteractionAffordance {
-  const offered = interaction.availableDecisions ?? [];
-  const questions = interaction.questions ?? [];
-  const answerable = questions.filter((question) => !question.secret);
-  const locked = questions.filter((question) => question.secret);
-  const reasons: string[] = [];
-  switch (interaction.interactionKind) {
-    case "command_approval": {
-      const decisions = orderedDecisions(
-        offered,
-        interaction.commandClass === null ? ["decline"] : ["once", "decline"],
-      );
-      if (interaction.commandClass === null) {
-        reasons.push("Approving needs the command class, which this projection does not carry.");
-      }
-      if (decisions.length === 0) {
-        reasons.push("This request offers no decision that can be taken from here.");
-      }
-      return { answerable: [], decisions, locked: [], reasons };
-    }
-    case "file_change_approval": {
-      const decisions = orderedDecisions(offered, ["decline"]);
-      reasons.push("Approving a file change needs the exact diff, which stays on the machine.");
-      return { answerable: [], decisions, locked: [], reasons };
-    }
-    case "permission_approval": {
-      const decisions = interaction.commandClass === null
-        ? []
-        : orderedDecisions(offered, ["once", "decline"]);
-      if (interaction.commandClass === null) {
-        reasons.push("This permission request asks for a category outside the workspace, so it is decided on the machine.");
-      }
-      return { answerable: [], decisions, locked: [], reasons };
-    }
-    case "user_input": {
-      // The daemon requires an answer for every question the provider asked,
-      // so one secret question makes the whole set local: a partial answer
-      // would be refused and a complete one would carry the protected value.
-      const offerable = locked.length === 0 ? answerable : [];
-      if (offerable.length === 0) {
-        reasons.push("This question is answered on the machine running the session.");
-      }
-      if (locked.length > 0) {
-        reasons.push(locked.length === 1
-          ? "One answer is protected, so the whole question is answered there."
-          : `${String(locked.length)} answers are protected, so the whole question is answered there.`);
-      }
-      return { answerable: offerable, decisions: [], locked, reasons };
-    }
-    case "mcp_elicitation": {
-      // An MCP form leaves out the values it cannot carry: an optional field
-      // may go unanswered, so the text fields are still offered.
-      if (answerable.length === 0) {
-        reasons.push("This MCP form is completed on the machine running the session.");
-      }
-      return { answerable, decisions: [], locked, reasons };
-    }
+  if (remotePolicy === null) {
+    return {
+      actions: [],
+      questions: [],
+      reachability: "machine_only",
+      reasonCodes: ["REMOTE_POLICY_UNAVAILABLE"],
+    };
   }
+  if (now >= remotePolicy.deadlineAt) {
+    return {
+      actions: [],
+      questions: [],
+      reachability: "machine_only",
+      reasonCodes: [
+        "INTERACTION_EXPIRED",
+        ...remotePolicy.reasonCodes.filter((code) => code !== "INTERACTION_EXPIRED"),
+      ],
+    };
+  }
+  const actions = [...remotePolicy.actions];
+  const questions = actions.includes("answer") ? [...remotePolicy.questions] : [];
+  return {
+    actions,
+    questions,
+    reasonCodes: [...remotePolicy.reasonCodes],
+    reachability: actions.length === 0
+      ? "machine_only"
+      : remotePolicy.reasonCodes.length === 0
+        ? "remote_available"
+        : "remote_limited",
+  };
 }
 
 /** Whether this device can resolve the interaction at all. */
 export function interactionIsLocalOnly(affordance: InteractionAffordance): boolean {
-  return affordance.decisions.length === 0 && affordance.answerable.length === 0;
+  return affordance.reachability === "machine_only";
+}
+
+/** Stable React identity for draft and command state owned by one revision. */
+export function interactionInstanceKey(
+  interaction: Readonly<{ interactionId: string; revision: number }>,
+): string {
+  return `${interaction.interactionId}:${String(interaction.revision)}`;
+}
+
+/** A submitted command never follows the panel into another revision. */
+export function interactionCommandPublicId(
+  command: Readonly<{ interactionKey: string; publicId: string }> | null,
+  interaction: Readonly<{ interactionId: string; revision: number }> | null,
+): string | null {
+  return command !== null
+    && interaction !== null
+    && command.interactionKey === interactionInstanceKey(interaction)
+    ? command.publicId
+    : null;
 }
 
 /** The one-line `turn_summary` marker under a finished turn. */

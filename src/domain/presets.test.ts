@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   assertPresetSupportedByProvider,
+  defaultPresetForProvider,
   isPresetSupportedByProvider,
   PresetProviderMismatchError,
   presetForProviderTier,
@@ -19,6 +20,17 @@ describe("model presets and providers", () => {
     expect(providerSchema.options).toEqual(["codex", "claude"]);
     expect(presetsForProvider("codex")).toEqual(["low", "high", "ultra"]);
     expect(presetsForProvider("claude")).toEqual(["fable-max"]);
+  });
+
+  test("gives every provider one supported default without changing preset meanings", () => {
+    expect(defaultPresetForProvider("codex")).toBe("ultra");
+    expect(defaultPresetForProvider("claude")).toBe("fable-max");
+
+    for (const provider of providerSchema.options) {
+      const preset = defaultPresetForProvider(provider);
+      expect(presetProviders[preset]).toBe(provider);
+      expect(isPresetSupportedByProvider(provider, preset)).toBe(true);
+    }
   });
 
   test("refuses a preset the session's provider cannot run", () => {

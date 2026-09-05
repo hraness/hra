@@ -48,6 +48,8 @@ import {
   finishAccountLoginHandoff,
   initialAccountLoginActionState,
   type AccountLoginActionState,
+  notificationHoursCommand,
+  parseNotificationClockMinute,
 } from "../model/device-commands";
 import {
   approvalModeCommand,
@@ -70,6 +72,7 @@ import {
   accountRows,
   accountStatusLabels,
   allScheduledTasks,
+  attentionEmailPresentation,
   commandTargetForMachine,
   machineLabelsByDevice,
   shortSessionId,
@@ -224,6 +227,141 @@ function GatewayKeyForm({
   );
 }
 
+function formatClockMinute(minute: number): string {
+  return `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
+}
+
+/** Separate from session settings: this is a machine-addressed, local CAS command. */
+export function NotificationHoursForm({ machine }: Readonly<{ machine: MachineView }>) {
+  const submit = useSubmitDeviceCommand();
+  const notificationHours = machine.notificationHours;
+  const projectedStart = notificationHours === null
+    ? ""
+    : formatClockMinute(notificationHours.startMinute);
+  const projectedEnd = notificationHours === null
+    ? ""
+    : formatClockMinute(notificationHours.endMinute);
+  const projectedTimeZone = notificationHours?.timeZone ?? "";
+  const projectedRevision = notificationHours?.revision ?? null;
+  const [submittedRevision, setSubmittedRevision] = useState<number | null>(null);
+  const [enqueuePending, setEnqueuePending] = useState(false);
+  const enqueueStarted = useRef(false);
+  const [start, setStart] = useState(projectedStart);
+  const [end, setEnd] = useState(projectedEnd);
+  const [timeZone, setTimeZone] = useState(projectedTimeZone);
+  const [error, setError] = useState<string | null>(null);
+  const handleUnavailable = useCallback(() => {
+    setSubmittedRevision(null);
+    setError(deviceCommandCommittedRowUnavailableMessage);
+  }, []);
+  const { observation, setHandle: setCommandHandle } = useDeviceCommandTracker(
+    handleUnavailable,
+  );
+  const command = observation.record;
+  const enabled = notificationHours !== null
+    && machine.deviceCommandsAllowed
+    && machine.deviceStatus === "active";
+  const awaitingProjection = command?.state === "applied"
+    && submittedRevision !== null
+    && projectedRevision === submittedRevision;
+  const commandBusy = enqueuePending
+    || awaitingProjection
+    || (observation.status !== "idle"
+      && (command === null || !terminalCommandStates.has(command.state)));
+  const notice = awaitingProjection
+    ? { text: "Saved. Waiting for the machine view to refresh…", tone: "pending" as const }
+    : deviceCommandNotice(command);
+
+  useEffect(() => {
+    if (projectedRevision === null) return;
+    setStart(projectedStart);
+    setEnd(projectedEnd);
+    setTimeZone(projectedTimeZone);
+  }, [projectedEnd, projectedRevision, projectedStart, projectedTimeZone]);
+
+  const submitHours = (event: { preventDefault: () => void }) => {
+    event.preventDefault();
+    if (notificationHours === null || !enabled || commandBusy || enqueueStarted.current) return;
+    const startMinute = parseNotificationClockMinute(start);
+    const endMinute = parseNotificationClockMinute(end);
+    if (startMinute === null || endMinute === null) {
+      setError("Enter both times as valid local times.");
+      return;
+    }
+    let payload;
+    try {
+      payload = notificationHoursCommand({
+        endMinute,
+        expectedRevision: notificationHours.revision,
+        startMinute,
+        timeZone,
+        version: 1,
+      });
+    } catch {
+      setError("Choose a nonempty time range and a valid IANA time zone.");
+      return;
+    }
+    setError(null);
+    setCommandHandle(null);
+    setSubmittedRevision(notificationHours.revision);
+    enqueueStarted.current = true;
+    setEnqueuePending(true);
+    void submit({ payload, targetDevicePublicId: machine.devicePublicId })
+      .then((publicId) => {
+        setCommandHandle({ publicId, responseValidated: true });
+      })
+      .catch((failure: unknown) => {
+        if (failure instanceof DeviceCommandResponseInvalidError) {
+          setCommandHandle({
+            publicId: failure.commandPublicId,
+            responseValidated: false,
+          });
+          return;
+        }
+        setSubmittedRevision(null);
+        setError(failure instanceof Error ? failure.message : "The machine did not accept the request.");
+      })
+      .finally(() => {
+        enqueueStarted.current = false;
+        setEnqueuePending(false);
+      });
+  };
+
+  if (machine.notificationHours === null) {
+    return machine.notificationHoursStatus === "unreadable"
+      ? <p className="text-xs text-danger">This machine’s notification hours could not be read.</p>
+      : <p className="text-xs text-ink-muted">Unavailable on this machine’s current daemon.</p>;
+  }
+  const edit = (setter: (value: string) => void, value: string) => {
+    setCommandHandle(null);
+    setSubmittedRevision(null);
+    setError(null);
+    setter(value);
+  };
+  return (
+    <form className="flex flex-col gap-2" onSubmit={submitHours}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Input aria-label="Notification hours start" disabled={!enabled || commandBusy} onChange={(event) => edit(setStart, event.target.value)} type="time" value={start} />
+        <span className="text-xs text-ink-muted">to</span>
+        <Input aria-label="Notification hours end" disabled={!enabled || commandBusy} onChange={(event) => edit(setEnd, event.target.value)} type="time" value={end} />
+        <Input aria-label="Notification hours time zone" className="min-w-40 flex-1" disabled={!enabled || commandBusy} onChange={(event) => edit(setTimeZone, event.target.value)} value={timeZone} />
+        <Button disabled={!enabled || commandBusy} size="small" type="submit" variant="secondary">Save</Button>
+      </div>
+      <p className="text-xs text-ink-muted">Stored for future notification timing only. Notification delivery is not active, and approvals and autonomy do not read this schedule.</p>
+      {machine.deviceStatus === "active"
+        ? null
+        : <p className="text-xs text-attention">This device is not active, so its schedule is read-only.</p>}
+      {error === null ? null : <p className="text-xs text-danger" role="alert">{error}</p>}
+      {observation.protocolWarning === null ? null : (
+        <p className="text-xs text-danger" role="status">
+          {observation.protocolWarning}
+        </p>
+      )}
+      {notice === null ? null : <p className={notice.tone === "error" ? "text-xs text-danger" : "text-xs text-ink-muted"} role="status">{notice.text}</p>}
+    </form>
+  );
+}
+
 function MachineCard({
   machine,
   now,
@@ -231,6 +369,7 @@ function MachineCard({
 }: Readonly<{ machine: MachineView; now: number; target: CommandTarget | null }>) {
   const command = useSettingsCommand();
   const disabled = target === null || command.busy;
+  const attentionEmail = attentionEmailPresentation(machine);
 
   const send = (payload: RemoteCommandPayload) => {
     if (target === null) return;
@@ -250,8 +389,8 @@ function MachineCard({
       >
         {target === null ? (
           <p className="text-xs text-attention">
-            This machine has no live session, so a setting cannot be sent to it from the browser.
-            Change it on the machine, or start a session there first.
+            This machine has no live session, so session-routed settings cannot be sent from the browser.
+            Notification hours use a machine-addressed command and do not need a live session; change other settings on the machine or start a session first.
           </p>
         ) : null}
         <Notice>{command.notice}</Notice>
@@ -270,6 +409,24 @@ function MachineCard({
         description="The default for new sessions on this machine."
         title="Approval mode"
       />
+
+      <SettingsRow
+        description="The local time window for notifications on this machine."
+        title="Notification hours"
+      >
+        <NotificationHoursForm machine={machine} />
+      </SettingsRow>
+
+      <SettingsRow
+        control={<Badge tone={attentionEmail.tone}>{attentionEmail.label}</Badge>}
+        description={attentionEmail.description}
+        title="Attention email"
+      >
+        <p className="text-xs text-ink-muted">
+          Read-only here. This local opt-in does not by itself activate hosted delivery.
+        </p>
+        <CommandHint>hra notification-email status</CommandHint>
+      </SettingsRow>
 
       <SettingsRow
         control={(

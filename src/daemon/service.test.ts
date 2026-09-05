@@ -25,7 +25,11 @@ import {
   type CloudProjectionRecoveryJournalEntry,
 } from "../cloud/daemon-journal";
 import { renderSuccess } from "../cli/render";
-import { localCommandSchema, type LocalCommand } from "../domain/contracts";
+import {
+  localCommandSchema,
+  type LocalCommand,
+  type NotificationEmailHostedAuthority,
+} from "../domain/contracts";
 import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
@@ -426,6 +430,16 @@ class FakeDaemonAuthority {
 }
 
 class FakeCloud implements CloudControlPort {
+  attentionObservation: NotificationEmailHostedAuthority = { state: "not_observed" };
+  attentionInvalidation: Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  > | null = null;
+  beforeAttentionInvalidation?: (
+    input: Parameters<NonNullable<CloudControlPort[
+      "invalidateAttentionNotificationAuthority"
+    ]>>[0],
+  ) => Promise<void> | void;
   readonly projectionRecoveries: Array<{
     acknowledgeGap: true;
     idempotencyKey: string;
@@ -481,6 +495,21 @@ class FakeCloud implements CloudControlPort {
     return this.statusResult;
   }
   async sync(): Promise<unknown> { return { synced: true }; }
+  async observeAttentionNotificationAuthority(): Promise<NotificationEmailHostedAuthority> {
+    return this.attentionObservation;
+  }
+  async invalidateAttentionNotificationAuthority(input: Parameters<NonNullable<
+    CloudControlPort["invalidateAttentionNotificationAuthority"]
+  >>[0]): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    await this.beforeAttentionInvalidation?.(input);
+    if (this.attentionInvalidation === null) {
+      throw new Error("Fake hosted notification invalidation is unavailable.");
+    }
+    return this.attentionInvalidation;
+  }
   async isCompactProjectionRecoveryUnsettled(sessionPublicId: `sess_${string}`): Promise<boolean> {
     await this.beforeProjectionUnsettledSessionReturn?.(sessionPublicId);
     return this.projectionRecoveryBlocker === undefined
@@ -943,6 +972,286 @@ const renderJson = (command: LocalCommand, data: unknown): string => {
 };
 
 describe("HraService", () => {
+  test("reports and CAS-updates notification hours with the injected clock only", async () => {
+    let now = Date.parse("2026-09-04T12:30:00.000Z");
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => now,
+    );
+    const approvalBefore = await value.service.execute(
+      { kind: "autorespond.status" },
+      { signal },
+    );
+
+    expect(await value.service.execute({
+      kind: "notification-hours.set",
+      expectedRevision: 1,
+      version: 1,
+      startMinute: 10 * 60,
+      endMinute: 22 * 60,
+      timeZone: "UTC",
+    }, { signal })).toEqual({
+      policy: {
+        version: 1,
+        revision: 2,
+        startMinute: 10 * 60,
+        endMinute: 22 * 60,
+        timeZone: "UTC",
+      },
+      observedAt: now,
+      withinHours: true,
+    });
+
+    now = Date.parse("2026-09-04T22:00:00.000Z");
+    expect(await value.service.execute(
+      { kind: "notification-hours.status" },
+      { signal },
+    )).toEqual({
+      policy: {
+        version: 1,
+        revision: 2,
+        startMinute: 10 * 60,
+        endMinute: 22 * 60,
+        timeZone: "UTC",
+      },
+      observedAt: now,
+      withinHours: false,
+    });
+    expect(await value.service.execute(
+      { kind: "autorespond.status" },
+      { signal },
+    )).toEqual(approvalBefore);
+  });
+
+  test("maps a stale notification-hours revision to a closed conflict", async () => {
+    const value = await fixture();
+    const first = {
+      kind: "notification-hours.set",
+      expectedRevision: 1,
+      version: 1,
+      startMinute: 8 * 60,
+      endMinute: 20 * 60,
+      timeZone: "UTC",
+    } as const;
+    await value.service.execute(first, { signal });
+
+    await expect(value.service.execute({
+      ...first,
+      startMinute: 9 * 60,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      name: "CommandFailure",
+    });
+    expect(value.store.readNotificationHours()).toEqual({
+      version: 1,
+      revision: 2,
+      startMinute: 8 * 60,
+      endMinute: 20 * 60,
+      timeZone: "UTC",
+    });
+  });
+
+  test("keeps notification email local, default-off, and on the shared revision", async () => {
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 1_000);
+    expect(await value.service.execute(
+      { kind: "notification-email.status" },
+      { signal },
+    )).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: false, revision: 1, version: 1 },
+    });
+    expect(await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: true, revision: 2, version: 1 },
+    });
+    expect((await value.service.execute(
+      { kind: "notification-hours.status" },
+      { signal },
+    ) as { policy: { revision: number } }).policy.revision).toBe(2);
+
+    await value.service.execute({
+      kind: "notification-hours.set",
+      expectedRevision: 2,
+      version: 1,
+      startMinute: 480,
+      endMinute: 1_200,
+      timeZone: "UTC",
+    }, { signal });
+    expect(await value.service.execute(
+      { kind: "notification-email.status" },
+      { signal },
+    )).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: true, revision: 3, version: 1 },
+    });
+    expect(await value.service.execute({
+      expectedRevision: 3,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: false, revision: 4, version: 1 },
+    });
+  });
+
+  test("commits local disable before reporting hosted acknowledgement", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    cloud.beforeAttentionInvalidation = (input) => {
+      expect(value.store.readNotificationEmailPolicy()).toEqual({
+        enabled: false,
+        revision: 3,
+        version: 1,
+      });
+      expect(input.localNotificationPolicyRevision).toBe(3);
+    };
+    cloud.attentionInvalidation = {
+      acknowledgedAt: 61_000,
+      consentLeaseUntil: 61_000,
+      state: "acknowledged",
+    };
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: {
+        acknowledgedAt: 61_000,
+        consentLeaseUntil: 61_000,
+        state: "acknowledged",
+      },
+      policy: { enabled: false, revision: 3, version: 1 },
+    });
+  });
+
+  test("returns exact bounded hosted observations for status and enable", async () => {
+    const cloud = new FakeCloud();
+    cloud.attentionObservation = {
+      deviceAuthority: {
+        consentLeaseUntil: 180_000,
+        globalNotificationGeneration: 4,
+        localNotificationPolicyRevision: 1,
+      },
+      globalNotificationGeneration: 4,
+      globalState: "enabled",
+      observedAt: 60_000,
+      state: "observed",
+    };
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    expect(await value.service.execute(
+      { kind: "notification-email.status" },
+      { signal },
+    )).toEqual({
+      hostedAuthority: cloud.attentionObservation,
+      policy: { enabled: false, revision: 1, version: 1 },
+    });
+    expect(await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal })).toEqual({
+      hostedAuthority: cloud.attentionObservation,
+      policy: { enabled: true, revision: 2, version: 1 },
+    });
+    for (const attentionObservation of [
+      {
+        acknowledgedAt: 61_000,
+        consentLeaseUntil: 61_000,
+        state: "acknowledged" as const,
+      },
+      {
+        expiresNoLaterThan: 180_000,
+        state: "revocation_pending" as const,
+      },
+      { state: "not_observed" as const },
+    ]) {
+      cloud.attentionObservation = attentionObservation;
+      expect((await value.service.execute(
+        { kind: "notification-email.status" },
+        { signal },
+      ) as { hostedAuthority: unknown }).hostedAuthority).toEqual(attentionObservation);
+    }
+    cloud.attentionObservation = {
+      acknowledgedAt: 61_000,
+      consentLeaseUntil: 61_000,
+      state: "acknowledged",
+    };
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.enable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: true, revision: 3, version: 1 },
+    });
+  });
+
+  test("does not invent a revocation deadline when offline after the local commit", async () => {
+    const cloud = new FakeCloud();
+    cloud.beforeAttentionInvalidation = () => {
+      throw new Error("offline");
+    };
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: false, revision: 3, version: 1 },
+    });
+    expect(value.store.readNotificationEmailPolicy().enabled).toBe(false);
+  });
+
+  test("reports revocation pending only from an exact control receipt", async () => {
+    const cloud = new FakeCloud();
+    cloud.attentionInvalidation = {
+      expiresNoLaterThan: 180_000,
+      state: "revocation_pending",
+    };
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: cloud.attentionInvalidation,
+      policy: { enabled: false, revision: 3, version: 1 },
+    });
+  });
+
+  test("maps stale notification-email CAS without changing local authority", async () => {
+    const value = await fixture();
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    await expect(value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.disable",
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining("notification-email status"),
+      name: "CommandFailure",
+    });
+    expect(value.store.readNotificationEmailPolicy()).toEqual({
+      enabled: true,
+      revision: 2,
+      version: 1,
+    });
+  });
+
   test("sets the two device-command switches locally and reports them", async () => {
     const value = await fixture();
     expect(await value.service.execute({ kind: "remote.policy-status" }, { signal })).toEqual({
@@ -3678,10 +3987,24 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }]);
+      ).all()).toEqual([
+        { version: 25 },
+        { version: 26 },
+        { version: 27 },
+        { version: 28 },
+        { version: 29 },
+        { version: 30 },
+        { version: 31 },
+        { version: 32 },
+        { version: 33 },
+        { version: 34 },
+        { version: 35 },
+        { version: 36 },
+        { version: 37 },
+      ]);
     } finally {
       inspector.close(false);
     }

@@ -5,6 +5,12 @@ import { CODEX_PIN } from "../codex/pin";
 import { ATTACHMENT_MAX_COUNT } from "../domain/attachments";
 import type { LocalCommand } from "../domain/contracts";
 import { localCommandSchema } from "../domain/contracts";
+import { canonicalizeNotificationTimeZone } from "../domain/notification-hours";
+import {
+  DEFAULT_PROVIDER,
+  defaultPresetForProvider,
+  providerSchema,
+} from "../domain/presets";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
 import { createCloudUuidV7, isUuidV7 } from "../domain/uuid-v7";
 import { parseAuthCredentials } from "../cloud/authCredentials";
@@ -182,7 +188,7 @@ export type RemoteCliCommand =
   | Readonly<{ commandPublicId: string; kind: "remote.command" }>
   | Readonly<{ kind: "remote.send" | "remote.queue" | "remote.steer"; message: string; orSteer?: boolean; session: string }>
   | Readonly<{
-      decision: "once" | "decline" | "cancel";
+      decision: "once" | "decline";
       interaction: string;
       kind: "remote.resolve";
       revision: number;
@@ -224,6 +230,8 @@ Usage:
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
+  hra notification-hours status|set
+  hra notification-email status|enable|disable
   hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
   hra remote list|show|command|send|queue|steer|stop|resolve|preset|fast|allow|deny|policy
@@ -341,6 +349,30 @@ Usage:
 Examples:
   hra project add --path . --name jungle
   hra project use jungle`,
+  "notification-hours": `HRA notification hours
+
+Usage:
+  hra notification-hours status [--json]
+  hra notification-hours set --start <HH:MM> --end <HH:MM> --timezone <IANA-zone> --revision <n> [--json]
+
+Examples:
+  hra notification-hours status
+  hra notification-hours set --start 10:00 --end 22:00 --timezone America/Puerto_Rico --revision 1`,
+  "notification-email": `HRA attention email notifications
+
+Usage:
+  hra notification-email status [--json]
+  hra notification-email enable|disable --revision <n> [--json]
+
+The setting is local to this machine. Status and enable report only bounded
+hosted observations. Disable commits locally first, then reports whether hosted
+invalidation was acknowledged, remains pending under a returned receipt, or was
+not observed; it never claims recall of a delivery that already started.
+
+Examples:
+  hra notification-email status
+  hra notification-email enable --revision 1
+  hra notification-email disable --revision 2`,
   session: `HRA session
 Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
@@ -430,7 +462,7 @@ Usage:
   hra remote command <uuidv7>
   hra remote send|queue|steer <cloud-session> <message>
   hra remote stop <cloud-session>
-  hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <once|decline|cancel>
+  hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>
   hra remote preset <cloud-session> <low|high|ultra|fable-max>
   hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
   hra remote fast <cloud-session> <on|off>
@@ -698,6 +730,39 @@ const boundedDecimal = (
     throw new CliUsageError(`${label} must be an integer from ${String(minimum)} to ${String(maximum)}.`);
   }
   return parsed;
+};
+
+const notificationClockMinute = (
+  value: string | undefined,
+  optionName: "--start" | "--end",
+): number => {
+  if (value === undefined) throw new CliUsageError(`Missing notification-hours ${optionName}.`);
+  const match = /^(\d{2}):(\d{2})$/u.exec(value);
+  const hour = Number(match?.[1]);
+  const minute = Number(match?.[2]);
+  if (
+    match === null
+    || !Number.isInteger(hour)
+    || hour < 0
+    || hour > 23
+    || !Number.isInteger(minute)
+    || minute < 0
+    || minute > 59
+  ) {
+    throw new CliUsageError(`Notification-hours ${optionName} must use 24-hour HH:MM from 00:00 through 23:59.`);
+  }
+  return hour * 60 + minute;
+};
+
+const notificationTimeZone = (value: string | undefined): string => {
+  if (value === undefined) throw new CliUsageError("Missing notification-hours --timezone.");
+  try {
+    return canonicalizeNotificationTimeZone(value);
+  } catch {
+    throw new CliUsageError(
+      "Notification-hours --timezone must be a supported explicit IANA time zone.",
+    );
+  }
 };
 
 const utcRfc3339Milliseconds = (value: string | undefined, label: string): number | undefined => {
@@ -1287,13 +1352,12 @@ const parseSession = (
     }
     case "start": {
       const project = option(cursor, "--project");
-      const provider = option(cursor, "--provider") ?? "codex";
-      if (provider !== "codex" && provider !== "claude") {
+      const parsedProvider = providerSchema.safeParse(option(cursor, "--provider") ?? DEFAULT_PROVIDER);
+      if (!parsedProvider.success) {
         throw new CliUsageError("Provider must be `codex` or `claude`.");
       }
-      // The provider chooses the default preset, so an unchanged `hra session
-      // start` keeps its exact Codex behaviour.
-      const preset = option(cursor, "--preset") ?? (provider === "claude" ? "fable-max" : "high");
+      const provider = parsedProvider.data;
+      const preset = option(cursor, "--preset") ?? defaultPresetForProvider(provider);
       const fast = flag(cursor, "--fast");
       const account = take(cursor, "account");
       finish(cursor);
@@ -1718,8 +1782,10 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
       if (revisionValue === undefined || !/^[1-9]\d{0,15}$/u.test(revisionValue) || !Number.isSafeInteger(revision)) {
         throw new CliUsageError("Remote resolve requires --revision <positive integer>.");
       }
-      if (decision !== "once" && decision !== "decline" && decision !== "cancel") {
-        throw new CliUsageError("Remote resolve requires --decision once|decline|cancel.");
+      // `once` remains accepted for payload compatibility with older compact
+      // projections. Current remote policy only advertises actions it grants.
+      if (decision !== "once" && decision !== "decline") {
+        throw new CliUsageError("Remote resolve requires --decision decline.");
       }
       return { decision, interaction, kind: "remote.resolve", revision, session };
     }
@@ -1896,6 +1962,83 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       throw new CliUsageError("`autorespond default` clears a session override; pass --session <session>.");
     }
     return { kind: "command", command: { kind: "autorespond.set", mode, ...(session === undefined ? {} : { session }) }, json };
+  }
+  if (group === "notification-hours") {
+    if (idempotencyKey !== undefined) {
+      throw new CliUsageError("--idempotency-key is not supported by notification-hours commands.");
+    }
+    const action = take(cursor, "notification-hours action");
+    if (action === "status") {
+      finish(cursor);
+      return {
+        kind: "command",
+        command: { kind: "notification-hours.status" },
+        json,
+      };
+    }
+    if (action !== "set") {
+      throw new CliUsageError(
+        "Unknown notification-hours action. Use `status` or `set`.",
+      );
+    }
+    const startMinute = notificationClockMinute(option(cursor, "--start"), "--start");
+    const endMinute = notificationClockMinute(option(cursor, "--end"), "--end");
+    const timeZone = notificationTimeZone(option(cursor, "--timezone"));
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Notification-hours --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    finish(cursor);
+    return {
+      kind: "command",
+      command: command({
+        kind: "notification-hours.set",
+        expectedRevision,
+        version: 1,
+        startMinute,
+        endMinute,
+        timeZone,
+      }),
+      json,
+    };
+  }
+  if (group === "notification-email") {
+    if (idempotencyKey !== undefined) {
+      throw new CliUsageError("--idempotency-key is not supported by notification-email commands.");
+    }
+    const action = take(cursor, "notification-email action");
+    if (action === "status") {
+      finish(cursor);
+      return {
+        kind: "command",
+        command: { kind: "notification-email.status" },
+        json,
+      };
+    }
+    if (action !== "enable" && action !== "disable") {
+      throw new CliUsageError(
+        "Unknown notification-email action. Use `status`, `enable`, or `disable`.",
+      );
+    }
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "Notification-email --revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    finish(cursor);
+    return {
+      kind: "command",
+      command: {
+        expectedRevision,
+        kind: action === "enable"
+          ? "notification-email.enable"
+          : "notification-email.disable",
+      },
+      json,
+    };
   }
   let parsed: LocalCommand;
   let sessionAttach: readonly string[] = [];

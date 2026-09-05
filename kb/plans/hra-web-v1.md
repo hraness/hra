@@ -20,6 +20,8 @@ relations:
 
 Revision 2 folds in two adversarial reviews (security and custody; feasibility, cost, and UX) recorded at the end of this document.
 
+Authority update (2026-09-04): Phase 8A of [Model routing and bounded autonomy](model-routing-autonomy.md) supersedes every blind browser-approval statement in this proposal and its implementation log. Current remote interaction policy may decline an offered command, permission, or file-change request, and may answer only a provider-proven, non-secret closed-choice user question contract. All grants and accepts, free-text and Other responses, and MCP answers remain on the execution device.
+
 ## Owner decisions this plan encodes (2026-09-03)
 
 1. Hosted sync is **not invite-only**. Anyone can sign up with an email and a one-time code.

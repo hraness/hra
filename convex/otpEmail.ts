@@ -6,21 +6,10 @@ import {
   hraOtpEmailFrom,
   resolveHraOtpReplyTo,
 } from "./otpEmailConfig";
+import { requireHraResendApiKey } from "./resendApiKey";
 
 const resendEndpoint = "https://api.resend.com/emails";
 const deliveryTimeoutMs = 8_000;
-
-function requireResendApiKey(): string {
-  const value = process.env.HRA_RESEND_API_KEY;
-  if (
-    value === undefined
-    || !value.startsWith("re_")
-    || value.length < 8
-    || value.length > 512
-    || /\s/u.test(value)
-  ) throw new Error("Email delivery is unavailable.");
-  return value;
-}
 
 export type HraOtpEmailPayload = Readonly<{
   from: typeof hraOtpEmailFrom;
@@ -76,7 +65,7 @@ export async function sendOtpEmail(input: Readonly<{
     const response = await fetch(resendEndpoint, {
       body: JSON.stringify(body),
       headers: {
-        Authorization: `Bearer ${requireResendApiKey()}`,
+        Authorization: `Bearer ${requireHraResendApiKey()}`,
         "Content-Type": "application/json",
         "Idempotency-Key": await sha256Hex(
           `hra-control-plane-resend-otp:v1:${input.email}:${input.token}:${String(input.expiresAt)}`,

@@ -953,6 +953,40 @@ describe("pinned server requests and safe notifications", () => {
         { label: "\u0002", description: "Second control" },
       ],
     }])).toThrow("option labels must be unique");
+
+    const rawLabel = "😀".repeat(200);
+    const lossy = parseQuestions([{
+      ...question,
+      options: [{ label: rawLabel, description: "A multibyte choice" }],
+    }]);
+    if (lossy.display.kind !== "user_input") throw new Error("expected user input");
+    const projected = lossy.display.questions[0];
+    const projectedLabel = projected?.options?.[0]?.label;
+    expect(projectedLabel).toBeDefined();
+    expect(projectedLabel).not.toBe(rawLabel);
+    expect(projected?.remoteAnswerable).toBeUndefined();
+    expect(() => compileCodexInteractionResponse({
+      method: "item/tool/requestUserInput",
+      kind: lossy.kind,
+      privateParams: lossy.privateParams,
+      resolution: {
+        answers: { confirm: { answers: [projectedLabel ?? ""] } },
+        kind: "user_answers",
+      },
+    })).toThrow("requested choices");
+
+    const exact = parseQuestions([question]);
+    if (exact.display.kind !== "user_input") throw new Error("expected user input");
+    expect(exact.display.questions[0]?.remoteAnswerable).toBe(true);
+    expect(compileCodexInteractionResponse({
+      method: "item/tool/requestUserInput",
+      kind: exact.kind,
+      privateParams: exact.privateParams,
+      resolution: {
+        answers: { confirm: { answers: ["Yes"] } },
+        kind: "user_answers",
+      },
+    })).toEqual({ answers: { confirm: { answers: ["Yes"] } } });
   });
 
   test("caps valid provider auto-resolution intervals and rejects malformed authority", () => {

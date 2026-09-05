@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 
+import {
+  attentionNotificationFaultSlotsPerDelivery,
+  maximumAttentionNotificationDeliveryAttempts,
+} from "./attentionNotificationControl";
 import schema from "./schema";
 import { DETAIL_CHUNK_RETENTION, HOSTED_TABLE_LIFECYCLE } from "./lifecyclePolicy";
 import { QUOTA_GENESIS_CHARGED_TABLES, USER_QUOTA_RESOURCES, USER_RESOURCE_QUOTAS } from "./quota";
@@ -26,6 +30,67 @@ describe("hosted schema invariants", () => {
     }).passthrough().parse(tables.authVerifiers);
     const indexes = table.indexes.map((index) => index.indexDescriptor);
     expect(indexes).toContain("sessionId");
+  });
+
+  test("attention notifications have every bounded lifecycle traversal index", () => {
+    const tables = (schema as unknown as {
+      readonly tables: Readonly<Record<string, unknown>>;
+    }).tables;
+    const table = z.object({
+      indexes: z.array(z.object({ indexDescriptor: z.string() }).passthrough()),
+    }).passthrough().parse(tables.attentionNotificationOutbox);
+    const indexes = table.indexes.map((index) => index.indexDescriptor);
+    for (const expected of [
+      "by_delivery_id",
+      "by_delivery_leader_row_id",
+      "by_fault_capacity_anchor",
+      "by_source_device_and_claimed_at",
+      "by_source_device_nonterminal_and_revocation",
+      "by_source_device_and_reconciliation",
+      "by_state_and_claim_deadline",
+      "by_state_and_cleanup_after",
+      "by_state_and_coalesce_after",
+      "by_state_and_delivery_deadline",
+      "by_state_and_next_attempt_at",
+      "by_user",
+      "by_user_and_interaction",
+      "by_user_and_claimed_at",
+      "by_user_state_and_coalesce_after",
+      "by_user_source_session_and_interaction",
+    ]) expect(indexes).toContain(expected);
+    expect(HOSTED_TABLE_LIFECYCLE.attentionNotificationOutbox).toEqual({
+      deletionOrder: 10,
+      disposition: "erase",
+      owner: "user",
+      quota: "command",
+      retention: "attention_notification_7d",
+    });
+    expect(USER_QUOTA_RESOURCES).toContain("nonterminal_command");
+
+    const faultTable = z.object({
+      indexes: z.array(z.object({ indexDescriptor: z.string() }).passthrough()),
+    }).passthrough().parse(tables.attentionNotificationSafetyFaults);
+    const faultIndexes = faultTable.indexes.map((index) => index.indexDescriptor);
+    for (const expected of [
+      "by_anchor_and_slot",
+      "by_cleanup_row",
+      "by_delivery_and_state",
+      "by_fault_id",
+      "by_identity",
+      "by_reason_quarantine_state_and_observed_at",
+      "by_state_and_cleanup_after",
+      "by_state_and_observed_at",
+      "by_user",
+    ]) expect(faultIndexes).toContain(expected);
+    expect(HOSTED_TABLE_LIFECYCLE.attentionNotificationSafetyFaults).toEqual({
+      deletionOrder: 10,
+      disposition: "expire",
+      owner: "service",
+      quota: "security",
+      retention: "attention_notification_7d",
+    });
+    expect(attentionNotificationFaultSlotsPerDelivery)
+      .toBe(maximumAttentionNotificationDeliveryAttempts + 1);
   });
 
   test("immutable compact history is erased only through whole-account deletion", () => {

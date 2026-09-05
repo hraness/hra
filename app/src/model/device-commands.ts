@@ -4,6 +4,7 @@ import {
   parseDeviceCommandPayload,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
+  type NotificationHoursUpdate,
 } from "../hra/cloud";
 import type { MachineView } from "./settings-view";
 
@@ -186,6 +187,24 @@ export function usageRefreshCommand(): DeviceCommandPayload {
   return build({ kind: "usage_refresh" });
 }
 
+/** Strictly parses the browser's `HH:MM` value without normalizing bad fields. */
+export function parseNotificationClockMinute(value: string): number | null {
+  const match = /^(\d{2}):(\d{2})$/u.exec(value);
+  if (match === null) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59
+    ? hour * 60 + minute
+    : null;
+}
+
+/** Machine-local policy revision, deliberately never a registry row revision. */
+export function notificationHoursCommand(input: NotificationHoursUpdate & Readonly<{
+  expectedRevision: number;
+}>): DeviceCommandPayload {
+  return build({ ...input, kind: "set_notification_hours" });
+}
+
 /**
  * Every account a browser could start a session on, paired with the machine
  * that owns it and that machine's projects. An account that is not signed in,
@@ -197,6 +216,7 @@ export function sessionStartTargets(
 ): readonly SessionStartTarget[] {
   const targets: SessionStartTarget[] = [];
   for (const machine of machines) {
+    if (machine.deviceStatus !== "active") continue;
     if (!machine.deviceCommandsAllowed) continue;
     if (machine.projects.length === 0) continue;
     for (const account of machine.accounts) {
@@ -239,6 +259,10 @@ const refusalNotices: Readonly<Record<string, string>> = {
   DEVICE_COMMAND_PROJECT_UNKNOWN: "That machine no longer has that project.",
   DEVICE_COMMAND_PROVIDER_UNSUPPORTED: "That account is not the provider this request named.",
   REQUESTING_DEVICE_INACTIVE: "This device is no longer active on the account.",
+  LOCAL_NOTIFICATION_HOURS_REVISION_CONFLICT:
+    "Notification hours changed on the machine. Refresh and try again.",
+  LOCAL_NOTIFICATION_HOURS_REVISION_EXHAUSTED:
+    "Notification hours reached their local revision limit and cannot be updated.",
 };
 
 /**

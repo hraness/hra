@@ -12,6 +12,7 @@ import {
   type ActiveCloudIdentity,
   type CloudCommandExecutorPort,
   type CloudDaemonIdentityPort,
+  type CloudDeviceRegistryProjection,
   type CloudDeviceCommandExecutionResult,
   type CloudDeviceCommandExecutorPort,
   type CloudDaemonLocalSourcePort,
@@ -63,6 +64,7 @@ import {
 import {
   decryptDeviceRegistry,
   decryptDeviceCommandResult,
+  decryptNotificationEmail,
   encryptDeviceCommand,
   encryptDeviceCommandResult,
   encryptRemoteCommand,
@@ -5247,13 +5249,30 @@ describe("device registry publication", () => {
     version: 1,
   } as const;
 
-  function registryWorld(readDeviceRegistry: () => Promise<DeviceRegistryPayload>) {
+  function registryWorld(
+    readDeviceRegistry: () => Promise<DeviceRegistryPayload>,
+    readNotificationHours?: () => Promise<Readonly<{
+      endMinute: number; revision: number; startMinute: number; timeZone: string; version: 1;
+    }>>,
+    readDeviceRegistryProjection?: () => Promise<CloudDeviceRegistryProjection>,
+  ) {
     const cloud = new FakeCloud();
     const device = "device_registry_1";
     const inner = cloud.connect(device);
-    const rows = new Map<string, Readonly<{ envelope: EncryptedEnvelope; keyVersion: number; revision: number }>>();
+    const rows = new Map<string, Readonly<{
+      envelope: EncryptedEnvelope;
+      keyVersion: number;
+      notificationEmailEnvelope?: EncryptedEnvelope;
+      notificationHoursEnvelope?: EncryptedEnvelope;
+      notificationPolicyRevision?: number;
+      revision: number;
+    }>>();
     const writes: Array<Readonly<{ expectedRevision: number }>> = [];
-    const local: CloudDaemonLocalSourcePort = Object.assign(new EmptyLocal(), { readDeviceRegistry });
+    const local: CloudDaemonLocalSourcePort = Object.assign(new EmptyLocal(), {
+      readDeviceRegistry,
+      ...(readNotificationHours === undefined ? {} : { readNotificationHours }),
+      ...(readDeviceRegistryProjection === undefined ? {} : { readDeviceRegistryProjection }),
+    });
     const transport: CloudTransport = {
       action: (name, args) => inner.action(name, args),
       mutation: async (name, args) => {
@@ -5268,6 +5287,15 @@ describe("device registry publication", () => {
         rows.set(device, {
           envelope: args.envelope as unknown as EncryptedEnvelope,
           keyVersion: args.keyVersion as number,
+          ...(args.notificationEmailEnvelope === undefined
+            ? {}
+            : { notificationEmailEnvelope: args.notificationEmailEnvelope as EncryptedEnvelope }),
+          ...(args.notificationHoursEnvelope === undefined
+            ? {}
+            : { notificationHoursEnvelope: args.notificationHoursEnvelope as EncryptedEnvelope }),
+          ...(args.notificationPolicyRevision === undefined
+            ? {}
+            : { notificationPolicyRevision: args.notificationPolicyRevision as number }),
           revision,
         });
         return { devicePublicId: device, revision, updatedAt: cloud.now };
@@ -5324,6 +5352,110 @@ describe("device registry publication", () => {
     expect((await daemon.cycle(signal)).errors).toEqual([]);
     expect(world.writes).toHaveLength(3);
     expect(world.rows.get(world.device)?.revision).toBe(3);
+  });
+
+  test("publishes hours with the registry and makes an older source clear the outer envelope", async () => {
+    const hours = { endMinute: 1_320, revision: 3, startMinute: 600, timeZone: "America/Puerto_Rico", version: 1 } as const;
+    const world = registryWorld(
+      () => Promise.resolve({ ...registry, heartbeatAt: 1_000 }),
+      () => Promise.resolve(hours),
+    );
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, now: () => world.cloud.now, transport: world.transport });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const stored = world.rows.get(world.device);
+    expect(stored?.notificationHoursEnvelope).toBeDefined();
+    // A source with no method models a daemon deployed before this capability.
+    const old = registryWorld(() => Promise.resolve({ ...registry, heartbeatAt: 2_000 }));
+    old.rows.set(old.device, stored as NonNullable<typeof stored>);
+    const oldDaemon = bridge({ cloud: old.cloud, device: old.device, local: old.local, now: () => old.cloud.now, transport: old.transport });
+    expect((await oldDaemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    expect(old.rows.get(old.device)?.notificationHoursEnvelope).toBeUndefined();
+  });
+
+  test("publishes email consent only from a coherent composite projection", async () => {
+    const hours = { endMinute: 1_320, revision: 3, startMinute: 600, timeZone: "America/Puerto_Rico", version: 1 } as const;
+    const email = { enabled: true, revision: 3, version: 1 } as const;
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      () => Promise.resolve({
+        notificationEmail: email,
+        notificationHours: hours,
+        notificationPolicyRevision: 3,
+        registry: payload,
+      }),
+    );
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, now: () => world.cloud.now, transport: world.transport });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const stored = world.rows.get(world.device);
+    expect(stored?.notificationEmailEnvelope).toBeDefined();
+    expect(stored?.notificationHoursEnvelope).toBeDefined();
+    expect(stored?.notificationPolicyRevision).toBe(3);
+    expect(await decryptNotificationEmail(
+      stored?.notificationEmailEnvelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "notification_email",
+        userPublicId,
+      },
+    )).toEqual(email);
+    expect(await decryptDeviceRegistry(
+      stored?.envelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "device_registry",
+        userPublicId,
+      },
+    )).toEqual(payload);
+  });
+
+  test("refuses a mismatched composite projection before a hosted write", async () => {
+    const payload = { ...registry, heartbeatAt: 1_000 } as const;
+    const world = registryWorld(
+      () => Promise.resolve(payload),
+      undefined,
+      () => Promise.resolve({
+        notificationEmail: { enabled: true, revision: 3, version: 1 },
+        notificationHours: { endMinute: 1_320, revision: 4, startMinute: 600, timeZone: "UTC", version: 1 },
+        notificationPolicyRevision: 3,
+        registry: payload,
+      }),
+    );
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, now: () => world.cloud.now, transport: world.transport });
+    expect((await daemon.cycle(new AbortController().signal)).errors)
+      .toEqual(["device registry: Local notification policy projection is incoherent."]);
+    expect(world.writes).toEqual([]);
+  });
+
+  test("keeps the broad registry byte-compatible and clears email fields for a legacy source", async () => {
+    const world = registryWorld(() => Promise.resolve({ ...registry, heartbeatAt: 1_000 }));
+    world.rows.set(world.device, {
+      envelope: { algorithm: "A256GCM", ciphertext: "AAAA", keyVersion: 1, nonce: "BBBB" },
+      keyVersion: 1,
+      notificationEmailEnvelope: { algorithm: "A256GCM", ciphertext: "AAAA", keyVersion: 1, nonce: "BBBB" },
+      notificationPolicyRevision: 2,
+      revision: 1,
+    });
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, now: () => world.cloud.now, transport: world.transport });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    const stored = world.rows.get(world.device);
+    expect(stored?.notificationEmailEnvelope).toBeUndefined();
+    expect(stored?.notificationPolicyRevision).toBeUndefined();
+    expect(await decryptDeviceRegistry(
+      stored?.envelope as EncryptedEnvelope,
+      key,
+      {
+        entityPublicId: world.device,
+        keyVersion: 1,
+        kind: "device_registry",
+        userPublicId,
+      },
+    )).toEqual({ ...registry, heartbeatAt: 1_000 });
   });
 
   test("reports a registry failure without stopping the cycle and recovers the server revision", async () => {

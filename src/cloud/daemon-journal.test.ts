@@ -544,8 +544,19 @@ describe("cloud daemon journal", () => {
   test("crash-journals only the bounded public interaction baseline exactly", () => {
     const baselineInteraction = {
       blocking: true,
+      detailMarkdown: "- Resolve this interaction on the machine.",
+      detailVersion: 2,
+      headline: "Interaction no longer accepts a response",
       interactionId: "70000000-0000-4000-8000-000000000001",
       interactionKind: "mcp_elicitation",
+      label: "MCP form",
+      remotePolicy: {
+        actions: [],
+        deadlineAt: fixedNow + 60_000,
+        questions: [],
+        reasonCodes: ["INTERACTION_NOT_PENDING"],
+        version: 2,
+      },
       revision: 2,
       state: "expired",
       summary: "Interaction state updated",

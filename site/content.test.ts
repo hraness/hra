@@ -485,9 +485,9 @@ describe("public content contract", () => {
       "hra remote command <uuidv7>",
       "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
       "--idempotency-key <current-uuidv7>",
-      "includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary",
-      "A pending command or file-change approval can be decided from another device with",
-      "Session scope and secret answers never travel remotely.",
+      "includes interaction events with a public interaction ID, kind, state, revision, blocking status, bounded safe summary, and a nested version 2 remote policy",
+      "Another device may decline a pending command, permission, or file-change request with",
+      "every MCP answer stays on the execution machine",
       "Transcript upload is bound to a durable local stream ledger",
       "HRA never resets, aliases, overwrites, or destructively reseeds encrypted history.",
       "hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
@@ -805,7 +805,7 @@ describe("public content contract", () => {
       expect(surface).toContain("anchored when the provider delivered it");
       expect(surface).toContain("caps the pending interval at 30 minutes");
       expect(surface).toContain("never invents an answer or grant");
-      expect(surface).toContain("encrypted remote interaction metadata does not include it");
+      expect(surface).toContain("nested remote policy version 2 carries the same absolute deadline");
     }
   });
 

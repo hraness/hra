@@ -4,12 +4,14 @@ import fc from "fast-check";
 import { containsAbsolutePath, redactAbsolutePaths } from "./contracts";
 import { randomKeyBytes } from "./crypto";
 import {
+  compactInteractionDetailOf,
   decryptCompactEvents,
   decryptDetailEvents,
   detailProjectionIsSafe,
   encryptCompactEvents,
   encryptDetailEvents,
   isProjectRelativePath,
+  parseCompactSessionEvent,
   parseCompactSessionEvents,
   parseDetailSessionEvents,
 } from "./projection";
@@ -167,6 +169,112 @@ describe("encrypted session projections", () => {
     }])).toBeNull();
   });
 
+  test("fails closed when an untrusted compact event has throwing accessors", () => {
+    const attack = Object.defineProperty({}, "kind", {
+      enumerable: true,
+      get(): never {
+        throw new Error("getter must not escape");
+      },
+    });
+    expect(parseCompactSessionEvent(attack)).toBeNull();
+    expect(parseCompactSessionEvents([attack])).toBeNull();
+  });
+
+  test("never validates and then rereads stateful projected detail accessors", () => {
+    let reads = 0;
+    const deadlineAttack = Object.defineProperty({
+      blocking: true,
+      interactionId: "70000000-0000-4000-8000-000000000001",
+      interactionKind: "user_input",
+      kind: "interaction_state",
+      revision: 1,
+      sequence: 1,
+      state: "pending",
+      summary: "Codex asks for input",
+    }, "deadlineAt", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? Date.now() + 60_000 : Number.NaN;
+      },
+    });
+    expect(parseCompactSessionEvent(deadlineAttack)).toBeNull();
+    expect(reads).toBe(0);
+
+    const questionAttack = Object.defineProperty({
+      id: "region",
+      kind: "user_text",
+      label: "Region",
+      secret: false,
+    }, "header", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? "Deployment" : ["", "opt", "someone", "secret"].join("/");
+      },
+    });
+    expect(parseCompactSessionEvents([{
+      blocking: true,
+      interactionId: "70000000-0000-4000-8000-000000000001",
+      interactionKind: "user_input",
+      kind: "interaction_state",
+      questions: [questionAttack],
+      revision: 1,
+      sequence: 1,
+      state: "pending",
+      summary: "Codex asks for input",
+    }])).toBeNull();
+    expect(reads).toBe(0);
+  });
+
+  test("never inherits remote authority from a polluted object prototype", () => {
+    const prototype = Object.prototype as Record<string, unknown>;
+    Object.defineProperties(prototype, {
+      detailVersion: { configurable: true, value: 2 },
+      remotePolicy: {
+        configurable: true,
+        value: {
+          actions: ["answer"],
+          deadlineAt: Date.now() + 60_000,
+          questions: [{
+            allowsOther: false,
+            header: "Region",
+            id: "region",
+            kind: "user_input",
+            options: [{ description: "Primary", label: "East" }],
+            question: "Which region?",
+          }],
+          reasonCodes: [],
+          version: 2,
+        },
+      },
+    });
+    let parsed: ReturnType<typeof parseCompactSessionEvent> = null;
+    try {
+      const detailFree = {
+        blocking: true,
+        interactionId: "70000000-0000-4000-8000-000000000001",
+        interactionKind: "user_input",
+        kind: "interaction_state",
+        revision: 1,
+        sequence: 1,
+        state: "pending",
+        summary: "Codex asks for input",
+      } as const;
+      expect(compactInteractionDetailOf(detailFree)).toEqual({});
+      parsed = parseCompactSessionEvent(detailFree);
+      expect(parsed).not.toBeNull();
+      expect(parsed && Object.hasOwn(parsed, "remotePolicy")).toBe(false);
+      expect(parsed && parsed.kind === "interaction_state" ? parsed.remotePolicy : undefined)
+        .toBeUndefined();
+    } finally {
+      delete prototype.detailVersion;
+      delete prototype.remotePolicy;
+    }
+    expect(parsed).not.toBeNull();
+    expect(parsed && "remotePolicy" in parsed).toBe(false);
+  });
+
   test("carries bounded interaction detail and refuses a path or secret shaped one", () => {
     const base = {
       blocking: true,
@@ -201,7 +309,7 @@ describe("encrypted session projections", () => {
 
     // An older reader ignores the whole block; a newer one that does not know
     // the revision must ignore it too rather than misread a field.
-    expect(parseCompactSessionEvents([{ ...detailed, detailVersion: 2 }])).toEqual([base]);
+    expect(parseCompactSessionEvents([{ ...detailed, detailVersion: 3 }])).toEqual([base]);
 
     // Path-shaped and secret-shaped detail is refused outright: the emitter
     // redacts before it writes, so a value that reaches here unredacted is a
@@ -260,6 +368,211 @@ describe("encrypted session projections", () => {
       base,
       { ...detailed, hypotheticalFutureField: true, sequence: 2 },
     ])).toEqual([base, { ...detailed, sequence: 2 }]);
+  });
+
+  test("parses strict v2 remote policy and fails closed across version and coherence edges", () => {
+    const base = {
+      blocking: true,
+      interactionId: "70000000-0000-4000-8000-000000000011",
+      interactionKind: "command_approval",
+      kind: "interaction_state",
+      revision: 4,
+      sequence: 1,
+      state: "pending",
+      summary: "Codex requests command approval",
+    } as const;
+    const remotePolicy = {
+      actions: ["decline"],
+      deadlineAt: 2_000_000_000_000,
+      questions: [],
+      reasonCodes: ["COMMAND_APPROVAL_LOCAL_ONLY"],
+      version: 2,
+    } as const;
+    const detailed = {
+      ...base,
+      detailMarkdown: "- Runs: git commit\n- Directory: src/cloud",
+      detailVersion: 2,
+      headline: "Allow git commit",
+      label: "Command approval",
+      remotePolicy,
+    } as const;
+    expect(parseCompactSessionEvents([detailed])).toEqual([detailed]);
+
+    // An unknown nested policy revision retains safe presentation but grants
+    // no action. An unknown detail revision drops every detail field.
+    expect(parseCompactSessionEvents([{
+      ...detailed,
+      remotePolicy: { future: "ignored", version: 1 },
+    }])).toEqual([{
+      ...base,
+      detailMarkdown: detailed.detailMarkdown,
+      detailVersion: 2,
+      headline: detailed.headline,
+      label: detailed.label,
+    }]);
+    expect(parseCompactSessionEvents([{
+      ...detailed,
+      detailVersion: 99,
+      remotePolicy: { version: 99 },
+    }])).toEqual([base]);
+
+    for (const malformed of [
+      { ...detailed, availableDecisions: ["once"] },
+      { ...detailed, commandClass: "git commit" },
+      { ...detailed, questions: [] },
+      { ...detailed, remotePolicy: undefined },
+      { ...detailed, remotePolicy: { ...remotePolicy, actions: ["answer", "decline"] } },
+      { ...detailed, remotePolicy: { ...remotePolicy, actions: ["decline", "decline"] } },
+      { ...detailed, remotePolicy: { ...remotePolicy, actions: ["cancel"] } },
+      { ...detailed, remotePolicy: { ...remotePolicy, commandClass: "git commit" } },
+      { ...detailed, remotePolicy: { ...remotePolicy, questions: [{ kind: "mcp_string" }] } },
+      { ...detailed, remotePolicy: { ...remotePolicy, reasonCodes: ["FUTURE_REASON"] } },
+      {
+        ...detailed,
+        remotePolicy: { ...remotePolicy, reasonCodes: ["USER_INPUT_METADATA_UNPROJECTABLE"] },
+      },
+      { ...detailed, remotePolicy: { ...remotePolicy, unexpected: true } },
+      { ...detailed, remotePolicy: { ...remotePolicy, reasonCodes: [] } },
+    ]) expect(parseCompactSessionEvents([malformed])).toBeNull();
+
+    const userQuestion = {
+      allowsOther: false,
+      header: "Region",
+      id: "region",
+      kind: "user_input",
+      options: [{ description: "Europe", label: "eu" }],
+      question: "Which region?",
+    } as const;
+    const user = {
+      ...base,
+      detailVersion: 2,
+      interactionKind: "user_input",
+      remotePolicy: {
+        actions: ["answer"],
+        deadlineAt: remotePolicy.deadlineAt,
+        questions: [userQuestion],
+        reasonCodes: [],
+        version: 2,
+      },
+    } as const;
+    expect(parseCompactSessionEvents([user])).toEqual([user]);
+    expect(parseCompactSessionEvents([{
+      ...user,
+      remotePolicy: {
+        ...user.remotePolicy,
+        questions: [{ ...userQuestion, options: [] }],
+      },
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...user,
+      remotePolicy: {
+        ...user.remotePolicy,
+        questions: [{ ...userQuestion, header: "one_time_code" }],
+      },
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...user,
+      remotePolicy: {
+        ...user.remotePolicy,
+        questions: [{ ...userQuestion, options: null }],
+      },
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...user,
+      remotePolicy: {
+        ...user.remotePolicy,
+        questions: [userQuestion, { ...userQuestion, id: "region-backup" }],
+      },
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...user,
+      remotePolicy: {
+        ...user.remotePolicy,
+        reasonCodes: ["COMMAND_APPROVAL_LOCAL_ONLY"],
+      },
+    }])).toBeNull();
+
+    const mcpQuestion = {
+      id: "region",
+      kind: "mcp_string",
+      label: "region",
+      maxLength: 24,
+      minLength: 2,
+      required: true,
+    } as const;
+    const mcp = {
+      ...base,
+      detailVersion: 2,
+      interactionKind: "mcp_elicitation",
+      remotePolicy: {
+        actions: [],
+        deadlineAt: remotePolicy.deadlineAt,
+        questions: [],
+        reasonCodes: ["MCP_ANSWER_LOCAL_ONLY"],
+        version: 2,
+      },
+    } as const;
+    expect(parseCompactSessionEvents([mcp])).toEqual([mcp]);
+    expect(parseCompactSessionEvents([{
+      ...mcp,
+      remotePolicy: {
+        ...mcp.remotePolicy,
+        reasonCodes: [
+          "MCP_MODE_UNSUPPORTED",
+          "MCP_FIELDS_MISSING",
+          "MCP_ANSWER_LOCAL_ONLY",
+        ],
+      },
+    }])).not.toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...mcp,
+      remotePolicy: {
+        actions: ["answer"],
+        deadlineAt: remotePolicy.deadlineAt,
+        questions: [mcpQuestion],
+        reasonCodes: [],
+        version: 2,
+      },
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...mcp,
+      remotePolicy: {
+        actions: ["answer"],
+        deadlineAt: remotePolicy.deadlineAt,
+        questions: [mcpQuestion],
+        reasonCodes: [],
+        version: 1,
+      },
+    }])).toEqual([{
+      ...base,
+      detailVersion: 2,
+      interactionKind: "mcp_elicitation",
+    }]);
+
+    const prepared = {
+      ...base,
+      detailVersion: 2,
+      state: "response_prepared",
+      remotePolicy: {
+        actions: [],
+        deadlineAt: remotePolicy.deadlineAt,
+        questions: [],
+        reasonCodes: ["INTERACTION_NOT_PENDING"],
+        version: 2,
+      },
+    } as const;
+    expect(parseCompactSessionEvents([prepared])).toEqual([prepared]);
+    expect(parseCompactSessionEvents([{
+      ...prepared,
+      remotePolicy,
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...prepared,
+      remotePolicy: {
+        ...prepared.remotePolicy,
+        reasonCodes: ["INTERACTION_NOT_PENDING", "COMMAND_APPROVAL_LOCAL_ONLY"],
+      },
+    }])).toBeNull();
   });
 
   test("versions the user_message actor and mixes old and new chunk shapes", () => {
