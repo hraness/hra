@@ -5244,6 +5244,7 @@ describe("device command execution", () => {
       code: "APPLIED",
       result: {
         expiresAt: fixedNow + 60_000,
+        handoffVersion: 2,
         kind: "account_login_start",
         loginUrl: "https://auth.example.test/device",
         userCode: "ABCD-EFGH",
@@ -5253,7 +5254,11 @@ describe("device command execution", () => {
     };
     await cloud.enqueueDeviceCommand({
       kind: "account_login_start",
-      payload: { accountPublicId: "acct_primary0001", kind: "account_login_start" },
+      payload: {
+        accountPublicId: "acct_primary0001",
+        handoffVersion: 2,
+        kind: "account_login_start",
+      },
       publicId: commandPublicId,
       requestingDevicePublicId: "device_browser1",
     });
@@ -5272,6 +5277,7 @@ describe("device command execution", () => {
       userPublicId,
     })).toEqual({
       expiresAt: fixedNow + 60_000,
+      handoffVersion: 2,
       kind: "account_login_start",
       loginUrl: "https://auth.example.test/device",
       userCode: "ABCD-EFGH",

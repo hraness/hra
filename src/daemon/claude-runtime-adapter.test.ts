@@ -1,9 +1,18 @@
 import { describe, expect, test } from "bun:test";
+import { lstatSync } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import type { ClaudeProcess, PinnedClaudeRuntime } from "../claude/index";
+import type {
+  ClaudeAuthStatusReader,
+  ClaudeProcess,
+  PinnedClaudeRuntime,
+} from "../claude/index";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { PresetProviderMismatchError } from "../domain/presets";
 import { effectiveClaudeRuntimeProfileSchema } from "../domain/runtime-profile";
+import { ensurePrivateDirectory } from "../storage/paths";
 import {
   PinnedClaudeRuntimeManager,
   type ClaudeSessionFact,
@@ -77,20 +86,27 @@ const settle = async (): Promise<void> => {
   await new Promise((resolve) => { setTimeout(resolve, 1); });
 };
 
-const harness = (options: { isCurrent?: () => boolean } = {}) => {
+const harness = (options: {
+  configDirFor?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["configDirFor"];
+  isCurrent?: () => boolean;
+  processFactory?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["processFactory"];
+  readAuthStatus?: ClaudeAuthStatusReader;
+  resolveRuntime?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["resolveRuntime"];
+} = {}) => {
   const facts: ClaudeSessionFact[] = [];
   const processes: FakeClaudeProcess[] = [];
   const manager = new PinnedClaudeRuntimeManager({
-    configDirFor: () => CONFIG_DIR,
+    configDirFor: options.configDirFor ?? (() => CONFIG_DIR),
     isCurrent: options.isCurrent ?? (() => true),
     now: () => 1_700_000_000_000,
     observer: { fact: (_authority, fact) => { facts.push(fact); } },
-    processFactory: () => {
+    processFactory: options.processFactory ?? (() => {
       const process = new FakeClaudeProcess();
       processes.push(process);
       return process;
-    },
-    resolveRuntime: async () => runtime,
+    }),
+    ...(options.readAuthStatus === undefined ? {} : { readAuthStatus: options.readAuthStatus }),
+    resolveRuntime: options.resolveRuntime ?? (async () => runtime),
   });
   return { facts, manager, processes };
 };
@@ -136,6 +152,295 @@ const startTurn = async (
 };
 
 describe("pinned Claude runtime manager", () => {
+  test("reports Claude's isolated auth status rather than inferring it from sessions", async () => {
+    let signedIn = false;
+    const reads: Readonly<{ configDir: string; signal: AbortSignal }>[] = [];
+    const { manager } = harness({
+      readAuthStatus: (input) => {
+        reads.push(input);
+        return Promise.resolve({ signedIn });
+      },
+    });
+    expect(await manager.readAccount({ authority, signal: signal() })).toEqual({ signedIn: false });
+    await startSession(manager);
+    // A running process is not evidence that the isolated home is currently
+    // authenticated; only Claude's own status command is authoritative.
+    expect(await manager.readAccount({ authority, signal: signal() })).toEqual({ signedIn: false });
+    signedIn = true;
+    expect(await manager.readAccount({ authority, signal: signal() })).toEqual({ signedIn: true });
+    expect(reads.map(({ configDir }) => configDir)).toEqual([
+      CONFIG_DIR,
+      CONFIG_DIR,
+      CONFIG_DIR,
+    ]);
+    await manager.close();
+  });
+
+  test("refuses a Claude config directory symlinked across account custody before any launch", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-config-link-")));
+    try {
+      const sourceRoot = join(root, "profiles", "source");
+      const target = join(root, "profiles", "target", "claude-config");
+      const source = join(sourceRoot, "claude-config");
+      await mkdir(sourceRoot, { mode: 0o700, recursive: true });
+      await mkdir(target, { mode: 0o700, recursive: true });
+      await symlink(target, source, "dir");
+      let statusLaunches = 0;
+      let runtimeLaunches = 0;
+      const { manager } = harness({
+        configDirFor: async () => await ensurePrivateDirectory(source),
+        readAuthStatus: async () => {
+          statusLaunches += 1;
+          return { signedIn: true };
+        },
+        resolveRuntime: async () => {
+          runtimeLaunches += 1;
+          return runtime;
+        },
+      });
+
+      await expect(manager.readAccount({ authority, signal: signal() }))
+        .rejects.toThrow(/regular directory|symbolic link/u);
+      await expect(manager.reviewSessionStart({
+        authority,
+        fast: false,
+        preset: "fable-max",
+        projectRoot: PROJECT_ROOT,
+        signal: signal(),
+      })).rejects.toThrow(/regular directory|symbolic link/u);
+      expect({ runtimeLaunches, statusLaunches }).toEqual({
+        runtimeLaunches: 0,
+        statusLaunches: 0,
+      });
+      await manager.close();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("repairs owned permissive Claude config custody immediately before each launch", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-config-mode-")));
+    try {
+      const configDir = join(root, "claude-config");
+      await mkdir(configDir, { mode: 0o700 });
+      const launchModes: number[] = [];
+      const { manager } = harness({
+        configDirFor: async () => await ensurePrivateDirectory(configDir),
+        processFactory: () => {
+          launchModes.push(lstatSync(configDir).mode & 0o777);
+          return new FakeClaudeProcess();
+        },
+        readAuthStatus: async () => {
+          launchModes.push((await lstat(configDir)).mode & 0o777);
+          return { signedIn: true };
+        },
+        resolveRuntime: async () => {
+          launchModes.push((await lstat(configDir)).mode & 0o777);
+          return runtime;
+        },
+      });
+
+      await chmod(configDir, 0o777);
+      await manager.readAccount({ authority, signal: signal() });
+      await chmod(configDir, 0o777);
+      const review = await manager.reviewSessionStart({
+        authority,
+        fast: false,
+        preset: "fable-max",
+        projectRoot: PROJECT_ROOT,
+        signal: signal(),
+      });
+      await chmod(configDir, 0o777);
+      await manager.startSession({ authority, review, signal: signal() });
+      expect(launchModes).toEqual([0o700, 0o700, 0o700, 0o700]);
+      await manager.close();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("refuses a wrong-shaped Claude config path before status or runtime admission", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-config-shape-")));
+    try {
+      const configDir = join(root, "claude-config");
+      await writeFile(configDir, "not a directory", { mode: 0o600 });
+      let statusLaunches = 0;
+      let runtimeLaunches = 0;
+      const { manager } = harness({
+        configDirFor: async () => await ensurePrivateDirectory(configDir),
+        readAuthStatus: async () => {
+          statusLaunches += 1;
+          return { signedIn: true };
+        },
+        resolveRuntime: async () => {
+          runtimeLaunches += 1;
+          return runtime;
+        },
+      });
+
+      await expect(manager.readAccount({ authority, signal: signal() })).rejects.toThrow();
+      await expect(manager.reviewSessionStart({
+        authority,
+        fast: false,
+        preset: "fable-max",
+        projectRoot: PROJECT_ROOT,
+        signal: signal(),
+      })).rejects.toThrow();
+      expect({ runtimeLaunches, statusLaunches }).toEqual({
+        runtimeLaunches: 0,
+        statusLaunches: 0,
+      });
+      await manager.close();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("does not launch or retain status, review, or session state after close wins custody awaits", async () => {
+    let releaseStatusConfig!: (value: string) => void;
+    const statusConfig = new Promise<string>((resolve) => { releaseStatusConfig = resolve; });
+    let statusLaunches = 0;
+    const statusHarness = harness({
+      configDirFor: () => statusConfig,
+      readAuthStatus: async () => {
+        statusLaunches += 1;
+        return { signedIn: true };
+      },
+    });
+    const pendingStatus = statusHarness.manager.readAccount({ authority, signal: signal() });
+    const statusOutcome = pendingStatus.catch((error: unknown) => error);
+    await statusHarness.manager.close();
+    releaseStatusConfig(CONFIG_DIR);
+    expect(await statusOutcome).toMatchObject({ message: expect.stringContaining("closed") });
+    expect(statusLaunches).toBe(0);
+
+    let enteredRuntime!: () => void;
+    let releaseRuntime!: (value: PinnedClaudeRuntime) => void;
+    const runtimeEntered = new Promise<void>((resolve) => { enteredRuntime = resolve; });
+    const deferredRuntime = new Promise<PinnedClaudeRuntime>((resolve) => { releaseRuntime = resolve; });
+    const reviewHarness = harness({
+      resolveRuntime: async () => {
+        enteredRuntime();
+        return await deferredRuntime;
+      },
+    });
+    const pendingReview = reviewHarness.manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    await runtimeEntered;
+    const reviewOutcome = pendingReview.catch((error: unknown) => error);
+    await reviewHarness.manager.close();
+    releaseRuntime(runtime);
+    expect(await reviewOutcome).toMatchObject({ message: expect.stringContaining("closed") });
+    expect(reviewHarness.processes).toEqual([]);
+
+    let configCalls = 0;
+    let releaseSessionConfig!: (value: string) => void;
+    const sessionConfig = new Promise<string>((resolve) => { releaseSessionConfig = resolve; });
+    let sessionLaunches = 0;
+    const sessionHarness = harness({
+      configDirFor: () => {
+        configCalls += 1;
+        return configCalls === 1 ? CONFIG_DIR : sessionConfig;
+      },
+      processFactory: () => {
+        sessionLaunches += 1;
+        return new FakeClaudeProcess();
+      },
+    });
+    const review = await sessionHarness.manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    const pendingSession = sessionHarness.manager.startSession({
+      authority,
+      review,
+      signal: signal(),
+    });
+    const sessionOutcome = pendingSession.catch((error: unknown) => error);
+    await sessionHarness.manager.close();
+    releaseSessionConfig(CONFIG_DIR);
+    expect(await sessionOutcome).toMatchObject({ message: expect.stringContaining("closed") });
+    expect(sessionLaunches).toBe(0);
+    await expect(sessionHarness.manager.startSession({ authority, review, signal: signal() }))
+      .rejects.toThrow("closed");
+  });
+
+  test("joins a spawned child when account authority changes before session insertion", async () => {
+    let current = true;
+    const termination: string[] = [];
+    let child: FakeClaudeProcess | undefined;
+    const { manager } = harness({
+      isCurrent: () => current,
+      processFactory: () => {
+        const process = new FakeClaudeProcess();
+        const exit = process.terminate.bind(process);
+        process.terminate = () => { termination.push("terminate"); };
+        process.forceTerminate = () => {
+          termination.push("force");
+          exit();
+        };
+        child = process;
+        current = false;
+        return process;
+      },
+    });
+    const review = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+
+    await expect(manager.startSession({ authority, review, signal: signal() }))
+      .rejects.toThrow("authority changed");
+
+    expect(termination).toEqual(["terminate", "force"]);
+    expect(child).toBeDefined();
+    if (child === undefined) throw new Error("Claude child was not launched.");
+    await expect(child.exited).resolves.toBe(0);
+    await manager.close();
+  });
+
+  test("rechecks account authority after the status subprocess settles", async () => {
+    let current = true;
+    let settleStatus!: (value: { signedIn: boolean }) => void;
+    const status = new Promise<{ signedIn: boolean }>((resolve) => { settleStatus = resolve; });
+    const { manager } = harness({
+      isCurrent: () => current,
+      readAuthStatus: () => status,
+    });
+    const pending = manager.readAccount({ authority, signal: signal() });
+    current = false;
+    settleStatus({ signedIn: true });
+    await expect(pending).rejects.toThrow("authority changed");
+    await manager.close();
+  });
+
+  test("explicitly releases an unconsumed runtime review", async () => {
+    const { manager, processes } = harness();
+    const review = await manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    manager.discardRuntimeReview(review);
+    await expect(manager.startSession({ authority, review, signal: signal() }))
+      .rejects.toThrow("no longer usable");
+    expect(processes).toEqual([]);
+    await manager.close();
+  });
+
   test("reviews, starts, runs, and completes one full turn", async () => {
     const { facts, manager, processes } = harness();
     const review = await manager.reviewSessionStart({

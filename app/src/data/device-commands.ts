@@ -9,12 +9,14 @@ import {
   deviceEnqueueRequestDigest,
 } from "../custody/registration";
 import { commandLifetimeMs } from "../env";
+import { bindHostedLoginResultExpiry } from "../model/device-commands";
 import {
   createCloudUuidV7,
   decryptDeviceCommandResult,
   encryptDeviceCommand,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
+  type EncryptedEnvelope,
 } from "../hra/cloud";
 import { consumeDeviceCommandResult, deviceCommandGet, enqueueDeviceCommand } from "./functions";
 import { parseDeviceCommandRecord, type DeviceCommandRecord } from "./wire";
@@ -81,8 +83,55 @@ export function useDeviceCommandState(
   return parseDeviceCommandRecord(value);
 }
 
+export type ReadDeviceCommandResult = (
+  commandPublicId: string,
+  envelope: EncryptedEnvelope,
+) => Promise<DeviceCommandResultPayload>;
+
+export async function readDeviceCommandResult(input: Readonly<{
+  commandPublicId: string;
+  envelope: EncryptedEnvelope;
+  key: Uint8Array;
+  keyVersion: number;
+  userPublicId: string;
+}>, decrypt: typeof decryptDeviceCommandResult = decryptDeviceCommandResult): Promise<DeviceCommandResultPayload> {
+  return await decrypt(
+    input.envelope,
+    input.key,
+    deviceCommandResultAuthority({
+      commandPublicId: input.commandPublicId,
+      keyVersion: input.keyVersion,
+      userPublicId: input.userPublicId,
+    }),
+  );
+}
+
+/**
+ * Decrypts a reusable command result already returned by the exact command
+ * query. Unlike the login-start exchange, this performs no hosted mutation and
+ * does not consume the result.
+ */
+export function useReadDeviceCommandResult(): ReadDeviceCommandResult {
+  const custody = useCustody();
+  const unlocked = custody.state === "unlocked" ? custody : null;
+
+  return useCallback(async (commandPublicId: string, envelope: EncryptedEnvelope) => {
+    if (unlocked === null) throw new Error("The account key is locked.");
+    return await readDeviceCommandResult({
+      commandPublicId,
+      envelope,
+      key: unlocked.key,
+      keyVersion: unlocked.identity.keyVersion,
+      userPublicId: unlocked.identity.userPublicId,
+    });
+  }, [unlocked]);
+}
+
 export type ConsumeDeviceCommandResult =
-  (commandPublicId: string) => Promise<DeviceCommandResultPayload | null>;
+  (
+    commandPublicId: string,
+    fallbackHostedExpiresAt: number,
+  ) => Promise<DeviceCommandResultPayload | null>;
 
 /**
  * Exchanges a single-use result for its plaintext, once. The hosted row erases
@@ -95,7 +144,7 @@ export function useConsumeDeviceCommandResult(): ConsumeDeviceCommandResult {
   const unlocked = custody.state === "unlocked" ? custody : null;
   const report = custody.reportAuthorityFailure;
 
-  return useCallback(async (commandPublicId: string) => {
+  return useCallback(async (commandPublicId: string, fallbackHostedExpiresAt: number) => {
     if (unlocked === null) throw new Error("The account key is locked.");
     let released: unknown;
     try {
@@ -110,6 +159,7 @@ export function useConsumeDeviceCommandResult(): ConsumeDeviceCommandResult {
       || (released as { status?: unknown }).status !== "released"
     ) return null;
     const envelope = (released as { result?: unknown }).result;
+    const returnedHostedExpiresAt = (released as { expiresAt?: unknown }).expiresAt;
     const record = parseDeviceCommandRecord({
       createdAt: 0,
       deadline: 0,
@@ -121,7 +171,7 @@ export function useConsumeDeviceCommandResult(): ConsumeDeviceCommandResult {
       updatedAt: 0,
     });
     if (record?.result == null) return null;
-    return await decryptDeviceCommandResult(
+    const result = await decryptDeviceCommandResult(
       record.result,
       unlocked.key,
       deviceCommandResultAuthority({
@@ -129,6 +179,11 @@ export function useConsumeDeviceCommandResult(): ConsumeDeviceCommandResult {
         keyVersion: unlocked.identity.keyVersion,
         userPublicId: unlocked.identity.userPublicId,
       }),
+    );
+    return bindHostedLoginResultExpiry(
+      result,
+      returnedHostedExpiresAt,
+      fallbackHostedExpiresAt,
     );
   }, [convex, report, unlocked]);
 }

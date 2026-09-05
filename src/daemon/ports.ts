@@ -154,6 +154,8 @@ export type CodexSessionPage = {
 export interface SessionRuntimePort<Profile> {
   readonly provider: Provider;
   reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReviewOf<Profile>>;
+  /** Releases a review that never reached its matching start effect. */
+  discardRuntimeReview(review: RuntimeStartReviewOf<Profile>): void;
   startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReviewOf<Profile>; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: Profile }>;
   observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation>;
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
@@ -212,6 +214,16 @@ export interface SessionRuntimePort<Profile> {
 export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRuntimeProfile> {
   readonly provider: "claude";
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
+  /**
+   * Rebinds live, quiescent Claude processes when only the sibling Codex
+   * account generation changes. The daemon calls this synchronously after
+   * the durable generation CAS, before another provider fact can run.
+   */
+  rebindProfileAuthority(input: {
+    profileId: ProfileId;
+    expectedGeneration: number;
+    nextGeneration: number;
+  }): void;
   pinnedVersion(): string;
   /**
    * The exact durable authority one pending Claude control request binds.
@@ -328,6 +340,7 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   listPlugins(): Promise<never> { return Promise.reject(this.#unavailable()); }
   listSessions(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  discardRuntimeReview(): void {}
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -382,7 +395,9 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
   interactionAuthority(): ProviderInteractionAuthority { return this.#unavailable(); }
   pinnedVersion(): string { return this.#unavailable(); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  rebindProfileAuthority(): void {}
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  discardRuntimeReview(): void {}
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }

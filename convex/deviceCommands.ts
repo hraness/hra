@@ -13,6 +13,7 @@ import {
   type DeviceCommandKind,
 } from "../src/cloud/contracts";
 import { commandTransitionDisposition } from "../src/cloud/commands";
+import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
 import {
   deviceCommandAuthorityTransitionDisposition,
   deviceCommandRecoveryAdmitted,
@@ -394,7 +395,11 @@ export const consumeResult = mutation({
     const commandPatch = { result: undefined, resultConsumedAt: now, updatedAt: now };
     await adjustCommandQuotaForPatch(ctx, authority.userId, command, commandPatch);
     await ctx.db.patch(command._id, commandPatch);
+    if (now >= command.updatedAt + deviceCommandLoginResultLifetimeMs) {
+      return { publicId: command.publicId, status: "expired" as const };
+    }
     return {
+      expiresAt: command.updatedAt + deviceCommandLoginResultLifetimeMs,
       publicId: command.publicId,
       result: command.result,
       status: "released" as const,

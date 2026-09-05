@@ -3,7 +3,7 @@
 import { dlopen } from "bun:ffi";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
-import { mkdirSync, readSync, type Stats } from "node:fs";
+import { readSync, type Stats } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isatty } from "node:tty";
@@ -20,6 +20,8 @@ import {
   CliUsageError,
   accountLoginCancelCommand,
   accountLoginReplayCommand,
+  claudeAccountLoginAbandonCommand,
+  claudeAccountLoginCommand,
   completeProtectedAuthLogin,
   completeProtectedInteraction,
   deviceMutationReplayCommand,
@@ -89,6 +91,16 @@ import {
   type CloudSecretCustodyPort,
 } from "./cloud/index";
 import { allowlistedEnvironment, resolvePinnedCodexRuntime } from "./codex/index";
+import {
+  createClaudeLoginSignalCustody,
+  resolvePinnedClaudeRuntime,
+  runClaudeForegroundLogin,
+  type ClaudeForegroundLoginResult,
+  type ClaudeLoginSignalCustody,
+  type ClaudeLoginSignalSource,
+  type PinnedClaudeRuntime,
+  type ResolvePinnedClaudeRuntimeOptions,
+} from "./claude/index";
 import { localCommandSchema, type CommandResponse, type LocalCommand } from "./domain/contracts";
 import { providerSchema, type Provider } from "./domain/presets";
 import {
@@ -106,6 +118,7 @@ import {
   GATEWAY_KEY_MAX_BYTES,
   GATEWAY_KEY_MIN_BYTES,
   gatewayKeySchema,
+  attemptIdSchema,
   profileIdSchema,
   selectByIdOrLabel,
   sessionIdSchema,
@@ -164,6 +177,8 @@ import {
 } from "./installation";
 import {
   initializeStatePaths,
+  initializeProfilePaths,
+  ensurePrivateDirectory,
   profilePaths,
   resolveStatePaths,
   type StatePaths,
@@ -1227,6 +1242,17 @@ export type CliMainInput = Readonly<{
   /** Where a relative `--attach` path is resolved from. Defaults to the process cwd. */
   attachmentCwd?: string;
   attachmentBlobStore?: AttachmentBlobStore;
+  /** Narrow test seam around Claude's foreground-only authentication command. */
+  runClaudeForegroundLogin?: (input: Readonly<{
+    configDir: string;
+    signal: AbortSignal;
+    signalCustody: ClaudeLoginSignalCustody;
+    stdio: Readonly<{ stderr: number; stdin: number; stdout: number }>;
+    runtime: PinnedClaudeRuntime;
+  }>) => Promise<ClaudeForegroundLoginResult>;
+  /** Test seam for grant-bound terminal-signal custody. */
+  claudeLoginSignalSource?: ClaudeLoginSignalSource;
+  resolveClaudeRuntime?: (options: ResolvePinnedClaudeRuntimeOptions) => Promise<PinnedClaudeRuntime>;
   onHumanSessionObserverBootstrap?: (bootstrap: Readonly<{
     interactions: readonly Readonly<{
       id: string;
@@ -3220,11 +3246,9 @@ export async function runDaemon(
     // so a machine without it pays nothing and is refused with one exact,
     // actionable message at `session start --provider claude`.
     claude = new PinnedClaudeRuntimeManager({
-      configDirFor: (authority) => {
-        const dir = profilePaths(paths, authority.id).claudeConfigDir;
-        mkdirSync(dir, { mode: 0o700, recursive: true });
-        return dir;
-      },
+      configDirFor: async (authority) => await ensurePrivateDirectory(
+        profilePaths(paths, authority.id).claudeConfigDir,
+      ),
       isCurrent: (authority) => {
         try {
           const profile = activeStore.requireProfile(authority.id);
@@ -3342,6 +3366,7 @@ export async function runDaemon(
             setKey: async (key) => { await gatewayKeys.set(key); },
           },
           paths,
+          platform: process.platform,
           store: activeStore,
           cloudIdentityNamespace,
         });
@@ -3429,6 +3454,7 @@ export async function runDaemon(
       cloud,
       daemonAuthority: activeDaemonAuthority,
       daemonGeneration: generation,
+      platform: process.platform,
       eventCursors,
       usageHistoryCursors,
       workCapabilities,
@@ -4310,6 +4336,369 @@ async function executeAccountLogin(
     }
   } finally {
     closeProtectedOutput();
+  }
+}
+
+const claudeLoginAccountSchema = z.object({
+  id: profileIdSchema,
+  label: z.string().min(1).max(160),
+}).strict();
+const claudeAuthenticationSchema = z.object({
+  provider: z.literal("claude"),
+  signedIn: z.boolean(),
+}).strict();
+const claudeStatusAuthenticationSchema = z.object({
+  provider: z.literal("claude"),
+  signedIn: z.boolean().nullable(),
+}).strict();
+const claudeLoginRecoverySchema = z.object({
+  required: z.literal(true),
+  attemptId: attemptIdSchema,
+  idempotencyKey: z.string().uuid(),
+  providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  statusCommand: z.string().min(1).max(512),
+  sameKeyReplayCommand: z.string().min(1).max(512),
+  abandonCommand: z.string().min(1).max(1_024),
+  diagnostic: z.string().min(1).max(2_048),
+}).strict();
+const claudeAccountStatusResponseSchema = z.object({
+  account: claudeLoginAccountSchema,
+  authentication: claudeStatusAuthenticationSchema,
+  providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  nextCommand: z.string().optional(),
+  recovery: claudeLoginRecoverySchema.optional(),
+}).strict().superRefine((value, context) => {
+  if (
+    value.nextCommand !== undefined
+    && value.nextCommand !== claudeAccountLoginCommand(value.account.id)
+  ) context.addIssue({ code: "custom", path: ["nextCommand"], message: "Claude login next command is not exact." });
+  if (value.authentication.signedIn === null && value.recovery === undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["authentication", "signedIn"],
+      message: "An unknown Claude authentication status requires exact recovery authority.",
+    });
+  }
+  if (value.recovery === undefined) return;
+  if (value.recovery.statusCommand !== `hra account show ${value.account.id} --provider claude`) {
+    context.addIssue({ code: "custom", path: ["recovery", "statusCommand"], message: "Claude recovery status command is not exact." });
+  }
+  if (value.recovery.sameKeyReplayCommand !== claudeAccountLoginCommand(value.account.id, value.recovery.idempotencyKey)) {
+    context.addIssue({ code: "custom", path: ["recovery", "sameKeyReplayCommand"], message: "Claude recovery replay command is not exact." });
+  }
+  if (value.recovery.abandonCommand !== claudeAccountLoginAbandonCommand(
+    value.account.id,
+    value.recovery.attemptId,
+    value.recovery.idempotencyKey,
+    value.recovery.providerGeneration,
+  )) {
+    context.addIssue({ code: "custom", path: ["recovery", "abandonCommand"], message: "Claude recovery abandon command is not exact." });
+  }
+});
+const claudeLoginPrepareResponseSchema = z.object({
+  account: claudeLoginAccountSchema,
+  authentication: claudeAuthenticationSchema,
+  login: z.discriminatedUnion("status", [
+    z.object({ status: z.literal("signed_in") }).strict(),
+    z.object({
+      status: z.literal("launch_granted"),
+      attemptId: attemptIdSchema,
+      idempotencyKey: z.string().uuid(),
+      providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    }).strict(),
+  ]),
+}).strict();
+const claudeLoginCompleteResponseSchema = z.object({
+  account: claudeLoginAccountSchema,
+  authentication: claudeAuthenticationSchema,
+  login: z.object({
+    status: z.enum(["signed_in", "signed_out"]),
+    attemptId: attemptIdSchema,
+    idempotencyKey: z.string().uuid(),
+    providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  }).strict(),
+}).strict();
+
+const renderClaudeLoginResult = (
+  data: z.infer<typeof claudeLoginPrepareResponseSchema> | z.infer<typeof claudeLoginCompleteResponseSchema>,
+  json: boolean,
+  output: Output,
+): void => {
+  if (json) {
+    output.writeStdout(`${safeJson({ command: "account.login", data, ok: true, version: 1 })}\n`);
+    return;
+  }
+  output.writeStdout(data.authentication.signedIn
+    ? `Claude Code is signed in for ${terminalSafe(data.account.label)}.\n`
+    : `Claude Code is signed out for ${terminalSafe(data.account.label)}.\nNext: ${claudeAccountLoginCommand(data.account.id)}\n`);
+};
+
+const claudeLoginRecovery = (
+  input: Readonly<{
+    accountId?: string;
+    attemptId?: string;
+    idempotencyKey: string;
+    providerGeneration?: number;
+    replayCommand: string;
+  }>,
+  json: boolean,
+  output: Output,
+): number => renderFailure({
+  code: "RECOVERY_REQUIRED",
+  details: {
+    ...(input.accountId === undefined ? {} : {
+      accountSelector: input.accountId,
+      statusCommand: `hra account show ${input.accountId} --provider claude`,
+    }),
+    ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+    idempotencyKey: input.idempotencyKey,
+    ...(input.providerGeneration === undefined ? {} : { providerGeneration: input.providerGeneration }),
+    sameKeyReplayCommand: input.replayCommand,
+    ...(
+      input.accountId === undefined
+      || input.attemptId === undefined
+      || input.providerGeneration === undefined
+        ? {}
+        : {
+            abandonCommand: claudeAccountLoginAbandonCommand(
+              input.accountId,
+              input.attemptId,
+              input.idempotencyKey,
+              input.providerGeneration,
+            ),
+          }
+    ),
+  },
+  message: "Claude login may have started, but HRA could not prove its terminal result. The same-key command identifies this attempt and will never relaunch Claude. If its HRA parent is gone, confirm the Claude child exited before using the exact acknowledged local abandon command; abandon does not stop Claude or change or delete credentials.",
+}, json, output);
+
+async function executeClaudeAccountAuthentication(
+  invocation: Extract<CliInvocation, { kind: "account.claude-login" }>,
+  output: Output,
+  input: CliMainInput,
+): Promise<number> {
+  const isTerminalDescriptor = input.isTerminalDescriptor ?? isatty;
+  if (
+    invocation.json
+    || input.interactive !== true
+    || !isTerminalDescriptor(0)
+    || !isTerminalDescriptor(1)
+    || !isTerminalDescriptor(2)
+  ) {
+    return renderFailure({
+      code: "INTERACTION_REQUIRED",
+      details: { nextCommand: invocation.replayCommand },
+      message: "Claude Code owns this login interaction. Run it in a foreground terminal without --json so its prompts and browser handoff stay between you and Claude Code.",
+    }, invocation.json, output);
+  }
+
+  const callDaemon = commandCaller(input);
+  let statusResponse: CommandResponse;
+  try {
+    statusResponse = await callDaemon({
+      kind: "account.show",
+      account: invocation.command.account,
+      provider: "claude",
+    });
+  } catch (error: unknown) {
+    if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
+    return renderFailure({
+      code: "UNAVAILABLE",
+      message: "HRA could not preflight the exact Claude account. No login launch was granted.",
+    }, invocation.json, output);
+  }
+  if (!statusResponse.ok) return renderFailure(statusResponse.error, invocation.json, output);
+  const status = claudeAccountStatusResponseSchema.safeParse(statusResponse.data);
+  if (!status.success) {
+    return renderFailure({
+      code: "INTERNAL",
+      message: "The daemon returned an invalid Claude account preflight. No login launch was granted.",
+    }, invocation.json, output);
+  }
+  if (status.data.recovery !== undefined) {
+    return renderFailure({
+      code: "RECOVERY_REQUIRED",
+      details: status.data.recovery,
+      message: status.data.recovery.diagnostic,
+    }, invocation.json, output);
+  }
+  const controller = new AbortController();
+  // Preflight unconditionally: the provider can sign out between this passive
+  // status read and serialized prepare, and prepare is then allowed to grant.
+  const installation = input.installation ?? createProductionInstallation();
+  await initializeStatePaths(installation.paths);
+  const owned = await initializeProfilePaths(installation.paths, status.data.account.id);
+  const runtime = await (input.resolveClaudeRuntime ?? resolvePinnedClaudeRuntime)({
+    configDir: owned.claudeConfigDir,
+    signal: controller.signal,
+  });
+  const preflight = { configDir: owned.claudeConfigDir, runtime };
+  // Prepare is the daemon boundary that can atomically return the launch
+  // grant. Observe terminal signals before awaiting it so a signal delivered
+  // in that response window cannot kill the parent after the grant commits.
+  const signalCustody = createClaudeLoginSignalCustody({
+    signal: controller.signal,
+    ...(input.claudeLoginSignalSource === undefined
+      ? {}
+      : { signalSource: input.claudeLoginSignalSource }),
+  });
+  try {
+    let preparedResponse: CommandResponse;
+    try {
+      preparedResponse = await callDaemon(invocation.command);
+    } catch (error: unknown) {
+      if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
+      return claudeLoginRecovery({
+        idempotencyKey: invocation.command.idempotencyKey,
+        replayCommand: invocation.replayCommand,
+      }, invocation.json, output);
+    }
+    if (!preparedResponse.ok) return renderFailure(preparedResponse.error, invocation.json, output);
+    const prepared = claudeLoginPrepareResponseSchema.safeParse(preparedResponse.data);
+    if (
+      !prepared.success
+      || prepared.data.account.id !== status.data.account.id
+      || (
+        prepared.data.login.status === "launch_granted"
+        && prepared.data.login.idempotencyKey !== invocation.command.idempotencyKey
+      )
+    ) {
+      return claudeLoginRecovery({
+        idempotencyKey: invocation.command.idempotencyKey,
+        replayCommand: invocation.replayCommand,
+      }, invocation.json, output);
+    }
+    if (prepared.data.login.status === "signed_in") {
+      renderClaudeLoginResult(prepared.data, invocation.json, output);
+      return signalCustody.interruptedBy === "SIGINT"
+        ? 130
+        : signalCustody.interruptedBy === "SIGTERM"
+          ? 143
+          : 0;
+    }
+    const grant = prepared.data.login;
+    const exactReplayCommand = claudeAccountLoginCommand(prepared.data.account.id, grant.idempotencyKey);
+    // Retain prepare-bound custody through path revalidation, spawn, child join,
+    // and the exact daemon completion RPC.
+    let foreground: ClaudeForegroundLoginResult | undefined = signalCustody.interruptedBy === null
+      ? undefined
+      : {
+          state: "not_started",
+          reason: "interrupted_before_spawn",
+          interruptedBy: signalCustody.interruptedBy,
+        };
+    try {
+      if (foreground === undefined) await ensurePrivateDirectory(preflight.configDir);
+    } catch {
+      // The path changed after the no-effect preflight but before spawn. Consume
+      // the grant with a typed no-effect completion instead of wedging it.
+      foreground = signalCustody.interruptedBy === null
+        ? { state: "not_started", reason: "preflight_stale" }
+        : {
+            state: "not_started",
+            reason: "interrupted_before_spawn",
+            interruptedBy: signalCustody.interruptedBy,
+          };
+    }
+    if (foreground === undefined && signalCustody.interruptedBy !== null) {
+      foreground = {
+        state: "not_started",
+        reason: "interrupted_before_spawn",
+        interruptedBy: signalCustody.interruptedBy,
+      };
+    }
+    if (foreground === undefined) {
+      try {
+        foreground = await (input.runClaudeForegroundLogin ?? runClaudeForegroundLogin)({
+          configDir: preflight.configDir,
+          runtime: preflight.runtime,
+          signal: controller.signal,
+          signalCustody,
+          stdio: { stderr: 2, stdin: 0, stdout: 1 },
+        });
+      } catch {
+        return claudeLoginRecovery({
+          accountId: prepared.data.account.id,
+          attemptId: grant.attemptId,
+          idempotencyKey: grant.idempotencyKey,
+          providerGeneration: grant.providerGeneration,
+          replayCommand: exactReplayCommand,
+        }, invocation.json, output);
+      }
+    }
+    const complete = localCommandSchema.parse({
+      kind: "account.claude-login.complete",
+      account: prepared.data.account.id,
+      attemptId: grant.attemptId,
+      idempotencyKey: grant.idempotencyKey,
+      providerGeneration: grant.providerGeneration,
+      outcome: foreground,
+    });
+    let completedResponse: CommandResponse;
+    try {
+      completedResponse = await callDaemon(complete);
+    } catch (error: unknown) {
+      if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
+      return claudeLoginRecovery({
+        accountId: prepared.data.account.id,
+        attemptId: grant.attemptId,
+        idempotencyKey: grant.idempotencyKey,
+        providerGeneration: grant.providerGeneration,
+        replayCommand: exactReplayCommand,
+      }, invocation.json, output);
+    }
+    if (!completedResponse.ok) {
+      return claudeLoginRecovery({
+        accountId: prepared.data.account.id,
+        attemptId: grant.attemptId,
+        idempotencyKey: grant.idempotencyKey,
+        providerGeneration: grant.providerGeneration,
+        replayCommand: exactReplayCommand,
+      }, invocation.json, output);
+    }
+    const completed = claudeLoginCompleteResponseSchema.safeParse(completedResponse.data);
+    if (
+      !completed.success
+      || completed.data.account.id !== prepared.data.account.id
+      || completed.data.login.attemptId !== grant.attemptId
+      || completed.data.login.idempotencyKey !== grant.idempotencyKey
+      || completed.data.login.providerGeneration !== grant.providerGeneration
+    ) {
+      return claudeLoginRecovery({
+        accountId: prepared.data.account.id,
+        attemptId: grant.attemptId,
+        idempotencyKey: grant.idempotencyKey,
+        providerGeneration: grant.providerGeneration,
+        replayCommand: exactReplayCommand,
+      }, invocation.json, output);
+    }
+    const interruptedBy = (foreground.state === "joined"
+      ? foreground.interruptedBy
+      : foreground.reason === "interrupted_before_spawn"
+        ? foreground.interruptedBy
+        : null) ?? signalCustody.interruptedBy;
+    if (interruptedBy !== null) {
+      output.writeStderr(completed.data.authentication.signedIn
+        ? "hra: Claude login was interrupted after authentication completed.\n"
+        : "hra: Claude login was canceled; the isolated profile remains signed out.\n");
+      return interruptedBy === "SIGINT" ? 130 : 143;
+    }
+    if (!completed.data.authentication.signedIn) {
+      return renderFailure({
+        code: "INTERACTION_REQUIRED",
+        details: {
+          accountSelector: completed.data.account.id,
+          accountState: "signed_out",
+          nextCommand: claudeAccountLoginCommand(completed.data.account.id),
+          provider: "claude",
+        },
+        message: "Claude Code finished without an authenticated session in this account's isolated profile.",
+      }, invocation.json, output);
+    }
+    renderClaudeLoginResult(completed.data, invocation.json, output);
+    return 0;
+  } finally {
+    signalCustody.close();
   }
 }
 
@@ -5235,6 +5624,9 @@ async function executeInvocation(
   }
   if (invocation.kind === "account.login-handoff") {
     return await executeAccountLogin(invocation, output, input);
+  }
+  if (invocation.kind === "account.claude-login") {
+    return await executeClaudeAccountAuthentication(invocation, output, { ...input, installation });
   }
   if (invocation.kind === "auth.login-protected") {
     return await executeProtectedAuthLogin(invocation, output, input);

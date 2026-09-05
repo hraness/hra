@@ -159,6 +159,12 @@ const processLocalPublicProviderIdentifierProjector =
 const profileStateSchema = z.enum(["signed_out", "login_pending", "signed_in", "recovery_required", "removed"]);
 const sessionStateSchema = z.enum(["starting", "active", "idle", "terminal", "recovery_required"]);
 const runtimeProfileSourceKindSchema = z.enum(["session_start", "turn_start", "queue_start"]);
+const providerAuthenticationSchema = z.object({
+  profileId: profileIdSchema,
+  processGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  provider: providerSchema,
+  signedIn: z.literal(true),
+}).strict();
 const interactionListPositionSchema = z.object({
   requestedAt: unixMillisecondsSchema,
   publicId: z.string().uuid(),
@@ -649,6 +655,7 @@ export type MutationEffectEvidence =
   | { kind: "session.rename"; providerThreadId: string; baseline: SessionProviderBaseline; requestedName: string }
   | { kind: "session.start"; projectId: ProjectId; clientMessageId: string | null; messageDigest: string | null; runtimeProfile?: ReviewedRuntimeProfile; conversationAutomationCapability?: typeof SESSION_CONVERSATION_AUTOMATION_CAPABILITY }
   | { kind: "account.login"; method: "browser" | "device_code" }
+  | { kind: "account.claude-login"; provider: "claude"; baselineSignedIn: false }
   | { kind: "account.logout"; baselineSignedIn: boolean }
   | { kind: "account.login-cancel"; loginId: string };
 
@@ -740,6 +747,7 @@ const mutationEffectEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.rename"), providerThreadId: providerThreadIdSchema, baseline: providerBaselineSchema, requestedName: titleSchema }).strict(),
   z.object({ kind: z.literal("session.start"), projectId: projectIdSchema, clientMessageId: z.string().min(1).max(512).nullable(), messageDigest: sha256Schema.nullable(), runtimeProfile: reviewedRuntimeProfileSchema.optional(), conversationAutomationCapability: z.literal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY).optional() }).strict(),
   z.object({ kind: z.literal("account.login"), method: z.enum(["browser", "device_code"]) }).strict(),
+  z.object({ kind: z.literal("account.claude-login"), provider: z.literal("claude"), baselineSignedIn: z.literal(false) }).strict(),
   z.object({ kind: z.literal("account.logout"), baselineSignedIn: z.boolean() }).strict(),
   z.object({ kind: z.literal("account.login-cancel"), loginId: providerLoginIdSchema }).strict(),
 ]);
@@ -4427,10 +4435,179 @@ export class StateStore {
     return mapProfile(row);
   }
 
+  providerAuthorityAdvanceBlocker(
+    profileId: ProfileId,
+    provider: Provider,
+  ): "active_session" | "recovery_required" | "unsettled_authority" | null {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedProvider = providerSchema.parse(provider);
+    if (this.#hasUnsettledClaudeLoginAuthority(parsedProfileId)) {
+      return "unsettled_authority";
+    }
+    const row = z.object({
+      reason: z.enum([
+        "active_session",
+        "recovery_required",
+        "unsettled_authority",
+      ]).nullable(),
+    }).strict().parse(this.#database.query(
+      `SELECT CASE
+         WHEN EXISTS(
+           SELECT 1 FROM sessions s
+           WHERE s.profile_id=? AND s.provider=?
+             AND (s.state IN ('starting','active') OR s.active_turn_id IS NOT NULL)
+         ) THEN 'active_session'
+         WHEN EXISTS(
+           SELECT 1 FROM sessions s
+           WHERE s.profile_id=? AND s.provider=? AND s.state='recovery_required'
+         ) THEN 'recovery_required'
+         WHEN EXISTS(
+           SELECT 1
+           FROM sessions s
+           WHERE s.profile_id=? AND s.provider=?
+             AND (
+               EXISTS(
+                 SELECT 1 FROM provider_interactions i
+                 WHERE i.session_id=s.id
+                   AND i.state IN ('pending','response_prepared','response_written')
+               )
+               OR EXISTS(
+                 SELECT 1 FROM mutation_attempts m
+                 LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+                 WHERE m.authority_id=s.id
+                   AND m.state IN ('effect_started','ambiguous')
+                   AND r.attempt_id IS NULL
+               )
+               OR EXISTS(
+                 SELECT 1 FROM queue_entries q
+                 LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
+                 WHERE q.session_id=s.id
+                   AND q.state IN ('dispatching','ambiguous')
+                   AND r.queue_id IS NULL
+               )
+               OR EXISTS(
+                 SELECT 1 FROM work_attempts w
+                 WHERE w.worker_session_id=s.id
+                   AND w.state IN ('claimed','dispatching','running','recovery_required')
+               )
+               OR EXISTS(
+                 SELECT 1 FROM work_signals w
+                 WHERE w.to_session_id=s.id
+                   AND NOT EXISTS(
+                     SELECT 1 FROM work_signal_receipts r
+                     WHERE r.signal_id=w.id AND r.kind='ack'
+                   )
+               )
+             )
+         ) THEN 'unsettled_authority'
+         ELSE NULL
+       END AS reason`,
+    ).get(
+      parsedProfileId,
+      parsedProvider,
+      parsedProfileId,
+      parsedProvider,
+      parsedProfileId,
+      parsedProvider,
+    )).reason;
+    return row;
+  }
+
+  hasNonterminalProviderSession(profileId: ProfileId, provider: Provider): boolean {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedProvider = providerSchema.parse(provider);
+    return this.#database.query(
+      `SELECT 1 AS present FROM sessions
+       WHERE profile_id=? AND provider=? AND state!='terminal'
+       LIMIT 1`,
+    ).get(parsedProfileId, parsedProvider) !== null;
+  }
+
+  listNonterminalProviderSessions(
+    profileId: ProfileId,
+    provider: Provider,
+  ): readonly SessionRecord[] {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedProvider = providerSchema.parse(provider);
+    return this.#database.query(
+      `SELECT * FROM sessions
+       WHERE profile_id=? AND provider=? AND state!='terminal'
+       ORDER BY id`,
+    ).all(parsedProfileId, parsedProvider).map(mapSession);
+  }
+
+  canReleaseIdleClaudeSessionForAccountLogin(input: Readonly<{
+    profileId: ProfileId;
+    profileGeneration: number;
+    sessionId: SessionId;
+  }>): boolean {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const profileGeneration = z.number().int().nonnegative()
+      .max(Number.MAX_SAFE_INTEGER).parse(input.profileGeneration);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    return this.#database.query(
+      `SELECT 1 AS releasable
+       FROM sessions s
+       JOIN profiles p ON p.id=s.profile_id
+       WHERE s.id=? AND s.profile_id=? AND p.process_generation=?
+         AND p.state!='removed'
+         AND s.provider='claude' AND s.provider_thread_id IS NOT NULL
+         AND s.state='idle' AND s.active_turn_id IS NULL
+         AND NOT EXISTS(
+           SELECT 1 FROM mutation_attempts m
+           LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+           LEFT JOIN session_start_attempts a ON a.attempt_id=m.id
+           WHERE (m.authority_id=s.id OR a.session_id=s.id)
+             AND m.state IN ('prepared','effect_started','ambiguous')
+             AND r.attempt_id IS NULL
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM queue_entries q
+           LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
+           WHERE q.session_id=s.id
+             AND q.state IN ('pending','dispatching','ambiguous')
+             AND r.queue_id IS NULL
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM provider_interactions i
+           WHERE i.session_id=s.id
+             AND i.state IN ('pending','response_prepared','response_written')
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM work_attempts w
+           WHERE w.worker_session_id=s.id
+             AND w.state IN ('claimed','dispatching','running','recovery_required')
+         )
+         AND NOT EXISTS(
+           SELECT 1 FROM work_signals w
+           WHERE w.to_session_id=s.id
+             AND NOT EXISTS(
+               SELECT 1 FROM work_signal_receipts r
+               WHERE r.signal_id=w.id AND r.kind='ack'
+             )
+         )
+       LIMIT 1`,
+    ).get(sessionId, profileId, profileGeneration) !== null;
+  }
+
+  #hasUnsettledClaudeLoginAuthority(profileId: ProfileId): boolean {
+    return this.#database.query(
+      `SELECT 1 AS present FROM mutation_attempts m
+       LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+       WHERE m.authority_id=? AND m.kind='account.claude-login'
+         AND m.state IN ('effect_started','ambiguous')
+         AND r.attempt_id IS NULL
+       LIMIT 1`,
+    ).get(profileId) !== null;
+  }
+
   nextProfileGeneration(profileId: ProfileId): ProfileRecord {
     const now = this.#now();
     const update = this.#database.transaction(() => {
       const current = mapProfile(this.#database.query("SELECT * FROM profiles WHERE id = ? AND state != 'removed'").get(profileId));
+      if (this.#hasUnsettledClaudeLoginAuthority(current.id)) {
+        throw new Error("CLAUDE_LOGIN_AUTHORITY_UNSETTLED");
+      }
       this.#database.query("UPDATE profiles SET process_generation = ?, updated_at = ? WHERE id = ? AND process_generation = ?").run(current.processGeneration + 1, now, profileId, current.processGeneration);
     });
     update.immediate();
@@ -4459,6 +4636,9 @@ export class StateStore {
       const current = mapProfile(this.#database.query("SELECT * FROM profiles WHERE id=? AND state!='removed'").get(profileId));
       if (current.processGeneration !== expectedGeneration) {
         throw new Error("Profile generation authority changed.");
+      }
+      if (this.#hasUnsettledClaudeLoginAuthority(current.id)) {
+        throw new Error("CLAUDE_LOGIN_AUTHORITY_UNSETTLED");
       }
       const activeLogin = this.#database.query(`SELECT attempt_id,process_generation
                                                 FROM provider_login_authorities
@@ -4583,7 +4763,11 @@ export class StateStore {
         && policy.accountFingerprint !== nextAccountFingerprint;
       const affectedWorkIds = state === "signed_in"
         ? []
-        : [...(workStore?.prepareProfileAuthorityChange(profileId, expectedGeneration) ?? [])];
+        : [...(workStore?.prepareProfileAuthorityChange(
+            profileId,
+            expectedGeneration,
+            "codex",
+          ) ?? [])];
       const result = this.#database.query(
         `UPDATE profiles
          SET state=?,provider_email=?,provider_plan=?,updated_at=?
@@ -6073,6 +6257,41 @@ export class StateStore {
     interactions: readonly InteractionRecord[];
     session: SessionRecord;
   }> {
+    return this.#terminalizeProviderSession({
+      ...input,
+      source: "provider_thread_deleted",
+    });
+  }
+
+  terminalizeIdleClaudeSessionForAccountLogin(input: Readonly<{
+    accountId: ProfileId;
+    providerConnectionId: string | null;
+    providerGeneration: number;
+    sessionId: SessionId;
+  }>): Readonly<{
+    changed: boolean;
+    event?: SessionEvent;
+    interactions: readonly InteractionRecord[];
+    session: SessionRecord;
+  }> {
+    return this.#terminalizeProviderSession({
+      ...input,
+      source: "claude_account_login",
+    });
+  }
+
+  #terminalizeProviderSession(input: Readonly<{
+    accountId: ProfileId;
+    providerConnectionId: string | null;
+    providerGeneration: number;
+    sessionId: SessionId;
+    source: "provider_thread_deleted" | "claude_account_login";
+  }>): Readonly<{
+    changed: boolean;
+    event?: SessionEvent;
+    interactions: readonly InteractionRecord[];
+    session: SessionRecord;
+  }> {
     completePendingSecurityScrub(this.#database, false, this.#securityScrubCheckpoint);
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const accountId = profileIdSchema.parse(input.accountId);
@@ -6082,6 +6301,14 @@ export class StateStore {
     const now = unixMillisecondsSchema.parse(this.#now());
     const terminalize = this.#database.transaction(() => {
       const current = this.requireSession(parsedSessionId);
+      if (
+        input.source === "claude_account_login"
+        && !this.canReleaseIdleClaudeSessionForAccountLogin({
+          profileId: accountId,
+          profileGeneration: providerGeneration,
+          sessionId: current.id,
+        })
+      ) throw new Error("CLAUDE_LOGIN_SESSION_NOT_QUIESCENT");
       let sessionChanged = false;
       let event: SessionEvent | undefined;
       if (current.state !== "terminal") {
@@ -6110,7 +6337,7 @@ export class StateStore {
       this.#database.query(
         "UPDATE queue_entries SET state='ambiguous',updated_at=? WHERE session_id=? AND state='dispatching'",
       ).run(now, current.id);
-      const providerDeletionEvidence = JSON.stringify({ source: "provider_thread_deleted" });
+      const providerDeletionEvidence = JSON.stringify({ source: input.source });
       this.#database.query(
         `INSERT OR IGNORE INTO queue_effect_resolutions(
            queue_id,resolution_kind,evidence_json,receipt_json,created_at
@@ -7089,6 +7316,12 @@ export class StateStore {
     profileGeneration: number;
     projectId: ProjectId;
     provider?: Provider;
+    providerAuthentication?: Readonly<{
+      profileId: ProfileId;
+      processGeneration: number;
+      provider: Provider;
+      signedIn: true;
+    }>;
     preset: Preset;
     fastEnabled: boolean;
     evidence: Extract<MutationEffectEvidence, { kind: "session.start" }>;
@@ -7099,6 +7332,20 @@ export class StateStore {
     const parsedProjectId = projectIdSchema.parse(input.projectId);
     const parsedPreset = presetSchema.parse(input.preset);
     const parsedProvider = providerSchema.parse(input.provider ?? "codex");
+    const providerAuthentication = input.providerAuthentication === undefined
+      ? undefined
+      : providerAuthenticationSchema.parse(input.providerAuthentication);
+    if (
+      providerAuthentication !== undefined
+      && (
+        providerAuthentication.profileId !== parsedProfileId
+        || providerAuthentication.processGeneration !== parsedGeneration
+        || providerAuthentication.provider !== parsedProvider
+      )
+    ) throw new Error("SESSION_START_PROVIDER_AUTHENTICATION_MISMATCH");
+    if (parsedProvider === "claude" && providerAuthentication === undefined) {
+      throw new Error("SESSION_START_PROVIDER_AUTHENTICATION_REQUIRED");
+    }
     assertPresetSupportedByProvider(parsedProvider, parsedPreset);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
     if (evidence.projectId !== parsedProjectId) throw new Error("MUTATION_EFFECT_REQUEST_MISMATCH");
@@ -7126,7 +7373,8 @@ export class StateStore {
         authority.authority_id !== parsedProfileId
         || authority.authority_generation !== parsedGeneration
         || authority.process_generation !== parsedGeneration
-        || authority.profile_state !== "signed_in"
+        || authority.profile_state === "removed"
+        || (parsedProvider === "codex" && authority.profile_state !== "signed_in")
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       this.#database.query("INSERT INTO sessions(id,profile_id,project_id,title,provider,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").run(sessionId, parsedProfileId, parsedProjectId, "Untitled session", parsedProvider, presetTiers[parsedPreset], input.fastEnabled ? 1 : 0, "starting", 1, now, now);
       this.#insertSessionEventStream(sessionId, now);
@@ -7223,16 +7471,28 @@ export class StateStore {
         || row.profile_state === "removed"
         || row.profile_state === "recovery_required"
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      if (
+        evidence.kind === "account.login"
+      ) {
+        const claudeBlocker = this.providerAuthorityAdvanceBlocker(
+          parsedProfileId,
+          "claude",
+        );
+        if (claudeBlocker !== null) {
+          throw new Error(`CLAUDE_PROVIDER_AUTHORITY_NOT_QUIESCENT:${claudeBlocker}`);
+        }
+      }
       const retiredSessionIds = new Set<SessionId>();
       let affectedWorkIds: readonly string[] = [];
       if (evidence.kind === "account.login") {
         for (const retirement of providerRetirements) {
           const session = z.object({
             profile_id: profileIdSchema,
+            provider: providerSchema,
           }).strict().parse(this.#database.query(
-            "SELECT profile_id FROM sessions WHERE id=?",
+            "SELECT profile_id,provider FROM sessions WHERE id=?",
           ).get(retirement.sessionId));
-          if (session.profile_id !== parsedProfileId) {
+          if (session.profile_id !== parsedProfileId || session.provider !== "codex") {
             throw new Error("ACCOUNT_LOGIN_RETIREMENT_SESSION_AUTHORITY_MISMATCH");
           }
           for (const event of retirement.releasedEvents) {
@@ -7240,10 +7500,17 @@ export class StateStore {
           }
         }
         const openInteractions = this.#database.query(
-          `SELECT * FROM provider_interactions
-           WHERE profile_id=? AND process_generation=?
+          `SELECT i.* FROM provider_interactions i
+           WHERE i.profile_id=? AND i.process_generation=?
              AND state IN ('pending','response_prepared','response_written')
-           ORDER BY requested_at,public_id`,
+             AND (
+               i.session_id IS NULL
+               OR EXISTS(
+                 SELECT 1 FROM sessions s
+                 WHERE s.id=i.session_id AND s.provider='codex'
+               )
+             )
+           ORDER BY i.requested_at,i.public_id`,
         ).all(parsedProfileId, expectedCurrentGeneration);
         for (const value of openInteractions) {
           const current = interactionRowSchema.parse(value);
@@ -7305,6 +7572,282 @@ export class StateStore {
       };
     });
     return begin.immediate();
+  }
+
+  /**
+   * Durably consumes the one-time permission to launch Claude's foreground
+   * login. This deliberately does not mutate the profile's Codex account
+   * projection; the generic mutation attempt is the provider-specific fence.
+   */
+  beginClaudeLoginMutationEffect(input: {
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    profileGeneration: number;
+    evidence: Extract<MutationEffectEvidence, { kind: "account.claude-login" }>;
+  }): MutationEffectEvidenceRecord {
+    const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
+    const parsedProfileId = profileIdSchema.parse(input.profileId);
+    const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
+    const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
+    const canonical = JSON.stringify(evidence);
+    const digest = createHash("sha256").update(canonical).digest("hex");
+    const now = this.#now();
+    const begin = this.#database.transaction(() => {
+      const row = z.object({
+        kind: z.literal("account.claude-login"),
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative(),
+        state: z.literal("prepared"),
+        process_generation: z.number().int().nonnegative(),
+        profile_state: profileStateSchema,
+      }).strict().parse(this.#database.query(
+        `SELECT m.kind,m.authority_id,m.authority_generation,m.state,
+                p.process_generation,p.state AS profile_state
+         FROM mutation_attempts m JOIN profiles p ON p.id=m.authority_id
+         WHERE m.id=?`,
+      ).get(parsedAttemptId));
+      if (
+        row.authority_id !== parsedProfileId
+        || row.authority_generation !== parsedGeneration
+        || row.process_generation !== parsedGeneration
+        || row.profile_state === "removed"
+      ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      this.#database.query(
+        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
+      ).run(parsedAttemptId, evidence.kind, canonical, digest, now);
+      const changed = this.#database.query(
+        "UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'",
+      ).run(now, parsedAttemptId);
+      if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+    });
+    begin.immediate();
+    return { attemptId: parsedAttemptId, digest, evidence, recordedAt: now };
+  }
+
+  settleClaudeLoginMutation(input: {
+    attemptId: AttemptId;
+    idempotencyKey: string;
+    profileId: ProfileId;
+    profileGeneration: number;
+    signedIn: boolean;
+    outcome:
+      | Readonly<{ state: "joined"; exitCode: number; interruptedBy: "SIGINT" | "SIGTERM" | null }>
+      | Readonly<{ state: "not_started"; reason: "spawn_failed" }>
+      | Readonly<{ state: "not_started"; reason: "preflight_stale" }>
+      | Readonly<{ state: "not_started"; reason: "interrupted_before_spawn"; interruptedBy: "SIGINT" | "SIGTERM" }>;
+  }): Readonly<{
+    accountId: ProfileId;
+    attemptId: AttemptId;
+    idempotencyKey: string;
+    providerGeneration: number;
+    signedIn: boolean;
+    outcome:
+      | Readonly<{ state: "joined"; exitCode: number; interruptedBy: "SIGINT" | "SIGTERM" | null }>
+      | Readonly<{ state: "not_started"; reason: "spawn_failed" }>
+      | Readonly<{ state: "not_started"; reason: "preflight_stale" }>
+      | Readonly<{ state: "not_started"; reason: "interrupted_before_spawn"; interruptedBy: "SIGINT" | "SIGTERM" }>;
+  }> {
+    const parsed = z.object({
+      attemptId: attemptIdSchema,
+      idempotencyKey: z.string().uuid(),
+      profileId: profileIdSchema,
+      profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      signedIn: z.boolean(),
+      outcome: z.union([
+        z.object({
+          state: z.literal("joined"),
+          exitCode: z.number().int().nonnegative().max(255),
+          interruptedBy: z.enum(["SIGINT", "SIGTERM"]).nullable(),
+        }).strict(),
+        z.object({ state: z.literal("not_started"), reason: z.literal("spawn_failed") }).strict(),
+        z.object({ state: z.literal("not_started"), reason: z.literal("preflight_stale") }).strict(),
+        z.object({
+          state: z.literal("not_started"),
+          reason: z.literal("interrupted_before_spawn"),
+          interruptedBy: z.enum(["SIGINT", "SIGTERM"]),
+        }).strict(),
+      ]),
+    }).strict().parse(input);
+    if (parsed.outcome.state === "not_started" && parsed.signedIn) {
+      throw new Error("CLAUDE_LOGIN_NO_EFFECT_STATUS_CONFLICT");
+    }
+    const result = {
+      accountId: parsed.profileId,
+      attemptId: parsed.attemptId,
+      idempotencyKey: parsed.idempotencyKey,
+      providerGeneration: parsed.profileGeneration,
+      signedIn: parsed.signedIn,
+      outcome: parsed.outcome,
+    } as const;
+    const now = this.#now();
+    const settle = this.#database.transaction(() => {
+      const row = z.object({
+        id: attemptIdSchema,
+        idempotency_key: z.string().uuid(),
+        kind: z.literal("account.claude-login"),
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative(),
+        state: z.enum(["effect_started", "applied", "failed", "ambiguous"]),
+        result_json: z.string().nullable(),
+        profile_state: profileStateSchema,
+        evidence_json: z.string(),
+        evidence_digest: sha256Schema,
+        resolution_kind: mutationResolutionKindSchema.nullable(),
+        receipt_json: z.string().nullable(),
+      }).strict().parse(this.#database.query(
+        `SELECT m.id,m.idempotency_key,m.kind,m.authority_id,m.authority_generation,
+                m.state,m.result_json,p.state AS profile_state,e.evidence_json,e.evidence_digest,
+                r.resolution_kind,r.receipt_json
+         FROM mutation_attempts m
+         JOIN profiles p ON p.id=m.authority_id
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.idempotency_key=?`,
+      ).get(parsed.idempotencyKey));
+      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      if (
+        row.id !== parsed.attemptId
+        || row.authority_id !== parsed.profileId
+        || row.authority_generation !== parsed.profileGeneration
+        || row.profile_state === "removed"
+        || evidence.kind !== "account.claude-login"
+        || digestJson(evidence) !== row.evidence_digest
+      ) throw new Error("CLAUDE_LOGIN_AUTHORITY_MISMATCH");
+      if (row.resolution_kind !== null) {
+        const prior = row.receipt_json === null ? null : JSON.parse(row.receipt_json) as unknown;
+        if (
+          row.resolution_kind === "abandoned"
+          || JSON.stringify(prior) !== JSON.stringify(result)
+        ) throw new Error("CLAUDE_LOGIN_TERMINAL_OUTCOME_CONFLICT");
+        return;
+      }
+      if (row.state === "applied" || row.state === "failed") {
+        const prior = row.result_json === null ? null : JSON.parse(row.result_json) as unknown;
+        if (JSON.stringify(prior) !== JSON.stringify(result)) {
+          throw new Error("CLAUDE_LOGIN_TERMINAL_OUTCOME_CONFLICT");
+        }
+        return;
+      }
+      if (row.state === "ambiguous") {
+        const inserted = this.#database.query(
+          "INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)",
+        ).run(
+          parsed.attemptId,
+          parsed.signedIn ? "proven_applied" : "provider_state_reconciled",
+          JSON.stringify({
+            source: "account.claude-login.complete",
+            signedIn: parsed.signedIn,
+            outcome: parsed.outcome,
+          }),
+          JSON.stringify(result),
+          now,
+        );
+        if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
+        return;
+      }
+      const target = parsed.signedIn ? "applied" : "failed";
+      const changed = this.#database.query(
+        "UPDATE mutation_attempts SET state=?,result_json=?,updated_at=? WHERE id=? AND state='effect_started'",
+      ).run(target, JSON.stringify(result), now, parsed.attemptId);
+      if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+    });
+    settle.immediate();
+    return result;
+  }
+
+  /**
+   * Releases only Claude's local one-child fence after the operator confirms
+   * the original foreground child has exited. This never reads, changes, or
+   * deletes Claude credentials and never invokes the provider.
+   */
+  abandonClaudeLoginMutation(input: {
+    attemptId: AttemptId;
+    idempotencyKey: string;
+    profileId: ProfileId;
+    profileGeneration: number;
+    acknowledgeChildExited: true;
+  }): Readonly<{
+    accountId: ProfileId;
+    attemptId: AttemptId;
+    idempotencyKey: string;
+    providerGeneration: number;
+    acknowledgedChildExited: true;
+  }> {
+    const parsed = z.object({
+      attemptId: attemptIdSchema,
+      idempotencyKey: z.string().uuid(),
+      profileId: profileIdSchema,
+      profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      acknowledgeChildExited: z.literal(true),
+    }).strict().parse(input);
+    const result = {
+      accountId: parsed.profileId,
+      attemptId: parsed.attemptId,
+      idempotencyKey: parsed.idempotencyKey,
+      providerGeneration: parsed.profileGeneration,
+      acknowledgedChildExited: true,
+    } as const;
+    const now = this.#now();
+    const abandon = this.#database.transaction(() => {
+      const row = z.object({
+        id: attemptIdSchema,
+        kind: z.literal("account.claude-login"),
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().nonnegative(),
+        state: mutationStateSchema.exclude(["reconciled"]),
+        profile_state: profileStateSchema,
+        evidence_json: z.string(),
+        evidence_digest: sha256Schema,
+        resolution_kind: mutationResolutionKindSchema.nullable(),
+        receipt_json: z.string().nullable(),
+      }).strict().parse(this.#database.query(
+        `SELECT m.id,m.kind,m.authority_id,m.authority_generation,m.state,
+                p.state AS profile_state,e.evidence_json,e.evidence_digest,
+                r.resolution_kind,r.receipt_json
+         FROM mutation_attempts m
+         JOIN profiles p ON p.id=m.authority_id
+         JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE m.idempotency_key=?`,
+      ).get(parsed.idempotencyKey));
+      const evidence = mutationEffectEvidenceSchema.parse(JSON.parse(row.evidence_json) as unknown);
+      if (
+        row.id !== parsed.attemptId
+        || row.authority_id !== parsed.profileId
+        || row.authority_generation !== parsed.profileGeneration
+        || row.profile_state === "removed"
+        || evidence.kind !== "account.claude-login"
+        || digestJson(evidence) !== row.evidence_digest
+      ) throw new Error("CLAUDE_LOGIN_AUTHORITY_MISMATCH");
+      if (row.resolution_kind !== null) {
+        const prior = row.receipt_json === null ? null : JSON.parse(row.receipt_json) as unknown;
+        if (
+          row.resolution_kind !== "abandoned"
+          || JSON.stringify(prior) !== JSON.stringify(result)
+        ) throw new Error("CLAUDE_LOGIN_TERMINAL_OUTCOME_CONFLICT");
+        return;
+      }
+      if (row.state !== "effect_started" && row.state !== "ambiguous") {
+        throw new Error("CLAUDE_LOGIN_NOT_UNSETTLED");
+      }
+      const inserted = this.#database.query(
+        "INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)",
+      ).run(
+        parsed.attemptId,
+        "abandoned",
+        JSON.stringify({
+          source: "operator_acknowledgement",
+          acknowledgedChildExited: true,
+          localOnly: true,
+          credentialAction: "none",
+        }),
+        JSON.stringify(result),
+        now,
+      );
+      if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
+    });
+    abandon.immediate();
+    return result;
   }
 
   listUnsettledMutations(input: { authorityId?: string; sessionId?: SessionId } = {}): readonly MutationAttemptRecord[] {
@@ -7538,6 +8081,20 @@ export class StateStore {
               }
               authorityResolved = true;
             }
+          }
+        } else if (kind === "account.claude-login") {
+          const parsedProfile = profileIdSchema.safeParse(authorityId);
+          if (parsedProfile.success) {
+            const profile = this.#database
+              .query("SELECT state,process_generation FROM profiles WHERE id=?")
+              .get(parsedProfile.data) as { state: string; process_generation: number } | null;
+            // Claude's provider-specific external-child fence survives the
+            // universal daemon-restart generation advance. It never rewrites
+            // the sibling Codex projection; only exact old-authority complete
+            // or acknowledged local abandon may append a resolution.
+            authorityResolved = profile !== null
+              && profile.state !== "removed"
+              && profile.process_generation >= authorityGeneration;
           }
         } else if (["account.login", "account.logout", "account.login-cancel"].includes(kind)) {
           const parsedProfile = profileIdSchema.safeParse(authorityId);
@@ -9730,6 +10287,13 @@ export class StateStore {
       if (currentProfile.processGeneration !== processGeneration) {
         throw new Error("INTERACTION_QUARANTINE_PROFILE_AUTHORITY_CHANGED");
       }
+      const claudeBlocker = this.providerAuthorityAdvanceBlocker(
+        profileId,
+        "claude",
+      );
+      if (claudeBlocker !== null) {
+        throw new Error(`CLAUDE_PROVIDER_AUTHORITY_NOT_QUIESCENT:${claudeBlocker}`);
+      }
 
       const focal = this.#requireInteractionRow(focalInteractionId);
       if (
@@ -10957,7 +11521,21 @@ export class StateStore {
       this.#database.query(
         `UPDATE profiles
          SET process_generation=process_generation+1,updated_at=MAX(updated_at,?)
-         WHERE state!='removed' AND process_generation>0`,
+         WHERE state!='removed'
+           AND (
+             process_generation>0
+             OR EXISTS (
+               SELECT 1
+               FROM mutation_attempts m
+               WHERE m.authority_id=profiles.id
+                 AND m.kind='account.claude-login'
+                 AND m.state IN ('effect_started','ambiguous')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM mutation_resolutions r
+                   WHERE r.attempt_id=m.id
+                 )
+             )
+           )`,
       ).run(now);
       this.#database.query("UPDATE daemon_state SET generation=?,boot_id=?,started_at=?,stopped_at=NULL WHERE singleton=1 AND generation=?").run(current.generation + 1, bootId, now, current.generation);
       return current.generation + 1;

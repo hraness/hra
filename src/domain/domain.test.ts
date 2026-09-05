@@ -69,6 +69,57 @@ describe("domain laws", () => {
     }
   });
 
+  test("binds the two-phase Claude login completion to one exact terminal outcome", () => {
+    const base = {
+      account: `acct_${"a".repeat(32)}`,
+      attemptId: `attempt_${"b".repeat(32)}`,
+      idempotencyKey: "00000000-0000-4000-8000-000000000301",
+      kind: "account.claude-login.complete",
+      providerGeneration: 7,
+    } as const;
+    expect(localCommandSchema.safeParse({
+      ...base,
+      outcome: { state: "joined", exitCode: 0, interruptedBy: null },
+    }).success).toBe(true);
+    expect(localCommandSchema.safeParse({
+      ...base,
+      outcome: { state: "not_started", reason: "spawn_failed" },
+    }).success).toBe(true);
+    expect(localCommandSchema.safeParse({
+      ...base,
+      outcome: { state: "not_started", reason: "preflight_stale" },
+    }).success).toBe(true);
+    expect(localCommandSchema.safeParse({
+      ...base,
+      outcome: { state: "not_started", reason: "interrupted_before_spawn", interruptedBy: "SIGINT" },
+    }).success).toBe(true);
+    for (const outcome of [
+      { state: "joined", exitCode: 0 },
+      { state: "not_started", reason: "unknown" },
+      { state: "not_started", reason: "interrupted_before_spawn" },
+      { state: "joined", exitCode: 0, interruptedBy: null, credential: "forbidden" },
+    ]) expect(localCommandSchema.safeParse({ ...base, outcome }).success).toBe(false);
+  });
+
+  test("requires exact authority and an explicit child-exit acknowledgement to abandon Claude login", () => {
+    const base = {
+      account: `acct_${"a".repeat(32)}`,
+      attemptId: `attempt_${"b".repeat(32)}`,
+      idempotencyKey: "00000000-0000-4000-8000-000000000302",
+      kind: "account.claude-login.abandon",
+      providerGeneration: 7,
+    } as const;
+    expect(localCommandSchema.safeParse({
+      ...base,
+      acknowledgeChildExited: true,
+    }).success).toBe(true);
+    expect(localCommandSchema.safeParse(base).success).toBe(false);
+    expect(localCommandSchema.safeParse({
+      ...base,
+      acknowledgeChildExited: false,
+    }).success).toBe(false);
+  });
+
   test("terminal mutation states are absorbing", () => {
     fc.assert(
       fc.property(fc.constantFrom("applied", "failed", "ambiguous", "cancelled", "reconciled"), fc.constantFrom(...mutationStateSchema.options), (from, to) => {

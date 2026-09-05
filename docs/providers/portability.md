@@ -1,8 +1,11 @@
 # Session portability
 
-HRA owns a provider-neutral record of every session. A conversation can move
-from Codex to Claude Code and back while it is running, and it can be exported
-in the letta-ai trajectory v1 shape for memory and search tooling.
+HRA owns a provider-neutral record of every session. On Linux, a conversation
+can move from Codex to Claude Code and back while it is running, and it can be
+exported in the letta-ai trajectory v1 shape for memory and search tooling.
+Codex switching remains available on macOS, but a switch into Claude is refused
+there until authenticated testing proves isolated Keychain custody and
+detached-daemon reads without a prompt.
 
 Before this, HRA stored no conversation of its own. Assistant text existed only
 as `assistant_delta` events, there was no record of what HRA had sent, and
@@ -84,6 +87,7 @@ A switch is refused, with no effect, when:
   Claude, `fable-max` on Codex). With no `--preset`, the switch keeps the
   session's tier when the target has one and otherwise takes the target's
   highest;
+- the target is Claude and the custodian daemon is not running on Linux;
 - the session already runs that provider, preset, and account.
 
 ### What a switch preserves, and what it cannot
@@ -143,7 +147,8 @@ user-directed and stays on the machine that holds the credentials; a remote
 switch keeps the session's account.
 
 `hra remote provider <cloud-session> <codex|claude> [--preset <preset>]` is the
-CLI form.
+CLI form. The custodian daemon applies the same Linux-only admission rule to a
+remote switch into Claude; the browser cannot widen platform support.
 
 ## Exporting a trajectory
 

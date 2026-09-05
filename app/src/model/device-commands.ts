@@ -1,7 +1,9 @@
 import {
+  deviceCommandLoginResultLifetimeMs,
   deviceCommandLimits,
   parseDeviceCommandPayload,
   type DeviceCommandPayload,
+  type DeviceCommandResultPayload,
 } from "../hra/cloud";
 import type { MachineView } from "./settings-view";
 
@@ -28,6 +30,25 @@ export type SessionStartTarget = Readonly<{
   provider: "codex" | "claude";
   targetDevicePublicId: string;
 }>;
+
+/** Public picker copy cannot infer OS, so it states Claude's admission boundary beside the choice. */
+export function sessionStartTargetLabel(target: SessionStartTarget): string {
+  const provider = target.provider === "claude"
+    ? "Claude Code (Linux machine only)"
+    : "Codex";
+  return `${target.accountLabel} — ${target.machineLabel} — ${provider}`;
+}
+
+/** The composer repeats the boundary after selection, before any remote provider effect. */
+export function sessionStartTargetHint(target: SessionStartTarget): string {
+  const availability = target.machineOnline
+    ? ""
+    : " (offline; it will run when the machine wakes)";
+  const platform = target.provider === "claude"
+    ? " Claude sessions require a Linux custodian; macOS refuses before launch."
+    : "";
+  return `Starts on ${target.machineLabel}${availability}.${platform}`;
+}
 
 function build(payload: DeviceCommandPayload): DeviceCommandPayload {
   const parsed = parseDeviceCommandPayload(payload);
@@ -58,11 +79,61 @@ export function sessionStartCommand(input: Readonly<{
 }
 
 export function accountLoginStartCommand(accountPublicId: string): DeviceCommandPayload {
-  return build({ accountPublicId, kind: "account_login_start" });
+  return build({ accountPublicId, handoffVersion: 2, kind: "account_login_start" });
 }
 
-export function accountLoginStatusCommand(): DeviceCommandPayload {
-  return build({ kind: "account_login_status" });
+export function accountLoginStatusCommand(accountPublicId: string): DeviceCommandPayload {
+  return build({ accountPublicId, kind: "account_login_status" });
+}
+
+/**
+ * Replaces the daemon-clock expiry with the hosted settlement deadline.
+ * Convex owns this timestamp so machine and browser clock skew cannot hide a
+ * freshly released code or extend its five-minute readable window.
+ */
+export function bindHostedLoginResultExpiry(
+  result: DeviceCommandResultPayload,
+  expiresAt: unknown,
+  fallbackExpiresAt?: unknown,
+): DeviceCommandResultPayload | null {
+  const effectiveExpiresAt = Number.isSafeInteger(expiresAt) && (expiresAt as number) > 0
+    ? expiresAt
+    : fallbackExpiresAt;
+  if (
+    result.kind !== "account_login_start"
+    || !Number.isSafeInteger(effectiveExpiresAt)
+    || (effectiveExpiresAt as number) <= 0
+  ) return null;
+  return { ...result, expiresAt: effectiveExpiresAt as number };
+}
+
+/** Server-owned deadline derivable from the public command settlement row. */
+export function hostedLoginHandoffDeadline(settledAt: unknown): number | null {
+  if (!Number.isSafeInteger(settledAt) || (settledAt as number) < 0) return null;
+  const deadline = (settledAt as number) + deviceCommandLoginResultLifetimeMs;
+  return Number.isSafeInteger(deadline) ? deadline : null;
+}
+
+export type HostedLoginHandoffAdmission =
+  | Readonly<{ status: "awaiting_server_clock" }>
+  | Readonly<{ status: "expired_or_invalid" }>
+  | Readonly<{ expiresAt: number; status: "ready" }>;
+
+/**
+ * Admit a single-use result only after the browser clock is server-anchored.
+ * An ahead local clock must not permanently consume or dismiss a fresh code
+ * during the render before `presence:current` establishes its offset.
+ */
+export function admitHostedLoginHandoff(input: Readonly<{
+  now: number;
+  serverClockReady: boolean;
+  settledAt: unknown;
+}>): HostedLoginHandoffAdmission {
+  if (!input.serverClockReady) return { status: "awaiting_server_clock" };
+  const expiresAt = hostedLoginHandoffDeadline(input.settledAt);
+  return expiresAt === null || expiresAt <= input.now
+    ? { status: "expired_or_invalid" }
+    : { expiresAt, status: "ready" };
 }
 
 export function usageRefreshCommand(): DeviceCommandPayload {

@@ -92,6 +92,13 @@ describe("device command guards", () => {
       accountLinkingAllowed: true,
       payload: payload({ accountPublicId: "account_primary", kind: "account_login_start" }),
     })).kind).toBe("admitted");
+    expect(deviceCommandGuardDecision(input({
+      accountLinkingAllowed: true,
+      payload: payload({
+        accountPublicId: "account_primary",
+        kind: "account_login_status",
+      }),
+    })).kind).toBe("admitted");
   });
 
   test("addressing is checked against the projected registry", () => {
@@ -105,6 +112,26 @@ describe("device command guards", () => {
     expect(deviceCommandGuardDecision(input({
       accounts: [{ provider: "claude", publicId: "account_primary", status: "signed_in" }],
     }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+    expect(deviceCommandGuardDecision(input({
+      accountLinkingAllowed: true,
+      accounts: [{ provider: "claude", publicId: "account_primary", status: "signed_out" }],
+      payload: payload({ accountPublicId: "account_primary", kind: "account_login_start" }),
+    }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+    expect(deviceCommandGuardDecision(input({
+      accountLinkingAllowed: true,
+      accounts: [{ provider: "claude", publicId: "account_primary", status: "signed_out" }],
+      payload: payload({
+        accountPublicId: "account_primary",
+        kind: "account_login_status",
+      }),
+    }))).toEqual({ code: "DEVICE_COMMAND_PROVIDER_UNSUPPORTED", kind: "refused" });
+    expect(deviceCommandGuardDecision(input({
+      accountLinkingAllowed: true,
+      payload: payload({
+        accountPublicId: "account_missing",
+        kind: "account_login_status",
+      }),
+    }))).toEqual({ code: "DEVICE_COMMAND_ACCOUNT_UNKNOWN", kind: "refused" });
   });
 
   test("the per-day cap refuses at the ceiling and resets on a new day", () => {

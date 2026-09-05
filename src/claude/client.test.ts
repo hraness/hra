@@ -327,4 +327,28 @@ describe("Claude stream client", () => {
     await client.close();
     await expect(client.startTurn({ message: "x", turnId: "t" })).rejects.toThrow(ClaudeError);
   });
+
+  test("force-terminates and exactly joins a session child that ignores TERM", async () => {
+    const process = new FakeClaudeProcess();
+    let forceTerminations = 0;
+    const gracefulExit = process.terminate.bind(process);
+    process.terminate = () => { process.terminated = true; };
+    process.forceTerminate = () => {
+      forceTerminations += 1;
+      gracefulExit();
+    };
+    const client = new ClaudeStreamClient({
+      configDir: CONFIG_DIR,
+      onFact: () => undefined,
+      process,
+      shutdownSettlementMs: 20,
+      shutdownTermGraceMs: 1,
+    });
+
+    await client.close();
+
+    expect(process.terminated).toBe(true);
+    expect(forceTerminations).toBe(1);
+    await expect(process.exited).resolves.toBe(0);
+  });
 });

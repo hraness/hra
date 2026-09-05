@@ -885,6 +885,11 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
+  discardRuntimeReview(review: RuntimeStartReview): void {
+    const pending = this.#runtimeReviews.get(review.reviewId);
+    if (pending?.review === review) this.#runtimeReviews.delete(review.reviewId);
+  }
+
   async startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReview; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
     return await this.#admit(async () => {
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a session.");

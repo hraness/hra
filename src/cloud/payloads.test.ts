@@ -351,8 +351,21 @@ describe("device command payloads", () => {
       accountPublicId: "account_primary",
       kind: "account_login_start",
     })).toEqual({ accountPublicId: "account_primary", kind: "account_login_start" });
+    expect(parseDeviceCommandPayload({
+      accountPublicId: "account_primary",
+      handoffVersion: 2,
+      kind: "account_login_start",
+    })).toEqual({
+      accountPublicId: "account_primary",
+      handoffVersion: 2,
+      kind: "account_login_start",
+    });
     expect(parseDeviceCommandPayload({ kind: "account_login_status" }))
       .toEqual({ kind: "account_login_status" });
+    expect(parseDeviceCommandPayload({
+      accountPublicId: "account_primary",
+      kind: "account_login_status",
+    })).toEqual({ accountPublicId: "account_primary", kind: "account_login_status" });
     expect(parseDeviceCommandPayload({ kind: "usage_refresh" }))
       .toEqual({ kind: "usage_refresh" });
   });
@@ -364,6 +377,11 @@ describe("device command payloads", () => {
     expect(parseDeviceCommandPayload({ kind: "send_or_steer", message: "hello" })).toBeNull();
     expect(parseDeviceCommandPayload({ kind: "account_login_status", accountPublicId: "a" }))
       .toBeNull();
+    expect(parseDeviceCommandPayload({
+      accountPublicId: "account_primary",
+      handoffVersion: 1,
+      kind: "account_login_start",
+    })).toBeNull();
   });
 
   test("never accepts a filesystem path as addressing or as a prompt", () => {
@@ -405,28 +423,38 @@ describe("device command payloads", () => {
     })).toEqual({ kind: "session_start", sessionPublicId: "sess_0000000000000001" });
     expect(parseDeviceCommandResultPayload({
       expiresAt: 1,
+      handoffVersion: 2,
       kind: "account_login_start",
       loginUrl: "https://auth.example.test/device",
       userCode: "ABCD-EFGH",
     })).not.toBeNull();
     expect(parseDeviceCommandResultPayload({
       expiresAt: 1,
+      handoffVersion: 2,
       kind: "account_login_start",
       loginUrl: "http://auth.example.test/device",
       userCode: "ABCD-EFGH",
     })).toBeNull();
-    // A URL-only result from an older daemon must not masquerade as a usable
-    // phone handoff. Settings reports it as incompatible and asks for an update.
+    // Legacy URL-only results still parse so an updated web client can consume
+    // them exactly once and report that the machine must be updated.
     expect(parseDeviceCommandResultPayload({
       expiresAt: 1,
       kind: "account_login_start",
       loginUrl: "https://auth.example.test/device",
-    })).toBeNull();
+    })).not.toBeNull();
     expect(parseDeviceCommandResultPayload({
       expiresAt: 1,
+      handoffVersion: 2,
       kind: "account_login_start",
       loginUrl: "https://auth.example.test/device",
       userCode: "not a device code",
+    })).toBeNull();
+    expect(parseDeviceCommandResultPayload({
+      expiresAt: 1,
+      handoffVersion: 1,
+      kind: "account_login_start",
+      loginUrl: "https://auth.example.test/device",
+      userCode: "ABCD-EFGH",
     })).toBeNull();
     expect(parseDeviceCommandResultPayload({
       instruction: "No login is in progress.",
@@ -460,6 +488,7 @@ describe("device command payloads", () => {
     await expectPromiseToReject(decryptDeviceCommandResult(envelope, key, resultAuthority));
     const result = {
       expiresAt: 1_760_000_000_000,
+      handoffVersion: 2,
       kind: "account_login_start",
       loginUrl: "https://auth.example.test/device",
       userCode: "ABCD-EFGH",

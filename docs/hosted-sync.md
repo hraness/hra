@@ -8,7 +8,7 @@ Never copy retired HRA v0 data, deployment URLs, deploy keys, authentication key
 
 The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. Retired HRA v0 Convex project ID `2680173` and production deployment ID `4677913` remain permanent denylisted safety tombstones; neither may be recreated, renamed into, or selected by this runbook. The current source repository has GitHub repository ID `1343008607`, and the current web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Provider names may change. The team identity and numeric resource IDs do not.
 
-Browser app project. The web app at `app.hra.sh` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, output directory `dist`, and no environment variables: the Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `hra-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.hra.sh`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`.
+Browser app project. The web app at `app.hra.sh` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`. Its tracked ignore command exits nonzero for production so Vercel builds `main` rather than skipping it, while preview deployments remain ignored. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `hra-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.hra.sh`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`.
 
 Live projection. Besides the compact stream of completed turns, the daemon streams the current turn's assistant text (and reasoning summaries only when show-thinking is enabled for the session, default off) to the `detail` stream about once per second in redacted, encrypted batches of at most 8 KiB. Detail chunks carry the `live_tail` retention class: each row expires six hours after it is written, a session keeps at most 200 rows, and the `live_tail_chunks` maintenance category sweeps expired rows behind a detail stream epoch so digest-chain verification of the surviving tail stays valid and both the chunk quota and the per-user `live_chunk` resource counter are released. Raw reasoning is never uploaded.
 
@@ -490,16 +490,22 @@ from silently starting a second session.
 | Kind | Payload | Result |
 | --- | --- | --- |
 | `session_start` | `{accountPublicId, projectPublicId, prompt, preset, provider}` | `{sessionPublicId}` |
-| `account_login_start` | `{accountPublicId}` | `{loginUrl, userCode, expiresAt}`, single use |
-| `account_login_status` | none | `{status, instruction}` |
+| `account_login_start` | `{accountPublicId,handoffVersion?:2}` | current: `{handoffVersion:2,loginUrl,userCode,expiresAt}`; legacy: `{loginUrl,expiresAt}`, single use |
+| `account_login_status` | current: `{accountPublicId}`; legacy: none | `{status, instruction}` |
 | `usage_refresh` | none | `{accountsRefreshed}` |
 
 Addressing is by the cloud public ids the device registry already projects
 (`DeviceRegistryPayload.accounts` and `.projects`). A filesystem path is
 refused by the payload parser, so a project root can never reach the hosted
-deployment. `account_login_status` deliberately carries no account: a machine
-relays at most one login at a time, so the poll asks what the machine is doing
-rather than naming an account.
+deployment. Current `account_login_status` requests name the projected account
+whose Settings row exposed the action. The machine reports only that account's
+state and uses its exact public id in any local finish or cancel instruction,
+so a pending login on a sibling profile cannot change the row's answer. The
+account-less machine-wide shape remains accepted for legacy browsers during a
+rolling deployment. The requesting browser decrypts this reusable result under
+the exact device-command-result authority and renders the machine's bounded
+status and instruction. It does not replace the result with a generic
+acknowledgement.
 
 `session_start` runs as start-then-send under one idempotency key. The two
 local effects use keys derived deterministically from the device command's own
@@ -518,7 +524,7 @@ Every guard is local. Nothing hosted and no browser can change one.
 | Account linking without the local opt-in | `ACCOUNT_LINKING_DENIED` |
 | Account not in the projected registry | `DEVICE_COMMAND_ACCOUNT_UNKNOWN` |
 | Account signed out on the machine | `DEVICE_COMMAND_ACCOUNT_SIGNED_OUT` |
-| Provider does not match the projected account | `DEVICE_COMMAND_PROVIDER_UNSUPPORTED` |
+| Provider does not match the projected account, or browser linking targets non-Codex | `DEVICE_COMMAND_PROVIDER_UNSUPPORTED` |
 | Project not in the projected registry | `DEVICE_COMMAND_PROJECT_UNKNOWN` |
 | Per-device daily cap (100 admitted commands) | `DEVICE_COMMAND_DAILY_CAP` |
 | Incomplete or non-relayable login handoff | `ACCOUNT_LOGIN_RELAY_UNAVAILABLE` |
@@ -535,8 +541,9 @@ is a daemon diagnostic and the CLI injects a real notifier when one exists. And
 a browser-started session inherits its project's approval mode, applied before
 the prompt is sent, so the first turn is already governed by it.
 
-For Codex, `account_login_start` always dispatches the local `account.login`
-command in device-code mode. The web lane never requests browser mode. A
+For Codex, a current browser sends `account_login_start` with
+`handoffVersion: 2`, which dispatches the local `account.login` command in
+device-code mode. The current web lane never requests browser mode. A
 browser-mode loopback callback cannot be completed on another device, so HRA
 does not relay it.
 
@@ -549,11 +556,13 @@ malformed value fails closed with
 
 HRA encrypts the URL and user code together under the account key in one
 result. The hosted deployment stores only that ciphertext. The result expires
-five minutes after issue and `deviceCommands:consumeResult` releases it only
-to the requesting browser, exactly once, while erasing the ciphertext in the
-same transaction. Settings displays the code before the link, offers a copy
-control with manual selection as the fallback, and clears the handoff at its
-expiry or when a later login start or status check supersedes it.
+five minutes after hosted settlement and `deviceCommands:consumeResult`
+releases it only to the requesting browser, exactly once, while erasing the
+ciphertext in the same transaction. Convex returns that server-owned deadline
+with the release, so machine or browser clock skew cannot extend the readable
+window. Settings displays the code before the link, offers a copy control with
+manual selection as the fallback, and clears the handoff at its expiry or when
+a later login start or status check supersedes it.
 
 Both local gates still apply: device commands must be enabled and the machine
 must have `hra remote allow account-linking` set. Settings offers the flow only
@@ -561,13 +570,14 @@ for an account in that machine's encrypted registry after the registry reports
 the opt-in. The daemon rechecks the requesting device, account public id, local
 switches, and daily cap before starting the provider effect.
 
-Roll out this exact result shape in order: deploy the updated web parser and UI
-first, then update the machine daemon. Refresh a stale Settings tab before
-starting a login. The new web app rejects an older URL-only result and asks for
-a machine update; an old tab can consume a new single-use result without being
-able to render it, so refresh and retry. This behavior is covered by focused
-parser, adapter, bridge, Convex, and UI tests. It has not yet been accepted
-against production or in a live two-device Codex login.
+The request version makes mixed rollout fail before the wrong provider effect.
+A current browser sends `handoffVersion: 2`; an older daemon rejects that
+unknown shape before login starts. A current daemon treats an unversioned
+request as the legacy browser-mode lane and returns only its legacy URL shape,
+which still fails closed for a loopback callback. A current browser can consume
+that legacy result exactly once only to ask for a machine update. This behavior
+is covered by focused parser, adapter, bridge, and UI tests. It has not yet been
+accepted against production or in a live two-device Codex login.
 
 ### Operator switches
 

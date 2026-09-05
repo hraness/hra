@@ -13,7 +13,7 @@ import {
 describe("the menu", () => {
   test("offers both providers, in the words the reader sees", () => {
     expect(providerSwitchOptions.map((option) => option.label))
-      .toEqual(["Run on Codex", "Run on Claude Code"]);
+      .toEqual(["Run on Codex", "Run on Claude Code (Linux machine only)"]);
     expect(providerSwitchOptions.map((option) => option.provider))
       .toEqual(["codex", "claude"]);
   });
@@ -21,6 +21,8 @@ describe("the menu", () => {
   test("says in one line what a switch carries across", () => {
     expect(providerSwitchNote).toContain("summary");
     expect(providerSwitchNote).toContain("not the other provider's own history");
+    expect(providerSwitchNote).toContain("Linux custodian");
+    expect(providerSwitchNote).toContain("macOS refuses");
   });
 });
 

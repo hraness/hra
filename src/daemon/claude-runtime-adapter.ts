@@ -6,9 +6,11 @@ import {
   ClaudeError,
   ClaudeStreamClient,
   boundClaudeText,
+  readClaudeAuthStatus,
   sanitizeClaudeText,
   spawnBunClaudeProcess,
   resolvePinnedClaudeRuntime,
+  type ClaudeAuthStatusReader,
   type ClaudeCanUseTool,
   type ClaudeFact,
   type ClaudeInteractionDecision,
@@ -71,7 +73,7 @@ const projectedText = (value: string): Pick<CodexProjectedMessage, "text" | "omi
 
 /** One live Claude session: its process, its client, and its projection. */
 type RunningSession = {
-  readonly authority: ProfileAuthority;
+  authority: ProfileAuthority;
   readonly client: ClaudeStreamClient;
   readonly connectionId: string;
   readonly providerThreadId: string;
@@ -106,7 +108,7 @@ export type ClaudeRuntimeObserver = {
 type PendingClaudeReview = {
   readonly review: ClaudeRuntimeStartReview;
   readonly runtime: PinnedClaudeRuntime;
-  readonly authority: ProfileAuthority;
+  authority: ProfileAuthority;
   readonly projectRoot: string;
   readonly providerThreadId?: string;
 };
@@ -179,7 +181,8 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   readonly provider = "claude" as const;
   readonly #isCurrent: (authority: ProfileAuthority) => boolean;
   readonly #observer: ClaudeRuntimeObserver;
-  readonly #configDirFor: (authority: ProfileAuthority) => string;
+  readonly #configDirFor: (authority: ProfileAuthority) => string | Promise<string>;
+  readonly #readAuthStatus: ClaudeAuthStatusReader;
   readonly #resolveRuntime: typeof resolvePinnedClaudeRuntime;
   readonly #processFactory: ClaudeProcessFactory;
   readonly #now: () => number;
@@ -192,7 +195,8 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     isCurrent: (authority: ProfileAuthority) => boolean;
     observer: ClaudeRuntimeObserver;
     /** The isolated, absolute `CLAUDE_CONFIG_DIR` for one HRA account. */
-    configDirFor: (authority: ProfileAuthority) => string;
+    configDirFor: (authority: ProfileAuthority) => string | Promise<string>;
+    readAuthStatus?: ClaudeAuthStatusReader;
     resolveRuntime?: typeof resolvePinnedClaudeRuntime;
     processFactory?: ClaudeProcessFactory;
     now?: () => number;
@@ -200,6 +204,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     this.#isCurrent = input.isCurrent;
     this.#observer = input.observer;
     this.#configDirFor = input.configDirFor;
+    this.#readAuthStatus = input.readAuthStatus ?? readClaudeAuthStatus;
     this.#resolveRuntime = input.resolveRuntime ?? resolvePinnedClaudeRuntime;
     this.#processFactory = input.processFactory
       ?? ((launch) => spawnBunClaudeProcess({
@@ -218,17 +223,72 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     return runtime.version;
   }
 
+  rebindProfileAuthority(input: {
+    profileId: ProfileAuthority["id"];
+    expectedGeneration: number;
+    nextGeneration: number;
+  }): void {
+    this.#assertOpen();
+    if (
+      !Number.isSafeInteger(input.expectedGeneration)
+      || input.expectedGeneration < 0
+      || input.nextGeneration !== input.expectedGeneration + 1
+    ) {
+      throw new ClaudeError(
+        "INVALID_INPUT",
+        "A Claude authority rebind must advance exactly one safe generation.",
+      );
+    }
+    const sessions = [...this.#sessions.values()].filter(
+      (session) => session.authority.id === input.profileId,
+    );
+    const reviews = [...this.#reviews.values()].filter(
+      (review) => review.authority.id === input.profileId,
+    );
+    for (const authority of [
+      ...sessions.map((session) => session.authority),
+      ...reviews.map((review) => review.authority),
+    ]) {
+      if (
+        authority.generation !== input.expectedGeneration
+        && authority.generation !== input.nextGeneration
+      ) {
+        throw new ClaudeError(
+          "AUTHORITY_STALE",
+          "A live Claude process belongs to an unexpected account generation.",
+        );
+      }
+    }
+    const next = (authority: ProfileAuthority): ProfileAuthority => ({
+      ...authority,
+      generation: input.nextGeneration,
+    });
+    for (const session of sessions) session.authority = next(session.authority);
+    for (const review of reviews) review.authority = next(review.authority);
+    const rebound = sessions[0]?.authority ?? reviews[0]?.authority;
+    if (rebound !== undefined) this.#assertCurrent(rebound);
+  }
+
   async readAccount(input: {
     authority: ProfileAuthority;
     signal: AbortSignal;
   }): Promise<CodexAccountProjection> {
-    input.signal.throwIfAborted();
-    // HRA never reads a Claude credential. The only fact it may report is
-    // whether the isolated home has ever produced an authenticated session.
-    const anySession = [...this.#sessions.values()].some(
-      (session) => session.authority.id === input.authority.id,
-    );
-    return { signedIn: anySession };
+    this.#assertLaunchAuthority(input.authority, input.signal);
+    // Claude's own non-interactive status command reads the isolated home and
+    // projects only this boolean. HRA never opens a credential file or copies
+    // any identity-bearing status fields into its account model.
+    const configDir = await this.#configDirFor(input.authority);
+    this.#assertLaunchAuthority(input.authority, input.signal);
+    const runtime = await this.#admitRuntime(configDir);
+    this.#assertLaunchAuthority(input.authority, input.signal);
+    this.#resolvedRuntime = runtime;
+    const account = await this.#readAuthStatus({
+      configDir,
+      runtime,
+      signal: input.signal,
+    });
+    this.#assertLaunchAuthority(input.authority, input.signal);
+    return { signedIn: account.signedIn };
   }
 
   async reviewSessionStart(input: {
@@ -239,6 +299,11 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     signal: AbortSignal;
   }): Promise<ClaudeRuntimeStartReview> {
     return await this.#review({ ...input, kind: "session_start" });
+  }
+
+  discardRuntimeReview(review: ClaudeRuntimeStartReview): void {
+    const pending = this.#reviews.get(review.reviewId);
+    if (pending?.review === review) this.#reviews.delete(review.reviewId);
   }
 
   async reviewTurnStart(input: {
@@ -258,48 +323,64 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     review: ClaudeRuntimeStartReview;
     signal: AbortSignal;
   }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveClaudeRuntimeProfile }> {
-    this.#assertOpen();
+    this.#assertLaunchAuthority(input.authority, input.signal);
     const pending = this.#consumeReview(input.review, "session_start");
-    this.#assertCurrent(input.authority);
     const connectionId = randomUUID();
     const providerThreadId = randomUUID();
-    const configDir = this.#configDirFor(input.authority);
+    const configDir = await this.#configDirFor(input.authority);
+    this.#assertLaunchAuthority(input.authority, input.signal);
     const process = this.#processFactory({
       configDir,
       projectRoot: pending.projectRoot,
       runtime: pending.runtime,
     });
-    const session: RunningSession = {
-      activeTurnId: undefined,
-      assistantItems: new Map(),
-      authority: input.authority,
-      client: new ClaudeStreamClient({
-        configDir,
-        onFact: (fact) => this.#onFact(providerThreadId, connectionId, fact),
-        process,
-      }),
-      connectionId,
-      droppedMessages: 0,
-      droppedTurns: 0,
-      messages: [],
-      profile: pending.review.effectiveRuntimeProfile,
-      projectRoot: pending.projectRoot,
-      providerThreadId,
-      status: "idle",
-      title: "Untitled session",
-      truncatedMessages: 0,
-      turnSummaries: [],
-      updatedAt: this.#now(),
-    };
-    this.#sessions.set(providerThreadId, session);
-    return {
-      effectiveRuntimeProfile: session.profile,
-      providerThreadId,
-      providerUpdatedAt: session.updatedAt,
-      status: "idle",
-      title: session.title,
-      projectRoot: session.projectRoot,
-    };
+    const client = new ClaudeStreamClient({
+      configDir,
+      onFact: (fact) => this.#onFact(providerThreadId, connectionId, fact),
+      process,
+    });
+    try {
+      this.#assertLaunchAuthority(input.authority, input.signal);
+      const session: RunningSession = {
+        activeTurnId: undefined,
+        assistantItems: new Map(),
+        authority: input.authority,
+        client,
+        connectionId,
+        droppedMessages: 0,
+        droppedTurns: 0,
+        messages: [],
+        profile: pending.review.effectiveRuntimeProfile,
+        projectRoot: pending.projectRoot,
+        providerThreadId,
+        status: "idle",
+        title: "Untitled session",
+        truncatedMessages: 0,
+        turnSummaries: [],
+        updatedAt: this.#now(),
+      };
+      this.#assertLaunchAuthority(input.authority, input.signal);
+      this.#sessions.set(providerThreadId, session);
+      return {
+        effectiveRuntimeProfile: session.profile,
+        providerThreadId,
+        providerUpdatedAt: session.updatedAt,
+        status: "idle",
+        title: session.title,
+        projectRoot: session.projectRoot,
+      };
+    } catch (error: unknown) {
+      try {
+        await client.close();
+      } catch (cleanupError: unknown) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Claude session launch authority failed and its child cleanup was incomplete.",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
   }
 
   async startTurn(input: {
@@ -554,7 +635,17 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     const sessions = [...this.#sessions.values()];
     this.#sessions.clear();
     this.#reviews.clear();
-    await Promise.allSettled(sessions.map((session) => session.client.close()));
+    const settlements = await Promise.allSettled(
+      sessions.map((session) => session.client.close()),
+    );
+    const failures = settlements.flatMap((settlement) =>
+      settlement.status === "rejected" ? [settlement.reason as unknown] : []);
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        "One or more Claude session children could not be joined during shutdown.",
+      );
+    }
   }
 
   /** The provider authority one pending `can_use_tool` request binds. */
@@ -590,9 +681,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     fast: boolean;
     signal: AbortSignal;
   }): Promise<ClaudeRuntimeStartReview> {
-    this.#assertOpen();
-    input.signal.throwIfAborted();
-    this.#assertCurrent(input.authority);
+    this.#assertLaunchAuthority(input.authority, input.signal);
     // Refuse another provider's preset before touching the runtime at all.
     assertPresetSupportedByProvider("claude", input.preset);
     if (input.fast) {
@@ -605,8 +694,10 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     if (projectRoot === undefined) {
       throw new ClaudeError("INVALID_INPUT", "A Claude session requires a project directory.");
     }
-    const configDir = this.#configDirFor(input.authority);
+    const configDir = await this.#configDirFor(input.authority);
+    this.#assertLaunchAuthority(input.authority, input.signal);
     const runtime = await this.#admitRuntime(configDir);
+    this.#assertLaunchAuthority(input.authority, input.signal);
     this.#resolvedRuntime = runtime;
     const profile = effectiveClaudeRuntimeProfileSchema.parse({
       claudeVersion: runtime.version,
@@ -634,6 +725,12 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       ...(input.providerThreadId === undefined ? {} : { providerThreadId: input.providerThreadId }),
     });
     return review;
+  }
+
+  #assertLaunchAuthority(authority: ProfileAuthority, signal: AbortSignal): void {
+    signal.throwIfAborted();
+    this.#assertOpen();
+    this.#assertCurrent(authority);
   }
 
   #consumeReview(

@@ -131,6 +131,14 @@ export type AccountLoginCliInvocation = Readonly<{
   replayCommand: string;
 }>;
 
+/** Claude owns the foreground interaction; the daemon owns its durable attempt. */
+export type ClaudeAccountAuthCliInvocation = Readonly<{
+  command: Extract<LocalCommand, { kind: "account.claude-login.prepare" }>;
+  json: boolean;
+  kind: "account.claude-login";
+  replayCommand: string;
+}>;
+
 export type InteractionResolveCommand = Extract<LocalCommand, { kind: "interaction.resolve" }>;
 
 export type CliInvocation =
@@ -145,6 +153,7 @@ export type CliInvocation =
   | ProtectedInteractionCliInvocation
   | ProtectedInteractionInspectCliInvocation
   | AccountLoginCliInvocation
+  | ClaudeAccountAuthCliInvocation
   | SessionAttachmentCliInvocation
   | SessionEventFollowCliInvocation
   | SessionEventWatchCliInvocation
@@ -237,6 +246,10 @@ Interactive:
 Mutation safety:
   --idempotency-key <uuid>  Reuse after a lost response; changed reuse fails closed.
 
+Platform:
+  Codex provider commands run on macOS and Linux. Claude login, status, sessions, and
+  provider switches require Linux; macOS refuses before launching Claude.
+
 Recommended profiles:
   low         Luna Max        (codex)
   high        Sol Max         (codex)
@@ -284,19 +297,26 @@ Examples:
 
 Usage:
   hra account add <label>
-  hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
-  hra account login-cancel <profile>
+  hra account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
+  hra account login-cancel <profile> [--provider codex]
+  hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
   hra account logout <profile>
   hra account list
-  hra account show <profile>
+  hra account show <profile> [--provider <codex|claude>]
   hra account usage [profile] [--refresh]
   hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
   hra account switch <profile>
   hra account switch-recover
 
+Platform:
+  Codex account commands run on macOS and Linux. Claude login and status require Linux;
+  macOS refuses before launching Claude.
+
 Examples:
   hra account add personal
   hra account login personal --device-code --handoff-file /private/path/login.json
+  hra account login personal --provider claude
+  hra account show personal --provider claude
   hra account login-cancel personal
   hra account usage personal --refresh
   hra account usage-history personal --from 2026-08-23T12:00:00Z --json`,
@@ -570,6 +590,7 @@ const uuidV7KeyLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
 const uuidV7KeyFutureSkewMs = 5 * 60 * 1_000;
 const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "account.login",
+  "account.claude-login.abandon",
   "account.logout",
   "account.switch",
   "session.start",
@@ -792,6 +813,34 @@ export const accountLoginReplayCommand = (
 export const accountLoginCancelCommand = (account: string): string =>
   `hra account login-cancel ${shellArgument(account)}`;
 
+export const claudeAccountLoginCommand = (
+  account: string,
+  idempotencyKey?: string,
+): string => [
+  "hra account login",
+  shellArgument(account),
+  "--provider claude",
+  ...(idempotencyKey === undefined ? [] : ["--idempotency-key", idempotencyKey]),
+].join(" ");
+
+export const claudeAccountLoginAbandonCommand = (
+  account: string,
+  attemptId: string,
+  idempotencyKey: string,
+  providerGeneration: number,
+): string => [
+  "hra account login-cancel",
+  shellArgument(account),
+  "--provider claude",
+  "--attempt-id",
+  shellArgument(attemptId),
+  "--provider-generation",
+  String(providerGeneration),
+  "--idempotency-key",
+  idempotencyKey,
+  "--acknowledge-child-exited",
+].join(" ");
+
 export const deviceMutationReplayCommand = (
   command: Extract<LocalCommand, { kind: "device.approve" | "device.revoke" }>,
   json: boolean,
@@ -879,17 +928,57 @@ const parseAccount = (
   cursor: Cursor,
   idempotencyKey: string | undefined,
   json: boolean,
-): LocalCommand | AccountLoginCliInvocation => {
+): LocalCommand | AccountLoginCliInvocation | ClaudeAccountAuthCliInvocation => {
   const action = take(cursor, "account action");
   switch (action) {
     case "list": finish(cursor); return { kind: "account.list" };
     case "add": { const label = remainder(cursor, "account label"); return command({ kind: "account.add", label }); }
-    case "show": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.show", account }; }
+    case "show": {
+      const provider = option(cursor, "--provider") ?? "codex";
+      const account = take(cursor, "account");
+      finish(cursor);
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      if (provider === "claude") {
+        if (idempotencyKey !== undefined) {
+          throw new CliUsageError("--idempotency-key is not supported by Claude account status.");
+        }
+        return command({ kind: "account.show", account, provider: "claude" });
+      }
+      return { kind: "account.show", account };
+    }
     case "login": {
       const deviceCode = flag(cursor, "--device-code");
       const handoffFile = option(cursor, "--handoff-file");
+      const provider = option(cursor, "--provider") ?? "codex";
       const account = take(cursor, "account");
       finish(cursor);
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      if (provider === "claude") {
+        if (deviceCode) {
+          throw new CliUsageError("Claude Code does not expose a device-code login. Run the foreground Claude login without --device-code.");
+        }
+        if (handoffFile !== undefined) {
+          throw new CliUsageError("Claude login is a foreground terminal flow and does not accept --handoff-file.");
+        }
+        const parsed = command({
+          kind: "account.claude-login.prepare",
+          account,
+          idempotencyKey: idempotencyKey ?? randomUUID(),
+        });
+        if (parsed.kind !== "account.claude-login.prepare") {
+          throw new CliUsageError("Claude account login command is invalid.");
+        }
+        return {
+          command: parsed,
+          json,
+          kind: "account.claude-login",
+          replayCommand: claudeAccountLoginCommand(parsed.account, parsed.idempotencyKey),
+        };
+      }
       if (handoffFile !== undefined && (!isAbsolute(handoffFile) || resolve(handoffFile) !== handoffFile)) {
         throw new CliUsageError("--handoff-file must be an absolute normalized path to an existing protected file.");
       }
@@ -915,7 +1004,40 @@ const parseAccount = (
         ),
       };
     }
-    case "login-cancel": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.login-cancel", account }; }
+    case "login-cancel": {
+      const provider = option(cursor, "--provider") ?? "codex";
+      if (provider !== "codex" && provider !== "claude") {
+        throw new CliUsageError("Provider must be `codex` or `claude`.");
+      }
+      if (provider === "claude") {
+        const acknowledgeChildExited = flag(cursor, "--acknowledge-child-exited");
+        const attemptId = option(cursor, "--attempt-id");
+        const providerGeneration = boundedDecimal(
+          option(cursor, "--provider-generation"),
+          "Claude provider generation",
+          0,
+          Number.MAX_SAFE_INTEGER,
+        );
+        const account = take(cursor, "account");
+        finish(cursor);
+        if (!acknowledgeChildExited) {
+          throw new CliUsageError("Claude login recovery requires --acknowledge-child-exited after you have confirmed its original foreground child exited.");
+        }
+        if (attemptId === undefined) throw new CliUsageError("Claude login recovery requires --attempt-id from account status.");
+        if (idempotencyKey === undefined) throw new CliUsageError("Claude login recovery requires the exact --idempotency-key from account status.");
+        return command({
+          kind: "account.claude-login.abandon",
+          account,
+          attemptId,
+          idempotencyKey,
+          providerGeneration,
+          acknowledgeChildExited: true,
+        });
+      }
+      const account = take(cursor, "account");
+      finish(cursor);
+      return { kind: "account.login-cancel", account };
+    }
     case "logout": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.logout", account }; }
     case "usage": { const refresh = flag(cursor, "--refresh"); const account = takeOptional(cursor); finish(cursor); return command({ kind: "account.usage", account, refresh }); }
     case "usage-history": {
@@ -1779,7 +1901,10 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   let sessionAttach: readonly string[] = [];
   if (group === "account") {
     const account = parseAccount(cursor, idempotencyKey, json);
-    if (account.kind === "account.login-handoff") return account;
+    if (
+      account.kind === "account.login-handoff"
+      || account.kind === "account.claude-login"
+    ) return account;
     parsed = account;
   }
   else if (group === "plugin") parsed = parsePlugin(cursor);

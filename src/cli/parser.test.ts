@@ -4,6 +4,8 @@ import fc from "fast-check";
 
 import {
   CliUsageError,
+  claudeAccountLoginAbandonCommand,
+  claudeAccountLoginCommand,
   completeProtectedAuthLogin,
   deviceMutationReplayCommand,
   completeProtectedInteraction,
@@ -73,6 +75,79 @@ describe("CLI parser", () => {
       kind: "account.login-handoff",
       replayCommand: expect.stringContaining("--handoff-file /absolute/path/to/empty-protected-login.json"),
     });
+    expect(parseCli(["account", "login", "personal", "--provider", "codex"])).toMatchObject({
+      kind: "account.login-handoff",
+      command: { account: "personal", deviceCode: false, kind: "account.login" },
+    });
+  });
+
+  test("keeps Claude login and status in a provider-scoped foreground CLI flow", () => {
+    const generated = parseCli(["account", "login", "personal", "--provider", "claude"]);
+    expect(generated).toMatchObject({
+      command: { account: "personal", kind: "account.claude-login.prepare" },
+      json: false,
+      kind: "account.claude-login",
+    });
+    if (generated.kind !== "account.claude-login") throw new Error("expected Claude login");
+    expect(generated.command.idempotencyKey).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(generated.replayCommand).toContain(generated.command.idempotencyKey);
+
+    const key = "00000000-0000-4000-8000-000000000101";
+    expect(parseCli(["account", "login", " personal ", "--provider", "claude", "--idempotency-key", key, "--json"])).toEqual({
+      command: { account: "personal", idempotencyKey: key, kind: "account.claude-login.prepare" },
+      json: true,
+      kind: "account.claude-login",
+      replayCommand: `hra account login personal --provider claude --idempotency-key ${key}`,
+    });
+    expect(parseCli(["account", "show", "personal", "--provider", "claude", "--json"])).toEqual({
+      command: { account: "personal", kind: "account.show", provider: "claude" },
+      json: true,
+      kind: "command",
+    });
+    expect(parseCli(["account", "show", "personal", "--provider", "codex"])).toEqual({
+      command: { account: "personal", kind: "account.show" },
+      json: false,
+      kind: "command",
+    });
+
+    for (const argv of [
+      ["account", "login", "personal", "--provider", "claude", "--device-code"],
+      ["account", "login", "personal", "--provider", "claude", "--handoff-file", "/private/login.json"],
+      ["account", "login-cancel", "personal", "--provider", "claude"],
+      ["account", "login", "personal", "--provider", "other"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+
+    expect(() => parseCli(["account", "login", "x".repeat(201), "--provider", "claude", "--json"]))
+      .toThrow(CliUsageError);
+    expect(() => parseCli(["account", "login", "bad\nselector", "--provider", "claude", "--json"]))
+      .toThrow("control characters");
+    expect(claudeAccountLoginCommand("work profile; false")).toBe(
+      "hra account login 'work profile; false' --provider claude",
+    );
+
+    const attemptId = `attempt_${"a".repeat(32)}`;
+    const abandon = claudeAccountLoginAbandonCommand("personal", attemptId, key, 7);
+    expect(abandon).toBe(
+      `hra account login-cancel personal --provider claude --attempt-id ${attemptId}`
+      + ` --provider-generation 7 --idempotency-key ${key} --acknowledge-child-exited`,
+    );
+    expect(parseCli(abandon.split(" ").slice(1))).toEqual({
+      command: {
+        acknowledgeChildExited: true,
+        account: "personal",
+        attemptId,
+        idempotencyKey: key,
+        kind: "account.claude-login.abandon",
+        providerGeneration: 7,
+      },
+      json: false,
+      kind: "command",
+    });
+    for (const argv of [
+      ["account", "login-cancel", "personal", "--provider", "claude", "--attempt-id", attemptId, "--provider-generation", "7", "--idempotency-key", key],
+      ["account", "login-cancel", "personal", "--provider", "claude", "--provider-generation", "7", "--idempotency-key", key, "--acknowledge-child-exited"],
+      ["account", "login-cancel", "personal", "--provider", "claude", "--attempt-id", attemptId, "--idempotency-key", key, "--acknowledge-child-exited"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
   });
 
   test("parses exact pending-login cancellation without accepting provider authority on argv", () => {
@@ -1512,6 +1587,10 @@ describe("CLI help", () => {
     const note = resolveUsage("session", "note");
     expect(note.usage).toContain("  hra session note get|edit|clear <session>\n  hra session note set <session> <note>");
     expect(note.usage).not.toContain("Examples:");
+
+    const claudeLogin = resolveUsage("account", "login");
+    expect(claudeLogin.usage).toContain("Claude login and status require Linux");
+    expect(claudeLogin.usage).toContain("macOS refuses before launching Claude");
   });
 
   test("falls back without echoing unknown groups or leaves", () => {
@@ -1528,6 +1607,8 @@ describe("CLI help", () => {
     expect(usage).not.toMatch(/[\u2018\u2019\u201c\u201d]/u);
     expect(usage).toContain("  hra help [<group> [<command>]]\n");
     expect(usage).toContain("Run `hra <group> --help` or `hra help <group> [<command>]` for command examples.");
+    expect(usage).toContain("Codex provider commands run on macOS and Linux");
+    expect(usage).toContain("Claude login, status, sessions, and\n  provider switches require Linux");
     for (const group of helpGroupNames) expect(usage).toContain(`hra ${group}`);
   });
 

@@ -4,9 +4,14 @@ import { parseDeviceCommandPayload, parseDeviceRegistryPayload } from "../hra/cl
 import {
   accountLoginStartCommand,
   accountLoginStatusCommand,
+  admitHostedLoginHandoff,
+  bindHostedLoginResultExpiry,
   defaultSessionStartPreset,
   deviceCommandNotice,
+  hostedLoginHandoffDeadline,
   sessionStartCommand,
+  sessionStartTargetHint,
+  sessionStartTargetLabel,
   sessionStartTargets,
   usageRefreshCommand,
 } from "./device-commands";
@@ -108,9 +113,62 @@ describe("device command builders", () => {
 
   test("builds the three machine-scoped commands", () => {
     expect(accepted(accountLoginStartCommand("acct_primary0001")))
-      .toEqual({ accountPublicId: "acct_primary0001", kind: "account_login_start" });
-    expect(accepted(accountLoginStatusCommand())).toEqual({ kind: "account_login_status" });
+      .toEqual({
+        accountPublicId: "acct_primary0001",
+        handoffVersion: 2,
+        kind: "account_login_start",
+      });
+    expect(accepted(accountLoginStatusCommand("acct_primary0001"))).toEqual({
+      accountPublicId: "acct_primary0001",
+      kind: "account_login_status",
+    });
     expect(accepted(usageRefreshCommand())).toEqual({ kind: "usage_refresh" });
+  });
+
+  test("uses the hosted deadline instead of a skewed machine login expiry", () => {
+    const machineResult = {
+      expiresAt: 1,
+      handoffVersion: 2,
+      kind: "account_login_start",
+      loginUrl: "https://auth.example.test/device",
+      userCode: "ABCD-EFGH",
+    } as const;
+    expect(bindHostedLoginResultExpiry(machineResult, 1_760_000_300_000)).toEqual({
+      ...machineResult,
+      expiresAt: 1_760_000_300_000,
+    });
+    expect(bindHostedLoginResultExpiry(
+      machineResult,
+      undefined,
+      1_760_000_240_000,
+    )).toEqual({
+      ...machineResult,
+      expiresAt: 1_760_000_240_000,
+    });
+    expect(bindHostedLoginResultExpiry(machineResult, 0)).toBeNull();
+    expect(bindHostedLoginResultExpiry(
+      { accountsRefreshed: 1, kind: "usage_refresh" },
+      1_760_000_300_000,
+    )).toBeNull();
+    expect(hostedLoginHandoffDeadline(1_760_000_000_000)).toBe(1_760_000_300_000);
+    expect(hostedLoginHandoffDeadline(Number.MAX_SAFE_INTEGER)).toBeNull();
+  });
+
+  test("waits for the hosted clock before judging a fresh handoff with an ahead browser", () => {
+    const settledAt = 1_760_000_000_000;
+    expect(admitHostedLoginHandoff({
+      now: settledAt + 10 * 60_000,
+      serverClockReady: false,
+      settledAt,
+    })).toEqual({ status: "awaiting_server_clock" });
+    expect(admitHostedLoginHandoff({
+      now: settledAt + 1_000,
+      serverClockReady: true,
+      settledAt,
+    })).toEqual({
+      expiresAt: settledAt + 5 * 60_000,
+      status: "ready",
+    });
   });
 });
 
@@ -168,6 +226,24 @@ describe("session start targets", () => {
     expect(view.deviceCommandsAllowed).toBe(true);
     expect(view.accountLinkingAllowed).toBe(false);
     expect(sessionStartTargets([view])).toHaveLength(1);
+  });
+
+  test("puts Claude's Linux boundary beside every browser start choice", () => {
+    const target = sessionStartTargets([machine({
+      accounts: [
+        { label: "Research", provider: "claude", publicId: "acct_claude00001", status: "signed_in" },
+      ],
+    })])[0];
+    if (target === undefined) throw new Error("expected Claude target");
+    expect(sessionStartTargetLabel(target))
+      .toBe("Research — Studio — Claude Code (Linux machine only)");
+    expect(sessionStartTargetHint(target)).toContain("Linux custodian");
+    expect(sessionStartTargetHint(target)).toContain("macOS refuses before launch");
+
+    const codex = sessionStartTargets([machine()])[0];
+    if (codex === undefined) throw new Error("expected Codex target");
+    expect(sessionStartTargetLabel(codex)).toBe("Work — Studio — Codex");
+    expect(sessionStartTargetHint(codex)).not.toContain("Linux custodian");
   });
 });
 

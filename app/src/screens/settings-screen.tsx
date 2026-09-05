@@ -1,5 +1,5 @@
 import { useAuthActions } from "@convex-dev/auth/react";
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -21,21 +21,23 @@ import { useCommandState, useSubmitCommand } from "../data/commands";
 import {
   useConsumeDeviceCommandResult,
   useDeviceCommandState,
+  useReadDeviceCommandResult,
   useSubmitDeviceCommand,
 } from "../data/device-commands";
-import { useDevices, useServerNow, type DeviceView } from "../data/devices";
+import { useDevices, useServerClock, type DeviceView } from "../data/devices";
 import { useDeviceRegistries } from "../data/registry";
 import { useSessionHeads } from "../data/session-heads";
 import { pageSize } from "../env";
-import type {
-  CommandState,
-  DeviceCommandResultPayload,
-  RemoteCommandPayload,
+import {
+  type CommandState,
+  type DeviceCommandResultPayload,
+  type RemoteCommandPayload,
 } from "../hra/cloud";
 import { formatRelativeTime, formatUtcDay } from "../model/relative-time";
 import {
   accountLoginStartCommand,
   accountLoginStatusCommand,
+  admitHostedLoginHandoff,
   deviceCommandNotice,
 } from "../model/device-commands";
 import {
@@ -95,7 +97,7 @@ type SettingsCommandInput = Readonly<{
 
 type AccountLoginRelayResult = Extract<
   DeviceCommandResultPayload,
-  { kind: "account_login_start" }
+  { handoffVersion: 2; kind: "account_login_start" }
 >;
 
 type SettingsCommandRunner = Readonly<{
@@ -357,22 +359,36 @@ function ArchivedSessionRow({
  * button is absent rather than disabled, because a machine that has not opted in
  * would refuse the command anyway. With it on, "Link here" relays the complete
  * provider device-code handoff. The URL and one-time code are account-key
- * encrypted, single use, and short lived — the hosted row erases their shared
- * ciphertext on the first read. Poll asks the machine what its login is doing;
- * it is one way and returns only a status and an instruction.
+ * encrypted, single use, and short lived; the hosted row erases their shared
+ * ciphertext on the first read. Poll names this row's account and returns only
+ * its status and a bounded local instruction.
  */
 function AccountRow({
   account,
   now,
-}: Readonly<{ account: AccountRowView; now: number }>) {
+  serverClockReady,
+}: Readonly<{ account: AccountRowView; now: number; serverClockReady: boolean }>) {
   const submitDeviceCommand = useSubmitDeviceCommand();
   const consumeResult = useConsumeDeviceCommandResult();
+  const readResult = useReadDeviceCommandResult();
   const [commandPublicId, setCommandPublicId] = useState<string | null>(null);
   const [relay, setRelay] = useState<AccountLoginRelayResult | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const consumedCommand = useRef<string | null>(null);
+  const readStatusCommand = useRef<string | null>(null);
+  const activeCommand = useRef<string | null>(null);
+  const mounted = useRef(true);
   const command = useDeviceCommandState(commandPublicId);
   const notice = deviceCommandNotice(command);
+  const localLoginCommand = account.provider === "claude"
+    ? `hra account login ${account.publicId} --provider claude`
+    : `hra account login ${account.publicId}`;
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   // The relay is exchanged exactly once, as soon as the command settles. A
   // second tab watching the same command gets nothing, which is the point.
@@ -383,24 +399,47 @@ function AccountRow({
       || !command.resultSingleUse
       || command.resultConsumed
       || command.kind !== "account_login_start"
+      || consumedCommand.current === command.publicId
     ) return;
-    let cancelled = false;
-    void consumeResult(command.publicId)
+    const admission = admitHostedLoginHandoff({
+      now,
+      serverClockReady,
+      settledAt: command.updatedAt,
+    });
+    if (admission.status === "awaiting_server_clock") return;
+    // Parsing the reactive command creates a fresh object on every render.
+    // Fence by public id only after hosted time is ready, before the mutation,
+    // so neither clock skew nor a relay-driven render can lose the one read.
+    consumedCommand.current = command.publicId;
+    if (admission.status === "expired_or_invalid") {
+      setStatus("This login handoff expired. Start a new login.");
+      return;
+    }
+    void consumeResult(
+      command.publicId,
+      admission.expiresAt,
+    )
       .then((result) => {
-        if (cancelled) return;
+        if (!mounted.current || activeCommand.current !== command.publicId) return;
         if (result === null) {
-          setStatus("No login handoff was available. It may already have been read; update HRA on the machine before trying again.");
+          setStatus("No login handoff was available. It expired, was already read, or requires an HRA update on the machine. Start a new login after checking the machine.");
           return;
         }
-        if (result.kind === "account_login_start") setRelay(result);
+        if (
+          result.kind === "account_login_start"
+          && "handoffVersion" in result
+        ) {
+          setRelay(result);
+        } else if (result.kind === "account_login_start") {
+          setStatus("The machine returned a legacy login handoff. Update HRA on the machine before trying again.");
+        }
       })
       .catch(() => {
-        if (!cancelled) {
+        if (mounted.current && activeCommand.current === command.publicId) {
           setStatus("The machine returned an incompatible login handoff. Update HRA on the machine before trying again.");
         }
       });
-    return () => { cancelled = true; };
-  }, [command, consumeResult]);
+  }, [command, consumeResult, now, serverClockReady]);
 
   // The provider code is short lived. Server-corrected `now` handles clock
   // skew, while the timer removes it from memory at the deadline between ticks.
@@ -415,22 +454,50 @@ function AccountRow({
   }, [now, relay]);
 
   useEffect(() => {
-    if (command?.state !== "applied" || command.kind !== "account_login_status") return;
-    setStatus("The machine reported its login state. Re-check from the machine if it stays idle.");
-  }, [command?.kind, command?.state]);
+    if (
+      command === null
+      || command.state !== "applied"
+      || command.kind !== "account_login_status"
+      || command.result === null
+      || command.resultSingleUse
+      || readStatusCommand.current === command.publicId
+    ) return;
+    readStatusCommand.current = command.publicId;
+    void readResult(command.publicId, command.result)
+      .then((result) => {
+        if (!mounted.current || activeCommand.current !== command.publicId) return;
+        if (result.kind !== "account_login_status") {
+          setStatus("The machine returned an incompatible login status. Update HRA on the machine before trying again.");
+          return;
+        }
+        setStatus(result.instruction);
+      })
+      .catch(() => {
+        if (mounted.current && activeCommand.current === command.publicId) {
+          setStatus("The machine returned an unreadable login status. Unlock this browser again and retry.");
+        }
+      });
+  }, [command, readResult]);
 
   const run = (payload: Parameters<typeof submitDeviceCommand>[0]["payload"]) => {
     if (busy) return;
     setBusy(true);
     // A later start or status check supersedes any earlier one-time handoff.
+    activeCommand.current = null;
     setRelay(null);
     setStatus(null);
     void submitDeviceCommand({ payload, targetDevicePublicId: account.targetDevicePublicId })
-      .then((publicId) => { setCommandPublicId(publicId); })
-      .catch((failure: unknown) => {
-        setStatus(failure instanceof Error ? failure.message : "The request was not accepted.");
+      .then((publicId) => {
+        if (!mounted.current) return;
+        activeCommand.current = publicId;
+        setCommandPublicId(publicId);
       })
-      .finally(() => { setBusy(false); });
+      .catch((failure: unknown) => {
+        if (mounted.current) {
+          setStatus(failure instanceof Error ? failure.message : "The request was not accepted.");
+        }
+      })
+      .finally(() => { if (mounted.current) setBusy(false); });
   };
 
   return (
@@ -446,7 +513,7 @@ function AccountRow({
       description={account.machineLabel}
       title={account.label}
     >
-      {account.accountLinkingAllowed ? (
+      {account.provider === "codex" && account.accountLinkingAllowed ? (
         <div className="flex flex-wrap items-center gap-2">
           <Button
             disabled={busy}
@@ -458,7 +525,7 @@ function AccountRow({
           </Button>
           <Button
             disabled={busy}
-            onClick={() => { run(accountLoginStatusCommand()); }}
+            onClick={() => { run(accountLoginStatusCommand(account.publicId)); }}
             size="small"
             variant="ghost"
           >
@@ -466,7 +533,15 @@ function AccountRow({
           </Button>
         </div>
       ) : (
-        <CommandHint>{`hra account login ${account.label}`}</CommandHint>
+        <>
+          <CommandHint>{localLoginCommand}</CommandHint>
+          {account.provider === "claude" ? (
+            <p className="text-xs text-ink-muted">
+              Run this on its Linux custodian. Claude linking is not available in the browser,
+              and macOS refuses before provider launch.
+            </p>
+          ) : null}
+        </>
       )}
       {relay === null ? null : (
         <AccountLoginRelay
@@ -526,7 +601,8 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
   const { signOut } = useAuthActions();
   const registries = useDeviceRegistries();
   const { devices, loading: devicesLoading } = useDevices();
-  const now = useServerNow();
+  const serverClock = useServerClock();
+  const now = serverClock.now;
   const { heads, isLoading: headsLoading, loadMore, status } = useSessionHeads(pageSize);
 
   const labels = useMemo(
@@ -639,8 +715,9 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
             {accounts.map((account) => (
               <AccountRow
                 account={account}
-                key={`${account.machineLabel}:${account.publicId}`}
+                key={`${account.targetDevicePublicId}:${account.provider}:${account.publicId}`}
                 now={now}
+                serverClockReady={serverClock.ready}
               />
             ))}
             <SettingsRow
@@ -650,10 +727,10 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
               <CommandHint>hra remote allow account-linking</CommandHint>
             </SettingsRow>
             <SettingsRow
-              description="Always available, and the fallback whenever the relay is not."
+              description="Codex works on macOS or Linux. Claude login is foreground-only on its Linux custodian."
               title="Link an account from the machine"
             >
-              <CommandHint>hra account login &lt;profile&gt;</CommandHint>
+              <CommandHint>hra account login &lt;profile&gt; [--provider claude]</CommandHint>
             </SettingsRow>
           </SettingsCard>
         </SettingsSection>
