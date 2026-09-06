@@ -344,6 +344,29 @@ export const sessionStateRowSchema = z.object({
 }).strict();
 
 export type SessionStateRow = z.infer<typeof sessionStateRowSchema>;
+
+/*
+ * Closed reasons whose session-state ownership comes from a live provider
+ * interaction. A daemon-generation rollover terminalizes that authority, so
+ * only these exact rows may be repaired during restart. In particular,
+ * prose-only `autorespond_verbatim_mismatch` attention is not on this list.
+ */
+const restartInteractionSessionStateReasons: ReadonlySet<string> = new Set([
+  "pending command_approval",
+  "pending file_change_approval",
+  "pending permission_approval",
+  "pending user_input",
+  "pending mcp_elicitation",
+  "autorespond_manual_mode",
+  "autorespond_not_an_approval",
+  "autorespond_decision_unavailable",
+  "autorespond_protected_authority_required",
+  "autorespond_consecutive_limit",
+  "autorespond_hourly_budget",
+  "autorespond_daily_budget",
+  "autorespond_resolution_refused",
+  "autorespond_failed",
+]);
 /*
  * Autorespond evidence covers both paths. `protocol` rows answer a provider
  * approval and carry its interaction id; `prose` rows answer an assistant
@@ -12502,6 +12525,71 @@ export class StateStore {
     });
   }
 
+  /*
+   * Restart removes the provider callback that owned an interaction-derived
+   * attention state. Repair that exact durable projection in the same
+   * transaction as interaction terminalization, and append the matching
+   * public event before the profile generation advances. Other attention
+   * reasons are deliberately untouched.
+   */
+  #repairRestartInteractionSessionStateInTransaction(
+    sessionId: SessionId,
+    recordedAt: number,
+  ): void {
+    const current = this.readSessionState(sessionId);
+    if (
+      current === null
+      || !restartInteractionSessionStateReasons.has(current.reason)
+      || this.#database.query(
+        `SELECT 1 FROM provider_interactions
+         WHERE session_id=? AND state IN ('pending','response_prepared','response_written')
+         LIMIT 1`,
+      ).get(sessionId) !== null
+    ) return;
+    if (current.revision >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("SESSION_STATE_REVISION_EXHAUSTED");
+    }
+    const session = this.requireSession(sessionId);
+    const working = session.state === "active" && session.activeTurnId !== undefined;
+    const state = working ? "working" as const : "aborted" as const;
+    const reason = working
+      ? "turn active"
+      : "provider interaction ended during daemon restart";
+    const revision = current.revision + 1;
+    const changed = this.#database.query(
+      `UPDATE session_states
+       SET state=?,attention=0,reason=?,verbatim_required=0,verbatim_literal=NULL,
+           last_activity_at=?,revision=?,updated_at=MAX(updated_at,?)
+       WHERE session_id=? AND revision=?`,
+    ).run(
+      state,
+      reason,
+      recordedAt,
+      revision,
+      recordedAt,
+      sessionId,
+      current.revision,
+    );
+    if (changed.changes !== 1) throw new Error("SESSION_STATE_RESTART_CONFLICT");
+    const profile = this.requireProfileById(session.profileId);
+    this.#appendSessionEventInTransaction({
+      sessionId,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: null,
+      body: {
+        type: "session_state",
+        state,
+        attention: false,
+        reason,
+        verbatimRequired: false,
+        lastActivityAt: recordedAt,
+        revision,
+      },
+      recordedAt,
+    });
+  }
+
   maintainSessionEventRetention(sessionId: SessionId, now = this.#now()): SessionEventStreamPosition {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const parsedNow = unixMillisecondsSchema.parse(now);
@@ -14292,6 +14380,25 @@ export class StateStore {
          WHERE i.state IN ('pending','response_prepared','response_written')
          ORDER BY i.requested_at,i.public_id`,
       ).all();
+      // Include a projection stranded by a crash under an older daemon that
+      // terminalized its interaction before this atomic repair existed.
+      const affectedInteractionSessions = new Set(
+        this.#database.query(
+          `SELECT ss.session_id FROM session_states ss
+           WHERE (
+             ss.reason GLOB 'pending *'
+             OR ss.reason GLOB 'autorespond_*'
+           )
+             AND NOT EXISTS (
+               SELECT 1 FROM provider_interactions i
+               WHERE i.session_id=ss.session_id
+                 AND i.state IN ('pending','response_prepared','response_written')
+             )
+           ORDER BY ss.session_id`,
+        ).all().map((row) => sessionIdSchema.parse(
+          z.object({ session_id: z.string() }).strict().parse(row).session_id,
+        )),
+      );
       for (const value of interactions) {
         const interaction = interactionRowSchema.parse(value);
         const state = interaction.state === "pending" ? "expired" : "resolution_unknown";
@@ -14301,7 +14408,14 @@ export class StateStore {
            WHERE public_id=? AND revision=? AND state=?`,
         ).run(state, now, now, interaction.public_id, interaction.revision, interaction.state);
         if (changed.changes !== 1) throw new Error("INTERACTION_DAEMON_RESTART_CONFLICT");
-        this.#recordInteractionTransition(this.#requireInteractionRow(interaction.public_id), now);
+        const terminalRow = this.#requireInteractionRow(interaction.public_id);
+        this.#recordInteractionTransition(terminalRow, now);
+        const terminal = mapInteraction(terminalRow);
+        this.#ensureInteractionStateEventInTransaction(terminal, now);
+        if (terminal.sessionId !== null) affectedInteractionSessions.add(terminal.sessionId);
+      }
+      for (const sessionId of affectedInteractionSessions) {
+        this.#repairRestartInteractionSessionStateInTransaction(sessionId, now);
       }
       const invalidLoginAuthority = this.#database.query(`SELECT a.attempt_id
                                                           FROM provider_login_authorities a

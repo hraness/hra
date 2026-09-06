@@ -260,6 +260,48 @@ function signInProfile(store: StateStore, label: string, email: string) {
   return store.requireProfile(current.id);
 }
 
+function admitRestartCommandInteraction(
+  store: StateStore,
+  input: Readonly<{
+    index: number;
+    processGeneration: number;
+    profileId: string;
+    sessionId: string;
+    threadId: string;
+    turnId: string | null;
+  }>,
+) {
+  const suffix = String(input.index).padStart(12, "0");
+  return store.admitInteraction({
+    publicId: `39000000-0000-4000-8000-${suffix}`,
+    sessionId: input.sessionId,
+    authority: {
+      profileId: input.profileId,
+      processGeneration: input.processGeneration,
+      connectionId: "39000000-0000-4000-8000-999999999999",
+      requestId: { type: "number", value: input.index },
+      method: "item/commandExecution/requestApproval",
+      requestDigest: input.index.toString(16).padStart(64, "0"),
+      threadId: input.threadId,
+      turnId: input.turnId,
+      itemId: `item-restart-${String(input.index)}`,
+      approvalId: null,
+    },
+    kind: "command_approval",
+    blocking: true,
+    display: {
+      kind: "command_approval",
+      summary: "Review restart handling",
+      reason: null,
+      commandClass: "test",
+      workingDirectory: null,
+      availableDecisions: ["once", "decline", "cancel"],
+    },
+    requestedAt: 1_000,
+    deadlineAt: 100_000,
+  }).record;
+}
+
 async function prepareSignedOutSessionStart(
   store: StateStore,
   home: string,
@@ -712,10 +754,37 @@ describe("StateStore", () => {
       sessionId: session.id,
       afterSequence: null,
       limit: 10,
-    }).events).toMatchObject([{
-      providerGeneration: 2,
+    }).events.map((event) => ({
+      body: event.body,
+      providerConnectionId: event.providerConnectionId,
+      providerGeneration: event.providerGeneration,
+    }))).toEqual([{
+      body: {
+        type: "interaction_state",
+        interactionId: pending.publicId,
+        state: "expired",
+        revision: 2,
+      },
+      providerConnectionId: pending.authority.connectionId,
+      providerGeneration: profile.processGeneration,
+    }, {
+      body: {
+        type: "interaction_state",
+        interactionId: prepared.publicId,
+        state: "resolution_unknown",
+        revision: 3,
+      },
+      providerConnectionId: prepared.authority.connectionId,
+      providerGeneration: profile.processGeneration,
+    }, {
+      body: {
+        type: "gap",
+        reason: "provider_restart",
+        fromSequence: 3,
+        throughSequence: 3,
+      },
       providerConnectionId: null,
-      body: { type: "gap", reason: "provider_restart" },
+      providerGeneration: profile.processGeneration + 1,
     }]);
     expect(store.nextDaemonGeneration(`boot_${"e".repeat(32)}`)).toBe(2);
     expect(store.requireProfileById(profile.id).processGeneration).toBe(3);
@@ -6483,6 +6552,333 @@ describe("StateStore", () => {
       expectedRevision: pending.revision,
       responseDigest: "1".repeat(64),
     })).toThrow("INTERACTION_AUTHORITY_CHANGED");
+  });
+
+  test("repairs interaction-owned attention to working when an active turn loses its callback", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Active restart attention", "active-restart-attention@example.com");
+    const threadId = "thread-active-restart-attention";
+    const turnId = "turn-active-restart-attention";
+    const session = store.upsertProviderSession({
+      profileId: profile.id,
+      providerThreadId: threadId,
+      title: "Active restart attention",
+      state: "active",
+      activeTurnId: turnId,
+    });
+    const interaction = admitRestartCommandInteraction(store, {
+      index: 1,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      sessionId: session.id,
+      threadId,
+      turnId,
+    });
+    store.upsertSessionState({
+      sessionId: session.id,
+      state: "needs_approval",
+      attention: true,
+      reason: "pending command_approval",
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+      lastActivityAt: 900,
+      revision: 7,
+    });
+
+    expect(store.nextDaemonGeneration(`boot_${"1".repeat(32)}`)).toBe(1);
+
+    expect(store.requireInteraction(interaction.publicId)).toMatchObject({
+      state: "expired",
+      revision: interaction.revision + 1,
+    });
+    const repaired = store.readSessionState(session.id);
+    expect(repaired).toMatchObject({
+      sessionId: session.id,
+      state: "working",
+      attention: false,
+      reason: "turn active",
+      verbatimRequired: false,
+      verbatimLiteral: null,
+      revision: 8,
+    });
+    if (repaired === null) throw new Error("Expected repaired session state.");
+    const events = store.listSessionEvents({
+      sessionId: session.id,
+      afterSequence: 0,
+    }).events;
+    expect(events.slice(0, 2).map((event) => ({
+      body: event.body,
+      providerGeneration: event.providerGeneration,
+    }))).toEqual([{
+      body: {
+        type: "interaction_state",
+        interactionId: interaction.publicId,
+        state: "expired",
+        revision: interaction.revision + 1,
+      },
+      providerGeneration: profile.processGeneration,
+    }, {
+      body: {
+        type: "session_state",
+        state: "working",
+        attention: false,
+        reason: "turn active",
+        verbatimRequired: false,
+        lastActivityAt: repaired.lastActivityAt,
+        revision: repaired.revision,
+      },
+      providerGeneration: profile.processGeneration,
+    }]);
+  });
+
+  test("repairs interaction-owned attention to aborted when an idle session loses its callback", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Idle restart attention", "idle-restart-attention@example.com");
+    const threadId = "thread-idle-restart-attention";
+    const session = store.upsertProviderSession({
+      profileId: profile.id,
+      providerThreadId: threadId,
+      title: "Idle restart attention",
+      state: "idle",
+    });
+    const interaction = admitRestartCommandInteraction(store, {
+      index: 2,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      sessionId: session.id,
+      threadId,
+      turnId: null,
+    });
+    store.upsertSessionState({
+      sessionId: session.id,
+      state: "needs_approval",
+      attention: true,
+      reason: "autorespond_manual_mode",
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+      lastActivityAt: 901,
+      revision: 3,
+    });
+
+    expect(store.nextDaemonGeneration(`boot_${"2".repeat(32)}`)).toBe(1);
+
+    expect(store.requireInteraction(interaction.publicId)).toMatchObject({
+      state: "expired",
+      revision: interaction.revision + 1,
+    });
+    const repaired = store.readSessionState(session.id);
+    expect(repaired).toMatchObject({
+      state: "aborted",
+      attention: false,
+      reason: "provider interaction ended during daemon restart",
+      verbatimRequired: false,
+      verbatimLiteral: null,
+      revision: 4,
+    });
+    const stateEvents = store.listSessionEvents({
+      sessionId: session.id,
+      afterSequence: 0,
+    }).events.filter((event) => event.body.type === "session_state");
+    expect(stateEvents).toHaveLength(1);
+    expect(stateEvents[0]).toMatchObject({
+      body: {
+        type: "session_state",
+        state: "aborted",
+        attention: false,
+        reason: "provider interaction ended during daemon restart",
+        revision: 4,
+      },
+    });
+  });
+
+  test("preserves non-interaction attention while restart terminalizes linked interactions", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Non-interaction restart attention",
+      "non-interaction-restart-attention@example.com",
+    );
+    const cases = [{
+      index: 11,
+      state: "needs_answer" as const,
+      reason: "autorespond_verbatim_mismatch",
+      verbatimRequired: true,
+      verbatimLiteral: "Approve exactly this sentence.",
+    }, {
+      index: 12,
+      state: "needs_action" as const,
+      reason: "review the release checklist",
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+    }];
+    const casesBySession = new Map<string, Readonly<{
+      before: ReturnType<StateStore["upsertSessionState"]>;
+      interaction: ReturnType<typeof admitRestartCommandInteraction>;
+    }>>();
+
+    for (const input of cases) {
+      const threadId = `thread-non-interaction-attention-${String(input.index)}`;
+      const turnId = `turn-non-interaction-attention-${String(input.index)}`;
+      const session = store.upsertProviderSession({
+        profileId: profile.id,
+        providerThreadId: threadId,
+        title: `Non-interaction attention ${String(input.index)}`,
+        state: "active",
+        activeTurnId: turnId,
+      });
+      const interaction = admitRestartCommandInteraction(store, {
+        index: input.index,
+        processGeneration: profile.processGeneration,
+        profileId: profile.id,
+        sessionId: session.id,
+        threadId,
+        turnId,
+      });
+      const before = store.upsertSessionState({
+        sessionId: session.id,
+        state: input.state,
+        attention: true,
+        reason: input.reason,
+        verbatimRequired: input.verbatimRequired,
+        verbatimLiteral: input.verbatimLiteral,
+        lastActivityAt: 910 + input.index,
+        revision: input.index,
+      });
+      casesBySession.set(session.id, { before, interaction });
+    }
+
+    expect(store.nextDaemonGeneration(`boot_${"3".repeat(32)}`)).toBe(1);
+
+    for (const [sessionId, { before, interaction }] of casesBySession) {
+      expect(store.requireInteraction(interaction.publicId)).toMatchObject({
+        state: "expired",
+        revision: interaction.revision + 1,
+      });
+      expect(store.readSessionState(sessionId)).toEqual(before);
+      const events = store.listSessionEvents({ sessionId, afterSequence: 0 }).events;
+      expect(events.filter((event) => event.body.type === "interaction_state")).toHaveLength(1);
+      expect(events.filter((event) => event.body.type === "session_state")).toEqual([]);
+    }
+  });
+
+  test("repairs one session-state revision after terminalizing every interaction in the session", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Multi restart attention", "multi-restart-attention@example.com");
+    const threadId = "thread-multi-restart-attention";
+    const turnId = "turn-multi-restart-attention";
+    const session = store.upsertProviderSession({
+      profileId: profile.id,
+      providerThreadId: threadId,
+      title: "Multi restart attention",
+      state: "active",
+      activeTurnId: turnId,
+    });
+    const interactions = [21, 22].map((index) => admitRestartCommandInteraction(store, {
+      index,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      sessionId: session.id,
+      threadId,
+      turnId,
+    }));
+    store.upsertSessionState({
+      sessionId: session.id,
+      state: "needs_approval",
+      attention: true,
+      reason: "autorespond_manual_mode",
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+      lastActivityAt: 920,
+      revision: 20,
+    });
+
+    expect(store.nextDaemonGeneration(`boot_${"4".repeat(32)}`)).toBe(1);
+
+    for (const interaction of interactions) {
+      expect(store.requireInteraction(interaction.publicId)).toMatchObject({
+        publicId: interaction.publicId,
+        state: "expired",
+        revision: interaction.revision + 1,
+      });
+    }
+    expect(store.readSessionState(session.id)).toMatchObject({
+      state: "working",
+      attention: false,
+      reason: "turn active",
+      revision: 21,
+    });
+    const events = store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events;
+    expect(events.filter((event) => event.body.type === "interaction_state").map((event) => event.body))
+      .toEqual(interactions.map((interaction) => ({
+        type: "interaction_state",
+        interactionId: interaction.publicId,
+        state: "expired",
+        revision: interaction.revision + 1,
+      })));
+    expect(events.filter((event) => event.body.type === "session_state")).toHaveLength(1);
+  });
+
+  test("rolls restart interaction and attention repair back when its event append fails", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Restart repair rollback", "restart-repair-rollback@example.com");
+    const threadId = "thread-restart-repair-rollback";
+    const turnId = "turn-restart-repair-rollback";
+    const session = store.upsertProviderSession({
+      profileId: profile.id,
+      providerThreadId: threadId,
+      title: "Restart repair rollback",
+      state: "active",
+      activeTurnId: turnId,
+    });
+    const interaction = admitRestartCommandInteraction(store, {
+      index: 31,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      sessionId: session.id,
+      threadId,
+      turnId,
+    });
+    const beforeState = store.upsertSessionState({
+      sessionId: session.id,
+      state: "needs_approval",
+      attention: true,
+      reason: "pending command_approval",
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+      lastActivityAt: 931,
+      revision: 31,
+    });
+    const injector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      injector.exec(`
+        CREATE TRIGGER fail_restart_session_state_event
+        BEFORE INSERT ON session_events
+        WHEN json_extract(NEW.event_json,'$.body.type')='session_state'
+        BEGIN
+          SELECT RAISE(ABORT,'injected restart event failure');
+        END
+      `);
+    } finally {
+      injector.close(false);
+    }
+
+    expect(() => store.nextDaemonGeneration(`boot_${"5".repeat(32)}`))
+      .toThrow("injected restart event failure");
+
+    expect(store.requireInteraction(interaction.publicId)).toEqual(interaction);
+    expect(store.readSessionState(session.id)).toEqual(beforeState);
+    expect(store.requireProfileById(profile.id).processGeneration).toBe(profile.processGeneration);
+    expect(store.eventStreamPosition(session.id).observedThroughSequence).toBe(0);
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("SELECT generation FROM daemon_state WHERE singleton=1").get())
+        .toEqual({ generation: 0 });
+      expect(inspector.query(
+        "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
+      ).all(interaction.publicId)).toEqual([{ revision: 1, state: "pending" }]);
+    } finally {
+      inspector.close(false);
+    }
   });
 
   for (const effect of ["known_unsent", "possibly_sent"] as const) {

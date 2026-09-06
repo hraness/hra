@@ -6,10 +6,8 @@ import {
   mcpFormFieldSchema,
   providerInteractionAuthoritySchema,
   providerRequestIdSchema,
-  permissionCategoryIsNetworkOrExternal,
   publicInteractionSchema,
 } from "./interactions";
-import { isNetworkOrExternalPermission } from "../daemon/autorespond";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import { createProfileId, createSessionId } from "./values";
 
@@ -276,24 +274,5 @@ describe("provider interactions", () => {
         title: "MCP_FIELD_TITLE_SENTINEL",
       },
     ]) expect(() => mcpFormFieldSchema.parse(invalid)).toThrow();
-  });
-});
-
-describe("permission category classification", () => {
-  const permissionApproval = (names: readonly string[]) => ({
-    allowsSessionScope: true,
-    kind: "permission_approval" as const,
-    reason: null,
-    requested: names.map((name) => ({ name })),
-    summary: "Allow additional permissions",
-  });
-
-  test("the network category test agrees with the autoresponder gate", () => {
-    for (const name of ["network_outbound", "mcp_tool", "web_search", "remote_exec"]) {
-      expect(permissionCategoryIsNetworkOrExternal(name)).toBe(true);
-      expect(isNetworkOrExternalPermission(permissionApproval([name]))).toBe(true);
-    }
-    expect(permissionCategoryIsNetworkOrExternal("workspace_write")).toBe(false);
-    expect(isNetworkOrExternalPermission(permissionApproval(["workspace_write"]))).toBe(false);
   });
 });

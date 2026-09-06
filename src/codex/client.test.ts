@@ -1540,7 +1540,7 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
-  test("rejects file approvals whose pinned callback omits exact changed paths", async () => {
+  test("admits file approvals for rejection responses without creating a blind acceptance path", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
     const diagnostics: string[] = [];
@@ -1554,7 +1554,6 @@ describe("CodexAppServerClient", () => {
       onSafeDiagnostic: (message) => { diagnostics.push(message); },
     });
     await client.initialize();
-    const sentinel = "/private/FILE-APPROVAL-REASON-SENTINEL";
     process.respond({
       id: 902,
       method: "item/fileChange/requestApproval",
@@ -1562,21 +1561,56 @@ describe("CodexAppServerClient", () => {
         threadId: "thread-1",
         turnId: "turn-1",
         itemId: "item-file",
-        reason: sentinel,
+        reason: "Apply the proposed patch",
         grantRoot: "/workspace",
       },
     });
-    await waitFor(() => facts.some((fact) => fact.type === "protocolNotice"));
-    expect(process.writes.at(-1)).toEqual({
-      id: 902,
-      error: {
-        code: -32_601,
-        message: "HRA cannot broker this server request capability",
-        data: { code: "UNSUPPORTED_CAPABILITY" },
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested") throw new Error("file approval was not admitted");
+    expect(requested).toMatchObject({
+      kind: "file_change_approval",
+      provider: {
+        connectionId: CONNECTION_ID,
+        requestId: { type: "number", value: 902 },
+        method: "item/fileChange/requestApproval",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-file",
+      },
+      display: {
+        kind: "file_change_approval",
+        availableDecisions: ["decline", "cancel"],
       },
     });
-    expect(facts.some((fact) => fact.type === "interactionRequested")).toBe(false);
-    expect(JSON.stringify({ writes: process.writes, facts, diagnostics })).not.toContain(sentinel);
+    expect(facts.some((fact) => fact.type === "protocolNotice")).toBe(false);
+    expect(diagnostics).toEqual([]);
+
+    const writesBeforeResolution = process.writes.length;
+    for (const decision of ["once", "session"] as const) {
+      await expect(client.resolveInteraction({
+        provider: requested.provider,
+        kind: requested.kind,
+        deadlineAt: requested.deadlineAt ?? Number.NaN,
+        resolution: { kind: "approval_decision", decision },
+      })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+      expect(process.writes).toHaveLength(writesBeforeResolution);
+    }
+    await expect(client.validateInteractionResolution({
+      provider: requested.provider,
+      kind: requested.kind,
+      resolution: { kind: "approval_decision", decision: "decline" },
+    })).resolves.toEqual({
+      responseDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+    expect(process.writes).toHaveLength(writesBeforeResolution);
+    await expect(client.resolveInteraction({
+      provider: requested.provider,
+      kind: requested.kind,
+      deadlineAt: requested.deadlineAt ?? Number.NaN,
+      resolution: { kind: "approval_decision", decision: "decline" },
+    })).resolves.toEqual({ responseWritten: true });
+    expect(process.writes.at(-1)).toEqual({ id: 902, result: { decision: "decline" } });
     await client.close();
   });
 

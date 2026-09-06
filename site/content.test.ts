@@ -460,7 +460,8 @@ describe("public content contract", () => {
       "ordinary stdout receives only safe binding and cleanup metadata",
       "neither the directory nor file may have an extended ACL",
       "Detail larger than 64 KiB also requires this file path.",
-      "rejects file-change approval callbacks before durable admission",
+      "durably admits a bounded file-change prompt so it remains observable and may be declined",
+      "refuses every acceptance",
       "does not provide the exact affected paths or change detail needed for informed approval",
     ];
     const markdown = renderReadmeMarkdown();

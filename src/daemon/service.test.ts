@@ -12358,6 +12358,97 @@ describe("HraService autorespond", () => {
     return interaction;
   };
 
+  const requestPermissionApproval = async (
+    value: Awaited<ReturnType<typeof fixture>>,
+    sessionId: string,
+    requestId: string,
+    requested: readonly string[],
+  ) => {
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const connectionId = "46000000-0000-4000-8000-000000000002";
+    await value.service.observeCodexFact({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, {
+      type: "interactionRequested",
+      connectionId,
+      provider: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "string" as const, value: requestId },
+        method: "item/permissions/requestApproval",
+        requestDigest: createHash("sha256").update(requestId).digest("hex"),
+        threadId: session.providerThreadId,
+        turnId: "turn-autorespond",
+        itemId: `item-${requestId}`,
+        approvalId: null,
+      },
+      kind: "permission_approval",
+      blocking: true,
+      display: {
+        kind: "permission_approval",
+        summary: "Allow requested permissions",
+        reason: null,
+        requested: requested.map((name) => ({ name })),
+        allowsSessionScope: true,
+      },
+    });
+    const interaction = value.store.listInteractions({ sessionId, limit: 10 })
+      .find((candidate) => candidate.authority.requestId.value === requestId);
+    if (interaction === undefined) throw new Error("Expected a permission approval interaction.");
+    return interaction;
+  };
+
+  const requestFileChangeApproval = async (
+    value: Awaited<ReturnType<typeof fixture>>,
+    sessionId: string,
+    requestId: string,
+  ) => {
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const connectionId = "46000000-0000-4000-8000-000000000003";
+    await value.service.observeCodexFact({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, {
+      type: "interactionRequested",
+      connectionId,
+      provider: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "string" as const, value: requestId },
+        method: "item/fileChange/requestApproval",
+        requestDigest: createHash("sha256").update(requestId).digest("hex"),
+        threadId: session.providerThreadId,
+        turnId: "turn-autorespond",
+        itemId: `item-${requestId}`,
+        approvalId: null,
+      },
+      kind: "file_change_approval",
+      blocking: true,
+      display: {
+        kind: "file_change_approval",
+        summary: "Allow proposed file changes",
+        reason: null,
+        grantRoot: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    });
+    const interaction = value.store.listInteractions({ sessionId, limit: 10 })
+      .find((candidate) => candidate.authority.requestId.value === requestId);
+    if (interaction === undefined) throw new Error("Expected a file-change approval interaction.");
+    return interaction;
+  };
+
   test("accepts a command approval at once scope under auto:all and records evidence", async () => {
     const value = await fixture();
     const { sessionId } = await createIdleSession(value, "Autorespond");
@@ -12381,15 +12472,253 @@ describe("HraService autorespond", () => {
     expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(1);
   });
 
+  test("keeps command approvals pending under auto:workspace without trusting their display class", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Workspace command guard");
+    value.store.setSessionApprovalMode(sessionId, "auto:workspace");
+    const interaction = await requestCommandApproval(value, sessionId, "workspace-command-1");
+    await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === 1);
+    expect(value.codex.validatedInteractions).toHaveLength(0);
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+    expect(value.store.requireInteraction(interaction.publicId).state).toBe("pending");
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      reason: "autorespond_protected_authority_required",
+      state: "needs_approval",
+    });
+  });
+
+  test("raises attention only when a refused provider resolution remains pending", async () => {
+    const pendingValue = await fixture();
+    const { sessionId: pendingSessionId } = await createIdleSession(pendingValue, "Pending refusal");
+    pendingValue.store.setSessionApprovalMode(pendingSessionId, "auto:all");
+    pendingValue.codex.validateInteractionResolutionError = new CodexError("INVALID_INPUT", "refused");
+    const pending = await requestCommandApproval(pendingValue, pendingSessionId, "pending-refusal-1");
+    await waitFor(() => pendingValue.store.listAutorespondEvidence({ sessionId: pendingSessionId }).length === 1);
+    expect(pendingValue.store.requireInteraction(pending.publicId).state).toBe("pending");
+    expect(pendingValue.store.readSessionState(pendingSessionId)).toMatchObject({
+      attention: true,
+      reason: "autorespond_resolution_refused",
+      state: "needs_approval",
+    });
+
+    const terminalValue = await fixture();
+    const { sessionId: terminalSessionId } = await createIdleSession(terminalValue, "Terminal refusal");
+    terminalValue.store.setSessionApprovalMode(terminalSessionId, "auto:all");
+    terminalValue.codex.validateInteractionResolutionError = new CodexError("PROCESS_EXITED", "closed");
+    const terminal = await requestCommandApproval(terminalValue, terminalSessionId, "terminal-refusal-1");
+    await waitFor(() => terminalValue.store.listAutorespondEvidence({ sessionId: terminalSessionId }).length === 1);
+    expect(terminalValue.store.requireInteraction(terminal.publicId).state).toBe("expired");
+    expect(terminalValue.store.readSessionState(terminalSessionId)?.reason)
+      .not.toBe("autorespond_resolution_refused");
+  });
+
   test("leaves approvals pending under manual mode", async () => {
     const value = await fixture();
     const { sessionId } = await createIdleSession(value, "Manual");
     value.store.setSessionApprovalMode(sessionId, "manual");
     const interaction = await requestCommandApproval(value, sessionId, "manual-1");
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === 1);
     expect(value.codex.resolvedInteractions).toHaveLength(0);
     expect(value.store.requireInteraction(interaction.publicId).state).toBe("pending");
-    expect(value.store.listAutorespondEvidence({ sessionId })).toHaveLength(0);
+    expect(value.store.listAutorespondEvidence({ sessionId })).toEqual([
+      expect.objectContaining({
+        decision: "manual_mode",
+        interactionId: interaction.publicId,
+        mode: "manual",
+        outcome: "refused",
+        path: "protocol",
+      }),
+    ]);
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      reason: "autorespond_manual_mode",
+      state: "needs_approval",
+    });
+  });
+
+  test("keeps every unattested workspace permission pending without a provider call", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Workspace permission guard");
+    value.store.setSessionApprovalMode(sessionId, "auto:workspace");
+    for (const [index, name] of ["workspace_write", "camera", "file_camera"].entries()) {
+      const interaction = await requestPermissionApproval(value, sessionId, `workspace-permission-${String(index)}`, [name]);
+      await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === index + 1);
+      expect(value.store.requireInteraction(interaction.publicId).state).toBe("pending");
+    }
+    expect(value.codex.validatedInteractions).toHaveLength(0);
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+    expect(value.store.listAutorespondEvidence({ sessionId }))
+      .toHaveLength(3);
+    expect(value.store.listAutorespondEvidence({ sessionId }).every((row) =>
+      row.decision === "protected_authority_required" && row.outcome === "refused")).toBe(true);
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      reason: "autorespond_protected_authority_required",
+      state: "needs_approval",
+    });
+  });
+
+  test("keeps file changes pending without a provider call in every automatic mode", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "File change guard");
+    for (const [index, mode] of (["auto:all", "auto:workspace"] as const).entries()) {
+      value.store.setSessionApprovalMode(sessionId, mode);
+      const interaction = await requestFileChangeApproval(value, sessionId, `file-change-${String(index)}`);
+      await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === index + 1);
+      expect(value.store.requireInteraction(interaction.publicId).state).toBe("pending");
+    }
+    expect(value.codex.validatedInteractions).toHaveLength(0);
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      reason: "autorespond_protected_authority_required",
+      state: "needs_approval",
+    });
+  });
+
+  test("clears autorespond attention only after the last pending approval resolves", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Autorespond attention lifecycle");
+    value.store.setSessionApprovalMode(sessionId, "auto:workspace");
+    const first = await requestCommandApproval(value, sessionId, "attention-first");
+    const second = await requestCommandApproval(value, sessionId, "attention-second");
+    await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === 2);
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      state: "needs_approval",
+    });
+
+    const settleDecline = async (interaction: InteractionRecord): Promise<void> => {
+      await value.service.execute({
+        kind: "interaction.resolve",
+        interaction: interaction.publicId,
+        expectedRevision: interaction.revision,
+        resolution: { kind: "approval_decision", decision: "decline" },
+      }, { signal });
+      const profile = value.store.requireProfileById(interaction.authority.profileId);
+      await value.service.observeCodexFact({
+        id: profile.id,
+        generation: profile.processGeneration,
+        codexHome: "unused",
+        desktopUserData: "unused",
+      }, {
+        type: "interactionResolved",
+        connectionId: interaction.authority.connectionId,
+        provider: interaction.authority,
+        kind: "command_approval",
+      });
+    };
+
+    await settleDecline(first);
+    expect(value.store.requireInteraction(first.publicId).state).toBe("declined");
+    expect(value.store.requireInteraction(second.publicId).state).toBe("pending");
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      state: "needs_approval",
+    });
+
+    await settleDecline(second);
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: false,
+      state: "done",
+    });
+  });
+
+  test("keeps a manual prompt human-owned after a later mode change", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Autorespond disposition binding");
+    value.store.setSessionApprovalMode(sessionId, "manual");
+    const manual = await requestCommandApproval(value, sessionId, "manual-before-mode-change");
+    await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === 1);
+
+    value.store.setSessionApprovalMode(sessionId, "auto:all");
+    const automatic = await requestCommandApproval(value, sessionId, "automatic-after-mode-change");
+    await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === 2);
+    expect(value.codex.resolvedInteractions).toHaveLength(1);
+    expect(value.store.requireInteraction(manual.publicId).state).toBe("pending");
+    expect(value.store.requireInteraction(automatic.publicId).state).not.toBe("pending");
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      state: "needs_approval",
+    });
+  });
+
+  test("clears autorespond attention when the pending approval expires", async () => {
+    let now = 10_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Autorespond expiry lifecycle");
+    value.store.setSessionApprovalMode(sessionId, "auto:workspace");
+    const interaction = await requestCommandApproval(value, sessionId, "attention-expiry");
+    await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === 1);
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      state: "needs_approval",
+    });
+
+    now = interaction.deadlineAt;
+    expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 1, failed: 0 });
+    expect(value.store.requireInteraction(interaction.publicId).state).toBe("expired");
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: false,
+      state: "done",
+    });
+  });
+
+  test("returns to working when the last actionable approval settles during an active turn", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Active-turn attention lifecycle");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    await value.service.observeCodexFact(authority, {
+      type: "turnStarted",
+      threadId: session.providerThreadId,
+      turn: {
+        id: "turn-autorespond",
+        items: [],
+        status: "inProgress",
+        startedAt: 1,
+        completedAt: null,
+        durationMs: null,
+      },
+    });
+
+    value.store.setSessionApprovalMode(sessionId, "auto:workspace");
+    const interaction = await requestCommandApproval(value, sessionId, "active-turn-attention");
+    await waitFor(() => value.store.listAutorespondEvidence({ sessionId }).length === 1);
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: true,
+      state: "needs_approval",
+    });
+
+    await value.service.execute({
+      kind: "interaction.resolve",
+      interaction: interaction.publicId,
+      expectedRevision: interaction.revision,
+      resolution: { kind: "approval_decision", decision: "decline" },
+    }, { signal });
+    await value.service.observeCodexFact(authority, {
+      type: "interactionResolved",
+      connectionId: interaction.authority.connectionId,
+      provider: interaction.authority,
+      kind: "command_approval",
+    });
+
+    expect(value.store.requireSession(sessionId)).toMatchObject({
+      activeTurnId: "turn-autorespond",
+      state: "active",
+    });
+    expect(value.store.readSessionState(sessionId)).toMatchObject({
+      attention: false,
+      state: "working",
+    });
   });
 });
 
