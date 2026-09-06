@@ -82,6 +82,21 @@ describe("public text policy", () => {
       .toThrow(PublicTextPolicyError);
   });
 
+  test("allows only the reviewed public Claude capture packages", () => {
+    for (const packageName of [
+      "@anthropic-ai/claude-code",
+      "@anthropic-ai/claude-code-darwin-arm64",
+    ]) {
+      expect(() => assertPublicText(`${packageName}@2.1.260`, "public capture package"))
+        .not.toThrow();
+      expect(() => assertPublicText(`${packageName}-unreviewed`, "unreviewed capture package"))
+        .toThrow(PublicTextPolicyError);
+    }
+    const unreviewed = ["@anthropic-ai", ["claude-code", "linux-x64"].join("-")].join("/");
+    expect(() => assertPublicText(unreviewed, "unreviewed native package"))
+      .toThrow(PublicTextPolicyError);
+  });
+
   test("distinguishes annotated Git tag references from package scopes", () => {
     expect(() => assertPublicText(
       "https://github.com/hraness/hra@refs/tags/v0.1.1",
