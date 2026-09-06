@@ -5752,12 +5752,14 @@ export class HraService {
   }
 
   #unsettledClaudeLogin(profile: ProfileRecord): MutationAttemptRecord | undefined {
-    return this.#store.listUnsettledMutations({ authorityId: profile.id }).find((attempt) =>
+    return this.#store.listUnsettledMutations({ authorityId: profile.id })
+      .filter((attempt) => attempt.format === "legacy").find((attempt) =>
       attempt.kind === "account.claude-login");
   }
 
   #unsettledDevinLogin(profile: ProfileRecord): MutationAttemptRecord | undefined {
-    return this.#store.listUnsettledMutations({ authorityId: profile.id }).find((attempt) =>
+    return this.#store.listUnsettledMutations({ authorityId: profile.id })
+      .filter((attempt) => attempt.format === "legacy").find((attempt) =>
       attempt.kind === "account.devin-login");
   }
 
@@ -6490,6 +6492,7 @@ export class HraService {
     }
     if (profile.state === "recovery_required") {
       const unsettled = this.#store.listUnsettledMutations({ authorityId: profile.id })
+        .filter((attempt) => attempt.format === "legacy")
         .filter((attempt) => {
           if (attempt.kind !== "account.login" && attempt.kind !== "account.logout") return false;
           const providerAuthority = this.#primaryMutationProviderAuthority(attempt);
@@ -6583,7 +6586,7 @@ export class HraService {
    */
   #resolveUnsettledLoginCancellations(profile: ProfileRecord, account: CodexAccountProjection): void {
     for (const attempt of this.#store.listUnsettledMutations({ authorityId: profile.id })) {
-      if (attempt.kind !== "account.login-cancel") continue;
+      if (attempt.format !== "legacy" || attempt.kind !== "account.login-cancel") continue;
       const providerAuthority = this.#primaryMutationProviderAuthority(attempt);
       if (
         providerAuthority === null
@@ -12358,6 +12361,13 @@ export class HraService {
     if (attempt === undefined) {
       throw new CommandFailure("RECOVERY_REQUIRED", "The mutation recovery authority disappeared.");
     }
+    if (attempt.format === "original_send_v1") {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "This send has its own original-request recovery authority. Generic session recovery cannot replay or resolve it.",
+        { idempotencyKey: attempt.idempotencyKey, reason: "original_send_recovery_required" },
+      );
+    }
     const originalState = attempt.originalState ?? attempt.state;
     if (originalState !== "effect_started" && originalState !== "ambiguous") {
       throw new CommandFailure("CONFLICT", "The mutation authority is already settled.");
@@ -13670,6 +13680,7 @@ export class HraService {
   #sessionRecoveryProfileIds(session: Pick<SessionRecord, "id" | "profileId">): readonly ProfileRecord["id"][] {
     const ids = new Set<ProfileRecord["id"]>([session.profileId]);
     for (const attempt of this.#store.listUnsettledMutations({ sessionId: session.id })) {
+      if (attempt.format !== "legacy") continue;
       const evidence = attempt.evidence?.evidence;
       if (evidence?.kind !== "session.switch") continue;
       ids.add(evidence.sourceProfileId);

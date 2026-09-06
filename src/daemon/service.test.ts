@@ -1395,6 +1395,47 @@ const renderJson = (command: LocalCommand, data: unknown): string => {
 };
 
 describe("HraService", () => {
+  test("original send ambiguity stays visible to doctor and cannot enter generic session recovery", async () => {
+    const value = await fixture();
+    const bootId = `boot_${"d".repeat(32)}`;
+    const daemonGeneration = value.store.nextDaemonGeneration(bootId);
+    const { sessionId } = await createIdleSession(value, "Owned send diagnostics");
+    const request = { kind: "session.send" as const, session: sessionId, message: "Original recovery input",
+      attachments: [], idempotencyKey: crypto.randomUUID() };
+    const owner = value.store.prepareOwnedSessionSend(request);
+    const runtimeProfile = value.store.latestSessionRuntimeProfile(sessionId)?.profile;
+    if (runtimeProfile === undefined) throw new Error("Expected a reviewed session runtime profile.");
+    const claim = value.store.beginOwnedDirectSendEffect({
+      attemptId: owner.owner.attemptId, ownerDigest: owner.ownerDigest, requestFingerprint: owner.owner.fingerprint,
+      daemonGeneration, bootId, expectedSessionRevision: owner.owner.sourceSessionRevision,
+      executionAuthority: owner.owner.sourceAuthority,
+      evidence: { kind: "session.send", providerThreadId: owner.owner.sourceThreadId,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: owner.owner.attemptId, messageDigest: owner.owner.fingerprint.inputDigest, runtimeProfile },
+    });
+    if (claim.claimDigest === null) throw new Error("Expected a durable direct send claim.");
+    const ambiguous = value.store.settleOwnedDirectSend({ attemptId: owner.owner.attemptId,
+      ownerDigest: owner.ownerDigest, claimDigest: claim.claimDigest,
+      outcome: { kind: "ambiguous", reason: "provider_outcome_unknown" } });
+    value.store.reconcileSessionFromProvider({ sessionId, state: "recovery_required" });
+    const doctor = await value.service.execute({ kind: "doctor", offline: true }, { signal });
+    expect(doctor).toMatchObject({ state: { database: "ready", unsettledMutations: 1 } });
+    expect(value.store.listUnsettledMutations({ sessionId })).toMatchObject([
+      { format: "original_send_v1", id: owner.owner.attemptId, state: "ambiguous" },
+    ]);
+    const providerCalls = [...value.codex.calls];
+    const current = value.store.requireSession(sessionId);
+    for (const kind of ["session.recover", "session.abandon"] as const) {
+      await expect(value.service.execute({ kind, session: sessionId }, { signal })).rejects.toMatchObject({
+        code: "RECOVERY_REQUIRED", details: { reason: "original_send_recovery_required" },
+      });
+    }
+    expect(value.codex.calls).toEqual(providerCalls);
+    expect(value.store.requireSession(sessionId)).toEqual(current);
+    expect(value.store.readOwnedSessionSend(request.idempotencyKey)).toEqual(ambiguous);
+    expect(value.codex.committedStartTurns).toBe(0);
+  });
+
   test("reports and CAS-updates notification hours with the injected clock only", async () => {
     let now = Date.parse("2026-09-04T12:30:00.000Z");
     const value = await fixture(
@@ -5425,10 +5466,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 44 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 45 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual(Array.from({ length: 20 }, (_, index) => ({ version: index + 25 })));
+      ).all()).toEqual(Array.from({ length: 21 }, (_, index) => ({ version: index + 25 })));
     } finally {
       inspector.close(false);
     }

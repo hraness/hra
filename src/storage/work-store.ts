@@ -10,6 +10,7 @@ import { providerAccountAuthoritySchema } from "../domain/provider-accounts";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
 import { workPreparedEffectMessage } from "../domain/work-message";
 import { MESSAGE_MAX_BYTES, sessionIdSchema } from "../domain/values";
+import { assertLegacyMutationOwnership, SessionSendOwnershipError } from "./session-send-owner";
 import {
   verifyWorkEvidence,
   WorkEvidenceVerificationError,
@@ -2000,9 +2001,32 @@ export class WorkStore {
     return read.deferred();
   }
 
+  #assertLegacyNestedMutationKey(idempotencyKey: string): void {
+    try {
+      assertLegacyMutationOwnership(this.#database, { idempotencyKey });
+    } catch (error) {
+      if (error instanceof SessionSendOwnershipError) {
+        throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+      }
+      throw error;
+    }
+  }
+
+  #assertLegacyPreparedInstruction(row: PreparedEffectRow, instruction: WorkPreparedEffect): void {
+    if (
+      digestText(row.instruction_json) !== row.instruction_digest
+      || instruction.workId !== row.work_id
+      || (instruction.kind === "dispatch" ? instruction.attemptId : instruction.signalId) !== row.subject_id
+      || instruction.kind !== (row.effect_kind === "attempt_dispatch" ? "dispatch" : "signal")
+      || instruction.nestedMutationKey !== deriveNestedMutationKey(row.idempotency_key)
+    ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+    this.#assertLegacyNestedMutationKey(instruction.nestedMutationKey);
+  }
+
   #nestedMutation(effect: WorkPreparedEffect):
     | Readonly<{ state: "absent" | "prepared" | "failed" | "unknown" }>
     | Readonly<{ state: "accepted"; receipt: WorkNestedEffectReceipt }> {
+    this.#assertLegacyNestedMutationKey(effect.nestedMutationKey);
     const table = this.#database.query(
       "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='mutation_attempts'",
     ).get() as { present: number } | null;
@@ -2140,6 +2164,7 @@ export class WorkStore {
   }
 
   #cancelNestedPrepared(effect: WorkPreparedEffect): void {
+    this.#assertLegacyNestedMutationKey(effect.nestedMutationKey);
     const table = this.#database.query(
       "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='mutation_attempts'",
     ).get() as { present: number } | null;
@@ -2438,13 +2463,6 @@ export class WorkStore {
         "SELECT * FROM work_prepared_effects WHERE idempotency_key=?",
       ).get(idempotencyKey) as PreparedEffectRow | null;
       if (effect === null) throw new WorkStoreError("ATTEMPT_NOT_FOUND");
-      if (effect.state === "accepted" || effect.state === "failed") {
-        return {
-          executable: false,
-          disposition: "settled",
-          status: this.#effectStatusFromRow(effect),
-        };
-      }
       const instruction = workPreparedEffectSchema.parse(parseStoredJson(effect.instruction_json));
       if (
         digestText(effect.instruction_json) !== effect.instruction_digest
@@ -2452,6 +2470,14 @@ export class WorkStore {
         || (instruction.kind === "dispatch" ? instruction.attemptId : instruction.signalId)
           !== effect.subject_id
       ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+      this.#assertLegacyPreparedInstruction(effect, instruction);
+      if (effect.state === "accepted" || effect.state === "failed") {
+        return {
+          executable: false,
+          disposition: "settled",
+          status: this.#effectStatusFromRow(effect),
+        };
+      }
       const nested = this.#nestedMutation(instruction);
       if (nested.state === "accepted") {
         this.#recordNestedEffectSettlement(effect, instruction, "accepted", nested.receipt);
@@ -2595,6 +2621,7 @@ export class WorkStore {
         || (instruction.kind === "dispatch" ? instruction.attemptId : instruction.signalId)
           !== effect.subject_id
       ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+      this.#assertLegacyPreparedInstruction(effect, instruction);
       const outcome = { kind: "failed" as const, code: failureCode };
       const outcomeDigest = digestText(canonicalWorkJson(outcome));
       if (effect.state === "failed" && effect.outcome_digest === outcomeDigest) {
@@ -4473,6 +4500,9 @@ export class WorkStore {
       throw new WorkStoreError("BAD_IDEMPOTENCY_KEY");
     }
     this.#authorizeOperation(operation);
+    if (operation.kind === "attempt.dispatch" || operation.kind === "signal.send") {
+      this.#assertLegacyNestedMutationKey(deriveNestedMutationKey(operation.idempotencyKey));
+    }
     const requestDigest = digestJson(operation);
     const releaseReplay = this.#replayReleaseTombstone(operation, requestDigest);
     if (releaseReplay !== null) return releaseReplay;
@@ -6149,6 +6179,7 @@ export class WorkStore {
       || instruction.workId !== attempt.work_id
       || digestText(effect.instruction_json) !== effect.instruction_digest
     ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+    this.#assertLegacyPreparedInstruction(effect, instruction);
     const projectedState = resolution === "proven_applied" ? "accepted" : "failed";
     if (
       (effect.state === "accepted" && projectedState !== "accepted")
@@ -6232,6 +6263,7 @@ export class WorkStore {
       || instruction.accountGeneration !== attempt.account_generation
       || digestText(effect.instruction_json) !== effect.instruction_digest
     ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+    this.#assertLegacyPreparedInstruction(effect, instruction);
     let receipt: WorkNestedEffectReceipt | null = null;
     if (effect.state === "accepted" && effect.outcome_json !== null) {
       const outcome = parseDispatchOutcome(parseStoredJson(effect.outcome_json));
@@ -6294,6 +6326,7 @@ export class WorkStore {
       || instruction.nestedMutationKey.length !== 36
       || digestText(effect.instruction_json) !== effect.instruction_digest
     ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+    this.#assertLegacyPreparedInstruction(effect, instruction);
     return this.#nestedMutation(instruction).state;
   }
 
@@ -6457,6 +6490,7 @@ export class WorkStore {
       }
       const instruction = workPreparedEffectSchema.parse(parseStoredJson(effect.instruction_json));
       if (instruction.kind !== "dispatch") throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+      this.#assertLegacyPreparedInstruction(effect, instruction);
       if (
         parsedOutcome.kind === "accepted"
         && (
@@ -6570,6 +6604,7 @@ export class WorkStore {
       }
       const instruction = workPreparedEffectSchema.parse(parseStoredJson(effect.instruction_json));
       if (instruction.kind !== "signal") throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+      this.#assertLegacyPreparedInstruction(effect, instruction);
       // Exact settled replay is historical evidence, not permission to execute.
       // In particular, legacy accepted signals remain readable after quarantine.
       if (effect.state !== "prepared" && effect.state !== "effect_started") {

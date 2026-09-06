@@ -147,6 +147,14 @@ import {
 import { TRANSCRIPT_SEED_MAX_CHARACTERS } from "../domain/transcript";
 import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../domain/session-tasks";
 import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
+import { fingerprintSessionSendRequest, sessionSendRequestSchema, sessionSendRequestFingerprintSchema,
+  type SessionSendRequest, type SessionSendRequestFingerprint } from "../domain/session-send-request";
+import { appendSessionSendOutcome, applySessionSendOwnerSchema, assertLegacyMutationOwnership,
+  assertUnsettledSessionSendOwners, auditSessionSendOwners, classifySessionSendOwnership,
+  insertSessionSendExecutionClaim, insertSessionSendOwner, ownedDirectSendEvidenceSchema, ownedDirectSendOutcomeInputSchema,
+  requireSessionSendOwner, sessionSendEvidenceDigest, sessionSendOwnedSql, sessionSendUnclaimedSql,
+  SessionSendOwnershipError, type OwnedDirectSendOutcomeInput, type SessionSendOwnerHistory,
+} from "./session-send-owner";
 import {
   digestTranscriptSeed,
   sessionProviderSwitchDurableReceiptSchema,
@@ -1101,6 +1109,18 @@ export type MutationAttemptRecord = {
   providerAuthorityQuarantine?: LegacyProviderAuthorityQuarantine;
 };
 
+/** Diagnostic union: owned sends never masquerade as legacy execution receipts. */
+export type UnsettledMutationRecord = (MutationAttemptRecord & { format: "legacy" }) | Readonly<{
+  format: "original_send_v1";
+  id: AttemptId;
+  idempotencyKey: string;
+  kind: "session.send";
+  authorityId: SessionId;
+  authorityGeneration: number;
+  state: "effect_started" | "ambiguous";
+  ownership: SessionSendOwnerHistory;
+}>;
+
 export type PendingLoginAuthority = {
   attemptId: AttemptId;
   idempotencyKey: string;
@@ -1381,7 +1401,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 44;
+const currentSchemaVersion = 45;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -9899,6 +9919,7 @@ const migrateWritableDatabase = (
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
   if (initialVersion === currentSchemaVersion) {
+    auditSessionSendOwners(database);
     auditDevinJoinedCloses(database);
     assertSchemaVersion43AutomaticUsagePolicy(database);
     assertCanonicalLabelKeys(database);
@@ -9920,6 +9941,7 @@ const migrateWritableDatabase = (
     // fences. Do not recreate missing current-format custody as a migration.
     if (initialVersion >= 40) assertWorkSignalProviderAuthorities(database);
     if (initialVersion >= 44) auditDevinJoinedCloses(database);
+    if (initialVersion >= 45) auditSessionSendOwners(database);
     let redacted = false;
     let version = initialVersion;
     const exactLegacyFeatureVersion36 = isExactLegacyFeatureVersion36(
@@ -10463,6 +10485,13 @@ const migrateWritableDatabase = (
       database.exec("PRAGMA user_version=44");
       version = 44;
     }
+    if (version < 45) {
+      applySessionSendOwnerSchema(database);
+      auditSessionSendOwners(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES(45,?)").run(now());
+      database.exec("PRAGMA user_version=45");
+      version = 45;
+    }
 
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
@@ -10529,6 +10558,7 @@ const migrateWritableDatabase = (
     assertSchemaVersion42SessionSwitch(database);
     auditAutomaticUsagePolicyHistory(database);
     auditDevinJoinedCloses(database);
+    auditSessionSendOwners(database);
     return hasPendingSecurityScrub(database);
   })();
   if (securityScrubPending) completePendingSecurityScrub(database, false, securityScrubCheckpoint);
@@ -13113,6 +13143,7 @@ export class StateStore {
       assertSchemaVersion42SessionSwitch(this.#database);
       if (this.#readonly) auditAutomaticUsagePolicyHistory(this.#database);
       if (this.#readonly) auditDevinJoinedCloses(this.#database);
+      if (this.#readonly) auditSessionSendOwners(this.#database);
       assertCompositeNotificationPolicy(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
@@ -13800,6 +13831,7 @@ export class StateStore {
       .max(Number.MAX_SAFE_INTEGER).parse(input.profileGeneration);
     const provider = z.enum(["claude", "devin"]).parse(input.provider);
     const sessionId = sessionIdSchema.parse(input.sessionId);
+    assertUnsettledSessionSendOwners(this.#database, sessionId);
     return this.#database.query(
       `SELECT 1 AS releasable
        FROM sessions s
@@ -13826,6 +13858,7 @@ export class StateStore {
            WHERE (m.authority_id=s.id OR a.session_id=s.id)
              AND m.state IN ('prepared','effect_started','ambiguous')
              AND r.attempt_id IS NULL
+             AND NOT ${sessionSendUnclaimedSql("m")}
          )
          AND NOT EXISTS(
            SELECT 1 FROM queue_entries q
@@ -14103,7 +14136,8 @@ export class StateStore {
       || this.sessionSwitchAdmissionBlocked({ sessionId: session.id, providerThreadId: witness.providerThreadId, providerAuthority: authority }).blocked) return null;
     if (this.#database.query(
       `SELECT 1 FROM mutation_attempts m LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-       WHERE m.authority_id=? AND m.state IN ('prepared','effect_started','ambiguous') AND r.attempt_id IS NULL LIMIT 1`,
+       WHERE m.authority_id=? AND m.state IN ('prepared','effect_started','ambiguous') AND r.attempt_id IS NULL
+         AND NOT ${sessionSendUnclaimedSql("m")} LIMIT 1`,
     ).get(session.id) !== null || this.#database.query(
       "SELECT 1 FROM queue_entries WHERE session_id=? AND state IN ('dispatching','ambiguous') LIMIT 1",
     ).get(session.id) !== null || this.#database.query(
@@ -15374,6 +15408,7 @@ export class StateStore {
    */
   requireCapturedSessionProviderAuthority(sessionId: SessionId): SessionProviderAuthority {
     const id = sessionIdSchema.parse(sessionId);
+    assertUnsettledSessionSendOwners(this.#database, id);
     assertDevinSuccessorProofCoverage(this.#database, id);
     const row = this.#database.query(
       `SELECT a.* FROM session_provider_authorities a
@@ -15416,6 +15451,7 @@ export class StateStore {
 
   requireSessionProviderAuthority(sessionId: SessionId): SessionProviderAuthority {
     const id = sessionIdSchema.parse(sessionId);
+    assertUnsettledSessionSendOwners(this.#database, id);
     assertDevinSuccessorProofCoverage(this.#database, id);
     const row = this.#database.query(
       `SELECT a.*,pa.readiness AS provider_readiness,
@@ -15609,6 +15645,7 @@ export class StateStore {
            )
            AND mutation.state IN ('prepared','effect_started','ambiguous')
            AND resolution.attempt_id IS NULL
+           AND NOT ${sessionSendUnclaimedSql("mutation")}
          LIMIT 1`,
       ).get(sessionId) !== null) {
         throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
@@ -17764,6 +17801,7 @@ export class StateStore {
     profile: ReviewedRuntimeProfile;
     providerAuthority: ProviderAccountAuthority;
   }): SessionRuntimeProfileRecord {
+    assertLegacyMutationOwnership(this.#database, { attemptId: input.sourceId });
     let record: SessionRuntimeProfileRecord | undefined;
     const transaction = this.#database.transaction(() => {
       record = this.#insertSessionRuntimeProfile(input, this.#now());
@@ -17813,6 +17851,7 @@ export class StateStore {
   }, now: number): SessionRuntimeProfileRecord {
     const sourceKind = runtimeProfileSourceKindSchema.parse(input.sourceKind);
     const sourceId = z.string().min(1).max(200).parse(input.sourceId);
+    assertLegacyMutationOwnership(this.#database, { attemptId: sourceId });
     const profile = reviewedRuntimeProfileSchema.parse(input.profile);
     const runtimeProvider = reviewedRuntimeProfileProvider(profile);
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
@@ -17973,6 +18012,7 @@ export class StateStore {
   runtimeProfileSourceRequiresSettlement(sessionId: SessionId, sourceId: string): boolean {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const parsedSourceId = z.string().min(1).max(200).parse(sourceId);
+    assertLegacyMutationOwnership(this.#database, { attemptId: parsedSourceId });
     const mutation = this.#database.query(`SELECT 1 FROM mutation_attempts m
       JOIN mutation_effect_evidence e ON e.attempt_id=m.id
       LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
@@ -18075,6 +18115,7 @@ export class StateStore {
     receipt: unknown;
   }): void {
     const attemptId = attemptIdSchema.parse(input.attemptId);
+    assertLegacyMutationOwnership(this.#database, { attemptId });
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
     const profile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
@@ -19295,6 +19336,7 @@ export class StateStore {
     ) throw new Error("SESSION_PROVIDER_DELETION_AUTHORITY_MISMATCH");
     const now = unixMillisecondsSchema.parse(this.#now());
     const terminalize = this.#database.transaction(() => {
+      assertUnsettledSessionSendOwners(this.#database, parsedSessionId);
       const current = this.requireSession(parsedSessionId);
       const frozen = baseProviderAccountAuthority(
         this.requireSessionProviderAuthority(parsedSessionId),
@@ -19393,6 +19435,7 @@ export class StateStore {
         `UPDATE mutation_attempts
          SET state='cancelled',updated_at=?
          WHERE state='prepared'
+           AND NOT ${sessionSendOwnedSql("mutation_attempts.id", "mutation_attempts.idempotency_key", "mutation_attempts.request_format")}
            AND (
              authority_id=? OR id IN (
                SELECT attempt_id FROM session_start_attempts WHERE session_id=?
@@ -19409,8 +19452,10 @@ export class StateStore {
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
          WHERE (m.authority_id=? OR s.session_id=?)
            AND m.state IN ('effect_started','ambiguous')
+           AND NOT ${sessionSendOwnedSql("m.id", "m.idempotency_key", "m.request_format")}
            AND r.attempt_id IS NULL`,
       ).run(providerDeletionEvidence, now, current.id, current.id);
+      this.#retireOwnedSessionSends(now, "provider_outcome_unknown", current.id);
       const rows = this.#database.query(
         `SELECT * FROM provider_interactions
          WHERE session_id=? AND state IN ('pending','response_prepared','response_written')
@@ -20236,6 +20281,7 @@ export class StateStore {
 
   readMutation(idempotencyKey: string): MutationAttemptRecord | null {
     const key = z.string().uuid().parse(idempotencyKey);
+    assertLegacyMutationOwnership(this.#database, { idempotencyKey: key });
     if (this.#database.query(
       `SELECT 1 FROM session_switch_malformed_dispositions
        WHERE mutation_request_key=? LIMIT 1`,
@@ -20938,6 +20984,7 @@ export class StateStore {
   }
 
   readMutationProviderAuthorities(attemptId: AttemptId): readonly ProviderAuthorityEvidence[] {
+    assertLegacyMutationOwnership(this.#database, { attemptId });
     const rows = this.#database.query(
       `SELECT role,provider_account_id,profile_id,provider,binding_generation,
               process_generation,provenance
@@ -21084,6 +21131,130 @@ export class StateStore {
     }).immediate();
   }
 
+  readOwnedSessionSend(idempotencyKey: string): SessionSendOwnerHistory | null {
+    const record = classifySessionSendOwnership(this.#database, { idempotencyKey });
+    if (record.kind === "absent") return null;
+    if (record.kind !== "owned") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
+    return record;
+  }
+
+  prepareOwnedSessionSend(input: SessionSendRequest): SessionSendOwnerHistory & { replayed: boolean } {
+    const request = sessionSendRequestSchema.parse(input);
+    const fingerprint = fingerprintSessionSendRequest(request);
+    return this.#database.transaction(() => {
+      // Classify the original global key before resolving a mutable selector.
+      const existing = classifySessionSendOwnership(this.#database, { idempotencyKey: request.idempotencyKey });
+      if (existing.kind === "owned") {
+        if (JSON.stringify(existing.owner.fingerprint) !== JSON.stringify(fingerprint)) throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
+        return { ...existing, replayed: true };
+      }
+      if (existing.kind === "legacy") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
+      const session = this.requireSession(request.session);
+      const captured = this.requireCapturedSessionProviderAuthority(session.id);
+      if (session.providerThreadId === undefined || session.state === "terminal") throw new SessionSendOwnershipError("SESSION_SEND_SOURCE_CHANGED");
+      assertUnsettledSessionSendOwners(this.#database, session.id);
+      const pending = this.#database.query(`SELECT COUNT(*) AS count FROM mutation_attempts m WHERE m.authority_id=? AND ${sessionSendUnclaimedSql("m")}`)
+        .get(session.id) as { count: number };
+      if (pending.count >= 64) throw new SessionSendOwnershipError("SESSION_SEND_OWNER_LIMIT");
+      const record = insertSessionSendOwner(this.#database, {
+        version: 1, attemptId: createAttemptId(), idempotencyKey: request.idempotencyKey, sessionId: session.id, fingerprint,
+        sourceAuthority: baseProviderAccountAuthority(captured), sourceThreadId: session.providerThreadId,
+        sourceSessionRevision: session.revision, sourceAuthorityRevision: captured.authorityRevision,
+        routingProvenance: captured.routingProvenance, appliedPointerRevision: captured.appliedPointerRevision,
+        createdAt: unixMillisecondsSchema.parse(this.#now()),
+      });
+      return { ...record, replayed: false };
+    }).immediate();
+  }
+
+  beginOwnedDirectSendEffect(input: Readonly<{
+    attemptId: AttemptId; ownerDigest: string; requestFingerprint: SessionSendRequestFingerprint;
+    daemonGeneration: number; bootId: string; expectedSessionRevision: number; executionAuthority: ProviderAccountAuthority;
+    evidence: z.infer<typeof ownedDirectSendEvidenceSchema>;
+  }>): SessionSendOwnerHistory & { dispatchGranted: true } {
+    const fingerprint = sessionSendRequestFingerprintSchema.parse(input.requestFingerprint);
+    const executionAuthority = providerAccountAuthoritySchema.parse(input.executionAuthority);
+    const evidence = ownedDirectSendEvidenceSchema.parse(input.evidence);
+    return this.#database.transaction(() => {
+      const history = requireSessionSendOwner(this.#database, { attemptId: input.attemptId });
+      if (history.ownerDigest !== input.ownerDigest || JSON.stringify(fingerprint) !== JSON.stringify(history.owner.fingerprint)) {
+        throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
+      }
+      if (history.state !== "input_required") throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
+      const session = this.requireSession(history.owner.sessionId);
+      const captured = this.requireCapturedSessionProviderAuthority(session.id);
+      if (session.revision !== history.owner.sourceSessionRevision || input.expectedSessionRevision !== session.revision
+        || captured.authorityRevision !== history.owner.sourceAuthorityRevision
+        || !sameProviderAccountAuthority(history.owner.sourceAuthority, captured) || !sameProviderAccountAuthority(executionAuthority, captured)
+        || captured.routingProvenance !== history.owner.routingProvenance || captured.appliedPointerRevision !== history.owner.appliedPointerRevision
+        || session.providerThreadId !== history.owner.sourceThreadId || session.state !== "idle" || session.activeTurnId !== undefined) {
+        throw new SessionSendOwnershipError("SESSION_SEND_SOURCE_CHANGED");
+      }
+      this.assertProviderAccountAuthorityCurrent(executionAuthority);
+      const account = this.requireProviderAccountById(executionAuthority.providerAccountId);
+      if (executionAuthority.processGeneration === 0 || (account.readiness !== "signed_in"
+        && !(executionAuthority.provider !== "codex" && account.readiness === "unverified" && captured.routingProvenance === "explicit"))) {
+        throw new SessionSendOwnershipError("SESSION_SEND_SOURCE_CHANGED");
+      }
+      this.#assertSessionRuntimeProfileContract(session.id, evidence.runtimeProfile);
+      if (this.sessionSwitchAdmissionBlocked({ sessionId: session.id, providerThreadId: history.owner.sourceThreadId,
+        providerAuthority: executionAuthority }).blocked) throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      assertUnsettledSessionSendOwners(this.#database, session.id);
+      // The mutation kind and profile remain an ambient login fence even if
+      // its immutable provider sidecar is missing. Never make corruption an
+      // execution opportunity or borrow a sibling provider's generation.
+      if (this.#database.query(`SELECT 1 FROM mutation_attempts m LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+        WHERE m.authority_id=? AND m.state IN ('prepared','effect_started','ambiguous') AND r.attempt_id IS NULL
+          AND ((?='codex' AND m.kind IN ('account.login','account.logout','account.login-cancel'))
+            OR (?='claude' AND m.kind='account.claude-login') OR (?='devin' AND m.kind='account.devin-login')) LIMIT 1`)
+        .get(executionAuthority.profileId, executionAuthority.provider, executionAuthority.provider, executionAuthority.provider) !== null
+        || this.#database.query(`SELECT 1 FROM mutation_attempts m LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+        WHERE m.authority_id=? AND m.id!=? AND m.state IN ('prepared','effect_started','ambiguous') AND r.attempt_id IS NULL
+          AND NOT ${sessionSendUnclaimedSql("m")} LIMIT 1`).get(session.id, history.owner.attemptId) !== null
+        || this.#database.query("SELECT 1 FROM queue_entries WHERE session_id=? AND state IN ('dispatching','ambiguous') LIMIT 1").get(session.id) !== null
+        || this.#database.query(`SELECT 1 FROM provider_interactions i LEFT JOIN interaction_provider_authorities a ON a.public_id=i.public_id
+          WHERE i.state IN ('pending','response_prepared','response_written') AND (i.session_id=? OR (
+            i.session_id IS NULL AND i.thread_id=? AND ((a.public_id IS NULL AND i.profile_id=?)
+              OR (a.provider_account_id=? AND a.profile_id=? AND a.provider=?
+                AND a.binding_generation=? AND a.process_generation=?)))) LIMIT 1`).get(session.id, history.owner.sourceThreadId, executionAuthority.profileId,
+          executionAuthority.providerAccountId, executionAuthority.profileId, executionAuthority.provider,
+          executionAuthority.bindingGeneration, executionAuthority.processGeneration) !== null) {
+        throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
+      }
+      const record = insertSessionSendExecutionClaim(this.#database, history, {
+        version: 1, mode: "direct", attemptId: history.owner.attemptId, ownerDigest: history.ownerDigest,
+        daemonGeneration: input.daemonGeneration, bootId: input.bootId, executionAuthority,
+        sessionRevision: session.revision, sessionAuthorityRevision: captured.authorityRevision,
+        providerThreadId: history.owner.sourceThreadId, clientMessageId: history.owner.attemptId,
+        evidence, evidenceDigest: sessionSendEvidenceDigest(evidence), createdAt: unixMillisecondsSchema.parse(this.#now()),
+      });
+      return { ...record, dispatchGranted: true as const };
+    }).immediate();
+  }
+
+  settleOwnedDirectSend(input: Readonly<{
+    attemptId: AttemptId; ownerDigest: string; claimDigest: string; outcome: OwnedDirectSendOutcomeInput;
+  }>): SessionSendOwnerHistory {
+    const outcome = ownedDirectSendOutcomeInputSchema.parse(input.outcome);
+    return this.#database.transaction(() => {
+      const history = requireSessionSendOwner(this.#database, { attemptId: input.attemptId });
+      if (history.ownerDigest !== input.ownerDigest || history.claimDigest !== input.claimDigest || history.claim === null) {
+        throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
+      }
+      // Receipt persistence is historical. No mutable session/runtime projection
+      // may be inferred from this receipt or overwrite a newer binding.
+      return appendSessionSendOutcome(this.#database, history, outcome, unixMillisecondsSchema.parse(this.#now()));
+    }).immediate();
+  }
+
+  cancelOwnedSessionSend(input: Readonly<{ attemptId: AttemptId; ownerDigest: string }>): SessionSendOwnerHistory {
+    return this.#database.transaction(() => {
+      const history = requireSessionSendOwner(this.#database, { attemptId: input.attemptId });
+      if (history.ownerDigest !== input.ownerDigest || history.claim !== null) throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
+      return appendSessionSendOutcome(this.#database, history, { kind: "cancelled" }, unixMillisecondsSchema.parse(this.#now()));
+    }).immediate();
+  }
+
   prepareMutation(input: {
     kind: string;
     authorityId: string;
@@ -21116,6 +21287,8 @@ export class StateStore {
     }
     let id: AttemptId | undefined;
     const prepare = this.#database.transaction(() => {
+      const ownedSession = sessionIdSchema.safeParse(input.authorityId);
+      if (ownedSession.success) assertUnsettledSessionSendOwners(this.#database, ownedSession.data);
       for (const evidence of providerAuthorities) {
         this.assertProviderAccountAuthorityCurrent(evidence.authority);
       }
@@ -21166,6 +21339,7 @@ export class StateStore {
     providerAuthorities: readonly ProviderAuthorityEvidence[];
   }>): boolean {
     const attemptId = attemptIdSchema.parse(input.attemptId);
+    assertLegacyMutationOwnership(this.#database, { attemptId });
     const providerAuthorities = this.#parseProviderAuthorityEvidence(input.providerAuthorities);
     const begin = this.#database.transaction(() => {
       this.#assertMutationProviderAuthorities(attemptId, providerAuthorities);
@@ -21178,6 +21352,7 @@ export class StateStore {
   }
 
   transitionMutation(id: AttemptId, from: MutationState, to: MutationState, result?: unknown): boolean {
+    assertLegacyMutationOwnership(this.#database, { attemptId: id });
     if (from === "reconciled" || to === "reconciled") {
       throw new Error("Reconciliation is append-only and cannot rewrite a mutation attempt.");
     }
@@ -21219,6 +21394,7 @@ export class StateStore {
     evidence: Extract<MutationEffectEvidence, { kind: "session.send" | "session.steer" | "session.stop" | "session.rename" }>;
   }): MutationEffectEvidenceRecord {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
+    assertLegacyMutationOwnership(this.#database, { attemptId: parsedAttemptId });
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
@@ -21302,6 +21478,7 @@ export class StateStore {
     evidence: Extract<MutationEffectEvidence, { kind: "session.start" }>;
   }): SessionRecord {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
+    assertLegacyMutationOwnership(this.#database, { attemptId: parsedAttemptId });
     const parsedProfileId = profileIdSchema.parse(input.profileId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const parsedProjectId = projectIdSchema.parse(input.projectId);
@@ -22351,6 +22528,7 @@ export class StateStore {
     affectedWorkIds: readonly string[];
   }> {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
+    assertLegacyMutationOwnership(this.#database, { attemptId: parsedAttemptId });
     const parsedProfileId = profileIdSchema.parse(input.profileId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
@@ -23045,7 +23223,11 @@ export class StateStore {
     return result;
   }
 
-  listUnsettledMutations(input: { authorityId?: string; sessionId?: SessionId } = {}): readonly MutationAttemptRecord[] {
+  listUnsettledMutations(input: { authorityId?: string; sessionId?: SessionId } = {}): readonly UnsettledMutationRecord[] {
+    // Include inverse artifacts in the audit; a missing mutation must not hide
+    // an unresolved owned writer from this diagnostic/admission boundary.
+    if (input.sessionId === undefined) auditSessionSendOwners(this.#database);
+    else assertUnsettledSessionSendOwners(this.#database, input.sessionId);
     const rows = input.sessionId === undefined
       ? input.authorityId === undefined
         ? this.#database.query(`SELECT m.idempotency_key FROM mutation_attempts m
@@ -23079,9 +23261,16 @@ export class StateStore {
                               ORDER BY m.created_at,m.id`).all(input.sessionId, input.sessionId);
     return rows.map((row) => {
       const key = z.object({ idempotency_key: z.string().uuid() }).strict().parse(row).idempotency_key;
+      const ownership = classifySessionSendOwnership(this.#database, { idempotencyKey: key });
+      if (ownership.kind === "owned") {
+        if (ownership.state !== "effect_started" && ownership.state !== "ambiguous") throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
+        return { format: "original_send_v1" as const, id: ownership.owner.attemptId, idempotencyKey: key,
+          kind: "session.send" as const, authorityId: ownership.owner.sessionId,
+          authorityGeneration: ownership.owner.sourceAuthority.processGeneration, state: ownership.state, ownership };
+      }
       const attempt = this.readMutation(key);
       if (attempt === null) throw new Error("Mutation disappeared during unsettled read.");
-      return attempt;
+      return { ...attempt, format: "legacy" as const };
     });
   }
 
@@ -23096,6 +23285,7 @@ export class StateStore {
     acknowledgeProviderStateUnknown?: boolean;
   }): SessionRecord {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
+    assertLegacyMutationOwnership(this.#database, { attemptId: parsedAttemptId });
     const expectedDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const resolution = mutationResolutionKindSchema.parse(input.resolution);
     const resolutionJson = JSON.stringify(input.resolutionEvidence);
@@ -23546,6 +23736,7 @@ export class StateStore {
     unresolved: readonly { id: AttemptId; kind: string; authorityId: string }[];
   } {
     const recover = this.#database.transaction(() => {
+      auditSessionSendOwners(this.#database);
       const rows = this.#database
         .query(`SELECT m.id,m.kind,m.authority_id,m.authority_generation,e.kind AS evidence_kind,e.evidence_json,e.evidence_digest,s.session_id AS session_start_id
                 FROM mutation_attempts m
@@ -23556,6 +23747,7 @@ export class StateStore {
                 LEFT JOIN session_switch_malformed_dispositions malformed
                   ON malformed.mutation_request_key=m.idempotency_key
                 WHERE m.state='effect_started' AND r.attempt_id IS NULL
+                  AND NOT ${sessionSendOwnedSql("m.id", "m.idempotency_key", "m.request_format")}
                   AND dedicated.attempt_id IS NULL
                   AND malformed.mutation_request_key IS NULL
                 ORDER BY m.created_at,m.id`)
@@ -28134,6 +28326,31 @@ export class StateStore {
       && evidence.usage_rows === 0;
   }
 
+  #retireOwnedSessionSends(now: number, reason: "daemon_restart" | "provider_outcome_unknown", sessionId?: SessionId): void {
+    let after = "";
+    for (;;) {
+      const parameters: string[] = [after];
+      if (sessionId !== undefined) parameters.push(sessionId);
+      const rows = this.#database.query(`SELECT m.id FROM mutation_attempts m WHERE m.id>? AND m.state='effect_started'
+        AND m.request_format='original_send_v1' ${sessionId === undefined ? "" : "AND m.authority_id=?"}
+        ORDER BY m.id LIMIT 100`).all(...parameters) as Array<{ id: string }>;
+      if (rows.length === 0) return;
+      for (const row of rows) {
+        after = row.id;
+        const history = requireSessionSendOwner(this.#database, { attemptId: row.id });
+        if (history.claim === null) throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
+        appendSessionSendOutcome(this.#database, history, { kind: "ambiguous", reason }, now);
+        const authority = history.claim.executionAuthority;
+        this.#database.query(`UPDATE sessions SET state='recovery_required',active_turn_id=NULL,revision=revision+1,updated_at=MAX(updated_at,?)
+          WHERE id=? AND state NOT IN ('terminal','recovery_required') AND provider_thread_id=? AND EXISTS(
+            SELECT 1 FROM session_provider_authorities a WHERE a.session_id=sessions.id
+              AND a.provider_account_id=? AND a.profile_id=? AND a.provider=? AND a.binding_generation=? AND a.process_generation=?
+          )`).run(now, history.owner.sessionId, history.claim.providerThreadId, authority.providerAccountId,
+            authority.profileId, authority.provider, authority.bindingGeneration, authority.processGeneration);
+      }
+    }
+  }
+
   nextDaemonGeneration(bootId: string): number {
     completePendingSecurityScrub(
       this.#database,
@@ -28153,6 +28370,8 @@ export class StateStore {
         if (current.stopped_at !== null) throw new Error("DAEMON_BOOT_ID_RETIRED");
         return current.generation;
       }
+      auditSessionSendOwners(this.#database);
+      this.#retireOwnedSessionSends(now, "daemon_restart");
       // An actual daemon restart retires every provider-process authority.
       // Dedicated switches therefore receive a local, phase-specific terminal
       // disposition before any generic gap or generation update can touch
@@ -28275,6 +28494,7 @@ export class StateStore {
                ELSE result_json END,
              updated_at=MAX(updated_at,?)
          WHERE state IN ('prepared','effect_started')
+           AND NOT ${sessionSendOwnedSql("mutation_attempts.id", "mutation_attempts.idempotency_key", "mutation_attempts.request_format")}
            AND kind IN (
              'session.start','session.send','session.steer','session.stop',
              'session.rename','session.queue','session.switch'
@@ -28344,6 +28564,7 @@ export class StateStore {
          LEFT JOIN session_start_attempts start ON start.attempt_id=m.id
          LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=m.id
          WHERE m.state='ambiguous' AND resolution.attempt_id IS NULL
+           AND NOT ${sessionSendOwnedSql("m.id", "m.idempotency_key", "m.request_format")}
            AND m.kind!='session.switch'
            AND NOT EXISTS(
              SELECT 1 FROM session_switch_attempts dedicated
@@ -28564,6 +28785,7 @@ export class StateStore {
          SET state='cancelled',updated_at=MAX(updated_at,?)
          WHERE state='prepared'
            AND kind IN ('session.send','session.steer','session.stop','session.rename')
+           AND NOT ${sessionSendOwnedSql("mutation_attempts.id", "mutation_attempts.idempotency_key", "mutation_attempts.request_format")}
            AND EXISTS(
              SELECT 1 FROM mutation_provider_authorities evidence
              JOIN session_provider_authorities session_authority

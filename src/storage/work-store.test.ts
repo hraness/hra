@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
 
 import {
   createAttemptId,
@@ -31,6 +34,11 @@ import {
   type WorkTaskSpec,
 } from "../domain/work";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
+import { presetRequirements } from "../domain/presets";
+import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
+import { initializeStatePaths, resolveStatePaths } from "./paths";
+import { applySessionSendOwnerSchema, SESSION_SEND_REQUEST_FORMAT } from "./session-send-owner";
+import { StateStore } from "./state-store";
 import {
   WORK_SCHEMA_SQL,
   WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL,
@@ -44,6 +52,7 @@ import {
 } from "./work-store";
 
 const databases: Database[] = [];
+const stateStores: StateStore[] = [];
 const capability = `hrac1_${"A".repeat(43)}`;
 
 let uuidV7Sequence = 0;
@@ -74,6 +83,7 @@ function turnStartedReceipt(accountGeneration = 1) {
 }
 
 afterEach(() => {
+  for (const store of stateStores.splice(0)) store.close();
   for (const database of databases.splice(0)) database.close(false);
 });
 
@@ -177,13 +187,20 @@ CREATE TABLE mutation_attempts(
 ) STRICT;
 CREATE TABLE mutation_effect_evidence(
   attempt_id TEXT PRIMARY KEY,
-  evidence_json TEXT
+  kind TEXT,
+  evidence_json TEXT,
+  evidence_digest TEXT,
+  recorded_at INTEGER
 ) STRICT;
 CREATE TABLE mutation_resolutions(
   attempt_id TEXT PRIMARY KEY,
   resolution_kind TEXT,
-  receipt_json TEXT
+  receipt_json TEXT,
+  evidence_json TEXT,
+  created_at INTEGER
 ) STRICT;
+CREATE TABLE session_runtime_profiles(source_id TEXT) STRICT;
+CREATE TABLE session_turn_runtime_profiles(source_id TEXT) STRICT;
 CREATE TABLE legacy_provider_authority_quarantines(
   scope_kind TEXT NOT NULL,scope_id TEXT NOT NULL,reason TEXT NOT NULL,recorded_at INTEGER NOT NULL,
   PRIMARY KEY(scope_kind,scope_id)
@@ -216,6 +233,7 @@ function fixture(): Fixture {
   databases.push(database);
   database.exec("PRAGMA foreign_keys=ON;");
   database.exec(parentSchema);
+  applySessionSendOwnerSchema(database);
   database.exec(WORK_SCHEMA_SQL);
   database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL);
   assertWorkSchema(database);
@@ -251,6 +269,124 @@ function fixture(): Fixture {
     reviewerSessionId,
     store,
   };
+}
+
+async function originalSendOwnerFixture(): Promise<Fixture & Readonly<{
+  stateStore: StateStore;
+  daemonGeneration: number;
+  bootId: string;
+}>> {
+  const home = await realpath(await mkdtemp(joinPath(tmpdir(), "hra-work-send-owner-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const now = { value: 10_000 };
+  const stateStore = new StateStore(paths, {
+    now: () => now.value,
+    resolveMachineTimeZone: () => "America/Puerto_Rico",
+    publicProviderIdentifierProjector: projectProviderIdentifier,
+  });
+  stateStores.push(stateStore);
+  const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = stateStore.nextDaemonGeneration(bootId);
+  const profile = stateStore.createProfile("Original send owner");
+  const account = stateStore.nextProfileGeneration(profile.id);
+  if (!stateStore.setProfileState(account.id, account.processGeneration, "signed_in", {
+    email: "work-owner@example.com",
+    plan: "Plus",
+  })) throw new Error("work owner fixture account was not admitted");
+  const projectRoot = joinPath(home, "project");
+  await mkdir(projectRoot);
+  const project = await stateStore.createProject("Owner fixture", projectRoot, true);
+  const bindSession = (thread: string): SessionId => {
+    const created = stateStore.createSession({
+      profileId: account.id,
+      projectId: project.id,
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    return stateStore.bindSession({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      providerThreadId: thread,
+      state: "idle",
+    }).id;
+  };
+  const actorSessionId = bindSession("work-owner-actor");
+  const reviewerSessionId = bindSession("work-owner-reviewer");
+  const database = new Database(paths.database, { strict: true });
+  databases.push(database);
+  database.exec("PRAGMA foreign_keys=ON");
+  const store = stateStore.createWorkStore(7, encodeCursor, {
+    issue: issueCapability,
+    verify: verifyCapability,
+  });
+  return {
+    accountId: account.id,
+    actorSessionId,
+    database,
+    now,
+    projectId: project.id,
+    reviewerSessionId,
+    stateStore,
+    store,
+    daemonGeneration,
+    bootId,
+  };
+}
+
+function prepareOriginalSendOwner(
+  value: Awaited<ReturnType<typeof originalSendOwnerFixture>>,
+  key: string,
+  message = "One original human request.",
+) {
+  return value.stateStore.prepareOwnedSessionSend({
+    kind: "session.send",
+    idempotencyKey: key,
+    session: value.actorSessionId,
+    message,
+    attachments: [],
+  });
+}
+
+function claimOriginalSendOwner(
+  value: Awaited<ReturnType<typeof originalSendOwnerFixture>>,
+  prepared: ReturnType<typeof prepareOriginalSendOwner>,
+) {
+  const authority = prepared.owner.sourceAuthority;
+  const runtimeProfile = effectiveRuntimeProfileSchema.parse({
+    approvalPolicy: "on-request",
+    computerUse: true,
+    enabledApps: [],
+    fast: false,
+    model: presetRequirements.high.model,
+    observedAt: value.now.value,
+    permissionProfile: ":workspace",
+    pluginCapability: true,
+    preset: "high",
+    processGeneration: authority.processGeneration,
+    profileId: authority.profileId,
+    reasoningEffort: "max",
+    reviewMode: "auto_review",
+    serviceTier: null,
+  });
+  return value.stateStore.beginOwnedDirectSendEffect({
+    attemptId: prepared.owner.attemptId,
+    ownerDigest: prepared.ownerDigest,
+    requestFingerprint: prepared.owner.fingerprint,
+    daemonGeneration: value.daemonGeneration,
+    bootId: value.bootId,
+    expectedSessionRevision: prepared.owner.sourceSessionRevision,
+    executionAuthority: authority,
+    evidence: {
+      kind: "session.send",
+      providerThreadId: prepared.owner.sourceThreadId,
+      baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+      clientMessageId: prepared.owner.attemptId,
+      messageDigest: prepared.owner.fingerprint.inputDigest,
+      runtimeProfile,
+    },
+  });
 }
 
 function fillWorkEventCapacity(
@@ -427,6 +563,41 @@ function claim(
   });
   if (result.kind !== "task.claim") throw new Error("unexpected result");
   return result;
+}
+
+function prepareOwnerGuardDispatch(value: Fixture, idempotencyKey = randomUUID()) {
+  const created = createWork(value);
+  join(value, created.work.id, created.work.revision, value.actorSessionId);
+  const task = created.tasks[0];
+  if (task === undefined) throw new Error("owner guard task missing");
+  const claimed = claim(value, {
+    workId: created.work.id,
+    taskId: task.id,
+    revision: task.revision,
+  });
+  const operation = {
+    kind: "attempt.dispatch" as const,
+    idempotencyKey,
+    workId: created.work.id,
+    attemptId: claimed.attempt.id,
+    expectedAttemptRevision: claimed.attempt.revision,
+    fence: claimed.attempt.fence,
+    actorSessionId: value.actorSessionId,
+    attemptCapability: capability,
+    targetSessionId: value.actorSessionId,
+    mode: "send" as const,
+  };
+  value.store.apply(operation);
+  const effect = value.store.preparedEffect(idempotencyKey)?.effect;
+  if (effect?.kind !== "dispatch") throw new Error("owner guard dispatch missing");
+  return { created, claimed, operation, effect };
+}
+
+function markNestedRequestAsOwned(value: Fixture, effect: WorkPreparedEffect): void {
+  value.database.exec("DROP TRIGGER session_send_format_immutable; DROP TRIGGER session_send_mutation_guard");
+  value.database.query("UPDATE mutation_attempts SET request_format=? WHERE idempotency_key=?")
+    .run(SESSION_SEND_REQUEST_FORMAT, effect.nestedMutationKey);
+  applySessionSendOwnerSchema(value.database);
 }
 
 function insertNestedDispatchMutation(
@@ -932,6 +1103,201 @@ describe("WorkStore schema and atomic plans", () => {
     expect(value.database.query(
       "SELECT COUNT(*) AS count FROM work_tasks WHERE work_id=?",
     ).get(created.work.id)).toEqual({ count: 1 });
+  });
+});
+
+describe("WorkStore original send ownership", () => {
+  test("original send ownership: rejects coherent unclaimed, direct, and terminal owners without changing either journal", async () => {
+    for (const stage of ["input_required", "effect_started", "accepted", "ambiguous", "abandoned", "cancelled"] as const) {
+      const value = await originalSendOwnerFixture();
+      const prepared = prepareOwnerGuardDispatch(value);
+      const owner = prepareOriginalSendOwner(value, prepared.effect.nestedMutationKey, workPreparedEffectMessage(prepared.effect));
+      if (stage === "cancelled") {
+        value.stateStore.cancelOwnedSessionSend({ attemptId: owner.owner.attemptId, ownerDigest: owner.ownerDigest });
+      } else if (stage !== "input_required") {
+        const claim = claimOriginalSendOwner(value, owner);
+        if (claim.claim === null || claim.claimDigest === null) throw new Error("owned direct claim missing");
+        const settlement = {
+          attemptId: owner.owner.attemptId,
+          ownerDigest: owner.ownerDigest,
+          claimDigest: claim.claimDigest,
+        };
+        if (stage === "accepted") {
+          value.stateStore.settleOwnedDirectSend({
+            ...settlement,
+            outcome: { kind: "accepted", receipt: {
+              sourceId: owner.owner.attemptId,
+              turnId: "original-owned-turn",
+              status: "completed",
+              effectiveRuntimeProfile: claim.claim.evidence.runtimeProfile,
+            } },
+          });
+        } else if (stage === "ambiguous" || stage === "abandoned") {
+          value.stateStore.settleOwnedDirectSend({ ...settlement, outcome: { kind: "ambiguous", reason: "provider_outcome_unknown" } });
+          if (stage === "abandoned") {
+            value.stateStore.settleOwnedDirectSend({ ...settlement, outcome: { kind: "abandoned", acknowledgeOutcomeUnknown: true } });
+          }
+        }
+      }
+      const before = value.stateStore.readOwnedSessionSend(prepared.effect.nestedMutationKey);
+      expect(before?.state).toBe(stage);
+      const workBefore = value.store.snapshot(prepared.created.work.id);
+      const rejected = new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+      expect(() => value.store.authorizePreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+      expect(() => value.store.reprojectPreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+      expect(() => value.store.settlePreparedEffectNoEffect(prepared.operation.idempotencyKey, "not_dispatched")).toThrow(rejected);
+      expect(() => value.store.apply(prepared.operation)).toThrow(rejected);
+      expect(value.stateStore.readOwnedSessionSend(prepared.effect.nestedMutationKey)).toEqual(before);
+      expect(value.store.snapshot(prepared.created.work.id)).toEqual(workBefore);
+      expect(value.store.effectStatus(prepared.operation.idempotencyKey)?.state).toBe("prepared");
+      expect(value.database.query("SELECT COUNT(*) AS count FROM work_nested_effect_settlements").get()).toEqual({ count: 0 });
+    }
+  });
+
+  test("original send ownership: keeps the independent top-level Work intent namespace usable", async () => {
+    const value = await originalSendOwnerFixture();
+    const key = randomUUID();
+    const owner = prepareOriginalSendOwner(value, key);
+    const prepared = prepareOwnerGuardDispatch(value, key);
+    expect(prepared.effect.nestedMutationKey).not.toBe(key);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+    expect(value.store.apply(prepared.operation).kind).toBe("attempt.dispatch");
+    expect(value.stateStore.readOwnedSessionSend(key)).toEqual({
+      kind: owner.kind,
+      owner: owner.owner,
+      ownerDigest: owner.ownerDigest,
+      claim: null,
+      claimDigest: null,
+      outcomes: [],
+      state: "input_required",
+    });
+    expect(value.stateStore.readMutation(prepared.effect.nestedMutationKey)).toBeNull();
+  });
+
+  test("original send ownership: rejects missing, orphaned, and relocated ownership without legacy fallback", async () => {
+    for (const corruption of ["marker", "owner", "anchor", "orphan", "relocated"] as const) {
+      const value = await originalSendOwnerFixture();
+      const prepared = prepareOwnerGuardDispatch(value);
+      const owner = prepareOriginalSendOwner(value, prepared.effect.nestedMutationKey, workPreparedEffectMessage(prepared.effect));
+      value.database.exec("PRAGMA foreign_keys=OFF");
+      try {
+        if (corruption === "marker") {
+          value.database.exec("DROP TRIGGER session_send_format_immutable; DROP TRIGGER session_send_mutation_guard");
+          value.database.query("UPDATE mutation_attempts SET request_format=NULL WHERE id=?").run(owner.owner.attemptId);
+        } else if (corruption === "owner") {
+          value.database.exec("DROP TRIGGER session_send_owners_immutable_delete");
+          value.database.query("DELETE FROM session_send_owners WHERE attempt_id=?").run(owner.owner.attemptId);
+        } else if (corruption === "anchor") {
+          value.database.exec("DROP TRIGGER session_send_owner_anchors_immutable_delete");
+          value.database.query("DELETE FROM session_send_owner_anchors WHERE attempt_id=?").run(owner.owner.attemptId);
+        } else if (corruption === "orphan") {
+          value.database.exec("DROP TRIGGER session_send_mutation_delete_guard");
+          value.database.query("DELETE FROM mutation_attempts WHERE id=?").run(owner.owner.attemptId);
+        } else {
+          value.database.exec("DROP TRIGGER session_send_mutation_guard");
+          value.database.query("UPDATE mutation_attempts SET idempotency_key=? WHERE id=?")
+            .run(randomUUID(), owner.owner.attemptId);
+        }
+        applySessionSendOwnerSchema(value.database);
+      } finally {
+        value.database.exec("PRAGMA foreign_keys=ON");
+      }
+      const workBefore = value.store.snapshot(prepared.created.work.id);
+      const mutationBefore = value.database.query("SELECT * FROM mutation_attempts WHERE id=?").get(owner.owner.attemptId);
+      const rejected = new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+      expect(() => value.store.authorizePreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+      expect(() => value.store.reprojectPreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+      expect(() => value.store.settlePreparedEffectNoEffect(prepared.operation.idempotencyKey, "not_dispatched")).toThrow(rejected);
+      expect(() => value.store.apply(prepared.operation)).toThrow(rejected);
+      expect(value.store.snapshot(prepared.created.work.id)).toEqual(workBefore);
+      expect(value.database.query("SELECT * FROM mutation_attempts WHERE id=?").get(owner.owner.attemptId)).toEqual(mutationBefore);
+      expect(value.database.query("SELECT COUNT(*) AS count FROM work_nested_effect_settlements").get()).toEqual({ count: 0 });
+    }
+  });
+
+  test("original send ownership: rejects marker-only nested receipts without accepting Work effects", () => {
+    const value = fixture();
+    const prepared = prepareOwnerGuardDispatch(value);
+    insertAppliedNestedMutation(value, prepared.effect);
+    markNestedRequestAsOwned(value, prepared.effect);
+    const before = value.database.query("SELECT * FROM mutation_attempts WHERE idempotency_key=?")
+      .get(prepared.effect.nestedMutationKey);
+
+    expect(() => value.store.authorizePreparedEffect(prepared.operation.idempotencyKey))
+      .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+    expect(() => value.store.reprojectPreparedEffect(prepared.operation.idempotencyKey))
+      .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+    expect(value.store.effectStatus(prepared.operation.idempotencyKey)?.state).toBe("prepared");
+    expect(value.store.snapshot(prepared.created.work.id).tasks).toHaveLength(1);
+    expect(value.database.query("SELECT * FROM mutation_attempts WHERE idempotency_key=?")
+      .get(prepared.effect.nestedMutationKey)).toEqual(before);
+    expect(value.database.query("SELECT COUNT(*) AS count FROM work_nested_effect_settlements").get())
+      .toEqual({ count: 0 });
+  });
+
+  test("original send ownership: rejects settled Work dispatch and signal replay while retaining history", () => {
+    for (const kind of ["dispatch", "signal"] as const) {
+      const value = fixture();
+      const dispatch = kind === "dispatch" ? prepareOwnerGuardDispatch(value) : null;
+      const signal = kind === "signal" ? prepareSignal(value) : null;
+      const effect = dispatch?.effect ?? signal?.effect;
+      const key = dispatch?.operation.idempotencyKey ?? signal?.key;
+      const workId = dispatch?.created.work.id ?? signal?.workId;
+      if (effect === undefined || key === undefined || workId === undefined) {
+        throw new Error("settled owner guard fixture missing");
+      }
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+      const dispatchOutcome = { kind: "accepted" as const, receipt: turnStartedReceipt() };
+      const signalOutcome = { kind: "accepted" as const, receipt: queueReceipt() };
+      const finalize = () => kind === "dispatch"
+        ? value.store.finalizeDispatch(key, dispatchOutcome)
+        : value.store.finalizeSignal(key, signalOutcome);
+      finalize();
+      insertAppliedNestedMutation(value, effect);
+      markNestedRequestAsOwned(value, effect);
+      const history = value.store.snapshot(workId);
+
+      expect(() => finalize()).toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+      expect(() => value.store.authorizePreparedEffect(key))
+        .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+      expect(() => value.store.reprojectPreparedEffect(key))
+        .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+      expect(value.store.effectStatus(key)?.state).toBe("accepted");
+      expect(value.store.snapshot(workId)).toEqual(history);
+    }
+  });
+
+  test("original send ownership: rejects redirected settled instruction keys even with a replaced digest", () => {
+    for (const kind of ["dispatch", "signal"] as const) {
+      for (const replaceDigest of [false, true]) {
+        const value = fixture();
+        const dispatch = kind === "dispatch" ? prepareOwnerGuardDispatch(value) : null;
+        const signal = kind === "signal" ? prepareSignal(value) : null;
+        const effect = dispatch?.effect ?? signal?.effect;
+        const key = dispatch?.operation.idempotencyKey ?? signal?.key;
+        if (effect === undefined || key === undefined) throw new Error("redirected owner fixture missing");
+        value.store.authorizePreparedEffect(key);
+        const dispatchOutcome = { kind: "accepted" as const, receipt: turnStartedReceipt() };
+        const signalOutcome = { kind: "accepted" as const, receipt: queueReceipt() };
+        const finalize = () => kind === "dispatch"
+          ? value.store.finalizeDispatch(key, dispatchOutcome)
+          : value.store.finalizeSignal(key, signalOutcome);
+        finalize();
+        insertAppliedNestedMutation(value, effect);
+        markNestedRequestAsOwned(value, effect);
+        const redirected = JSON.stringify({ ...effect, nestedMutationKey: randomUUID() });
+        value.database.exec("DROP TRIGGER work_effect_identity_immutable");
+        value.database.query(`UPDATE work_prepared_effects SET instruction_json=?,
+          instruction_digest=CASE WHEN ? THEN ? ELSE instruction_digest END WHERE idempotency_key=?`)
+          .run(redirected, replaceDigest ? 1 : 0, createHash("sha256").update(redirected).digest("hex"), key);
+        value.database.exec(WORK_SCHEMA_SQL);
+
+        expect(() => finalize()).toThrow("WORK_EFFECT_INSTRUCTION_CORRUPT");
+        expect(() => value.store.authorizePreparedEffect(key)).toThrow("WORK_EFFECT_INSTRUCTION_CORRUPT");
+        expect(() => value.store.reprojectPreparedEffect(key)).toThrow("WORK_EFFECT_INSTRUCTION_CORRUPT");
+        expect(value.store.effectStatus(key)?.state).toBe("accepted");
+      }
+    }
   });
 });
 

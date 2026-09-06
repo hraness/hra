@@ -1521,7 +1521,8 @@ describe("HraService work protocol", () => {
 
     const [nestedMutation] = value.store.listUnsettledMutations({ sessionId: actor.sessionId });
     if (
-      nestedMutation?.state !== "ambiguous"
+      nestedMutation?.format !== "legacy"
+      || nestedMutation.state !== "ambiguous"
       || nestedMutation.evidence?.evidence.kind !== "session.send"
     ) throw new Error("Expected one exact ambiguous session.send mutation.");
     const session = value.store.requireSession(actor.sessionId);
