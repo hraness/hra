@@ -57,6 +57,7 @@ import {
   presetForProviderTier,
   presetSchema,
   presetTiers,
+  presetsForProvider,
   presetTierSchema,
   providerSchema,
   type Preset,
@@ -106,6 +107,7 @@ import {
   SESSION_EVENT_RETAIN_AGE_MS,
   SESSION_EVENT_RETAIN_BYTES,
   SESSION_EVENT_RETAIN_COUNT,
+  SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
   sessionEventBodySchema,
   sessionEventGapReasonSchema,
   sessionEventSchema,
@@ -113,7 +115,9 @@ import {
   type SessionEventBody,
   type SessionEventGapReason,
 } from "../domain/session-events";
+import { TRANSCRIPT_SEED_MAX_CHARACTERS } from "../domain/transcript";
 import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../domain/session-tasks";
+import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
 import {
   canTransitionQueue,
   mutationStateSchema,
@@ -345,6 +349,7 @@ export type ProviderAccountState = Readonly<{
 
 export type SessionProviderAuthority = ProviderAccountAuthority & Readonly<{
   sessionId: SessionId;
+  authorityRevision: number;
   routingProvenance: SessionRoutingProvenance;
   appliedPointerRevision: number | null;
   createdAt: number;
@@ -536,6 +541,167 @@ type AccountProviderSessionRetirement = Readonly<{
 export type SessionSnapshotWithEventPosition = SessionEventStreamPosition & {
   session: SessionRecord;
 };
+
+export const sessionSwitchPhaseSchema = z.enum([
+  "prepared",
+  "target_starting",
+  "target_started",
+  "source_releasing",
+  "source_released",
+  "rebound",
+  "seed_dispatching",
+  "seed_settled",
+  "reconciliation_required",
+  "failed",
+  "cancelled",
+  "abandoned",
+]);
+
+export type SessionSwitchPhase = z.infer<typeof sessionSwitchPhaseSchema>;
+
+const sessionSwitchReconciliationFromPhaseSchema = z.enum([
+  "target_starting",
+  "target_started",
+  "source_releasing",
+  "source_released",
+  "rebound",
+  "seed_dispatching",
+]);
+
+type SessionSwitchReconciliationFromPhase = z.infer<
+  typeof sessionSwitchReconciliationFromPhaseSchema
+>;
+
+export type SessionSwitchRawRequest = Readonly<{
+  session: string;
+  provider: Provider;
+  account: string | null;
+  preset: Preset | null;
+}>;
+
+export type SessionSwitchTranscriptPin = Readonly<{
+  streamEpoch: string;
+  floorSequence: number;
+  afterSequenceExclusive: number;
+  throughSequenceInclusive: number;
+  acceptedHeadSequence: number;
+  rendererVersion: number;
+  rendererLimit: number;
+  transcriptDigest: string;
+  seedDigest: string;
+  seedIncludedRecords: number;
+  seedOmittedRecords: number;
+  seedClientMessageId: string;
+}>;
+
+export type SessionSwitchCas = Readonly<{
+  attemptId: AttemptId;
+  requestDigest: string;
+  sourceAuthority: ProviderAccountAuthority;
+  targetAuthority: ProviderAccountAuthority;
+  originalSessionRevision: number;
+  originalAuthorityRevision: number;
+}>;
+
+export type SessionSwitchRecord = Readonly<{
+  attemptId: AttemptId;
+  idempotencyKey: string;
+  requestDigest: string;
+  rawRequest: SessionSwitchRawRequest;
+  sessionId: SessionId;
+  phase: SessionSwitchPhase;
+  sourceAuthority: ProviderAccountAuthority;
+  targetAuthority: ProviderAccountAuthority;
+  originalSessionRevision: number;
+  originalAuthorityRevision: number;
+  sourceProviderThreadId: string;
+  sourcePreset: Preset;
+  targetPreset: Preset;
+  sourceRuntimeProfileRevision: number;
+  sourceRuntimeProfileDigest: string;
+  sourceRuntimeProfileSourceKind: z.infer<typeof runtimeProfileSourceKindSchema>;
+  sourceRuntimeProfileSourceId: string;
+  sourceRuntimeProfileRecordedAt: number;
+  transcript: SessionSwitchTranscriptPin;
+  targetStart: null | Readonly<{
+    providerThreadId: string;
+    state: "active" | "idle" | "terminal";
+    activeTurnId: string | null;
+    providerUpdatedAt: number | null;
+    runtimeProfile: ReviewedRuntimeProfile;
+    recordedAt: number;
+  }>;
+  sourceRelease: null | Readonly<{
+    status: "released" | "already_released";
+    recordedAt: number;
+  }>;
+  rebind: null | Readonly<{
+    sessionRevision: number;
+    authorityRevision: number;
+    runtimeProfileRevision: number;
+    switchEventSequence: number;
+    recordedAt: number;
+  }>;
+  seedAuthority: null | Readonly<{
+    authority: ProviderAccountAuthority;
+    authorityRevision: number;
+    provenance: "rebound" | "successor_lineage";
+    recordedAt: number;
+  }>;
+  seed: null | Readonly<{
+    outcome: "accepted" | "rejected";
+    failureCode: string | null;
+    turnId: string | null;
+    turnStatus: "completed" | "interrupted" | "failed" | "inProgress" | null;
+    runtimeProfileRevision: number | null;
+    receiptDigest: string;
+    publicReceipt: unknown;
+    recordedAt: number;
+  }>;
+  abandonment: null | Readonly<{
+    authority: ProviderAccountAuthority;
+    authorityRevision: number;
+    expectedSessionRevision: number;
+    terminalSessionRevision: number;
+    session: SessionRecord;
+    recordedAt: number;
+  }>;
+  diagnosticCode: string | null;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+export type SessionSwitchSeedInput = Readonly<{
+  switch: SessionSwitchRecord;
+  events: readonly SessionEvent[];
+}>;
+
+export type SessionSwitchSeedSettlement =
+  | Readonly<{
+      outcome: "accepted";
+      turnId: string;
+      turnStatus: "completed" | "interrupted" | "failed" | "inProgress";
+      runtimeProfile: ReviewedRuntimeProfile;
+      receiptDigest: string;
+      seedText: string;
+    }>
+  | Readonly<{
+      outcome: "rejected";
+      failureCode: string;
+      receiptDigest: string;
+    }>;
+
+export type SessionSwitchRecoveryPage = Readonly<{
+  switches: readonly SessionSwitchRecord[];
+  malformedAttemptIds: readonly AttemptId[];
+  nextJournalSequence: number | null;
+}>;
+
+export type SessionSwitchAbandonResult = Readonly<{
+  switch: SessionSwitchRecord;
+  session: SessionRecord;
+  interactions: readonly InteractionRecord[];
+}>;
 
 export type UsageSnapshotRecord = {
   sourceRevision: number;
@@ -992,6 +1158,75 @@ const desktopSwitchBeginSchema = z
     }
   });
 
+const sessionSwitchDiagnosticSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/u);
+const sessionSwitchFailureCodeSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/u);
+const sessionSwitchRawRequestSchema = z.object({
+  session: z.string().min(1).max(200),
+  provider: providerSchema,
+  account: z.string().min(1).max(200).nullable(),
+  preset: presetSchema.nullable(),
+}).strict();
+const defaultSessionSwitchPreset = (provider: Provider, sourcePreset: Preset): Preset => {
+  const supported = presetsForProvider(provider);
+  const matchingTier = supported.find(
+    (preset) => presetTiers[preset] === presetTiers[sourcePreset],
+  );
+  const fallback = supported[supported.length - 1];
+  if (matchingTier !== undefined) return matchingTier;
+  if (fallback === undefined) throw new Error("SESSION_SWITCH_TARGET_PROVIDER_HAS_NO_PRESET");
+  return fallback;
+};
+const sessionSwitchTranscriptPinSchema = z.object({
+  streamEpoch: z.string().uuid(),
+  floorSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  afterSequenceExclusive: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  throughSequenceInclusive: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  acceptedHeadSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  rendererVersion: z.number().int().positive().max(1_000),
+  rendererLimit: z.number().int().positive().max(10_000),
+  transcriptDigest: sha256Schema,
+  seedDigest: sha256Schema,
+  seedIncludedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  seedOmittedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  seedClientMessageId: z.string().min(1).max(512),
+}).strict().superRefine((value, context) => {
+  if (
+    value.afterSequenceExclusive < value.floorSequence - 1
+    || value.throughSequenceInclusive < value.afterSequenceExclusive
+    || value.throughSequenceInclusive > value.acceptedHeadSequence
+  ) context.addIssue({ code: "custom", message: "Session switch transcript range is invalid." });
+});
+const sessionSwitchCasSchema = z.object({
+  attemptId: attemptIdSchema,
+  requestDigest: sha256Schema,
+  sourceAuthority: providerAccountAuthoritySchema,
+  targetAuthority: providerAccountAuthoritySchema,
+  originalSessionRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  originalAuthorityRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+const parseSessionSwitchCas = (input: SessionSwitchCas): SessionSwitchCas =>
+  sessionSwitchCasSchema.parse({
+    attemptId: input.attemptId,
+    requestDigest: input.requestDigest,
+    sourceAuthority: input.sourceAuthority,
+    targetAuthority: input.targetAuthority,
+    originalSessionRevision: input.originalSessionRevision,
+    originalAuthorityRevision: input.originalAuthorityRevision,
+  });
+const malformedSessionSwitchDiagnosticAttemptId = (switchRowId: number): AttemptId =>
+  attemptIdSchema.parse(`attempt_${createHash("sha256")
+    .update("hra:malformed-session-switch-row:v1\0", "utf8")
+    .update(String(switchRowId), "utf8")
+    .digest("hex")
+    .slice(0, 32)}`);
+const sessionSwitchTerminalPhases = new Set<SessionSwitchPhase>([
+  "seed_settled",
+  "reconciliation_required",
+  "failed",
+  "cancelled",
+  "abandoned",
+]);
+
 type DesktopSwitchPlan =
   | {
       status: "ready";
@@ -1032,7 +1267,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 36;
+const currentSchemaVersion = 37;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -3647,6 +3882,1491 @@ const applySchemaVersion36ProviderUsage = (database: Database): void => {
   database.exec(schemaVersion36ProviderUsage);
 };
 
+const schemaVersion37SessionSwitch = `
+CREATE TABLE IF NOT EXISTS session_provider_authority_successors (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  from_authority_revision INTEGER NOT NULL CHECK(from_authority_revision BETWEEN 1 AND 9007199254740990),
+  to_authority_revision INTEGER NOT NULL CHECK(to_authority_revision=from_authority_revision+1),
+  from_provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  from_profile_id TEXT NOT NULL REFERENCES profiles(id),
+  from_provider TEXT NOT NULL CHECK(from_provider IN ('codex','claude')),
+  from_binding_generation INTEGER NOT NULL CHECK(from_binding_generation BETWEEN 1 AND 9007199254740991),
+  from_process_generation INTEGER NOT NULL CHECK(from_process_generation BETWEEN 0 AND 9007199254740991),
+  from_routing_provenance TEXT NOT NULL CHECK(from_routing_provenance IN ('managed','explicit')),
+  from_applied_pointer_revision INTEGER CHECK(from_applied_pointer_revision IS NULL OR from_applied_pointer_revision BETWEEN 1 AND 9007199254740991),
+  to_provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  to_profile_id TEXT NOT NULL REFERENCES profiles(id),
+  to_provider TEXT NOT NULL CHECK(to_provider IN ('codex','claude')),
+  to_binding_generation INTEGER NOT NULL CHECK(to_binding_generation BETWEEN 1 AND 9007199254740991),
+  to_process_generation INTEGER NOT NULL CHECK(to_process_generation BETWEEN 0 AND 9007199254740991),
+  to_routing_provenance TEXT NOT NULL CHECK(to_routing_provenance IN ('managed','explicit')),
+  to_applied_pointer_revision INTEGER CHECK(to_applied_pointer_revision IS NULL OR to_applied_pointer_revision BETWEEN 1 AND 9007199254740991),
+  transition_kind TEXT NOT NULL CHECK(transition_kind IN ('legacy_switch','provider_restart','session_switch')),
+  transition_id TEXT NOT NULL CHECK(length(CAST(transition_id AS BLOB)) BETWEEN 1 AND 200),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991),
+  PRIMARY KEY(session_id,from_authority_revision),
+  UNIQUE(session_id,to_authority_revision)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_attempts (
+  journal_sequence INTEGER PRIMARY KEY AUTOINCREMENT
+    CHECK(journal_sequence BETWEEN 1 AND 9007199254740991),
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES mutation_attempts(id)
+    CHECK(length(attempt_id)=40 AND attempt_id GLOB 'attempt_[0-9a-f]*'
+      AND substr(attempt_id,9) NOT GLOB '*[^0-9a-f]*'),
+  request_key TEXT NOT NULL UNIQUE CHECK(length(request_key)=36),
+  request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+  raw_request_json TEXT NOT NULL CHECK(json_valid(raw_request_json)=1 AND length(CAST(raw_request_json AS BLOB)) BETWEEN 2 AND 2048),
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  phase TEXT NOT NULL CHECK(phase IN (
+    'prepared','target_starting','target_started','source_releasing','source_released',
+    'rebound','seed_dispatching','seed_settled','reconciliation_required','failed','cancelled','abandoned'
+  )),
+  source_provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  source_profile_id TEXT NOT NULL REFERENCES profiles(id),
+  source_provider TEXT NOT NULL CHECK(source_provider IN ('codex','claude')),
+  source_binding_generation INTEGER NOT NULL CHECK(source_binding_generation BETWEEN 1 AND 9007199254740991),
+  source_process_generation INTEGER NOT NULL CHECK(source_process_generation BETWEEN 0 AND 9007199254740991),
+  target_provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  target_profile_id TEXT NOT NULL REFERENCES profiles(id),
+  target_provider TEXT NOT NULL CHECK(target_provider IN ('codex','claude')),
+  target_binding_generation INTEGER NOT NULL CHECK(target_binding_generation BETWEEN 1 AND 9007199254740991),
+  target_process_generation INTEGER NOT NULL CHECK(target_process_generation BETWEEN 0 AND 9007199254740991),
+  original_session_revision INTEGER NOT NULL CHECK(original_session_revision BETWEEN 1 AND 9007199254740991),
+  original_authority_revision INTEGER NOT NULL CHECK(original_authority_revision BETWEEN 1 AND 9007199254740990),
+  source_provider_thread_id TEXT NOT NULL CHECK(length(CAST(source_provider_thread_id AS BLOB)) BETWEEN 1 AND 200),
+  source_preset TEXT NOT NULL CHECK(source_preset IN ('low','high','ultra','fable-max')),
+  target_preset TEXT NOT NULL CHECK(target_preset IN ('low','high','ultra','fable-max')),
+  source_runtime_profile_revision INTEGER NOT NULL CHECK(source_runtime_profile_revision BETWEEN 1 AND 9007199254740991),
+  source_runtime_profile_digest TEXT NOT NULL CHECK(length(source_runtime_profile_digest)=64 AND source_runtime_profile_digest NOT GLOB '*[^0-9a-f]*'),
+  stream_epoch TEXT NOT NULL CHECK(length(stream_epoch)=36),
+  floor_sequence INTEGER NOT NULL CHECK(floor_sequence BETWEEN 1 AND 9007199254740991),
+  after_sequence_exclusive INTEGER NOT NULL CHECK(after_sequence_exclusive BETWEEN 0 AND 9007199254740991),
+  through_sequence_inclusive INTEGER NOT NULL CHECK(through_sequence_inclusive BETWEEN 0 AND 9007199254740991),
+  accepted_head_sequence INTEGER NOT NULL CHECK(accepted_head_sequence BETWEEN 0 AND 9007199254740991),
+  renderer_version INTEGER NOT NULL CHECK(renderer_version BETWEEN 1 AND 1000),
+  renderer_limit INTEGER NOT NULL CHECK(renderer_limit BETWEEN 1 AND 10000),
+  transcript_digest TEXT NOT NULL CHECK(length(transcript_digest)=64 AND transcript_digest NOT GLOB '*[^0-9a-f]*'),
+  seed_digest TEXT NOT NULL CHECK(length(seed_digest)=64 AND seed_digest NOT GLOB '*[^0-9a-f]*'),
+  seed_included_records INTEGER NOT NULL CHECK(seed_included_records BETWEEN 0 AND 9007199254740991),
+  seed_omitted_records INTEGER NOT NULL CHECK(seed_omitted_records BETWEEN 0 AND 9007199254740991),
+  seed_client_message_id TEXT NOT NULL CHECK(length(CAST(seed_client_message_id AS BLOB)) BETWEEN 1 AND 512),
+  diagnostic_code TEXT CHECK(diagnostic_code IS NULL OR (diagnostic_code GLOB '[A-Z]*' AND length(diagnostic_code) BETWEEN 1 AND 80)),
+  created_at INTEGER NOT NULL CHECK(created_at BETWEEN 0 AND 9007199254740991),
+  updated_at INTEGER NOT NULL CHECK(updated_at BETWEEN created_at AND 9007199254740991),
+  CHECK(after_sequence_exclusive>=floor_sequence-1),
+  CHECK(through_sequence_inclusive>=after_sequence_exclusive),
+  CHECK(through_sequence_inclusive<=accepted_head_sequence),
+  FOREIGN KEY(session_id,source_runtime_profile_revision)
+    REFERENCES session_runtime_profiles(session_id,revision)
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS session_switch_one_open_per_session
+  ON session_switch_attempts(session_id)
+  WHERE phase IN (
+    'prepared','target_starting','target_started','source_releasing',
+    'source_released','rebound','seed_dispatching','reconciliation_required'
+  );
+CREATE INDEX IF NOT EXISTS session_switch_recovery_page
+  ON session_switch_attempts(attempt_id)
+  WHERE phase NOT IN ('seed_settled','reconciliation_required','failed','cancelled','abandoned');
+
+CREATE TABLE IF NOT EXISTS session_switch_plan_anchors (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  source_provider_thread_id TEXT NOT NULL CHECK(
+    length(CAST(source_provider_thread_id AS BLOB)) BETWEEN 1 AND 200
+  ),
+  plan_digest TEXT NOT NULL CHECK(
+    length(plan_digest)=64 AND plan_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_target_start_receipts (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  provider_thread_id TEXT NOT NULL CHECK(length(CAST(provider_thread_id AS BLOB)) BETWEEN 1 AND 200),
+  state TEXT NOT NULL CHECK(state IN ('active','idle','terminal')),
+  active_turn_id TEXT CHECK(active_turn_id IS NULL OR length(CAST(active_turn_id AS BLOB)) BETWEEN 1 AND 200),
+  provider_updated_at REAL CHECK(provider_updated_at IS NULL OR provider_updated_at>=0),
+  runtime_profile_json TEXT NOT NULL CHECK(json_valid(runtime_profile_json)=1 AND length(CAST(runtime_profile_json AS BLOB)) BETWEEN 2 AND 262144),
+  runtime_profile_digest TEXT NOT NULL CHECK(length(runtime_profile_digest)=64 AND runtime_profile_digest NOT GLOB '*[^0-9a-f]*'),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991),
+  CHECK((state='active' AND active_turn_id IS NOT NULL) OR (state!='active' AND active_turn_id IS NULL))
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_target_start_anchors (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  result_digest TEXT NOT NULL CHECK(
+    length(result_digest)=64 AND result_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_source_release_receipts (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  provider_thread_id TEXT NOT NULL CHECK(length(CAST(provider_thread_id AS BLOB)) BETWEEN 1 AND 200),
+  status TEXT NOT NULL CHECK(status IN ('released','already_released')),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_source_release_anchors (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  evidence_digest TEXT NOT NULL CHECK(
+    length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_rebind_receipts (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  session_revision INTEGER NOT NULL CHECK(session_revision BETWEEN 2 AND 9007199254740991),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision BETWEEN 2 AND 9007199254740991),
+  runtime_profile_revision INTEGER NOT NULL CHECK(runtime_profile_revision BETWEEN 1 AND 9007199254740991),
+  switch_event_sequence INTEGER NOT NULL CHECK(switch_event_sequence BETWEEN 1 AND 9007199254740991),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_rebind_anchors (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  evidence_digest TEXT NOT NULL CHECK(
+    length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_seed_authorities (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
+  binding_generation INTEGER NOT NULL CHECK(binding_generation BETWEEN 1 AND 9007199254740991),
+  process_generation INTEGER NOT NULL CHECK(process_generation BETWEEN 0 AND 9007199254740991),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision BETWEEN 2 AND 9007199254740991),
+  provenance TEXT NOT NULL CHECK(provenance IN ('rebound','successor_lineage')),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_seed_receipts (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  outcome TEXT NOT NULL CHECK(outcome IN ('accepted','rejected')),
+  failure_code TEXT CHECK(failure_code IS NULL OR (failure_code GLOB '[A-Z]*' AND length(failure_code) BETWEEN 1 AND 80)),
+  turn_id TEXT CHECK(turn_id IS NULL OR length(CAST(turn_id AS BLOB)) BETWEEN 1 AND 200),
+  turn_status TEXT CHECK(turn_status IS NULL OR turn_status IN ('completed','interrupted','failed','inProgress')),
+  runtime_profile_revision INTEGER CHECK(runtime_profile_revision IS NULL OR runtime_profile_revision BETWEEN 1 AND 9007199254740991),
+  receipt_digest TEXT NOT NULL CHECK(length(receipt_digest)=64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'),
+  public_receipt_json TEXT NOT NULL CHECK(json_valid(public_receipt_json)=1 AND length(CAST(public_receipt_json AS BLOB)) BETWEEN 2 AND 262144),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991),
+  CHECK(
+    (outcome='accepted' AND failure_code IS NULL AND turn_id IS NOT NULL AND turn_status IS NOT NULL AND runtime_profile_revision IS NOT NULL)
+    OR (outcome='rejected' AND failure_code IS NOT NULL AND turn_id IS NULL AND turn_status IS NULL AND runtime_profile_revision IS NULL)
+  )
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_seed_anchors (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  evidence_digest TEXT NOT NULL CHECK(
+    length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  message_event_sequence INTEGER CHECK(
+    message_event_sequence IS NULL
+    OR message_event_sequence BETWEEN 1 AND 9007199254740991
+  ),
+  message_event_digest TEXT CHECK(
+    message_event_digest IS NULL
+    OR (length(message_event_digest)=64 AND message_event_digest NOT GLOB '*[^0-9a-f]*')
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_no_effect_receipts (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  effect TEXT NOT NULL CHECK(effect='target_start'),
+  diagnostic_code TEXT NOT NULL CHECK(diagnostic_code GLOB '[A-Z]*' AND length(diagnostic_code) BETWEEN 1 AND 80),
+  evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_no_effect_anchors (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  evidence_digest TEXT NOT NULL CHECK(
+    length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_reconciliation_receipts (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  from_phase TEXT NOT NULL CHECK(from_phase IN (
+    'target_starting','target_started','source_releasing','source_released',
+    'rebound','seed_dispatching'
+  )),
+  evidence_depth INTEGER NOT NULL CHECK(
+    evidence_depth=CASE from_phase
+      WHEN 'target_starting' THEN 0
+      WHEN 'target_started' THEN 1
+      WHEN 'source_releasing' THEN 1
+      WHEN 'source_released' THEN 2
+      WHEN 'rebound' THEN 3
+      WHEN 'seed_dispatching' THEN 4
+    END
+  ),
+  diagnostic_code TEXT NOT NULL CHECK(
+    diagnostic_code GLOB '[A-Z]*' AND length(diagnostic_code) BETWEEN 1 AND 80
+  ),
+  request_digest TEXT NOT NULL CHECK(
+    length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  plan_digest TEXT NOT NULL CHECK(
+    length(plan_digest)=64 AND plan_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_reconciliation_anchors (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  evidence_digest TEXT NOT NULL CHECK(
+    length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+-- Malformed journal rows cannot safely be addressed by their externally
+-- supplied identifiers. This local disposition is deliberately keyed only
+-- by the stable journal sequence so restart can make an effect-started row permanently
+-- non-dispatchable without copying or parsing corrupt identifier bytes.
+CREATE TABLE IF NOT EXISTS session_switch_malformed_dispositions (
+  journal_sequence INTEGER PRIMARY KEY
+    REFERENCES session_switch_attempts(journal_sequence),
+  mutation_request_key TEXT NOT NULL UNIQUE REFERENCES mutation_attempts(idempotency_key)
+    CHECK(length(mutation_request_key)=36),
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  from_phase TEXT NOT NULL CHECK(from_phase IN (
+    'prepared','target_starting','target_started','source_releasing',
+    'source_released','rebound','seed_dispatching','seed_settled',
+    'reconciliation_required','failed','cancelled','abandoned'
+  )),
+  terminal_phase TEXT NOT NULL CHECK(terminal_phase IN ('cancelled','reconciliation_required')),
+  diagnostic_code TEXT NOT NULL CHECK(diagnostic_code='MALFORMED_SWITCH_RECORD'),
+  evidence_depth INTEGER NOT NULL CHECK(
+    evidence_depth=CASE from_phase
+      WHEN 'prepared' THEN 0
+      WHEN 'target_starting' THEN 0
+      WHEN 'target_started' THEN 1
+      WHEN 'source_releasing' THEN 1
+      WHEN 'source_released' THEN 2
+      WHEN 'rebound' THEN 3
+      WHEN 'seed_dispatching' THEN 4
+      WHEN 'seed_settled' THEN 5
+      WHEN 'reconciliation_required' THEN 0
+      WHEN 'failed' THEN 0
+      WHEN 'cancelled' THEN 0
+      WHEN 'abandoned' THEN 0
+    END
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991),
+  CHECK(
+    (from_phase='prepared' AND terminal_phase='cancelled')
+    OR terminal_phase='reconciliation_required'
+  )
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_abandon_receipts (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
+  binding_generation INTEGER NOT NULL CHECK(binding_generation BETWEEN 1 AND 9007199254740991),
+  process_generation INTEGER NOT NULL CHECK(process_generation BETWEEN 0 AND 9007199254740991),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision BETWEEN 1 AND 9007199254740991),
+  expected_session_revision INTEGER NOT NULL CHECK(expected_session_revision BETWEEN 1 AND 9007199254740990),
+  terminal_session_revision INTEGER NOT NULL CHECK(terminal_session_revision=expected_session_revision+1),
+  session_json TEXT NOT NULL CHECK(json_valid(session_json)=1 AND length(CAST(session_json AS BLOB)) BETWEEN 2 AND 262144),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS session_switch_abandon_anchors (
+  attempt_id TEXT PRIMARY KEY REFERENCES session_switch_attempts(attempt_id),
+  evidence_digest TEXT NOT NULL CHECK(
+    length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+) STRICT;
+
+CREATE TRIGGER IF NOT EXISTS session_provider_authority_successors_insert_guard
+BEFORE INSERT ON session_provider_authority_successors
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_provider_authorities current
+  JOIN provider_accounts target ON target.id=NEW.to_provider_account_id
+  WHERE current.session_id=NEW.session_id
+    AND current.authority_revision=NEW.from_authority_revision
+    AND current.provider_account_id=NEW.from_provider_account_id
+    AND current.profile_id=NEW.from_profile_id AND current.provider=NEW.from_provider
+    AND current.binding_generation=NEW.from_binding_generation
+    AND current.process_generation=NEW.from_process_generation
+    AND current.routing_provenance=NEW.from_routing_provenance
+    AND current.applied_pointer_revision IS NEW.from_applied_pointer_revision
+    AND target.profile_id=NEW.to_profile_id AND target.provider=NEW.to_provider
+    AND target.binding_generation=NEW.to_binding_generation
+    AND target.process_generation=NEW.to_process_generation
+    AND target.readiness!='removed'
+)
+BEGIN SELECT RAISE(ABORT, 'session authority successor mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_authority_successors_immutable_update
+BEFORE UPDATE ON session_provider_authority_successors
+BEGIN SELECT RAISE(ABORT, 'session authority successor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_provider_authority_successors_immutable_delete
+BEFORE DELETE ON session_provider_authority_successors
+BEGIN SELECT RAISE(ABORT, 'session authority successor is immutable'); END;
+
+DROP TRIGGER IF EXISTS session_provider_authorities_transition_guard;
+CREATE TRIGGER session_provider_authorities_transition_guard
+BEFORE UPDATE ON session_provider_authorities
+WHEN NOT (
+  NEW.session_id=OLD.session_id
+  AND NEW.created_at=OLD.created_at
+  AND NEW.authority_revision=OLD.authority_revision+1
+  AND EXISTS(
+    SELECT 1 FROM sessions s JOIN provider_accounts a ON a.id=NEW.provider_account_id
+    WHERE s.id=NEW.session_id AND s.profile_id=NEW.profile_id
+      AND s.provider=NEW.provider AND a.profile_id=NEW.profile_id
+      AND a.provider=NEW.provider AND a.binding_generation=NEW.binding_generation
+  )
+  AND EXISTS(
+    SELECT 1 FROM session_provider_authority_successors successor
+    WHERE successor.session_id=OLD.session_id
+      AND successor.from_authority_revision=OLD.authority_revision
+      AND successor.to_authority_revision=NEW.authority_revision
+      AND successor.from_provider_account_id=OLD.provider_account_id
+      AND successor.from_profile_id=OLD.profile_id AND successor.from_provider=OLD.provider
+      AND successor.from_binding_generation=OLD.binding_generation
+      AND successor.from_process_generation=OLD.process_generation
+      AND successor.from_routing_provenance=OLD.routing_provenance
+      AND successor.from_applied_pointer_revision IS OLD.applied_pointer_revision
+      AND successor.to_provider_account_id=NEW.provider_account_id
+      AND successor.to_profile_id=NEW.profile_id AND successor.to_provider=NEW.provider
+      AND successor.to_binding_generation=NEW.binding_generation
+      AND successor.to_process_generation=NEW.process_generation
+      AND successor.to_routing_provenance=NEW.routing_provenance
+      AND successor.to_applied_pointer_revision IS NEW.applied_pointer_revision
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'illegal session provider authority transition'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_switch_attempts_insert_guard
+BEFORE INSERT ON session_switch_attempts
+WHEN NOT (
+  EXISTS(
+    SELECT 1 FROM mutation_attempts mutation
+    WHERE mutation.id=NEW.attempt_id AND mutation.idempotency_key=NEW.request_key
+      AND mutation.kind='session.switch' AND mutation.authority_id=NEW.session_id
+      AND mutation.authority_generation=NEW.target_process_generation
+      AND mutation.request_digest=NEW.request_digest AND mutation.state='prepared'
+  )
+  AND EXISTS(
+    SELECT 1 FROM mutation_provider_authorities source
+    WHERE source.attempt_id=NEW.attempt_id AND source.role='source'
+      AND source.provider_account_id=NEW.source_provider_account_id
+      AND source.profile_id=NEW.source_profile_id AND source.provider=NEW.source_provider
+      AND source.binding_generation=NEW.source_binding_generation
+      AND source.process_generation=NEW.source_process_generation
+  )
+  AND EXISTS(
+    SELECT 1 FROM mutation_provider_authorities target
+    WHERE target.attempt_id=NEW.attempt_id AND target.role='target'
+      AND target.provider_account_id=NEW.target_provider_account_id
+      AND target.profile_id=NEW.target_profile_id AND target.provider=NEW.target_provider
+      AND target.binding_generation=NEW.target_binding_generation
+      AND target.process_generation=NEW.target_process_generation
+  )
+  AND EXISTS(
+    SELECT 1 FROM sessions session
+    JOIN session_provider_authorities authority ON authority.session_id=session.id
+    JOIN session_event_streams stream ON stream.session_id=session.id
+    JOIN session_runtime_profiles runtime
+      ON runtime.session_id=session.id AND runtime.revision=NEW.source_runtime_profile_revision
+    JOIN runtime_profile_provider_authorities runtime_authority
+      ON runtime_authority.session_id=runtime.session_id AND runtime_authority.revision=runtime.revision
+    WHERE session.id=NEW.session_id AND session.revision=NEW.original_session_revision
+      AND session.profile_id=NEW.source_profile_id AND session.provider=NEW.source_provider
+      AND session.provider_thread_id=NEW.source_provider_thread_id
+      AND authority.authority_revision=NEW.original_authority_revision
+      AND authority.provider_account_id=NEW.source_provider_account_id
+      AND authority.profile_id=NEW.source_profile_id AND authority.provider=NEW.source_provider
+      AND authority.binding_generation=NEW.source_binding_generation
+      AND authority.process_generation=NEW.source_process_generation
+      AND runtime_authority.provider_account_id=NEW.source_provider_account_id
+      AND runtime_authority.profile_id=NEW.source_profile_id AND runtime_authority.provider=NEW.source_provider
+      AND runtime_authority.binding_generation=NEW.source_binding_generation
+      AND runtime_authority.process_generation=NEW.source_process_generation
+      AND stream.stream_epoch=NEW.stream_epoch AND stream.floor_sequence=NEW.floor_sequence
+      AND stream.observed_through_sequence=NEW.accepted_head_sequence
+  )
+  AND json_extract(NEW.raw_request_json,'$.provider')=NEW.target_provider
+)
+BEGIN SELECT RAISE(ABORT, 'session switch immutable authority mismatch'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_switch_attempts_immutable_update
+BEFORE UPDATE OF journal_sequence,request_key,request_digest,raw_request_json,session_id,
+  source_provider_account_id,source_profile_id,source_provider,source_binding_generation,
+  source_process_generation,target_provider_account_id,target_profile_id,target_provider,
+  target_binding_generation,target_process_generation,original_session_revision,
+  original_authority_revision,source_provider_thread_id,source_preset,target_preset,
+  source_runtime_profile_revision,source_runtime_profile_digest,stream_epoch,floor_sequence,
+  after_sequence_exclusive,through_sequence_inclusive,accepted_head_sequence,renderer_version,
+  renderer_limit,transcript_digest,seed_digest,seed_included_records,seed_omitted_records,
+  seed_client_message_id,created_at
+ON session_switch_attempts
+BEGIN SELECT RAISE(ABORT, 'session switch immutable plan changed'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_attempt_id_repair_guard
+BEFORE UPDATE OF attempt_id ON session_switch_attempts
+WHEN NOT (
+  NEW.journal_sequence=OLD.journal_sequence
+  AND NEW.phase=OLD.phase
+  AND NEW.diagnostic_code IS OLD.diagnostic_code
+  AND NEW.created_at=OLD.created_at
+  AND NEW.updated_at=OLD.updated_at
+  AND EXISTS(
+    SELECT 1 FROM session_switch_malformed_dispositions malformed
+    WHERE malformed.journal_sequence=OLD.journal_sequence
+      AND EXISTS(
+        SELECT 1 FROM mutation_attempts mutation
+        WHERE mutation.idempotency_key=malformed.mutation_request_key
+          AND mutation.id=NEW.attempt_id
+      )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'session switch attempt id repair mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_attempts_immutable_delete
+BEFORE DELETE ON session_switch_attempts
+BEGIN SELECT RAISE(ABORT, 'session switch journal is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_switch_attempts_phase_guard
+BEFORE UPDATE OF phase ON session_switch_attempts
+WHEN NOT (
+  (OLD.phase='prepared' AND NEW.phase IN ('target_starting','cancelled','failed'))
+  OR (OLD.phase='target_starting' AND NEW.phase IN ('target_started','failed','reconciliation_required'))
+  OR (OLD.phase='target_started' AND NEW.phase IN ('source_releasing','reconciliation_required'))
+  OR (OLD.phase='source_releasing' AND NEW.phase IN ('source_released','reconciliation_required'))
+  OR (OLD.phase='source_released' AND NEW.phase IN ('rebound','reconciliation_required'))
+  OR (OLD.phase='rebound' AND NEW.phase IN ('seed_dispatching','reconciliation_required'))
+  OR (OLD.phase='seed_dispatching' AND NEW.phase IN ('seed_settled','reconciliation_required'))
+  OR (OLD.phase='reconciliation_required' AND NEW.phase='abandoned')
+)
+OR (NEW.phase='target_started' AND NOT EXISTS(
+  SELECT 1 FROM session_switch_target_start_receipts receipt
+  JOIN session_switch_target_start_anchors anchor ON anchor.attempt_id=receipt.attempt_id
+  WHERE receipt.attempt_id=OLD.attempt_id
+))
+OR (OLD.phase='prepared' AND NOT EXISTS(
+  SELECT 1 FROM session_switch_plan_anchors anchor WHERE anchor.attempt_id=OLD.attempt_id
+  UNION ALL
+  SELECT 1 FROM session_switch_malformed_dispositions malformed
+  WHERE malformed.journal_sequence=OLD.journal_sequence AND malformed.from_phase=OLD.phase
+    AND malformed.terminal_phase=NEW.phase
+    AND malformed.diagnostic_code='MALFORMED_SWITCH_RECORD'
+))
+OR (NEW.phase='source_released' AND NOT EXISTS(
+  SELECT 1 FROM session_switch_source_release_receipts receipt
+  JOIN session_switch_source_release_anchors anchor ON anchor.attempt_id=receipt.attempt_id
+  WHERE receipt.attempt_id=OLD.attempt_id AND anchor.recorded_at=receipt.recorded_at
+))
+OR (NEW.phase='rebound' AND NOT EXISTS(
+  SELECT 1 FROM session_switch_rebind_receipts receipt
+  JOIN session_switch_rebind_anchors anchor ON anchor.attempt_id=receipt.attempt_id
+  WHERE receipt.attempt_id=OLD.attempt_id
+))
+OR (NEW.phase='seed_dispatching' AND NOT EXISTS(
+  SELECT 1 FROM session_switch_seed_authorities authority WHERE authority.attempt_id=OLD.attempt_id
+))
+OR (NEW.phase='seed_settled' AND NOT EXISTS(
+  SELECT 1 FROM session_switch_seed_receipts receipt
+  JOIN session_switch_seed_anchors anchor ON anchor.attempt_id=receipt.attempt_id
+  WHERE receipt.attempt_id=OLD.attempt_id
+))
+OR (NEW.phase='failed' AND NOT EXISTS(
+  SELECT 1 FROM session_switch_no_effect_receipts receipt
+  JOIN session_switch_no_effect_anchors anchor ON anchor.attempt_id=receipt.attempt_id
+  WHERE receipt.attempt_id=OLD.attempt_id AND receipt.effect='target_start'
+    AND anchor.recorded_at=receipt.recorded_at
+))
+OR (NEW.phase='reconciliation_required' AND NOT EXISTS(
+  SELECT 1 FROM session_switch_reconciliation_receipts receipt
+  JOIN session_switch_plan_anchors anchor ON anchor.attempt_id=receipt.attempt_id
+  JOIN session_switch_reconciliation_anchors receipt_anchor
+    ON receipt_anchor.attempt_id=receipt.attempt_id
+  WHERE receipt.attempt_id=OLD.attempt_id AND receipt.from_phase=OLD.phase
+    AND receipt.diagnostic_code=NEW.diagnostic_code
+    AND receipt.request_digest=OLD.request_digest
+    AND receipt.plan_digest=anchor.plan_digest
+    AND receipt_anchor.recorded_at=receipt.recorded_at
+  UNION ALL
+  SELECT 1 FROM session_switch_malformed_dispositions malformed
+  WHERE malformed.journal_sequence=OLD.journal_sequence AND malformed.from_phase=OLD.phase
+    AND malformed.terminal_phase='reconciliation_required'
+    AND malformed.diagnostic_code=NEW.diagnostic_code
+))
+OR (NEW.phase='abandoned' AND NOT EXISTS(
+  SELECT 1 FROM session_switch_abandon_receipts receipt
+  JOIN session_switch_abandon_anchors anchor ON anchor.attempt_id=receipt.attempt_id
+  JOIN session_switch_reconciliation_receipts reconciliation
+    ON reconciliation.attempt_id=receipt.attempt_id
+  JOIN session_switch_reconciliation_anchors reconciliation_anchor
+    ON reconciliation_anchor.attempt_id=reconciliation.attempt_id
+  JOIN mutation_resolutions resolution ON resolution.attempt_id=receipt.attempt_id
+  WHERE receipt.attempt_id=OLD.attempt_id AND resolution.resolution_kind='abandoned'
+    AND anchor.recorded_at=receipt.recorded_at
+    AND reconciliation_anchor.recorded_at=reconciliation.recorded_at
+))
+BEGIN SELECT RAISE(ABORT, 'illegal session switch transition'); END;
+
+DROP TRIGGER IF EXISTS mutation_transition_guard;
+CREATE TRIGGER mutation_transition_guard BEFORE UPDATE OF state ON mutation_attempts
+WHEN NOT (
+  (OLD.state='prepared' AND NEW.state IN ('effect_started','cancelled'))
+  OR (OLD.state='prepared' AND NEW.state='failed' AND EXISTS(
+    SELECT 1 FROM session_switch_attempts switch
+    WHERE switch.attempt_id=OLD.id AND switch.phase='failed'
+  ))
+  OR (OLD.state='effect_started' AND NEW.state IN ('applied','failed','ambiguous'))
+  OR OLD.state=NEW.state
+)
+BEGIN SELECT RAISE(ABORT, 'illegal mutation transition'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_mutation_state_guard
+BEFORE UPDATE OF state ON mutation_attempts
+WHEN EXISTS(SELECT 1 FROM session_switch_attempts switch WHERE switch.attempt_id=OLD.id)
+AND NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  WHERE switch.attempt_id=OLD.id AND (
+    (NEW.state='effect_started' AND switch.phase IN (
+      'target_starting','target_started','source_releasing','source_released','rebound','seed_dispatching'
+    ))
+    OR (NEW.state='applied' AND switch.phase='seed_settled')
+    OR (NEW.state='ambiguous' AND switch.phase='reconciliation_required')
+    OR (NEW.state='failed' AND switch.phase='failed')
+    OR (NEW.state='cancelled' AND switch.phase='cancelled')
+    OR NEW.state=OLD.state
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'session switch mutation state mismatch'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_switch_target_start_receipts_insert_guard
+BEFORE INSERT ON session_switch_target_start_receipts
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='target_starting'
+    AND json_extract(NEW.runtime_profile_json,'$.profileId')=switch.target_profile_id
+    AND json_extract(NEW.runtime_profile_json,'$.processGeneration')=switch.target_process_generation
+)
+BEGIN SELECT RAISE(ABORT, 'session switch target receipt mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_plan_anchors_insert_guard
+BEFORE INSERT ON session_switch_plan_anchors
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='prepared'
+    AND NEW.source_provider_thread_id=switch.source_provider_thread_id
+    AND NEW.recorded_at=switch.created_at
+)
+BEGIN SELECT RAISE(ABORT, 'session switch plan anchor mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_target_start_anchors_insert_guard
+BEFORE INSERT ON session_switch_target_start_anchors
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_target_start_receipts receipt
+    ON receipt.attempt_id=switch.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='target_starting'
+)
+BEGIN SELECT RAISE(ABORT, 'session switch target anchor mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_source_release_receipts_insert_guard
+BEFORE INSERT ON session_switch_source_release_receipts
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='source_releasing'
+    AND switch.source_provider_thread_id=NEW.provider_thread_id
+)
+BEGIN SELECT RAISE(ABORT, 'session switch release receipt mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_source_release_anchors_insert_guard
+BEFORE INSERT ON session_switch_source_release_anchors
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_source_release_receipts receipt ON receipt.attempt_id=switch.attempt_id
+  JOIN session_switch_plan_anchors plan ON plan.attempt_id=switch.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='source_releasing'
+    AND receipt.provider_thread_id=switch.source_provider_thread_id
+    AND NEW.recorded_at=receipt.recorded_at
+)
+BEGIN SELECT RAISE(ABORT, 'session switch release anchor mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_rebind_receipts_insert_guard
+BEFORE INSERT ON session_switch_rebind_receipts
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_target_start_receipts target ON target.attempt_id=switch.attempt_id
+  JOIN session_switch_source_release_receipts released ON released.attempt_id=switch.attempt_id
+  JOIN session_switch_source_release_anchors release_anchor
+    ON release_anchor.attempt_id=released.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='source_released'
+    AND target.state='idle' AND target.active_turn_id IS NULL
+    AND released.provider_thread_id=switch.source_provider_thread_id
+    AND release_anchor.recorded_at=released.recorded_at
+    AND NEW.session_revision=switch.original_session_revision+1
+    AND NEW.authority_revision=switch.original_authority_revision+1
+)
+BEGIN SELECT RAISE(ABORT, 'session switch rebind receipt mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_rebind_anchors_insert_guard
+BEFORE INSERT ON session_switch_rebind_anchors
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_rebind_receipts receipt ON receipt.attempt_id=switch.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='source_released'
+    AND NEW.recorded_at=receipt.recorded_at
+)
+BEGIN SELECT RAISE(ABORT, 'session switch rebind anchor mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_authorities_insert_guard
+BEFORE INSERT ON session_switch_seed_authorities
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_rebind_receipts rebound ON rebound.attempt_id=switch.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='rebound'
+    AND NEW.provider_account_id=switch.target_provider_account_id
+    AND NEW.profile_id=switch.target_profile_id AND NEW.provider=switch.target_provider
+    AND NEW.binding_generation=switch.target_binding_generation
+    AND NEW.authority_revision>=rebound.authority_revision
+)
+BEGIN SELECT RAISE(ABORT, 'session switch seed authority mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_receipts_insert_guard
+BEFORE INSERT ON session_switch_seed_receipts
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_seed_authorities authority ON authority.attempt_id=switch.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='seed_dispatching'
+    AND json_extract(NEW.public_receipt_json,'$.idempotencyKey')=switch.request_key
+    AND json_extract(NEW.public_receipt_json,'$.session.id')=switch.session_id
+    AND json_extract(NEW.public_receipt_json,'$.transcriptDigest')=switch.transcript_digest
+    AND json_extract(NEW.public_receipt_json,'$.from.provider')=switch.source_provider
+    AND json_extract(NEW.public_receipt_json,'$.from.preset')=switch.source_preset
+    AND json_extract(NEW.public_receipt_json,'$.from.account')=switch.source_profile_id
+    AND json_extract(NEW.public_receipt_json,'$.to.provider')=switch.target_provider
+    AND json_extract(NEW.public_receipt_json,'$.to.preset')=switch.target_preset
+    AND json_extract(NEW.public_receipt_json,'$.to.account')=switch.target_profile_id
+    AND json_extract(NEW.public_receipt_json,'$.seed.digest')=switch.seed_digest
+    AND json_extract(NEW.public_receipt_json,'$.seed.includedRecords')=switch.seed_included_records
+    AND json_extract(NEW.public_receipt_json,'$.seed.omittedRecords')=switch.seed_omitted_records
+    AND json_extract(NEW.public_receipt_json,'$.seed.delivered')=(NEW.outcome='accepted')
+    AND json_extract(NEW.public_receipt_json,'$.turnId') IS NEW.turn_id
+    AND (
+      (NEW.outcome='accepted' AND json_type(NEW.public_receipt_json,'$.seed.failureCode') IS NULL)
+      OR (NEW.outcome='rejected'
+        AND json_extract(NEW.public_receipt_json,'$.seed.failureCode')=NEW.failure_code)
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session switch seed receipt mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_anchors_insert_guard
+BEFORE INSERT ON session_switch_seed_anchors
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_seed_receipts receipt ON receipt.attempt_id=switch.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='seed_dispatching'
+    AND NEW.recorded_at=receipt.recorded_at
+    AND ((receipt.outcome='accepted' AND NEW.message_event_sequence IS NOT NULL
+          AND NEW.message_event_digest IS NOT NULL)
+      OR (receipt.outcome='rejected' AND NEW.message_event_sequence IS NULL
+          AND NEW.message_event_digest IS NULL))
+)
+BEGIN SELECT RAISE(ABORT, 'session switch seed anchor mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_no_effect_receipts_insert_guard
+BEFORE INSERT ON session_switch_no_effect_receipts
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase IN ('prepared','target_starting')
+    AND NOT EXISTS(
+      SELECT 1 FROM session_switch_target_start_receipts target
+      WHERE target.attempt_id=switch.attempt_id
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session switch no-effect receipt mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_no_effect_anchors_insert_guard
+BEFORE INSERT ON session_switch_no_effect_anchors
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_no_effect_receipts receipt ON receipt.attempt_id=switch.attempt_id
+  JOIN session_switch_plan_anchors plan ON plan.attempt_id=switch.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase IN ('prepared','target_starting')
+    AND NEW.recorded_at=receipt.recorded_at
+    AND NOT EXISTS(
+      SELECT 1 FROM session_switch_target_start_receipts target
+      WHERE target.attempt_id=switch.attempt_id
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session switch no-effect anchor mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_reconciliation_receipts_insert_guard
+BEFORE INSERT ON session_switch_reconciliation_receipts
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_plan_anchors anchor ON anchor.attempt_id=switch.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase=NEW.from_phase
+    AND switch.request_digest=NEW.request_digest
+    AND NEW.plan_digest=anchor.plan_digest
+    AND NEW.evidence_depth=CASE switch.phase
+      WHEN 'target_starting' THEN 0
+      WHEN 'target_started' THEN 1
+      WHEN 'source_releasing' THEN 1
+      WHEN 'source_released' THEN 2
+      WHEN 'rebound' THEN 3
+      WHEN 'seed_dispatching' THEN 4
+    END
+)
+BEGIN SELECT RAISE(ABORT, 'session switch reconciliation receipt mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_reconciliation_anchors_insert_guard
+BEFORE INSERT ON session_switch_reconciliation_anchors
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN session_switch_reconciliation_receipts receipt ON receipt.attempt_id=switch.attempt_id
+  JOIN session_switch_plan_anchors plan ON plan.attempt_id=switch.attempt_id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase=receipt.from_phase
+    AND receipt.request_digest=switch.request_digest
+    AND receipt.plan_digest=plan.plan_digest
+    AND NEW.recorded_at=receipt.recorded_at
+)
+BEGIN SELECT RAISE(ABORT, 'session switch reconciliation anchor mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_malformed_dispositions_insert_guard
+BEFORE INSERT ON session_switch_malformed_dispositions
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN mutation_attempts mutation
+    ON mutation.idempotency_key=NEW.mutation_request_key
+  WHERE switch.journal_sequence=NEW.journal_sequence AND switch.phase=NEW.from_phase
+    AND (mutation.idempotency_key=switch.request_key OR mutation.id=switch.attempt_id)
+    AND mutation.kind='session.switch'
+    AND mutation.authority_id=NEW.session_id
+    AND (NEW.terminal_phase='reconciliation_required'
+      OR (NEW.from_phase='prepared' AND mutation.state='prepared'))
+)
+BEGIN SELECT RAISE(ABORT, 'session switch malformed disposition mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_abandon_receipts_insert_guard
+BEFORE INSERT ON session_switch_abandon_receipts
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_attempts switch
+  JOIN sessions session ON session.id=switch.session_id
+  JOIN session_provider_authorities authority ON authority.session_id=session.id
+  WHERE switch.attempt_id=NEW.attempt_id AND switch.phase='reconciliation_required'
+    AND session.revision=NEW.expected_session_revision
+    AND NEW.terminal_session_revision=NEW.expected_session_revision+1
+    AND authority.provider_account_id=NEW.provider_account_id
+    AND authority.profile_id=NEW.profile_id AND authority.provider=NEW.provider
+    AND authority.binding_generation=NEW.binding_generation
+    AND authority.process_generation=NEW.process_generation
+    AND authority.authority_revision=NEW.authority_revision
+    AND json_extract(NEW.session_json,'$.id')=session.id
+    AND json_extract(NEW.session_json,'$.state')='terminal'
+    AND json_extract(NEW.session_json,'$.revision')=NEW.terminal_session_revision
+)
+BEGIN SELECT RAISE(ABORT, 'session switch abandon receipt mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_abandon_anchors_insert_guard
+BEFORE INSERT ON session_switch_abandon_anchors
+WHEN NOT EXISTS(
+  SELECT 1 FROM session_switch_abandon_receipts receipt
+  JOIN session_switch_attempts switch ON switch.attempt_id=receipt.attempt_id
+  JOIN session_switch_reconciliation_receipts reconciliation
+    ON reconciliation.attempt_id=receipt.attempt_id
+  WHERE receipt.attempt_id=NEW.attempt_id
+    AND switch.phase='reconciliation_required'
+    AND NEW.recorded_at=receipt.recorded_at
+)
+BEGIN SELECT RAISE(ABORT, 'session switch abandon anchor mismatch'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_switch_target_start_receipts_immutable_update
+BEFORE UPDATE ON session_switch_target_start_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch target receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_plan_anchors_immutable_update
+BEFORE UPDATE ON session_switch_plan_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch plan anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_plan_anchors_immutable_delete
+BEFORE DELETE ON session_switch_plan_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch plan anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_target_start_receipts_immutable_delete
+BEFORE DELETE ON session_switch_target_start_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch target receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_target_start_anchors_immutable_update
+BEFORE UPDATE ON session_switch_target_start_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch target anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_target_start_anchors_immutable_delete
+BEFORE DELETE ON session_switch_target_start_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch target anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_source_release_receipts_immutable_update
+BEFORE UPDATE ON session_switch_source_release_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch release receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_source_release_receipts_immutable_delete
+BEFORE DELETE ON session_switch_source_release_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch release receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_source_release_anchors_immutable_update
+BEFORE UPDATE ON session_switch_source_release_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch release anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_source_release_anchors_immutable_delete
+BEFORE DELETE ON session_switch_source_release_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch release anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_rebind_receipts_immutable_update
+BEFORE UPDATE ON session_switch_rebind_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch rebind receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_rebind_receipts_immutable_delete
+BEFORE DELETE ON session_switch_rebind_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch rebind receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_rebind_anchors_immutable_update
+BEFORE UPDATE ON session_switch_rebind_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch rebind anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_rebind_anchors_immutable_delete
+BEFORE DELETE ON session_switch_rebind_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch rebind anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_authorities_immutable_update
+BEFORE UPDATE ON session_switch_seed_authorities
+BEGIN SELECT RAISE(ABORT, 'session switch seed authority is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_authorities_immutable_delete
+BEFORE DELETE ON session_switch_seed_authorities
+BEGIN SELECT RAISE(ABORT, 'session switch seed authority is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_receipts_immutable_update
+BEFORE UPDATE ON session_switch_seed_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch seed receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_receipts_immutable_delete
+BEFORE DELETE ON session_switch_seed_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch seed receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_anchors_immutable_update
+BEFORE UPDATE ON session_switch_seed_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch seed anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_anchors_immutable_delete
+BEFORE DELETE ON session_switch_seed_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch seed anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_no_effect_receipts_immutable_update
+BEFORE UPDATE ON session_switch_no_effect_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch no-effect receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_no_effect_receipts_immutable_delete
+BEFORE DELETE ON session_switch_no_effect_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch no-effect receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_no_effect_anchors_immutable_update
+BEFORE UPDATE ON session_switch_no_effect_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch no-effect anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_no_effect_anchors_immutable_delete
+BEFORE DELETE ON session_switch_no_effect_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch no-effect anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_reconciliation_receipts_immutable_update
+BEFORE UPDATE ON session_switch_reconciliation_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch reconciliation receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_reconciliation_receipts_immutable_delete
+BEFORE DELETE ON session_switch_reconciliation_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch reconciliation receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_reconciliation_anchors_immutable_update
+BEFORE UPDATE ON session_switch_reconciliation_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch reconciliation anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_reconciliation_anchors_immutable_delete
+BEFORE DELETE ON session_switch_reconciliation_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch reconciliation anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_malformed_dispositions_immutable_update
+BEFORE UPDATE ON session_switch_malformed_dispositions
+BEGIN SELECT RAISE(ABORT, 'session switch malformed disposition is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_malformed_dispositions_immutable_delete
+BEFORE DELETE ON session_switch_malformed_dispositions
+BEGIN SELECT RAISE(ABORT, 'session switch malformed disposition is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_abandon_receipts_immutable_update
+BEFORE UPDATE ON session_switch_abandon_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch abandon receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_abandon_receipts_immutable_delete
+BEFORE DELETE ON session_switch_abandon_receipts
+BEGIN SELECT RAISE(ABORT, 'session switch abandon receipt is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_abandon_anchors_immutable_update
+BEFORE UPDATE ON session_switch_abandon_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch abandon anchor is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_abandon_anchors_immutable_delete
+BEFORE DELETE ON session_switch_abandon_anchors
+BEGIN SELECT RAISE(ABORT, 'session switch abandon anchor is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_switch_queue_dispatch_guard
+BEFORE UPDATE OF state ON queue_entries
+WHEN OLD.state='pending' AND NEW.state='dispatching' AND EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  WHERE switch.session_id=OLD.session_id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks queue dispatch'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_interaction_insert_guard
+BEFORE INSERT ON provider_interactions
+WHEN NEW.session_id IS NOT NULL AND EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  WHERE switch.session_id=NEW.session_id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks interaction admission'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_interaction_update_guard
+BEFORE UPDATE OF state,intended_terminal_state,response_digest,response_expected_revision ON provider_interactions
+WHEN EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  LEFT JOIN session_switch_target_start_receipts target
+    ON target.attempt_id=switch.attempt_id
+  LEFT JOIN interaction_provider_authorities authority
+    ON authority.public_id=OLD.public_id
+  WHERE ${SESSION_SWITCH_BLOCKING_PREDICATE}
+    AND (
+      switch.session_id=OLD.session_id
+      OR (
+        OLD.session_id IS NULL AND OLD.thread_id=switch.source_provider_thread_id
+        AND authority.provider_account_id=switch.source_provider_account_id
+        AND authority.profile_id=switch.source_profile_id
+        AND authority.provider=switch.source_provider
+        AND authority.binding_generation=switch.source_binding_generation
+        AND authority.process_generation=switch.source_process_generation
+      )
+      OR (
+        OLD.session_id IS NULL AND OLD.thread_id=target.provider_thread_id
+        AND authority.provider_account_id=switch.target_provider_account_id
+        AND authority.profile_id=switch.target_profile_id
+        AND authority.provider=switch.target_provider
+        AND authority.binding_generation=switch.target_binding_generation
+        AND authority.process_generation=switch.target_process_generation
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks interaction transition'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_interaction_authority_insert_guard
+BEFORE INSERT ON interaction_provider_authorities
+WHEN EXISTS(
+  SELECT 1 FROM provider_interactions interaction
+  JOIN ${SESSION_SWITCH_FENCE_SOURCE} switch
+    ON ${SESSION_SWITCH_BLOCKING_PREDICATE}
+  LEFT JOIN session_switch_target_start_receipts target
+    ON target.attempt_id=switch.attempt_id
+  WHERE interaction.public_id=NEW.public_id
+    AND (
+      interaction.session_id=switch.session_id
+      OR (
+        interaction.thread_id=switch.source_provider_thread_id
+        AND NEW.provider_account_id=switch.source_provider_account_id
+        AND NEW.profile_id=switch.source_profile_id AND NEW.provider=switch.source_provider
+        AND NEW.binding_generation=switch.source_binding_generation
+        AND NEW.process_generation=switch.source_process_generation
+      )
+      OR (
+        interaction.thread_id=target.provider_thread_id
+        AND NEW.provider_account_id=switch.target_provider_account_id
+        AND NEW.profile_id=switch.target_profile_id AND NEW.provider=switch.target_provider
+        AND NEW.binding_generation=switch.target_binding_generation
+        AND NEW.process_generation=switch.target_process_generation
+      )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks interaction admission'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_interaction_update_guard
+BEFORE UPDATE OF state,intended_terminal_state,response_digest,response_expected_revision ON provider_interactions
+WHEN EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  JOIN session_switch_target_start_receipts target
+    ON target.attempt_id=switch.attempt_id
+  JOIN session_switch_seed_authorities seed
+    ON seed.attempt_id=switch.attempt_id
+  JOIN interaction_provider_authorities authority
+    ON authority.public_id=OLD.public_id
+  WHERE ${SESSION_SWITCH_BLOCKING_PREDICATE}
+    AND OLD.session_id IS NULL AND OLD.thread_id=target.provider_thread_id
+    AND authority.provider_account_id=seed.provider_account_id
+    AND authority.profile_id=seed.profile_id AND authority.provider=seed.provider
+    AND authority.binding_generation=seed.binding_generation
+    AND authority.process_generation=seed.process_generation
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks seed interaction transition'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_seed_interaction_authority_insert_guard
+BEFORE INSERT ON interaction_provider_authorities
+WHEN EXISTS(
+  SELECT 1 FROM provider_interactions interaction
+  JOIN ${SESSION_SWITCH_FENCE_SOURCE} switch
+    ON ${SESSION_SWITCH_BLOCKING_PREDICATE}
+  JOIN session_switch_target_start_receipts target
+    ON target.attempt_id=switch.attempt_id
+  JOIN session_switch_seed_authorities seed
+    ON seed.attempt_id=switch.attempt_id
+  WHERE interaction.public_id=NEW.public_id
+    AND interaction.session_id IS NULL AND interaction.thread_id=target.provider_thread_id
+    AND NEW.provider_account_id=seed.provider_account_id
+    AND NEW.profile_id=seed.profile_id AND NEW.provider=seed.provider
+    AND NEW.binding_generation=seed.binding_generation
+    AND NEW.process_generation=seed.process_generation
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks seed interaction admission'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_session_state_insert_guard
+BEFORE INSERT ON session_states
+WHEN EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  WHERE switch.session_id=NEW.session_id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks callback state admission'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_session_state_update_guard
+BEFORE UPDATE ON session_states
+WHEN EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  WHERE switch.session_id=OLD.session_id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks callback state admission'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_session_event_insert_guard
+BEFORE INSERT ON session_events
+WHEN EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  WHERE switch.session_id=NEW.session_id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+    AND NOT COALESCE((
+      switch.phase='source_released'
+      AND EXISTS(
+        SELECT 1 FROM session_switch_rebind_receipts receipt
+        WHERE receipt.attempt_id=switch.attempt_id
+          AND receipt.session_revision=switch.original_session_revision+1
+          AND receipt.authority_revision=switch.original_authority_revision+1
+          AND receipt.switch_event_sequence=NEW.sequence
+      )
+      AND json_extract(NEW.event_json,'$.body.type')='provider_switched'
+      AND json_extract(NEW.event_json,'$.body.fromProvider')=switch.source_provider
+      AND json_extract(NEW.event_json,'$.body.toProvider')=switch.target_provider
+      AND json_extract(NEW.event_json,'$.body.fromPreset')=switch.source_preset
+      AND json_extract(NEW.event_json,'$.body.toPreset')=switch.target_preset
+      AND json_extract(NEW.event_json,'$.body.accountChanged')=(switch.source_profile_id!=switch.target_profile_id)
+      AND json_extract(NEW.event_json,'$.body.transcriptDigest')=switch.transcript_digest
+      AND json_extract(NEW.event_json,'$.body.seedDigest')=switch.seed_digest
+      AND json_extract(NEW.event_json,'$.body.seedOmittedRecords')=switch.seed_omitted_records
+    ),0)
+    AND NOT COALESCE((
+      switch.phase='seed_dispatching'
+      AND NEW.stream_epoch=switch.stream_epoch AND NEW.projection_version=2
+      AND NEW.provider_connection_id IS NULL
+      AND json_extract(NEW.event_json,'$.version')=1
+      AND json_extract(NEW.event_json,'$.sessionId')=NEW.session_id
+      AND json_extract(NEW.event_json,'$.streamEpoch')=NEW.stream_epoch
+      AND json_extract(NEW.event_json,'$.sequence')=NEW.sequence
+      AND json_extract(NEW.event_json,'$.recordedAt')=NEW.recorded_at
+      AND json_extract(NEW.event_json,'$.accountId')=NEW.account_id
+      AND json_extract(NEW.event_json,'$.providerGeneration')=NEW.provider_generation
+      AND json_type(NEW.event_json,'$.providerConnectionId')='null'
+      AND json_extract(NEW.event_json,'$.body.type')='user_message'
+      AND json_extract(NEW.event_json,'$.body.actor')='provider_switch'
+      AND EXISTS(
+        SELECT 1 FROM session_switch_seed_receipts receipt
+        JOIN session_switch_seed_anchors anchor ON anchor.attempt_id=receipt.attempt_id
+        JOIN session_switch_seed_authorities seed ON seed.attempt_id=receipt.attempt_id
+        JOIN session_switch_rebind_receipts rebound ON rebound.attempt_id=receipt.attempt_id
+        JOIN session_provider_authorities current ON current.session_id=switch.session_id
+        JOIN session_runtime_profiles runtime ON runtime.session_id=switch.session_id
+          AND runtime.revision=receipt.runtime_profile_revision
+        WHERE receipt.attempt_id=switch.attempt_id AND receipt.outcome='accepted'
+          AND anchor.message_event_sequence=NEW.sequence
+          AND NEW.sequence=rebound.switch_event_sequence+1
+          AND anchor.recorded_at=receipt.recorded_at AND NEW.recorded_at=receipt.recorded_at
+          AND NEW.account_id=seed.profile_id AND NEW.provider_generation=seed.process_generation
+          AND current.provider_account_id=seed.provider_account_id
+          AND current.profile_id=seed.profile_id AND current.provider=seed.provider
+          AND current.binding_generation=seed.binding_generation
+          AND current.process_generation=seed.process_generation
+          AND current.authority_revision=seed.authority_revision
+          AND runtime.source_kind='turn_start' AND runtime.source_id=switch.seed_client_message_id
+          AND runtime.profile_id=seed.profile_id AND runtime.process_generation=seed.process_generation
+      )
+    ),0)
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks callback event admission'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_provider_session_insert_guard
+BEFORE INSERT ON sessions
+WHEN NEW.provider_thread_id IS NOT NULL AND EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  LEFT JOIN session_switch_target_start_receipts target
+    ON target.attempt_id=switch.attempt_id
+  WHERE ${SESSION_SWITCH_BLOCKING_PREDICATE}
+    AND (
+      (NEW.profile_id=switch.source_profile_id
+        AND NEW.provider_thread_id=switch.source_provider_thread_id)
+      OR
+      (NEW.profile_id=switch.target_profile_id
+        AND NEW.provider_thread_id=target.provider_thread_id)
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session switch reserves provider session identity'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_session_update_guard
+BEFORE UPDATE ON sessions
+WHEN EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  WHERE switch.session_id=OLD.id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+    AND NOT (
+      EXISTS(
+        SELECT 1 FROM session_switch_malformed_dispositions malformed
+        WHERE malformed.session_id=OLD.id
+          AND malformed.terminal_phase='reconciliation_required'
+      )
+      AND OLD.state NOT IN ('terminal','recovery_required')
+      AND NEW.state='recovery_required' AND NEW.active_turn_id IS NULL
+      AND NEW.revision=OLD.revision+1
+      AND NEW.id=OLD.id AND NEW.project_id IS OLD.project_id
+      AND NEW.profile_id=OLD.profile_id AND NEW.provider=OLD.provider
+      AND NEW.provider_thread_id IS OLD.provider_thread_id AND NEW.preset=OLD.preset
+      AND NEW.provider_updated_at IS OLD.provider_updated_at
+      AND NEW.title=OLD.title AND NEW.note=OLD.note AND NEW.fast_enabled=OLD.fast_enabled
+      AND NEW.archived_at IS OLD.archived_at AND NEW.created_at=OLD.created_at
+    )
+    AND NOT (
+      switch.phase='source_released'
+      AND OLD.revision=switch.original_session_revision
+      AND NEW.revision=OLD.revision+1
+      AND OLD.profile_id=switch.source_profile_id AND OLD.provider=switch.source_provider
+      AND OLD.provider_thread_id=switch.source_provider_thread_id
+      AND OLD.preset=CASE switch.source_preset WHEN 'fable-max' THEN 'ultra' ELSE switch.source_preset END
+      AND NEW.profile_id=switch.target_profile_id AND NEW.provider=switch.target_provider
+      AND NEW.preset=CASE switch.target_preset WHEN 'fable-max' THEN 'ultra' ELSE switch.target_preset END
+      AND EXISTS(
+        SELECT 1 FROM session_switch_target_start_receipts target
+        WHERE target.attempt_id=switch.attempt_id
+          AND NEW.provider_thread_id=target.provider_thread_id
+          AND target.state='idle' AND target.active_turn_id IS NULL
+          AND NEW.state='idle' AND NEW.active_turn_id IS NULL
+          AND NEW.provider_updated_at IS target.provider_updated_at
+      )
+      AND NEW.id=OLD.id AND NEW.project_id IS OLD.project_id AND NEW.title=OLD.title
+      AND NEW.note=OLD.note AND NEW.fast_enabled=OLD.fast_enabled
+      AND NEW.archived_at IS OLD.archived_at AND NEW.created_at=OLD.created_at
+    )
+    AND NOT (
+      switch.phase='seed_dispatching'
+      AND EXISTS(
+        SELECT 1 FROM session_switch_rebind_receipts rebound
+        JOIN session_switch_seed_receipts seed ON seed.attempt_id=rebound.attempt_id
+        WHERE rebound.attempt_id=switch.attempt_id AND seed.outcome='accepted'
+          AND OLD.revision=rebound.session_revision
+          AND NEW.revision=OLD.revision+1
+          AND NEW.state=CASE seed.turn_status WHEN 'inProgress' THEN 'active' ELSE 'idle' END
+          AND NEW.active_turn_id IS CASE seed.turn_status
+            WHEN 'inProgress' THEN seed.turn_id ELSE NULL END
+      )
+      AND OLD.profile_id=switch.target_profile_id AND NEW.profile_id=OLD.profile_id
+      AND OLD.provider=switch.target_provider AND NEW.provider=OLD.provider
+      AND NEW.provider_thread_id=OLD.provider_thread_id AND NEW.preset=OLD.preset
+      AND NEW.provider_updated_at IS OLD.provider_updated_at
+      AND NEW.id=OLD.id AND NEW.project_id IS OLD.project_id AND NEW.title=OLD.title
+      AND NEW.note=OLD.note AND NEW.fast_enabled=OLD.fast_enabled
+      AND NEW.archived_at IS OLD.archived_at AND NEW.created_at=OLD.created_at
+    )
+    AND NOT (
+      switch.phase='reconciliation_required'
+      AND OLD.revision=COALESCE(
+        (SELECT receipt.session_revision
+         FROM session_switch_rebind_receipts receipt
+         WHERE receipt.attempt_id=switch.attempt_id),
+        switch.original_session_revision
+      )
+      AND OLD.profile_id=CASE WHEN EXISTS(
+        SELECT 1 FROM session_switch_rebind_receipts receipt
+        WHERE receipt.attempt_id=switch.attempt_id
+      ) THEN switch.target_profile_id ELSE switch.source_profile_id END
+      AND OLD.provider=CASE WHEN EXISTS(
+        SELECT 1 FROM session_switch_rebind_receipts receipt
+        WHERE receipt.attempt_id=switch.attempt_id
+      ) THEN switch.target_provider ELSE switch.source_provider END
+      AND NEW.revision=OLD.revision+1
+      AND NEW.state='recovery_required' AND NEW.active_turn_id IS NULL
+      AND NEW.id=OLD.id AND NEW.project_id IS OLD.project_id
+      AND NEW.profile_id=OLD.profile_id AND NEW.provider=OLD.provider
+      AND NEW.provider_thread_id=OLD.provider_thread_id AND NEW.preset=OLD.preset
+      AND NEW.provider_updated_at IS OLD.provider_updated_at
+      AND NEW.title=OLD.title AND NEW.note=OLD.note AND NEW.fast_enabled=OLD.fast_enabled
+      AND NEW.archived_at IS OLD.archived_at AND NEW.created_at=OLD.created_at
+    )
+    AND NOT (
+      switch.phase='reconciliation_required'
+      AND EXISTS(
+        SELECT 1 FROM session_switch_abandon_receipts receipt
+        JOIN mutation_resolutions resolution ON resolution.attempt_id=receipt.attempt_id
+        WHERE receipt.attempt_id=switch.attempt_id
+          AND resolution.resolution_kind='abandoned'
+          AND receipt.expected_session_revision=OLD.revision
+          AND receipt.terminal_session_revision=NEW.revision
+          AND json_extract(receipt.session_json,'$.id')=NEW.id
+          AND json_extract(receipt.session_json,'$.revision')=NEW.revision
+          AND json_extract(receipt.session_json,'$.state')='terminal'
+          AND json_extract(receipt.session_json,'$.updatedAt')=NEW.updated_at
+      )
+      AND NEW.revision=OLD.revision+1
+      AND OLD.state='recovery_required' AND OLD.active_turn_id IS NULL
+      AND NEW.state='terminal' AND NEW.active_turn_id IS NULL
+      AND NEW.id=OLD.id AND NEW.project_id IS OLD.project_id
+      AND NEW.profile_id=OLD.profile_id AND NEW.provider=OLD.provider
+      AND NEW.provider_thread_id=OLD.provider_thread_id AND NEW.preset=OLD.preset
+      AND NEW.provider_updated_at IS OLD.provider_updated_at
+      AND NEW.title=OLD.title AND NEW.note=OLD.note AND NEW.fast_enabled=OLD.fast_enabled
+      AND NEW.archived_at IS OLD.archived_at AND NEW.created_at=OLD.created_at
+    )
+  )
+BEGIN SELECT RAISE(ABORT, 'session switch blocks session mutation'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_runtime_profile_insert_guard
+BEFORE INSERT ON session_runtime_profiles
+WHEN EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  WHERE switch.session_id=NEW.session_id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+    AND NOT (
+      (switch.phase='source_released' AND NEW.source_kind='session_start'
+       AND NEW.source_id=switch.attempt_id AND NEW.profile_id=switch.target_profile_id
+       AND NEW.process_generation=switch.target_process_generation)
+      OR
+      (switch.phase='seed_dispatching' AND NEW.source_kind='turn_start'
+       AND NEW.source_id=switch.seed_client_message_id
+       AND EXISTS(
+         SELECT 1 FROM session_switch_seed_authorities authority
+         WHERE authority.attempt_id=switch.attempt_id
+           AND authority.profile_id=NEW.profile_id
+           AND authority.process_generation=NEW.process_generation
+       ))
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks runtime profile admission'); END;
+CREATE TRIGGER IF NOT EXISTS session_switch_task_occurrence_insert_guard
+BEFORE INSERT ON session_task_occurrences
+WHEN EXISTS(
+  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+  WHERE switch.session_id=NEW.session_id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+)
+BEGIN SELECT RAISE(ABORT, 'session switch blocks scheduled task materialization'); END;
+`;
+
+const applySchemaVersion37SessionSwitch = (database: Database): void => {
+  database.exec(`
+    DROP TRIGGER IF EXISTS session_provider_authority_successors_insert_guard;
+    DROP TRIGGER IF EXISTS session_provider_authority_successors_immutable_update;
+    DROP TRIGGER IF EXISTS session_provider_authority_successors_immutable_delete;
+    DROP TRIGGER IF EXISTS session_provider_authorities_transition_guard;
+    DROP TRIGGER IF EXISTS session_switch_attempts_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_attempts_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_attempt_id_repair_guard;
+    DROP TRIGGER IF EXISTS session_switch_attempts_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_attempts_phase_guard;
+    DROP TRIGGER IF EXISTS mutation_transition_guard;
+    DROP TRIGGER IF EXISTS session_switch_mutation_state_guard;
+    DROP TRIGGER IF EXISTS session_switch_plan_anchors_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_target_start_receipts_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_target_start_anchors_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_source_release_receipts_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_source_release_anchors_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_rebind_receipts_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_rebind_anchors_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_seed_authorities_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_seed_receipts_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_seed_anchors_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_no_effect_receipts_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_no_effect_anchors_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_reconciliation_receipts_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_reconciliation_anchors_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_malformed_dispositions_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_abandon_receipts_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_abandon_anchors_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_target_start_receipts_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_target_start_receipts_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_plan_anchors_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_plan_anchors_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_target_start_anchors_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_target_start_anchors_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_source_release_receipts_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_source_release_receipts_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_source_release_anchors_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_source_release_anchors_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_rebind_receipts_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_rebind_receipts_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_rebind_anchors_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_rebind_anchors_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_seed_authorities_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_seed_authorities_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_seed_receipts_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_seed_receipts_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_seed_anchors_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_seed_anchors_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_no_effect_receipts_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_no_effect_receipts_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_no_effect_anchors_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_no_effect_anchors_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_reconciliation_receipts_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_reconciliation_receipts_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_reconciliation_anchors_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_reconciliation_anchors_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_malformed_dispositions_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_malformed_dispositions_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_abandon_receipts_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_abandon_receipts_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_abandon_anchors_immutable_update;
+    DROP TRIGGER IF EXISTS session_switch_abandon_anchors_immutable_delete;
+    DROP TRIGGER IF EXISTS session_switch_queue_dispatch_guard;
+    DROP TRIGGER IF EXISTS session_switch_interaction_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_interaction_update_guard;
+    DROP TRIGGER IF EXISTS session_switch_interaction_authority_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_seed_interaction_update_guard;
+    DROP TRIGGER IF EXISTS session_switch_seed_interaction_authority_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_session_state_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_session_state_update_guard;
+    DROP TRIGGER IF EXISTS session_switch_session_event_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_provider_session_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_session_update_guard;
+    DROP TRIGGER IF EXISTS session_switch_runtime_profile_insert_guard;
+    DROP TRIGGER IF EXISTS session_switch_task_occurrence_insert_guard;
+    DROP INDEX IF EXISTS session_switch_one_open_per_session;
+    DROP INDEX IF EXISTS session_switch_recovery_page;
+  `);
+  database.exec(schemaVersion37SessionSwitch);
+};
+
+const schemaVersion37SessionSwitchObjects = [
+  { name: "session_provider_authority_successors", table: "session_provider_authority_successors", type: "table" },
+  { name: "session_switch_attempts", table: "session_switch_attempts", type: "table" },
+  { name: "session_switch_plan_anchors", table: "session_switch_plan_anchors", type: "table" },
+  { name: "session_switch_target_start_receipts", table: "session_switch_target_start_receipts", type: "table" },
+  { name: "session_switch_target_start_anchors", table: "session_switch_target_start_anchors", type: "table" },
+  { name: "session_switch_source_release_receipts", table: "session_switch_source_release_receipts", type: "table" },
+  { name: "session_switch_source_release_anchors", table: "session_switch_source_release_anchors", type: "table" },
+  { name: "session_switch_rebind_receipts", table: "session_switch_rebind_receipts", type: "table" },
+  { name: "session_switch_rebind_anchors", table: "session_switch_rebind_anchors", type: "table" },
+  { name: "session_switch_seed_authorities", table: "session_switch_seed_authorities", type: "table" },
+  { name: "session_switch_seed_receipts", table: "session_switch_seed_receipts", type: "table" },
+  { name: "session_switch_seed_anchors", table: "session_switch_seed_anchors", type: "table" },
+  { name: "session_switch_no_effect_receipts", table: "session_switch_no_effect_receipts", type: "table" },
+  { name: "session_switch_no_effect_anchors", table: "session_switch_no_effect_anchors", type: "table" },
+  { name: "session_switch_reconciliation_receipts", table: "session_switch_reconciliation_receipts", type: "table" },
+  { name: "session_switch_reconciliation_anchors", table: "session_switch_reconciliation_anchors", type: "table" },
+  { name: "session_switch_malformed_dispositions", table: "session_switch_malformed_dispositions", type: "table" },
+  { name: "session_switch_abandon_receipts", table: "session_switch_abandon_receipts", type: "table" },
+  { name: "session_switch_abandon_anchors", table: "session_switch_abandon_anchors", type: "table" },
+  { name: "session_switch_one_open_per_session", table: "session_switch_attempts", type: "index" },
+  { name: "session_switch_recovery_page", table: "session_switch_attempts", type: "index" },
+  { name: "session_provider_authority_successors_insert_guard", table: "session_provider_authority_successors", type: "trigger" },
+  { name: "session_provider_authority_successors_immutable_update", table: "session_provider_authority_successors", type: "trigger" },
+  { name: "session_provider_authority_successors_immutable_delete", table: "session_provider_authority_successors", type: "trigger" },
+  { name: "session_provider_authorities_transition_guard", table: "session_provider_authorities", type: "trigger" },
+  { name: "session_switch_attempts_insert_guard", table: "session_switch_attempts", type: "trigger" },
+  { name: "session_switch_attempts_immutable_update", table: "session_switch_attempts", type: "trigger" },
+  { name: "session_switch_attempt_id_repair_guard", table: "session_switch_attempts", type: "trigger" },
+  { name: "session_switch_attempts_immutable_delete", table: "session_switch_attempts", type: "trigger" },
+  { name: "session_switch_attempts_phase_guard", table: "session_switch_attempts", type: "trigger" },
+  { name: "mutation_transition_guard", table: "mutation_attempts", type: "trigger" },
+  { name: "session_switch_mutation_state_guard", table: "mutation_attempts", type: "trigger" },
+  { name: "session_switch_plan_anchors_insert_guard", table: "session_switch_plan_anchors", type: "trigger" },
+  { name: "session_switch_target_start_receipts_insert_guard", table: "session_switch_target_start_receipts", type: "trigger" },
+  { name: "session_switch_target_start_anchors_insert_guard", table: "session_switch_target_start_anchors", type: "trigger" },
+  { name: "session_switch_source_release_receipts_insert_guard", table: "session_switch_source_release_receipts", type: "trigger" },
+  { name: "session_switch_source_release_anchors_insert_guard", table: "session_switch_source_release_anchors", type: "trigger" },
+  { name: "session_switch_rebind_receipts_insert_guard", table: "session_switch_rebind_receipts", type: "trigger" },
+  { name: "session_switch_rebind_anchors_insert_guard", table: "session_switch_rebind_anchors", type: "trigger" },
+  { name: "session_switch_seed_authorities_insert_guard", table: "session_switch_seed_authorities", type: "trigger" },
+  { name: "session_switch_seed_receipts_insert_guard", table: "session_switch_seed_receipts", type: "trigger" },
+  { name: "session_switch_seed_anchors_insert_guard", table: "session_switch_seed_anchors", type: "trigger" },
+  { name: "session_switch_no_effect_receipts_insert_guard", table: "session_switch_no_effect_receipts", type: "trigger" },
+  { name: "session_switch_no_effect_anchors_insert_guard", table: "session_switch_no_effect_anchors", type: "trigger" },
+  { name: "session_switch_reconciliation_receipts_insert_guard", table: "session_switch_reconciliation_receipts", type: "trigger" },
+  { name: "session_switch_reconciliation_anchors_insert_guard", table: "session_switch_reconciliation_anchors", type: "trigger" },
+  { name: "session_switch_malformed_dispositions_insert_guard", table: "session_switch_malformed_dispositions", type: "trigger" },
+  { name: "session_switch_abandon_receipts_insert_guard", table: "session_switch_abandon_receipts", type: "trigger" },
+  { name: "session_switch_abandon_anchors_insert_guard", table: "session_switch_abandon_anchors", type: "trigger" },
+  { name: "session_switch_target_start_receipts_immutable_update", table: "session_switch_target_start_receipts", type: "trigger" },
+  { name: "session_switch_target_start_receipts_immutable_delete", table: "session_switch_target_start_receipts", type: "trigger" },
+  { name: "session_switch_plan_anchors_immutable_update", table: "session_switch_plan_anchors", type: "trigger" },
+  { name: "session_switch_plan_anchors_immutable_delete", table: "session_switch_plan_anchors", type: "trigger" },
+  { name: "session_switch_target_start_anchors_immutable_update", table: "session_switch_target_start_anchors", type: "trigger" },
+  { name: "session_switch_target_start_anchors_immutable_delete", table: "session_switch_target_start_anchors", type: "trigger" },
+  { name: "session_switch_source_release_receipts_immutable_update", table: "session_switch_source_release_receipts", type: "trigger" },
+  { name: "session_switch_source_release_receipts_immutable_delete", table: "session_switch_source_release_receipts", type: "trigger" },
+  { name: "session_switch_source_release_anchors_immutable_update", table: "session_switch_source_release_anchors", type: "trigger" },
+  { name: "session_switch_source_release_anchors_immutable_delete", table: "session_switch_source_release_anchors", type: "trigger" },
+  { name: "session_switch_rebind_receipts_immutable_update", table: "session_switch_rebind_receipts", type: "trigger" },
+  { name: "session_switch_rebind_receipts_immutable_delete", table: "session_switch_rebind_receipts", type: "trigger" },
+  { name: "session_switch_rebind_anchors_immutable_update", table: "session_switch_rebind_anchors", type: "trigger" },
+  { name: "session_switch_rebind_anchors_immutable_delete", table: "session_switch_rebind_anchors", type: "trigger" },
+  { name: "session_switch_seed_authorities_immutable_update", table: "session_switch_seed_authorities", type: "trigger" },
+  { name: "session_switch_seed_authorities_immutable_delete", table: "session_switch_seed_authorities", type: "trigger" },
+  { name: "session_switch_seed_receipts_immutable_update", table: "session_switch_seed_receipts", type: "trigger" },
+  { name: "session_switch_seed_receipts_immutable_delete", table: "session_switch_seed_receipts", type: "trigger" },
+  { name: "session_switch_seed_anchors_immutable_update", table: "session_switch_seed_anchors", type: "trigger" },
+  { name: "session_switch_seed_anchors_immutable_delete", table: "session_switch_seed_anchors", type: "trigger" },
+  { name: "session_switch_no_effect_receipts_immutable_update", table: "session_switch_no_effect_receipts", type: "trigger" },
+  { name: "session_switch_no_effect_receipts_immutable_delete", table: "session_switch_no_effect_receipts", type: "trigger" },
+  { name: "session_switch_no_effect_anchors_immutable_update", table: "session_switch_no_effect_anchors", type: "trigger" },
+  { name: "session_switch_no_effect_anchors_immutable_delete", table: "session_switch_no_effect_anchors", type: "trigger" },
+  { name: "session_switch_reconciliation_receipts_immutable_update", table: "session_switch_reconciliation_receipts", type: "trigger" },
+  { name: "session_switch_reconciliation_receipts_immutable_delete", table: "session_switch_reconciliation_receipts", type: "trigger" },
+  { name: "session_switch_reconciliation_anchors_immutable_update", table: "session_switch_reconciliation_anchors", type: "trigger" },
+  { name: "session_switch_reconciliation_anchors_immutable_delete", table: "session_switch_reconciliation_anchors", type: "trigger" },
+  { name: "session_switch_malformed_dispositions_immutable_update", table: "session_switch_malformed_dispositions", type: "trigger" },
+  { name: "session_switch_malformed_dispositions_immutable_delete", table: "session_switch_malformed_dispositions", type: "trigger" },
+  { name: "session_switch_abandon_receipts_immutable_update", table: "session_switch_abandon_receipts", type: "trigger" },
+  { name: "session_switch_abandon_receipts_immutable_delete", table: "session_switch_abandon_receipts", type: "trigger" },
+  { name: "session_switch_abandon_anchors_immutable_update", table: "session_switch_abandon_anchors", type: "trigger" },
+  { name: "session_switch_abandon_anchors_immutable_delete", table: "session_switch_abandon_anchors", type: "trigger" },
+  { name: "session_switch_queue_dispatch_guard", table: "queue_entries", type: "trigger" },
+  { name: "session_switch_interaction_insert_guard", table: "provider_interactions", type: "trigger" },
+  { name: "session_switch_interaction_update_guard", table: "provider_interactions", type: "trigger" },
+  { name: "session_switch_interaction_authority_insert_guard", table: "interaction_provider_authorities", type: "trigger" },
+  { name: "session_switch_seed_interaction_update_guard", table: "provider_interactions", type: "trigger" },
+  { name: "session_switch_seed_interaction_authority_insert_guard", table: "interaction_provider_authorities", type: "trigger" },
+  { name: "session_switch_session_state_insert_guard", table: "session_states", type: "trigger" },
+  { name: "session_switch_session_state_update_guard", table: "session_states", type: "trigger" },
+  { name: "session_switch_session_event_insert_guard", table: "session_events", type: "trigger" },
+  { name: "session_switch_provider_session_insert_guard", table: "sessions", type: "trigger" },
+  { name: "session_switch_session_update_guard", table: "sessions", type: "trigger" },
+  { name: "session_switch_runtime_profile_insert_guard", table: "session_runtime_profiles", type: "trigger" },
+  { name: "session_switch_task_occurrence_insert_guard", table: "session_task_occurrences", type: "trigger" },
+] as const;
+
+const schemaVersion37SessionSwitchObjectSql = (
+  object: (typeof schemaVersion37SessionSwitchObjects)[number],
+): string => {
+  const markers = object.type === "table"
+    ? [`CREATE TABLE IF NOT EXISTS ${object.name}`]
+    : object.type === "index"
+      ? [
+          `CREATE UNIQUE INDEX IF NOT EXISTS ${object.name}`,
+          `CREATE INDEX IF NOT EXISTS ${object.name}`,
+        ]
+      : [
+          `CREATE TRIGGER IF NOT EXISTS ${object.name}`,
+          `CREATE TRIGGER ${object.name}`,
+        ];
+  const marker = markers.find((candidate) => schemaVersion37SessionSwitch.includes(candidate));
+  if (marker === undefined) throw new Error("STATE_SCHEMA_V37_DEFINITION_INVALID");
+  const start = schemaVersion37SessionSwitch.indexOf(marker);
+  if (object.type !== "trigger") {
+    const terminator = object.type === "table" ? ") STRICT;" : ";";
+    const end = schemaVersion37SessionSwitch.indexOf(terminator, start);
+    if (end < 0) throw new Error("STATE_SCHEMA_V37_DEFINITION_INVALID");
+    return schemaVersion37SessionSwitch.slice(start, end + terminator.length);
+  }
+  let cursor = start;
+  for (;;) {
+    const end = schemaVersion37SessionSwitch.indexOf("END;", cursor);
+    if (end < 0) throw new Error("STATE_SCHEMA_V37_DEFINITION_INVALID");
+    const remainder = schemaVersion37SessionSwitch.slice(end + "END;".length).trimStart();
+    if (/^(?:CREATE|DROP)\b/u.test(remainder) || remainder.length === 0) {
+      return schemaVersion37SessionSwitch.slice(start, end + "END;".length);
+    }
+    cursor = end + "END;".length;
+  }
+};
+
+const assertSchemaVersion37SessionSwitch = (database: Database): void => {
+  const names = schemaVersion37SessionSwitchObjects
+    .map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== schemaVersion37SessionSwitchObjects.length) {
+    throw new Error("STATE_SCHEMA_V37_STRUCTURE_INVALID");
+  }
+  for (const expected of schemaVersion37SessionSwitchObjects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    const observedSql = observed?.sql.replace(/\bIF NOT EXISTS\b/giu, "");
+    const expectedSql = schemaVersion37SessionSwitchObjectSql(expected)
+      .replace(/\bIF NOT EXISTS\b/giu, "");
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observedSql ?? "") !== normalizeSqlStructure(expectedSql)
+    ) throw new Error(`STATE_SCHEMA_V37_STRUCTURE_INVALID:${expected.name}`);
+  }
+};
+
 const retireMigratedOrphanCodexUsageAuthorities = (
   database: Database,
   selectedAt: number,
@@ -4615,7 +6335,8 @@ const backfillSchemaVersion35ProviderAccounts = (
       candidate.profileId === event.account_id
       && candidate.processGeneration === event.provider_generation
     );
-    if (candidates.length !== 1 || matching.length !== 1) {
+    const matched = matching[0];
+    if (candidates.length !== 1 || matching.length !== 1 || matched === undefined) {
       insertLegacyProviderAuthorityQuarantine(
         database,
         "session_event",
@@ -4631,7 +6352,7 @@ const backfillSchemaVersion35ProviderAccounts = (
       database,
       "session_event_provider_authorities",
       [event.session_id, event.sequence],
-      matching[0]!,
+      matched,
       provenance,
       Math.max(event.recorded_at, migratedAt),
     );
@@ -6382,6 +8103,212 @@ const pruneAllProviderUsageComponents = (database: Database, now: number): void 
   }
 };
 
+const quarantineMalformedSessionSwitchJournal = (
+  database: Database,
+  nowProvider: () => number,
+  journalSequence: number,
+): void => {
+  const sequence = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+    .parse(journalSequence);
+  const quarantine = database.transaction(() => {
+    if (database.query(
+      "SELECT 1 FROM session_switch_malformed_dispositions WHERE journal_sequence=?",
+    ).get(sequence) !== null) return;
+    // The journal plan is the untrusted input being diagnosed. Resolve its
+    // owner from the independent mutation identity, without requiring corrupt
+    // plan fields to agree before we can retain a fence.
+    const identities = database.query(
+      `SELECT switch.phase,mutation.state AS mutation_state,
+              mutation.idempotency_key AS mutation_request_key,
+              mutation.authority_id AS session_id,
+              EXISTS(
+                SELECT 1 FROM session_switch_target_start_receipts WHERE attempt_id=mutation.id
+                UNION ALL SELECT 1 FROM session_switch_source_release_receipts WHERE attempt_id=mutation.id
+                UNION ALL SELECT 1 FROM session_switch_rebind_receipts WHERE attempt_id=mutation.id
+                UNION ALL SELECT 1 FROM session_switch_seed_authorities WHERE attempt_id=mutation.id
+                UNION ALL SELECT 1 FROM session_switch_seed_receipts WHERE attempt_id=mutation.id
+                UNION ALL SELECT 1 FROM session_switch_no_effect_receipts WHERE attempt_id=mutation.id
+                UNION ALL SELECT 1 FROM session_switch_reconciliation_receipts WHERE attempt_id=mutation.id
+                UNION ALL SELECT 1 FROM session_switch_abandon_receipts WHERE attempt_id=mutation.id
+              ) AS effect_evidence_present
+       FROM session_switch_attempts switch
+       JOIN mutation_attempts mutation
+         ON (mutation.idempotency_key=switch.request_key OR mutation.id=switch.attempt_id)
+        AND mutation.kind='session.switch'
+       WHERE switch.journal_sequence=?
+         AND length(CAST(mutation.idempotency_key AS BLOB))=36
+         AND length(CAST(mutation.authority_id AS BLOB)) BETWEEN 1 AND 200
+       LIMIT 2`,
+    ).all(sequence);
+    if (identities.length !== 1) {
+      throw new Error("SESSION_SWITCH_MALFORMED_IDENTITY_UNPROVABLE");
+    }
+    const row = z.object({
+      phase: sessionSwitchPhaseSchema,
+      mutation_state: mutationStateSchema,
+      mutation_request_key: z.string().uuid(),
+      session_id: sessionIdSchema,
+      effect_evidence_present: z.union([z.literal(0), z.literal(1)]),
+    }).strict().parse(identities[0]);
+    const now = unixMillisecondsSchema.parse(nowProvider());
+    const canCancel = row.phase === "prepared" && row.mutation_state === "prepared"
+      && row.effect_evidence_present === 0;
+    const terminalPhase = canCancel
+      ? "cancelled"
+      : "reconciliation_required";
+    const evidenceDepth = row.phase === "prepared" || row.phase === "target_starting"
+      || row.phase === "failed" || row.phase === "cancelled"
+      || row.phase === "reconciliation_required" || row.phase === "abandoned"
+      ? 0
+      : row.phase === "target_started" || row.phase === "source_releasing"
+        ? 1
+        : row.phase === "source_released"
+          ? 2
+          : row.phase === "rebound"
+            ? 3
+            : row.phase === "seed_dispatching"
+              ? 4
+              : 5;
+    const disposition = database.query(
+      `INSERT INTO session_switch_malformed_dispositions(
+         journal_sequence,mutation_request_key,session_id,from_phase,terminal_phase,
+         diagnostic_code,evidence_depth,recorded_at
+       ) VALUES (?,?,?,?,?,'MALFORMED_SWITCH_RECORD',?,?)`,
+    ).run(
+      sequence,
+      row.mutation_request_key,
+      row.session_id,
+      row.phase,
+      terminalPhase,
+      evidenceDepth,
+      now,
+    );
+    if (disposition.changes !== 1) {
+      throw new Error("SESSION_SWITCH_MALFORMED_DISPOSITION_CONFLICT");
+    }
+    const repaired = database.query(
+      `UPDATE session_switch_attempts
+       SET attempt_id=(
+         SELECT mutation.id FROM mutation_attempts mutation
+         WHERE mutation.idempotency_key=?
+       )
+       WHERE journal_sequence=? AND attempt_id IS NOT (
+         SELECT mutation.id FROM mutation_attempts mutation
+         WHERE mutation.idempotency_key=?
+       )`,
+    ).run(row.mutation_request_key, sequence, row.mutation_request_key);
+    if (repaired.changes > 1) {
+      throw new Error("SESSION_SWITCH_MALFORMED_LINK_REPAIR_CONFLICT");
+    }
+    if (canCancel) {
+      const journal = database.query(
+        `UPDATE session_switch_attempts
+         SET phase='cancelled',diagnostic_code='MALFORMED_SWITCH_RECORD',
+             updated_at=MAX(updated_at,?)
+         WHERE journal_sequence=? AND phase='prepared'`,
+      ).run(now, sequence);
+      const mutation = database.query(
+        `UPDATE mutation_attempts SET state='cancelled',updated_at=MAX(updated_at,?)
+         WHERE idempotency_key=? AND state='prepared'`,
+      ).run(now, row.mutation_request_key);
+      if (journal.changes !== 1 || mutation.changes !== 1) {
+        throw new Error("SESSION_SWITCH_MALFORMED_CANCEL_CONFLICT");
+      }
+      return;
+    }
+    // Historical terminal journals stay terminal. Reopening them would both
+    // rewrite settled history and collide with another open switch for this
+    // session; the independent disposition is now their admission authority.
+    if (
+      row.phase !== "prepared" && !sessionSwitchTerminalPhases.has(row.phase)
+      && row.mutation_state === "effect_started"
+    ) {
+      const journal = database.query(
+        `UPDATE session_switch_attempts
+         SET phase='reconciliation_required',diagnostic_code='MALFORMED_SWITCH_RECORD',
+             updated_at=MAX(updated_at,?)
+         WHERE journal_sequence=?
+           AND phase NOT IN ('seed_settled','reconciliation_required','failed','cancelled','abandoned')`,
+      ).run(now, sequence);
+      const mutation = database.query(
+        `UPDATE mutation_attempts SET state='ambiguous',
+                                      result_json=json_object('code','MALFORMED_SWITCH_RECORD'),
+                                      updated_at=MAX(updated_at,?)
+         WHERE idempotency_key=? AND state='effect_started'`,
+      ).run(now, row.mutation_request_key);
+      if (journal.changes !== 1 || mutation.changes !== 1) {
+        throw new Error("SESSION_SWITCH_MALFORMED_RECONCILE_CONFLICT");
+      }
+    }
+    database.query(
+      `UPDATE sessions SET state='recovery_required',active_turn_id=NULL,
+                           revision=revision+1,updated_at=MAX(updated_at,?)
+       WHERE id=?
+         AND state NOT IN ('terminal','recovery_required')`,
+    ).run(now, row.session_id);
+    const session = z.object({
+      state: sessionStateSchema,
+      active_turn_id: z.string().nullable(),
+    }).strict().parse(database.query(
+      "SELECT state,active_turn_id FROM sessions WHERE id=?",
+    ).get(row.session_id));
+    if (
+      (session.state !== "recovery_required" && session.state !== "terminal")
+      || session.active_turn_id !== null
+    ) {
+      throw new Error("SESSION_SWITCH_MALFORMED_SESSION_QUARANTINE_CONFLICT");
+    }
+  });
+  quarantine.immediate();
+};
+
+const repairMalformedSessionSwitchJournalsBeforeIntegrity = (
+  database: Database,
+  now: () => number,
+): void => {
+  // Bound every selected field inside SQLite before exposing any corrupt row
+  // bytes to a parser. JSON evidence has its established 256 KiB ceiling;
+  // identifiers and scalar projections have a smaller closed envelope.
+  const fieldBounds = Object.keys(sessionSwitchRowSchema.shape).map((field) => (
+    `COALESCE(length(CAST("${field}" AS BLOB)),0)<=${field.endsWith("_json") ? 262_144 : 512}`
+  )).join(" AND ");
+  let afterJournalSequence = 0;
+  for (;;) {
+    const rows = database.query(
+      `SELECT journal_sequence
+       FROM session_switch_attempts switch
+       WHERE switch.journal_sequence>?
+         AND NOT EXISTS(
+           SELECT 1 FROM session_switch_malformed_dispositions malformed
+           WHERE malformed.journal_sequence=switch.journal_sequence
+         )
+       ORDER BY switch.journal_sequence LIMIT 100`,
+    ).all(afterJournalSequence).map((value) => z.object({
+      journal_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    }).strict().parse(value));
+    if (rows.length === 0) return;
+    for (const row of rows) {
+      afterJournalSequence = row.journal_sequence;
+      try {
+        const bounded = database.query(
+          `SELECT CASE WHEN ${fieldBounds}
+             AND typeof(attempt_id)='text' AND length(CAST(attempt_id AS BLOB))=40
+             AND attempt_id GLOB 'attempt_[0-9a-f]*'
+             AND substr(attempt_id,9) NOT GLOB '*[^0-9a-f]*'
+           THEN 1 ELSE 0 END AS valid
+           FROM (${sessionSwitchSelect} WHERE switch.journal_sequence=?)`,
+        ).get(row.journal_sequence) as { valid: 0 | 1 } | null;
+        if (bounded?.valid !== 1) throw new Error("SESSION_SWITCH_RECORD_BOUNDS_INVALID");
+        mapSessionSwitch(database, database.query(
+          `${sessionSwitchSelect} WHERE switch.journal_sequence=?`,
+        ).get(row.journal_sequence));
+      } catch {
+        quarantineMalformedSessionSwitchJournal(database, now, row.journal_sequence);
+      }
+    }
+  }
+};
+
 const migrateWritableDatabase = (
   database: Database,
   now: () => number,
@@ -6398,6 +8325,9 @@ const migrateWritableDatabase = (
     // restartable without rewriting any retained evidence.
     applySchemaVersion36ProviderUsage(database);
     assertSchemaVersion36ProviderUsage(database);
+    applySchemaVersion37SessionSwitch(database);
+    assertSchemaVersion37SessionSwitch(database);
+    repairMalformedSessionSwitchJournalsBeforeIntegrity(database, now);
   }
 
   // Security migrations may replace secret-bearing legacy records. SQLite must
@@ -6841,6 +8771,22 @@ const migrateWritableDatabase = (
       version = 36;
     }
 
+    if (version < 37) {
+      applySchemaVersion37SessionSwitch(database);
+      const migratedAt = unixMillisecondsSchema.parse(now());
+      // A pre-release v36 fixture can contain a partially applied v37 journal.
+      // Contain malformed dedicated rows before either the v37 audit or the
+      // repository-wide foreign-key scan observes their intentionally broken
+      // attempt linkage.
+      repairMalformedSessionSwitchJournalsBeforeIntegrity(database, now);
+      assertSchemaVersion37SessionSwitch(database);
+      database.query(
+        "INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)",
+      ).run(37, migratedAt);
+      database.exec("PRAGMA user_version = 37");
+      version = 37;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     applySchemaVersion32(database);
@@ -6883,6 +8829,8 @@ const migrateWritableDatabase = (
     applySchemaVersion34Attachments(database);
     applySchemaVersion35ProviderAccounts(database);
     applySchemaVersion36ProviderUsage(database);
+    applySchemaVersion37SessionSwitch(database);
+    repairMalformedSessionSwitchJournalsBeforeIntegrity(database, now);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -6891,6 +8839,7 @@ const migrateWritableDatabase = (
     assertWorkSchema(database);
     assertProviderAccountAuthority(database);
     assertSchemaVersion36ProviderUsage(database);
+    assertSchemaVersion37SessionSwitch(database);
     return hasPendingSecurityScrub(database);
   })();
   if (securityScrubPending) completePendingSecurityScrub(database, false, securityScrubCheckpoint);
@@ -7347,6 +9296,1883 @@ const desktopSwitchSelect = `SELECT d.attempt_id,m.idempotency_key,m.state AS mu
     ON target_authority.attempt_id=d.attempt_id AND target_authority.role='target'
   LEFT JOIN desktop_switch_resolutions r ON r.attempt_id=d.attempt_id`;
 
+const sessionSwitchRowSchema = z.object({
+  attempt_id: attemptIdSchema,
+  idempotency_key: z.string().uuid(),
+  mutation_state: mutationStateSchema,
+  mutation_result_json: z.string().max(262_144).nullable(),
+  mutation_kind: z.string().min(1).max(80),
+  mutation_authority_id: z.string().min(1).max(200),
+  mutation_authority_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  mutation_request_digest: sha256Schema,
+  request_key: z.string().uuid(),
+  request_digest: sha256Schema,
+  raw_request_json: z.string().min(2).max(2_048),
+  session_id: sessionIdSchema,
+  phase: sessionSwitchPhaseSchema,
+  source_provider_account_id: providerAccountIdSchema,
+  source_profile_id: profileIdSchema,
+  source_provider: providerSchema,
+  source_binding_generation: positiveGenerationSchema,
+  source_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  target_provider_account_id: providerAccountIdSchema,
+  target_profile_id: profileIdSchema,
+  target_provider: providerSchema,
+  target_binding_generation: positiveGenerationSchema,
+  target_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  original_session_revision: positiveGenerationSchema,
+  original_authority_revision: positiveGenerationSchema,
+  source_provider_thread_id: providerThreadIdSchema,
+  source_preset: presetSchema,
+  target_preset: presetSchema,
+  source_runtime_profile_revision: positiveGenerationSchema,
+  source_runtime_profile_digest: sha256Schema,
+  source_runtime_row_source_kind: runtimeProfileSourceKindSchema.nullable(),
+  source_runtime_row_source_id: z.string().min(1).max(200).nullable(),
+  source_runtime_row_profile_id: profileIdSchema.nullable(),
+  source_runtime_row_process_generation: z.number().int().nonnegative()
+    .max(Number.MAX_SAFE_INTEGER).nullable(),
+  source_runtime_row_observed_at: unixMillisecondsSchema.nullable(),
+  source_runtime_row_profile_json: z.string().min(2).max(262_144).nullable(),
+  source_runtime_row_recorded_at: unixMillisecondsSchema.nullable(),
+  source_runtime_authority_provider_account_id: providerAccountIdSchema.nullable(),
+  source_runtime_authority_profile_id: profileIdSchema.nullable(),
+  source_runtime_authority_provider: providerSchema.nullable(),
+  source_runtime_authority_binding_generation: positiveGenerationSchema.nullable(),
+  source_runtime_authority_process_generation: z.number().int().nonnegative()
+    .max(Number.MAX_SAFE_INTEGER).nullable(),
+  source_runtime_authority_provenance: z.string().min(1).max(80).nullable(),
+  source_runtime_authority_recorded_at: unixMillisecondsSchema.nullable(),
+  mutation_source_provider_account_id: providerAccountIdSchema.nullable(),
+  mutation_source_profile_id: profileIdSchema.nullable(),
+  mutation_source_provider: providerSchema.nullable(),
+  mutation_source_binding_generation: positiveGenerationSchema.nullable(),
+  mutation_source_process_generation: z.number().int().nonnegative()
+    .max(Number.MAX_SAFE_INTEGER).nullable(),
+  mutation_source_provenance: z.string().min(1).max(80).nullable(),
+  mutation_target_provider_account_id: providerAccountIdSchema.nullable(),
+  mutation_target_profile_id: profileIdSchema.nullable(),
+  mutation_target_provider: providerSchema.nullable(),
+  mutation_target_binding_generation: positiveGenerationSchema.nullable(),
+  mutation_target_process_generation: z.number().int().nonnegative()
+    .max(Number.MAX_SAFE_INTEGER).nullable(),
+  mutation_target_provenance: z.string().min(1).max(80).nullable(),
+  stream_epoch: z.string().uuid(),
+  floor_sequence: positiveGenerationSchema,
+  after_sequence_exclusive: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  through_sequence_inclusive: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  accepted_head_sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  renderer_version: positiveGenerationSchema,
+  renderer_limit: positiveGenerationSchema,
+  transcript_digest: sha256Schema,
+  seed_digest: sha256Schema,
+  seed_included_records: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  seed_omitted_records: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  seed_client_message_id: z.string().min(1).max(512),
+  diagnostic_code: sessionSwitchDiagnosticSchema.nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+  plan_digest: sha256Schema.nullable(),
+  plan_source_provider_thread_id: providerThreadIdSchema.nullable(),
+  plan_recorded_at: unixMillisecondsSchema.nullable(),
+  target_provider_thread_id: providerThreadIdSchema.nullable(),
+  target_state: z.enum(["active", "idle", "terminal"]).nullable(),
+  target_active_turn_id: providerThreadIdSchema.nullable(),
+  target_provider_updated_at: z.number().nonnegative().nullable(),
+  target_runtime_profile_json: z.string().min(2).max(262_144).nullable(),
+  target_runtime_profile_digest: sha256Schema.nullable(),
+  target_recorded_at: unixMillisecondsSchema.nullable(),
+  target_result_digest: sha256Schema.nullable(),
+  target_anchor_recorded_at: unixMillisecondsSchema.nullable(),
+  source_release_provider_thread_id: providerThreadIdSchema.nullable(),
+  source_release_status: z.enum(["released", "already_released"]).nullable(),
+  source_release_recorded_at: unixMillisecondsSchema.nullable(),
+  source_release_evidence_digest: sha256Schema.nullable(),
+  source_release_anchor_recorded_at: unixMillisecondsSchema.nullable(),
+  rebound_session_revision: positiveGenerationSchema.nullable(),
+  rebound_authority_revision: positiveGenerationSchema.nullable(),
+  rebound_runtime_profile_revision: positiveGenerationSchema.nullable(),
+  switch_event_sequence: positiveGenerationSchema.nullable(),
+  rebound_recorded_at: unixMillisecondsSchema.nullable(),
+  rebound_evidence_digest: sha256Schema.nullable(),
+  rebound_anchor_recorded_at: unixMillisecondsSchema.nullable(),
+  seed_provider_account_id: providerAccountIdSchema.nullable(),
+  seed_profile_id: profileIdSchema.nullable(),
+  seed_provider: providerSchema.nullable(),
+  seed_binding_generation: positiveGenerationSchema.nullable(),
+  seed_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  seed_authority_revision: positiveGenerationSchema.nullable(),
+  seed_authority_provenance: z.enum(["rebound", "successor_lineage"]).nullable(),
+  seed_authority_recorded_at: unixMillisecondsSchema.nullable(),
+  seed_outcome: z.enum(["accepted", "rejected"]).nullable(),
+  seed_failure_code: sessionSwitchFailureCodeSchema.nullable(),
+  seed_turn_id: providerThreadIdSchema.nullable(),
+  seed_turn_status: z.enum(["completed", "interrupted", "failed", "inProgress"]).nullable(),
+  seed_runtime_profile_revision: positiveGenerationSchema.nullable(),
+  seed_receipt_digest: sha256Schema.nullable(),
+  seed_public_receipt_json: z.string().min(2).max(262_144).nullable(),
+  seed_recorded_at: unixMillisecondsSchema.nullable(),
+  seed_evidence_digest: sha256Schema.nullable(),
+  seed_message_event_sequence: positiveGenerationSchema.nullable(),
+  seed_message_event_digest: sha256Schema.nullable(),
+  seed_anchor_recorded_at: unixMillisecondsSchema.nullable(),
+  seed_runtime_profile_json: z.string().min(2).max(262_144).nullable(),
+  no_effect_kind: z.literal("target_start").nullable(),
+  no_effect_diagnostic_code: sessionSwitchDiagnosticSchema.nullable(),
+  no_effect_evidence_digest: sha256Schema.nullable(),
+  no_effect_recorded_at: unixMillisecondsSchema.nullable(),
+  no_effect_anchor_digest: sha256Schema.nullable(),
+  no_effect_anchor_recorded_at: unixMillisecondsSchema.nullable(),
+  reconciliation_from_phase: sessionSwitchReconciliationFromPhaseSchema.nullable(),
+  reconciliation_evidence_depth: z.number().int().min(0).max(4).nullable(),
+  reconciliation_diagnostic_code: sessionSwitchDiagnosticSchema.nullable(),
+  reconciliation_request_digest: sha256Schema.nullable(),
+  reconciliation_plan_digest: sha256Schema.nullable(),
+  reconciliation_recorded_at: unixMillisecondsSchema.nullable(),
+  reconciliation_evidence_digest: sha256Schema.nullable(),
+  reconciliation_anchor_recorded_at: unixMillisecondsSchema.nullable(),
+  abandon_provider_account_id: providerAccountIdSchema.nullable(),
+  abandon_profile_id: profileIdSchema.nullable(),
+  abandon_provider: providerSchema.nullable(),
+  abandon_binding_generation: positiveGenerationSchema.nullable(),
+  abandon_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  abandon_authority_revision: positiveGenerationSchema.nullable(),
+  abandon_expected_session_revision: positiveGenerationSchema.nullable(),
+  abandon_terminal_session_revision: positiveGenerationSchema.nullable(),
+  abandon_session_json: z.string().min(2).max(262_144).nullable(),
+  abandon_recorded_at: unixMillisecondsSchema.nullable(),
+  abandon_evidence_digest: sha256Schema.nullable(),
+  abandon_anchor_recorded_at: unixMillisecondsSchema.nullable(),
+  resolution_kind: z.string().min(1).max(80).nullable(),
+  resolution_evidence_json: z.string().min(2).max(262_144).nullable(),
+  resolution_receipt_json: z.string().min(2).max(262_144).nullable(),
+  resolution_created_at: unixMillisecondsSchema.nullable(),
+}).strict();
+
+const sessionSwitchPublicSessionSchema = z.object({
+  id: sessionIdSchema,
+  profileId: profileIdSchema,
+  projectId: projectIdSchema.optional(),
+  providerThreadId: providerThreadIdSchema.optional(),
+  title: z.string(),
+  note: z.string(),
+  provider: providerSchema,
+  preset: presetSchema,
+  fastEnabled: z.boolean(),
+  state: sessionStateSchema,
+  activeTurnId: providerThreadIdSchema.optional(),
+  providerUpdatedAt: z.number().nonnegative().optional(),
+  archivedAt: unixMillisecondsSchema.optional(),
+  revision: positiveGenerationSchema,
+  createdAt: unixMillisecondsSchema,
+  updatedAt: unixMillisecondsSchema,
+}).strict();
+
+const parseSessionSwitchPublicSession = (value: unknown): SessionRecord => {
+  const parsed = sessionSwitchPublicSessionSchema.parse(value);
+  return {
+    id: parsed.id,
+    profileId: parsed.profileId,
+    ...(parsed.projectId === undefined ? {} : { projectId: parsed.projectId }),
+    ...(parsed.providerThreadId === undefined
+      ? {}
+      : { providerThreadId: parsed.providerThreadId }),
+    title: parsed.title,
+    note: parsed.note,
+    provider: parsed.provider,
+    preset: parsed.preset,
+    fastEnabled: parsed.fastEnabled,
+    state: parsed.state,
+    ...(parsed.activeTurnId === undefined ? {} : { activeTurnId: parsed.activeTurnId }),
+    ...(parsed.providerUpdatedAt === undefined
+      ? {}
+      : { providerUpdatedAt: parsed.providerUpdatedAt }),
+    ...(parsed.archivedAt === undefined ? {} : { archivedAt: parsed.archivedAt }),
+    revision: parsed.revision,
+    createdAt: parsed.createdAt,
+    updatedAt: parsed.updatedAt,
+  };
+};
+
+const sessionSwitchStoredPublicReceiptSchema = z.object({
+  session: sessionSwitchPublicSessionSchema,
+  from: z.object({
+    provider: providerSchema,
+    preset: presetSchema,
+    account: profileIdSchema,
+  }).strict(),
+  to: z.object({
+    provider: providerSchema,
+    preset: presetSchema,
+    account: profileIdSchema,
+  }).strict(),
+  seed: z.object({
+    delivered: z.boolean(),
+    digest: sha256Schema,
+    failureCode: sessionSwitchFailureCodeSchema.optional(),
+    includedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    omittedRecords: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  }).strict(),
+  transcriptDigest: sha256Schema,
+  turnId: providerThreadIdSchema.nullable(),
+  idempotencyKey: z.string().uuid(),
+}).strict();
+
+const sessionSwitchSelect = `SELECT
+  switch.attempt_id,mutation.idempotency_key,mutation.state AS mutation_state,
+  mutation.result_json AS mutation_result_json,
+  mutation.kind AS mutation_kind,mutation.authority_id AS mutation_authority_id,
+  mutation.authority_generation AS mutation_authority_generation,
+  mutation.request_digest AS mutation_request_digest,
+  switch.request_key,switch.request_digest,switch.raw_request_json,switch.session_id,switch.phase,
+  switch.source_provider_account_id,switch.source_profile_id,switch.source_provider,
+  switch.source_binding_generation,switch.source_process_generation,
+  switch.target_provider_account_id,switch.target_profile_id,switch.target_provider,
+  switch.target_binding_generation,switch.target_process_generation,
+  switch.original_session_revision,switch.original_authority_revision,
+  switch.source_provider_thread_id,switch.source_preset,switch.target_preset,
+  switch.source_runtime_profile_revision,switch.source_runtime_profile_digest,
+  source_runtime.source_kind AS source_runtime_row_source_kind,
+  source_runtime.source_id AS source_runtime_row_source_id,
+  source_runtime.profile_id AS source_runtime_row_profile_id,
+  source_runtime.process_generation AS source_runtime_row_process_generation,
+  source_runtime.observed_at AS source_runtime_row_observed_at,
+  source_runtime.profile_json AS source_runtime_row_profile_json,
+  source_runtime.recorded_at AS source_runtime_row_recorded_at,
+  source_runtime_authority.provider_account_id AS source_runtime_authority_provider_account_id,
+  source_runtime_authority.profile_id AS source_runtime_authority_profile_id,
+  source_runtime_authority.provider AS source_runtime_authority_provider,
+  source_runtime_authority.binding_generation AS source_runtime_authority_binding_generation,
+  source_runtime_authority.process_generation AS source_runtime_authority_process_generation,
+  source_runtime_authority.provenance AS source_runtime_authority_provenance,
+  source_runtime_authority.recorded_at AS source_runtime_authority_recorded_at,
+  mutation_source.provider_account_id AS mutation_source_provider_account_id,
+  mutation_source.profile_id AS mutation_source_profile_id,
+  mutation_source.provider AS mutation_source_provider,
+  mutation_source.binding_generation AS mutation_source_binding_generation,
+  mutation_source.process_generation AS mutation_source_process_generation,
+  mutation_source.provenance AS mutation_source_provenance,
+  mutation_target.provider_account_id AS mutation_target_provider_account_id,
+  mutation_target.profile_id AS mutation_target_profile_id,
+  mutation_target.provider AS mutation_target_provider,
+  mutation_target.binding_generation AS mutation_target_binding_generation,
+  mutation_target.process_generation AS mutation_target_process_generation,
+  mutation_target.provenance AS mutation_target_provenance,
+  switch.stream_epoch,switch.floor_sequence,switch.after_sequence_exclusive,
+  switch.through_sequence_inclusive,switch.accepted_head_sequence,
+  switch.renderer_version,switch.renderer_limit,switch.transcript_digest,switch.seed_digest,
+  switch.seed_included_records,switch.seed_omitted_records,switch.seed_client_message_id,
+  switch.diagnostic_code,switch.created_at,switch.updated_at,
+  plan.plan_digest,plan.recorded_at AS plan_recorded_at,
+  plan.source_provider_thread_id AS plan_source_provider_thread_id,
+  target.provider_thread_id AS target_provider_thread_id,target.state AS target_state,
+  target.active_turn_id AS target_active_turn_id,target.provider_updated_at AS target_provider_updated_at,
+  target.runtime_profile_json AS target_runtime_profile_json,
+  target.runtime_profile_digest AS target_runtime_profile_digest,target.recorded_at AS target_recorded_at,
+  target_anchor.result_digest AS target_result_digest,
+  target_anchor.recorded_at AS target_anchor_recorded_at,
+  release.provider_thread_id AS source_release_provider_thread_id,
+  release.status AS source_release_status,release.recorded_at AS source_release_recorded_at,
+  release_anchor.evidence_digest AS source_release_evidence_digest,
+  release_anchor.recorded_at AS source_release_anchor_recorded_at,
+  rebound.session_revision AS rebound_session_revision,
+  rebound.authority_revision AS rebound_authority_revision,
+  rebound.runtime_profile_revision AS rebound_runtime_profile_revision,
+  rebound.switch_event_sequence,rebound.recorded_at AS rebound_recorded_at,
+  rebound_anchor.evidence_digest AS rebound_evidence_digest,
+  rebound_anchor.recorded_at AS rebound_anchor_recorded_at,
+  seed_authority.provider_account_id AS seed_provider_account_id,
+  seed_authority.profile_id AS seed_profile_id,seed_authority.provider AS seed_provider,
+  seed_authority.binding_generation AS seed_binding_generation,
+  seed_authority.process_generation AS seed_process_generation,
+  seed_authority.authority_revision AS seed_authority_revision,
+  seed_authority.provenance AS seed_authority_provenance,
+  seed_authority.recorded_at AS seed_authority_recorded_at,
+  seed.outcome AS seed_outcome,seed.failure_code AS seed_failure_code,
+  seed.turn_id AS seed_turn_id,seed.turn_status AS seed_turn_status,
+  seed.runtime_profile_revision AS seed_runtime_profile_revision,
+  seed.receipt_digest AS seed_receipt_digest,
+  seed.public_receipt_json AS seed_public_receipt_json,
+  seed.recorded_at AS seed_recorded_at,
+  seed_anchor.evidence_digest AS seed_evidence_digest,
+  seed_anchor.message_event_sequence AS seed_message_event_sequence,
+  seed_anchor.message_event_digest AS seed_message_event_digest,
+  seed_anchor.recorded_at AS seed_anchor_recorded_at,
+  seed_runtime.profile_json AS seed_runtime_profile_json,
+  no_effect.effect AS no_effect_kind,
+  no_effect.diagnostic_code AS no_effect_diagnostic_code,
+  no_effect.evidence_digest AS no_effect_evidence_digest,
+  no_effect.recorded_at AS no_effect_recorded_at,
+  no_effect_anchor.evidence_digest AS no_effect_anchor_digest,
+  no_effect_anchor.recorded_at AS no_effect_anchor_recorded_at,
+  reconciliation.from_phase AS reconciliation_from_phase,
+  reconciliation.evidence_depth AS reconciliation_evidence_depth,
+  reconciliation.diagnostic_code AS reconciliation_diagnostic_code,
+  reconciliation.request_digest AS reconciliation_request_digest,
+  reconciliation.plan_digest AS reconciliation_plan_digest,
+  reconciliation.recorded_at AS reconciliation_recorded_at,
+  reconciliation_anchor.evidence_digest AS reconciliation_evidence_digest,
+  reconciliation_anchor.recorded_at AS reconciliation_anchor_recorded_at,
+  abandon.provider_account_id AS abandon_provider_account_id,
+  abandon.profile_id AS abandon_profile_id,abandon.provider AS abandon_provider,
+  abandon.binding_generation AS abandon_binding_generation,
+  abandon.process_generation AS abandon_process_generation,
+  abandon.authority_revision AS abandon_authority_revision,
+  abandon.expected_session_revision AS abandon_expected_session_revision,
+  abandon.terminal_session_revision AS abandon_terminal_session_revision,
+  abandon.session_json AS abandon_session_json,
+  abandon.recorded_at AS abandon_recorded_at,
+  abandon_anchor.evidence_digest AS abandon_evidence_digest,
+  abandon_anchor.recorded_at AS abandon_anchor_recorded_at,
+  resolution.resolution_kind,resolution.evidence_json AS resolution_evidence_json,
+  resolution.receipt_json AS resolution_receipt_json,
+  resolution.created_at AS resolution_created_at
+FROM session_switch_attempts switch
+JOIN mutation_attempts mutation ON mutation.id=switch.attempt_id
+LEFT JOIN mutation_provider_authorities mutation_source
+  ON mutation_source.attempt_id=switch.attempt_id AND mutation_source.role='source'
+LEFT JOIN mutation_provider_authorities mutation_target
+  ON mutation_target.attempt_id=switch.attempt_id AND mutation_target.role='target'
+LEFT JOIN session_runtime_profiles source_runtime
+  ON source_runtime.session_id=switch.session_id
+ AND source_runtime.revision=switch.source_runtime_profile_revision
+LEFT JOIN runtime_profile_provider_authorities source_runtime_authority
+  ON source_runtime_authority.session_id=source_runtime.session_id
+ AND source_runtime_authority.revision=source_runtime.revision
+LEFT JOIN session_switch_plan_anchors plan ON plan.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_target_start_receipts target ON target.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_target_start_anchors target_anchor
+  ON target_anchor.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_source_release_receipts release ON release.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_source_release_anchors release_anchor
+  ON release_anchor.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_rebind_receipts rebound ON rebound.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_rebind_anchors rebound_anchor
+  ON rebound_anchor.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_seed_authorities seed_authority ON seed_authority.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_seed_receipts seed ON seed.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_seed_anchors seed_anchor ON seed_anchor.attempt_id=switch.attempt_id
+LEFT JOIN session_runtime_profiles seed_runtime
+  ON seed_runtime.session_id=switch.session_id
+ AND seed_runtime.revision=seed.runtime_profile_revision
+LEFT JOIN session_switch_no_effect_receipts no_effect ON no_effect.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_no_effect_anchors no_effect_anchor
+  ON no_effect_anchor.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_reconciliation_receipts reconciliation
+  ON reconciliation.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_reconciliation_anchors reconciliation_anchor
+  ON reconciliation_anchor.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_abandon_receipts abandon ON abandon.attempt_id=switch.attempt_id
+LEFT JOIN session_switch_abandon_anchors abandon_anchor
+  ON abandon_anchor.attempt_id=switch.attempt_id
+LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=switch.attempt_id`;
+
+const allOrNone = (values: readonly unknown[]): boolean => {
+  const present = values.filter((value) => value !== null).length;
+  return present === 0 || present === values.length;
+};
+
+const sessionSwitchTargetStartResultDigest = (input: Readonly<{
+  providerThreadId: string;
+  state: "active" | "idle" | "terminal";
+  activeTurnId: string | null;
+  providerUpdatedAt: number | null;
+  runtimeProfile: ReviewedRuntimeProfile;
+}>): string => digestJson({
+  domain: "hra:session-switch-target-start-result:v1",
+  providerThreadId: input.providerThreadId,
+  state: input.state,
+  activeTurnId: input.activeTurnId,
+  providerUpdatedAt: input.providerUpdatedAt,
+  runtimeProfile: input.runtimeProfile,
+});
+
+const sessionSwitchPhaseEvidenceDepth = {
+  prepared: [0, 0],
+  target_starting: [0, 0],
+  target_started: [1, 1],
+  source_releasing: [1, 1],
+  source_released: [2, 2],
+  rebound: [3, 3],
+  seed_dispatching: [4, 4],
+  seed_settled: [5, 5],
+  reconciliation_required: null,
+  failed: [0, 0],
+  cancelled: [0, 0],
+  abandoned: null,
+} as const satisfies Record<SessionSwitchPhase, readonly [number, number] | null>;
+
+const sessionSwitchReconciliationEvidenceDepth = {
+  target_starting: 0,
+  target_started: 1,
+  source_releasing: 1,
+  source_released: 2,
+  rebound: 3,
+  seed_dispatching: 4,
+} as const satisfies Record<SessionSwitchReconciliationFromPhase, number>;
+
+type SessionSwitchReconciliationEvidence = Readonly<{
+  fromPhase: SessionSwitchReconciliationFromPhase;
+  evidenceDepth: number;
+  diagnosticCode: string;
+  requestDigest: string;
+  planDigest: string;
+  recordedAt: number;
+}>;
+
+const sessionSwitchReconciliationEvidenceDigest = (input: Readonly<{
+  attemptId: AttemptId;
+  reconciliation: SessionSwitchReconciliationEvidence;
+}>): string => digestJson({
+  domain: "hra:session-switch-reconciliation-evidence:v1",
+  attemptId: input.attemptId,
+  reconciliation: input.reconciliation,
+});
+
+const sessionSwitchAbandonEvidenceDigest = (input: Readonly<{
+  attemptId: AttemptId;
+  planDigest: string;
+  reconciliation: SessionSwitchReconciliationEvidence;
+  authority: ProviderAccountAuthority;
+  authorityRevision: number;
+  expectedSessionRevision: number;
+  terminalSessionRevision: number;
+  session: SessionRecord;
+  recordedAt: number;
+}>): string => digestJson({
+  domain: "hra:session-switch-abandon-evidence:v1",
+  attemptId: input.attemptId,
+  planDigest: input.planDigest,
+  reconciliation: input.reconciliation,
+  authority: input.authority,
+  authorityRevision: input.authorityRevision,
+  expectedSessionRevision: input.expectedSessionRevision,
+  terminalSessionRevision: input.terminalSessionRevision,
+  session: input.session,
+  recordedAt: input.recordedAt,
+});
+
+const assertSessionSwitchEvidenceMatrix = (input: Readonly<{
+  phase: SessionSwitchPhase;
+  cumulative: readonly [boolean, boolean, boolean, boolean, boolean];
+  noEffect: boolean;
+  abandonment: boolean;
+  reconciliation: SessionSwitchReconciliationEvidence | null;
+}>): void => {
+  const firstMissing = input.cumulative.indexOf(false);
+  const depth = firstMissing === -1 ? input.cumulative.length : firstMissing;
+  if (input.cumulative.slice(depth).some(Boolean)) {
+    throw new Error("SESSION_SWITCH_EVIDENCE_CHAIN_NONCONTIGUOUS");
+  }
+  const phaseDepth = sessionSwitchPhaseEvidenceDepth[input.phase];
+  const reconciliationExpected = input.phase === "reconciliation_required"
+    || input.phase === "abandoned";
+  if (reconciliationExpected !== (input.reconciliation !== null)) {
+    throw new Error("SESSION_SWITCH_RECONCILIATION_PHASE_MISMATCH");
+  }
+  const requiredDepth = input.reconciliation?.evidenceDepth ?? phaseDepth?.[0];
+  if (requiredDepth === undefined || depth !== requiredDepth) {
+    throw new Error("SESSION_SWITCH_PHASE_EVIDENCE_MISMATCH");
+  }
+  if (input.noEffect !== (input.phase === "failed")) {
+    throw new Error("SESSION_SWITCH_NO_EFFECT_PHASE_MISMATCH");
+  }
+  if (input.abandonment !== (input.phase === "abandoned")) {
+    throw new Error("SESSION_SWITCH_ABANDON_PHASE_MISMATCH");
+  }
+};
+
+const sessionSwitchPlanDigest = (input: Readonly<{
+  attemptId: AttemptId;
+  requestKey: string;
+  requestDigest: string;
+  rawRequest: SessionSwitchRawRequest;
+  sessionId: SessionId;
+  sourceAuthority: ProviderAccountAuthority;
+  targetAuthority: ProviderAccountAuthority;
+  originalSessionRevision: number;
+  originalAuthorityRevision: number;
+  sourceProviderThreadId: string;
+  sourcePreset: Preset;
+  targetPreset: Preset;
+  sourceRuntimeProfileRevision: number;
+  sourceRuntimeProfileDigest: string;
+  sourceRuntimeProfileSourceKind: z.infer<typeof runtimeProfileSourceKindSchema>;
+  sourceRuntimeProfileSourceId: string;
+  sourceRuntimeProfileRecordedAt: number;
+  transcript: SessionSwitchTranscriptPin;
+  createdAt: number;
+}>): string => digestJson({
+  domain: "hra:session-switch-prepared-plan:v1",
+  attemptId: input.attemptId,
+  requestKey: input.requestKey,
+  requestDigest: input.requestDigest,
+  rawRequest: input.rawRequest,
+  sessionId: input.sessionId,
+  sourceAuthority: input.sourceAuthority,
+  targetAuthority: input.targetAuthority,
+  originalSessionRevision: input.originalSessionRevision,
+  originalAuthorityRevision: input.originalAuthorityRevision,
+  sourceProviderThreadId: input.sourceProviderThreadId,
+  sourcePreset: input.sourcePreset,
+  targetPreset: input.targetPreset,
+  sourceRuntimeProfileRevision: input.sourceRuntimeProfileRevision,
+  sourceRuntimeProfileDigest: input.sourceRuntimeProfileDigest,
+  sourceRuntimeProfileSourceKind: input.sourceRuntimeProfileSourceKind,
+  sourceRuntimeProfileSourceId: input.sourceRuntimeProfileSourceId,
+  sourceRuntimeProfileRecordedAt: input.sourceRuntimeProfileRecordedAt,
+  transcript: input.transcript,
+  createdAt: input.createdAt,
+});
+
+const sessionSwitchTargetNoEffectEvidenceDigest = (input: Readonly<{
+  attemptId: AttemptId;
+  requestDigest: string;
+  planDigest: string;
+  targetAuthority: ProviderAccountAuthority;
+  diagnosticCode: string;
+}>): string => digestJson({
+  domain: "hra:session-switch-target-no-effect:v2",
+  attemptId: input.attemptId,
+  requestDigest: input.requestDigest,
+  planDigest: input.planDigest,
+  targetAuthority: input.targetAuthority,
+  diagnosticCode: input.diagnosticCode,
+});
+
+const sessionSwitchTargetNoEffectAnchorDigest = (input: Readonly<{
+  attemptId: AttemptId;
+  requestDigest: string;
+  planDigest: string;
+  targetAuthority: ProviderAccountAuthority;
+  diagnosticCode: string;
+  evidenceDigest: string;
+  recordedAt: number;
+}>): string => digestJson({
+  domain: "hra:session-switch-target-no-effect-anchor:v1",
+  attemptId: input.attemptId,
+  requestDigest: input.requestDigest,
+  planDigest: input.planDigest,
+  targetAuthority: input.targetAuthority,
+  effect: "target_start",
+  diagnosticCode: input.diagnosticCode,
+  evidenceDigest: input.evidenceDigest,
+  recordedAt: input.recordedAt,
+});
+
+const sessionSwitchSourceReleaseEvidenceDigest = (input: Readonly<{
+  attemptId: AttemptId;
+  requestDigest: string;
+  planDigest: string;
+  sourceAuthority: ProviderAccountAuthority;
+  providerThreadId: string;
+  status: "released" | "already_released";
+  recordedAt: number;
+}>): string => digestJson({
+  domain: "hra:session-switch-source-release-evidence:v1",
+  attemptId: input.attemptId,
+  requestDigest: input.requestDigest,
+  planDigest: input.planDigest,
+  sourceAuthority: input.sourceAuthority,
+  providerThreadId: input.providerThreadId,
+  status: input.status,
+  recordedAt: input.recordedAt,
+});
+
+const sessionSwitchProviderSwitchedBody = (input: Readonly<{
+  sourceAuthority: ProviderAccountAuthority;
+  targetAuthority: ProviderAccountAuthority;
+  sourcePreset: Preset;
+  targetPreset: Preset;
+  transcript: SessionSwitchTranscriptPin;
+}>): SessionEventBody => ({
+  type: "provider_switched",
+  fromProvider: input.sourceAuthority.provider,
+  toProvider: input.targetAuthority.provider,
+  fromPreset: input.sourcePreset,
+  toPreset: input.targetPreset,
+  accountChanged: input.sourceAuthority.profileId !== input.targetAuthority.profileId,
+  transcriptDigest: input.transcript.transcriptDigest,
+  seedDigest: input.transcript.seedDigest,
+  seedOmittedRecords: input.transcript.seedOmittedRecords,
+});
+
+const sessionSwitchRebindEvidenceDigest = (input: Readonly<{
+  attemptId: AttemptId;
+  planDigest: string;
+  sourceAuthority: ProviderAccountAuthority;
+  targetAuthority: ProviderAccountAuthority;
+  sourcePreset: Preset;
+  targetPreset: Preset;
+  sourceRoutingProvenance: SessionRoutingProvenance;
+  sourceAppliedPointerRevision: number | null;
+  targetStart: NonNullable<SessionSwitchRecord["targetStart"]>;
+  sourceRelease: NonNullable<SessionSwitchRecord["sourceRelease"]>;
+  transcript: SessionSwitchTranscriptPin;
+  rebind: NonNullable<SessionSwitchRecord["rebind"]>;
+}>): string => digestJson({
+  domain: "hra:session-switch-rebind-evidence:v2",
+  attemptId: input.attemptId,
+  planDigest: input.planDigest,
+  sourceAuthority: input.sourceAuthority,
+  targetAuthority: input.targetAuthority,
+  sourceRoutingProvenance: input.sourceRoutingProvenance,
+  sourceAppliedPointerRevision: input.sourceAppliedPointerRevision,
+  targetRoutingProvenance: "explicit",
+  targetAppliedPointerRevision: null,
+  targetStart: input.targetStart,
+  sourceRelease: input.sourceRelease,
+  transcript: input.transcript,
+  rebind: input.rebind,
+  runtimeSource: { kind: "session_start", id: input.attemptId },
+  eventBody: sessionSwitchProviderSwitchedBody(input),
+});
+
+const sessionSwitchSeedEvidenceDigest = (input: Readonly<{
+  attemptId: AttemptId;
+  planDigest: string;
+  seedAuthority: NonNullable<SessionSwitchRecord["seedAuthority"]>;
+  outcome: "accepted" | "rejected";
+  failureCode: string | null;
+  turnId: string | null;
+  turnStatus: "completed" | "interrupted" | "failed" | "inProgress" | null;
+  runtimeProfileRevision: number | null;
+  receiptDigest: string;
+  publicReceipt: z.infer<typeof sessionSwitchStoredPublicReceiptSchema>;
+  recordedAt: number;
+  messageEventSequence: number | null;
+  messageEventDigest: string | null;
+}>): string => digestJson({
+  domain: "hra:session-switch-seed-evidence:v1",
+  ...input,
+});
+
+const sessionProviderAuthoritySuccessorRowSchema = z.object({
+  session_id: sessionIdSchema,
+  from_authority_revision: positiveGenerationSchema,
+  to_authority_revision: positiveGenerationSchema,
+  from_provider_account_id: providerAccountIdSchema,
+  from_profile_id: profileIdSchema,
+  from_provider: providerSchema,
+  from_binding_generation: positiveGenerationSchema,
+  from_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  from_routing_provenance: sessionRoutingProvenanceSchema,
+  from_applied_pointer_revision: positiveGenerationSchema.nullable(),
+  to_provider_account_id: providerAccountIdSchema,
+  to_profile_id: profileIdSchema,
+  to_provider: providerSchema,
+  to_binding_generation: positiveGenerationSchema,
+  to_process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  to_routing_provenance: sessionRoutingProvenanceSchema,
+  to_applied_pointer_revision: positiveGenerationSchema.nullable(),
+  transition_kind: z.enum(["legacy_switch", "provider_restart", "session_switch"]),
+  transition_id: z.string().min(1).max(200),
+  recorded_at: unixMillisecondsSchema,
+}).strict();
+
+const assertSessionSwitchRebindEvidence = (
+  database: Database,
+  input: Readonly<{
+    attemptId: AttemptId;
+    planDigest: string;
+    sessionId: SessionId;
+    sourceAuthority: ProviderAccountAuthority;
+    targetAuthority: ProviderAccountAuthority;
+    sourcePreset: Preset;
+    targetPreset: Preset;
+    transcript: SessionSwitchTranscriptPin;
+    targetStart: NonNullable<SessionSwitchRecord["targetStart"]>;
+    sourceRelease: NonNullable<SessionSwitchRecord["sourceRelease"]>;
+    rebind: NonNullable<SessionSwitchRecord["rebind"]>;
+    anchorDigest: string;
+    anchorRecordedAt: number;
+  }>,
+): void => {
+  if (input.anchorRecordedAt !== input.rebind.recordedAt) {
+    throw new Error("SESSION_SWITCH_REBIND_ANCHOR_MISMATCH");
+  }
+  const runtimeRow = z.object({
+    source_kind: runtimeProfileSourceKindSchema,
+    source_id: z.string().min(1).max(200),
+    profile_id: profileIdSchema,
+    process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    observed_at: unixMillisecondsSchema,
+    profile_json: z.string().min(2).max(262_144),
+    recorded_at: unixMillisecondsSchema,
+    provider_account_id: providerAccountIdSchema.nullable(),
+    authority_profile_id: profileIdSchema.nullable(),
+    authority_provider: providerSchema.nullable(),
+    authority_binding_generation: positiveGenerationSchema.nullable(),
+    authority_process_generation: z.number().int().nonnegative()
+      .max(Number.MAX_SAFE_INTEGER).nullable(),
+    authority_provenance: z.string().min(1).max(80).nullable(),
+    authority_recorded_at: unixMillisecondsSchema.nullable(),
+  }).strict().parse(database.query(
+    `SELECT runtime.source_kind,runtime.source_id,runtime.profile_id,
+            runtime.process_generation,runtime.observed_at,runtime.profile_json,
+            runtime.recorded_at,authority.provider_account_id,
+            authority.profile_id AS authority_profile_id,
+            authority.provider AS authority_provider,
+            authority.binding_generation AS authority_binding_generation,
+            authority.process_generation AS authority_process_generation,
+            authority.provenance AS authority_provenance,
+            authority.recorded_at AS authority_recorded_at
+     FROM session_runtime_profiles runtime
+     LEFT JOIN runtime_profile_provider_authorities authority
+       ON authority.session_id=runtime.session_id AND authority.revision=runtime.revision
+     WHERE runtime.session_id=? AND runtime.revision=?`,
+  ).get(input.sessionId, input.rebind.runtimeProfileRevision));
+  const runtimeAuthority = providerAccountAuthoritySchema.parse({
+    providerAccountId: runtimeRow.provider_account_id,
+    profileId: runtimeRow.authority_profile_id,
+    provider: runtimeRow.authority_provider,
+    bindingGeneration: runtimeRow.authority_binding_generation,
+    processGeneration: runtimeRow.authority_process_generation,
+  });
+  const runtimeProfile = reviewedRuntimeProfileSchema.parse(
+    JSON.parse(runtimeRow.profile_json) as unknown,
+  );
+  if (
+    runtimeRow.source_kind !== "session_start"
+    || runtimeRow.source_id !== input.attemptId
+    || runtimeRow.profile_id !== input.targetAuthority.profileId
+    || runtimeRow.process_generation !== input.targetAuthority.processGeneration
+    || runtimeRow.observed_at !== input.targetStart.runtimeProfile.observedAt
+    || runtimeRow.recorded_at !== input.rebind.recordedAt
+    || runtimeRow.authority_provenance !== "runtime_profile"
+    || runtimeRow.authority_recorded_at !== input.rebind.recordedAt
+    || JSON.stringify(runtimeProfile) !== runtimeRow.profile_json
+    || JSON.stringify(runtimeProfile) !== JSON.stringify(input.targetStart.runtimeProfile)
+    || !sameProviderAccountAuthority(runtimeAuthority, input.targetAuthority)
+  ) throw new Error("SESSION_SWITCH_REBIND_RUNTIME_EVIDENCE_MISMATCH");
+
+  const successor = sessionProviderAuthoritySuccessorRowSchema.parse(database.query(
+    `SELECT * FROM session_provider_authority_successors
+     WHERE session_id=? AND from_authority_revision=?`,
+  ).get(input.sessionId, input.rebind.authorityRevision - 1));
+  if (
+    successor.to_authority_revision !== input.rebind.authorityRevision
+    || successor.from_provider_account_id !== input.sourceAuthority.providerAccountId
+    || successor.from_profile_id !== input.sourceAuthority.profileId
+    || successor.from_provider !== input.sourceAuthority.provider
+    || successor.from_binding_generation !== input.sourceAuthority.bindingGeneration
+    || successor.from_process_generation !== input.sourceAuthority.processGeneration
+    || successor.to_provider_account_id !== input.targetAuthority.providerAccountId
+    || successor.to_profile_id !== input.targetAuthority.profileId
+    || successor.to_provider !== input.targetAuthority.provider
+    || successor.to_binding_generation !== input.targetAuthority.bindingGeneration
+    || successor.to_process_generation !== input.targetAuthority.processGeneration
+    || successor.to_routing_provenance !== "explicit"
+    || successor.to_applied_pointer_revision !== null
+    || successor.transition_kind !== "session_switch"
+    || successor.transition_id !== input.attemptId
+    || successor.recorded_at !== input.rebind.recordedAt
+  ) throw new Error("SESSION_SWITCH_REBIND_SUCCESSOR_EVIDENCE_MISMATCH");
+
+  if (input.anchorDigest !== sessionSwitchRebindEvidenceDigest({
+    attemptId: input.attemptId,
+    planDigest: input.planDigest,
+    sourceAuthority: input.sourceAuthority,
+    targetAuthority: input.targetAuthority,
+    sourcePreset: input.sourcePreset,
+    targetPreset: input.targetPreset,
+    sourceRoutingProvenance: successor.from_routing_provenance,
+    sourceAppliedPointerRevision: successor.from_applied_pointer_revision,
+    targetStart: input.targetStart,
+    sourceRelease: input.sourceRelease,
+    transcript: input.transcript,
+    rebind: input.rebind,
+  })) throw new Error("SESSION_SWITCH_REBIND_ANCHOR_MISMATCH");
+
+  const eventRow = database.query(
+    `SELECT event.event_json,event.recorded_at,
+            authority.provider_account_id,authority.profile_id,
+            authority.provider,authority.binding_generation,
+            authority.process_generation,authority.provenance,
+            authority.recorded_at AS authority_recorded_at
+     FROM session_events event
+     LEFT JOIN session_event_provider_authorities authority
+       ON authority.session_id=event.session_id AND authority.sequence=event.sequence
+     WHERE event.session_id=? AND event.sequence=?`,
+  ).get(input.sessionId, input.rebind.switchEventSequence);
+  if (eventRow === null) {
+    const stream = z.object({ floor_sequence: positiveGenerationSchema }).strict().parse(
+      database.query("SELECT floor_sequence FROM session_event_streams WHERE session_id=?")
+        .get(input.sessionId),
+    );
+    if (stream.floor_sequence <= input.rebind.switchEventSequence) {
+      throw new Error("SESSION_SWITCH_REBIND_EVENT_EVIDENCE_MISSING");
+    }
+    return;
+  }
+  const stored = z.object({
+    event_json: z.string().min(2).max(262_144),
+    recorded_at: unixMillisecondsSchema,
+    provider_account_id: providerAccountIdSchema.nullable(),
+    profile_id: profileIdSchema.nullable(),
+    provider: providerSchema.nullable(),
+    binding_generation: positiveGenerationSchema.nullable(),
+    process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    provenance: z.string().min(1).max(80).nullable(),
+    authority_recorded_at: unixMillisecondsSchema.nullable(),
+  }).strict().parse(eventRow);
+  const event = sessionEventSchema.parse(JSON.parse(stored.event_json) as unknown);
+  const eventAuthority = providerAccountAuthoritySchema.parse({
+    providerAccountId: stored.provider_account_id,
+    profileId: stored.profile_id,
+    provider: stored.provider,
+    bindingGeneration: stored.binding_generation,
+    processGeneration: stored.process_generation,
+  });
+  if (
+    JSON.stringify(event) !== stored.event_json
+    || event.sessionId !== input.sessionId
+    || event.streamEpoch !== input.transcript.streamEpoch
+    || event.sequence !== input.rebind.switchEventSequence
+    || event.recordedAt !== input.rebind.recordedAt
+    || stored.recorded_at !== input.rebind.recordedAt
+    || event.accountId !== input.targetAuthority.profileId
+    || event.providerGeneration !== input.targetAuthority.processGeneration
+    || event.providerConnectionId !== null
+    || JSON.stringify(event.body) !== JSON.stringify(sessionSwitchProviderSwitchedBody(input))
+    || !sameProviderAccountAuthority(eventAuthority, input.targetAuthority)
+    || stored.provenance !== "session_event"
+    || stored.authority_recorded_at !== input.rebind.recordedAt
+  ) throw new Error("SESSION_SWITCH_REBIND_EVENT_EVIDENCE_MISMATCH");
+};
+
+const assertSessionSwitchSeedSettlementEvidence = (
+  database: Database,
+  input: Readonly<{
+    attemptId: AttemptId;
+    planDigest: string;
+    sessionId: SessionId;
+    transcript: SessionSwitchTranscriptPin;
+    seedAuthority: NonNullable<SessionSwitchRecord["seedAuthority"]>;
+    outcome: "accepted" | "rejected";
+    failureCode: string | null;
+    turnId: string | null;
+    turnStatus: "completed" | "interrupted" | "failed" | "inProgress" | null;
+    runtimeProfileRevision: number | null;
+    runtimeProfile: ReviewedRuntimeProfile | null;
+    receiptDigest: string;
+    publicReceipt: z.infer<typeof sessionSwitchStoredPublicReceiptSchema>;
+    recordedAt: number;
+    anchorDigest: string;
+    anchorRecordedAt: number;
+    messageEventSequence: number | null;
+    messageEventDigest: string | null;
+  }>,
+): void => {
+  if (
+    input.anchorRecordedAt !== input.recordedAt
+    || input.anchorDigest !== sessionSwitchSeedEvidenceDigest({
+      attemptId: input.attemptId,
+      planDigest: input.planDigest,
+      seedAuthority: input.seedAuthority,
+      outcome: input.outcome,
+      failureCode: input.failureCode,
+      turnId: input.turnId,
+      turnStatus: input.turnStatus,
+      runtimeProfileRevision: input.runtimeProfileRevision,
+      receiptDigest: input.receiptDigest,
+      publicReceipt: input.publicReceipt,
+      recordedAt: input.recordedAt,
+      messageEventSequence: input.messageEventSequence,
+      messageEventDigest: input.messageEventDigest,
+    })
+  ) throw new Error("SESSION_SWITCH_SEED_ANCHOR_MISMATCH");
+  if (input.outcome === "rejected") {
+    if (
+      input.runtimeProfileRevision !== null
+      || input.runtimeProfile !== null
+      || input.messageEventSequence !== null
+      || input.messageEventDigest !== null
+    ) throw new Error("SESSION_SWITCH_SEED_REJECTED_EVIDENCE_MISMATCH");
+    return;
+  }
+  if (
+    input.turnId === null
+    || input.runtimeProfileRevision === null
+    || input.runtimeProfile === null
+    || input.messageEventSequence === null
+    || input.messageEventDigest === null
+  ) throw new Error("SESSION_SWITCH_SEED_ACCEPTED_EVIDENCE_INCOMPLETE");
+  const runtimeRow = z.object({
+    source_kind: runtimeProfileSourceKindSchema,
+    source_id: z.string().min(1).max(200),
+    profile_id: profileIdSchema,
+    process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    observed_at: unixMillisecondsSchema,
+    profile_json: z.string().min(2).max(262_144),
+    recorded_at: unixMillisecondsSchema,
+    provider_account_id: providerAccountIdSchema.nullable(),
+    authority_profile_id: profileIdSchema.nullable(),
+    authority_provider: providerSchema.nullable(),
+    authority_binding_generation: positiveGenerationSchema.nullable(),
+    authority_process_generation: z.number().int().nonnegative()
+      .max(Number.MAX_SAFE_INTEGER).nullable(),
+    authority_provenance: z.string().min(1).max(80).nullable(),
+    authority_recorded_at: unixMillisecondsSchema.nullable(),
+  }).strict().parse(database.query(
+    `SELECT runtime.source_kind,runtime.source_id,runtime.profile_id,
+            runtime.process_generation,runtime.observed_at,runtime.profile_json,
+            runtime.recorded_at,authority.provider_account_id,
+            authority.profile_id AS authority_profile_id,
+            authority.provider AS authority_provider,
+            authority.binding_generation AS authority_binding_generation,
+            authority.process_generation AS authority_process_generation,
+            authority.provenance AS authority_provenance,
+            authority.recorded_at AS authority_recorded_at
+     FROM session_runtime_profiles runtime
+     LEFT JOIN runtime_profile_provider_authorities authority
+       ON authority.session_id=runtime.session_id AND authority.revision=runtime.revision
+     WHERE runtime.session_id=? AND runtime.revision=?`,
+  ).get(input.sessionId, input.runtimeProfileRevision));
+  const runtimeAuthority = providerAccountAuthoritySchema.parse({
+    providerAccountId: runtimeRow.provider_account_id,
+    profileId: runtimeRow.authority_profile_id,
+    provider: runtimeRow.authority_provider,
+    bindingGeneration: runtimeRow.authority_binding_generation,
+    processGeneration: runtimeRow.authority_process_generation,
+  });
+  const runtimeProfile = reviewedRuntimeProfileSchema.parse(
+    JSON.parse(runtimeRow.profile_json) as unknown,
+  );
+  if (
+    runtimeRow.source_kind !== "turn_start"
+    || runtimeRow.source_id !== input.transcript.seedClientMessageId
+    || runtimeRow.profile_id !== input.seedAuthority.authority.profileId
+    || runtimeRow.process_generation !== input.seedAuthority.authority.processGeneration
+    || runtimeRow.observed_at !== input.runtimeProfile.observedAt
+    || runtimeRow.recorded_at !== input.recordedAt
+    || runtimeRow.authority_provenance !== "runtime_profile"
+    || runtimeRow.authority_recorded_at !== input.recordedAt
+    || JSON.stringify(runtimeProfile) !== runtimeRow.profile_json
+    || JSON.stringify(runtimeProfile) !== JSON.stringify(input.runtimeProfile)
+    || !sameProviderAccountAuthority(runtimeAuthority, input.seedAuthority.authority)
+  ) throw new Error("SESSION_SWITCH_SEED_RUNTIME_EVIDENCE_MISMATCH");
+  const turnRuntime = z.object({
+    source_kind: runtimeProfileSourceKindSchema,
+    source_id: z.string().min(1).max(200),
+    profile_id: profileIdSchema,
+    process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    observed_at: unixMillisecondsSchema,
+    profile_json: z.string().min(2).max(262_144),
+    profile_digest: sha256Schema,
+    recorded_at: unixMillisecondsSchema,
+  }).strict().parse(database.query(
+    `SELECT source_kind,source_id,profile_id,process_generation,observed_at,
+            profile_json,profile_digest,recorded_at
+     FROM session_turn_runtime_profiles WHERE session_id=? AND turn_id=?`,
+  ).get(input.sessionId, input.turnId));
+  if (
+    turnRuntime.source_kind !== "turn_start"
+    || turnRuntime.source_id !== input.transcript.seedClientMessageId
+    || turnRuntime.profile_id !== runtimeRow.profile_id
+    || turnRuntime.process_generation !== runtimeRow.process_generation
+    || turnRuntime.observed_at !== runtimeRow.observed_at
+    || turnRuntime.profile_json !== runtimeRow.profile_json
+    || turnRuntime.profile_digest !== digestJson(runtimeProfile)
+    || turnRuntime.recorded_at !== input.recordedAt
+  ) throw new Error("SESSION_SWITCH_SEED_TURN_RUNTIME_EVIDENCE_MISMATCH");
+
+  const eventRow = database.query(
+    `SELECT event.event_json,event.recorded_at,
+            authority.provider_account_id,authority.profile_id,
+            authority.provider,authority.binding_generation,
+            authority.process_generation,authority.provenance,
+            authority.recorded_at AS authority_recorded_at
+     FROM session_events event
+     LEFT JOIN session_event_provider_authorities authority
+       ON authority.session_id=event.session_id AND authority.sequence=event.sequence
+     WHERE event.session_id=? AND event.sequence=?`,
+  ).get(input.sessionId, input.messageEventSequence);
+  if (eventRow === null) {
+    const stream = z.object({ floor_sequence: positiveGenerationSchema }).strict().parse(
+      database.query("SELECT floor_sequence FROM session_event_streams WHERE session_id=?")
+        .get(input.sessionId),
+    );
+    if (stream.floor_sequence <= input.messageEventSequence) {
+      throw new Error("SESSION_SWITCH_SEED_EVENT_EVIDENCE_MISSING");
+    }
+    return;
+  }
+  const stored = z.object({
+    event_json: z.string().min(2).max(262_144),
+    recorded_at: unixMillisecondsSchema,
+    provider_account_id: providerAccountIdSchema.nullable(),
+    profile_id: profileIdSchema.nullable(),
+    provider: providerSchema.nullable(),
+    binding_generation: positiveGenerationSchema.nullable(),
+    process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    provenance: z.string().min(1).max(80).nullable(),
+    authority_recorded_at: unixMillisecondsSchema.nullable(),
+  }).strict().parse(eventRow);
+  const event = sessionEventSchema.parse(JSON.parse(stored.event_json) as unknown);
+  const eventAuthority = providerAccountAuthoritySchema.parse({
+    providerAccountId: stored.provider_account_id,
+    profileId: stored.profile_id,
+    provider: stored.provider,
+    bindingGeneration: stored.binding_generation,
+    processGeneration: stored.process_generation,
+  });
+  if (
+    JSON.stringify(event) !== stored.event_json
+    || digestJson(event) !== input.messageEventDigest
+    || event.sessionId !== input.sessionId
+    || event.streamEpoch !== input.transcript.streamEpoch
+    || event.sequence !== input.messageEventSequence
+    || event.recordedAt !== input.recordedAt
+    || stored.recorded_at !== input.recordedAt
+    || event.accountId !== input.seedAuthority.authority.profileId
+    || event.providerGeneration !== input.seedAuthority.authority.processGeneration
+    || event.providerConnectionId !== null
+    || event.body.type !== "user_message"
+    || event.body.actor !== "provider_switch"
+    || !sameProviderAccountAuthority(eventAuthority, input.seedAuthority.authority)
+    || stored.provenance !== "session_event"
+    || stored.authority_recorded_at !== input.recordedAt
+  ) throw new Error("SESSION_SWITCH_SEED_EVENT_EVIDENCE_MISMATCH");
+};
+
+const assertSessionSwitchSeedAuthorityLineage = (
+  database: Database,
+  input: Readonly<{
+    sessionId: SessionId;
+    targetAuthority: ProviderAccountAuthority;
+    rebind: NonNullable<SessionSwitchRecord["rebind"]>;
+    seedAuthority: NonNullable<SessionSwitchRecord["seedAuthority"]>;
+  }>,
+): void => {
+  const { targetAuthority, rebind, seedAuthority } = input;
+  if (seedAuthority.provenance === "rebound") {
+    if (
+      seedAuthority.authorityRevision !== rebind.authorityRevision
+      || !sameProviderAccountAuthority(seedAuthority.authority, targetAuthority)
+    ) throw new Error("SESSION_SWITCH_SEED_AUTHORITY_LINEAGE_MISMATCH");
+    return;
+  }
+  if (
+    !sameProviderAccountBinding(seedAuthority.authority, targetAuthority)
+    || seedAuthority.authority.processGeneration === targetAuthority.processGeneration
+    || seedAuthority.authorityRevision <= rebind.authorityRevision
+  ) throw new Error("SESSION_SWITCH_SEED_AUTHORITY_LINEAGE_MISMATCH");
+  const lineage = database.query(
+    `SELECT * FROM session_provider_authority_successors
+     WHERE session_id=? AND from_authority_revision>=? AND to_authority_revision<=?
+     ORDER BY from_authority_revision`,
+  ).all(
+    input.sessionId,
+    rebind.authorityRevision,
+    seedAuthority.authorityRevision,
+  ).map((row) => sessionProviderAuthoritySuccessorRowSchema.parse(row));
+  if (lineage.length !== seedAuthority.authorityRevision - rebind.authorityRevision) {
+    throw new Error("SESSION_SWITCH_SEED_AUTHORITY_LINEAGE_MISMATCH");
+  }
+  let expectedRevision = rebind.authorityRevision;
+  let expectedProcessGeneration = targetAuthority.processGeneration;
+  for (const edge of lineage) {
+    if (
+      edge.from_authority_revision !== expectedRevision
+      || edge.to_authority_revision !== expectedRevision + 1
+      || edge.from_provider_account_id !== targetAuthority.providerAccountId
+      || edge.to_provider_account_id !== targetAuthority.providerAccountId
+      || edge.from_profile_id !== targetAuthority.profileId
+      || edge.to_profile_id !== targetAuthority.profileId
+      || edge.from_provider !== targetAuthority.provider
+      || edge.to_provider !== targetAuthority.provider
+      || edge.from_binding_generation !== targetAuthority.bindingGeneration
+      || edge.to_binding_generation !== targetAuthority.bindingGeneration
+      || edge.from_process_generation !== expectedProcessGeneration
+      || edge.to_process_generation <= edge.from_process_generation
+      || edge.from_routing_provenance !== "explicit"
+      || edge.to_routing_provenance !== "explicit"
+      || edge.from_applied_pointer_revision !== null
+      || edge.to_applied_pointer_revision !== null
+    ) throw new Error("SESSION_SWITCH_SEED_AUTHORITY_LINEAGE_MISMATCH");
+    expectedRevision = edge.to_authority_revision;
+    expectedProcessGeneration = edge.to_process_generation;
+  }
+  if (
+    expectedRevision !== seedAuthority.authorityRevision
+    || expectedProcessGeneration !== seedAuthority.authority.processGeneration
+  ) throw new Error("SESSION_SWITCH_SEED_AUTHORITY_LINEAGE_MISMATCH");
+};
+
+const mapSessionSwitch = (database: Database, value: unknown): SessionSwitchRecord => {
+  const row = sessionSwitchRowSchema.parse(value);
+  const rawRequest = sessionSwitchRawRequestSchema.parse(
+    JSON.parse(row.raw_request_json) as unknown,
+  );
+  if (
+    JSON.stringify(rawRequest) !== row.raw_request_json
+    || digestJson(rawRequest) !== row.request_digest
+    || row.idempotency_key !== row.request_key
+  ) throw new Error("SESSION_SWITCH_REQUEST_EVIDENCE_MISMATCH");
+  const expectedMutationState: MutationState = row.phase === "seed_settled"
+    ? "applied"
+    : row.phase === "reconciliation_required" || row.phase === "abandoned"
+      ? "ambiguous"
+      : row.phase === "failed"
+        ? "failed"
+        : row.phase === "cancelled"
+          ? "cancelled"
+          : row.phase === "prepared" ? "prepared" : "effect_started";
+  if (row.mutation_state !== expectedMutationState) {
+    throw new Error("SESSION_SWITCH_MUTATION_STATE_MISMATCH");
+  }
+  if (
+    ((row.phase === "prepared" || row.phase === "cancelled"
+      || expectedMutationState === "effect_started") && row.mutation_result_json !== null)
+    || ((row.phase === "reconciliation_required" || row.phase === "abandoned")
+      && row.mutation_result_json !== JSON.stringify({ code: row.diagnostic_code }))
+  ) throw new Error("SESSION_SWITCH_MUTATION_RESULT_MISMATCH");
+  const sourceAuthority = providerAccountAuthoritySchema.parse({
+    providerAccountId: row.source_provider_account_id,
+    profileId: row.source_profile_id,
+    provider: row.source_provider,
+    bindingGeneration: row.source_binding_generation,
+    processGeneration: row.source_process_generation,
+  });
+  const targetAuthority = providerAccountAuthoritySchema.parse({
+    providerAccountId: row.target_provider_account_id,
+    profileId: row.target_profile_id,
+    provider: row.target_provider,
+    bindingGeneration: row.target_binding_generation,
+    processGeneration: row.target_process_generation,
+  });
+  if (
+    row.mutation_kind !== "session.switch"
+    || row.mutation_authority_id !== row.session_id
+    || row.mutation_authority_generation !== targetAuthority.processGeneration
+    || row.mutation_request_digest !== row.request_digest
+  ) throw new Error("SESSION_SWITCH_MUTATION_AUTHORITY_MISMATCH");
+  const mutationSourceFields = [
+    row.mutation_source_provider_account_id,
+    row.mutation_source_profile_id,
+    row.mutation_source_provider,
+    row.mutation_source_binding_generation,
+    row.mutation_source_process_generation,
+    row.mutation_source_provenance,
+  ];
+  const mutationTargetFields = [
+    row.mutation_target_provider_account_id,
+    row.mutation_target_profile_id,
+    row.mutation_target_provider,
+    row.mutation_target_binding_generation,
+    row.mutation_target_process_generation,
+    row.mutation_target_provenance,
+  ];
+  if (!allOrNone(mutationSourceFields) || !allOrNone(mutationTargetFields)) {
+    throw new Error("SESSION_SWITCH_MUTATION_PROVIDER_AUTHORITY_INCOMPLETE");
+  }
+  if (
+    row.mutation_source_provider_account_id === null
+    || row.mutation_target_provider_account_id === null
+  ) throw new Error("SESSION_SWITCH_MUTATION_PROVIDER_AUTHORITY_MISSING");
+  const mutationSourceAuthority = providerAccountAuthoritySchema.parse({
+    providerAccountId: row.mutation_source_provider_account_id,
+    profileId: row.mutation_source_profile_id,
+    provider: row.mutation_source_provider,
+    bindingGeneration: row.mutation_source_binding_generation,
+    processGeneration: row.mutation_source_process_generation,
+  });
+  const mutationTargetAuthority = providerAccountAuthoritySchema.parse({
+    providerAccountId: row.mutation_target_provider_account_id,
+    profileId: row.mutation_target_profile_id,
+    provider: row.mutation_target_provider,
+    bindingGeneration: row.mutation_target_binding_generation,
+    processGeneration: row.mutation_target_process_generation,
+  });
+  if (
+    row.mutation_source_provenance !== "session_switch_source"
+    || row.mutation_target_provenance !== "session_switch_target"
+    || !sameProviderAccountAuthority(mutationSourceAuthority, sourceAuthority)
+    || !sameProviderAccountAuthority(mutationTargetAuthority, targetAuthority)
+  ) throw new Error("SESSION_SWITCH_MUTATION_PROVIDER_AUTHORITY_MISMATCH");
+  const sourceRuntimeFields = [
+    row.source_runtime_row_source_kind,
+    row.source_runtime_row_source_id,
+    row.source_runtime_row_profile_id,
+    row.source_runtime_row_process_generation,
+    row.source_runtime_row_observed_at,
+    row.source_runtime_row_profile_json,
+    row.source_runtime_row_recorded_at,
+    row.source_runtime_authority_provider_account_id,
+    row.source_runtime_authority_profile_id,
+    row.source_runtime_authority_provider,
+    row.source_runtime_authority_binding_generation,
+    row.source_runtime_authority_process_generation,
+    row.source_runtime_authority_provenance,
+    row.source_runtime_authority_recorded_at,
+  ];
+  if (!allOrNone(sourceRuntimeFields) || row.source_runtime_row_profile_json === null) {
+    throw new Error("SESSION_SWITCH_SOURCE_RUNTIME_EVIDENCE_INCOMPLETE");
+  }
+  const sourceRuntimeProfile = reviewedRuntimeProfileSchema.parse(
+    JSON.parse(row.source_runtime_row_profile_json) as unknown,
+  );
+  const sourceRuntimeAuthority = providerAccountAuthoritySchema.parse({
+    providerAccountId: row.source_runtime_authority_provider_account_id,
+    profileId: row.source_runtime_authority_profile_id,
+    provider: row.source_runtime_authority_provider,
+    bindingGeneration: row.source_runtime_authority_binding_generation,
+    processGeneration: row.source_runtime_authority_process_generation,
+  });
+  if (
+    JSON.stringify(sourceRuntimeProfile) !== row.source_runtime_row_profile_json
+    || digestJson(sourceRuntimeProfile) !== row.source_runtime_profile_digest
+    || sourceRuntimeProfile.profileId !== row.source_runtime_row_profile_id
+    || sourceRuntimeProfile.processGeneration !== row.source_runtime_row_process_generation
+    || sourceRuntimeProfile.observedAt !== row.source_runtime_row_observed_at
+    || row.source_runtime_row_recorded_at !== row.source_runtime_authority_recorded_at
+    || reviewedRuntimeProfileProvider(sourceRuntimeProfile) !== sourceAuthority.provider
+    || !sameProviderAccountAuthority(sourceRuntimeAuthority, sourceAuthority)
+    || row.source_runtime_authority_provenance !== "runtime_profile"
+  ) throw new Error("SESSION_SWITCH_SOURCE_RUNTIME_EVIDENCE_MISMATCH");
+  const transcript = sessionSwitchTranscriptPinSchema.parse({
+    streamEpoch: row.stream_epoch,
+    floorSequence: row.floor_sequence,
+    afterSequenceExclusive: row.after_sequence_exclusive,
+    throughSequenceInclusive: row.through_sequence_inclusive,
+    acceptedHeadSequence: row.accepted_head_sequence,
+    rendererVersion: row.renderer_version,
+    rendererLimit: row.renderer_limit,
+    transcriptDigest: row.transcript_digest,
+    seedDigest: row.seed_digest,
+    seedIncludedRecords: row.seed_included_records,
+    seedOmittedRecords: row.seed_omitted_records,
+    seedClientMessageId: row.seed_client_message_id,
+  });
+  if (
+    row.plan_digest === null
+    || row.plan_source_provider_thread_id !== row.source_provider_thread_id
+    || row.plan_recorded_at !== row.created_at
+    || row.plan_digest !== sessionSwitchPlanDigest({
+      attemptId: row.attempt_id,
+      requestKey: row.request_key,
+      requestDigest: row.request_digest,
+      rawRequest,
+      sessionId: row.session_id,
+      sourceAuthority,
+      targetAuthority,
+      originalSessionRevision: row.original_session_revision,
+      originalAuthorityRevision: row.original_authority_revision,
+      sourceProviderThreadId: row.source_provider_thread_id,
+      sourcePreset: row.source_preset,
+      targetPreset: row.target_preset,
+      sourceRuntimeProfileRevision: row.source_runtime_profile_revision,
+      sourceRuntimeProfileDigest: row.source_runtime_profile_digest,
+      sourceRuntimeProfileSourceKind: z.enum(runtimeProfileSourceKindSchema.options)
+        .parse(row.source_runtime_row_source_kind),
+      sourceRuntimeProfileSourceId: z.string().min(1).max(200)
+        .parse(row.source_runtime_row_source_id),
+      sourceRuntimeProfileRecordedAt: unixMillisecondsSchema
+        .parse(row.source_runtime_row_recorded_at),
+      transcript,
+      createdAt: row.created_at,
+    })
+  ) throw new Error("SESSION_SWITCH_PLAN_ANCHOR_MISMATCH");
+  const targetFields = [
+    row.target_provider_thread_id,
+    row.target_state,
+    row.target_runtime_profile_json,
+    row.target_runtime_profile_digest,
+    row.target_recorded_at,
+    row.target_result_digest,
+    row.target_anchor_recorded_at,
+  ];
+  if (!allOrNone(targetFields)) throw new Error("SESSION_SWITCH_TARGET_RECEIPT_INCOMPLETE");
+  let targetStart: SessionSwitchRecord["targetStart"] = null;
+  if (row.target_provider_thread_id !== null) {
+    const runtimeProfileJson = z.string().parse(row.target_runtime_profile_json);
+    const runtimeProfile = reviewedRuntimeProfileSchema.parse(
+      JSON.parse(runtimeProfileJson) as unknown,
+    );
+    if (
+      JSON.stringify(runtimeProfile) !== runtimeProfileJson
+      || sessionSwitchTargetStartResultDigest({
+        providerThreadId: row.target_provider_thread_id,
+        state: z.enum(["active", "idle", "terminal"]).parse(row.target_state),
+        activeTurnId: row.target_active_turn_id,
+        providerUpdatedAt: row.target_provider_updated_at,
+        runtimeProfile,
+      }) !== row.target_result_digest
+      || digestJson(runtimeProfile) !== row.target_runtime_profile_digest
+      || row.target_anchor_recorded_at !== row.target_recorded_at
+      || runtimeProfile.profileId !== targetAuthority.profileId
+      || runtimeProfile.processGeneration !== targetAuthority.processGeneration
+      || reviewedRuntimeProfileProvider(runtimeProfile) !== targetAuthority.provider
+    ) throw new Error("SESSION_SWITCH_TARGET_RUNTIME_PROFILE_MISMATCH");
+    targetStart = {
+      providerThreadId: row.target_provider_thread_id,
+      state: z.enum(["active", "idle", "terminal"]).parse(row.target_state),
+      activeTurnId: row.target_active_turn_id,
+      providerUpdatedAt: row.target_provider_updated_at,
+      runtimeProfile,
+      recordedAt: unixMillisecondsSchema.parse(row.target_recorded_at),
+    };
+  }
+  const releaseFields = [
+    row.source_release_provider_thread_id,
+    row.source_release_status,
+    row.source_release_recorded_at,
+    row.source_release_evidence_digest,
+    row.source_release_anchor_recorded_at,
+  ];
+  if (!allOrNone(releaseFields)) throw new Error("SESSION_SWITCH_RELEASE_RECEIPT_INCOMPLETE");
+  if (
+    row.source_release_provider_thread_id !== null
+    && row.source_release_provider_thread_id !== row.source_provider_thread_id
+  ) throw new Error("SESSION_SWITCH_RELEASE_RECEIPT_MISMATCH");
+  const sourceRelease = row.source_release_status === null ? null : {
+    status: row.source_release_status,
+    recordedAt: unixMillisecondsSchema.parse(row.source_release_recorded_at),
+  };
+  if (sourceRelease !== null && (
+    row.source_release_anchor_recorded_at !== sourceRelease.recordedAt
+    || row.source_release_evidence_digest !== sessionSwitchSourceReleaseEvidenceDigest({
+      attemptId: row.attempt_id,
+      requestDigest: row.request_digest,
+      planDigest: sha256Schema.parse(row.plan_digest),
+      sourceAuthority,
+      providerThreadId: row.source_provider_thread_id,
+      status: sourceRelease.status,
+      recordedAt: sourceRelease.recordedAt,
+    })
+  )) throw new Error("SESSION_SWITCH_RELEASE_ANCHOR_MISMATCH");
+  const reboundFields = [
+    row.rebound_session_revision,
+    row.rebound_authority_revision,
+    row.rebound_runtime_profile_revision,
+    row.switch_event_sequence,
+    row.rebound_recorded_at,
+    row.rebound_evidence_digest,
+    row.rebound_anchor_recorded_at,
+  ];
+  if (!allOrNone(reboundFields)) throw new Error("SESSION_SWITCH_REBIND_RECEIPT_INCOMPLETE");
+  const rebind = row.rebound_session_revision === null ? null : {
+    sessionRevision: row.rebound_session_revision,
+    authorityRevision: z.number().int().positive().parse(row.rebound_authority_revision),
+    runtimeProfileRevision: z.number().int().positive().parse(row.rebound_runtime_profile_revision),
+    switchEventSequence: z.number().int().positive().parse(row.switch_event_sequence),
+    recordedAt: unixMillisecondsSchema.parse(row.rebound_recorded_at),
+  };
+  if (
+    rebind !== null
+    && (
+      targetStart === null
+      || sourceRelease === null
+      || targetStart.state !== "idle"
+      || targetStart.activeTurnId !== null
+      || rebind.sessionRevision !== row.original_session_revision + 1
+      || rebind.authorityRevision !== row.original_authority_revision + 1
+    )
+  ) throw new Error("SESSION_SWITCH_REBIND_RECEIPT_MISMATCH");
+  if (rebind !== null) {
+    assertSessionSwitchRebindEvidence(database, {
+      attemptId: row.attempt_id,
+      planDigest: sha256Schema.parse(row.plan_digest),
+      sessionId: row.session_id,
+      sourceAuthority,
+      targetAuthority,
+      sourcePreset: row.source_preset,
+      targetPreset: row.target_preset,
+      transcript,
+      targetStart: targetStart as NonNullable<SessionSwitchRecord["targetStart"]>,
+      sourceRelease: sourceRelease as NonNullable<SessionSwitchRecord["sourceRelease"]>,
+      rebind,
+      anchorDigest: sha256Schema.parse(row.rebound_evidence_digest),
+      anchorRecordedAt: unixMillisecondsSchema.parse(row.rebound_anchor_recorded_at),
+    });
+  }
+  const seedAuthorityFields = [
+    row.seed_provider_account_id,
+    row.seed_profile_id,
+    row.seed_provider,
+    row.seed_binding_generation,
+    row.seed_process_generation,
+    row.seed_authority_revision,
+    row.seed_authority_provenance,
+    row.seed_authority_recorded_at,
+  ];
+  if (!allOrNone(seedAuthorityFields)) throw new Error("SESSION_SWITCH_SEED_AUTHORITY_INCOMPLETE");
+  const seedAuthority = row.seed_provider_account_id === null ? null : {
+    authority: providerAccountAuthoritySchema.parse({
+      providerAccountId: row.seed_provider_account_id,
+      profileId: row.seed_profile_id,
+      provider: row.seed_provider,
+      bindingGeneration: row.seed_binding_generation,
+      processGeneration: row.seed_process_generation,
+    }),
+    authorityRevision: z.number().int().positive().parse(row.seed_authority_revision),
+    provenance: z.enum(["rebound", "successor_lineage"]).parse(row.seed_authority_provenance),
+    recordedAt: unixMillisecondsSchema.parse(row.seed_authority_recorded_at),
+  };
+  if (seedAuthority !== null) {
+    if (rebind === null) throw new Error("SESSION_SWITCH_SEED_AUTHORITY_LINEAGE_MISMATCH");
+    assertSessionSwitchSeedAuthorityLineage(database, {
+      sessionId: row.session_id,
+      targetAuthority,
+      rebind,
+      seedAuthority,
+    });
+  }
+  const seedFields = [
+    row.seed_outcome,
+    row.seed_receipt_digest,
+    row.seed_public_receipt_json,
+    row.seed_recorded_at,
+    row.seed_evidence_digest,
+    row.seed_anchor_recorded_at,
+  ];
+  if (!allOrNone(seedFields)) throw new Error("SESSION_SWITCH_SEED_RECEIPT_INCOMPLETE");
+  let seed: SessionSwitchRecord["seed"] = null;
+  if (row.seed_outcome !== null) {
+    const publicReceiptJson = z.string().parse(row.seed_public_receipt_json);
+    const publicReceipt = sessionSwitchStoredPublicReceiptSchema.parse(
+      JSON.parse(publicReceiptJson) as unknown,
+    );
+    if (JSON.stringify(publicReceipt) !== publicReceiptJson) {
+      throw new Error("SESSION_SWITCH_SEED_PUBLIC_RECEIPT_NONCANONICAL");
+    }
+    const publicSession = parseSessionSwitchPublicSession(publicReceipt.session);
+    const expectedSessionRevision = row.seed_outcome === "accepted"
+      ? (rebind?.sessionRevision ?? 0) + 1
+      : rebind?.sessionRevision;
+    if (
+      targetStart === null
+      || rebind === null
+      || publicSession.id !== row.session_id
+      || publicSession.profileId !== targetAuthority.profileId
+      || publicSession.provider !== targetAuthority.provider
+      || publicSession.preset !== row.target_preset
+      || publicSession.providerThreadId !== targetStart.providerThreadId
+      || publicSession.revision !== expectedSessionRevision
+      || publicReceipt.idempotencyKey !== row.request_key
+      || publicReceipt.from.provider !== sourceAuthority.provider
+      || publicReceipt.from.preset !== row.source_preset
+      || publicReceipt.from.account !== sourceAuthority.profileId
+      || publicReceipt.to.provider !== targetAuthority.provider
+      || publicReceipt.to.preset !== row.target_preset
+      || publicReceipt.to.account !== targetAuthority.profileId
+      || publicReceipt.seed.digest !== row.seed_digest
+      || publicReceipt.seed.includedRecords !== row.seed_included_records
+      || publicReceipt.seed.omittedRecords !== row.seed_omitted_records
+      || publicReceipt.transcriptDigest !== row.transcript_digest
+    ) throw new Error("SESSION_SWITCH_SEED_PUBLIC_RECEIPT_MISMATCH");
+    let expectedReceiptDigest: string;
+    let seedRuntimeProfile: ReviewedRuntimeProfile | null = null;
+    if (row.seed_outcome === "accepted") {
+      if (
+        row.seed_failure_code !== null
+        || row.seed_turn_id === null
+        || row.seed_turn_status === null
+        || row.seed_runtime_profile_revision === null
+        || row.seed_runtime_profile_json === null
+        || !publicReceipt.seed.delivered
+        || publicReceipt.seed.failureCode !== undefined
+        || publicReceipt.turnId !== row.seed_turn_id
+        || publicSession.state !== (row.seed_turn_status === "inProgress" ? "active" : "idle")
+        || (row.seed_turn_status === "inProgress"
+          ? publicSession.activeTurnId !== row.seed_turn_id
+          : publicSession.activeTurnId !== undefined)
+      ) throw new Error("SESSION_SWITCH_SEED_PUBLIC_RECEIPT_MISMATCH");
+      const runtimeProfile = reviewedRuntimeProfileSchema.parse(
+        JSON.parse(row.seed_runtime_profile_json) as unknown,
+      );
+      seedRuntimeProfile = runtimeProfile;
+      if (
+        seedAuthority === null
+        || runtimeProfile.profileId !== seedAuthority.authority.profileId
+        || runtimeProfile.processGeneration !== seedAuthority.authority.processGeneration
+        || reviewedRuntimeProfileProvider(runtimeProfile) !== seedAuthority.authority.provider
+      ) throw new Error("SESSION_SWITCH_SEED_RUNTIME_PROFILE_AUTHORITY_MISMATCH");
+      expectedReceiptDigest = digestJson({
+        domain: "hra:session-switch-seed-accepted:v1",
+        turnId: row.seed_turn_id,
+        turnStatus: row.seed_turn_status,
+        runtimeProfile,
+      });
+    } else {
+      if (
+        row.seed_failure_code === null
+        || row.seed_turn_id !== null
+        || row.seed_turn_status !== null
+        || row.seed_runtime_profile_revision !== null
+        || row.seed_runtime_profile_json !== null
+        || publicReceipt.seed.delivered
+        || publicReceipt.seed.failureCode !== row.seed_failure_code
+        || publicReceipt.turnId !== null
+        || publicSession.state !== "idle"
+        || publicSession.activeTurnId !== undefined
+      ) throw new Error("SESSION_SWITCH_SEED_PUBLIC_RECEIPT_MISMATCH");
+      expectedReceiptDigest = createHash("sha256")
+        .update("hra:session-switch-seed-rejected:v1\0", "utf8")
+        .update(row.seed_failure_code, "utf8")
+        .digest("hex");
+    }
+    if (
+      expectedReceiptDigest !== row.seed_receipt_digest
+      || row.mutation_result_json !== publicReceiptJson
+    ) throw new Error("SESSION_SWITCH_SEED_RECEIPT_DIGEST_MISMATCH");
+    if (seedAuthority === null) {
+      throw new Error("SESSION_SWITCH_SEED_AUTHORITY_LINEAGE_MISMATCH");
+    }
+    if (
+      (row.seed_outcome === "accepted")
+      !== (row.seed_message_event_sequence !== null && row.seed_message_event_digest !== null)
+      || (row.seed_outcome === "rejected"
+        && (row.seed_message_event_sequence !== null || row.seed_message_event_digest !== null))
+    ) throw new Error("SESSION_SWITCH_SEED_EVENT_ANCHOR_MISMATCH");
+    assertSessionSwitchSeedSettlementEvidence(database, {
+      attemptId: row.attempt_id,
+      planDigest: sha256Schema.parse(row.plan_digest),
+      sessionId: row.session_id,
+      transcript,
+      seedAuthority,
+      outcome: row.seed_outcome,
+      failureCode: row.seed_failure_code,
+      turnId: row.seed_turn_id,
+      turnStatus: row.seed_turn_status,
+      runtimeProfileRevision: row.seed_runtime_profile_revision,
+      runtimeProfile: seedRuntimeProfile,
+      receiptDigest: sha256Schema.parse(row.seed_receipt_digest),
+      publicReceipt,
+      recordedAt: unixMillisecondsSchema.parse(row.seed_recorded_at),
+      anchorDigest: sha256Schema.parse(row.seed_evidence_digest),
+      anchorRecordedAt: unixMillisecondsSchema.parse(row.seed_anchor_recorded_at),
+      messageEventSequence: row.seed_message_event_sequence,
+      messageEventDigest: row.seed_message_event_digest,
+    });
+    seed = {
+      outcome: row.seed_outcome,
+      failureCode: row.seed_failure_code,
+      turnId: row.seed_turn_id,
+      turnStatus: row.seed_turn_status,
+      runtimeProfileRevision: row.seed_runtime_profile_revision,
+      receiptDigest: sha256Schema.parse(row.seed_receipt_digest),
+      publicReceipt,
+      recordedAt: unixMillisecondsSchema.parse(row.seed_recorded_at),
+    };
+  } else if (row.seed_runtime_profile_json !== null) {
+    throw new Error("SESSION_SWITCH_SEED_RUNTIME_PROFILE_ORPHANED");
+  }
+  const noEffectFields = [
+    row.no_effect_kind,
+    row.no_effect_diagnostic_code,
+    row.no_effect_evidence_digest,
+    row.no_effect_recorded_at,
+    row.no_effect_anchor_digest,
+    row.no_effect_anchor_recorded_at,
+  ];
+  if (!allOrNone(noEffectFields)) {
+    throw new Error("SESSION_SWITCH_NO_EFFECT_RECEIPT_INCOMPLETE");
+  }
+  const noEffectPresent = row.no_effect_kind !== null;
+  if (row.phase === "failed") {
+    if (!noEffectPresent) throw new Error("SESSION_SWITCH_NO_EFFECT_PHASE_MISMATCH");
+    const diagnosticCode = z.string().parse(row.no_effect_diagnostic_code);
+    const expectedEvidenceDigest = sessionSwitchTargetNoEffectEvidenceDigest({
+      attemptId: row.attempt_id,
+      requestDigest: row.request_digest,
+      planDigest: sha256Schema.parse(row.plan_digest),
+      targetAuthority,
+      diagnosticCode,
+    });
+    if (
+      row.no_effect_kind !== "target_start"
+      || row.no_effect_evidence_digest !== expectedEvidenceDigest
+      || row.no_effect_anchor_recorded_at !== row.no_effect_recorded_at
+      || row.no_effect_anchor_digest !== sessionSwitchTargetNoEffectAnchorDigest({
+        attemptId: row.attempt_id,
+        requestDigest: row.request_digest,
+        planDigest: sha256Schema.parse(row.plan_digest),
+        targetAuthority,
+        diagnosticCode,
+        evidenceDigest: expectedEvidenceDigest,
+        recordedAt: unixMillisecondsSchema.parse(row.no_effect_recorded_at),
+      })
+      || row.diagnostic_code !== diagnosticCode
+      || row.mutation_result_json !== JSON.stringify({ code: diagnosticCode })
+    ) throw new Error("SESSION_SWITCH_NO_EFFECT_RECEIPT_MISMATCH");
+  } else if (noEffectPresent) {
+    throw new Error("SESSION_SWITCH_NO_EFFECT_PHASE_MISMATCH");
+  }
+  const reconciliationFields = [
+    row.reconciliation_from_phase,
+    row.reconciliation_evidence_depth,
+    row.reconciliation_diagnostic_code,
+    row.reconciliation_request_digest,
+    row.reconciliation_plan_digest,
+    row.reconciliation_recorded_at,
+    row.reconciliation_evidence_digest,
+    row.reconciliation_anchor_recorded_at,
+  ];
+  if (!allOrNone(reconciliationFields)) {
+    throw new Error("SESSION_SWITCH_RECONCILIATION_RECEIPT_INCOMPLETE");
+  }
+  let reconciliation: SessionSwitchReconciliationEvidence | null = null;
+  if (row.reconciliation_from_phase !== null) {
+    reconciliation = {
+      fromPhase: row.reconciliation_from_phase,
+      evidenceDepth: z.number().int().min(0).max(4)
+        .parse(row.reconciliation_evidence_depth),
+      diagnosticCode: z.string().parse(row.reconciliation_diagnostic_code),
+      requestDigest: sha256Schema.parse(row.reconciliation_request_digest),
+      planDigest: sha256Schema.parse(row.reconciliation_plan_digest),
+      recordedAt: unixMillisecondsSchema.parse(row.reconciliation_recorded_at),
+    };
+    if (
+      reconciliation.evidenceDepth
+        !== sessionSwitchReconciliationEvidenceDepth[reconciliation.fromPhase]
+      || reconciliation.diagnosticCode !== row.diagnostic_code
+      || reconciliation.requestDigest !== row.request_digest
+      || reconciliation.planDigest !== row.plan_digest
+      || row.reconciliation_anchor_recorded_at !== reconciliation.recordedAt
+      || row.reconciliation_evidence_digest !== sessionSwitchReconciliationEvidenceDigest({
+        attemptId: row.attempt_id,
+        reconciliation,
+      })
+    ) throw new Error("SESSION_SWITCH_RECONCILIATION_RECEIPT_MISMATCH");
+  }
+  const abandonFields = [
+    row.abandon_provider_account_id,
+    row.abandon_profile_id,
+    row.abandon_provider,
+    row.abandon_binding_generation,
+    row.abandon_process_generation,
+    row.abandon_authority_revision,
+    row.abandon_expected_session_revision,
+    row.abandon_terminal_session_revision,
+    row.abandon_session_json,
+    row.abandon_recorded_at,
+    row.abandon_evidence_digest,
+    row.abandon_anchor_recorded_at,
+  ];
+  if (!allOrNone(abandonFields)) {
+    throw new Error("SESSION_SWITCH_ABANDON_RECEIPT_INCOMPLETE");
+  }
+  let abandonment: SessionSwitchRecord["abandonment"] = null;
+  if (row.abandon_provider_account_id !== null) {
+    const sessionJson = z.string().parse(row.abandon_session_json);
+    const session = parseSessionSwitchPublicSession(JSON.parse(sessionJson) as unknown);
+    if (JSON.stringify(session) !== sessionJson) {
+      throw new Error("SESSION_SWITCH_ABANDON_RECEIPT_NONCANONICAL");
+    }
+    abandonment = {
+      authority: providerAccountAuthoritySchema.parse({
+        providerAccountId: row.abandon_provider_account_id,
+        profileId: row.abandon_profile_id,
+        provider: row.abandon_provider,
+        bindingGeneration: row.abandon_binding_generation,
+        processGeneration: row.abandon_process_generation,
+      }),
+      authorityRevision: positiveGenerationSchema.parse(row.abandon_authority_revision),
+      expectedSessionRevision: positiveGenerationSchema.parse(
+        row.abandon_expected_session_revision,
+      ),
+      terminalSessionRevision: positiveGenerationSchema.parse(
+        row.abandon_terminal_session_revision,
+      ),
+      session,
+      recordedAt: unixMillisecondsSchema.parse(row.abandon_recorded_at),
+    };
+  }
+  if (
+    abandonment !== null
+    && (
+      abandonment.session.state !== "terminal"
+      || abandonment.session.revision !== abandonment.terminalSessionRevision
+      || abandonment.terminalSessionRevision !== abandonment.expectedSessionRevision + 1
+      || abandonment.session.profileId !== abandonment.authority.profileId
+      || abandonment.session.provider !== abandonment.authority.provider
+    )
+  ) throw new Error("SESSION_SWITCH_ABANDON_RECEIPT_MISMATCH");
+  if (abandonment !== null) {
+    if (reconciliation === null) {
+      throw new Error("SESSION_SWITCH_ABANDON_RECONCILIATION_MISSING");
+    }
+    const expectedAbandonAuthority = seedAuthority?.authority
+      ?? (rebind === null ? sourceAuthority : targetAuthority);
+    const expectedAbandonAuthorityRevision = seedAuthority?.authorityRevision
+      ?? rebind?.authorityRevision
+      ?? row.original_authority_revision;
+    const expectedAbandonSessionRevision = (
+      rebind?.sessionRevision ?? row.original_session_revision
+    ) + 1;
+    if (
+      !sameProviderAccountAuthority(abandonment.authority, expectedAbandonAuthority)
+      || abandonment.authorityRevision !== expectedAbandonAuthorityRevision
+      || abandonment.expectedSessionRevision !== expectedAbandonSessionRevision
+      || abandonment.session.providerThreadId !== (
+        rebind === null ? row.source_provider_thread_id : targetStart?.providerThreadId
+      )
+      || abandonment.session.preset !== (
+        rebind === null ? row.source_preset : row.target_preset
+      )
+      || row.abandon_anchor_recorded_at !== abandonment.recordedAt
+      || row.abandon_evidence_digest !== sessionSwitchAbandonEvidenceDigest({
+        attemptId: row.attempt_id,
+        planDigest: sha256Schema.parse(row.plan_digest),
+        reconciliation,
+        authority: abandonment.authority,
+        authorityRevision: abandonment.authorityRevision,
+        expectedSessionRevision: abandonment.expectedSessionRevision,
+        terminalSessionRevision: abandonment.terminalSessionRevision,
+        session: abandonment.session,
+        recordedAt: abandonment.recordedAt,
+      })
+    ) throw new Error("SESSION_SWITCH_ABANDON_RECEIPT_MISMATCH");
+  }
+  const resolutionFields = [
+    row.resolution_kind,
+    row.resolution_evidence_json,
+    row.resolution_receipt_json,
+    row.resolution_created_at,
+  ];
+  if (!allOrNone(resolutionFields)) {
+    throw new Error("SESSION_SWITCH_ABANDON_RESOLUTION_INCOMPLETE");
+  }
+  const resolutionPresent = row.resolution_kind !== null;
+  if (resolutionPresent !== (row.phase === "abandoned")) {
+    throw new Error("SESSION_SWITCH_ABANDON_RESOLUTION_PHASE_MISMATCH");
+  }
+  if (abandonment !== null) {
+    if (
+      row.resolution_kind !== "abandoned"
+      || row.resolution_evidence_json !== JSON.stringify({
+        source: "session_switch_abandon",
+        providerEffectRetried: false,
+        providerStateDeleted: false,
+      })
+      || row.resolution_receipt_json !== JSON.stringify({
+        sessionId: row.session_id,
+        terminalSessionRevision: abandonment.terminalSessionRevision,
+      })
+      || row.resolution_created_at !== abandonment.recordedAt
+    ) throw new Error("SESSION_SWITCH_ABANDON_RESOLUTION_MISMATCH");
+  }
+  assertSessionSwitchEvidenceMatrix({
+    phase: row.phase,
+    cumulative: [
+      targetStart !== null,
+      sourceRelease !== null,
+      rebind !== null,
+      seedAuthority !== null,
+      seed !== null,
+    ],
+    noEffect: noEffectPresent,
+    abandonment: abandonment !== null,
+    reconciliation,
+  });
+  return {
+    attemptId: row.attempt_id,
+    idempotencyKey: row.request_key,
+    requestDigest: row.request_digest,
+    rawRequest,
+    sessionId: row.session_id,
+    phase: row.phase,
+    sourceAuthority,
+    targetAuthority,
+    originalSessionRevision: row.original_session_revision,
+    originalAuthorityRevision: row.original_authority_revision,
+    sourceProviderThreadId: row.source_provider_thread_id,
+    sourcePreset: row.source_preset,
+    targetPreset: row.target_preset,
+    sourceRuntimeProfileRevision: row.source_runtime_profile_revision,
+    sourceRuntimeProfileDigest: row.source_runtime_profile_digest,
+    sourceRuntimeProfileSourceKind: z.enum(runtimeProfileSourceKindSchema.options)
+      .parse(row.source_runtime_row_source_kind),
+    sourceRuntimeProfileSourceId: z.string().min(1).max(200)
+      .parse(row.source_runtime_row_source_id),
+    sourceRuntimeProfileRecordedAt: unixMillisecondsSchema
+      .parse(row.source_runtime_row_recorded_at),
+    transcript,
+    targetStart,
+    sourceRelease,
+    rebind,
+    seedAuthority,
+    seed,
+    abandonment,
+    diagnosticCode: row.diagnostic_code,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const insertSessionProviderAuthoritySuccessor = (
+  database: Database,
+  input: Readonly<{
+    sessionId: SessionId;
+    targetAuthority: ProviderAccountAuthority;
+    targetRoutingProvenance: SessionRoutingProvenance;
+    targetAppliedPointerRevision: number | null;
+    transitionKind: "legacy_switch" | "provider_restart" | "session_switch";
+    transitionId: string;
+    recordedAt: number;
+  }>,
+): SessionProviderAuthority => {
+  const current = sessionProviderAuthorityRowSchema.parse(database.query(
+    "SELECT * FROM session_provider_authorities WHERE session_id=?",
+  ).get(sessionIdSchema.parse(input.sessionId)));
+  const target = providerAccountAuthoritySchema.parse(input.targetAuthority);
+  const targetRoutingProvenance = sessionRoutingProvenanceSchema.parse(
+    input.targetRoutingProvenance,
+  );
+  const targetAppliedPointerRevision = input.targetAppliedPointerRevision === null
+    ? null
+    : positiveGenerationSchema.parse(input.targetAppliedPointerRevision);
+  const transitionId = z.string().min(1).max(200).parse(input.transitionId);
+  const recordedAt = unixMillisecondsSchema.parse(input.recordedAt);
+  database.query(
+    `INSERT INTO session_provider_authority_successors(
+       session_id,from_authority_revision,to_authority_revision,
+       from_provider_account_id,from_profile_id,from_provider,
+       from_binding_generation,from_process_generation,
+       from_routing_provenance,from_applied_pointer_revision,
+       to_provider_account_id,to_profile_id,to_provider,
+       to_binding_generation,to_process_generation,
+       to_routing_provenance,to_applied_pointer_revision,
+       transition_kind,transition_id,recorded_at
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    current.session_id,
+    current.authority_revision,
+    current.authority_revision + 1,
+    current.provider_account_id,
+    current.profile_id,
+    current.provider,
+    current.binding_generation,
+    current.process_generation,
+    current.routing_provenance,
+    current.applied_pointer_revision,
+    target.providerAccountId,
+    target.profileId,
+    target.provider,
+    target.bindingGeneration,
+    target.processGeneration,
+    targetRoutingProvenance,
+    targetAppliedPointerRevision,
+    input.transitionKind,
+    transitionId,
+    recordedAt,
+  );
+  return {
+    sessionId: current.session_id,
+    providerAccountId: current.provider_account_id,
+    profileId: current.profile_id,
+    provider: current.provider,
+    bindingGeneration: current.binding_generation,
+    processGeneration: current.process_generation,
+    authorityRevision: current.authority_revision,
+    routingProvenance: current.routing_provenance,
+    appliedPointerRevision: current.applied_pointer_revision,
+    createdAt: current.created_at,
+  };
+};
+
 const switchPhaseByStage: Readonly<Record<DesktopSwitchStage, z.infer<typeof desktopSwitchPhaseSchema>>> = {
   prepared: "prepared",
   "quit-requested": "quit_started",
@@ -7385,6 +11211,36 @@ export class ProviderUsageTurnNotBoundError extends Error {
   constructor() {
     super("PROVIDER_USAGE_TURN_NOT_BOUND");
     this.name = "ProviderUsageTurnNotBoundError";
+  }
+}
+
+export type SessionSwitchStoreErrorCode =
+  | "IDEMPOTENCY_CONFLICT"
+  | "SESSION_SWITCH_NOT_FOUND"
+  | "SESSION_SWITCH_PHASE_CONFLICT"
+  | "SESSION_SWITCH_REQUEST_CONFLICT"
+  | "SESSION_SWITCH_AUTHORITY_CONFLICT"
+  | "SESSION_SWITCH_SESSION_REVISION_STALE"
+  | "SESSION_SWITCH_AUTHORITY_REVISION_STALE"
+  | "SESSION_SWITCH_SESSION_TERMINAL"
+  | "SESSION_SWITCH_RECOVERY_REQUIRED"
+  | "SESSION_SWITCH_ACTIVE_TURN"
+  | "SESSION_SWITCH_QUEUE_UNSETTLED"
+  | "SESSION_SWITCH_INTERACTION_UNSETTLED"
+  | "SESSION_SWITCH_ALREADY_OPEN"
+  | "SESSION_SWITCH_NOOP"
+  | "SESSION_SWITCH_TRANSCRIPT_STALE"
+  | "SESSION_SWITCH_RUNTIME_PROFILE_STALE"
+  | "SESSION_SWITCH_SOURCE_AUTHORITY_STALE"
+  | "SESSION_SWITCH_TARGET_AUTHORITY_STALE"
+  | "SESSION_SWITCH_SEED_AUTHORITY_UNPROVED"
+  | "SESSION_SWITCH_RECOVERY_CORRUPT"
+  | "SESSION_SWITCH_STORAGE_FENCED";
+
+export class SessionSwitchStoreError extends Error {
+  constructor(readonly code: SessionSwitchStoreErrorCode, cause?: unknown) {
+    super(code, cause === undefined ? undefined : { cause });
+    this.name = "SessionSwitchStoreError";
   }
 }
 
@@ -7461,6 +11317,7 @@ export class StateStore {
       assertSessionTaskSchema(this.#database);
       assertProviderAccountAuthority(this.#database);
       assertSchemaVersion36ProviderUsage(this.#database);
+      assertSchemaVersion37SessionSwitch(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
@@ -8876,6 +12733,7 @@ export class StateStore {
       provider: parsed.provider,
       bindingGeneration: parsed.binding_generation,
       processGeneration: parsed.process_generation,
+      authorityRevision: parsed.authority_revision,
       routingProvenance: parsed.routing_provenance,
       appliedPointerRevision: parsed.applied_pointer_revision,
       createdAt: parsed.created_at,
@@ -8927,10 +12785,2129 @@ export class StateStore {
       provider: parsed.provider,
       bindingGeneration: parsed.binding_generation,
       processGeneration: parsed.process_generation,
+      authorityRevision: parsed.authority_revision,
       routingProvenance: parsed.routing_provenance,
       appliedPointerRevision: parsed.applied_pointer_revision,
       createdAt: parsed.created_at,
     };
+  }
+
+  prepareSessionSwitch(input: Readonly<{
+    idempotencyKey: string;
+    rawRequest: SessionSwitchRawRequest;
+    sessionId: SessionId;
+    sourceAuthority: ProviderAccountAuthority;
+    targetAuthority: ProviderAccountAuthority;
+    expectedSessionRevision: number;
+    expectedAuthorityRevision: number;
+    sourcePreset: Preset;
+    targetPreset: Preset;
+    sourceRuntimeProfileRevision: number;
+    transcript: SessionSwitchTranscriptPin;
+  }>): Readonly<{ status: "prepared" | "replayed"; switch: SessionSwitchRecord }> {
+    const idempotencyKey = z.string().uuid().parse(input.idempotencyKey);
+    const rawRequest = sessionSwitchRawRequestSchema.parse(input.rawRequest);
+    const rawRequestJson = JSON.stringify(rawRequest);
+    const requestDigest = digestJson(rawRequest);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const sourceAuthority = providerAccountAuthoritySchema.parse(input.sourceAuthority);
+    const targetAuthority = providerAccountAuthoritySchema.parse(input.targetAuthority);
+    const expectedSessionRevision = positiveGenerationSchema.parse(
+      input.expectedSessionRevision,
+    );
+    const expectedAuthorityRevision = positiveGenerationSchema.parse(
+      input.expectedAuthorityRevision,
+    );
+    const sourcePreset = presetSchema.parse(input.sourcePreset);
+    const targetPreset = presetSchema.parse(input.targetPreset);
+    assertPresetSupportedByProvider(sourceAuthority.provider, sourcePreset);
+    assertPresetSupportedByProvider(targetAuthority.provider, targetPreset);
+    const sourceRuntimeProfileRevision = positiveGenerationSchema.parse(
+      input.sourceRuntimeProfileRevision,
+    );
+    const transcript = sessionSwitchTranscriptPinSchema.parse(input.transcript);
+
+    // The global idempotency namespace is consulted before current-state and
+    // no-op validation. A settled attempt remains replayable after later
+    // session metadata or provider bindings change.
+    const existing = this.readSessionSwitchByIdempotencyKey(idempotencyKey);
+    if (existing !== null) {
+      if (
+        existing.requestDigest !== requestDigest
+        || JSON.stringify(existing.rawRequest) !== rawRequestJson
+        || existing.sessionId !== sessionId
+        || !sameProviderAccountAuthority(existing.sourceAuthority, sourceAuthority)
+        || !sameProviderAccountAuthority(existing.targetAuthority, targetAuthority)
+        || existing.originalSessionRevision !== expectedSessionRevision
+        || existing.originalAuthorityRevision !== expectedAuthorityRevision
+        || existing.sourcePreset !== sourcePreset
+        || existing.targetPreset !== targetPreset
+        || existing.sourceRuntimeProfileRevision !== sourceRuntimeProfileRevision
+        || JSON.stringify(existing.transcript) !== JSON.stringify(transcript)
+      ) throw new SessionSwitchStoreError("IDEMPOTENCY_CONFLICT");
+      return { status: "replayed", switch: existing };
+    }
+
+    let attemptId: AttemptId | undefined;
+    const prepare = this.#database.transaction(() => {
+      const session = mapSession(this.#database.query(
+        "SELECT * FROM sessions WHERE id=?",
+      ).get(sessionId));
+      let requestedSessionId: SessionId;
+      let requestedTargetProfileId: ProfileId;
+      try {
+        requestedSessionId = this.requireSession(rawRequest.session).id;
+        requestedTargetProfileId = rawRequest.account === null
+          ? sourceAuthority.profileId
+          : this.requireProfile(rawRequest.account).id;
+      } catch (error: unknown) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT", error);
+      }
+      const requestedTargetPreset = rawRequest.preset
+        ?? defaultSessionSwitchPreset(rawRequest.provider, sourcePreset);
+      if (
+        requestedSessionId !== sessionId
+        || rawRequest.provider !== targetAuthority.provider
+        || requestedTargetProfileId !== targetAuthority.profileId
+        || requestedTargetPreset !== targetPreset
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      if (session.revision !== expectedSessionRevision) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+      }
+      if (session.state === "terminal") {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_TERMINAL");
+      }
+      if (session.state === "recovery_required") {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_REQUIRED");
+      }
+      if (session.state === "active" || session.activeTurnId !== undefined) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_ACTIVE_TURN");
+      }
+      if (
+        session.providerThreadId === undefined
+        || session.profileId !== sourceAuthority.profileId
+        || session.provider !== sourceAuthority.provider
+        || session.preset !== sourcePreset
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_SOURCE_AUTHORITY_STALE");
+      const captured = this.requireCapturedSessionProviderAuthority(sessionId);
+      if (captured.authorityRevision !== expectedAuthorityRevision) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_AUTHORITY_REVISION_STALE");
+      }
+      if (!sameProviderAccountAuthority(captured, sourceAuthority)) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SOURCE_AUTHORITY_STALE");
+      }
+      try {
+        this.assertProviderAccountAuthorityCurrent(sourceAuthority);
+      } catch (error) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SOURCE_AUTHORITY_STALE", error);
+      }
+      try {
+        this.assertProviderAccountAuthorityCurrent(targetAuthority);
+      } catch (error) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_TARGET_AUTHORITY_STALE", error);
+      }
+      const targetAccount = this.requireProviderAccountById(targetAuthority.providerAccountId);
+      if (
+        targetAccount.readiness !== "signed_in"
+        && !(targetAccount.provider === "claude" && targetAccount.readiness === "unverified")
+      ) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_TARGET_AUTHORITY_STALE");
+      }
+      if (
+        session.provider === targetAuthority.provider
+        && session.profileId === targetAuthority.profileId
+        && session.preset === targetPreset
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_NOOP");
+      if (this.#database.query(
+        `SELECT 1 FROM mutation_attempts mutation
+         LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
+         WHERE mutation.authority_id=?
+           AND mutation.kind IN (
+             'session.send','session.steer','session.stop','session.rename',
+             'session.queue','session.switch'
+           )
+           AND mutation.state IN ('prepared','effect_started','ambiguous')
+           AND resolution.attempt_id IS NULL
+         LIMIT 1`,
+      ).get(sessionId) !== null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      }
+      if (this.#database.query(
+        `SELECT 1 FROM queue_entries
+         WHERE session_id=? AND state IN ('dispatching','ambiguous') LIMIT 1`,
+      ).get(sessionId) !== null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_QUEUE_UNSETTLED");
+      }
+      if (this.#database.query(
+        `SELECT 1 FROM provider_interactions interaction
+         LEFT JOIN interaction_provider_authorities authority
+           ON authority.public_id=interaction.public_id
+         WHERE interaction.state IN ('pending','response_prepared','response_written')
+           AND (
+             interaction.session_id=?
+             OR (
+               interaction.session_id IS NULL
+               AND interaction.thread_id=?
+               AND authority.provider_account_id=?
+               AND authority.profile_id=? AND authority.provider=?
+               AND authority.binding_generation=? AND authority.process_generation=?
+             )
+           )
+         LIMIT 1`,
+      ).get(
+        sessionId,
+        session.providerThreadId,
+        sourceAuthority.providerAccountId,
+        sourceAuthority.profileId,
+        sourceAuthority.provider,
+        sourceAuthority.bindingGeneration,
+        sourceAuthority.processGeneration,
+      ) !== null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_INTERACTION_UNSETTLED");
+      }
+      if (this.#database.query(
+        `SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+         WHERE switch.session_id=?
+           AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         LIMIT 1`,
+      ).get(sessionId) !== null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_ALREADY_OPEN");
+      }
+      const sourceRuntime = this.#database.query(
+        `SELECT * FROM session_runtime_profiles
+         WHERE session_id=? AND revision=?`,
+      ).get(sessionId, sourceRuntimeProfileRevision);
+      if (sourceRuntime === null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_RUNTIME_PROFILE_STALE");
+      }
+      const runtimeRecord = this.#mapSessionRuntimeProfileWithAuthority(sourceRuntime);
+      const runtimeAuthority = this.#requireRuntimeProfileProviderAuthority(runtimeRecord);
+      if (
+        !sameProviderAccountAuthority(runtimeAuthority, sourceAuthority)
+        || reviewedRuntimeProfileProvider(runtimeRecord.profile) !== sourceAuthority.provider
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_RUNTIME_PROFILE_STALE");
+      const sourceRuntimeProfileDigest = digestJson(runtimeRecord.profile);
+      const stream = this.#readSessionEventStream(sessionId);
+      if (
+        stream.stream_epoch !== transcript.streamEpoch
+        || stream.floor_sequence !== transcript.floorSequence
+        || stream.observed_through_sequence !== transcript.acceptedHeadSequence
+        || transcript.afterSequenceExclusive < stream.floor_sequence - 1
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_TRANSCRIPT_STALE");
+      const retainedRange = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          `SELECT COUNT(*) AS count FROM session_events
+           WHERE session_id=? AND stream_epoch=? AND sequence>? AND sequence<=?`,
+        ).get(
+          sessionId,
+          transcript.streamEpoch,
+          transcript.afterSequenceExclusive,
+          transcript.throughSequenceInclusive,
+        ),
+      );
+      if (
+        retainedRange.count
+        !== transcript.throughSequenceInclusive - transcript.afterSequenceExclusive
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_TRANSCRIPT_STALE");
+
+      attemptId = createAttemptId();
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#database.query(
+        `INSERT INTO mutation_attempts(
+           id,idempotency_key,kind,authority_id,authority_generation,
+           request_digest,state,created_at,updated_at
+         ) VALUES (?,?,'session.switch',?,?,?,'prepared',?,?)`,
+      ).run(
+        attemptId,
+        idempotencyKey,
+        sessionId,
+        targetAuthority.processGeneration,
+        requestDigest,
+        now,
+        now,
+      );
+      insertProviderAuthorityEvidence(
+        this.#database,
+        "mutation_provider_authorities",
+        [attemptId, "source"],
+        sourceAuthority,
+        "session_switch_source",
+        now,
+      );
+      insertProviderAuthorityEvidence(
+        this.#database,
+        "mutation_provider_authorities",
+        [attemptId, "target"],
+        targetAuthority,
+        "session_switch_target",
+        now,
+      );
+      this.#database.query(
+        `INSERT INTO session_switch_attempts(
+           attempt_id,request_key,request_digest,raw_request_json,session_id,phase,
+           source_provider_account_id,source_profile_id,source_provider,
+           source_binding_generation,source_process_generation,
+           target_provider_account_id,target_profile_id,target_provider,
+           target_binding_generation,target_process_generation,
+           original_session_revision,original_authority_revision,
+           source_provider_thread_id,source_preset,target_preset,
+           source_runtime_profile_revision,source_runtime_profile_digest,
+           stream_epoch,floor_sequence,after_sequence_exclusive,
+           through_sequence_inclusive,accepted_head_sequence,
+           renderer_version,renderer_limit,transcript_digest,seed_digest,
+           seed_included_records,seed_omitted_records,seed_client_message_id,
+           diagnostic_code,created_at,updated_at
+         ) VALUES (?,?,?,?,?,'prepared',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)`,
+      ).run(
+        attemptId,
+        idempotencyKey,
+        requestDigest,
+        rawRequestJson,
+        sessionId,
+        sourceAuthority.providerAccountId,
+        sourceAuthority.profileId,
+        sourceAuthority.provider,
+        sourceAuthority.bindingGeneration,
+        sourceAuthority.processGeneration,
+        targetAuthority.providerAccountId,
+        targetAuthority.profileId,
+        targetAuthority.provider,
+        targetAuthority.bindingGeneration,
+        targetAuthority.processGeneration,
+        expectedSessionRevision,
+        expectedAuthorityRevision,
+        session.providerThreadId,
+        sourcePreset,
+        targetPreset,
+        sourceRuntimeProfileRevision,
+        sourceRuntimeProfileDigest,
+        transcript.streamEpoch,
+        transcript.floorSequence,
+        transcript.afterSequenceExclusive,
+        transcript.throughSequenceInclusive,
+        transcript.acceptedHeadSequence,
+        transcript.rendererVersion,
+        transcript.rendererLimit,
+        transcript.transcriptDigest,
+        transcript.seedDigest,
+        transcript.seedIncludedRecords,
+        transcript.seedOmittedRecords,
+        transcript.seedClientMessageId,
+        now,
+        now,
+      );
+      this.#database.query(
+        `INSERT INTO session_switch_plan_anchors(attempt_id,source_provider_thread_id,plan_digest,recorded_at)
+         VALUES (?,?,?,?)`,
+      ).run(
+        attemptId,
+        session.providerThreadId,
+        sessionSwitchPlanDigest({
+          attemptId,
+          requestKey: idempotencyKey,
+          requestDigest,
+          rawRequest,
+          sessionId,
+          sourceAuthority,
+          targetAuthority,
+          originalSessionRevision: expectedSessionRevision,
+          originalAuthorityRevision: expectedAuthorityRevision,
+          sourceProviderThreadId: session.providerThreadId,
+          sourcePreset,
+          targetPreset,
+          sourceRuntimeProfileRevision,
+          sourceRuntimeProfileDigest,
+          sourceRuntimeProfileSourceKind: runtimeRecord.sourceKind,
+          sourceRuntimeProfileSourceId: runtimeRecord.sourceId,
+          sourceRuntimeProfileRecordedAt: runtimeRecord.recordedAt,
+          transcript,
+          createdAt: now,
+        }),
+        now,
+      );
+    });
+    try {
+      prepare.immediate();
+    } catch (error) {
+      if (
+        error instanceof Error
+        && (error.message.includes("session_switch_one_open_per_session")
+          || error.message.includes("UNIQUE constraint failed: session_switch_attempts.session_id"))
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_ALREADY_OPEN", error);
+      if (
+        error instanceof Error
+        && error.message.includes("UNIQUE constraint failed: mutation_attempts.idempotency_key")
+      ) throw new SessionSwitchStoreError("IDEMPOTENCY_CONFLICT", error);
+      throw error;
+    }
+    if (attemptId === undefined) throw new Error("SESSION_SWITCH_PREPARE_LOST_AUTHORITY");
+    return { status: "prepared", switch: this.requireSessionSwitch(attemptId) };
+  }
+
+  readSessionSwitchByIdempotencyKey(idempotencyKey: string): SessionSwitchRecord | null {
+    const key = z.string().uuid().parse(idempotencyKey);
+    const mutation = this.#database.query(
+      `SELECT kind,
+              CASE WHEN typeof(id)='text'
+                         AND length(CAST(id AS BLOB))=40
+                         AND id GLOB 'attempt_[0-9a-f]*'
+                         AND substr(id,9) NOT GLOB '*[^0-9a-f]*'
+                THEN 1 ELSE 0 END AS attempt_id_valid
+       FROM mutation_attempts WHERE idempotency_key=?`,
+    ).get(key) as { kind: string; attempt_id_valid: 0 | 1 } | null;
+    if (mutation === null) return null;
+    if (mutation.kind !== "session.switch") {
+      throw new SessionSwitchStoreError("IDEMPOTENCY_CONFLICT");
+    }
+    if (this.#database.query(
+      `SELECT 1 FROM session_switch_malformed_dispositions
+       WHERE mutation_request_key=? LIMIT 1`,
+    ).get(key) !== null) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    if (mutation.attempt_id_valid !== 1) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    const journal = this.#database.query(
+      `SELECT CASE WHEN typeof(attempt_id)='text'
+                          AND length(CAST(attempt_id AS BLOB))=40
+                          AND attempt_id GLOB 'attempt_[0-9a-f]*'
+                          AND substr(attempt_id,9) NOT GLOB '*[^0-9a-f]*'
+                     THEN 1 ELSE 0 END AS attempt_id_valid
+       FROM session_switch_attempts WHERE request_key=?`,
+    ).get(key) as { attempt_id_valid: 0 | 1 } | null;
+    if (journal === null) throw new SessionSwitchStoreError("IDEMPOTENCY_CONFLICT");
+    if (journal.attempt_id_valid !== 1) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    const row = this.#database.query(
+      `${sessionSwitchSelect} WHERE switch.request_key=?`,
+    ).get(key);
+    if (row === null) throw new SessionSwitchStoreError("IDEMPOTENCY_CONFLICT");
+    try {
+      return mapSessionSwitch(this.#database, row);
+    } catch (error: unknown) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT", error);
+    }
+  }
+
+  requireSessionSwitch(attemptId: AttemptId): SessionSwitchRecord {
+    const parsedAttemptId = attemptIdSchema.parse(attemptId);
+    if (this.#database.query(
+      `SELECT 1 FROM session_switch_malformed_dispositions malformed
+       JOIN mutation_attempts mutation
+         ON mutation.idempotency_key=malformed.mutation_request_key
+       WHERE mutation.id=? LIMIT 1`,
+    ).get(parsedAttemptId) !== null) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    const row = this.#database.query(
+      `${sessionSwitchSelect} WHERE switch.attempt_id=?`,
+    ).get(parsedAttemptId);
+    if (row === null) throw new SessionSwitchStoreError("SESSION_SWITCH_NOT_FOUND");
+    try {
+      return mapSessionSwitch(this.#database, row);
+    } catch (error: unknown) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT", error);
+    }
+  }
+
+  /**
+   * Read the one dedicated switch that still owns recovery for a session.
+   * This lookup is deliberately non-mutating so an operator recovery command
+   * cannot change phase merely while selecting the correct recovery owner.
+   */
+  readSessionSwitchForRecovery(sessionId: SessionId): SessionSwitchRecord | null {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    if (this.#database.query(
+      `SELECT 1 FROM session_switch_malformed_dispositions malformed
+       WHERE malformed.session_id=? AND malformed.terminal_phase='reconciliation_required' LIMIT 1`,
+    ).get(parsedSessionId) !== null) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    const identities = this.#database.query(
+      `SELECT journal_sequence,
+              CASE WHEN typeof(attempt_id)='text'
+                         AND length(CAST(attempt_id AS BLOB))=40
+                         AND attempt_id GLOB 'attempt_[0-9a-f]*'
+                         AND substr(attempt_id,9) NOT GLOB '*[^0-9a-f]*'
+                THEN 1 ELSE 0 END AS attempt_id_valid
+       FROM session_switch_attempts
+       WHERE session_id=?
+         AND phase NOT IN ('seed_settled','failed','cancelled','abandoned')
+       ORDER BY updated_at DESC,journal_sequence DESC LIMIT 2`,
+    ).all(parsedSessionId).map((value) => z.object({
+      journal_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      attempt_id_valid: z.union([z.literal(0), z.literal(1)]),
+    }).strict().parse(value));
+    const identity = identities[0];
+    if (identity === undefined) return null;
+    if (identities.length !== 1 || identity.attempt_id_valid !== 1) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    const row = this.#database.query(
+      `${sessionSwitchSelect} WHERE switch.journal_sequence=?`,
+    ).get(identity.journal_sequence);
+    if (row === null) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    try {
+      return mapSessionSwitch(this.#database, row);
+    } catch (error: unknown) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT", error);
+    }
+  }
+
+  beginSessionSwitchTargetStart(input: SessionSwitchCas): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const begin = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, "prepared");
+      this.#assertSessionSwitchSourceCurrent(record);
+      this.#assertSessionSwitchTargetCurrent(record);
+      this.#transitionSessionSwitch(record, "prepared", "target_starting", null);
+      const changed = this.#database.query(
+        `UPDATE mutation_attempts SET state='effect_started',updated_at=?
+         WHERE id=? AND state='prepared' AND request_digest=?`,
+      ).run(this.#now(), record.attemptId, record.requestDigest);
+      if (changed.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+      }
+    });
+    begin.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  completeSessionSwitchTargetStart(input: SessionSwitchCas & Readonly<{
+    providerThreadId: string;
+    state: "active" | "idle" | "terminal";
+    activeTurnId?: string;
+    providerUpdatedAt?: number;
+    runtimeProfile: ReviewedRuntimeProfile;
+  }>): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const providerThreadId = providerThreadIdSchema.parse(input.providerThreadId);
+    const state = z.enum(["active", "idle", "terminal"]).parse(input.state);
+    const activeTurnId = input.activeTurnId === undefined
+      ? null
+      : providerThreadIdSchema.parse(input.activeTurnId);
+    if ((state === "active") !== (activeTurnId !== null)) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+    }
+    const providerUpdatedAt = input.providerUpdatedAt === undefined
+      ? null
+      : z.number().finite().nonnegative().parse(input.providerUpdatedAt);
+    const runtimeProfile = reviewedRuntimeProfileSchema.parse(input.runtimeProfile);
+    const runtimeProfileJson = JSON.stringify(runtimeProfile);
+    const runtimeProfileDigest = digestJson(runtimeProfile);
+    const complete = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, "target_starting");
+      this.#assertSessionSwitchSourceCurrent(record);
+      this.#assertSessionSwitchTargetCurrent(record);
+      if (
+        reviewedRuntimeProfileProvider(runtimeProfile) !== record.targetAuthority.provider
+        || runtimeProfile.profileId !== record.targetAuthority.profileId
+        || runtimeProfile.processGeneration !== record.targetAuthority.processGeneration
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_AUTHORITY_CONFLICT");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#database.query(
+        `INSERT INTO session_switch_target_start_receipts(
+           attempt_id,provider_thread_id,state,active_turn_id,provider_updated_at,
+           runtime_profile_json,runtime_profile_digest,recorded_at
+         ) VALUES (?,?,?,?,?,?,?,?)`,
+      ).run(
+        record.attemptId,
+        providerThreadId,
+        state,
+        activeTurnId,
+        providerUpdatedAt,
+        runtimeProfileJson,
+        runtimeProfileDigest,
+        now,
+      );
+      this.#database.query(
+        `INSERT INTO session_switch_target_start_anchors(
+           attempt_id,result_digest,recorded_at
+         ) VALUES (?,?,?)`,
+      ).run(
+        record.attemptId,
+        sessionSwitchTargetStartResultDigest({
+          providerThreadId,
+          state,
+          activeTurnId,
+          providerUpdatedAt,
+          runtimeProfile,
+        }),
+        now,
+      );
+      this.#transitionSessionSwitch(record, "target_starting", "target_started", null);
+    });
+    complete.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  beginSessionSwitchSourceRelease(input: SessionSwitchCas): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const begin = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, "target_started");
+      if (
+        record.targetStart === null
+        || record.targetStart.state !== "idle"
+        || record.targetStart.activeTurnId !== null
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      const sourceSession = this.requireSession(record.sessionId);
+      if (
+        sourceSession.revision !== record.originalSessionRevision
+        || sourceSession.state !== "idle"
+        || sourceSession.activeTurnId !== undefined
+        || sourceSession.profileId !== record.sourceAuthority.profileId
+        || sourceSession.provider !== record.sourceAuthority.provider
+        || sourceSession.providerThreadId !== record.sourceProviderThreadId
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+      this.#assertSessionSwitchSourceCurrent(record);
+      this.#assertSessionSwitchTargetCurrent(record);
+      if (
+        record.sourceAuthority.profileId === record.targetAuthority.profileId
+        && record.targetStart.providerThreadId === record.sourceProviderThreadId
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      const targetCollision = this.#database.query(
+        `SELECT 'session' AS owner
+         FROM sessions session
+         WHERE session.id!=? AND session.provider_thread_id=?
+           AND session.profile_id=?
+         UNION ALL
+         SELECT 'switch' AS owner
+         FROM ${SESSION_SWITCH_FENCE_SOURCE} other
+         LEFT JOIN session_switch_target_start_receipts target
+           ON target.attempt_id=other.attempt_id
+         WHERE other.attempt_id!=?
+           AND ${SESSION_SWITCH_BLOCKING_PREDICATE.replaceAll("switch.", "other.")}
+           AND (
+             (
+               target.provider_thread_id=?
+               AND other.target_profile_id=?
+             )
+             OR (
+               other.source_provider_thread_id=?
+               AND other.source_profile_id=?
+             )
+           )
+         LIMIT 1`,
+      ).get(
+        record.sessionId,
+        record.targetStart.providerThreadId,
+        record.targetAuthority.profileId,
+        record.attemptId,
+        record.targetStart.providerThreadId,
+        record.targetAuthority.profileId,
+        record.targetStart.providerThreadId,
+        record.targetAuthority.profileId,
+      );
+      if (targetCollision !== null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      }
+      const unresolvedInteraction = this.#database.query(
+        `SELECT 1
+         FROM provider_interactions interaction
+         LEFT JOIN interaction_provider_authorities authority
+           ON authority.public_id=interaction.public_id
+         WHERE interaction.state IN ('pending','response_prepared','response_written')
+           AND (
+             interaction.session_id=?
+             OR (
+               interaction.thread_id=?
+               AND authority.provider_account_id=? AND authority.profile_id=?
+               AND authority.provider=? AND authority.binding_generation=?
+               AND authority.process_generation=?
+             )
+             OR (
+               interaction.thread_id=?
+               AND authority.provider_account_id=? AND authority.profile_id=?
+               AND authority.provider=? AND authority.binding_generation=?
+               AND authority.process_generation=?
+             )
+           )
+         LIMIT 1`,
+      ).get(
+        record.sessionId,
+        record.sourceProviderThreadId,
+        record.sourceAuthority.providerAccountId,
+        record.sourceAuthority.profileId,
+        record.sourceAuthority.provider,
+        record.sourceAuthority.bindingGeneration,
+        record.sourceAuthority.processGeneration,
+        record.targetStart.providerThreadId,
+        record.targetAuthority.providerAccountId,
+        record.targetAuthority.profileId,
+        record.targetAuthority.provider,
+        record.targetAuthority.bindingGeneration,
+        record.targetAuthority.processGeneration,
+      );
+      if (unresolvedInteraction !== null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_INTERACTION_UNSETTLED");
+      }
+      this.#transitionSessionSwitch(record, "target_started", "source_releasing", null);
+    });
+    begin.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  completeSessionSwitchSourceRelease(input: SessionSwitchCas & Readonly<{
+    status: "released" | "already_released";
+  }>): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const status = z.enum(["released", "already_released"]).parse(input.status);
+    const complete = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, "source_releasing");
+      this.#assertSessionSwitchSourceCurrent(record);
+      this.#assertSessionSwitchTargetCurrent(record);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#database.query(
+        `INSERT INTO session_switch_source_release_receipts(
+           attempt_id,provider_thread_id,status,recorded_at
+         ) VALUES (?,?,?,?)`,
+      ).run(record.attemptId, record.sourceProviderThreadId, status, now);
+      const planDigest = z.object({ plan_digest: sha256Schema }).strict().parse(
+        this.#database.query(
+          "SELECT plan_digest FROM session_switch_plan_anchors WHERE attempt_id=?",
+        ).get(record.attemptId),
+      ).plan_digest;
+      this.#database.query(
+        `INSERT INTO session_switch_source_release_anchors(
+           attempt_id,evidence_digest,recorded_at
+         ) VALUES (?,?,?)`,
+      ).run(
+        record.attemptId,
+        sessionSwitchSourceReleaseEvidenceDigest({
+          attemptId: record.attemptId,
+          requestDigest: record.requestDigest,
+          planDigest,
+          sourceAuthority: record.sourceAuthority,
+          providerThreadId: record.sourceProviderThreadId,
+          status,
+          recordedAt: now,
+        }),
+        now,
+      );
+      this.#transitionSessionSwitch(record, "source_releasing", "source_released", null);
+    });
+    complete.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  rebindSessionSwitch(input: SessionSwitchCas): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const rebind = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, "source_released");
+      if (record.targetStart === null || record.sourceRelease === null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+      }
+      if (record.targetStart.state !== "idle") {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      }
+      this.#assertSessionSwitchSourceCurrent(record);
+      this.#assertSessionSwitchTargetCurrent(record);
+      const sessionRow = this.#database.query(
+        "SELECT * FROM sessions WHERE id=?",
+      ).get(record.sessionId);
+      const authorityRow = this.#database.query(
+        "SELECT * FROM session_provider_authorities WHERE session_id=?",
+      ).get(record.sessionId);
+      if (sessionRow === null || authorityRow === null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SOURCE_AUTHORITY_STALE");
+      }
+      const session = mapSession(sessionRow);
+      const captured = sessionProviderAuthorityRowSchema.parse(authorityRow);
+      const capturedAuthority = providerAccountAuthoritySchema.parse({
+        providerAccountId: captured.provider_account_id,
+        profileId: captured.profile_id,
+        provider: captured.provider,
+        bindingGeneration: captured.binding_generation,
+        processGeneration: captured.process_generation,
+      });
+      if (
+        session.revision !== record.originalSessionRevision
+        || session.providerThreadId !== record.sourceProviderThreadId
+        || session.profileId !== record.sourceAuthority.profileId
+        || session.provider !== record.sourceAuthority.provider
+        || session.preset !== record.sourcePreset
+        || captured.authority_revision !== record.originalAuthorityRevision
+        || !sameProviderAccountAuthority(record.sourceAuthority, capturedAuthority)
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_SOURCE_AUTHORITY_STALE");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const runtimeRevision = z.object({ revision: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          "SELECT COALESCE(MAX(revision),0)+1 AS revision FROM session_runtime_profiles WHERE session_id=?",
+        ).get(record.sessionId),
+      ).revision;
+      const stream = z.object({
+        next_sequence: positiveGenerationSchema,
+      }).strict().parse(this.#database.query(
+        "SELECT next_sequence FROM session_event_streams WHERE session_id=?",
+      ).get(record.sessionId));
+      this.#database.query(
+        `INSERT INTO session_switch_rebind_receipts(
+           attempt_id,session_revision,authority_revision,runtime_profile_revision,
+           switch_event_sequence,recorded_at
+         ) VALUES (?,?,?,?,?,?)`,
+      ).run(
+        record.attemptId,
+        record.originalSessionRevision + 1,
+        record.originalAuthorityRevision + 1,
+        runtimeRevision,
+        stream.next_sequence,
+        now,
+      );
+      const bound = this.#database.query(
+        `UPDATE sessions
+         SET profile_id=?,provider=?,preset=?,provider_thread_id=?,state=?,active_turn_id=?,
+             provider_updated_at=?,revision=revision+1,updated_at=MAX(updated_at,?)
+         WHERE id=? AND revision=? AND profile_id=? AND provider=? AND preset=?
+           AND provider_thread_id=? AND state NOT IN ('terminal','recovery_required')`,
+      ).run(
+        record.targetAuthority.profileId,
+        record.targetAuthority.provider,
+        presetTiers[record.targetPreset],
+        record.targetStart.providerThreadId,
+        record.targetStart.state,
+        record.targetStart.activeTurnId,
+        record.targetStart.providerUpdatedAt,
+        now,
+        record.sessionId,
+        record.originalSessionRevision,
+        record.sourceAuthority.profileId,
+        record.sourceAuthority.provider,
+        presetTiers[record.sourcePreset],
+        record.sourceProviderThreadId,
+      );
+      if (bound.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+      }
+      const previousAuthority = insertSessionProviderAuthoritySuccessor(this.#database, {
+        sessionId: record.sessionId,
+        targetAuthority: record.targetAuthority,
+        targetRoutingProvenance: "explicit",
+        targetAppliedPointerRevision: null,
+        transitionKind: "session_switch",
+        transitionId: record.attemptId,
+        recordedAt: now,
+      });
+      if (previousAuthority.authorityRevision !== record.originalAuthorityRevision) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_AUTHORITY_REVISION_STALE");
+      }
+      const authorityChanged = this.#database.query(
+        `UPDATE session_provider_authorities
+         SET provider_account_id=?,profile_id=?,provider=?,binding_generation=?,
+             process_generation=?,authority_revision=authority_revision+1,
+             routing_provenance='explicit',applied_pointer_revision=NULL
+         WHERE session_id=? AND authority_revision=?
+           AND provider_account_id=? AND profile_id=? AND provider=?
+           AND binding_generation=? AND process_generation=?`,
+      ).run(
+        record.targetAuthority.providerAccountId,
+        record.targetAuthority.profileId,
+        record.targetAuthority.provider,
+        record.targetAuthority.bindingGeneration,
+        record.targetAuthority.processGeneration,
+        record.sessionId,
+        record.originalAuthorityRevision,
+        record.sourceAuthority.providerAccountId,
+        record.sourceAuthority.profileId,
+        record.sourceAuthority.provider,
+        record.sourceAuthority.bindingGeneration,
+        record.sourceAuthority.processGeneration,
+      );
+      if (authorityChanged.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_AUTHORITY_REVISION_STALE");
+      }
+      this.#database.query(
+        `UPDATE session_conversation_automation SET provider_thread_id=?
+         WHERE session_id=?`,
+      ).run(record.targetStart.providerThreadId, record.sessionId);
+      const runtime = this.#insertSessionRuntimeProfile({
+        sessionId: record.sessionId,
+        sourceKind: "session_start",
+        sourceId: record.attemptId,
+        profile: record.targetStart.runtimeProfile,
+        providerAuthority: record.targetAuthority,
+      }, now);
+      if (runtime.revision !== runtimeRevision) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_RUNTIME_PROFILE_STALE");
+      }
+      const event = this.#appendSessionEventInTransaction({
+        sessionId: record.sessionId,
+        accountId: record.targetAuthority.profileId,
+        providerGeneration: record.targetAuthority.processGeneration,
+        providerAuthority: record.targetAuthority,
+        providerConnectionId: null,
+        body: sessionSwitchProviderSwitchedBody(record),
+        recordedAt: now,
+      });
+      if (event.sequence !== stream.next_sequence) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      }
+      const reboundReceipt: NonNullable<SessionSwitchRecord["rebind"]> = {
+        sessionRevision: record.originalSessionRevision + 1,
+        authorityRevision: record.originalAuthorityRevision + 1,
+        runtimeProfileRevision: runtimeRevision,
+        switchEventSequence: stream.next_sequence,
+        recordedAt: now,
+      };
+      this.#database.query(
+        `INSERT INTO session_switch_rebind_anchors(attempt_id,evidence_digest,recorded_at)
+         VALUES (?,?,?)`,
+      ).run(
+        record.attemptId,
+        sessionSwitchRebindEvidenceDigest({
+          attemptId: record.attemptId,
+          planDigest: sessionSwitchPlanDigest({
+            attemptId: record.attemptId,
+            requestKey: record.idempotencyKey,
+            requestDigest: record.requestDigest,
+            rawRequest: record.rawRequest,
+            sessionId: record.sessionId,
+            sourceAuthority: record.sourceAuthority,
+            targetAuthority: record.targetAuthority,
+            originalSessionRevision: record.originalSessionRevision,
+            originalAuthorityRevision: record.originalAuthorityRevision,
+            sourceProviderThreadId: record.sourceProviderThreadId,
+            sourcePreset: record.sourcePreset,
+            targetPreset: record.targetPreset,
+            sourceRuntimeProfileRevision: record.sourceRuntimeProfileRevision,
+            sourceRuntimeProfileDigest: record.sourceRuntimeProfileDigest,
+            sourceRuntimeProfileSourceKind: record.sourceRuntimeProfileSourceKind,
+            sourceRuntimeProfileSourceId: record.sourceRuntimeProfileSourceId,
+            sourceRuntimeProfileRecordedAt: record.sourceRuntimeProfileRecordedAt,
+            transcript: record.transcript,
+            createdAt: record.createdAt,
+          }),
+          sourceAuthority: record.sourceAuthority,
+          targetAuthority: record.targetAuthority,
+          sourcePreset: record.sourcePreset,
+          targetPreset: record.targetPreset,
+          sourceRoutingProvenance: previousAuthority.routingProvenance,
+          sourceAppliedPointerRevision: previousAuthority.appliedPointerRevision,
+          targetStart: record.targetStart,
+          sourceRelease: record.sourceRelease,
+          transcript: record.transcript,
+          rebind: reboundReceipt,
+        }),
+        now,
+      );
+      this.#transitionSessionSwitch(record, "source_released", "rebound", null);
+    });
+    rebind.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  readSessionSwitchSeedInput(attemptId: AttemptId): SessionSwitchSeedInput {
+    const record = this.requireSessionSwitch(attemptIdSchema.parse(attemptId));
+    const stream = this.#readSessionEventStream(record.sessionId);
+    if (
+      stream.stream_epoch !== record.transcript.streamEpoch
+      || stream.floor_sequence > record.transcript.afterSequenceExclusive + 1
+    ) throw new SessionSwitchStoreError("SESSION_SWITCH_TRANSCRIPT_STALE");
+    const rows = this.#database.query(
+      `SELECT event_json,projection_version FROM session_events
+       WHERE session_id=? AND stream_epoch=? AND sequence>? AND sequence<=?
+       ORDER BY sequence`,
+    ).all(
+      record.sessionId,
+      record.transcript.streamEpoch,
+      record.transcript.afterSequenceExclusive,
+      record.transcript.throughSequenceInclusive,
+    ).map((value) => z.object({
+      event_json: z.string(),
+      projection_version: z.union([z.literal(1), z.literal(2)]),
+    }).strict().parse(value));
+    if (
+      rows.length
+      !== record.transcript.throughSequenceInclusive
+        - record.transcript.afterSequenceExclusive
+    ) throw new SessionSwitchStoreError("SESSION_SWITCH_TRANSCRIPT_STALE");
+    const events = rows.map((row) => parseStoredSessionEvent(
+      row.event_json,
+      row.projection_version,
+      this.#publicProviderIdentifierProjector,
+    ));
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index];
+      if (
+        event === undefined
+        || event.sessionId !== record.sessionId
+        || event.streamEpoch !== record.transcript.streamEpoch
+        || event.sequence !== record.transcript.afterSequenceExclusive + index + 1
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_TRANSCRIPT_STALE");
+    }
+    return { switch: record, events };
+  }
+
+  beginSessionSwitchSeedDispatch(input: SessionSwitchCas & Readonly<{
+    seedAuthority: ProviderAccountAuthority;
+    seedAuthorityRevision: number;
+    seedDigest: string;
+    clientMessageId: string;
+  }>): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const seedAuthority = providerAccountAuthoritySchema.parse(input.seedAuthority);
+    const seedAuthorityRevision = positiveGenerationSchema.parse(input.seedAuthorityRevision);
+    const seedDigest = sha256Schema.parse(input.seedDigest);
+    const clientMessageId = z.string().min(1).max(512).parse(input.clientMessageId);
+    const begin = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, "rebound");
+      if (record.rebind === null || record.targetStart === null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+      }
+      if (
+        seedDigest !== record.transcript.seedDigest
+        || clientMessageId !== record.transcript.seedClientMessageId
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      const captured = this.requireCapturedSessionProviderAuthority(record.sessionId);
+      if (
+        captured.authorityRevision !== seedAuthorityRevision
+        || !sameProviderAccountAuthority(captured, seedAuthority)
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+      try {
+        this.assertProviderAccountAuthorityCurrent(seedAuthority);
+      } catch (error) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED", error);
+      }
+      let provenance: "rebound" | "successor_lineage";
+      if (
+        sameProviderAccountAuthority(seedAuthority, record.targetAuthority)
+        && seedAuthorityRevision === record.rebind.authorityRevision
+      ) {
+        provenance = "rebound";
+      } else {
+        if (
+          !sameProviderAccountBinding(seedAuthority, record.targetAuthority)
+          || seedAuthority.processGeneration === record.targetAuthority.processGeneration
+          || seedAuthorityRevision <= record.rebind.authorityRevision
+        ) throw new SessionSwitchStoreError("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+        const lineage = this.#database.query(
+          `SELECT * FROM session_provider_authority_successors
+           WHERE session_id=? AND from_authority_revision>=? AND to_authority_revision<=?
+           ORDER BY from_authority_revision`,
+        ).all(
+          record.sessionId,
+          record.rebind.authorityRevision,
+          seedAuthorityRevision,
+        ).map((row) => sessionProviderAuthoritySuccessorRowSchema.parse(row));
+        if (lineage.length !== seedAuthorityRevision - record.rebind.authorityRevision) {
+          throw new SessionSwitchStoreError("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+        }
+        let expectedRevision = record.rebind.authorityRevision;
+        let expectedProcessGeneration = record.targetAuthority.processGeneration;
+        for (const edge of lineage) {
+          if (
+            edge.from_authority_revision !== expectedRevision
+            || edge.to_authority_revision !== expectedRevision + 1
+            || edge.from_provider_account_id !== record.targetAuthority.providerAccountId
+            || edge.to_provider_account_id !== record.targetAuthority.providerAccountId
+            || edge.from_profile_id !== record.targetAuthority.profileId
+            || edge.to_profile_id !== record.targetAuthority.profileId
+            || edge.from_provider !== record.targetAuthority.provider
+            || edge.to_provider !== record.targetAuthority.provider
+            || edge.from_binding_generation !== record.targetAuthority.bindingGeneration
+            || edge.to_binding_generation !== record.targetAuthority.bindingGeneration
+            || edge.from_process_generation !== expectedProcessGeneration
+            || edge.to_process_generation <= edge.from_process_generation
+            || edge.from_routing_provenance !== "explicit"
+            || edge.to_routing_provenance !== "explicit"
+            || edge.from_applied_pointer_revision !== null
+            || edge.to_applied_pointer_revision !== null
+          ) throw new SessionSwitchStoreError("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+          expectedRevision = edge.to_authority_revision;
+          expectedProcessGeneration = edge.to_process_generation;
+        }
+        if (
+          expectedRevision !== seedAuthorityRevision
+          || expectedProcessGeneration !== seedAuthority.processGeneration
+        ) throw new SessionSwitchStoreError("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+        provenance = "successor_lineage";
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#database.query(
+        `INSERT INTO session_switch_seed_authorities(
+           attempt_id,provider_account_id,profile_id,provider,binding_generation,
+           process_generation,authority_revision,provenance,recorded_at
+         ) VALUES (?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        record.attemptId,
+        seedAuthority.providerAccountId,
+        seedAuthority.profileId,
+        seedAuthority.provider,
+        seedAuthority.bindingGeneration,
+        seedAuthority.processGeneration,
+        seedAuthorityRevision,
+        provenance,
+        now,
+      );
+      this.#transitionSessionSwitch(record, "rebound", "seed_dispatching", null);
+    });
+    begin.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  completeSessionSwitchSeed(
+    input: SessionSwitchCas & Readonly<{
+      seedAuthority: ProviderAccountAuthority;
+      seedAuthorityRevision: number;
+      settlement: SessionSwitchSeedSettlement;
+    }>,
+  ): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const seedAuthority = providerAccountAuthoritySchema.parse(input.seedAuthority);
+    const seedAuthorityRevision = positiveGenerationSchema.parse(input.seedAuthorityRevision);
+    const settlement = input.settlement.outcome === "accepted"
+      ? {
+          outcome: "accepted" as const,
+          turnId: providerThreadIdSchema.parse(input.settlement.turnId),
+          turnStatus: z.enum(["completed", "interrupted", "failed", "inProgress"])
+            .parse(input.settlement.turnStatus),
+          runtimeProfile: reviewedRuntimeProfileSchema.parse(input.settlement.runtimeProfile),
+          receiptDigest: sha256Schema.parse(input.settlement.receiptDigest),
+          seedText: z.string().min(1).max(TRANSCRIPT_SEED_MAX_CHARACTERS)
+            .parse(input.settlement.seedText),
+        }
+      : {
+          outcome: "rejected" as const,
+          failureCode: sessionSwitchFailureCodeSchema.parse(input.settlement.failureCode),
+          receiptDigest: sha256Schema.parse(input.settlement.receiptDigest),
+        };
+    const complete = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, "seed_dispatching");
+      if (
+        record.rebind === null
+        || record.seedAuthority === null
+        || !sameProviderAccountAuthority(record.seedAuthority.authority, seedAuthority)
+        || record.seedAuthority.authorityRevision !== seedAuthorityRevision
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+      try {
+        this.assertProviderAccountAuthorityCurrent(seedAuthority);
+      } catch (error) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED", error);
+      }
+      if (
+        settlement.outcome === "accepted"
+        && createHash("sha256")
+          .update("hra:session-transcript-seed:v1\0", "utf8")
+          .update(settlement.seedText, "utf8")
+          .digest("hex") !== record.transcript.seedDigest
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      const expectedReceiptDigest = settlement.outcome === "accepted"
+        ? digestJson({
+            domain: "hra:session-switch-seed-accepted:v1",
+            turnId: settlement.turnId,
+            turnStatus: settlement.turnStatus,
+            runtimeProfile: settlement.runtimeProfile,
+          })
+        : createHash("sha256")
+            .update("hra:session-switch-seed-rejected:v1\0", "utf8")
+            .update(settlement.failureCode, "utf8")
+            .digest("hex");
+      if (settlement.receiptDigest !== expectedReceiptDigest) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      }
+      const captured = this.requireCapturedSessionProviderAuthority(record.sessionId);
+      if (
+        captured.authorityRevision !== seedAuthorityRevision
+        || !sameProviderAccountAuthority(captured, seedAuthority)
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+      const session = this.requireSession(record.sessionId);
+      if (
+        session.revision !== record.rebind.sessionRevision
+        || session.profileId !== seedAuthority.profileId
+        || session.provider !== seedAuthority.provider
+        || session.providerThreadId !== record.targetStart?.providerThreadId
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      let runtimeProfileRevision: number | null = null;
+      let publicSession = session;
+      if (settlement.outcome === "accepted") {
+        if (
+          reviewedRuntimeProfileProvider(settlement.runtimeProfile) !== seedAuthority.provider
+          || settlement.runtimeProfile.profileId !== seedAuthority.profileId
+          || settlement.runtimeProfile.processGeneration !== seedAuthority.processGeneration
+        ) throw new SessionSwitchStoreError("SESSION_SWITCH_AUTHORITY_CONFLICT");
+        runtimeProfileRevision = z.object({ revision: positiveGenerationSchema }).strict().parse(
+          this.#database.query(
+            "SELECT COALESCE(MAX(revision),0)+1 AS revision FROM session_runtime_profiles WHERE session_id=?",
+          ).get(record.sessionId),
+        ).revision;
+        const sessionWithoutActiveTurn = { ...session };
+        delete sessionWithoutActiveTurn.activeTurnId;
+        publicSession = {
+          ...sessionWithoutActiveTurn,
+          state: settlement.turnStatus === "inProgress" ? "active" : "idle",
+          ...(settlement.turnStatus === "inProgress"
+            ? { activeTurnId: settlement.turnId }
+            : {}),
+          revision: session.revision + 1,
+          updatedAt: Math.max(session.updatedAt, now),
+        };
+      }
+      const publicReceipt = sessionSwitchStoredPublicReceiptSchema.parse({
+        session: publicSession,
+        from: {
+          provider: record.sourceAuthority.provider,
+          preset: record.sourcePreset,
+          account: record.sourceAuthority.profileId,
+        },
+        to: {
+          provider: record.targetAuthority.provider,
+          preset: record.targetPreset,
+          account: record.targetAuthority.profileId,
+        },
+        seed: {
+          delivered: settlement.outcome === "accepted",
+          digest: record.transcript.seedDigest,
+          ...(settlement.outcome === "rejected"
+            ? { failureCode: settlement.failureCode }
+            : {}),
+          includedRecords: record.transcript.seedIncludedRecords,
+          omittedRecords: record.transcript.seedOmittedRecords,
+        },
+        transcriptDigest: record.transcript.transcriptDigest,
+        turnId: settlement.outcome === "accepted" ? settlement.turnId : null,
+        idempotencyKey: record.idempotencyKey,
+      });
+      const publicReceiptJson = JSON.stringify(publicReceipt);
+      if (utf8Bytes(publicReceiptJson) > 262_144) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      }
+      this.#database.query(
+        `INSERT INTO session_switch_seed_receipts(
+           attempt_id,outcome,failure_code,turn_id,turn_status,
+           runtime_profile_revision,receipt_digest,public_receipt_json,recorded_at
+         ) VALUES (?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        record.attemptId,
+        settlement.outcome,
+        settlement.outcome === "rejected" ? settlement.failureCode : null,
+        settlement.outcome === "accepted" ? settlement.turnId : null,
+        settlement.outcome === "accepted" ? settlement.turnStatus : null,
+        runtimeProfileRevision,
+        settlement.receiptDigest,
+        publicReceiptJson,
+        now,
+      );
+      if (settlement.outcome === "accepted") {
+        const state = settlement.turnStatus === "inProgress" ? "active" : "idle";
+        const activeTurnId = settlement.turnStatus === "inProgress"
+          ? settlement.turnId
+          : null;
+        const changed = this.#database.query(
+          `UPDATE sessions SET state=?,active_turn_id=?,revision=revision+1,
+                               updated_at=MAX(updated_at,?)
+           WHERE id=? AND revision=? AND profile_id=? AND provider=?
+             AND provider_thread_id=?`,
+        ).run(
+          state,
+          activeTurnId,
+          now,
+          record.sessionId,
+          record.rebind.sessionRevision,
+          seedAuthority.profileId,
+          seedAuthority.provider,
+          record.targetStart?.providerThreadId ?? null,
+        );
+        if (changed.changes !== 1) {
+          throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+        }
+        this.#bindSessionTurnRuntimeProfile({
+          sessionId: record.sessionId,
+          sourceKind: "turn_start",
+          sourceId: record.transcript.seedClientMessageId,
+          turnId: settlement.turnId,
+          profile: settlement.runtimeProfile,
+          providerAuthority: seedAuthority,
+        }, now);
+        const boundRuntime = z.object({ revision: positiveGenerationSchema }).strict().parse(
+          this.#database.query(
+            `SELECT revision FROM session_runtime_profiles
+             WHERE session_id=? AND source_kind='turn_start' AND source_id=?`,
+          ).get(record.sessionId, record.transcript.seedClientMessageId),
+        );
+        if (boundRuntime.revision !== runtimeProfileRevision) {
+          throw new SessionSwitchStoreError("SESSION_SWITCH_RUNTIME_PROFILE_STALE");
+        }
+      }
+      let messageEvent: SessionEvent | null = null;
+      if (settlement.outcome === "accepted") {
+        const text = settlement.seedText.slice(0, SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS);
+        const stream = z.object({
+          stream_epoch: z.string().uuid(),
+          next_sequence: positiveGenerationSchema,
+        }).strict().parse(this.#database.query(
+          "SELECT stream_epoch,next_sequence FROM session_event_streams WHERE session_id=?",
+        ).get(record.sessionId));
+        if (
+          stream.stream_epoch !== record.transcript.streamEpoch
+          || stream.next_sequence !== record.rebind.switchEventSequence + 1
+        ) throw new SessionSwitchStoreError("SESSION_SWITCH_TRANSCRIPT_STALE");
+        // Freeze the complete event before granting its narrow SQL admission.
+        // Only the digest is retained beside the existing transcript event.
+        messageEvent = sessionEventSchema.parse({
+          version: 1,
+          sessionId: record.sessionId,
+          streamEpoch: stream.stream_epoch,
+          sequence: stream.next_sequence,
+          accountId: seedAuthority.profileId,
+          providerGeneration: seedAuthority.processGeneration,
+          providerConnectionId: null,
+          body: {
+            type: "user_message",
+            turnId: this.#publicProviderIdentifierProjector(settlement.turnId),
+            actor: "provider_switch",
+            text,
+            omittedCharacters: settlement.seedText.length - text.length,
+          },
+          recordedAt: now,
+        });
+      }
+      const messageEventSequence = messageEvent?.sequence ?? null;
+      const messageEventDigest = messageEvent === null ? null : digestJson(messageEvent);
+      this.#database.query(
+        `INSERT INTO session_switch_seed_anchors(
+           attempt_id,evidence_digest,message_event_sequence,message_event_digest,recorded_at
+         ) VALUES (?,?,?,?,?)`,
+      ).run(
+        record.attemptId,
+        sessionSwitchSeedEvidenceDigest({
+          attemptId: record.attemptId,
+          planDigest: sessionSwitchPlanDigest({
+            attemptId: record.attemptId,
+            requestKey: record.idempotencyKey,
+            requestDigest: record.requestDigest,
+            rawRequest: record.rawRequest,
+            sessionId: record.sessionId,
+            sourceAuthority: record.sourceAuthority,
+            targetAuthority: record.targetAuthority,
+            originalSessionRevision: record.originalSessionRevision,
+            originalAuthorityRevision: record.originalAuthorityRevision,
+            sourceProviderThreadId: record.sourceProviderThreadId,
+            sourcePreset: record.sourcePreset,
+            targetPreset: record.targetPreset,
+            sourceRuntimeProfileRevision: record.sourceRuntimeProfileRevision,
+            sourceRuntimeProfileDigest: record.sourceRuntimeProfileDigest,
+            sourceRuntimeProfileSourceKind: record.sourceRuntimeProfileSourceKind,
+            sourceRuntimeProfileSourceId: record.sourceRuntimeProfileSourceId,
+            sourceRuntimeProfileRecordedAt: record.sourceRuntimeProfileRecordedAt,
+            transcript: record.transcript,
+            createdAt: record.createdAt,
+          }),
+          seedAuthority: record.seedAuthority,
+          outcome: settlement.outcome,
+          failureCode: settlement.outcome === "rejected" ? settlement.failureCode : null,
+          turnId: settlement.outcome === "accepted" ? settlement.turnId : null,
+          turnStatus: settlement.outcome === "accepted" ? settlement.turnStatus : null,
+          runtimeProfileRevision,
+          receiptDigest: settlement.receiptDigest,
+          publicReceipt,
+          recordedAt: now,
+          messageEventSequence,
+          messageEventDigest,
+        }),
+        messageEventSequence,
+        messageEventDigest,
+        now,
+      );
+      if (messageEvent !== null) {
+        const appended = this.#appendSessionEventInTransaction({
+          sessionId: record.sessionId,
+          accountId: seedAuthority.profileId,
+          providerGeneration: seedAuthority.processGeneration,
+          providerAuthority: seedAuthority,
+          providerConnectionId: null,
+          body: messageEvent.body,
+          recordedAt: now,
+        });
+        if (JSON.stringify(appended) !== JSON.stringify(messageEvent)) {
+          throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+        }
+      }
+      this.#transitionSessionSwitch(record, "seed_dispatching", "seed_settled", null);
+      const applied = this.#database.query(
+        `UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='effect_started' AND request_digest=?`,
+      ).run(publicReceiptJson, now, record.attemptId, record.requestDigest);
+      if (applied.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+      }
+      // Validate the complete receipt/event/runtime chain before committing;
+      // a malformed accepted event must roll back all settlement authority.
+      this.requireSessionSwitch(record.attemptId);
+    });
+    complete.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  markSessionSwitchReconciliationRequired(input: SessionSwitchCas & Readonly<{
+    expectedPhase: Exclude<SessionSwitchPhase, "seed_settled" | "reconciliation_required" | "failed" | "cancelled">;
+    diagnosticCode: string;
+  }>): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const expectedPhase = sessionSwitchPhaseSchema.parse(input.expectedPhase);
+    if (expectedPhase === "prepared" || sessionSwitchTerminalPhases.has(expectedPhase)) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+    }
+    const diagnosticCode = sessionSwitchDiagnosticSchema.parse(input.diagnosticCode);
+    const reconcile = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, expectedPhase);
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#recordSessionSwitchReconciliation(
+        record,
+        sessionSwitchReconciliationFromPhaseSchema.parse(expectedPhase),
+        diagnosticCode,
+        now,
+      );
+      this.#transitionSessionSwitch(
+        record,
+        expectedPhase,
+        "reconciliation_required",
+        diagnosticCode,
+      );
+      const changed = this.#database.query(
+        `UPDATE mutation_attempts SET state='ambiguous',
+                                      result_json=json_object('code',?),
+                                      updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='effect_started' AND request_digest=?`,
+      ).run(diagnosticCode, now, record.attemptId, record.requestDigest);
+      if (changed.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+      }
+      const expectedRevision = record.rebind?.sessionRevision
+        ?? record.originalSessionRevision;
+      const expectedProfileId = record.rebind === null
+        ? record.sourceAuthority.profileId
+        : record.targetAuthority.profileId;
+      const expectedProvider = record.rebind === null
+        ? record.sourceAuthority.provider
+        : record.targetAuthority.provider;
+      const retired = this.#database.query(
+        `UPDATE sessions SET state='recovery_required',active_turn_id=NULL,
+                             revision=revision+1,updated_at=MAX(updated_at,?)
+         WHERE id=? AND revision=? AND profile_id=? AND provider=?
+           AND state NOT IN ('terminal','recovery_required')`,
+      ).run(
+        now,
+        record.sessionId,
+        expectedRevision,
+        expectedProfileId,
+        expectedProvider,
+      );
+      if (retired.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+      }
+    });
+    reconcile.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  failSessionSwitchTargetStartNoEffect(input: SessionSwitchCas & Readonly<{
+    expectedPhase: "prepared" | "target_starting";
+    diagnosticCode: string;
+  }>): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const expectedPhase = z.enum(["prepared", "target_starting"])
+      .parse(input.expectedPhase);
+    const diagnosticCode = sessionSwitchDiagnosticSchema.parse(input.diagnosticCode);
+    const fail = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, expectedPhase);
+      if (record.targetStart !== null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const planDigest = sha256Schema.parse(z.object({
+        plan_digest: sha256Schema,
+      }).strict().parse(this.#database.query(
+        "SELECT plan_digest FROM session_switch_plan_anchors WHERE attempt_id=?",
+      ).get(record.attemptId)).plan_digest);
+      const evidenceDigest = sessionSwitchTargetNoEffectEvidenceDigest({
+        attemptId: record.attemptId,
+        requestDigest: record.requestDigest,
+        planDigest,
+        targetAuthority: record.targetAuthority,
+        diagnosticCode,
+      });
+      this.#database.query(
+        `INSERT INTO session_switch_no_effect_receipts(
+           attempt_id,effect,diagnostic_code,evidence_digest,recorded_at
+         ) VALUES (?,'target_start',?,?,?)`,
+      ).run(record.attemptId, diagnosticCode, evidenceDigest, now);
+      this.#database.query(
+        `INSERT INTO session_switch_no_effect_anchors(
+           attempt_id,evidence_digest,recorded_at
+         ) VALUES (?,?,?)`,
+      ).run(
+        record.attemptId,
+        sessionSwitchTargetNoEffectAnchorDigest({
+          attemptId: record.attemptId,
+          requestDigest: record.requestDigest,
+          planDigest,
+          targetAuthority: record.targetAuthority,
+          diagnosticCode,
+          evidenceDigest,
+          recordedAt: now,
+        }),
+        now,
+      );
+      this.#transitionSessionSwitch(record, expectedPhase, "failed", diagnosticCode);
+      const changed = this.#database.query(
+        `UPDATE mutation_attempts SET state='failed',
+                                      result_json=json_object('code',?),
+                                      updated_at=MAX(updated_at,?)
+         WHERE id=? AND state=? AND request_digest=?`,
+      ).run(
+        diagnosticCode,
+        now,
+        record.attemptId,
+        expectedPhase === "prepared" ? "prepared" : "effect_started",
+        record.requestDigest,
+      );
+      if (changed.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+      }
+    });
+    fail.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  cancelPreparedSessionSwitch(input: SessionSwitchCas): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const cancel = this.#database.transaction(() => {
+      const record = this.#requireSessionSwitchCas(cas, "prepared");
+      this.#transitionSessionSwitch(record, "prepared", "cancelled", null);
+      const changed = this.#database.query(
+        `UPDATE mutation_attempts SET state='cancelled',updated_at=MAX(updated_at,?)
+         WHERE id=? AND state='prepared' AND request_digest=?`,
+      ).run(this.#now(), record.attemptId, record.requestDigest);
+      if (changed.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+      }
+    });
+    cancel.immediate();
+    return this.requireSessionSwitch(cas.attemptId);
+  }
+
+  abandonReconciledSessionSwitch(input: SessionSwitchCas & Readonly<{
+    expectedSessionRevision: number;
+    expectedSessionAuthority: ProviderAccountAuthority;
+    expectedSessionAuthorityRevision: number;
+  }>): SessionSwitchAbandonResult {
+    const cas = parseSessionSwitchCas(input);
+    const expectedSessionRevision = positiveGenerationSchema.parse(
+      input.expectedSessionRevision,
+    );
+    const expectedSessionAuthority = providerAccountAuthoritySchema.parse({
+      providerAccountId: input.expectedSessionAuthority.providerAccountId,
+      profileId: input.expectedSessionAuthority.profileId,
+      provider: input.expectedSessionAuthority.provider,
+      bindingGeneration: input.expectedSessionAuthority.bindingGeneration,
+      processGeneration: input.expectedSessionAuthority.processGeneration,
+    });
+    const expectedSessionAuthorityRevision = positiveGenerationSchema.parse(
+      input.expectedSessionAuthorityRevision,
+    );
+    const abandon = this.#database.transaction((): readonly InteractionRecord[] => {
+      const record = this.#requireSessionSwitchCas(cas, "reconciliation_required");
+      const current = this.requireSession(record.sessionId);
+      const captured = this.requireCapturedSessionProviderAuthority(record.sessionId);
+      if (
+        current.revision !== expectedSessionRevision
+        || current.state !== "recovery_required"
+        || current.activeTurnId !== undefined
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+      if (
+        captured.authorityRevision !== expectedSessionAuthorityRevision
+        || !sameProviderAccountAuthority(captured, expectedSessionAuthority)
+        || current.profileId !== expectedSessionAuthority.profileId
+        || current.provider !== expectedSessionAuthority.provider
+      ) throw new SessionSwitchStoreError("SESSION_SWITCH_AUTHORITY_CONFLICT");
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const withoutActiveTurn = { ...current };
+      delete withoutActiveTurn.activeTurnId;
+      const terminalSession: SessionRecord = {
+        ...withoutActiveTurn,
+        state: "terminal",
+        revision: current.revision + 1,
+        updatedAt: Math.max(current.updatedAt, now),
+      };
+      const sessionJson = JSON.stringify(terminalSession);
+      if (utf8Bytes(sessionJson) > 262_144) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+      }
+      const abandonmentEvidence = z.object({
+        plan_digest: sha256Schema,
+        from_phase: sessionSwitchReconciliationFromPhaseSchema,
+        evidence_depth: z.number().int().min(0).max(4),
+        diagnostic_code: sessionSwitchDiagnosticSchema,
+        request_digest: sha256Schema,
+        reconciliation_plan_digest: sha256Schema,
+        reconciliation_recorded_at: unixMillisecondsSchema,
+      }).strict().parse(this.#database.query(
+        `SELECT plan.plan_digest,reconciliation.from_phase,
+                reconciliation.evidence_depth,reconciliation.diagnostic_code,
+                reconciliation.request_digest,
+                reconciliation.plan_digest AS reconciliation_plan_digest,
+                reconciliation.recorded_at AS reconciliation_recorded_at
+         FROM session_switch_plan_anchors plan
+         JOIN session_switch_reconciliation_receipts reconciliation
+           ON reconciliation.attempt_id=plan.attempt_id
+         WHERE plan.attempt_id=?`,
+      ).get(record.attemptId));
+      const reconciliation: SessionSwitchReconciliationEvidence = {
+        fromPhase: abandonmentEvidence.from_phase,
+        evidenceDepth: abandonmentEvidence.evidence_depth,
+        diagnosticCode: abandonmentEvidence.diagnostic_code,
+        requestDigest: abandonmentEvidence.request_digest,
+        planDigest: abandonmentEvidence.reconciliation_plan_digest,
+        recordedAt: abandonmentEvidence.reconciliation_recorded_at,
+      };
+      this.#database.query(
+        `INSERT INTO session_switch_abandon_receipts(
+           attempt_id,provider_account_id,profile_id,provider,binding_generation,
+           process_generation,authority_revision,expected_session_revision,
+           terminal_session_revision,session_json,recorded_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        record.attemptId,
+        expectedSessionAuthority.providerAccountId,
+        expectedSessionAuthority.profileId,
+        expectedSessionAuthority.provider,
+        expectedSessionAuthority.bindingGeneration,
+        expectedSessionAuthority.processGeneration,
+        expectedSessionAuthorityRevision,
+        expectedSessionRevision,
+        terminalSession.revision,
+        sessionJson,
+        now,
+      );
+      this.#database.query(
+        `INSERT INTO session_switch_abandon_anchors(
+           attempt_id,evidence_digest,recorded_at
+         ) VALUES (?,?,?)`,
+      ).run(
+        record.attemptId,
+        sessionSwitchAbandonEvidenceDigest({
+          attemptId: record.attemptId,
+          planDigest: abandonmentEvidence.plan_digest,
+          reconciliation,
+          authority: expectedSessionAuthority,
+          authorityRevision: expectedSessionAuthorityRevision,
+          expectedSessionRevision,
+          terminalSessionRevision: terminalSession.revision,
+          session: terminalSession,
+          recordedAt: now,
+        }),
+        now,
+      );
+      const resolutionEvidence = JSON.stringify({
+        source: "session_switch_abandon",
+        providerEffectRetried: false,
+        providerStateDeleted: false,
+      });
+      const resolutionReceipt = JSON.stringify({
+        sessionId: record.sessionId,
+        terminalSessionRevision: terminalSession.revision,
+      });
+      const resolved = this.#database.query(
+        `INSERT INTO mutation_resolutions(
+           attempt_id,resolution_kind,evidence_json,receipt_json,created_at
+         ) VALUES (?,'abandoned',?,?,?)`,
+      ).run(record.attemptId, resolutionEvidence, resolutionReceipt, now);
+      if (resolved.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+      }
+      const changed = this.#database.query(
+        `UPDATE sessions SET state='terminal',active_turn_id=NULL,
+                             revision=revision+1,updated_at=MAX(updated_at,?)
+         WHERE id=? AND revision=? AND profile_id=? AND provider=?
+           AND state='recovery_required' AND active_turn_id IS NULL`,
+      ).run(
+        now,
+        record.sessionId,
+        expectedSessionRevision,
+        expectedSessionAuthority.profileId,
+        expectedSessionAuthority.provider,
+      );
+      if (changed.changes !== 1) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+      }
+      this.#database.query(
+        `UPDATE queue_entries SET state='cancelled',updated_at=MAX(updated_at,?)
+         WHERE session_id=? AND state='pending'`,
+      ).run(now, record.sessionId);
+      this.#transitionSessionSwitch(
+        record,
+        "reconciliation_required",
+        "abandoned",
+        record.diagnosticCode,
+      );
+      // The terminal journal phase removes the general interaction fence only
+      // inside this transaction, after the immutable abandonment evidence and
+      // terminal session CAS exist. Retire every interaction whose custody was
+      // owned by the switch before the transaction can expose `abandoned`.
+      const interactions = this.#database.query(
+        `SELECT interaction.*
+         FROM provider_interactions interaction
+         LEFT JOIN interaction_provider_authorities authority
+           ON authority.public_id=interaction.public_id
+         LEFT JOIN session_switch_target_start_receipts target
+           ON target.attempt_id=?
+         LEFT JOIN session_switch_seed_authorities seed
+           ON seed.attempt_id=?
+         WHERE interaction.state IN ('pending','response_prepared','response_written')
+           AND (
+             interaction.session_id=?
+             OR (
+               interaction.session_id IS NULL
+               AND interaction.thread_id=?
+               AND authority.provider_account_id=?
+               AND authority.profile_id=? AND authority.provider=?
+               AND authority.binding_generation=? AND authority.process_generation=?
+             )
+             OR (
+               interaction.session_id IS NULL
+               AND interaction.thread_id=target.provider_thread_id
+               AND (
+                 (
+                   authority.provider_account_id=?
+                   AND authority.profile_id=? AND authority.provider=?
+                   AND authority.binding_generation=? AND authority.process_generation=?
+                 )
+                 OR (
+                   authority.provider_account_id=seed.provider_account_id
+                   AND authority.profile_id=seed.profile_id AND authority.provider=seed.provider
+                   AND authority.binding_generation=seed.binding_generation
+                   AND authority.process_generation=seed.process_generation
+                 )
+               )
+             )
+           )
+         ORDER BY interaction.requested_at,interaction.public_id LIMIT 10001`,
+      ).all(
+        record.attemptId,
+        record.attemptId,
+        record.sessionId,
+        record.sourceProviderThreadId,
+        record.sourceAuthority.providerAccountId,
+        record.sourceAuthority.profileId,
+        record.sourceAuthority.provider,
+        record.sourceAuthority.bindingGeneration,
+        record.sourceAuthority.processGeneration,
+        record.targetAuthority.providerAccountId,
+        record.targetAuthority.profileId,
+        record.targetAuthority.provider,
+        record.targetAuthority.bindingGeneration,
+        record.targetAuthority.processGeneration,
+      );
+      if (interactions.length > 10_000) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      }
+      const terminalInteractions: InteractionRecord[] = [];
+      for (const value of interactions) {
+        const interaction = interactionRowSchema.parse(value);
+        const terminalState = interaction.state === "pending"
+          ? "expired"
+          : "resolution_unknown";
+        const retired = this.#database.query(
+          `UPDATE provider_interactions
+           SET state=?,revision=revision+1,updated_at=MAX(updated_at,?),
+               terminal_at=MAX(requested_at,?)
+           WHERE public_id=? AND revision=? AND state=?`,
+        ).run(
+          terminalState,
+          now,
+          now,
+          interaction.public_id,
+          interaction.revision,
+          interaction.state,
+        );
+        if (retired.changes !== 1) {
+          throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+        }
+        const terminal = this.#requireInteractionRow(interaction.public_id);
+        this.#recordInteractionTransition(terminal, now);
+        terminalInteractions.push(this.#mapInteraction(terminal));
+      }
+      return terminalInteractions;
+    });
+    const interactions = abandon.immediate();
+    const updatedSwitch = this.requireSessionSwitch(cas.attemptId);
+    const terminalSession = updatedSwitch.abandonment?.session;
+    if (terminalSession === undefined) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    return { switch: updatedSwitch, session: terminalSession, interactions };
+  }
+
+  recoverSessionSwitchesPage(input: Readonly<{
+    afterJournalSequence?: number;
+    limit?: number;
+  }> = {}): SessionSwitchRecoveryPage {
+    const afterJournalSequence = z.number().int().nonnegative()
+      .max(Number.MAX_SAFE_INTEGER).parse(input.afterJournalSequence ?? 0);
+    const limit = z.number().int().min(1).max(100).parse(input.limit ?? 25);
+    const malformedAttemptIds: AttemptId[] = [];
+    const rows = this.#database.query(
+      `SELECT journal_sequence,
+              CASE WHEN typeof(attempt_id)='text'
+                         AND length(CAST(attempt_id AS BLOB)) BETWEEN 1 AND 200
+                THEN CAST(attempt_id AS TEXT) ELSE NULL END AS bounded_attempt_id
+       FROM session_switch_attempts
+       WHERE phase NOT IN ('seed_settled','reconciliation_required','failed','cancelled','abandoned')
+         AND journal_sequence>?
+       ORDER BY journal_sequence LIMIT ?`,
+    ).all(afterJournalSequence, limit + 1).map((row) => z.object({
+      journal_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      bounded_attempt_id: z.string().min(1).max(200).nullable(),
+    }).strict().parse(row));
+    const selected = rows.slice(0, limit);
+    const switches: SessionSwitchRecord[] = [];
+    for (const row of selected) {
+      const diagnosticAttemptId = malformedSessionSwitchDiagnosticAttemptId(
+        row.journal_sequence,
+      );
+      const parsedAttemptId = attemptIdSchema.safeParse(row.bounded_attempt_id);
+      if (!parsedAttemptId.success) {
+        this.#quarantineMalformedSessionSwitchRow(row.journal_sequence);
+        malformedAttemptIds.push(diagnosticAttemptId);
+        continue;
+      }
+      try {
+        const record = this.requireSessionSwitch(parsedAttemptId.data);
+        const cas: SessionSwitchCas = {
+          attemptId: record.attemptId,
+          requestDigest: record.requestDigest,
+          sourceAuthority: record.sourceAuthority,
+          targetAuthority: record.targetAuthority,
+          originalSessionRevision: record.originalSessionRevision,
+          originalAuthorityRevision: record.originalAuthorityRevision,
+        };
+        if (record.phase === "prepared") {
+          switches.push(this.cancelPreparedSessionSwitch(cas));
+        } else if (record.phase === "target_starting" || record.phase === "seed_dispatching") {
+          switches.push(this.markSessionSwitchReconciliationRequired({
+            ...cas,
+            expectedPhase: record.phase,
+            diagnosticCode: record.phase === "target_starting"
+              ? "TARGET_START_OUTCOME_UNKNOWN"
+              : "SEED_DISPATCH_OUTCOME_UNKNOWN",
+          }));
+        } else {
+          switches.push(record);
+        }
+      } catch {
+        this.#quarantineMalformedSessionSwitchRow(row.journal_sequence);
+        malformedAttemptIds.push(diagnosticAttemptId);
+      }
+    }
+    return {
+      switches,
+      malformedAttemptIds,
+      nextJournalSequence: rows.length > limit
+        ? z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+          .parse(selected[selected.length - 1]?.journal_sequence)
+        : null,
+    };
+  }
+
+  sessionSwitchAdmissionBlocked(input: Readonly<{
+    sessionId: SessionId | null;
+    providerThreadId: string | null;
+    providerAuthority: ProviderAccountAuthority;
+  }>): Readonly<{
+    blocked: boolean;
+    attemptId: AttemptId | null;
+    role: "session" | "source" | "target" | null;
+  }> {
+    const sessionId = sessionIdSchema.nullable().parse(input.sessionId);
+    const providerThreadId = input.providerThreadId === null
+      ? null
+      : z.string().min(1).max(512).parse(input.providerThreadId);
+    const authority = providerAccountAuthoritySchema.parse(input.providerAuthority);
+    if (sessionId !== null && this.#database.query(
+      `SELECT 1 FROM session_switch_malformed_dispositions
+       WHERE session_id=? AND terminal_phase='reconciliation_required' LIMIT 1`,
+    ).get(sessionId) !== null) {
+      return { blocked: true, attemptId: null, role: "session" };
+    }
+    const row = this.#database.query(
+      `SELECT CASE WHEN malformed.journal_sequence IS NULL
+                         AND typeof(switch.attempt_id)='text'
+                         AND length(CAST(switch.attempt_id AS BLOB))=40
+                         AND switch.attempt_id GLOB 'attempt_[0-9a-f]*'
+                         AND substr(switch.attempt_id,9) NOT GLOB '*[^0-9a-f]*'
+                    THEN switch.attempt_id ELSE NULL END AS attempt_id,
+              CASE
+                WHEN ? IS NOT NULL AND switch.session_id=? THEN 'session'
+                WHEN ? IS NOT NULL AND switch.source_provider_thread_id=?
+                  AND switch.source_provider_account_id=?
+                  AND switch.source_profile_id=? AND switch.source_provider=?
+                  AND switch.source_binding_generation=?
+                  AND switch.source_process_generation=? THEN 'source'
+                ELSE 'target'
+              END AS role
+       FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+       LEFT JOIN session_switch_malformed_dispositions malformed
+         ON malformed.journal_sequence=switch.journal_sequence
+       LEFT JOIN mutation_attempts switch_mutation
+         ON switch_mutation.kind='session.switch'
+        AND (
+          (malformed.journal_sequence IS NOT NULL
+            AND switch_mutation.idempotency_key=malformed.mutation_request_key)
+          OR (malformed.journal_sequence IS NULL
+            AND switch_mutation.idempotency_key=switch.request_key
+            AND switch_mutation.authority_id=switch.session_id
+            AND switch_mutation.authority_generation=switch.target_process_generation
+            AND switch_mutation.request_digest=switch.request_digest)
+        )
+       LEFT JOIN session_switch_target_start_receipts target
+         ON target.attempt_id=switch_mutation.id
+       LEFT JOIN session_switch_seed_authorities seed
+         ON seed.attempt_id=switch_mutation.id
+       WHERE ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         AND (
+           (? IS NOT NULL AND switch.session_id=?)
+           OR (
+             ? IS NOT NULL AND switch.source_provider_thread_id=?
+             AND switch.source_provider_account_id=?
+             AND switch.source_profile_id=? AND switch.source_provider=?
+             AND switch.source_binding_generation=?
+             AND switch.source_process_generation=?
+           )
+           OR (
+             ? IS NOT NULL AND target.provider_thread_id=?
+             AND (
+               (
+                 switch.target_provider_account_id=?
+                 AND switch.target_profile_id=? AND switch.target_provider=?
+                 AND switch.target_binding_generation=?
+                 AND switch.target_process_generation=?
+               )
+               OR (
+                 seed.provider_account_id=? AND seed.profile_id=? AND seed.provider=?
+                 AND seed.binding_generation=? AND seed.process_generation=?
+               )
+             )
+           )
+         )
+       ORDER BY switch.journal_sequence LIMIT 1`,
+    ).get(
+      sessionId,
+      sessionId,
+      providerThreadId,
+      providerThreadId,
+      authority.providerAccountId,
+      authority.profileId,
+      authority.provider,
+      authority.bindingGeneration,
+      authority.processGeneration,
+      sessionId,
+      sessionId,
+      providerThreadId,
+      providerThreadId,
+      authority.providerAccountId,
+      authority.profileId,
+      authority.provider,
+      authority.bindingGeneration,
+      authority.processGeneration,
+      providerThreadId,
+      providerThreadId,
+      authority.providerAccountId,
+      authority.profileId,
+      authority.provider,
+      authority.bindingGeneration,
+      authority.processGeneration,
+      authority.providerAccountId,
+      authority.profileId,
+      authority.provider,
+      authority.bindingGeneration,
+      authority.processGeneration,
+    );
+    if (row === null) return { blocked: false, attemptId: null, role: null };
+    const parsed = z.object({
+      attempt_id: attemptIdSchema.nullable(),
+      role: z.enum(["session", "source", "target"]),
+    }).strict().parse(row);
+    return { blocked: true, attemptId: parsed.attempt_id, role: parsed.role };
+  }
+
+  #requireSessionSwitchCas(
+    input: SessionSwitchCas,
+    expectedPhase?: SessionSwitchPhase,
+  ): SessionSwitchRecord {
+    const cas = parseSessionSwitchCas(input);
+    const record = this.requireSessionSwitch(cas.attemptId);
+    if (record.requestDigest !== cas.requestDigest) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
+    }
+    if (
+      !sameProviderAccountAuthority(record.sourceAuthority, cas.sourceAuthority)
+      || !sameProviderAccountAuthority(record.targetAuthority, cas.targetAuthority)
+    ) throw new SessionSwitchStoreError("SESSION_SWITCH_AUTHORITY_CONFLICT");
+    if (record.originalSessionRevision !== cas.originalSessionRevision) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+    }
+    if (record.originalAuthorityRevision !== cas.originalAuthorityRevision) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_AUTHORITY_REVISION_STALE");
+    }
+    if (expectedPhase !== undefined && record.phase !== expectedPhase) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+    }
+    return record;
+  }
+
+  #assertSessionSwitchSourceCurrent(record: SessionSwitchRecord): void {
+    const sessionRow = this.#database.query(
+      "SELECT * FROM sessions WHERE id=?",
+    ).get(record.sessionId);
+    const authorityRow = this.#database.query(
+      "SELECT * FROM session_provider_authorities WHERE session_id=?",
+    ).get(record.sessionId);
+    if (sessionRow === null || authorityRow === null) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_SOURCE_AUTHORITY_STALE");
+    }
+    const session = mapSession(sessionRow);
+    const captured = sessionProviderAuthorityRowSchema.parse(authorityRow);
+    const authority = providerAccountAuthoritySchema.parse({
+      providerAccountId: captured.provider_account_id,
+      profileId: captured.profile_id,
+      provider: captured.provider,
+      bindingGeneration: captured.binding_generation,
+      processGeneration: captured.process_generation,
+    });
+    if (
+      session.revision !== record.originalSessionRevision
+      || session.providerThreadId !== record.sourceProviderThreadId
+      || session.preset !== record.sourcePreset
+      || captured.authority_revision !== record.originalAuthorityRevision
+      || !sameProviderAccountAuthority(authority, record.sourceAuthority)
+    ) throw new SessionSwitchStoreError("SESSION_SWITCH_SOURCE_AUTHORITY_STALE");
+    try {
+      this.assertProviderAccountAuthorityCurrent(record.sourceAuthority);
+    } catch (error) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_SOURCE_AUTHORITY_STALE", error);
+    }
+  }
+
+  #assertSessionSwitchTargetCurrent(record: SessionSwitchRecord): void {
+    try {
+      this.assertProviderAccountAuthorityCurrent(record.targetAuthority);
+    } catch (error) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_TARGET_AUTHORITY_STALE", error);
+    }
+  }
+
+  #recordSessionSwitchReconciliation(
+    record: SessionSwitchRecord,
+    fromPhase: SessionSwitchReconciliationFromPhase,
+    diagnosticCode: string,
+    recordedAt: number,
+  ): void {
+    const phase = sessionSwitchReconciliationFromPhaseSchema.parse(fromPhase);
+    const diagnostic = sessionSwitchDiagnosticSchema.parse(diagnosticCode);
+    const now = unixMillisecondsSchema.parse(recordedAt);
+    const planDigest = z.object({ plan_digest: sha256Schema }).strict().parse(
+      this.#database.query(
+        "SELECT plan_digest FROM session_switch_plan_anchors WHERE attempt_id=?",
+      ).get(record.attemptId),
+    ).plan_digest;
+    const inserted = this.#database.query(
+      `INSERT INTO session_switch_reconciliation_receipts(
+         attempt_id,from_phase,evidence_depth,diagnostic_code,request_digest,
+         plan_digest,recorded_at
+       ) VALUES (?,?,?,?,?,?,?)`,
+    ).run(
+      record.attemptId,
+      phase,
+      sessionSwitchReconciliationEvidenceDepth[phase],
+      diagnostic,
+      record.requestDigest,
+      planDigest,
+      now,
+    );
+    if (inserted.changes !== 1) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+    }
+    this.#database.query(
+      `INSERT INTO session_switch_reconciliation_anchors(
+         attempt_id,evidence_digest,recorded_at
+       ) VALUES (?,?,?)`,
+    ).run(
+      record.attemptId,
+      sessionSwitchReconciliationEvidenceDigest({
+        attemptId: record.attemptId,
+        reconciliation: {
+          fromPhase: phase,
+          evidenceDepth: sessionSwitchReconciliationEvidenceDepth[phase],
+          diagnosticCode: diagnostic,
+          requestDigest: record.requestDigest,
+          planDigest,
+          recordedAt: now,
+        },
+      }),
+      now,
+    );
+  }
+
+  #transitionSessionSwitch(
+    record: SessionSwitchRecord,
+    from: SessionSwitchPhase,
+    to: SessionSwitchPhase,
+    diagnosticCode: string | null,
+  ): void {
+    const diagnostic = diagnosticCode === null
+      ? null
+      : sessionSwitchDiagnosticSchema.parse(diagnosticCode);
+    const now = unixMillisecondsSchema.parse(this.#now());
+    const changed = this.#database.query(
+      `UPDATE session_switch_attempts
+       SET phase=?,diagnostic_code=?,updated_at=MAX(updated_at,?)
+       WHERE attempt_id=? AND phase=? AND request_digest=?
+         AND source_provider_account_id=? AND source_profile_id=? AND source_provider=?
+         AND source_binding_generation=? AND source_process_generation=?
+         AND target_provider_account_id=? AND target_profile_id=? AND target_provider=?
+         AND target_binding_generation=? AND target_process_generation=?
+         AND original_session_revision=? AND original_authority_revision=?`,
+    ).run(
+      to,
+      diagnostic,
+      now,
+      record.attemptId,
+      from,
+      record.requestDigest,
+      record.sourceAuthority.providerAccountId,
+      record.sourceAuthority.profileId,
+      record.sourceAuthority.provider,
+      record.sourceAuthority.bindingGeneration,
+      record.sourceAuthority.processGeneration,
+      record.targetAuthority.providerAccountId,
+      record.targetAuthority.profileId,
+      record.targetAuthority.provider,
+      record.targetAuthority.bindingGeneration,
+      record.targetAuthority.processGeneration,
+      record.originalSessionRevision,
+      record.originalAuthorityRevision,
+    );
+    if (changed.changes !== 1) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+    }
+  }
+
+  #quarantineMalformedSessionSwitchRow(journalSequence: number): void {
+    try {
+      quarantineMalformedSessionSwitchJournal(
+        this.#database,
+        this.#now,
+        journalSequence,
+      );
+    } catch {
+      // One malformed dedicated record must not abort daemon startup or hide
+      // unrelated sessions. The recovery page reports its stable attempt id;
+      // a later explicit reconciliation can inspect the retained local row.
+    }
   }
 
   /**
@@ -9412,6 +15389,13 @@ export class StateStore {
       const id = createSessionId();
       const create = this.#database.transaction(() => {
         this.assertProviderAccountAuthorityCurrent(authority);
+        if (this.sessionSwitchAdmissionBlocked({
+          sessionId: null,
+          providerThreadId: input.providerThreadId,
+          providerAuthority: authority,
+        }).blocked) {
+          throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+        }
         this.#database.query("INSERT INTO sessions(id,profile_id,project_id,provider_thread_id,title,provider,preset,fast_enabled,state,active_turn_id,provider_updated_at,revision,created_at,updated_at) VALUES (?,?,?,?,?,?,'high',0,?,?,?,1,?,?)").run(id, authority.profileId, input.projectId ?? null, input.providerThreadId, titleSchema.parse(input.title), authority.provider, input.state, input.activeTurnId ?? null, input.providerUpdatedAt ?? null, now, now);
         this.#insertSessionEventStream(id, now);
         this.#database.query(
@@ -9442,6 +15426,13 @@ export class StateStore {
         throw new Error("PROVIDER_SESSION_IMPORT_AUTHORITY_CHANGED");
       }
       this.assertProviderAccountAuthorityCurrent(authority);
+      if (this.sessionSwitchAdmissionBlocked({
+        sessionId: coherent.id,
+        providerThreadId: input.providerThreadId,
+        providerAuthority: authority,
+      }).blocked) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      }
       const captured = this.requireSessionProviderAuthority(coherent.id);
       if (
         captured.providerAccountId !== authority.providerAccountId
@@ -10221,6 +16212,15 @@ export class StateStore {
     const now = this.#now();
     const transaction = this.#database.transaction(() => {
       this.assertProviderAccountAuthorityCurrent(providerAuthority);
+      const previousAuthority = insertSessionProviderAuthoritySuccessor(this.#database, {
+        sessionId,
+        targetAuthority: providerAuthority,
+        targetRoutingProvenance: "explicit",
+        targetAppliedPointerRevision: null,
+        transitionKind: "legacy_switch",
+        transitionId: attemptId,
+        recordedAt: now,
+      });
       const bound = this.#database.query(
         `UPDATE sessions
          SET provider=?,profile_id=?,preset=?,provider_thread_id=?,state=?,active_turn_id=?,
@@ -10242,8 +16242,9 @@ export class StateStore {
       const authorityChanged = this.#database.query(
         `UPDATE session_provider_authorities
          SET provider_account_id=?,profile_id=?,provider=?,binding_generation=?,process_generation=?,
-             authority_revision=authority_revision+1
-         WHERE session_id=?`,
+             authority_revision=authority_revision+1,routing_provenance='explicit',
+             applied_pointer_revision=NULL
+         WHERE session_id=? AND authority_revision=?`,
       ).run(
         providerAuthority.providerAccountId,
         providerAuthority.profileId,
@@ -10251,6 +16252,7 @@ export class StateStore {
         providerAuthority.bindingGeneration,
         providerAuthority.processGeneration,
         sessionId,
+        previousAuthority.authorityRevision,
       );
       if (authorityChanged.changes !== 1) {
         throw new Error("SESSION_PROVIDER_SWITCH_AUTHORITY_MISSING");
@@ -10329,6 +16331,13 @@ export class StateStore {
       );
       if (!sameProviderAccountAuthority(frozen, providerAuthority)) {
         throw new Error("SESSION_PROVIDER_DELETION_AUTHORITY_MISMATCH");
+      }
+      if (this.sessionSwitchAdmissionBlocked({
+        sessionId: current.id,
+        providerThreadId: current.providerThreadId ?? null,
+        providerAuthority,
+      }).blocked) {
+        throw new Error("SESSION_SWITCH_STORAGE_FENCED");
       }
       let sessionChanged = false;
       let event: SessionEvent | undefined;
@@ -10780,6 +16789,11 @@ export class StateStore {
        LEFT JOIN legacy_provider_authority_quarantines q
          ON q.scope_kind='queue' AND q.scope_id=value.id
        WHERE value.session_id=? AND value.state='pending'
+         AND NOT EXISTS(
+           SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+           WHERE switch.session_id=value.session_id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         )
        ORDER BY enqueue_sequence LIMIT 1`,
     ).get(parsedSessionId);
     if (row === null) return null;
@@ -10808,7 +16822,14 @@ export class StateStore {
 
   listRecoverableQueue(): readonly QueueRecord[] {
     const rows = this.#database
-      .query("SELECT id,session_id,message,state,created_at,updated_at FROM queue_entries WHERE state IN ('pending','dispatching') ORDER BY enqueue_sequence")
+      .query(`SELECT id,session_id,message,state,created_at,updated_at
+              FROM queue_entries value WHERE state IN ('pending','dispatching')
+                AND NOT EXISTS(
+                  SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+                  WHERE switch.session_id=value.session_id
+    AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+                )
+              ORDER BY enqueue_sequence`)
       .all();
     return rows.map((row) => {
       const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema, message: z.string(), state: queueStateSchema, created_at: unixMillisecondsSchema, updated_at: unixMillisecondsSchema }).strict().parse(row);
@@ -11205,6 +17226,29 @@ export class StateStore {
   }
 
   readMutation(idempotencyKey: string): MutationAttemptRecord | null {
+    const key = z.string().uuid().parse(idempotencyKey);
+    if (this.#database.query(
+      `SELECT 1 FROM session_switch_malformed_dispositions
+       WHERE mutation_request_key=? LIMIT 1`,
+    ).get(key) !== null) {
+      throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    const identity = this.#database.query(
+      `SELECT kind,
+              CASE WHEN typeof(id)='text'
+                         AND length(CAST(id AS BLOB))=40
+                         AND id GLOB 'attempt_[0-9a-f]*'
+                         AND substr(id,9) NOT GLOB '*[^0-9a-f]*'
+                THEN 1 ELSE 0 END AS attempt_id_valid
+       FROM mutation_attempts WHERE idempotency_key=?`,
+    ).get(key) as { kind: string; attempt_id_valid: 0 | 1 } | null;
+    if (identity === null) return null;
+    if (identity.attempt_id_valid !== 1) {
+      if (identity.kind === "session.switch") {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_RECOVERY_CORRUPT");
+      }
+      throw new Error("MUTATION_ATTEMPT_ID_INVALID");
+    }
     const row = this.#database
       .query(`SELECT m.id,m.idempotency_key,m.kind,m.authority_id,m.authority_generation,m.request_digest,m.state,m.result_json,
                      e.evidence_json,e.evidence_digest,e.recorded_at,
@@ -11215,7 +17259,7 @@ export class StateStore {
               LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
               LEFT JOIN session_start_attempts s ON s.attempt_id=m.id
               WHERE m.idempotency_key=?`)
-      .get(idempotencyKey) as {
+      .get(key) as {
         id: AttemptId;
         idempotency_key: string;
         kind: string;
@@ -11233,7 +17277,7 @@ export class StateStore {
         resolution_created_at: number | null;
         session_start_id: SessionId | null;
       } | null;
-    if (row === null) return null;
+    if (row === null) throw new Error("MUTATION_ATTEMPT_ID_LOOKUP_LOST");
     const originalState = mutationStateSchema.exclude(["reconciled"]).parse(row.state);
     let evidence: MutationEffectEvidenceRecord | undefined;
     if (row.evidence_json !== null) {
@@ -11437,7 +17481,6 @@ export class StateStore {
     if (
       stored === null
       || stored.profileId !== profileId
-      || stored.provider !== "codex"
       || stored.processGeneration !== processGeneration
     ) throw new Error("ACCOUNT_SCOPED_PROVIDER_AUTHORITY_MISSING");
     const binding = this.#database.query(
@@ -11966,8 +18009,16 @@ export class StateStore {
       for (const evidence of providerAuthorities) {
         this.assertProviderAccountAuthorityCurrent(evidence.authority);
       }
+      if (this.#database.query(
+        `SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+         WHERE switch.session_id=?
+           AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         LIMIT 1`,
+      ).get(input.authorityId) !== null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      }
       const unsettled = this.#database
-        .query(`SELECT m.id FROM mutation_attempts m
+        .query(`SELECT 1 FROM mutation_attempts m
                 LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
                 LEFT JOIN desktop_switch_resolutions dr ON dr.attempt_id=m.id
                 WHERE m.authority_id=? AND m.authority_generation=?
@@ -12014,10 +18065,34 @@ export class StateStore {
     if (from === "reconciled" || to === "reconciled") {
       throw new Error("Reconciliation is append-only and cannot rewrite a mutation attempt.");
     }
-    const now = this.#now();
-    const resultJson = result === undefined ? null : JSON.stringify(result);
-    const update = this.#database.query("UPDATE mutation_attempts SET state=?,result_json=?,updated_at=? WHERE id=? AND state=?").run(to, resultJson, now, id, from);
-    return update.changes === 1;
+    const attemptId = attemptIdSchema.parse(id);
+    const transition = this.#database.transaction(() => {
+      // Dedicated v37 switch results are receipt-backed immutable evidence.
+      // Only their phase-specific APIs may transition or settle the linked
+      // mutation; the legacy generic session.switch path has no journal row
+      // and remains supported here.
+      if (this.#database.query(
+        "SELECT 1 FROM session_switch_attempts WHERE attempt_id=?",
+      ).get(attemptId) !== null) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      }
+      const now = this.#now();
+      const resultJson = result === undefined ? null : JSON.stringify(result);
+      const update = this.#database.query(
+        `UPDATE mutation_attempts SET state=?,result_json=?,updated_at=?
+         WHERE id=? AND state=?
+           AND NOT EXISTS(
+             SELECT 1 FROM session_switch_attempts switch
+             WHERE switch.attempt_id=mutation_attempts.id
+           )
+           AND NOT EXISTS(
+             SELECT 1 FROM session_switch_malformed_dispositions malformed
+             WHERE malformed.mutation_request_key=mutation_attempts.idempotency_key
+           )`,
+      ).run(to, resultJson, now, attemptId, from);
+      return update.changes === 1;
+    });
+    return transition.immediate();
   }
 
   beginSessionMutationEffect(input: {
@@ -12036,6 +18111,13 @@ export class StateStore {
     const digest = createHash("sha256").update(canonical).digest("hex");
     const now = this.#now();
     const begin = this.#database.transaction(() => {
+      if (this.sessionSwitchAdmissionBlocked({
+        sessionId: parsedSessionId,
+        providerThreadId: evidence.providerThreadId,
+        providerAuthority,
+      }).blocked) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      }
       const authority = z.object({
         kind: z.string(),
         authority_id: sessionIdSchema,
@@ -12473,13 +18555,34 @@ export class StateStore {
   listUnsettledMutations(input: { authorityId?: string; sessionId?: SessionId } = {}): readonly MutationAttemptRecord[] {
     const rows = input.sessionId === undefined
       ? input.authorityId === undefined
-        ? this.#database.query(`SELECT m.idempotency_key FROM mutation_attempts m LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id WHERE m.state IN ('effect_started','ambiguous') AND r.attempt_id IS NULL ORDER BY m.created_at,m.id`).all()
-        : this.#database.query(`SELECT m.idempotency_key FROM mutation_attempts m LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id WHERE m.authority_id=? AND m.state IN ('effect_started','ambiguous') AND r.attempt_id IS NULL ORDER BY m.created_at,m.id`).all(input.authorityId)
+        ? this.#database.query(`SELECT m.idempotency_key FROM mutation_attempts m
+                                LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+                                LEFT JOIN session_switch_attempts dedicated ON dedicated.attempt_id=m.id
+                                LEFT JOIN session_switch_malformed_dispositions malformed
+                                  ON malformed.mutation_request_key=m.idempotency_key
+                                WHERE m.state IN ('effect_started','ambiguous')
+                                  AND r.attempt_id IS NULL AND dedicated.attempt_id IS NULL
+                                  AND malformed.mutation_request_key IS NULL
+                                ORDER BY m.created_at,m.id`).all()
+        : this.#database.query(`SELECT m.idempotency_key FROM mutation_attempts m
+                                LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+                                LEFT JOIN session_switch_attempts dedicated ON dedicated.attempt_id=m.id
+                                LEFT JOIN session_switch_malformed_dispositions malformed
+                                  ON malformed.mutation_request_key=m.idempotency_key
+                                WHERE m.authority_id=? AND m.state IN ('effect_started','ambiguous')
+                                  AND r.attempt_id IS NULL AND dedicated.attempt_id IS NULL
+                                  AND malformed.mutation_request_key IS NULL
+                                ORDER BY m.created_at,m.id`).all(input.authorityId)
       : this.#database.query(`SELECT m.idempotency_key FROM mutation_attempts m
                               LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
                               LEFT JOIN session_start_attempts s ON s.attempt_id=m.id
+                              LEFT JOIN session_switch_attempts dedicated ON dedicated.attempt_id=m.id
+                              LEFT JOIN session_switch_malformed_dispositions malformed
+                                ON malformed.mutation_request_key=m.idempotency_key
                               WHERE (m.authority_id=? OR s.session_id=?)
-                                AND m.state IN ('effect_started','ambiguous') AND r.attempt_id IS NULL
+                                AND m.state IN ('effect_started','ambiguous')
+                                AND r.attempt_id IS NULL AND dedicated.attempt_id IS NULL
+                                AND malformed.mutation_request_key IS NULL
                               ORDER BY m.created_at,m.id`).all(input.sessionId, input.sessionId);
     return rows.map((row) => {
       const key = z.object({ idempotency_key: z.string().uuid() }).strict().parse(row).idempotency_key;
@@ -12650,7 +18753,11 @@ export class StateStore {
         `SELECT m.authority_id,m.authority_generation,m.kind,m.state
          FROM mutation_attempts m
          LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
-         WHERE m.id=? AND r.attempt_id IS NULL`,
+         LEFT JOIN session_switch_attempts dedicated ON dedicated.attempt_id=m.id
+         LEFT JOIN session_switch_malformed_dispositions malformed
+           ON malformed.mutation_request_key=m.idempotency_key
+         WHERE m.id=? AND r.attempt_id IS NULL AND dedicated.attempt_id IS NULL
+           AND malformed.mutation_request_key IS NULL`,
       ).get(attemptId));
       if (row.authority_id !== sessionId || row.state !== expectedState) {
         throw new Error("SESSION_SWITCH_RECOVERY_CAS_CONFLICT");
@@ -12763,7 +18870,12 @@ export class StateStore {
                 LEFT JOIN mutation_effect_evidence e ON e.attempt_id=m.id
                 LEFT JOIN session_start_attempts s ON s.attempt_id=m.id
                 LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+                LEFT JOIN session_switch_attempts dedicated ON dedicated.attempt_id=m.id
+                LEFT JOIN session_switch_malformed_dispositions malformed
+                  ON malformed.mutation_request_key=m.idempotency_key
                 WHERE m.state='effect_started' AND r.attempt_id IS NULL
+                  AND dedicated.attempt_id IS NULL
+                  AND malformed.mutation_request_key IS NULL
                 ORDER BY m.created_at,m.id`)
         .all() as { id: string; kind: string; authority_id: string; authority_generation: number; evidence_kind: string | null; evidence_json: string | null; evidence_digest: string | null; session_start_id: string | null }[];
       const recovered: AttemptId[] = [];
@@ -14116,9 +20228,20 @@ export class StateStore {
     reason: Extract<SessionEventGapReason, "retention_count" | "retention_age" | "retention_bytes">,
     now: number,
   ): void {
+    const pin = z.object({
+      after_sequence_exclusive: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    }).strict().parse(this.#database.query(
+      `SELECT MIN(switch.after_sequence_exclusive) AS after_sequence_exclusive
+       FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+       WHERE switch.session_id=? AND ${SESSION_SWITCH_BLOCKING_PREDICATE}`,
+    ).get(sessionId));
+    const retainedThrough = pin.after_sequence_exclusive === null
+      ? throughSequence
+      : Math.min(throughSequence, pin.after_sequence_exclusive);
+    if (retainedThrough < 1) return;
     const deleted = this.#database.query(
       "DELETE FROM session_events WHERE session_id=? AND sequence<=?",
-    ).run(sessionId, throughSequence);
+    ).run(sessionId, retainedThrough);
     if (deleted.changes === 0) return;
     const boundary = z.object({
       floor_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
@@ -15060,6 +21183,14 @@ export class StateStore {
         result = { record: existing, replayed: true };
         return;
       }
+      const switchFence = this.sessionSwitchAdmissionBlocked({
+        sessionId,
+        providerThreadId: authority.threadId,
+        providerAuthority,
+      });
+      if (switchFence.blocked) {
+        throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED");
+      }
       if (this.#database.query("SELECT 1 FROM provider_interactions WHERE public_id=?").get(publicId) !== null) {
         throw new Error("INTERACTION_PUBLIC_ID_CONFLICT");
       }
@@ -15212,17 +21343,102 @@ export class StateStore {
     const now = unixMillisecondsSchema.parse(input.now ?? this.#now());
     const limit = z.number().int().min(1).max(128).parse(input.limit ?? 32);
     return this.#database.query(
-      `SELECT * FROM provider_interactions
-       WHERE state='pending' AND deadline_at<=?
-       ORDER BY deadline_at,public_id LIMIT ?`,
+      `SELECT interaction.* FROM provider_interactions interaction
+       WHERE interaction.state='pending' AND interaction.deadline_at<=?
+         AND NOT EXISTS(
+           SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+           LEFT JOIN session_switch_target_start_receipts target
+             ON target.attempt_id=switch.attempt_id
+           LEFT JOIN session_switch_seed_authorities seed
+             ON seed.attempt_id=switch.attempt_id
+           LEFT JOIN interaction_provider_authorities authority
+             ON authority.public_id=interaction.public_id
+           WHERE ${SESSION_SWITCH_BLOCKING_PREDICATE}
+             AND (
+               interaction.session_id=switch.session_id
+               OR (
+                 interaction.session_id IS NULL
+                 AND interaction.thread_id=switch.source_provider_thread_id
+                 AND authority.provider_account_id=switch.source_provider_account_id
+                 AND authority.profile_id=switch.source_profile_id
+                 AND authority.provider=switch.source_provider
+                 AND authority.binding_generation=switch.source_binding_generation
+                 AND authority.process_generation=switch.source_process_generation
+               )
+               OR (
+                 interaction.session_id IS NULL
+                 AND interaction.thread_id=target.provider_thread_id
+                 AND (
+                   (
+                     authority.provider_account_id=switch.target_provider_account_id
+                     AND authority.profile_id=switch.target_profile_id
+                     AND authority.provider=switch.target_provider
+                     AND authority.binding_generation=switch.target_binding_generation
+                     AND authority.process_generation=switch.target_process_generation
+                   )
+                   OR (
+                     authority.provider_account_id=seed.provider_account_id
+                     AND authority.profile_id=seed.profile_id
+                     AND authority.provider=seed.provider
+                     AND authority.binding_generation=seed.binding_generation
+                     AND authority.process_generation=seed.process_generation
+                   )
+                 )
+               )
+             )
+         )
+       ORDER BY interaction.deadline_at,interaction.public_id LIMIT ?`,
     ).all(now, limit).map((row) => this.#mapInteraction(row));
   }
 
   nextInteractionDeadlineAt(): number | null {
     const row = z.object({ deadline_at: unixMillisecondsSchema }).strict().nullable().parse(
       this.#database.query(
-        `SELECT deadline_at FROM provider_interactions
-         WHERE state='pending' ORDER BY deadline_at,public_id LIMIT 1`,
+        `SELECT interaction.deadline_at FROM provider_interactions interaction
+         WHERE interaction.state='pending'
+           AND NOT EXISTS(
+             SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+             LEFT JOIN session_switch_target_start_receipts target
+               ON target.attempt_id=switch.attempt_id
+             LEFT JOIN session_switch_seed_authorities seed
+               ON seed.attempt_id=switch.attempt_id
+             LEFT JOIN interaction_provider_authorities authority
+               ON authority.public_id=interaction.public_id
+             WHERE ${SESSION_SWITCH_BLOCKING_PREDICATE}
+               AND (
+                 interaction.session_id=switch.session_id
+                 OR (
+                   interaction.session_id IS NULL
+                   AND interaction.thread_id=switch.source_provider_thread_id
+                   AND authority.provider_account_id=switch.source_provider_account_id
+                   AND authority.profile_id=switch.source_profile_id
+                   AND authority.provider=switch.source_provider
+                   AND authority.binding_generation=switch.source_binding_generation
+                   AND authority.process_generation=switch.source_process_generation
+                 )
+                 OR (
+                   interaction.session_id IS NULL
+                   AND interaction.thread_id=target.provider_thread_id
+                   AND (
+                     (
+                       authority.provider_account_id=switch.target_provider_account_id
+                       AND authority.profile_id=switch.target_profile_id
+                       AND authority.provider=switch.target_provider
+                       AND authority.binding_generation=switch.target_binding_generation
+                       AND authority.process_generation=switch.target_process_generation
+                     )
+                     OR (
+                       authority.provider_account_id=seed.provider_account_id
+                       AND authority.profile_id=seed.profile_id
+                       AND authority.provider=seed.provider
+                       AND authority.binding_generation=seed.binding_generation
+                       AND authority.process_generation=seed.process_generation
+                     )
+                   )
+                 )
+               )
+           )
+         ORDER BY interaction.deadline_at,interaction.public_id LIMIT 1`,
       ).get(),
     );
     return row?.deadline_at ?? null;
@@ -15602,6 +21818,7 @@ export class StateStore {
     processGeneration: number;
     connectionId?: string;
     providerAuthority: ProviderAccountAuthority;
+    excludeSessionSwitchBlocked?: boolean;
   }): readonly InteractionRecord[] {
     return this.#terminalizeGenerationInteractions(input, false);
   }
@@ -15670,6 +21887,7 @@ export class StateStore {
       processGeneration: number;
       connectionId?: string;
       providerAuthority: ProviderAccountAuthority;
+      excludeSessionSwitchBlocked?: boolean;
     },
     allUnknown: boolean,
   ): readonly InteractionRecord[] {
@@ -15677,6 +21895,9 @@ export class StateStore {
     const processGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(input.processGeneration);
     const connectionId = input.connectionId === undefined ? undefined : z.string().uuid().parse(input.connectionId);
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
+    const excludeSessionSwitchBlocked = z.boolean().parse(
+      input.excludeSessionSwitchBlocked ?? false,
+    );
     if (
       providerAuthority.profileId !== profileId
       || providerAuthority.processGeneration !== processGeneration
@@ -15691,6 +21912,41 @@ export class StateStore {
            AND a.binding_generation=? AND a.process_generation=?
            ${connectionId === undefined ? "" : "AND value.connection_id=?"}
            AND value.state IN ('pending','response_prepared','response_written')
+           ${excludeSessionSwitchBlocked ? `AND NOT EXISTS(
+             SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+             LEFT JOIN session_switch_target_start_receipts target
+               ON target.attempt_id=switch.attempt_id
+             LEFT JOIN session_switch_seed_authorities seed
+               ON seed.attempt_id=switch.attempt_id
+             WHERE ${SESSION_SWITCH_BLOCKING_PREDICATE}
+               AND (
+                 value.session_id=switch.session_id
+                 OR (
+                   value.session_id IS NULL AND value.thread_id=switch.source_provider_thread_id
+                   AND a.provider_account_id=switch.source_provider_account_id
+                   AND a.profile_id=switch.source_profile_id AND a.provider=switch.source_provider
+                   AND a.binding_generation=switch.source_binding_generation
+                   AND a.process_generation=switch.source_process_generation
+                 )
+                 OR (
+                   value.session_id IS NULL AND value.thread_id=target.provider_thread_id
+                   AND (
+                     (
+                       a.provider_account_id=switch.target_provider_account_id
+                       AND a.profile_id=switch.target_profile_id AND a.provider=switch.target_provider
+                       AND a.binding_generation=switch.target_binding_generation
+                       AND a.process_generation=switch.target_process_generation
+                     )
+                     OR (
+                       a.provider_account_id=seed.provider_account_id
+                       AND a.profile_id=seed.profile_id AND a.provider=seed.provider
+                       AND a.binding_generation=seed.binding_generation
+                       AND a.process_generation=seed.process_generation
+                     )
+                   )
+                 )
+               )
+           )` : ""}
          ORDER BY value.requested_at,value.public_id`,
       ).all(
         profileId,
@@ -16453,7 +22709,6 @@ export class StateStore {
     if (
       observation.authority.provider !== "claude"
       || observation.source === "codex_app_server"
-      || observation.turn === null
     ) throw new Error("PROVIDER_USAGE_STORAGE_CLAUDE_ONLY");
     const json = canonicalProviderUsageJson(observation);
     if (new TextEncoder().encode(json).byteLength > PROVIDER_USAGE_COMPONENT_MAX_BYTES) {
@@ -17138,12 +23393,59 @@ export class StateStore {
         if (current.stopped_at !== null) throw new Error("DAEMON_BOOT_ID_RETIRED");
         return current.generation;
       }
+      // An actual daemon restart retires every provider-process authority.
+      // Dedicated switches therefore receive a local, phase-specific terminal
+      // disposition before any generic gap or generation update can touch
+      // their session. Same-generation retries remain resumable elsewhere;
+      // restart never pretends that an escaped provider effect survived the
+      // retired process fence.
+      this.#retireSessionSwitchesForDaemonRestart(now);
       // Record the discontinuity against the exact authority that owned each
       // old runtime before advancing either provider's process fence.
       this.#recordDaemonRestartGaps(now);
       const interactions = this.#database.query(
         `SELECT i.* FROM provider_interactions i
          WHERE i.state IN ('pending','response_prepared','response_written')
+           AND NOT EXISTS(
+             SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+             LEFT JOIN session_switch_target_start_receipts target
+               ON target.attempt_id=switch.attempt_id
+             LEFT JOIN session_switch_seed_authorities seed
+               ON seed.attempt_id=switch.attempt_id
+             LEFT JOIN interaction_provider_authorities authority
+               ON authority.public_id=i.public_id
+             WHERE ${SESSION_SWITCH_BLOCKING_PREDICATE}
+               AND (
+                 switch.session_id=i.session_id
+                 OR (
+                   i.session_id IS NULL AND i.thread_id=switch.source_provider_thread_id
+                   AND authority.provider_account_id=switch.source_provider_account_id
+                   AND authority.profile_id=switch.source_profile_id
+                   AND authority.provider=switch.source_provider
+                   AND authority.binding_generation=switch.source_binding_generation
+                   AND authority.process_generation=switch.source_process_generation
+                 )
+                 OR (
+                   i.session_id IS NULL AND i.thread_id=target.provider_thread_id
+                   AND (
+                     (
+                       authority.provider_account_id=switch.target_provider_account_id
+                       AND authority.profile_id=switch.target_profile_id
+                       AND authority.provider=switch.target_provider
+                       AND authority.binding_generation=switch.target_binding_generation
+                       AND authority.process_generation=switch.target_process_generation
+                     )
+                     OR (
+                       authority.provider_account_id=seed.provider_account_id
+                       AND authority.profile_id=seed.profile_id
+                       AND authority.provider=seed.provider
+                       AND authority.binding_generation=seed.binding_generation
+                       AND authority.process_generation=seed.process_generation
+                     )
+                   )
+                 )
+               )
+           )
          ORDER BY i.requested_at,i.public_id`,
       ).all();
       for (const value of interactions) {
@@ -17217,6 +23519,14 @@ export class StateStore {
              JOIN mutation_provider_authorities evidence
                ON evidence.attempt_id=m.id
              WHERE m.kind='session.switch' AND m.state='effect_started'
+               AND NOT EXISTS(
+                 SELECT 1 FROM session_switch_attempts dedicated
+                 WHERE dedicated.attempt_id=m.id
+               )
+               AND NOT EXISTS(
+                 SELECT 1 FROM session_switch_malformed_dispositions malformed
+                 WHERE malformed.mutation_request_key=m.idempotency_key
+               )
                AND evidence.provider='claude'
            )`,
       ).run(now);
@@ -17236,6 +23546,14 @@ export class StateStore {
              SELECT 1 FROM mutation_provider_authorities evidence
              WHERE evidence.attempt_id=mutation_attempts.id
                AND evidence.provider='claude'
+           )
+           AND NOT EXISTS(
+             SELECT 1 FROM session_switch_attempts dedicated
+             WHERE dedicated.attempt_id=mutation_attempts.id
+           )
+           AND NOT EXISTS(
+             SELECT 1 FROM session_switch_malformed_dispositions malformed
+             WHERE malformed.mutation_request_key=mutation_attempts.idempotency_key
            )`,
       ).run(now);
       this.#database.query(
@@ -17244,12 +23562,22 @@ export class StateStore {
            updated_at=MAX(updated_at,?)
          WHERE state IN ('pending','dispatching') AND session_id IN (
            SELECT id FROM sessions WHERE provider='claude' AND state!='terminal'
-         )`,
+         )
+           AND NOT EXISTS(
+             SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+             WHERE switch.session_id=queue_entries.session_id
+               AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+           )`,
       ).run(now);
       this.#database.query(
         `UPDATE sessions SET state='terminal',active_turn_id=NULL,
                              revision=revision+1,updated_at=MAX(updated_at,?)
-         WHERE provider='claude' AND state!='terminal'`,
+         WHERE provider='claude' AND state!='terminal'
+           AND NOT EXISTS(
+             SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+             WHERE switch.session_id=sessions.id
+               AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+           )`,
       ).run(now);
       // Claude cannot resume after daemon loss. Preserve the ambiguous
       // attempt/queue state and its immutable pre-effect authority, but append
@@ -17272,6 +23600,14 @@ export class StateStore {
          LEFT JOIN session_start_attempts start ON start.attempt_id=m.id
          LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=m.id
          WHERE m.state='ambiguous' AND resolution.attempt_id IS NULL
+           AND NOT EXISTS(
+             SELECT 1 FROM session_switch_attempts dedicated
+             WHERE dedicated.attempt_id=m.id
+           )
+           AND NOT EXISTS(
+             SELECT 1 FROM session_switch_malformed_dispositions malformed
+             WHERE malformed.mutation_request_key=m.idempotency_key
+           )
            AND EXISTS(
              SELECT 1 FROM mutation_provider_authorities authority
              WHERE authority.attempt_id=m.id AND authority.provider='claude'
@@ -17301,7 +23637,12 @@ export class StateStore {
          LEFT JOIN queue_effect_resolutions resolution ON resolution.queue_id=queue.id
          WHERE queue.state='ambiguous' AND resolution.queue_id IS NULL
            AND session.provider='claude' AND session.state='terminal'
-           AND authority.provider='claude'`,
+           AND authority.provider='claude'
+           AND NOT EXISTS(
+             SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+             WHERE switch.session_id=session.id
+               AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+           )`,
       ).run(claudeRestartDisposition, now);
       this.#database.query(
         `UPDATE profiles
@@ -17317,6 +23658,63 @@ export class StateStore {
       // lineage is its latest provider_disconnect gap under the still-captured
       // session authority. Per-effect sidecars remain frozen and are settled
       // separately below; none inherits this replacement process.
+      this.#database.query(
+        `INSERT INTO session_provider_authority_successors(
+           session_id,from_authority_revision,to_authority_revision,
+           from_provider_account_id,from_profile_id,from_provider,
+           from_binding_generation,from_process_generation,
+           from_routing_provenance,from_applied_pointer_revision,
+           to_provider_account_id,to_profile_id,to_provider,
+           to_binding_generation,to_process_generation,
+           to_routing_provenance,to_applied_pointer_revision,
+           transition_kind,transition_id,recorded_at
+         )
+         SELECT authority.session_id,authority.authority_revision,authority.authority_revision+1,
+                authority.provider_account_id,authority.profile_id,authority.provider,
+                authority.binding_generation,authority.process_generation,
+                authority.routing_provenance,authority.applied_pointer_revision,
+                authority.provider_account_id,authority.profile_id,authority.provider,
+                authority.binding_generation,account.process_generation,
+                authority.routing_provenance,authority.applied_pointer_revision,
+                'provider_restart',?,?
+         FROM session_provider_authorities authority
+         JOIN provider_accounts account ON account.id=authority.provider_account_id
+         WHERE authority.provider='codex'
+           AND EXISTS(
+             SELECT 1 FROM sessions s
+             JOIN session_events gap ON gap.session_id=authority.session_id
+             JOIN session_event_provider_authorities gap_authority
+               ON gap_authority.session_id=gap.session_id
+              AND gap_authority.sequence=gap.sequence
+             WHERE s.id=authority.session_id
+               AND s.state!='terminal'
+               AND s.provider_thread_id IS NOT NULL
+               AND s.profile_id=authority.profile_id
+               AND s.provider='codex'
+               AND account.profile_id=authority.profile_id
+               AND account.provider='codex'
+               AND account.binding_generation=authority.binding_generation
+               AND account.readiness!='removed'
+               AND gap.sequence=(
+                 SELECT MAX(candidate.sequence) FROM session_events candidate
+                 WHERE candidate.session_id=authority.session_id
+                   AND json_extract(candidate.event_json,'$.body.type')='gap'
+               )
+               AND json_extract(gap.event_json,'$.body.type')='gap'
+               AND gap_authority.provider_account_id=authority.provider_account_id
+               AND gap_authority.profile_id=authority.profile_id
+               AND gap_authority.provider=authority.provider
+               AND gap_authority.binding_generation=authority.binding_generation
+               AND gap_authority.process_generation=authority.process_generation
+               AND (
+                 (account.process_generation=authority.process_generation+1
+                   AND json_extract(gap.event_json,'$.body.reason')='provider_restart')
+                 OR
+                 (account.process_generation=authority.process_generation+2
+                   AND json_extract(gap.event_json,'$.body.reason')='provider_disconnect')
+               )
+           )`,
+      ).run(bootId, now);
       this.#database.query(
         `UPDATE session_provider_authorities
          SET process_generation=(
@@ -17394,6 +23792,11 @@ export class StateStore {
         `UPDATE queue_entries
          SET state='cancelled',updated_at=MAX(updated_at,?)
          WHERE state='pending'
+           AND NOT EXISTS(
+             SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+             WHERE switch.session_id=queue_entries.session_id
+               AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+           )
            AND EXISTS(
              SELECT 1 FROM queue_provider_authorities evidence
              JOIN session_provider_authorities session_authority
@@ -17425,6 +23828,105 @@ export class StateStore {
     return generation;
   }
 
+  #retireSessionSwitchesForDaemonRestart(now: number): void {
+    let afterRowId = 0;
+    for (;;) {
+      // Read only a bounded attempt id. Corrupt SQLite rows may contain an
+      // arbitrarily large external key, so containment is keyed by the stable
+      // local journal sequence and never surfaces or logs provider-controlled text.
+      const rows = this.#database.query(
+        `SELECT journal_sequence,
+                CASE WHEN typeof(attempt_id)='text'
+                           AND length(CAST(attempt_id AS BLOB)) BETWEEN 1 AND 200
+                  THEN CAST(attempt_id AS TEXT) ELSE NULL END AS bounded_attempt_id
+         FROM session_switch_attempts
+         WHERE phase NOT IN ('seed_settled','reconciliation_required','failed','cancelled','abandoned')
+           AND journal_sequence>?
+         ORDER BY journal_sequence LIMIT 100`,
+      ).all(afterRowId).map((value) => z.object({
+        journal_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        bounded_attempt_id: z.string().min(1).max(200).nullable(),
+      }).strict().parse(value));
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        afterRowId = row.journal_sequence;
+        const parsed = attemptIdSchema.safeParse(row.bounded_attempt_id);
+        if (!parsed.success) {
+          this.#quarantineMalformedSessionSwitchRow(row.journal_sequence);
+          continue;
+        }
+        try {
+          const dispose = this.#database.transaction(() => {
+            const record = this.requireSessionSwitch(parsed.data);
+            if (record.phase === "prepared") {
+              this.#transitionSessionSwitch(record, "prepared", "cancelled", null);
+              const mutation = this.#database.query(
+                `UPDATE mutation_attempts SET state='cancelled',updated_at=MAX(updated_at,?)
+                 WHERE id=? AND state='prepared' AND request_digest=?`,
+              ).run(now, record.attemptId, record.requestDigest);
+              if (mutation.changes !== 1) {
+                throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+              }
+              return;
+            }
+            const fromPhase = sessionSwitchReconciliationFromPhaseSchema.parse(record.phase);
+            this.#recordSessionSwitchReconciliation(
+              record,
+              fromPhase,
+              "DAEMON_RESTART_AUTHORITY_RETIRED",
+              now,
+            );
+            this.#transitionSessionSwitch(
+              record,
+              fromPhase,
+              "reconciliation_required",
+              "DAEMON_RESTART_AUTHORITY_RETIRED",
+            );
+            const mutation = this.#database.query(
+              `UPDATE mutation_attempts SET state='ambiguous',
+                                            result_json=json_object('code','DAEMON_RESTART_AUTHORITY_RETIRED'),
+                                            updated_at=MAX(updated_at,?)
+               WHERE id=? AND state='effect_started' AND request_digest=?`,
+            ).run(now, record.attemptId, record.requestDigest);
+            if (mutation.changes !== 1) {
+              throw new SessionSwitchStoreError("SESSION_SWITCH_PHASE_CONFLICT");
+            }
+            const expectedRevision = record.rebind?.sessionRevision
+              ?? record.originalSessionRevision;
+            const expectedProfileId = record.rebind === null
+              ? record.sourceAuthority.profileId
+              : record.targetAuthority.profileId;
+            const expectedProvider = record.rebind === null
+              ? record.sourceAuthority.provider
+              : record.targetAuthority.provider;
+            const session = this.#database.query(
+              `UPDATE sessions SET state='recovery_required',active_turn_id=NULL,
+                                   revision=revision+1,updated_at=MAX(updated_at,?)
+               WHERE id=? AND revision=? AND profile_id=? AND provider=?
+                 AND state NOT IN ('terminal','recovery_required')
+               RETURNING id`,
+            ).get(
+              now,
+              record.sessionId,
+              expectedRevision,
+              expectedProfileId,
+              expectedProvider,
+            );
+            if (session === null) {
+              throw new SessionSwitchStoreError("SESSION_SWITCH_SESSION_REVISION_STALE");
+            }
+          });
+          dispose.immediate();
+        } catch {
+          // Keep corruption local to this attempt. The dedicated quarantine
+          // retains its immutable journal for explicit inspection and must not
+          // stop unrelated sessions from booting.
+          this.#quarantineMalformedSessionSwitchRow(row.journal_sequence);
+        }
+      }
+    }
+  }
+
   #recordDaemonRestartGaps(now: number): void {
     const sessions = this.#database.query(
       `SELECT s.id,s.provider_thread_id,a.profile_id,a.provider_account_id,a.provider,
@@ -17432,6 +23934,11 @@ export class StateStore {
        FROM sessions s JOIN session_provider_authorities a ON a.session_id=s.id
        JOIN provider_accounts pa ON pa.id=a.provider_account_id
        WHERE s.state!='terminal'
+         AND NOT EXISTS(
+           SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+           WHERE switch.session_id=s.id
+             AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         )
          AND pa.profile_id=a.profile_id AND pa.provider=a.provider
          AND pa.binding_generation=a.binding_generation
          AND pa.process_generation=a.process_generation

@@ -79,6 +79,7 @@ import {
 } from "../domain/session-tasks";
 import {
   SESSION_EVENT_PAGE_LIMIT,
+  SESSION_EVENT_RETAIN_COUNT,
   SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
   sessionEventPageSchema,
   type SessionEvent,
@@ -152,6 +153,7 @@ import { WorkCapabilityCodec } from "../storage/work-capability";
 import {
   ProviderUsageTurnNotBoundError,
   SelectionError,
+  SessionSwitchStoreError,
   StateSecurityScrubRequiredError,
   UnusableProjectRootError,
   USAGE_LOCAL_RETAIN_AGE_MS,
@@ -162,6 +164,9 @@ import {
   type ProfileRecord,
   type SessionRecord,
   type SessionProviderAuthority,
+  type SessionSwitchCas,
+  type SessionSwitchRawRequest,
+  type SessionSwitchRecord,
   type StateStore,
   type StoredMessageAttachment,
 } from "../storage/state-store";
@@ -561,6 +566,20 @@ class WorkEffectExecutionSuppressed extends Error {
   }
 }
 
+class SessionSwitchSourceFactBeforeTargetEffect extends Error {
+  constructor() {
+    super("Source fact custody changed before the target provider effect.");
+    this.name = "SessionSwitchSourceFactBeforeTargetEffect";
+  }
+}
+
+class SessionSwitchTargetFactBeforeSeedEffect extends Error {
+  constructor() {
+    super("Target fact custody changed before the seed provider effect.");
+    this.name = "SessionSwitchTargetFactBeforeSeedEffect";
+  }
+}
+
 class InteractionPersistenceBoundaryError extends Error {
   constructor(
     readonly focalInteraction: InteractionRecord,
@@ -636,18 +655,69 @@ const neutralToolSummary = (fact: Readonly<{
  * it is willing to walk to find them.
  */
 const TRANSCRIPT_EVENT_PAGE_BUDGET = 20;
+const SESSION_SWITCH_TRANSCRIPT_EVENT_PAGE_BUDGET = Math.ceil(
+  SESSION_EVENT_RETAIN_COUNT / SESSION_EVENT_PAGE_LIMIT,
+) + 1;
 
-/** The turn the handoff seed opened, when the provider named one. */
-const seededTurnId = (value: unknown): string | null => {
-  const parsed = z.object({ turnId: z.string().min(1).max(200) }).safeParse(value);
-  return parsed.success ? parsed.data.turnId : null;
-};
-
-const sessionSwitchReceiptSchema = z.object({
-  providerThreadId: z.string().min(1).max(200),
-  sessionId: sessionIdSchema,
-  toProvider: providerSchema,
+const sessionSwitchPublicReceiptSchema = z.object({
+  session: z.object({ id: sessionIdSchema }).passthrough(),
+  from: z.object({
+    provider: providerSchema,
+    preset: z.string().min(1).max(32),
+    account: profileIdSchema,
+  }).strict(),
+  to: z.object({
+    provider: providerSchema,
+    preset: z.string().min(1).max(32),
+    account: profileIdSchema,
+  }).strict(),
+  seed: z.object({
+    delivered: z.boolean(),
+    digest: z.string().regex(/^[a-f0-9]{64}$/u),
+    failureCode: z.string().min(1).max(80).optional(),
+    includedRecords: z.number().int().nonnegative(),
+    omittedRecords: z.number().int().nonnegative(),
+  }).strict(),
+  transcriptDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+  turnId: z.string().min(1).max(200).nullable(),
+  idempotencyKey: z.string().uuid(),
 }).strict();
+
+type RemoteExpectedSessionAuthority = Readonly<{
+  sessionId: SessionRecord["id"];
+  profileId: ProfileRecord["id"];
+  processGeneration: number;
+  provider: Provider;
+  providerAccountId: ProviderAccountId;
+  bindingGeneration: number;
+  providerThreadId: string;
+}>;
+
+const sessionSwitchRawRequest = (
+  command: Extract<LocalCommand, { kind: "session.switch" }>,
+): SessionSwitchRawRequest => ({
+  session: command.session,
+  provider: command.provider,
+  account: command.account ?? null,
+  preset: command.preset ?? null,
+});
+
+const sameSessionSwitchRawRequest = (
+  left: SessionSwitchRawRequest,
+  right: SessionSwitchRawRequest,
+): boolean => left.session === right.session
+  && left.provider === right.provider
+  && left.account === right.account
+  && left.preset === right.preset;
+
+const sessionSwitchCas = (record: SessionSwitchRecord): SessionSwitchCas => ({
+  attemptId: record.attemptId,
+  requestDigest: record.requestDigest,
+  sourceAuthority: record.sourceAuthority,
+  targetAuthority: record.targetAuthority,
+  originalSessionRevision: record.originalSessionRevision,
+  originalAuthorityRevision: record.originalAuthorityRevision,
+});
 
 /**
  * The preset a switch uses when the operator named none: the session's own
@@ -828,6 +898,9 @@ export const BACKGROUND_DIAGNOSTIC_CODES = [
   "usage_refresh_failed",
   "usage_poll_account_failed",
   "provider_switch_seed_failed",
+  "provider_switch_fact_flush_failed",
+  "provider_switch_fact_overflow",
+  "provider_switch_recovery_failed",
   "provider_usage_admission_failed",
   "provider_usage_persistence_failed",
   "provider_usage_queue_overflow",
@@ -864,6 +937,8 @@ const SESSION_FACT_EPOCH_LIMIT = 4_096;
 const PENDING_CLAUDE_DISCONNECT_LIMIT = 1_024;
 /** Upper bound on admitted informational usage writes not yet attempted. */
 const PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT = 1_024;
+/** Facts emitted synchronously by a target's first turn wait behind its durable seed receipt. */
+const SESSION_SWITCH_DEFERRED_FACT_LIMIT = 256;
 
 type PendingClaudeDisconnect = Readonly<{
   authority: ProfileAuthority;
@@ -888,6 +963,23 @@ type ProviderUsagePersistenceJob = Readonly<{
   observation: ProviderUsageComponent;
   turnBindingSettlement: Promise<ProviderUsageTurnBindingSettlement> | null;
 }>;
+
+type SessionSwitchDeferredFact =
+  | Readonly<{ provider: "codex"; authority: ProfileAuthority; fact: CodexFact }>
+  | Readonly<{ provider: "claude"; authority: ProfileAuthority; fact: ClaudeSessionFact }>;
+
+type SessionSwitchDeferredFactOwner = {
+  readonly attemptId: SessionSwitchRecord["attemptId"];
+  readonly authority: ProviderAccountAuthority;
+  readonly providerThreadId: string;
+  readonly facts: SessionSwitchDeferredFact[];
+  overflowed: boolean;
+};
+
+// Provider callbacks can change this field across an await or synchronous
+// storage callback, even after an earlier branch observed it as false.
+const sessionSwitchFactDeferralOverflowed = (owner: SessionSwitchDeferredFactOwner): boolean =>
+  owner.overflowed;
 
 const sameProviderUsageAuthority = (
   left: ProviderAccountAuthority,
@@ -944,6 +1036,10 @@ export class HraService {
   readonly #providerUsageTurnBindings = new Map<
     SessionRecord["id"],
     ProviderUsageTurnBindingOwner
+  >();
+  readonly #sessionSwitchDeferredFacts = new Map<
+    SessionRecord["id"],
+    Set<SessionSwitchDeferredFactOwner>
   >();
   #providerUsagePersistencePending = 0;
   #providerUsagePersistenceTask: Promise<void> | undefined;
@@ -1084,6 +1180,25 @@ export class HraService {
       provider: authority.provider,
       bindingGeneration: authority.bindingGeneration,
       processGeneration: authority.generation,
+    });
+  }
+
+  #sessionProviderAccountAuthority(
+    authority: Pick<
+      SessionProviderAuthority,
+      | "providerAccountId"
+      | "profileId"
+      | "provider"
+      | "bindingGeneration"
+      | "processGeneration"
+    >,
+  ): ProviderAccountAuthority {
+    return providerAccountAuthoritySchema.parse({
+      providerAccountId: authority.providerAccountId,
+      profileId: authority.profileId,
+      provider: authority.provider,
+      bindingGeneration: authority.bindingGeneration,
+      processGeneration: authority.processGeneration,
     });
   }
 
@@ -1562,24 +1677,22 @@ export class HraService {
         case "session.steer": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#steer(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? [])); }
         case "session.stop": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#stop(session.id, command.idempotencyKey, context.signal)); }
         case "session.rename": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#rename(session.id, command.name, command.idempotencyKey, context.signal)); }
-        case "session.recover": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#resolveSessionRecovery(session.id, "recover", context.signal)); }
-        case "session.abandon": {
-          const session = this.#store.requireSession(command.session);
-          return await this.#serializeSessionAuthority(session, async () => {
-            const current = this.#store.requireSession(session.id);
-            if (current.state !== "recovery_required") {
-              return await this.#resolveSessionRecovery(current.id, "abandon", context.signal);
-            }
-            await this.#cleanupFactsMemory(current, "abandon");
-            return await this.#resolveSessionRecovery(current.id, "abandon", context.signal);
-          });
-        }
+        case "session.recover": return await this.#resolveSessionRecoveryCommand(
+          command.session,
+          "recover",
+          context.signal,
+        );
+        case "session.abandon": return await this.#resolveSessionRecoveryCommand(
+          command.session,
+          "abandon",
+          context.signal,
+        );
         case "session.note.get": { const session = this.#store.requireSession(command.session); return { sessionId: session.id, note: session.note, revision: session.revision }; }
         case "session.note.edit": throw new CommandFailure("INTERACTION_REQUIRED", "Open the editor through the local `hra session note edit` command.");
         case "session.note.set": return { session: await this.#updateSession(command.session, (session) => ({ note: command.note, expectedRevision: session.revision })) };
         case "session.note.clear": return { session: await this.#updateSession(command.session, (session) => ({ note: "", expectedRevision: session.revision })) };
         case "session.preset": return { session: await this.#updateSession(command.session, (session) => ({ preset: command.preset, expectedRevision: session.revision })) };
-        case "session.switch": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#switchProvider(command, context.signal)); }
+        case "session.switch": return await this.#switchProvider(command, context.signal);
         case "session.transcript": return this.#readTranscript(command.session, command.after, command.limit);
         case "session.fast": return { session: await this.#updateSession(command.session, (session) => ({ fastEnabled: command.enabled, expectedRevision: session.revision })) };
         case "session.project": {
@@ -1787,6 +1900,40 @@ export class HraService {
       if (error instanceof WorkEventWaiterLimitError) {
         throw new CommandFailure("UNAVAILABLE", error.message);
       }
+      if (error instanceof SessionSwitchStoreError) {
+        const details = { reason: error.code };
+        switch (error.code) {
+          case "SESSION_SWITCH_NOT_FOUND":
+            throw new CommandFailure("NOT_FOUND", error.message, details);
+          case "SESSION_SWITCH_NOOP":
+            throw new CommandFailure("INVALID_INPUT", error.message, details);
+          case "SESSION_SWITCH_RECOVERY_REQUIRED":
+          case "SESSION_SWITCH_RECOVERY_CORRUPT":
+          case "SESSION_SWITCH_SEED_AUTHORITY_UNPROVED":
+          case "SESSION_SWITCH_STORAGE_FENCED":
+            throw new CommandFailure("RECOVERY_REQUIRED", error.message, details);
+          case "IDEMPOTENCY_CONFLICT":
+          case "SESSION_SWITCH_PHASE_CONFLICT":
+          case "SESSION_SWITCH_REQUEST_CONFLICT":
+          case "SESSION_SWITCH_AUTHORITY_CONFLICT":
+          case "SESSION_SWITCH_SESSION_REVISION_STALE":
+          case "SESSION_SWITCH_AUTHORITY_REVISION_STALE":
+          case "SESSION_SWITCH_SESSION_TERMINAL":
+          case "SESSION_SWITCH_ACTIVE_TURN":
+          case "SESSION_SWITCH_QUEUE_UNSETTLED":
+          case "SESSION_SWITCH_INTERACTION_UNSETTLED":
+          case "SESSION_SWITCH_ALREADY_OPEN":
+          case "SESSION_SWITCH_TRANSCRIPT_STALE":
+          case "SESSION_SWITCH_RUNTIME_PROFILE_STALE":
+          case "SESSION_SWITCH_SOURCE_AUTHORITY_STALE":
+          case "SESSION_SWITCH_TARGET_AUTHORITY_STALE":
+            throw new CommandFailure("CONFLICT", error.message, details);
+          default: {
+            const unreachable: never = error.code;
+            throw new CommandFailure("UNAVAILABLE", unreachable);
+          }
+        }
+      }
       if (error instanceof SessionTaskStoreError) {
         const details = { reason: error.code };
         switch (error.code) {
@@ -1944,7 +2091,7 @@ export class HraService {
 
   async executeRemote(
     command: RemoteSessionCommand,
-    expectedAuthority: { sessionId: SessionRecord["id"]; profileId: ProfileRecord["id"]; processGeneration: number; provider: Provider; providerAccountId: ProviderAccountId; bindingGeneration: number; providerThreadId: string },
+    expectedAuthority: RemoteExpectedSessionAuthority,
     context: { signal: AbortSignal },
   ): Promise<unknown> {
     const finish = this.#beginOperation();
@@ -1975,7 +2122,7 @@ export class HraService {
 
   async #executeRemoteAdmitted(
     command: RemoteSessionCommand,
-    expectedAuthority: { sessionId: SessionRecord["id"]; profileId: ProfileRecord["id"]; processGeneration: number; provider: Provider; providerAccountId: ProviderAccountId; bindingGeneration: number; providerThreadId: string },
+    expectedAuthority: RemoteExpectedSessionAuthority,
     context: { signal: AbortSignal },
   ): Promise<unknown> {
     const expected = z
@@ -1992,6 +2139,9 @@ export class HraService {
       .parse(expectedAuthority);
     if (command.kind !== "interaction.resolve" && command.session !== expected.sessionId) {
       throw new CommandFailure("CONFLICT", "The remote command selector does not match its exact session authority.");
+    }
+    if (command.kind === "session.switch") {
+      return await this.#switchProvider(command, context.signal, expected);
     }
     return await this.#serializeSessionAuthority({ id: expected.sessionId, profileId: expected.profileId }, async () => {
       await this.#daemonAuthority.assertCurrent();
@@ -2046,7 +2196,6 @@ export class HraService {
             sessionId: session.id,
           }),
         };
-        case "session.switch": return await this.#switchProvider(command, context.signal);
         case "session.fast": return {
           session: this.#store.updateSessionMetadata({
             expectedRevision: session.revision,
@@ -2110,6 +2259,8 @@ export class HraService {
 
   async #recoverAdmitted(): Promise<void> {
     await this.#cloud.supersedeTerminalCompactProjectionRecoveries();
+    await this.#daemonAuthority.assertCurrent();
+    await this.#recoverDedicatedSessionSwitches(this.#backgroundAbort.signal);
     await this.#daemonAuthority.assertCurrent();
     const recoveredMutations = this.#store.recoverEffectStartedMutations();
     if (recoveredMutations.unresolved.length > 0) {
@@ -2201,6 +2352,42 @@ export class HraService {
       // Keep each startup read and recovery batch bounded while allowing close
       // and notification work to run before the next page is admitted.
       await new Promise<void>((resolveYield) => setTimeout(resolveYield, 0));
+    }
+  }
+
+  async #recoverDedicatedSessionSwitches(signal: AbortSignal): Promise<void> {
+    let afterJournalSequence: number | undefined;
+    for (;;) {
+      const page = this.#store.recoverSessionSwitchesPage({
+        ...(afterJournalSequence === undefined ? {} : { afterJournalSequence }),
+        limit: 100,
+      });
+      for (const attemptId of page.malformedAttemptIds) {
+        this.recordBackgroundDiagnostic(
+          "provider_switch_recovery_failed",
+          new Error(`SESSION_SWITCH_MALFORMED:${attemptId}`),
+        );
+      }
+      for (const candidate of page.switches) {
+        if (signal.aborted) throw signal.reason;
+        if (
+          candidate.phase !== "cancelled"
+          && candidate.phase !== "reconciliation_required"
+          && candidate.phase !== "failed"
+          && candidate.phase !== "seed_settled"
+          && candidate.phase !== "abandoned"
+        ) {
+          this.recordBackgroundDiagnostic(
+            "provider_switch_recovery_failed",
+            new Error(`SESSION_SWITCH_BOOT_DISPOSITION_INCOMPLETE:${candidate.phase}`),
+          );
+        }
+      }
+      if (page.nextJournalSequence === null) return;
+      if (page.nextJournalSequence === afterJournalSequence) {
+        throw new Error("SESSION_SWITCH_RECOVERY_CURSOR_DID_NOT_ADVANCE");
+      }
+      afterJournalSequence = page.nextJournalSequence;
     }
   }
 
@@ -2560,10 +2747,255 @@ export class HraService {
     }
   }
 
+  #deferSessionSwitchFact(value: SessionSwitchDeferredFact): boolean {
+    const authority = this.#providerAccountAuthority(value.authority);
+    const providerThreadId = value.provider === "claude"
+      ? value.fact.providerThreadId
+      : "threadId" in value.fact && typeof value.fact.threadId === "string"
+        ? value.fact.threadId
+        : value.fact.type === "interactionRequested"
+          || value.fact.type === "interactionResolved"
+          ? value.fact.provider.threadId
+          : null;
+    for (const owners of this.#sessionSwitchDeferredFacts.values()) {
+      for (const owner of owners) {
+        if (!sameProviderUsageAuthority(owner.authority, authority)) {
+          continue;
+        }
+        // A Codex connection is account-wide and can serve many sessions.
+        // Deferral is therefore exact-thread only; connection-wide notices
+        // and disconnects must continue through their per-session/account
+        // projection path instead of disappearing into one switch owner.
+        if (providerThreadId !== owner.providerThreadId) continue;
+        if (owner.facts.length >= SESSION_SWITCH_DEFERRED_FACT_LIMIT) {
+          owner.overflowed = true;
+          this.recordBackgroundDiagnostic("provider_switch_fact_overflow", new Error(
+            "SESSION_SWITCH_DEFERRED_FACT_LIMIT_EXCEEDED",
+          ));
+        } else {
+          owner.facts.push(value);
+        }
+        return true;
+      }
+    }
+    const blocked = this.#store.sessionSwitchAdmissionBlocked({
+      sessionId: null,
+      providerThreadId,
+      providerAuthority: authority,
+    });
+    if (!blocked.blocked) return false;
+    if (blocked.attemptId === null) {
+      // Restart has already row-locally quarantined an identifier/evidence row
+      // that cannot be safely decoded. Its durable admission fence remains the
+      // authority: consume the exact late callback without reloading, logging,
+      // or otherwise exposing provider-controlled identifier bytes.
+      this.recordBackgroundDiagnostic(
+        "provider_switch_recovery_failed",
+        new Error("SESSION_SWITCH_MALFORMED_CALLBACK_BLOCKED"),
+      );
+      return true;
+    }
+
+    // An exact callback must never disappear merely because durable switch
+    // custody outlived its in-memory buffer (for example between retries).
+    // A prepared switch has issued no provider effect, so cancelling it makes
+    // the source callback safe to apply normally. Every later open phase may
+    // already own an external effect and is therefore closed fail-safe before
+    // the callback is consumed.
+    const record = this.#store.requireSessionSwitch(blocked.attemptId);
+    if (record.phase === "prepared") {
+      this.#store.cancelPreparedSessionSwitch(sessionSwitchCas(record));
+      return false;
+    }
+    if (
+      record.phase === "seed_settled"
+      || record.phase === "failed"
+      || record.phase === "cancelled"
+      || record.phase === "abandoned"
+    ) return false;
+    if (record.phase === "reconciliation_required") return true;
+    this.#store.markSessionSwitchReconciliationRequired({
+      ...sessionSwitchCas(record),
+      expectedPhase: record.phase,
+      diagnosticCode: "FACT_WITHOUT_IN_MEMORY_CUSTODY",
+    });
+    return true;
+  }
+
+  #beginSessionSwitchFactDeferral(
+    sessionId: SessionRecord["id"],
+    record: SessionSwitchRecord,
+    authority: ProviderAccountAuthority,
+    providerThreadId: string,
+  ): SessionSwitchDeferredFactOwner {
+    const owners = this.#sessionSwitchDeferredFacts.get(sessionId) ?? new Set();
+    if ([...owners].some((owner) => owner.attemptId === record.attemptId
+      && sameProviderUsageAuthority(owner.authority, authority)
+      && owner.providerThreadId === providerThreadId)) {
+      throw new Error("SESSION_SWITCH_FACT_DEFERRAL_ALREADY_OPEN");
+    }
+    const owner: SessionSwitchDeferredFactOwner = {
+      attemptId: record.attemptId,
+      authority,
+      providerThreadId,
+      facts: [],
+      overflowed: false,
+    };
+    owners.add(owner);
+    this.#sessionSwitchDeferredFacts.set(sessionId, owners);
+    return owner;
+  }
+
+  #beginSessionSwitchTargetFactDeferral(
+    record: SessionSwitchRecord,
+  ): SessionSwitchDeferredFactOwner {
+    const providerThreadId = record.targetStart?.providerThreadId;
+    if (providerThreadId === undefined) {
+      throw new Error("SESSION_SWITCH_TARGET_START_RECEIPT_MISSING");
+    }
+    const authority = record.seedAuthority?.authority
+      ?? (record.rebind === null
+        ? record.targetAuthority
+        : this.#sessionProviderAccountAuthority(
+            this.#store.requireCapturedSessionProviderAuthority(record.sessionId),
+          ));
+    return this.#beginSessionSwitchFactDeferral(
+      record.sessionId,
+      record,
+      authority,
+      providerThreadId,
+    );
+  }
+
+  #discardSessionSwitchFactDeferral(
+    sessionId: SessionRecord["id"],
+    owner: SessionSwitchDeferredFactOwner,
+  ): void {
+    const owners = this.#sessionSwitchDeferredFacts.get(sessionId);
+    if (owners === undefined || !owners.has(owner)) {
+      return;
+    }
+    owners.delete(owner);
+    if (owners.size === 0) this.#sessionSwitchDeferredFacts.delete(sessionId);
+    owner.facts.splice(0);
+  }
+
+  #discardSessionSwitchFactDeferralsForAttempt(
+    sessionId: SessionRecord["id"],
+    attemptId: SessionSwitchRecord["attemptId"],
+  ): void {
+    const owners = this.#sessionSwitchDeferredFacts.get(sessionId);
+    if (owners === undefined) return;
+    for (const owner of [...owners]) {
+      if (owner.attemptId === attemptId) {
+        this.#discardSessionSwitchFactDeferral(sessionId, owner);
+      }
+    }
+  }
+
+  #markSessionSwitchReconciliationRequiredAndDiscard(
+    sessionId: SessionRecord["id"],
+    input: Parameters<StateStore["markSessionSwitchReconciliationRequired"]>[0],
+    ...owners: ReadonlyArray<SessionSwitchDeferredFactOwner | undefined>
+  ): SessionSwitchRecord {
+    try {
+      return this.#store.markSessionSwitchReconciliationRequired(input);
+    } finally {
+      for (const owner of owners) {
+        if (owner !== undefined) this.#discardSessionSwitchFactDeferral(sessionId, owner);
+      }
+    }
+  }
+
+  #sessionSwitchFactDeferralLost(
+    sessionId: SessionRecord["id"],
+    owner: SessionSwitchDeferredFactOwner,
+  ): boolean {
+    return owner.overflowed
+      || this.#sessionSwitchDeferredFacts.get(sessionId)?.has(owner) !== true;
+  }
+
+  #sessionSwitchFactDeferralObserved(
+    sessionId: SessionRecord["id"],
+    owner: SessionSwitchDeferredFactOwner,
+  ): boolean {
+    return owner.facts.length > 0
+      || this.#sessionSwitchFactDeferralLost(sessionId, owner);
+  }
+
+  async #drainSessionSwitchFactDeferral(
+    sessionId: SessionRecord["id"],
+    owner: SessionSwitchDeferredFactOwner,
+  ): Promise<boolean> {
+    const owners = this.#sessionSwitchDeferredFacts.get(sessionId);
+    if (owners === undefined || !owners.has(owner)) {
+      owner.overflowed = true;
+      return true;
+    }
+    for (;;) {
+      if (owner.overflowed) {
+        owner.facts.splice(0);
+        owners.delete(owner);
+        if (owners.size === 0) this.#sessionSwitchDeferredFacts.delete(sessionId);
+        return true;
+      }
+      const value = owner.facts.shift();
+      if (value === undefined) {
+        // There is deliberately no await between observing the empty queue
+        // and removing its owner. A callback that arrived during an earlier
+        // apply appended behind that batch and was consumed first.
+        owners.delete(owner);
+        if (owners.size === 0) this.#sessionSwitchDeferredFacts.delete(sessionId);
+        return false;
+      }
+      try {
+        if (value.provider === "codex") {
+          await this.#observeCodexFactAdmitted(value.authority, value.fact);
+        } else {
+          await this.#observeClaudeFactAdmitted(value.authority, value.fact);
+        }
+      } catch (error: unknown) {
+        if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+        this.recordBackgroundDiagnostic("provider_switch_fact_flush_failed", error);
+        owner.overflowed = true;
+      }
+    }
+  }
+
+  async #cancelPreparedSessionSwitchForDeferredSourceFacts(
+    record: SessionSwitchRecord,
+    owner: SessionSwitchDeferredFactOwner,
+  ): Promise<SessionSwitchRecord | null> {
+    if (!this.#sessionSwitchFactDeferralObserved(record.sessionId, owner)) {
+      return null;
+    }
+    let cancelled: SessionSwitchRecord;
+    try {
+      cancelled = this.#store.cancelPreparedSessionSwitch(sessionSwitchCas(record));
+    } catch (error: unknown) {
+      this.#discardSessionSwitchFactDeferral(record.sessionId, owner);
+      throw error;
+    }
+    const lost = await this.#drainSessionSwitchFactDeferral(record.sessionId, owner);
+    if (lost) {
+      const session = this.#store.requireSession(record.sessionId);
+      if (session.state !== "recovery_required" && session.state !== "terminal") {
+        this.#quarantineSession(session.id);
+      }
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "Source facts exceeded or escaped the bounded buffer before target-start intent.",
+        { idempotencyKey: record.idempotencyKey },
+      );
+    }
+    return cancelled;
+  }
+
   async observeCodexFact(authority: ProfileAuthority, fact: CodexFact): Promise<void> {
     const finish = this.#beginFactOperation();
     if (finish === null) return;
     try {
+      if (this.#deferSessionSwitchFact({ provider: "codex", authority, fact })) return;
       await this.#observeCodexFactAdmitted(authority, fact);
     } catch (error: unknown) {
       if (error instanceof InteractionPersistenceBoundaryError) this.#scheduleStop();
@@ -2585,71 +3017,79 @@ export class HraService {
     const finish = this.#beginFactOperation();
     if (finish === null) return;
     try {
-      await this.#daemonAuthority.assertCurrent();
-      if (!this.#profileAuthorityIsCurrent(authority)) return;
-      const session = this.#store.findSessionByProviderThread(
-        authority.id,
-        fact.providerThreadId,
-      );
-      if (session === null) {
-        if (fact.type === "providerDisconnected") {
-          this.#rememberPendingClaudeDisconnect({
-            authority,
-            connectionId: fact.connectionId,
-            providerThreadId: fact.providerThreadId,
-            reason: fact.reason,
-          });
-        }
-        return;
-      }
-      if (!this.#authorityMatchesSession(authority, session)) return;
-      const currentConnectionId = this.#sessionProviderConnections.get(session.id);
-      if (currentConnectionId !== undefined && currentConnectionId !== fact.connectionId) return;
-      if (currentConnectionId === undefined) {
-        // A newly launched Claude subprocess can exit after its durable start
-        // commits but before the first observation installs the connection.
-        // Its manager-stamped thread and exact provider authority are enough
-        // to bind that first fact without guessing from mutable account state.
-        if (session.state === "terminal" || session.state === "recovery_required") return;
-        this.#ensureSessionProviderConnection(authority, session, fact.connectionId);
-      } else if (
-        (session.state === "terminal" || session.state === "recovery_required")
-        && fact.type !== "providerDisconnected"
-      ) {
-        return;
-      }
-      let translated: ReturnType<ClaudeSessionFactTranslator["translate"]>;
-      try {
-        translated = this.#claudeFacts.translate(
-          this.#providerAccountAuthority(authority),
-          fact,
-        );
-      } catch (error: unknown) {
-        // A control request whose authority the runtime can no longer prove is
-        // a dropped fact, never a fault on a live session.
-        this.recordBackgroundDiagnostic("claude_fact_untranslatable", error);
-        return;
-      }
-      const usageComponents: ProviderUsageComponent[] = [];
-      for (const observation of translated.usageObservations) {
-        try {
-          usageComponents.push(this.#claudeUsageComponent(session.id, observation));
-        } catch (error: unknown) {
-          this.#recordProviderUsageDiagnostic("provider_usage_admission_failed", error);
-        }
-      }
-      for (const neutral of translated.timelineFacts) {
-        await this.#observeCodexFactAdmitted(authority, neutral);
-      }
-      for (const component of usageComponents) {
-        this.#enqueueProviderUsagePersistence(component);
-      }
+      if (this.#deferSessionSwitchFact({ provider: "claude", authority, fact })) return;
+      await this.#observeClaudeFactAdmitted(authority, fact);
     } catch (error: unknown) {
       if (error instanceof InteractionPersistenceBoundaryError) this.#scheduleStop();
       if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
       throw error;
     } finally {
       finish();
+    }
+  }
+
+  async #observeClaudeFactAdmitted(
+    authority: ProfileAuthority,
+    fact: ClaudeSessionFact,
+  ): Promise<void> {
+    await this.#daemonAuthority.assertCurrent();
+    if (!this.#profileAuthorityIsCurrent(authority)) return;
+    const session = this.#store.findSessionByProviderThread(
+      authority.id,
+      fact.providerThreadId,
+    );
+    if (session === null) {
+      if (fact.type === "providerDisconnected") {
+        this.#rememberPendingClaudeDisconnect({
+          authority,
+          connectionId: fact.connectionId,
+          providerThreadId: fact.providerThreadId,
+          reason: fact.reason,
+        });
+      }
+      return;
+    }
+    if (!this.#authorityMatchesSession(authority, session)) return;
+    const currentConnectionId = this.#sessionProviderConnections.get(session.id);
+    if (currentConnectionId !== undefined && currentConnectionId !== fact.connectionId) return;
+    if (currentConnectionId === undefined) {
+      // A newly launched Claude subprocess can exit after its durable start
+      // commits but before the first observation installs the connection.
+      // Its manager-stamped thread and exact provider authority are enough
+      // to bind that first fact without guessing from mutable account state.
+      if (session.state === "terminal" || session.state === "recovery_required") return;
+      this.#ensureSessionProviderConnection(authority, session, fact.connectionId);
+    } else if (
+      (session.state === "terminal" || session.state === "recovery_required")
+      && fact.type !== "providerDisconnected"
+    ) {
+      return;
+    }
+    let translated: ReturnType<ClaudeSessionFactTranslator["translate"]>;
+    try {
+      translated = this.#claudeFacts.translate(
+        this.#providerAccountAuthority(authority),
+        fact,
+      );
+    } catch (error: unknown) {
+      // A control request whose authority the runtime can no longer prove is
+      // a dropped fact, never a fault on a live session.
+      this.recordBackgroundDiagnostic("claude_fact_untranslatable", error);
+      return;
+    }
+    const usageComponents: ProviderUsageComponent[] = [];
+    for (const observation of translated.usageObservations) {
+      try {
+        usageComponents.push(this.#claudeUsageComponent(session.id, observation));
+      } catch (error: unknown) {
+        this.#recordProviderUsageDiagnostic("provider_usage_admission_failed", error);
+      }
+    }
+    for (const neutral of translated.timelineFacts) {
+      await this.#observeCodexFactAdmitted(authority, neutral);
+    }
+    for (const component of usageComponents) {
+      this.#enqueueProviderUsagePersistence(component);
     }
   }
 
@@ -2861,10 +3301,12 @@ export class HraService {
     const finish = this.#beginOperation();
     try {
       await this.#daemonAuthority.assertCurrent();
+      const callProvider = providerSchema.safeParse(call.authority.provider);
       if (
-        call.authority.profileId !== authority.id
+        !callProvider.success
+        || call.authority.profileId !== authority.id
         || call.authority.processGeneration !== authority.generation
-        || call.authority.provider !== authority.provider
+        || callProvider.data !== authority.provider
         || call.authority.providerAccountId !== authority.providerAccountId
         || call.authority.bindingGeneration !== authority.bindingGeneration
       ) throw new Error("CONVERSATION_AUTOMATION_AUTHORITY_MISMATCH");
@@ -3162,6 +3604,12 @@ export class HraService {
       const session = fact.provider.threadId === null
         ? null
         : this.#store.findSessionByProviderThread(authority.id, fact.provider.threadId);
+      if (fact.provider.threadId !== null && session === null) {
+        // A thread-scoped interaction must never be downgraded to a global
+        // interaction merely because a dedicated switch temporarily owns the
+        // source or target binding.
+        throw new Error("INTERACTION_SESSION_BINDING_UNAVAILABLE");
+      }
       if (session !== null && !this.#authorityMatchesSession(authority, session)) {
         throw new Error("INTERACTION_SESSION_PROVIDER_AUTHORITY_MISMATCH");
       }
@@ -3232,6 +3680,11 @@ export class HraService {
         if (connectionId !== fact.connectionId) continue;
         const session = this.#store.requireSession(sessionId);
         if (!this.#authorityMatchesSession(authority, session)) continue;
+        if (this.#store.sessionSwitchAdmissionBlocked({
+          sessionId: session.id,
+          providerThreadId: session.providerThreadId ?? null,
+          providerAuthority: this.#providerAccountAuthority(authority),
+        }).blocked) continue;
         this.#appendSessionEvent(authority, session.id, connectionId, {
           type: "protocol_incompatible",
           method: fact.method,
@@ -3828,10 +4281,8 @@ export class HraService {
       this.#store.requireProfileById(providerAuthority.profileId),
       providerAuthority,
     );
-    const key = this.#claudeDisconnectKey(authority, session.providerThreadId);
-    const pending = this.#pendingClaudeDisconnects.get(key);
+    const pending = this.#takePendingClaudeDisconnect(authority, session.providerThreadId);
     if (pending === undefined) return;
-    this.#pendingClaudeDisconnects.delete(key);
     if (
       session.state === "terminal"
       || session.state === "recovery_required"
@@ -3846,6 +4297,27 @@ export class HraService {
     this.#handleProviderDisconnected(authority, pending.connectionId, pending.reason);
   }
 
+  #takePendingClaudeDisconnect(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+  ): PendingClaudeDisconnect | undefined {
+    if (authority.provider !== "claude") return undefined;
+    const key = this.#claudeDisconnectKey(authority, providerThreadId);
+    const pending = this.#pendingClaudeDisconnects.get(key);
+    if (pending !== undefined) this.#pendingClaudeDisconnects.delete(key);
+    return pending;
+  }
+
+  #forgetPendingClaudeDisconnect(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+  ): void {
+    if (authority.provider !== "claude") return;
+    this.#pendingClaudeDisconnects.delete(
+      this.#claudeDisconnectKey(authority, providerThreadId),
+    );
+  }
+
   #handleProviderDisconnected(
     authority: ProfileAuthority,
     connectionId: string,
@@ -3857,6 +4329,7 @@ export class HraService {
       processGeneration: authority.generation,
       connectionId,
       providerAuthority,
+      excludeSessionSwitchBlocked: true,
     });
     for (const interaction of terminal) this.#appendInteractionState(interaction);
     // Codex shares one connection across its account runtime, while each
@@ -3871,6 +4344,21 @@ export class HraService {
       });
     for (const session of affectedSessions) {
       const sessionConnectionId = connectionId;
+      if (this.#store.sessionSwitchAdmissionBlocked({
+        sessionId: session.id,
+        providerThreadId: session.providerThreadId ?? null,
+        providerAuthority,
+      }).blocked) {
+        // The durable switch journal owns this session. The account-wide
+        // disconnect still retires unrelated sessions and its process
+        // generation, while the journal/recovery path owns this session's
+        // exact disposition.
+        this.#sessionProviderConnections.delete(session.id);
+        this.#sessionObservationFailures.delete(session.id);
+        this.#sessionResubscriptionConnections.delete(session.id);
+        this.#sessionsAwaitingResubscription.delete(session.id);
+        continue;
+      }
       this.#appendSessionEvent(authority, session.id, sessionConnectionId, {
         type: "connection",
         state: "disconnected",
@@ -4285,6 +4773,7 @@ export class HraService {
           profileId: account.profileId,
           processGeneration: account.processGeneration,
           providerAuthority,
+          excludeSessionSwitchBlocked: true,
         });
       } catch (error: unknown) {
         projectionErrors.push(error);
@@ -4304,6 +4793,20 @@ export class HraService {
       for (const session of sessions) {
         const connectionId = this.#sessionProviderConnections.get(session.id) ?? null;
         try {
+          // An open or reconciliation-required dedicated switch owns this
+          // session's source/target projection. Shutdown still retires the
+          // account process fence below, but must not author generic
+          // disconnect, gap, or Claude terminalization rows across that WAL.
+          if (this.#store.sessionSwitchAdmissionBlocked({
+            sessionId: session.id,
+            providerThreadId: session.providerThreadId ?? null,
+            providerAuthority,
+          }).blocked) {
+            if (account.provider === "claude" && session.providerThreadId !== undefined) {
+              this.#claudeFacts.forgetSession(providerAuthority, session.providerThreadId);
+            }
+            continue;
+          }
           if (connectionId !== null) {
             const authority = authorityFor(
               this.#paths,
@@ -5886,18 +6389,57 @@ export class HraService {
     session: SessionRecord,
     reason: "abandon" | "archive" | "expired",
   ): Promise<void> {
+    await this.#cleanupFactsMemoryOwner(session.id, session.profileId, reason);
+  }
+
+  async #cleanupFactsMemoryOwner(
+    sessionId: SessionRecord["id"],
+    ownerId: ProfileRecord["id"],
+    reason: "abandon" | "archive" | "expired",
+  ): Promise<void> {
     if (this.#factsMemory === undefined) return;
     try {
       await this.#factsMemory.cleanupSession({
-        ownerId: session.profileId,
+        ownerId,
         reason,
-        sessionId: session.id,
+        sessionId,
       });
     } catch (cause: unknown) {
       throw new CommandFailure(
         "RECOVERY_REQUIRED",
         "The session facts-memory directory could not be proven fully purged. HRA retained the cleanup authority for an exact retry.",
-        { cause: cause instanceof Error ? cause.name : "error", sessionId: session.id },
+        { cause: cause instanceof Error ? cause.name : "error", sessionId },
+      );
+    }
+  }
+
+  async #transferSessionSwitchFactsMemoryOwner(
+    record: SessionSwitchRecord,
+  ): Promise<void> {
+    if (this.#factsMemory === undefined) return;
+    const operationDigest = digestText(JSON.stringify({
+      domain: "hra:session-switch-facts-memory-owner:v1",
+      attemptId: record.attemptId,
+      sourceAuthority: record.sourceAuthority,
+      targetAuthority: record.targetAuthority,
+    }));
+    try {
+      await this.#factsMemory.transferSessionOwner({
+        sessionId: record.sessionId,
+        fromOwnerId: record.sourceAuthority.profileId,
+        toOwnerId: record.targetAuthority.profileId,
+        operationKey: `session-switch-owner:${operationDigest}`,
+        expiresAt: this.#factsMemoryExpiry(this.#store.requireSession(record.sessionId)),
+      });
+    } catch (error: unknown) {
+      if (error instanceof CommandFailure) throw error;
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "Facts-memory owner transfer did not settle; the switch remains recoverable before rebind.",
+        {
+          cause: error instanceof Error ? error.name : "error",
+          idempotencyKey: record.idempotencyKey,
+        },
       );
     }
   }
@@ -6899,6 +7441,44 @@ export class HraService {
     this.#eventWaiters.notify(interaction.sessionId);
   }
 
+  #surfaceAbandonedSessionSwitchInteractions(
+    interactions: readonly InteractionRecord[],
+  ): void {
+    for (const interaction of interactions) {
+      if (interaction.sessionId === null) continue;
+      // The abandonment transaction is already terminal. Always wake a
+      // session event waiter, but author an interaction_state event only when
+      // the row still carries the terminal session's exact captured provider
+      // authority. A recovered corrupt/source-era row after rebind must not
+      // turn the committed abandon into an authority-mismatch failure.
+      try {
+        const captured = this.#sessionProviderAccountAuthority(
+          this.#store.requireCapturedSessionProviderAuthority(interaction.sessionId),
+        );
+        const interactionAuthority = providerAccountAuthoritySchema.parse({
+          providerAccountId: interaction.authority.providerAccountId,
+          profileId: interaction.authority.profileId,
+          provider: interaction.authority.provider,
+          bindingGeneration: interaction.authority.bindingGeneration,
+          processGeneration: interaction.authority.processGeneration,
+        });
+        if (!sameProviderUsageAuthority(captured, interactionAuthority)) {
+          this.#eventWaiters.notify(interaction.sessionId);
+          this.recordBackgroundDiagnostic(
+            "provider_switch_recovery_failed",
+            new Error("SESSION_SWITCH_ABANDON_INTERACTION_AUTHORITY_MISMATCH"),
+          );
+          continue;
+        }
+        this.#appendInteractionState(interaction);
+      } catch (error: unknown) {
+        this.#eventWaiters.notify(interaction.sessionId);
+        if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+        this.recordBackgroundDiagnostic("provider_switch_recovery_failed", error);
+      }
+    }
+  }
+
   #interactionPersistenceBoundaryError(input: Readonly<{
     cause: unknown;
     effect: "known_unsent" | "possibly_sent";
@@ -7836,50 +8416,430 @@ export class HraService {
     return sessionTranscriptSchema.parse({ ...transcript, nextSequence });
   }
 
-  /**
-   * Move one live conversation from its current provider to another one.
-   *
-   * What this does, in order: refuse an unsafe or impossible switch, build the
-   * neutral transcript and render the bounded handoff seed from it, release
-   * the outgoing provider's hold on the thread, start a thread on the target
-   * provider and account, commit the whole rebinding in one transaction,
-   * append the `provider_switched` record, and send the seed as the first user
-   * message of the new thread.
-   *
-   * What it cannot do is carry the provider's own state across. The target
-   * gets HRA's record of the conversation, not the source provider's thread,
-   * hidden reasoning, or cached context — `docs/providers/portability.md`
-   * states that boundary.
-   */
+  #sessionSwitchReplay(
+    record: SessionSwitchRecord,
+    rawRequest: SessionSwitchRawRequest,
+  ): unknown {
+    if (!sameSessionSwitchRawRequest(record.rawRequest, rawRequest)) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "The idempotency key belongs to a different provider-switch request.",
+        { idempotencyKey: record.idempotencyKey },
+      );
+    }
+    if (record.phase === "seed_settled" && record.seed !== null) {
+      return sessionSwitchPublicReceiptSchema.parse(record.seed.publicReceipt);
+    }
+    if (record.phase === "reconciliation_required") {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "That provider switch has an indeterminate effect and will not be replayed.",
+        { idempotencyKey: record.idempotencyKey },
+      );
+    }
+    if (
+      record.phase === "failed"
+      || record.phase === "cancelled"
+      || record.phase === "abandoned"
+    ) {
+      throw new CommandFailure(
+        "CONFLICT",
+        `That provider switch already reached ${record.phase}.`,
+        { idempotencyKey: record.idempotencyKey },
+      );
+    }
+    throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      "That provider switch is still owned by durable recovery and will not be replayed.",
+      { idempotencyKey: record.idempotencyKey },
+    );
+  }
+
+  #sessionSwitchDiagnostic(prefix: string, error: unknown): string {
+    const detail = error instanceof CodexError || error instanceof ClaudeError
+      ? error.code
+      : error instanceof SessionSwitchStoreError
+        ? error.code
+        : error instanceof CommandFailure
+          ? error.code
+          : error instanceof Error
+            ? error.name
+            : "ERROR";
+    return `${prefix}_${detail}`
+      .toUpperCase()
+      .replace(/[^A-Z0-9_]/gu, "_")
+      .slice(0, 80);
+  }
+
+  #sessionSwitchEffectIsIndeterminate(
+    error: unknown,
+    boundary: "target_start" | "seed_dispatch",
+  ): boolean {
+    if (
+      error instanceof DaemonAuthoritySafetyError
+      || error instanceof IndeterminateCodexEffectError
+      || error instanceof IndeterminateLocalCommitError
+    ) return true;
+    if (error instanceof CodexError) return false;
+    if (error instanceof ClaudeError) {
+      if (boundary === "target_start") {
+        // Only adapter refusals that are proved to occur before process or
+        // session construction may close the WAL as definitely-not-sent.
+        // Transport/process/protocol failures remain possibly-sent.
+        return error.code !== "AUTHORITY_STALE"
+          && error.code !== "INVALID_INPUT"
+          && error.code !== "PRESET_UNSUPPORTED"
+          && error.code !== "UNSUPPORTED_CAPABILITY"
+          && error.code !== "RUNTIME_MISMATCH";
+      }
+      return error.code === "PROCESS_EXITED"
+        || error.code === "PROTOCOL_ERROR"
+        || error.code === "PROTOCOL_LIMIT"
+        || error.code === "TIMEOUT";
+    }
+    if (error instanceof CommandFailure || error instanceof ProviderRuntimeUnavailableError) {
+      return false;
+    }
+    return true;
+  }
+
+  #sessionSwitchTranscript(
+    sessionId: SessionRecord["id"],
+    position: Readonly<{
+      streamEpoch: string;
+      floorSequence: number;
+      observedThroughSequence: number;
+    }>,
+    fromProvider: Provider,
+    toProvider: Provider,
+    seedClientMessageId: string,
+  ): Readonly<{
+    transcript: SessionTranscript;
+    seed: ReturnType<typeof renderTranscriptSeed>;
+    pin: Parameters<StateStore["prepareSessionSwitch"]>[0]["transcript"];
+  }> {
+    const events: SessionEvent[] = [];
+    const afterSequenceExclusive = position.floorSequence - 1;
+    let cursor = afterSequenceExclusive;
+    for (let page = 0; page < SESSION_SWITCH_TRANSCRIPT_EVENT_PAGE_BUDGET; page += 1) {
+      const listed = this.#store.listSessionEvents({
+        sessionId,
+        afterSequence: cursor,
+        limit: SESSION_EVENT_PAGE_LIMIT,
+      });
+      const admitted = listed.events.filter(
+        (event) => event.sequence <= position.observedThroughSequence,
+      );
+      events.push(...admitted);
+      const last = admitted.at(-1);
+      if (
+        last === undefined
+        || last.sequence >= position.observedThroughSequence
+        || admitted.length < listed.events.length
+      ) break;
+      cursor = last.sequence;
+    }
+    if (
+      position.observedThroughSequence > afterSequenceExclusive
+      && events.at(-1)?.sequence !== position.observedThroughSequence
+    ) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The retained transcript could not be pinned through its exact accepted head.",
+      );
+    }
+    const transcript = buildSessionTranscript({
+      sessionId,
+      events,
+      limit: TRANSCRIPT_PAGE_LIMIT,
+    });
+    const seed = renderTranscriptSeed({ transcript, fromProvider, toProvider });
+    return {
+      transcript,
+      seed,
+      pin: {
+        streamEpoch: position.streamEpoch,
+        floorSequence: position.floorSequence,
+        afterSequenceExclusive,
+        throughSequenceInclusive: events.at(-1)?.sequence ?? afterSequenceExclusive,
+        acceptedHeadSequence: position.observedThroughSequence,
+        rendererVersion: 1,
+        rendererLimit: TRANSCRIPT_PAGE_LIMIT,
+        transcriptDigest: transcript.digest,
+        seedDigest: seed.digest,
+        seedIncludedRecords: seed.includedRecords,
+        seedOmittedRecords: seed.omittedRecords,
+        seedClientMessageId,
+      },
+    };
+  }
+
   async #switchProvider(
     command: Extract<LocalCommand, { kind: "session.switch" }>,
     signal: AbortSignal,
+    remoteExpected?: RemoteExpectedSessionAuthority,
   ): Promise<unknown> {
-    const session = this.#requireBoundSession(command.session);
-    const currentProfile = this.#store.requireProfile(session.profileId);
-    let targetProfile = command.account === undefined
-      ? currentProfile
+    const rawRequest = sessionSwitchRawRequest(command);
+    const key = command.idempotencyKey ?? randomUUID();
+    const replay = this.#store.readSessionSwitchByIdempotencyKey(key);
+    if (replay !== null) {
+      this.#assertRemoteSessionSwitchAuthority(replay, remoteExpected);
+      if (
+        replay.phase === "seed_settled"
+        || replay.phase === "reconciliation_required"
+        || replay.phase === "failed"
+        || replay.phase === "cancelled"
+        || replay.phase === "abandoned"
+      ) return this.#sessionSwitchReplay(replay, rawRequest);
+      if (!sameSessionSwitchRawRequest(replay.rawRequest, rawRequest)) {
+        return this.#sessionSwitchReplay(replay, rawRequest);
+      }
+      return await this.#serializeProviderSwitch({
+        providers: [replay.sourceAuthority.provider, replay.targetAuthority.provider],
+        profileIds: [replay.sourceAuthority.profileId, replay.targetAuthority.profileId],
+        sessionId: replay.sessionId,
+      }, async () => {
+        const current = this.#store.readSessionSwitchByIdempotencyKey(key);
+        if (current === null) throw new Error("SESSION_SWITCH_REPLAY_DISAPPEARED");
+        this.#assertRemoteSessionSwitchAuthority(current, remoteExpected);
+        if (!sameSessionSwitchRawRequest(current.rawRequest, rawRequest)) {
+          return this.#sessionSwitchReplay(current, rawRequest);
+        }
+        return await this.#resumeSessionSwitchLocked(current, signal);
+      });
+    }
+
+    // These two selector reads derive lock keys only. Every mutable value and
+    // exact authority is reread after all ranked locks are held.
+    const candidateSession = this.#store.requireSession(command.session);
+    const candidateTarget = command.account === undefined
+      ? this.#store.requireProfileById(candidateSession.profileId)
       : this.#store.requireProfile(command.account);
-    const sourceProviderAuthority = this.#sessionProviderAuthority(session);
-    const preparedTarget = await this.#prepareProviderForSessionStart(
-      targetProfile,
-      command.provider,
-      signal,
-    );
-    targetProfile = preparedTarget.profile;
-    const targetProviderAuthority = preparedTarget.providerAuthority;
+    return await this.#serializeProviderSwitch({
+      providers: [candidateSession.provider, command.provider],
+      profileIds: [candidateSession.profileId, candidateTarget.id],
+      sessionId: candidateSession.id,
+    }, async () => {
+      const racedReplay = this.#store.readSessionSwitchByIdempotencyKey(key);
+      if (racedReplay !== null) {
+        this.#assertRemoteSessionSwitchAuthority(racedReplay, remoteExpected);
+        if (!sameSessionSwitchRawRequest(racedReplay.rawRequest, rawRequest)) {
+          return this.#sessionSwitchReplay(racedReplay, rawRequest);
+        }
+        return await this.#resumeSessionSwitchLocked(racedReplay, signal);
+      }
+      const selectedSession = this.#store.requireSession(command.session);
+      const selectedTarget = command.account === undefined
+        ? this.#store.requireProfileById(selectedSession.profileId)
+        : this.#store.requireProfile(command.account);
+      if (
+        selectedSession.id !== candidateSession.id
+        || selectedSession.profileId !== candidateSession.profileId
+        || selectedSession.provider !== candidateSession.provider
+        || selectedTarget.id !== candidateTarget.id
+      ) {
+        throw new CommandFailure("CONFLICT", "Session switch authority changed before lock admission.");
+      }
+      const recoveryUnsettled = await this.#cloud
+        .isCompactProjectionRecoveryUnsettled(selectedSession.id);
+      await this.#daemonAuthority.assertCurrent();
+      if (recoveryUnsettled) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "This session has an unsettled compact-projection recovery.",
+        );
+      }
+      return await this.#switchProviderLocked(
+        command,
+        rawRequest,
+        key,
+        selectedSession,
+        selectedTarget,
+        signal,
+        remoteExpected,
+      );
+    });
+  }
+
+  #assertRemoteSessionSwitchAuthority(
+    record: SessionSwitchRecord,
+    expected: RemoteExpectedSessionAuthority | undefined,
+  ): void {
+    if (expected === undefined) return;
     if (
-      session.provider === command.provider
-      && targetProfile.id === currentProfile.id
-      && (command.preset === undefined || command.preset === session.preset)
+      record.sessionId !== expected.sessionId
+      || record.sourceAuthority.profileId !== expected.profileId
+      || record.sourceAuthority.provider !== expected.provider
+      || record.sourceAuthority.providerAccountId !== expected.providerAccountId
+      || record.sourceAuthority.bindingGeneration !== expected.bindingGeneration
+      || record.sourceAuthority.processGeneration !== expected.processGeneration
+      || record.sourceProviderThreadId !== expected.providerThreadId
     ) {
       throw new CommandFailure(
-        "INVALID_INPUT",
-        `That session already runs on ${command.provider} with the \`${session.preset}\` preset.`,
+        "CONFLICT",
+        "The remote command authority does not match the switch's frozen source authority.",
       );
     }
-    // A switch mid-turn would strand the running turn on the outgoing
-    // provider with no way to attribute its result.
+  }
+
+  async #resumeSessionSwitchLocked(
+    current: SessionSwitchRecord,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    let record = this.#store.requireSessionSwitch(current.attemptId);
+    if (
+      record.phase === "seed_settled"
+      || record.phase === "reconciliation_required"
+      || record.phase === "failed"
+      || record.phase === "cancelled"
+      || record.phase === "abandoned"
+    ) return this.#sessionSwitchReplay(record, record.rawRequest);
+    if (
+      record.phase === "seed_dispatching"
+      && record.sourceRelease !== null
+    ) {
+      // Facts-memory custody is a separate durable store. Replaying this
+      // exact transfer is required even after the StateStore rebind exists;
+      // the transfer port proves either the source or target owner and is
+      // idempotent for an already-settled target owner.
+      const targetDeferral = this.#beginSessionSwitchTargetFactDeferral(record);
+      try {
+        await this.#transferSessionSwitchFactsMemoryOwner(record);
+      } catch (error: unknown) {
+        if (this.#sessionSwitchFactDeferralObserved(record.sessionId, targetDeferral)) {
+          record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+            record.sessionId,
+            {
+              ...sessionSwitchCas(record),
+              expectedPhase: "seed_dispatching",
+              diagnosticCode: this.#sessionSwitchFactDeferralLost(record.sessionId, targetDeferral)
+                ? "TARGET_FACT_OVERFLOW_DURING_CUSTODY_REPLAY"
+                : "TARGET_FACT_DURING_FAILED_CUSTODY_REPLAY",
+            },
+            targetDeferral,
+          );
+          return this.#sessionSwitchReplay(record, record.rawRequest);
+        }
+        this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+        throw error;
+      }
+      const diagnosticCode = this.#sessionSwitchFactDeferralLost(
+        record.sessionId,
+        targetDeferral,
+      )
+        ? "TARGET_FACT_OVERFLOW_DURING_CUSTODY_REPLAY"
+        : targetDeferral.facts.length > 0
+          ? "TARGET_FACT_DURING_SEED_CUSTODY_REPLAY"
+          : "RECOVERY_SEED_POSSIBLY_SENT";
+      record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+        record.sessionId,
+        {
+          ...sessionSwitchCas(record),
+          expectedPhase: "seed_dispatching",
+          diagnosticCode,
+        },
+        targetDeferral,
+      );
+      return this.#sessionSwitchReplay(record, record.rawRequest);
+    }
+    if (record.phase === "target_starting" || record.phase === "seed_dispatching") {
+      record = this.#store.markSessionSwitchReconciliationRequired({
+        ...sessionSwitchCas(record),
+        expectedPhase: record.phase,
+        diagnosticCode: record.phase === "target_starting"
+          ? "RECOVERY_TARGET_START_POSSIBLY_SENT"
+          : "RECOVERY_SEED_POSSIBLY_SENT",
+      });
+      return this.#sessionSwitchReplay(record, record.rawRequest);
+    }
+
+    let targetReview: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
+    let targetProfile: ProfileRecord | undefined;
+    let projectRoot: string | undefined;
+    let replaySourceDeferral: SessionSwitchDeferredFactOwner | undefined;
+    if (record.phase === "prepared") {
+      replaySourceDeferral = this.#beginSessionSwitchFactDeferral(
+        record.sessionId,
+        record,
+        record.sourceAuthority,
+        record.sourceProviderThreadId,
+      );
+      try {
+        targetProfile = this.#store.requireProfileById(record.targetAuthority.profileId);
+        this.#assertProviderReady(targetProfile, record.targetAuthority, { userInitiatedStart: true });
+        const session = this.#store.requireSession(record.sessionId);
+        const project = session.projectId === undefined
+          ? undefined
+          : this.#store.requireProject(session.projectId);
+        projectRoot = project === undefined
+          ? undefined
+          : await this.#requireUsableProjectRoot(project.rootPath);
+        targetReview = await this.#fencedEffect(async () => await this.#sessionRuntime(
+          record.targetAuthority.provider,
+        ).reviewSessionStart({
+          authority: authorityFor(this.#paths, targetProfile as ProfileRecord, record.targetAuthority),
+          ...(projectRoot === undefined ? {} : { projectRoot }),
+          preset: record.targetPreset,
+          fast: session.fastEnabled,
+          signal,
+        }));
+      } catch (error: unknown) {
+        if (this.#sessionSwitchFactDeferralObserved(record.sessionId, replaySourceDeferral)) {
+          const cancelled = await this.#cancelPreparedSessionSwitchForDeferredSourceFacts(
+            record,
+            replaySourceDeferral,
+          );
+          if (cancelled !== null) return this.#sessionSwitchReplay(cancelled, cancelled.rawRequest);
+        }
+        this.#discardSessionSwitchFactDeferral(record.sessionId, replaySourceDeferral);
+        throw error;
+      }
+      if (this.#sessionSwitchFactDeferralObserved(record.sessionId, replaySourceDeferral)) {
+        const cancelled = await this.#cancelPreparedSessionSwitchForDeferredSourceFacts(
+          record,
+          replaySourceDeferral,
+        );
+        if (cancelled !== null) return this.#sessionSwitchReplay(cancelled, cancelled.rawRequest);
+      }
+    }
+    return await this.#runPreparedSessionSwitch(
+      record,
+      targetReview,
+      targetProfile,
+      projectRoot,
+      signal,
+      record.phase === "source_releasing",
+      replaySourceDeferral,
+    );
+  }
+
+  async #switchProviderLocked(
+    command: Extract<LocalCommand, { kind: "session.switch" }>,
+    rawRequest: SessionSwitchRawRequest,
+    key: string,
+    selectedSession: SessionRecord,
+    selectedTarget: ProfileRecord,
+    signal: AbortSignal,
+    remoteExpected?: RemoteExpectedSessionAuthority,
+  ): Promise<unknown> {
+    const session = this.#requireBoundSession(selectedSession.id);
+    const currentProfile = this.#store.requireProfileById(session.profileId);
+    const source = this.#store.requireSessionProviderAuthority(session.id);
+    const sourceAuthority = this.#sessionProviderAccountAuthority(source);
+    if (remoteExpected !== undefined) {
+      if (
+        session.id !== remoteExpected.sessionId
+        || session.profileId !== remoteExpected.profileId
+        || session.providerThreadId !== remoteExpected.providerThreadId
+        || source.provider !== remoteExpected.provider
+        || source.providerAccountId !== remoteExpected.providerAccountId
+        || source.bindingGeneration !== remoteExpected.bindingGeneration
+        || source.processGeneration !== remoteExpected.processGeneration
+      ) {
+        throw new CommandFailure("CONFLICT", "The remote command authority changed before dispatch.");
+      }
+      this.#assertProviderReady(currentProfile, sourceAuthority, { session });
+    }
     if (session.state === "active" || session.activeTurnId !== undefined) {
       throw new CommandFailure(
         "CONFLICT",
@@ -7892,100 +8852,254 @@ export class HraService {
         `A ${session.state === "terminal" ? "terminal" : "quarantined"} session cannot switch provider.`,
       );
     }
-    const preset = command.preset ?? defaultPresetForProviderSwitch(command.provider, session.preset);
+    const preset = command.preset
+      ?? defaultPresetForProviderSwitch(command.provider, session.preset);
     if (!isPresetSupportedByProvider(command.provider, preset)) {
       throw new CommandFailure(
         "INVALID_INPUT",
         new PresetProviderMismatchError(command.provider, preset).message,
       );
     }
+    if (
+      session.provider === command.provider
+      && selectedTarget.id === currentProfile.id
+      && preset === session.preset
+    ) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        `That session already runs on ${command.provider} with the \`${session.preset}\` preset.`,
+      );
+    }
+
+    let targetProfile = this.#store.requireProfileById(selectedTarget.id);
+    const preparedTarget = await this.#prepareProviderForSessionStart(
+      targetProfile,
+      command.provider,
+      signal,
+    );
+    targetProfile = preparedTarget.profile;
+    const targetAuthority = preparedTarget.providerAuthority;
     const project = session.projectId === undefined
       ? undefined
       : this.#store.requireProject(session.projectId);
     const projectRoot = project === undefined
       ? undefined
       : await this.#requireUsableProjectRoot(project.rootPath);
-
-    const transcript = this.#readTranscript(session.id, undefined, TRANSCRIPT_PAGE_LIMIT);
-    const seed = renderTranscriptSeed({
-      transcript,
-      fromProvider: session.provider,
-      toProvider: command.provider,
-    });
-
     const runtime = this.#sessionRuntime(command.provider);
-    const key = command.idempotencyKey ?? randomUUID();
-    const fromProvider = session.provider;
-    const fromPreset = session.preset;
-    let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
-    let started:
-      | (CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile })
-      | undefined;
-    const switchProviderAuthorities = [
-      { role: "source" as const, authority: sourceProviderAuthority, provenance: "session_switch_source" },
-      { role: "target" as const, authority: targetProviderAuthority, provenance: "session_switch_target" },
-    ];
-    const outcome = await this.#effect<z.infer<typeof sessionSwitchReceiptSchema>>({
-      kind: "session.switch",
-      authorityId: session.id,
-      authorityGeneration: targetProviderAuthority.processGeneration,
-      request: {
-        provider: command.provider,
-        preset,
-        targetProfileId: targetProfile.id,
-        seedDigest: seed.digest,
-      },
+    const targetProfileAuthority = authorityFor(this.#paths, targetProfile, targetAuthority);
+    const review = await this.#fencedEffect(async () => await runtime.reviewSessionStart({
+      authority: targetProfileAuthority,
+      ...(projectRoot === undefined ? {} : { projectRoot }),
+      preset,
+      fast: session.fastEnabled,
+      signal,
+    }));
+
+    const frozen = this.#store.readSessionSnapshotWithEventPosition(session.id);
+    const frozenSource = this.#store.requireSessionProviderAuthority(session.id);
+    if (
+      frozen.session.revision !== session.revision
+      || frozenSource.authorityRevision !== source.authorityRevision
+      || !sameProviderUsageAuthority(
+        sourceAuthority,
+        this.#sessionProviderAccountAuthority(frozenSource),
+      )
+    ) throw new CommandFailure("CONFLICT", "Session switch authority changed before preparation.");
+    const sourceRuntime = this.#store.latestSessionRuntimeProfile(session.id);
+    if (sourceRuntime === null) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The source session has no immutable runtime profile.");
+    }
+    const rendered = this.#sessionSwitchTranscript(
+      session.id,
+      frozen,
+      session.provider,
+      command.provider,
+      key,
+    );
+    const prepared = this.#store.prepareSessionSwitch({
       idempotencyKey: key,
-      providerAuthorities: switchProviderAuthorities,
-      beginEffect: (attemptId) => {
-        this.#store.beginPreparedMutationEffect({
-          attemptId,
-          providerAuthorities: switchProviderAuthorities,
+      rawRequest,
+      sessionId: session.id,
+      sourceAuthority,
+      targetAuthority,
+      expectedSessionRevision: session.revision,
+      expectedAuthorityRevision: source.authorityRevision,
+      sourcePreset: session.preset,
+      targetPreset: preset,
+      sourceRuntimeProfileRevision: sourceRuntime.revision,
+      transcript: rendered.pin,
+    });
+    if (prepared.status === "replayed") {
+      this.#assertRemoteSessionSwitchAuthority(prepared.switch, remoteExpected);
+      return this.#sessionSwitchReplay(prepared.switch, rawRequest);
+    }
+    return await this.#runPreparedSessionSwitch(
+      prepared.switch,
+      review,
+      targetProfile,
+      projectRoot,
+      signal,
+      false,
+    );
+  }
+
+  async #runPreparedSessionSwitch(
+    initial: SessionSwitchRecord,
+    targetReview: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined,
+    targetProfile: ProfileRecord | undefined,
+    projectRoot: string | undefined,
+    signal: AbortSignal,
+    resumedSourceRelease: boolean,
+    existingSourceDeferral?: SessionSwitchDeferredFactOwner,
+  ): Promise<unknown> {
+    try {
+      return await this.#runPreparedSessionSwitchOwned(
+        initial,
+        targetReview,
+        targetProfile,
+        projectRoot,
+        signal,
+        resumedSourceRelease,
+        existingSourceDeferral,
+      );
+    } finally {
+      this.#discardSessionSwitchFactDeferralsForAttempt(
+        initial.sessionId,
+        initial.attemptId,
+      );
+    }
+  }
+
+  async #runPreparedSessionSwitchOwned(
+    initial: SessionSwitchRecord,
+    targetReview: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined,
+    targetProfile: ProfileRecord | undefined,
+    projectRoot: string | undefined,
+    signal: AbortSignal,
+    resumedSourceRelease: boolean,
+    existingSourceDeferral?: SessionSwitchDeferredFactOwner,
+  ): Promise<unknown> {
+    let record = initial;
+    const cas = sessionSwitchCas(record);
+    let sourceDeferral = existingSourceDeferral;
+    if (record.phase === "prepared") {
+      if (targetReview === undefined || targetProfile === undefined) {
+        throw new Error("SESSION_SWITCH_PREPARED_TARGET_REVIEW_MISSING");
+      }
+      sourceDeferral ??= this.#beginSessionSwitchFactDeferral(
+        record.sessionId,
+        record,
+        record.sourceAuthority,
+        record.sourceProviderThreadId,
+      );
+      if (this.#sessionSwitchFactDeferralObserved(record.sessionId, sourceDeferral)) {
+        const cancelled = await this.#cancelPreparedSessionSwitchForDeferredSourceFacts(
+          record,
+          sourceDeferral,
+        );
+        if (cancelled !== null) return this.#sessionSwitchReplay(cancelled, cancelled.rawRequest);
+      }
+      const targetStartSourceDeferral = sourceDeferral;
+      const targetRuntime = this.#sessionRuntime(record.targetAuthority.provider);
+      const targetProfileAuthority = authorityFor(this.#paths, targetProfile, record.targetAuthority);
+      try {
+        record = this.#store.beginSessionSwitchTargetStart(cas);
+      } catch (error: unknown) {
+        this.#discardSessionSwitchFactDeferral(record.sessionId, sourceDeferral);
+        throw error;
+      }
+      let started: CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile };
+      try {
+        started = await this.#fencedEffect(async () => {
+          // #fencedEffect first awaits daemon authority. Recheck source-fact
+          // custody inside the closure so a callback delivered by that await
+          // cannot cross into target session construction.
+          if (this.#sessionSwitchFactDeferralObserved(record.sessionId, targetStartSourceDeferral)) {
+            throw new SessionSwitchSourceFactBeforeTargetEffect();
+          }
+          return await targetRuntime.startSession({
+            authority: targetProfileAuthority,
+            ...(projectRoot === undefined ? {} : { projectRoot }),
+            review: targetReview,
+            signal,
+          });
         });
-      },
-      effect: async () => {
-        // The target thread is started before the source is released. A target
-        // that refuses then leaves the session exactly where it was, still
-        // observed and still runnable, instead of stranding it with a released
-        // thread it can no longer resume.
-        review = await this.#fencedEffect(async () => await runtime.reviewSessionStart({
-          authority: authorityFor(this.#paths, targetProfile, targetProviderAuthority),
-          ...(projectRoot === undefined ? {} : { projectRoot }),
-          preset,
-          fast: session.fastEnabled,
-          signal,
-        }));
-        const runtimeReview = review;
-        started = await this.#fencedEffect(async () => await runtime.startSession({
-          authority: authorityFor(this.#paths, targetProfile, targetProviderAuthority),
-          ...(projectRoot === undefined ? {} : { projectRoot }),
-          review: runtimeReview,
-          signal,
-        }));
-        // Now release the outgoing provider: a per-session runtime process is
-        // stopped rather than left running behind an abandoned thread.
-        await this.#endProviderSession(session, signal);
-        return {
-          providerThreadId: started.providerThreadId,
-          sessionId: session.id,
-          toProvider: command.provider,
-        };
-      },
-      receipt: (value) => sessionSwitchReceiptSchema.parse(value),
-      restore: (value) => sessionSwitchReceiptSchema.parse(value),
-      commit: (attemptId) => {
-        if (started === undefined) {
-          throw new Error("Provider switch commit lost its exact provider projection.");
+      } catch (error: unknown) {
+        if (error instanceof DaemonAuthoritySafetyError) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, sourceDeferral);
+          throw error;
         }
-        const current = this.#store.requireSession(session.id);
-        this.#store.completeSessionProviderSwitch({
-          attemptId,
-          sessionId: current.id,
-          expectedSessionRevision: current.revision,
-          provider: command.provider,
-          profileId: targetProfile.id,
-          providerAuthority: targetProviderAuthority,
-          preset,
+        if (error instanceof SessionSwitchSourceFactBeforeTargetEffect) {
+          try {
+            this.#store.failSessionSwitchTargetStartNoEffect({
+              ...cas,
+              expectedPhase: "target_starting",
+              diagnosticCode: "SOURCE_FACT_BEFORE_TARGET_EFFECT",
+            });
+          } catch (settlementError: unknown) {
+            this.#discardSessionSwitchFactDeferral(record.sessionId, sourceDeferral);
+            throw settlementError;
+          }
+          const lost = await this.#drainSessionSwitchFactDeferral(
+            record.sessionId,
+            sourceDeferral,
+          );
+          if (lost) {
+            const session = this.#store.requireSession(record.sessionId);
+            if (session.state !== "recovery_required" && session.state !== "terminal") {
+              this.#quarantineSession(session.id);
+            }
+            throw new CommandFailure(
+              "RECOVERY_REQUIRED",
+              "Source facts exceeded or escaped the bounded buffer before target start.",
+              { idempotencyKey: record.idempotencyKey },
+            );
+          }
+          throw new CommandFailure(
+            "CONFLICT",
+            "The source session changed before target start; no target provider effect was issued.",
+            { idempotencyKey: record.idempotencyKey },
+          );
+        }
+        const diagnosticCode = this.#sessionSwitchDiagnostic("TARGET_START", error);
+        if (this.#sessionSwitchEffectIsIndeterminate(error, "target_start")) {
+          this.#markSessionSwitchReconciliationRequiredAndDiscard(
+            record.sessionId,
+            {
+              ...cas,
+              expectedPhase: "target_starting",
+              diagnosticCode,
+            },
+            sourceDeferral,
+          );
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The target provider start may have occurred and will not be replayed.",
+            { idempotencyKey: record.idempotencyKey },
+          );
+        }
+        try {
+          this.#store.failSessionSwitchTargetStartNoEffect({
+            ...cas,
+            expectedPhase: "target_starting",
+            diagnosticCode,
+          });
+        } catch (settlementError: unknown) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, sourceDeferral);
+          throw settlementError;
+        }
+        const lost = await this.#drainSessionSwitchFactDeferral(record.sessionId, sourceDeferral);
+        if (lost) {
+          const session = this.#store.requireSession(record.sessionId);
+          if (session.state !== "recovery_required" && session.state !== "terminal") {
+            this.#quarantineSession(session.id);
+          }
+        }
+        throw error;
+      }
+      try {
+        record = this.#store.completeSessionSwitchTargetStart({
+          ...cas,
           providerThreadId: started.providerThreadId,
           state: started.status,
           ...(started.activeTurnId === undefined ? {} : { activeTurnId: started.activeTurnId }),
@@ -7993,114 +9107,971 @@ export class HraService {
             ? {}
             : { providerUpdatedAt: started.providerUpdatedAt }),
           runtimeProfile: started.effectiveRuntimeProfile,
-          receipt: {
-            providerThreadId: started.providerThreadId,
-            sessionId: current.id,
-            toProvider: command.provider,
-          },
         });
-      },
-      onAmbiguous: () => this.#quarantineSession(session.id),
-    });
-
-    const switched = this.#store.requireSession(outcome.sessionId);
-    this.#appendSessionEvent(
-      authorityFor(this.#paths, targetProfile, targetProviderAuthority),
-      switched.id,
-      null,
-      {
-        type: "provider_switched",
-        fromProvider,
-        toProvider: command.provider,
-        fromPreset,
-        toPreset: preset,
-        accountChanged: targetProfile.id !== currentProfile.id,
-        transcriptDigest: transcript.digest,
-        seedDigest: seed.digest,
-        seedOmittedRecords: seed.omittedRecords,
-      },
-    );
-    await this.#ensureSessionObservedLocked(switched.id, signal);
-    // The handoff summary is an ordinary first turn on the new thread, so it
-    // records its own `user_message` and produces an ordinary reply. The
-    // rebinding is already durable at this point, so a seed the new provider
-    // refuses is reported as an undelivered seed rather than raised as a
-    // failed switch the operator would wrongly retry.
-    let seeded: unknown;
-    let seedFailure: string | undefined;
-    try {
-      seeded = await this.#send(
-        switched.id,
-        seed.text,
-        undefined,
-        signal,
-        undefined,
-        "provider_switch",
+      } catch (error: unknown) {
+        this.#discardSessionSwitchFactDeferral(record.sessionId, sourceDeferral);
+        if (!(error instanceof StateSecurityScrubRequiredError)) {
+          this.#store.markSessionSwitchReconciliationRequired({
+            ...cas,
+            expectedPhase: "target_starting",
+            diagnosticCode: this.#sessionSwitchDiagnostic("TARGET_START_RECEIPT", error),
+          });
+        }
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The target provider started but its exact receipt did not settle.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      if (this.#sessionSwitchFactDeferralObserved(record.sessionId, sourceDeferral)) {
+        record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "target_started",
+            diagnosticCode: this.#sessionSwitchFactDeferralLost(record.sessionId, sourceDeferral)
+              ? "SOURCE_FACT_OVERFLOW_DURING_TARGET_START"
+              : "SOURCE_FACT_DURING_TARGET_START",
+          },
+          sourceDeferral,
+        );
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Source facts arrived after target-start intent; the target will not be released or rebound automatically.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      if (started.status !== "idle" || started.activeTurnId !== undefined) {
+        record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "target_started",
+            diagnosticCode: started.status === "terminal"
+              ? "TARGET_START_TERMINAL"
+              : "TARGET_START_NOT_IDLE",
+          },
+          sourceDeferral,
+        );
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The target provider did not start as an idle session and will not be rebound automatically.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      if (
+        record.targetAuthority.provider === "claude"
+        && this.#takePendingClaudeDisconnect(
+          targetProfileAuthority,
+          started.providerThreadId,
+        ) !== undefined
+      ) {
+        record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "target_started",
+            diagnosticCode: "TARGET_DISCONNECTED_BEFORE_RECEIPT_ADMISSION",
+          },
+          sourceDeferral,
+        );
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The target Claude process disconnected before its switch receipt could be admitted.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      const targetCollision = this.#store.findSessionByProviderThread(
+        record.targetAuthority.profileId,
+        started.providerThreadId,
       );
-    } catch (error: unknown) {
-      seedFailure = error instanceof CommandFailure
-        ? error.code
-        : error instanceof Error ? error.name : "error";
-      this.recordBackgroundDiagnostic("provider_switch_seed_failed", error);
+      if (targetCollision !== null) {
+        record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "target_started",
+            diagnosticCode: "TARGET_THREAD_ALREADY_BOUND",
+          },
+          sourceDeferral,
+        );
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The target provider returned a thread already bound to an HRA session.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
     }
-    return {
-      session: this.#store.requireSession(switched.id),
-      from: { provider: fromProvider, preset: fromPreset, account: currentProfile.id },
-      to: { provider: command.provider, preset, account: targetProfile.id },
-      seed: {
-        delivered: seedFailure === undefined,
-        digest: seed.digest,
-        ...(seedFailure === undefined ? {} : { failureCode: seedFailure }),
-        includedRecords: seed.includedRecords,
-        omittedRecords: seed.omittedRecords,
-      },
-      transcriptDigest: transcript.digest,
-      turnId: seededTurnId(seeded),
-      idempotencyKey: key,
-    };
+
+    if (
+      record.targetStart !== null
+      && (
+        record.targetStart.state !== "idle"
+        || record.targetStart.activeTurnId !== null
+      )
+      && (
+        record.phase === "target_started"
+        || record.phase === "source_releasing"
+        || record.phase === "source_released"
+        || record.phase === "rebound"
+      )
+    ) {
+      record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+        record.sessionId,
+        {
+          ...cas,
+          expectedPhase: record.phase,
+          diagnosticCode: record.targetStart.state === "terminal"
+            ? "TARGET_START_TERMINAL"
+            : "TARGET_START_NOT_IDLE",
+        },
+        sourceDeferral,
+      );
+      return this.#sessionSwitchReplay(record, record.rawRequest);
+    }
+    if (
+      record.phase === "target_started"
+      && record.targetStart !== null
+      && record.targetAuthority.provider === "claude"
+    ) {
+      const targetProfile = this.#store.requireProfileById(record.targetAuthority.profileId);
+      if (this.#takePendingClaudeDisconnect(
+        authorityFor(this.#paths, targetProfile, record.targetAuthority),
+        record.targetStart.providerThreadId,
+      ) !== undefined) {
+        record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "target_started",
+            diagnosticCode: "TARGET_DISCONNECTED_BEFORE_SOURCE_RELEASE",
+          },
+          sourceDeferral,
+        );
+        return this.#sessionSwitchReplay(record, record.rawRequest);
+      }
+    }
+    if (record.phase === "target_started" && record.targetStart !== null) {
+      const targetCollision = this.#store.findSessionByProviderThread(
+        record.targetAuthority.profileId,
+        record.targetStart.providerThreadId,
+      );
+      if (targetCollision !== null) {
+        record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "target_started",
+            diagnosticCode: "TARGET_THREAD_ALREADY_BOUND",
+          },
+          sourceDeferral,
+        );
+        return this.#sessionSwitchReplay(record, record.rawRequest);
+      }
+    }
+
+    const targetDeferral = record.targetStart === null
+      ? undefined
+      : this.#beginSessionSwitchTargetFactDeferral(record);
+
+    if (
+      record.phase === "rebound"
+      && record.sourceRelease !== null
+      && targetDeferral !== undefined
+    ) {
+      try {
+        await this.#transferSessionSwitchFactsMemoryOwner(record);
+      } catch (error: unknown) {
+        if (this.#sessionSwitchFactDeferralObserved(record.sessionId, targetDeferral)) {
+          record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+            record.sessionId,
+            {
+              ...cas,
+              expectedPhase: "rebound",
+              diagnosticCode: this.#sessionSwitchFactDeferralLost(record.sessionId, targetDeferral)
+                ? "TARGET_FACT_OVERFLOW_DURING_CUSTODY_REPLAY"
+                : "TARGET_FACT_DURING_FAILED_CUSTODY_REPLAY",
+            },
+            targetDeferral,
+          );
+          return this.#sessionSwitchReplay(record, record.rawRequest);
+        }
+        this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+        throw error;
+      }
+      if (this.#sessionSwitchFactDeferralObserved(record.sessionId, targetDeferral)) {
+        record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "rebound",
+            diagnosticCode: this.#sessionSwitchFactDeferralLost(record.sessionId, targetDeferral)
+              ? "TARGET_FACT_OVERFLOW_DURING_CUSTODY_REPLAY"
+              : "TARGET_FACT_DURING_CUSTODY_REPLAY",
+          },
+          targetDeferral,
+        );
+        return this.#sessionSwitchReplay(record, record.rawRequest);
+      }
+    }
+
+    if (record.phase === "target_started") {
+      sourceDeferral ??= this.#beginSessionSwitchFactDeferral(
+        record.sessionId,
+        record,
+        record.sourceAuthority,
+        record.sourceProviderThreadId,
+      );
+      try {
+        record = this.#store.beginSessionSwitchSourceRelease(cas);
+      } catch (error: unknown) {
+        this.#discardSessionSwitchFactDeferral(record.sessionId, sourceDeferral);
+        if (targetDeferral !== undefined) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+        }
+        if (error instanceof StateSecurityScrubRequiredError) throw error;
+        try {
+          record = this.#store.markSessionSwitchReconciliationRequired({
+            ...cas,
+            expectedPhase: "target_started",
+            diagnosticCode: this.#sessionSwitchDiagnostic(
+              "SOURCE_RELEASE_INTENT",
+              error,
+            ),
+          });
+        } catch (reconciliationError: unknown) {
+          if (reconciliationError instanceof StateSecurityScrubRequiredError) {
+            throw reconciliationError;
+          }
+          const observed = this.#store.requireSessionSwitch(record.attemptId);
+          if (observed.phase === "source_releasing") {
+            throw new CommandFailure(
+              "RECOVERY_REQUIRED",
+              "The source-release intent may have committed; replay this exact switch to resume it.",
+              { idempotencyKey: record.idempotencyKey },
+            );
+          }
+          throw reconciliationError;
+        }
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The target exists, but source-release intent admission failed; the switch requires explicit reconciliation.",
+          {
+            cause: this.#sessionSwitchDiagnostic("SOURCE_RELEASE_INTENT", error),
+            idempotencyKey: record.idempotencyKey,
+          },
+        );
+      }
+    }
+    if (record.phase === "source_releasing") {
+      const sourceSession = this.#store.requireSession(record.sessionId);
+      const sourceProfile = this.#store.requireProfileById(record.sourceAuthority.profileId);
+      const sourceProfileAuthority = authorityFor(
+        this.#paths,
+        sourceProfile,
+        record.sourceAuthority,
+      );
+      sourceDeferral ??= this.#beginSessionSwitchFactDeferral(
+        record.sessionId,
+        record,
+        record.sourceAuthority,
+        record.sourceProviderThreadId,
+      );
+      const activeSourceDeferral = sourceDeferral;
+      try {
+        await this.#fencedEffect(async () => await this.#sessionRuntime(
+          record.sourceAuthority.provider,
+        ).endSession({
+          authority: sourceProfileAuthority,
+          providerThreadId: record.sourceProviderThreadId,
+          signal,
+        }));
+      } catch (error: unknown) {
+        if (error instanceof DaemonAuthoritySafetyError) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
+          if (targetDeferral !== undefined) {
+            this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+          }
+          throw error;
+        }
+        if (
+          targetDeferral !== undefined
+          && this.#sessionSwitchFactDeferralObserved(record.sessionId, targetDeferral)
+        ) {
+          try {
+            record = this.#store.markSessionSwitchReconciliationRequired({
+              ...cas,
+              expectedPhase: "source_releasing",
+              diagnosticCode: this.#sessionSwitchFactDeferralLost(
+                record.sessionId,
+                targetDeferral,
+              )
+                ? "TARGET_FACT_OVERFLOW_DURING_SOURCE_RELEASE"
+                : "TARGET_FACT_DURING_FAILED_SOURCE_RELEASE",
+            });
+          } finally {
+            this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
+            this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+          }
+          return this.#sessionSwitchReplay(record, record.rawRequest);
+        }
+        this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
+        if (targetDeferral !== undefined) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+        }
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The idempotent source release did not return; replay this exact switch to retry its durable source_releasing intent.",
+          {
+            cause: this.#sessionSwitchDiagnostic("SOURCE_RELEASE", error),
+            idempotencyKey: record.idempotencyKey,
+          },
+        );
+      }
+      try {
+        record = this.#store.completeSessionSwitchSourceRelease({
+          ...cas,
+          status: resumedSourceRelease ? "already_released" : "released",
+        });
+      } catch (error: unknown) {
+        if (error instanceof StateSecurityScrubRequiredError) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
+          if (targetDeferral !== undefined) {
+            this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+          }
+          if (error.operationCommitted) this.#store.requireSessionSwitch(record.attemptId);
+          throw error;
+        }
+        if (
+          targetDeferral !== undefined
+          && this.#sessionSwitchFactDeferralObserved(record.sessionId, targetDeferral)
+        ) {
+          try {
+            record = this.#store.markSessionSwitchReconciliationRequired({
+              ...cas,
+              expectedPhase: "source_releasing",
+              diagnosticCode: this.#sessionSwitchFactDeferralLost(
+                record.sessionId,
+                targetDeferral,
+              )
+                ? "TARGET_FACT_OVERFLOW_DURING_SOURCE_RELEASE_RECEIPT"
+                : "TARGET_FACT_DURING_FAILED_SOURCE_RELEASE_RECEIPT",
+            });
+          } finally {
+            this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
+            this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+          }
+          return this.#sessionSwitchReplay(record, record.rawRequest);
+        }
+        this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
+        if (targetDeferral !== undefined) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+        }
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The source release receipt did not commit; replay this exact switch to repeat the idempotent release and receipt.",
+          {
+            cause: this.#sessionSwitchDiagnostic("SOURCE_RELEASE_RECEIPT", error),
+            idempotencyKey: record.idempotencyKey,
+          },
+        );
+      }
+      this.#clearReleasedProviderSession(
+        sourceSession,
+        sourceProfileAuthority,
+      );
+      if (activeSourceDeferral.overflowed) {
+        this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "source_released",
+            diagnosticCode: "SOURCE_RELEASE_FACT_OVERFLOW",
+          },
+          activeSourceDeferral,
+          targetDeferral,
+        );
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Source release facts exceeded the bounded switch buffer.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      try {
+        await this.#transferSessionSwitchFactsMemoryOwner(record);
+      } catch (error: unknown) {
+        if (
+          targetDeferral !== undefined
+          && this.#sessionSwitchFactDeferralObserved(record.sessionId, targetDeferral)
+        ) {
+          record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+            record.sessionId,
+            {
+              ...cas,
+              expectedPhase: "source_released",
+              diagnosticCode: this.#sessionSwitchFactDeferralLost(record.sessionId, targetDeferral)
+                ? "TARGET_FACT_OVERFLOW_DURING_CUSTODY_TRANSFER"
+                : "TARGET_FACT_DURING_FAILED_CUSTODY_TRANSFER",
+            },
+            activeSourceDeferral,
+            targetDeferral,
+          );
+          return this.#sessionSwitchReplay(record, record.rawRequest);
+        }
+        this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
+        if (targetDeferral !== undefined) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+        }
+        throw error;
+      }
+      const sourceOverflowed = sessionSwitchFactDeferralOverflowed(activeSourceDeferral);
+      if (sourceOverflowed || targetDeferral?.overflowed === true) {
+        this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "source_released",
+            diagnosticCode: sourceOverflowed
+              ? "SOURCE_RELEASE_FACT_OVERFLOW"
+              : "TARGET_FACT_OVERFLOW_BEFORE_REBIND",
+          },
+          activeSourceDeferral,
+          targetDeferral,
+        );
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Provider facts exceeded the bounded switch buffer before rebind.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      try {
+        record = this.#store.rebindSessionSwitch(cas);
+      } catch (error: unknown) {
+        if (error instanceof StateSecurityScrubRequiredError) {
+          // The transaction may already contain the rebind receipt and event.
+          // Never issue a source_released CAS against that possible commit.
+          if (error.operationCommitted) {
+            record = this.#store.requireSessionSwitch(record.attemptId);
+          }
+          this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
+          if (targetDeferral !== undefined) {
+            this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+          }
+          throw error;
+        }
+        this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "source_released",
+            diagnosticCode: this.#sessionSwitchDiagnostic("REBIND", error),
+          },
+          activeSourceDeferral,
+          targetDeferral,
+        );
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The source is released but the exact session rebind did not commit.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
+    } else if (record.phase === "source_released") {
+      const sourceSession = this.#store.requireSession(record.sessionId);
+      const sourceProfile = this.#store.requireProfileById(record.sourceAuthority.profileId);
+      const sourceAuthority = authorityFor(this.#paths, sourceProfile, record.sourceAuthority);
+      const cleanupDeferral = this.#beginSessionSwitchFactDeferral(
+        record.sessionId,
+        record,
+        record.sourceAuthority,
+        record.sourceProviderThreadId,
+      );
+      this.#clearReleasedProviderSession(sourceSession, sourceAuthority);
+      try {
+        await this.#transferSessionSwitchFactsMemoryOwner(record);
+      } catch (error: unknown) {
+        if (
+          targetDeferral !== undefined
+          && this.#sessionSwitchFactDeferralObserved(record.sessionId, targetDeferral)
+        ) {
+          record = this.#markSessionSwitchReconciliationRequiredAndDiscard(
+            record.sessionId,
+            {
+              ...cas,
+              expectedPhase: "source_released",
+              diagnosticCode: this.#sessionSwitchFactDeferralLost(record.sessionId, targetDeferral)
+                ? "TARGET_FACT_OVERFLOW_DURING_CUSTODY_TRANSFER"
+                : "TARGET_FACT_DURING_FAILED_CUSTODY_TRANSFER",
+            },
+            cleanupDeferral,
+            targetDeferral,
+          );
+          return this.#sessionSwitchReplay(record, record.rawRequest);
+        }
+        this.#discardSessionSwitchFactDeferral(record.sessionId, cleanupDeferral);
+        if (targetDeferral !== undefined) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+        }
+        throw error;
+      }
+      if (cleanupDeferral.overflowed || targetDeferral?.overflowed === true) {
+        this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "source_released",
+            diagnosticCode: cleanupDeferral.overflowed
+              ? "SOURCE_RELEASE_FACT_OVERFLOW"
+              : "TARGET_FACT_OVERFLOW_BEFORE_REBIND",
+          },
+          cleanupDeferral,
+          targetDeferral,
+        );
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Provider facts exceeded the bounded switch buffer before rebind.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      try {
+        record = this.#store.rebindSessionSwitch(cas);
+      } catch (error: unknown) {
+        this.#discardSessionSwitchFactDeferral(record.sessionId, cleanupDeferral);
+        if (targetDeferral !== undefined) {
+          this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+        }
+        if (error instanceof StateSecurityScrubRequiredError) {
+          if (error.operationCommitted) {
+            record = this.#store.requireSessionSwitch(record.attemptId);
+          }
+          throw error;
+        }
+        this.#store.markSessionSwitchReconciliationRequired({
+          ...cas,
+          expectedPhase: "source_released",
+          diagnosticCode: this.#sessionSwitchDiagnostic("REBIND", error),
+        });
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The source is released but the exact session rebind did not commit.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      if (sessionSwitchFactDeferralOverflowed(cleanupDeferral)) {
+        this.#markSessionSwitchReconciliationRequiredAndDiscard(
+          record.sessionId,
+          {
+            ...cas,
+            expectedPhase: "rebound",
+            diagnosticCode: "SOURCE_RELEASE_FACT_OVERFLOW",
+          },
+          cleanupDeferral,
+          targetDeferral,
+        );
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Source release facts exceeded the bounded switch buffer.",
+          { idempotencyKey: record.idempotencyKey },
+        );
+      }
+      this.#discardSessionSwitchFactDeferral(record.sessionId, cleanupDeferral);
+    }
+
+    if (record.phase !== "rebound") {
+      if (targetDeferral !== undefined) {
+        this.#discardSessionSwitchFactDeferral(record.sessionId, targetDeferral);
+      }
+      return this.#sessionSwitchReplay(record, record.rawRequest);
+    }
+    return await this.#dispatchSessionSwitchSeed(record, signal, targetDeferral);
   }
 
-  /**
-   * Release the outgoing provider's hold on a session's thread and close
-   * HRA's live view of it. The thread itself is never deleted.
-   */
-  async #endProviderSession(
-    session: SessionRecord & { providerThreadId: string },
+  async #dispatchSessionSwitchSeed(
+    rebound: SessionSwitchRecord,
     signal: AbortSignal,
-  ): Promise<void> {
-    const authority = this.#sessionAuthority(session);
+    existingDeferral?: SessionSwitchDeferredFactOwner,
+  ): Promise<unknown> {
+    try {
+      return await this.#dispatchSessionSwitchSeedOwned(
+        rebound,
+        signal,
+        existingDeferral,
+      );
+    } finally {
+      this.#discardSessionSwitchFactDeferralsForAttempt(
+        rebound.sessionId,
+        rebound.attemptId,
+      );
+    }
+  }
+
+  async #dispatchSessionSwitchSeedOwned(
+    rebound: SessionSwitchRecord,
+    signal: AbortSignal,
+    existingDeferral?: SessionSwitchDeferredFactOwner,
+  ): Promise<unknown> {
+    const targetThreadId = rebound.targetStart?.providerThreadId;
+    if (targetThreadId === undefined) {
+      throw new Error("SESSION_SWITCH_TARGET_START_RECEIPT_MISSING");
+    }
+    const capturedSeedAuthority = this.#sessionProviderAccountAuthority(
+      this.#store.requireCapturedSessionProviderAuthority(rebound.sessionId),
+    );
+    const reusableDeferral = (
+      existingDeferral !== undefined
+      && !sameProviderUsageAuthority(existingDeferral.authority, capturedSeedAuthority)
+    ) ? undefined : existingDeferral;
+    if (existingDeferral !== undefined && reusableDeferral === undefined) {
+      this.#discardSessionSwitchFactDeferral(rebound.sessionId, existingDeferral);
+    }
+    const deferral = reusableDeferral ?? this.#beginSessionSwitchFactDeferral(
+      rebound.sessionId,
+      rebound,
+      capturedSeedAuthority,
+      targetThreadId,
+    );
+    try {
+      return await this.#dispatchSessionSwitchSeedDeferred(rebound, signal, deferral);
+    } finally {
+      this.#discardSessionSwitchFactDeferral(rebound.sessionId, deferral);
+    }
+  }
+
+  async #dispatchSessionSwitchSeedDeferred(
+    rebound: SessionSwitchRecord,
+    signal: AbortSignal,
+    deferral: SessionSwitchDeferredFactOwner,
+  ): Promise<unknown> {
+    if (this.#sessionSwitchFactDeferralObserved(rebound.sessionId, deferral)) {
+      this.#store.markSessionSwitchReconciliationRequired({
+        ...sessionSwitchCas(rebound),
+        expectedPhase: "rebound",
+        diagnosticCode: this.#sessionSwitchFactDeferralLost(rebound.sessionId, deferral)
+          ? "TARGET_FACT_OVERFLOW_BEFORE_SEED"
+          : "TARGET_FACT_BEFORE_SEED",
+      });
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "Target facts arrived or exceeded the bounded switch buffer before seed dispatch.",
+        { idempotencyKey: rebound.idempotencyKey },
+      );
+    }
+    const seedInput = this.#store.readSessionSwitchSeedInput(rebound.attemptId);
+    const transcript = buildSessionTranscript({
+      sessionId: rebound.sessionId,
+      events: seedInput.events,
+      limit: rebound.transcript.rendererLimit,
+    });
+    const seed = renderTranscriptSeed({
+      transcript,
+      fromProvider: rebound.sourceAuthority.provider,
+      toProvider: rebound.targetAuthority.provider,
+    });
+    if (
+      transcript.digest !== rebound.transcript.transcriptDigest
+      || seed.digest !== rebound.transcript.seedDigest
+      || seed.includedRecords !== rebound.transcript.seedIncludedRecords
+      || seed.omittedRecords !== rebound.transcript.seedOmittedRecords
+    ) {
+      this.#store.markSessionSwitchReconciliationRequired({
+        ...sessionSwitchCas(rebound),
+        expectedPhase: "rebound",
+        diagnosticCode: "SEED_PIN_DIGEST_MISMATCH",
+      });
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The pinned transcript no longer reproduces the exact handoff seed.",
+        { idempotencyKey: rebound.idempotencyKey },
+      );
+    }
+    const session = this.#store.requireSession(rebound.sessionId);
+    const seedAuthority = this.#store.requireSessionProviderAuthority(session.id);
+    const providerAuthority = this.#sessionProviderAccountAuthority(seedAuthority);
+    const targetProfile = this.#store.requireProfileById(seedAuthority.profileId);
+    const project = session.projectId === undefined
+      ? undefined
+      : this.#store.requireProject(session.projectId);
+    const projectRoot = project === undefined
+      ? undefined
+      : await this.#requireUsableProjectRoot(project.rootPath);
+    const runtime = this.#sessionRuntime(seedAuthority.provider);
+    const cas = sessionSwitchCas(rebound);
+    // Project-root validation awaited external filesystem state. Re-prove
+    // bounded callback custody immediately before publishing seed intent.
+    if (this.#sessionSwitchFactDeferralObserved(rebound.sessionId, deferral)) {
+      this.#store.markSessionSwitchReconciliationRequired({
+        ...cas,
+        expectedPhase: "rebound",
+        diagnosticCode: this.#sessionSwitchFactDeferralLost(rebound.sessionId, deferral)
+          ? "TARGET_FACT_OVERFLOW_BEFORE_SEED_INTENT"
+          : "TARGET_FACT_BEFORE_SEED_INTENT",
+      });
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "Target facts arrived or exceeded the bounded switch buffer before seed intent.",
+        { idempotencyKey: rebound.idempotencyKey },
+      );
+    }
+    let dispatching = this.#store.beginSessionSwitchSeedDispatch({
+      ...cas,
+      seedAuthority: providerAuthority,
+      seedAuthorityRevision: seedAuthority.authorityRevision,
+      seedDigest: seed.digest,
+      clientMessageId: rebound.transcript.seedClientMessageId,
+    });
+    let started:
+      | Readonly<{
+          turnId: string;
+          status: "completed" | "interrupted" | "failed" | "inProgress";
+          effectiveRuntimeProfile: ReviewedRuntimeProfile;
+        }>
+      | undefined;
+    const settleSeedFailure = (error: unknown): void => {
+      if (error instanceof DaemonAuthoritySafetyError) {
+        this.#discardSessionSwitchFactDeferral(rebound.sessionId, deferral);
+        throw error;
+      }
+      if (error instanceof SessionSwitchTargetFactBeforeSeedEffect) {
+        this.#store.markSessionSwitchReconciliationRequired({
+          ...cas,
+          expectedPhase: "seed_dispatching",
+          diagnosticCode: this.#sessionSwitchFactDeferralLost(rebound.sessionId, deferral)
+            ? "SEED_FACT_OVERFLOW"
+            : "TARGET_FACT_BEFORE_SEED_EFFECT",
+        });
+        this.#discardSessionSwitchFactDeferral(rebound.sessionId, deferral);
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Target facts arrived before seed dispatch; the handoff seed was not sent.",
+          { idempotencyKey: rebound.idempotencyKey },
+        );
+      }
+      const failureCode = this.#sessionSwitchDiagnostic("SEED", error);
+      if (
+        this.#sessionSwitchFactDeferralLost(rebound.sessionId, deferral)
+        || this.#sessionSwitchEffectIsIndeterminate(error, "seed_dispatch")
+      ) {
+        this.#store.markSessionSwitchReconciliationRequired({
+          ...cas,
+          expectedPhase: "seed_dispatching",
+          diagnosticCode: this.#sessionSwitchFactDeferralLost(rebound.sessionId, deferral)
+            ? "SEED_FACT_OVERFLOW"
+            : failureCode,
+        });
+        this.#discardSessionSwitchFactDeferral(rebound.sessionId, deferral);
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The handoff seed may have reached the target and will not be replayed.",
+          { idempotencyKey: rebound.idempotencyKey },
+        );
+      }
+      dispatching = this.#store.completeSessionSwitchSeed({
+        ...cas,
+        seedAuthority: providerAuthority,
+        seedAuthorityRevision: seedAuthority.authorityRevision,
+        settlement: {
+          outcome: "rejected",
+          failureCode,
+          receiptDigest: digestText(`hra:session-switch-seed-rejected:v1\0${failureCode}`),
+        },
+      });
+      this.recordBackgroundDiagnostic("provider_switch_seed_failed", error);
+    };
+    let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
+    try {
+      review = await this.#fencedEffect(async () => await runtime.reviewTurnStart({
+        authority: authorityFor(this.#paths, targetProfile, providerAuthority),
+        providerThreadId: session.providerThreadId as string,
+        ...(projectRoot === undefined ? {} : { projectRoot }),
+        preset: session.preset,
+        fast: session.fastEnabled,
+        signal,
+      }));
+    } catch (error: unknown) {
+      settleSeedFailure(error);
+    }
+    if (review !== undefined) {
+      // reviewTurnStart is provider-neutral and has no turn effect, but it can
+      // await while target callbacks arrive. Observed or lost callback custody is a
+      // reconciliation boundary, never a determinate seed rejection.
+      if (this.#sessionSwitchFactDeferralObserved(rebound.sessionId, deferral)) {
+        this.#store.markSessionSwitchReconciliationRequired({
+          ...cas,
+          expectedPhase: "seed_dispatching",
+          diagnosticCode: this.#sessionSwitchFactDeferralLost(rebound.sessionId, deferral)
+            ? "SEED_FACT_OVERFLOW_BEFORE_EFFECT"
+            : "TARGET_FACT_BEFORE_SEED_EFFECT",
+        });
+        this.#discardSessionSwitchFactDeferral(rebound.sessionId, deferral);
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Target facts arrived or exceeded the bounded switch buffer before seed dispatch.",
+          { idempotencyKey: rebound.idempotencyKey },
+        );
+      }
+      try {
+        started = await this.#fencedEffect(async () => {
+          // #fencedEffect awaits the daemon fence before invoking this
+          // closure. Re-prove callback custody on the provider-call side of
+          // that await so an observed or lost callback can never cross into startTurn.
+          if (this.#sessionSwitchFactDeferralObserved(rebound.sessionId, deferral)) {
+            throw new SessionSwitchTargetFactBeforeSeedEffect();
+          }
+          return await runtime.startTurn({
+            authority: authorityFor(this.#paths, targetProfile, providerAuthority),
+            providerThreadId: session.providerThreadId as string,
+            ...(projectRoot === undefined ? {} : { projectRoot }),
+            review,
+            message: seed.text,
+            clientMessageId: rebound.transcript.seedClientMessageId,
+            signal,
+          });
+        });
+      } catch (error: unknown) {
+        settleSeedFailure(error);
+      }
+    }
+    if (this.#sessionSwitchFactDeferralLost(rebound.sessionId, deferral)) {
+      if (dispatching.phase === "seed_dispatching") {
+        this.#store.markSessionSwitchReconciliationRequired({
+          ...cas,
+          expectedPhase: "seed_dispatching",
+          diagnosticCode: "SEED_FACT_OVERFLOW",
+        });
+      }
+      this.#discardSessionSwitchFactDeferral(rebound.sessionId, deferral);
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "Target seed facts exceeded the bounded switch buffer.",
+        { idempotencyKey: rebound.idempotencyKey },
+      );
+    }
+    if (started !== undefined) {
+      try {
+        const runtimeProfile = reviewedRuntimeProfileSchema.parse(
+          started.effectiveRuntimeProfile,
+        );
+        dispatching = this.#store.completeSessionSwitchSeed({
+          ...cas,
+          seedAuthority: providerAuthority,
+          seedAuthorityRevision: seedAuthority.authorityRevision,
+          settlement: {
+            outcome: "accepted",
+            turnId: started.turnId,
+            turnStatus: started.status,
+            runtimeProfile,
+            receiptDigest: digestText(JSON.stringify({
+              domain: "hra:session-switch-seed-accepted:v1",
+              turnId: started.turnId,
+              turnStatus: started.status,
+              runtimeProfile,
+            })),
+            seedText: seed.text,
+          },
+        });
+      } catch (error: unknown) {
+        if (!(error instanceof StateSecurityScrubRequiredError)) {
+          this.#store.markSessionSwitchReconciliationRequired({
+            ...cas,
+            expectedPhase: "seed_dispatching",
+            diagnosticCode: this.#sessionSwitchDiagnostic("SEED_RECEIPT", error),
+          });
+        }
+        this.#discardSessionSwitchFactDeferral(rebound.sessionId, deferral);
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The handoff seed reached the target but its exact receipt did not settle.",
+          { idempotencyKey: rebound.idempotencyKey },
+        );
+      }
+    }
+    const settled = dispatching.phase === "seed_settled"
+      ? dispatching
+      : this.#store.requireSessionSwitch(rebound.attemptId);
+    if (settled.phase !== "seed_settled") return this.#sessionSwitchReplay(settled, settled.rawRequest);
+    let factDrainLostState = false;
+    try {
+      factDrainLostState = await this.#drainSessionSwitchFactDeferral(
+        rebound.sessionId,
+        deferral,
+      );
+    } catch (error: unknown) {
+      factDrainLostState = true;
+      if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+      this.recordBackgroundDiagnostic("provider_switch_fact_flush_failed", error);
+    }
+    try {
+      const switched = this.#store.requireSession(settled.sessionId);
+      if (factDrainLostState) {
+        const current = this.#store.requireSession(switched.id);
+        if (current.state !== "recovery_required" && current.state !== "terminal") {
+          this.#quarantineSession(switched.id);
+        }
+        this.recordBackgroundDiagnostic(
+          "provider_switch_fact_flush_failed",
+          new Error("SESSION_SWITCH_DEFERRED_FACT_LOST_AFTER_SETTLEMENT"),
+        );
+      } else {
+        this.#drainPendingClaudeDisconnect(switched);
+        await this.#ensureSessionObservedLocked(switched.id, signal);
+      }
+    } catch (error: unknown) {
+      if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+      this.recordBackgroundDiagnostic("provider_switch_fact_flush_failed", error);
+    }
+    return this.#sessionSwitchReplay(settled, settled.rawRequest);
+  }
+
+  #clearReleasedProviderSession(
+    session: SessionRecord,
+    authority: ProfileAuthority,
+  ): void {
     const connectionId = this.#sessionProviderConnections.get(session.id) ?? null;
-    this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
+    // Clear the redactor's volatile source buffers, but do not append their
+    // interruption writes through the open-switch storage fence. Admission
+    // proved the source idle, and the journal is the durable release evidence.
+    this.#eventRedactor.interruptSession({
       accountId: authority.id,
       providerConnectionId: connectionId,
       providerGeneration: authority.generation,
       providerAuthority: this.#providerAccountAuthority(authority),
       sessionId: session.id,
-    }));
-    this.#appendSessionEvent(authority, session.id, connectionId, {
-      type: "connection",
-      state: "disconnected",
-      reason: "provider switch",
     });
     this.#sessionProviderConnections.delete(session.id);
     this.#sessionObservationFailures.delete(session.id);
     this.#sessionResubscriptionConnections.delete(session.id);
     this.#sessionsAwaitingResubscription.delete(session.id);
     this.#forgetSessionFactEpoch(session.id);
-    try {
-      await this.#runtimeForSession(session).endSession({
-        authority,
-        providerThreadId: session.providerThreadId,
-        signal,
-      });
-    } finally {
-      if (authority.provider === "claude") {
-        this.#claudeFacts.forgetSession(
-          this.#providerAccountAuthority(authority),
-          session.providerThreadId,
-        );
-      }
+    if (authority.provider === "claude" && session.providerThreadId !== undefined) {
+      this.#forgetPendingClaudeDisconnect(authority, session.providerThreadId);
+      this.#claudeFacts.forgetSession(
+        this.#providerAccountAuthority(authority),
+        session.providerThreadId,
+      );
     }
+  }
+
+  #clearAbandonedSessionSwitchLocalState(record: SessionSwitchRecord): void {
+    const session = this.#store.requireSession(record.sessionId);
+    const captured = this.#sessionProviderAccountAuthority(
+      this.#store.requireCapturedSessionProviderAuthority(record.sessionId),
+    );
+    const profile = this.#store.requireProfileById(captured.profileId);
+    this.#clearReleasedProviderSession(
+      session,
+      authorityFor(this.#paths, profile, captured),
+    );
+    const targetThreadId = record.targetStart?.providerThreadId;
+    if (record.targetAuthority.provider !== "claude" || targetThreadId === undefined) return;
+    const targetBinding = this.#store.findSessionByProviderThread(
+      record.targetAuthority.profileId,
+      targetThreadId,
+    );
+    if (targetBinding !== null && targetBinding.id !== record.sessionId) return;
+    const targetProfile = this.#store.requireProfileById(record.targetAuthority.profileId);
+    const targetAuthority = authorityFor(this.#paths, targetProfile, record.targetAuthority);
+    this.#forgetPendingClaudeDisconnect(targetAuthority, targetThreadId);
+    this.#claudeFacts.forgetSession(record.targetAuthority, targetThreadId);
   }
 
   /*
@@ -8602,6 +10573,98 @@ export class HraService {
       this.#quarantineSession(session.id);
       throw new CommandFailure("RECOVERY_REQUIRED", "Codex renamed the session, but its local title could not be committed; the session is quarantined.", { cause: error instanceof Error ? error.name : "error" });
     }
+  }
+
+  #findRecoverableSessionSwitch(
+    sessionId: SessionRecord["id"],
+  ): SessionSwitchRecord | null {
+    return this.#store.readSessionSwitchForRecovery(sessionId);
+  }
+
+  async #resolveSessionRecoveryCommand(
+    selector: string,
+    action: "recover" | "abandon",
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const selected = this.#store.requireSession(selector);
+    const dedicated = this.#findRecoverableSessionSwitch(selected.id);
+    if (dedicated !== null) {
+      return await this.#serializeProviderSwitch({
+        providers: [dedicated.sourceAuthority.provider, dedicated.targetAuthority.provider],
+        profileIds: [dedicated.sourceAuthority.profileId, dedicated.targetAuthority.profileId],
+        sessionId: dedicated.sessionId,
+      }, async () => {
+        const current = this.#store.requireSessionSwitch(dedicated.attemptId);
+        if (action === "abandon") {
+          if (current.phase === "prepared") {
+            const cancelled = this.#store.cancelPreparedSessionSwitch(sessionSwitchCas(current));
+            const session = this.#store.requireSession(cancelled.sessionId);
+            return {
+              session,
+              idempotencyKey: cancelled.idempotencyKey,
+              recovery: {
+                resolved: true,
+                resolution: "cancelled",
+                providerEffectRetried: false,
+                providerStateDeleted: false,
+              },
+            };
+          }
+          let reconciled = current;
+          if (reconciled.phase !== "reconciliation_required") {
+            if (
+              reconciled.phase === "seed_settled"
+              || reconciled.phase === "failed"
+              || reconciled.phase === "cancelled"
+              || reconciled.phase === "abandoned"
+            ) return this.#sessionSwitchReplay(reconciled, reconciled.rawRequest);
+            reconciled = this.#store.markSessionSwitchReconciliationRequired({
+              ...sessionSwitchCas(reconciled),
+              expectedPhase: reconciled.phase,
+              diagnosticCode: "USER_ABANDON_NO_PROVIDER_REPLAY",
+            });
+          }
+          if (reconciled.sourceRelease !== null) {
+            await this.#transferSessionSwitchFactsMemoryOwner(reconciled);
+          }
+          const ownerId = reconciled.sourceRelease === null
+            ? reconciled.sourceAuthority.profileId
+            : reconciled.targetAuthority.profileId;
+          await this.#cleanupFactsMemoryOwner(reconciled.sessionId, ownerId, "abandon");
+          this.#clearAbandonedSessionSwitchLocalState(reconciled);
+          const session = this.#store.requireSession(reconciled.sessionId);
+          const authority = this.#store.requireCapturedSessionProviderAuthority(
+            reconciled.sessionId,
+          );
+          const resolved = this.#store.abandonReconciledSessionSwitch({
+            ...sessionSwitchCas(reconciled),
+            expectedSessionRevision: session.revision,
+            expectedSessionAuthority: this.#sessionProviderAccountAuthority(authority),
+            expectedSessionAuthorityRevision: authority.authorityRevision,
+          });
+          this.#surfaceAbandonedSessionSwitchInteractions(resolved.interactions);
+          this.#resumeSessionWorkAfterRecovery(resolved.session);
+          return {
+            session: resolved.session,
+            idempotencyKey: resolved.switch.idempotencyKey,
+            recovery: {
+              resolved: true,
+              resolution: "abandoned",
+              providerEffectRetried: false,
+              providerStateDeleted: false,
+            },
+          };
+        }
+        return await this.#resumeSessionSwitchLocked(current, signal);
+      });
+    }
+    return await this.#serializeSessionAuthority(selected, async () => {
+      const current = this.#store.requireSession(selected.id);
+      if (action === "abandon" && current.state === "recovery_required") {
+        await this.#cleanupFactsMemory(current, "abandon");
+      }
+      return await this.#resolveSessionRecovery(current.id, action, signal);
+    });
   }
 
   async #resolveSessionRecovery(selector: string, action: "recover" | "abandon", signal: AbortSignal): Promise<unknown> {
@@ -9242,6 +11305,34 @@ export class HraService {
     } finally {
       if (this.#mutationTails.get(key) === current) this.#mutationTails.delete(key);
     }
+  }
+
+  async #serializeProviderSwitch<T>(
+    scope: Readonly<{
+      providers: readonly Provider[];
+      profileIds: readonly ProfileRecord["id"][];
+      sessionId: SessionRecord["id"];
+    }>,
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    const compare = (left: string, right: string): number =>
+      left === right ? 0 : left < right ? -1 : 1;
+    const keys = [
+      ...[...new Set(scope.providers)]
+        .sort(compare)
+        .map((provider) => `provider-policy:${provider}`),
+      ...[...new Set(scope.profileIds)]
+        .sort(compare)
+        .map((profileId) => `account:${profileId}`),
+      `session:${scope.sessionId}`,
+    ];
+    const acquire = async (index: number): Promise<T> => {
+      const key = keys[index];
+      return key === undefined
+        ? await operation()
+        : await this.#serialize(key, async () => await acquire(index + 1));
+    };
+    return await acquire(0);
   }
 
   async #applyOrderedAccountFact(

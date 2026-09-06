@@ -627,11 +627,14 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   readonly cleanups: Array<Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0]> = [];
   readonly ensures: Array<Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0]> = [];
   readonly sweeps: number[] = [];
+  readonly transfers: Array<Parameters<HraFactsMemoryLifecyclePort["transferSessionOwner"]>[0]> = [];
   readonly epochs = new Map<string, number>();
   readonly expiries = new Map<string, number>();
+  readonly owners = new Map<string, string>();
   readonly states = new Map<string, "active" | "purged">();
   readonly cleanupErrors = new Set<string>();
   ensureErrorOnce: Error | undefined;
+  transferErrorOnce: Error | undefined;
   simulateExpiry = false;
 
   #receipt(sessionId: string, state: HraFactsMemoryLifecycleReceipt["state"] = "active"): HraFactsMemoryLifecycleReceipt {
@@ -661,6 +664,7 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     const error = this.ensureErrorOnce;
     this.ensureErrorOnce = undefined;
     if (error !== undefined) throw error;
+    this.owners.set(input.sessionId, input.ownerId);
     if (this.states.get(input.sessionId) !== "active") {
       this.epochs.set(input.sessionId, (this.epochs.get(input.sessionId) ?? 0) + 1);
       this.states.set(input.sessionId, "active");
@@ -669,6 +673,36 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
       input.sessionId,
       Math.max(this.expiries.get(input.sessionId) ?? 0, input.expiresAt),
     );
+    return this.#receipt(input.sessionId);
+  }
+
+  async transferSessionOwner(
+    input: Parameters<HraFactsMemoryLifecyclePort["transferSessionOwner"]>[0],
+  ) {
+    this.transfers.push(input);
+    const error = this.transferErrorOnce;
+    this.transferErrorOnce = undefined;
+    if (error !== undefined) throw error;
+    const owner = this.owners.get(input.sessionId);
+    if (owner !== undefined && owner !== input.fromOwnerId && owner !== input.toOwnerId) {
+      throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+    }
+    if (owner === input.toOwnerId || input.fromOwnerId === input.toOwnerId) {
+      this.owners.set(input.sessionId, input.toOwnerId);
+      this.expiries.set(
+        input.sessionId,
+        Math.max(this.expiries.get(input.sessionId) ?? 0, input.expiresAt),
+      );
+      this.states.set(input.sessionId, "active");
+      return this.#receipt(input.sessionId);
+    }
+    this.owners.set(input.sessionId, input.toOwnerId);
+    this.expiries.set(
+      input.sessionId,
+      Math.max(this.expiries.get(input.sessionId) ?? 0, input.expiresAt),
+    );
+    this.states.set(input.sessionId, "active");
+    this.epochs.set(input.sessionId, (this.epochs.get(input.sessionId) ?? 0) + 1);
     return this.#receipt(input.sessionId);
   }
 
@@ -3282,10 +3316,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }]);
+      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }]);
     } finally {
       inspector.close(false);
     }

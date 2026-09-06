@@ -15,7 +15,7 @@ import {
   type FactsMemoryStoreReceipt,
   type FactsMemoryStoreInspection,
 } from "../domain/facts-memory";
-import { unixMillisecondsSchema } from "../domain/values";
+import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
 import {
   factsMemoryCleanupReasonSchema,
   type FactsMemoryCleanupReason,
@@ -89,6 +89,13 @@ export interface HraFactsMemoryLifecyclePort {
     sessionId: string;
   }>): Promise<HraFactsMemoryLifecycleReceipt>;
   sweepExpired(now: number): Promise<Readonly<{ attempted: number; failed: number; purged: number }>>;
+  transferSessionOwner(input: Readonly<{
+    expiresAt: number;
+    fromOwnerId: string;
+    operationKey: string;
+    sessionId: string;
+    toOwnerId: string;
+  }>): Promise<HraFactsMemoryLifecycleReceipt>;
 }
 
 const lifecycleReceipt = (record: FactsMemoryControlRecord): HraFactsMemoryLifecycleReceipt => ({
@@ -176,23 +183,101 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     sessionId: string;
   }>): Promise<HraFactsMemoryLifecycleReceipt> {
     return this.#serialize(input.sessionId, async () => {
-      const current = this.#control.get(input.sessionId);
-      if (current !== null && current.binding.ownerId !== input.ownerId) {
+      return lifecycleReceipt(await this.#ensureSessionLocked(input));
+    });
+  }
+
+  transferSessionOwner(input: Readonly<{
+    expiresAt: number;
+    fromOwnerId: string;
+    operationKey: string;
+    sessionId: string;
+    toOwnerId: string;
+  }>): Promise<HraFactsMemoryLifecycleReceipt> {
+    const expiresAt = unixMillisecondsSchema.parse(input.expiresAt);
+    const fromOwnerId = profileIdSchema.parse(input.fromOwnerId);
+    const operationKey = z.string().min(1).max(200).parse(input.operationKey);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const toOwnerId = profileIdSchema.parse(input.toOwnerId);
+    return this.#serialize(sessionId, async () => {
+      if (fromOwnerId === toOwnerId) {
+        return lifecycleReceipt(await this.#ensureSessionLocked({
+          expiresAt,
+          ownerId: toOwnerId,
+          sessionId,
+        }));
+      }
+      const observed = this.#control.get(sessionId);
+      if (observed === null) {
+        const targetBinding = createFactsMemoryBinding({ ownerId: toOwnerId, sessionId });
+        const fresh = this.#control.reserveFreshOwnerTransfer({
+          binding: targetBinding,
+          createOperationKey: this.#createOperationKey(targetBinding, "create"),
+          expiresAt,
+          fromOwnerId,
+          operationKey,
+        });
+        return lifecycleReceipt(await this.#ensureReserved(fresh));
+      }
+      if (observed.binding.ownerId === toOwnerId) {
+        const exactTarget = this.#control.requireOwnerTransferTarget({
+          binding: observed.binding,
+          fromOwnerId,
+          operationKey,
+        });
+        if (
+          exactTarget.cleanupReason === "abandon"
+          || exactTarget.cleanupReason === "archive"
+        ) {
+          if (exactTarget.state !== "cleanup_pending" && exactTarget.state !== "purged") {
+            throw new Error("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+          }
+          return lifecycleReceipt(exactTarget);
+        }
+        if (
+          exactTarget.state === "cleanup_pending"
+          && exactTarget.cleanupReason === "expired"
+        ) await this.#purgePending(exactTarget);
+        const target = await this.#ensureSessionLocked({
+          expiresAt,
+          ownerId: toOwnerId,
+          sessionId,
+        });
+        return lifecycleReceipt(target);
+      }
+      if (observed.binding.ownerId !== fromOwnerId) {
         throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
       }
-      const binding = createFactsMemoryBinding({
-        epoch: current?.state === "purged" && current.cleanupReason === "expired"
-          ? current.binding.epoch + 1
-          : current?.binding.epoch ?? 1,
-        ownerId: input.ownerId,
-        sessionId: input.sessionId,
+      const sourceBinding = observed.binding;
+      let source = observed;
+      if (source.state === "cleanup_pending" && source.cleanupReason === "expired") {
+        source = await this.#purgePending(source);
+      }
+      const pending = source.state === "purged" && source.cleanupReason === "expired"
+        ? this.#control.adoptExpiredPurgeForOwnerTransfer({
+            binding: sourceBinding,
+            operationKey,
+            toOwnerId,
+          })
+        : this.#control.beginOwnerTransfer({
+            binding: sourceBinding,
+            operationKey,
+            toOwnerId,
+          });
+      await this.#purgePending(pending);
+      const targetBinding = createFactsMemoryBinding({
+        epoch: sourceBinding.epoch + 1,
+        ownerId: toOwnerId,
+        sessionId,
       });
-      const record = this.#control.reserve({
-        binding,
-        createOperationKey: this.#createOperationKey(binding, "create"),
-        expiresAt: input.expiresAt,
+      const target = this.#control.advanceOwnerTransfer({
+        createOperationKey: this.#createOperationKey(targetBinding, "create"),
+        expiresAt,
+        fromBinding: sourceBinding,
+        operationKey,
+        toBinding: targetBinding,
       });
-      return lifecycleReceipt(await this.#ensureReserved(record));
+      return lifecycleReceipt(await this.#ensureReserved(target));
     });
   }
 
@@ -328,10 +413,9 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
             current.state !== "cleanup_pending"
             && (current.expiresAt > now || current.state === "purged")
           ) return null;
-          return lifecycleReceipt(await this.#cleanupRecord(
-            current,
-            current.cleanupReason ?? "expired",
-          ));
+          return lifecycleReceipt(current.cleanupReason === "provider_switch"
+            ? await this.#purgePending(current)
+            : await this.#cleanupRecord(current, current.cleanupReason ?? "expired"));
         });
         if (result?.state === "purged") purged += 1;
       } catch {
@@ -339,6 +423,33 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
       }
     }
     return { attempted: records.length, failed, purged };
+  }
+
+  async #ensureSessionLocked(input: Readonly<{
+    expiresAt: number;
+    ownerId: string;
+    sessionId: string;
+  }>): Promise<FactsMemoryControlRecord> {
+    const expiresAt = unixMillisecondsSchema.parse(input.expiresAt);
+    const ownerId = profileIdSchema.parse(input.ownerId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const current = this.#control.get(sessionId);
+    if (current !== null && current.binding.ownerId !== ownerId) {
+      throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+    }
+    const binding = createFactsMemoryBinding({
+      epoch: current?.state === "purged" && current.cleanupReason === "expired"
+        ? current.binding.epoch + 1
+        : current?.binding.epoch ?? 1,
+      ownerId,
+      sessionId,
+    });
+    const record = this.#control.reserve({
+      binding,
+      createOperationKey: this.#createOperationKey(binding, "create"),
+      expiresAt,
+    });
+    return await this.#ensureReserved(record);
   }
 
   async #ensureReserved(record: FactsMemoryControlRecord): Promise<FactsMemoryControlRecord> {
@@ -526,6 +637,9 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   ): Promise<FactsMemoryControlRecord> {
     const binding = existing.binding;
     const exact = this.#control.requireExact(binding);
+    if (exact.cleanupReason === "provider_switch") {
+      throw new Error("FACTS_MEMORY_OWNER_TRANSFER_IN_PROGRESS");
+    }
     const sealsExpiredPurge = exact.state === "purged"
       && exact.cleanupReason === "expired"
       && requestedReason !== "expired";
@@ -534,11 +648,20 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
       ? this.#cleanupOperationKey(binding, reason)
       : exact.cleanupOperationKey ?? this.#cleanupOperationKey(binding, reason);
     const pending = this.#control.beginCleanup({ binding, operationKey, reason });
+    return await this.#purgePending(pending);
+  }
+
+  async #purgePending(pendingValue: FactsMemoryControlRecord): Promise<FactsMemoryControlRecord> {
+    const binding = pendingValue.binding;
+    const pending = this.#control.requireExact(binding);
     if (pending.state === "purged") return pending;
+    if (pending.state !== "cleanup_pending" || pending.cleanupOperationKey === null) {
+      throw new Error("FACTS_MEMORY_CLEANUP_STATE_INVALID");
+    }
     const purge = assertPurgeReceipt(binding, await this.#broker.purge({
       binding,
       expectedHandleHash: pending.handleHash,
-      operationKey: pending.cleanupOperationKey ?? operationKey,
+      operationKey: pending.cleanupOperationKey,
     }));
     return this.#control.finalizePurged(binding, purge);
   }

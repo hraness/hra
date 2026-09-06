@@ -115,7 +115,10 @@ const codexAuthorityOf = (authority: ProfileAuthority): CodexAuthority => {
   };
 };
 
-const sameCodexAuthority = (left: CodexAuthority, right: CodexAuthority): boolean =>
+const sameCodexAuthority = (
+  left: Omit<CodexAuthority, "provider"> & { readonly provider: unknown },
+  right: CodexAuthority,
+): boolean =>
   left.profileId === right.profileId
   && left.processGeneration === right.processGeneration
   && left.provider === right.provider
@@ -984,10 +987,11 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         this.#assertObservedClientCurrent(running);
         if (
           (running.sessionObservationFactByThread.get(projection.providerThreadId) ?? 0)
-          <= observationFactSequence
+          > observationFactSequence
         ) {
-          this.#rememberSessionObservation(running, projection, false);
+          throw new Error("THREAD_START_PROJECTION_INVALIDATED_BY_CONCURRENT_FACT");
         }
+        this.#rememberSessionObservation(running, projection, false);
         return { ...projection, effectiveRuntimeProfile: reviewed.review.effectiveRuntimeProfile };
       } catch (error: unknown) {
         throw new IndeterminateCodexEffectError("thread/start", 0, error);

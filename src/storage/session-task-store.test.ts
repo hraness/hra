@@ -61,6 +61,60 @@ CREATE TABLE queue_entries (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 ) STRICT;
+CREATE TABLE session_switch_attempts (
+  journal_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  attempt_id TEXT,
+  request_key TEXT,
+  request_digest TEXT,
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  phase TEXT NOT NULL,
+  original_session_revision INTEGER,
+  original_authority_revision INTEGER,
+  source_preset TEXT,
+  target_preset TEXT,
+  stream_epoch TEXT,
+  transcript_digest TEXT,
+  seed_digest TEXT,
+  seed_omitted_records INTEGER,
+  seed_client_message_id TEXT,
+  source_provider_thread_id TEXT,
+  after_sequence_exclusive INTEGER,
+  source_provider_account_id TEXT,
+  source_profile_id TEXT,
+  source_provider TEXT,
+  source_binding_generation INTEGER,
+  source_process_generation INTEGER,
+  target_provider_account_id TEXT,
+  target_profile_id TEXT,
+  target_provider TEXT,
+  target_binding_generation INTEGER,
+  target_process_generation INTEGER
+) STRICT;
+CREATE TABLE session_switch_malformed_dispositions (
+  journal_sequence INTEGER PRIMARY KEY REFERENCES session_switch_attempts(journal_sequence),
+  mutation_request_key TEXT,
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  terminal_phase TEXT NOT NULL
+) STRICT;
+CREATE TABLE mutation_attempts (
+  id TEXT PRIMARY KEY,
+  idempotency_key TEXT,
+  request_digest TEXT
+) STRICT;
+CREATE TABLE mutation_provider_authorities (
+  attempt_id TEXT NOT NULL REFERENCES mutation_attempts(id),
+  role TEXT NOT NULL,
+  provider_account_id TEXT,
+  profile_id TEXT,
+  provider TEXT,
+  binding_generation INTEGER,
+  process_generation INTEGER,
+  PRIMARY KEY(attempt_id,role)
+) STRICT;
+CREATE TABLE session_switch_plan_anchors (
+  attempt_id TEXT PRIMARY KEY,
+  source_provider_thread_id TEXT
+) STRICT;
 `;
 
 let uuidSequence = 0;
@@ -607,6 +661,84 @@ describe("SessionTaskStore mutation authority", () => {
 });
 
 describe("SessionTaskStore due materialization", () => {
+  test("excludes open and reconciled provider switches at both due-scan boundaries", async () => {
+    const blocked = fixture();
+    const blockedTask = createTask(blocked);
+    blocked.database.query(
+      "INSERT INTO session_switch_attempts(session_id,phase) VALUES (?,'prepared')",
+    ).run(blocked.sessionId);
+    expect(blocked.store.nextDueAt()).toBeNull();
+    expect(await blocked.store.materializeDue({ now: blockedTask.nextDueAt ?? 0 })).toEqual([]);
+    expect(blocked.database.query("SELECT COUNT(*) AS count FROM queue_entries").get())
+      .toEqual({ count: 0 });
+
+    const raceReference: { value?: Fixture } = {};
+    const raced = fixture({
+      resolveProjectDirectory: async (root) => {
+        const value = raceReference.value;
+        if (value === undefined) throw new Error("Missing provider-switch race fixture.");
+        value.database.query(
+          "INSERT INTO session_switch_attempts(session_id,phase) VALUES (?,'reconciliation_required')",
+        ).run(value.sessionId);
+        return root;
+      },
+    });
+    raceReference.value = raced;
+    const racedTask = createTask(raced);
+    expect(await raced.store.materializeDue({ now: racedTask.nextDueAt ?? 0 })).toEqual([]);
+    expect(raced.database.query("SELECT COUNT(*) AS count FROM session_task_occurrences").get())
+      .toEqual({ count: 0 });
+    expect(raced.database.query("SELECT COUNT(*) AS count FROM queue_entries").get())
+      .toEqual({ count: 0 });
+  });
+
+  test("excludes malformed terminal switches while valid terminal histories remain schedulable", async () => {
+    for (const phase of ["failed", "seed_settled", "cancelled", "abandoned"]) {
+      const value = fixture();
+      const task = createTask(value);
+      const journal = value.database.query(
+        `INSERT INTO session_switch_attempts(session_id,phase) VALUES (?,?)
+         RETURNING journal_sequence`,
+      ).get(value.sessionId, phase) as { journal_sequence: number };
+      expect(value.store.nextDueAt()).toBe(task.nextDueAt);
+      value.database.query(
+        `INSERT INTO session_switch_malformed_dispositions(journal_sequence,session_id,terminal_phase)
+         VALUES (?,?,'reconciliation_required')`,
+      ).run(journal.journal_sequence, value.sessionId);
+      value.database.query(
+        "UPDATE session_switch_attempts SET session_id=? WHERE journal_sequence=?",
+      ).run(value.otherSessionId, journal.journal_sequence);
+      expect(value.store.nextDueAt()).toBeNull();
+      expect(await value.store.materializeDue({ now: task.nextDueAt ?? 0 })).toEqual([]);
+      expect(value.database.query("SELECT COUNT(*) AS count FROM queue_entries").get())
+        .toEqual({ count: 0 });
+    }
+
+    const raceReference: { value?: Fixture } = {};
+    const raced = fixture({
+      resolveProjectDirectory: async (root) => {
+        const value = raceReference.value;
+        if (value === undefined) throw new Error("Missing terminal-switch race fixture.");
+        value.database.query(
+          `INSERT INTO session_switch_malformed_dispositions(journal_sequence,session_id,terminal_phase)
+           SELECT journal_sequence,session_id,'reconciliation_required' FROM session_switch_attempts
+           WHERE session_id=?`,
+        ).run(value.sessionId);
+        return root;
+      },
+    });
+    raceReference.value = raced;
+    const task = createTask(raced);
+    raced.database.query(
+      "INSERT INTO session_switch_attempts(session_id,phase) VALUES (?,'cancelled')",
+    ).run(raced.sessionId);
+    expect(await raced.store.materializeDue({ now: task.nextDueAt ?? 0 })).toEqual([]);
+    expect(raced.database.query("SELECT COUNT(*) AS count FROM session_task_occurrences").get())
+      .toEqual({ count: 0 });
+    expect(raced.database.query("SELECT COUNT(*) AS count FROM queue_entries").get())
+      .toEqual({ count: 0 });
+  });
+
   test("returns after one atomic handoff before resolving the next candidate", async () => {
     let rejectSecond = true;
     const resolvedRoots: string[] = [];

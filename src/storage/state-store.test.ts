@@ -252,6 +252,238 @@ const reviewedClaudeProfile = (
   reasoningEffort: "max",
 });
 
+const sessionSwitchDigest = (value: unknown): string =>
+  createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+type SignedInTestProfile = ReturnType<typeof signInProfile>;
+
+const prepareDedicatedSessionSwitch = (
+  store: StateStore,
+  sequence: number,
+  options: Readonly<{
+    sourceProfile?: SignedInTestProfile;
+    targetProfile?: SignedInTestProfile;
+    targetPreset?: "low" | "high";
+    targetThreadId?: string;
+    pinSourceEvent?: boolean;
+  }> = {},
+) => {
+  const suffix = String(sequence).padStart(12, "0");
+  const sourceProfile = options.sourceProfile
+    ?? signInProfile(store, `Switch source ${sequence}`, `switch-source-${sequence}@example.com`);
+  const targetProfile = options.targetProfile
+    ?? signInProfile(store, `Switch target ${sequence}`, `switch-target-${sequence}@example.com`);
+  const targetPreset = options.targetPreset ?? "low";
+  const sourceAuthority = store.requireProviderAccountAuthority(sourceProfile.id, "codex");
+  const targetAuthority = store.requireProviderAccountAuthority(targetProfile.id, "codex");
+  const created = store.createSession({
+    profileId: sourceProfile.id,
+    provider: "codex",
+    preset: "high",
+    fastEnabled: false,
+    title: `Switch ${sequence}`,
+  });
+  const session = store.bindSession({
+    sessionId: created.id,
+    expectedRevision: created.revision,
+    providerThreadId: `source-thread-${sequence}`,
+    providerUpdatedAt: 10 + sequence,
+    state: "idle",
+  });
+  const sourceRuntime = store.recordSessionRuntimeProfile({
+    sessionId: session.id,
+    sourceKind: "session_start",
+    sourceId: `10000000-0000-4000-8000-${suffix}`,
+    profile: reviewedCodexProfile({
+      id: sourceProfile.id,
+      processGeneration: sourceAuthority.processGeneration,
+    }, 2_000 + sequence),
+    providerAuthority: sourceAuthority,
+  });
+  if (options.pinSourceEvent === true) {
+    store.appendSessionEvent({
+      sessionId: session.id,
+      accountId: sourceAuthority.profileId,
+      providerGeneration: sourceAuthority.processGeneration,
+      providerAuthority: sourceAuthority,
+      providerConnectionId: null,
+      body: {
+        type: "warning",
+        code: "SWITCH_PIN",
+        message: `Pinned switch event ${sequence}`,
+      },
+    });
+  }
+  const position = store.readSessionSnapshotWithEventPosition(session.id);
+  const seedText = `Provider switch seed ${sequence}`;
+  const seedDigest = createHash("sha256")
+    .update("hra:session-transcript-seed:v1\0", "utf8")
+    .update(seedText, "utf8")
+    .digest("hex");
+  const prepared = store.prepareSessionSwitch({
+    idempotencyKey: `20000000-0000-4000-8000-${suffix}`,
+    rawRequest: {
+      session: session.id,
+      provider: "codex",
+      account: targetProfile.id,
+      preset: targetPreset,
+    },
+    sessionId: session.id,
+    sourceAuthority,
+    targetAuthority,
+    expectedSessionRevision: session.revision,
+    expectedAuthorityRevision: store.requireSessionProviderAuthority(session.id).authorityRevision,
+    sourcePreset: "high",
+    targetPreset,
+    sourceRuntimeProfileRevision: sourceRuntime.revision,
+    transcript: {
+      streamEpoch: position.streamEpoch,
+      floorSequence: position.floorSequence,
+      afterSequenceExclusive: options.pinSourceEvent === true
+        ? position.floorSequence - 1
+        : position.observedThroughSequence,
+      throughSequenceInclusive: position.observedThroughSequence,
+      acceptedHeadSequence: position.observedThroughSequence,
+      rendererVersion: 1,
+      rendererLimit: 400,
+      transcriptDigest: createHash("sha256").update(`transcript-${sequence}`).digest("hex"),
+      seedDigest,
+      seedIncludedRecords: options.pinSourceEvent === true ? 1 : 0,
+      seedOmittedRecords: 0,
+      seedClientMessageId: `switch-seed-${sequence}`,
+    },
+  });
+  const cas = {
+    attemptId: prepared.switch.attemptId,
+    requestDigest: prepared.switch.requestDigest,
+    sourceAuthority,
+    targetAuthority,
+    originalSessionRevision: prepared.switch.originalSessionRevision,
+    originalAuthorityRevision: prepared.switch.originalAuthorityRevision,
+  } as const;
+  return {
+    ...prepared,
+    cas,
+    seedText,
+    session,
+    sourceProfile,
+    targetProfile,
+    targetRuntime: effectiveRuntimeProfileSchema.parse({
+      ...reviewedCodexProfile({
+        id: targetProfile.id,
+        processGeneration: targetAuthority.processGeneration,
+      }, 3_000 + sequence),
+      preset: targetPreset,
+      model: targetPreset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
+    }),
+    targetThreadId: options.targetThreadId ?? `target-thread-${sequence}`,
+  };
+};
+
+const advanceDedicatedSessionSwitch = (
+  store: StateStore,
+  prepared: ReturnType<typeof prepareDedicatedSessionSwitch>,
+  through: "target_starting" | "target_started" | "source_releasing"
+    | "source_released" | "rebound" | "seed_dispatching",
+) => {
+  let record = store.beginSessionSwitchTargetStart(prepared.cas);
+  if (through === "target_starting") return record;
+  record = store.completeSessionSwitchTargetStart({
+    ...prepared.cas,
+    providerThreadId: prepared.targetThreadId,
+    state: "idle",
+    providerUpdatedAt: 20,
+    runtimeProfile: prepared.targetRuntime,
+  });
+  if (through === "target_started") return record;
+  record = store.beginSessionSwitchSourceRelease(prepared.cas);
+  if (through === "source_releasing") return record;
+  record = store.completeSessionSwitchSourceRelease({ ...prepared.cas, status: "released" });
+  if (through === "source_released") return record;
+  record = store.rebindSessionSwitch(prepared.cas);
+  if (through === "rebound") return record;
+  const authority = store.requireSessionProviderAuthority(prepared.session.id);
+  return store.beginSessionSwitchSeedDispatch({
+    ...prepared.cas,
+    seedAuthority: prepared.cas.targetAuthority,
+    seedAuthorityRevision: authority.authorityRevision,
+    seedDigest: prepared.switch.transcript.seedDigest,
+    clientMessageId: prepared.switch.transcript.seedClientMessageId,
+  });
+};
+
+const installSessionAuthoritySuccessorForTest = (
+  store: StateStore,
+  prepared: ReturnType<typeof prepareDedicatedSessionSwitch>,
+  targetAuthority: ReturnType<StateStore["requireProviderAccountAuthority"]>,
+  routingProvenance: "managed" | "explicit" = "explicit",
+) => {
+  const previous = store.requireCapturedSessionProviderAuthority(prepared.session.id);
+  const targetAppliedPointerRevision = routingProvenance === "managed"
+    ? store.readProviderAccountState(targetAuthority.provider).pointerRevision
+    : null;
+  const database = new Database(store.paths.database, { create: false, strict: true });
+  try {
+    const transition = database.transaction(() => {
+      database.query(
+        `INSERT INTO session_provider_authority_successors(
+           session_id,from_authority_revision,to_authority_revision,
+           from_provider_account_id,from_profile_id,from_provider,
+           from_binding_generation,from_process_generation,
+           from_routing_provenance,from_applied_pointer_revision,
+           to_provider_account_id,to_profile_id,to_provider,
+           to_binding_generation,to_process_generation,
+           to_routing_provenance,to_applied_pointer_revision,
+           transition_kind,transition_id,recorded_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        prepared.session.id,
+        previous.authorityRevision,
+        previous.authorityRevision + 1,
+        previous.providerAccountId,
+        previous.profileId,
+        previous.provider,
+        previous.bindingGeneration,
+        previous.processGeneration,
+        previous.routingProvenance,
+        previous.appliedPointerRevision,
+        targetAuthority.providerAccountId,
+        targetAuthority.profileId,
+        targetAuthority.provider,
+        targetAuthority.bindingGeneration,
+        targetAuthority.processGeneration,
+        routingProvenance,
+        targetAppliedPointerRevision,
+        "provider_restart",
+        `same-daemon-successor-${prepared.switch.attemptId}`,
+        9_000,
+      );
+      const changed = database.query(
+        `UPDATE session_provider_authorities
+         SET provider_account_id=?,profile_id=?,provider=?,binding_generation=?,
+             process_generation=?,authority_revision=authority_revision+1,
+             routing_provenance=?,applied_pointer_revision=?
+         WHERE session_id=? AND authority_revision=?`,
+      ).run(
+        targetAuthority.providerAccountId,
+        targetAuthority.profileId,
+        targetAuthority.provider,
+        targetAuthority.bindingGeneration,
+        targetAuthority.processGeneration,
+        routingProvenance,
+        targetAppliedPointerRevision,
+        prepared.session.id,
+        previous.authorityRevision,
+      );
+      expect(changed.changes).toBe(1);
+    });
+    transition.immediate();
+  } finally {
+    database.close(false);
+  }
+  return store.requireSessionProviderAuthority(prepared.session.id);
+};
+
 const codexInteractionBinding = (
   store: StateStore,
   profileId: ProfileId,
@@ -301,24 +533,97 @@ const schemaVersion35Tables = [
   "provider_accounts",
 ] as const;
 
+const schemaVersion36ProviderUsageTables = [
+  "provider_usage_observation_components",
+  "provider_usage_prune_targets",
+  "provider_usage_observation_receipts",
+  "codex_usage_authority_prune_targets",
+] as const;
+
+const schemaVersion37SessionSwitchTables = [
+  "session_switch_seed_anchors",
+  "session_switch_rebind_anchors",
+  "session_switch_target_start_anchors",
+  "session_switch_abandon_anchors",
+  "session_switch_source_release_anchors",
+  "session_switch_no_effect_anchors",
+  "session_switch_reconciliation_anchors",
+  "session_switch_reconciliation_receipts",
+  "session_switch_malformed_dispositions",
+  "session_switch_plan_anchors",
+  "session_switch_target_start_receipts",
+  "session_switch_source_release_receipts",
+  "session_switch_rebind_receipts",
+  "session_switch_seed_authorities",
+  "session_switch_seed_receipts",
+  "session_switch_no_effect_receipts",
+  "session_switch_abandon_receipts",
+  "session_switch_attempts",
+  "session_provider_authority_successors",
+] as const;
+
 const downgradeProviderAuthoritySchemaToVersion34 = (database: Database): void => {
   database.exec("PRAGMA foreign_keys=OFF");
   try {
+    const switchTriggers = database.query(
+      `SELECT name FROM sqlite_schema
+       WHERE type='trigger' AND name GLOB 'session_switch_*'
+       ORDER BY name`,
+    ).all() as Array<{ name: string }>;
+    for (const { name } of switchTriggers) {
+      if (!/^session_switch_[a-z_]+$/u.test(name)) {
+        throw new Error("Unexpected session-switch trigger name.");
+      }
+      database.exec(`DROP TRIGGER "${name}"`);
+    }
+    database.exec(`
+      DROP TRIGGER IF EXISTS mutation_transition_guard;
+      DROP TRIGGER IF EXISTS profiles_process_generation_provider_mirror;
+      DROP TRIGGER IF EXISTS session_events_account_authority_guard;
+      DROP TRIGGER IF EXISTS usage_snapshots_immutable_update;
+      DROP TRIGGER IF EXISTS usage_poll_failures_immutable_update;
+      DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_immutable_update;
+      DROP TRIGGER IF EXISTS usage_snapshots_prune_authority;
+      DROP TRIGGER IF EXISTS usage_poll_failures_prune_authority;
+      DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_prune_authority;
+    `);
+    for (const table of schemaVersion37SessionSwitchTables) {
+      database.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    for (const table of schemaVersion36ProviderUsageTables) {
+      database.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
     for (const table of schemaVersion35Tables) {
       database.exec(`DROP TABLE IF EXISTS ${table}`);
     }
-    database.exec("DELETE FROM migrations WHERE version=35; PRAGMA user_version=34");
+    database.exec(`
+      CREATE TRIGGER mutation_transition_guard BEFORE UPDATE OF state ON mutation_attempts
+      WHEN NOT (
+        (OLD.state='prepared' AND NEW.state IN ('effect_started','cancelled'))
+        OR (OLD.state='effect_started' AND NEW.state IN ('applied','failed','ambiguous'))
+        OR OLD.state=NEW.state
+      )
+      BEGIN SELECT RAISE(ABORT, 'illegal mutation transition'); END;
+      CREATE TRIGGER session_events_account_authority_guard
+      BEFORE INSERT ON session_events
+      WHEN NOT EXISTS(
+        SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
+        WHERE s.id=NEW.session_id
+          AND s.profile_id=NEW.account_id
+          AND p.process_generation=NEW.provider_generation
+      )
+      BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
+      DELETE FROM migrations WHERE version>=35;
+      PRAGMA user_version=34;
+    `);
+    const violations = database.query("PRAGMA foreign_key_check").all();
+    if (violations.length !== 0) {
+      throw new Error("Version 34 fixture retained a post-v34 foreign-key dependency.");
+    }
   } finally {
     database.exec("PRAGMA foreign_keys=ON");
   }
 };
-
-const schemaVersion36ProviderUsageTables = [
-  "codex_usage_authority_prune_targets",
-  "provider_usage_prune_targets",
-  "provider_usage_observation_components",
-  "provider_usage_observation_receipts",
-] as const;
 
 const downgradeProviderUsageSchemaToVersion35 = (database: Database): void => {
   database.exec("PRAGMA foreign_keys=OFF");
@@ -868,6 +1173,2096 @@ function moveQueueTo(store: StateStore, queueId: ReturnType<StateStore["enqueue"
 }
 
 describe("StateStore", () => {
+  test("journals a provider switch through accepted seed settlement and replays its immutable receipt", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 701);
+    expect(prepared.status).toBe("prepared");
+    expect(store.prepareSessionSwitch({
+      idempotencyKey: prepared.switch.idempotencyKey,
+      rawRequest: prepared.switch.rawRequest,
+      sessionId: prepared.switch.sessionId,
+      sourceAuthority: prepared.cas.sourceAuthority,
+      targetAuthority: prepared.cas.targetAuthority,
+      expectedSessionRevision: prepared.cas.originalSessionRevision,
+      expectedAuthorityRevision: prepared.cas.originalAuthorityRevision,
+      sourcePreset: prepared.switch.sourcePreset,
+      targetPreset: prepared.switch.targetPreset,
+      sourceRuntimeProfileRevision: prepared.switch.sourceRuntimeProfileRevision,
+      transcript: prepared.switch.transcript,
+    })).toMatchObject({ status: "replayed", switch: { attemptId: prepared.switch.attemptId } });
+
+    const dispatching = advanceDedicatedSessionSwitch(store, prepared, "seed_dispatching");
+    const seedAuthority = store.requireSessionProviderAuthority(prepared.session.id);
+    const receiptInput = {
+      domain: "hra:session-switch-seed-accepted:v1",
+      turnId: "seed-turn-701",
+      turnStatus: "completed",
+      runtimeProfile: prepared.targetRuntime,
+    } as const;
+    const direct = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const forgedReceipt = {
+        session: { ...store.requireSession(prepared.session.id), id: "session_wrong_receipt" },
+        from: {
+          provider: prepared.cas.sourceAuthority.provider,
+          preset: prepared.switch.sourcePreset,
+          account: prepared.cas.sourceAuthority.profileId,
+        },
+        to: {
+          provider: prepared.cas.targetAuthority.provider,
+          preset: prepared.switch.targetPreset,
+          account: prepared.cas.targetAuthority.profileId,
+        },
+        seed: {
+          delivered: true,
+          digest: prepared.switch.transcript.seedDigest,
+          includedRecords: prepared.switch.transcript.seedIncludedRecords,
+          omittedRecords: prepared.switch.transcript.seedOmittedRecords,
+        },
+        transcriptDigest: prepared.switch.transcript.transcriptDigest,
+        turnId: receiptInput.turnId,
+        idempotencyKey: prepared.switch.idempotencyKey,
+      };
+      expect(() => direct.query(
+        `INSERT INTO session_switch_seed_receipts(
+           attempt_id,outcome,failure_code,turn_id,turn_status,
+           runtime_profile_revision,receipt_digest,public_receipt_json,recorded_at
+         ) VALUES (?,'accepted',NULL,?,'completed',1,?,?,50000)`,
+      ).run(
+        prepared.switch.attemptId,
+        receiptInput.turnId,
+        sessionSwitchDigest(receiptInput),
+        JSON.stringify(forgedReceipt),
+      )).toThrow("session switch seed receipt mismatch");
+    } finally {
+      direct.close(false);
+    }
+    expect(() => store.completeSessionSwitchSeed({
+      ...prepared.cas,
+      seedAuthority: prepared.cas.targetAuthority,
+      seedAuthorityRevision: seedAuthority.authorityRevision,
+      settlement: {
+        outcome: "accepted",
+        turnId: receiptInput.turnId,
+        turnStatus: receiptInput.turnStatus,
+        runtimeProfile: receiptInput.runtimeProfile,
+        receiptDigest: "f".repeat(64),
+        seedText: prepared.seedText,
+      },
+    })).toThrow("SESSION_SWITCH_REQUEST_CONFLICT");
+    expect(store.requireSessionSwitch(dispatching.attemptId).phase).toBe("seed_dispatching");
+
+    const eventsBeforeSettlement = store.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events;
+    for (const body of [
+      { type: "warning", code: "LATE_CALLBACK", message: "Must remain fenced" },
+      {
+        type: "user_message",
+        turnId: publicProviderIdentifier(receiptInput.turnId),
+        actor: "human",
+        text: prepared.seedText,
+        omittedCharacters: 0,
+      },
+      {
+        type: "user_message",
+        turnId: publicProviderIdentifier("wrong-seed-turn"),
+        actor: "provider_switch",
+        text: prepared.seedText,
+        omittedCharacters: 0,
+      },
+      {
+        type: "user_message",
+        turnId: publicProviderIdentifier(receiptInput.turnId),
+        actor: "provider_switch",
+        text: "Forged seed contents",
+        omittedCharacters: 0,
+      },
+      {
+        type: "user_message",
+        turnId: publicProviderIdentifier(receiptInput.turnId),
+        actor: "provider_switch",
+        text: prepared.seedText,
+        omittedCharacters: 0,
+      },
+    ] as const) {
+      expect(() => store.appendSessionEvent({
+        sessionId: prepared.session.id,
+        accountId: prepared.cas.targetAuthority.profileId,
+        providerGeneration: prepared.cas.targetAuthority.processGeneration,
+        providerAuthority: prepared.cas.targetAuthority,
+        providerConnectionId: null,
+        body,
+      })).toThrow("session switch blocks callback event admission");
+    }
+    expect(store.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events).toEqual(eventsBeforeSettlement);
+
+    const settled = store.completeSessionSwitchSeed({
+      ...prepared.cas,
+      seedAuthority: prepared.cas.targetAuthority,
+      seedAuthorityRevision: seedAuthority.authorityRevision,
+      settlement: {
+        outcome: "accepted",
+        turnId: receiptInput.turnId,
+        turnStatus: receiptInput.turnStatus,
+        runtimeProfile: receiptInput.runtimeProfile,
+        receiptDigest: sessionSwitchDigest(receiptInput),
+        seedText: prepared.seedText,
+      },
+    });
+    expect(settled).toMatchObject({
+      phase: "seed_settled",
+      seed: {
+        outcome: "accepted",
+        turnId: "seed-turn-701",
+        publicReceipt: {
+          idempotencyKey: prepared.switch.idempotencyKey,
+          seed: { delivered: true },
+        },
+      },
+    });
+    const immutablePublicReceipt = JSON.stringify(settled.seed?.publicReceipt);
+    expect(() => store.transitionMutation(
+      prepared.switch.attemptId,
+      "applied",
+      "applied",
+      { forged: "replacement receipt" },
+    )).toThrow("SESSION_SWITCH_STORAGE_FENCED");
+    const replayed = store.readSessionSwitchByIdempotencyKey(
+      prepared.switch.idempotencyKey,
+    );
+    expect(JSON.stringify(replayed?.seed?.publicReceipt)).toBe(immutablePublicReceipt);
+    expect(store.requireSession(prepared.session.id)).toMatchObject({
+      profileId: prepared.targetProfile.id,
+      providerThreadId: prepared.targetThreadId,
+      preset: "low",
+      state: "idle",
+    });
+    const events = store.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events;
+    expect(events.filter((event) => event.body.type === "provider_switched")).toHaveLength(1);
+    expect(events.filter((event) =>
+      event.body.type === "user_message" && event.body.actor === "provider_switch"))
+      .toHaveLength(1);
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const journal = inspector.query(
+        `SELECT raw_request_json,runtime_profile_json,public_receipt_json
+         FROM session_switch_attempts switch
+         LEFT JOIN session_switch_target_start_receipts target USING(attempt_id)
+         LEFT JOIN session_switch_seed_receipts seed USING(attempt_id)
+         WHERE switch.attempt_id=?`,
+      ).get(prepared.switch.attemptId) as Record<string, string>;
+      expect(JSON.stringify(journal)).not.toContain(prepared.seedText);
+      expect(JSON.stringify(journal)).not.toContain("Provider switch seed");
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rejects raw near-miss seed events while accepted settlement custody is live", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 763);
+    advanceDedicatedSessionSwitch(store, prepared, "seed_dispatching");
+    const authority = store.requireCapturedSessionProviderAuthority(prepared.session.id);
+    const eventsBefore = store.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events;
+    const settle = () => store.completeSessionSwitchSeed({
+      ...prepared.cas,
+      seedAuthority: prepared.cas.targetAuthority,
+      seedAuthorityRevision: authority.authorityRevision,
+      settlement: {
+        outcome: "accepted",
+        turnId: "seed-turn-763",
+        turnStatus: "completed",
+        runtimeProfile: prepared.targetRuntime,
+        receiptDigest: sessionSwitchDigest({
+          domain: "hra:session-switch-seed-accepted:v1",
+          turnId: "seed-turn-763",
+          turnStatus: "completed",
+          runtimeProfile: prepared.targetRuntime,
+        }),
+        seedText: prepared.seedText,
+      },
+    });
+    const injectedText = "json_set(NEW.event_json,'$.body.text','Injected seed callback')";
+    const probes = [
+      {
+        eventJson: `json_remove(${injectedText},'$.body.actor')`,
+        sequence: "NEW.sequence",
+        accountId: "NEW.account_id",
+      },
+      {
+        eventJson: `json_set(${injectedText},'$.body.actor','human')`,
+        sequence: "NEW.sequence",
+        accountId: "NEW.account_id",
+      },
+      {
+        eventJson: `json_set(${injectedText},'$.sequence',NEW.sequence+1)`,
+        sequence: "NEW.sequence+1",
+        accountId: "NEW.account_id",
+      },
+      {
+        eventJson: `json_set(${injectedText},'$.accountId','${prepared.sourceProfile.id}')`,
+        sequence: "NEW.sequence",
+        accountId: `'${prepared.sourceProfile.id}'`,
+      },
+    ];
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      for (const probe of probes) {
+        database.exec(`
+          CREATE TRIGGER session_switch_test_seed_callback BEFORE INSERT ON session_events
+          WHEN NEW.session_id='${prepared.session.id}'
+            AND json_extract(NEW.event_json,'$.body.text')='Provider switch seed 763'
+          BEGIN
+            INSERT INTO session_events(
+              session_id,stream_epoch,sequence,recorded_at,account_id,
+              provider_generation,provider_connection_id,event_json,event_bytes,projection_version
+            ) VALUES (
+              NEW.session_id,NEW.stream_epoch,${probe.sequence},NEW.recorded_at,${probe.accountId},
+              NEW.provider_generation,NEW.provider_connection_id,${probe.eventJson},
+              length(CAST(${probe.eventJson} AS BLOB)),NEW.projection_version
+            );
+          END;
+        `);
+        try {
+          expect(settle).toThrow("session switch blocks callback event admission");
+        } finally {
+          database.exec("DROP TRIGGER session_switch_test_seed_callback");
+        }
+        expect(store.requireSessionSwitch(prepared.switch.attemptId).phase).toBe("seed_dispatching");
+        expect(store.listSessionEvents({
+          sessionId: prepared.session.id,
+          afterSequence: 0,
+        }).events).toEqual(eventsBefore);
+      }
+    } finally {
+      database.close(false);
+    }
+    expect(settle().phase).toBe("seed_settled");
+    const messages = store.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events.filter((event) => event.body.type === "user_message");
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.body).toMatchObject({ actor: "provider_switch", text: prepared.seedText });
+  });
+
+  test("accepts only canonical no-effect and rejected-seed receipts", async () => {
+    const { store } = await fixture();
+    const noEffect = prepareDedicatedSessionSwitch(store, 708);
+    store.beginSessionSwitchTargetStart(noEffect.cas);
+    expect(store.failSessionSwitchTargetStartNoEffect({
+      ...noEffect.cas,
+      expectedPhase: "target_starting",
+      diagnosticCode: "TARGET_START_REJECTED",
+    }).phase).toBe("failed");
+
+    const rejected = prepareDedicatedSessionSwitch(store, 709);
+    advanceDedicatedSessionSwitch(store, rejected, "seed_dispatching");
+    const seedAuthority = store.requireSessionProviderAuthority(rejected.session.id);
+    expect(() => store.completeSessionSwitchSeed({
+      ...rejected.cas,
+      seedAuthority: rejected.cas.targetAuthority,
+      seedAuthorityRevision: seedAuthority.authorityRevision,
+      settlement: {
+        outcome: "rejected",
+        failureCode: "SEED_REJECTED",
+        receiptDigest: createHash("sha256")
+          .update("hra:session-switch-seed-rejected:v1\0DIFFERENT_REJECTION")
+          .digest("hex"),
+      },
+    })).toThrow("SESSION_SWITCH_REQUEST_CONFLICT");
+    expect(store.requireSessionSwitch(rejected.switch.attemptId).phase).toBe("seed_dispatching");
+    const rejectedDigest = createHash("sha256")
+      .update("hra:session-switch-seed-rejected:v1\0SEED_REJECTED")
+      .digest("hex");
+    const settled = store.completeSessionSwitchSeed({
+      ...rejected.cas,
+      seedAuthority: rejected.cas.targetAuthority,
+      seedAuthorityRevision: seedAuthority.authorityRevision,
+      settlement: {
+        outcome: "rejected",
+        failureCode: "SEED_REJECTED",
+        receiptDigest: rejectedDigest,
+      },
+    });
+    expect(settled).toMatchObject({
+      phase: "seed_settled",
+      seed: { outcome: "rejected", failureCode: "SEED_REJECTED" },
+    });
+    expect(store.listSessionEvents({
+      sessionId: rejected.session.id,
+      afterSequence: 0,
+    }).events.filter((event) =>
+      event.body.type === "user_message" && event.body.actor === "provider_switch"))
+      .toEqual([]);
+
+    const stale = prepareDedicatedSessionSwitch(store, 712);
+    advanceDedicatedSessionSwitch(store, stale, "seed_dispatching");
+    const staleSeedAuthority = store.requireSessionProviderAuthority(stale.session.id);
+    store.advanceProviderAccountProcessGeneration({
+      profileId: stale.targetProfile.id,
+      provider: "codex",
+      expectedProcessGeneration: stale.cas.targetAuthority.processGeneration,
+    });
+    expect(() => store.completeSessionSwitchSeed({
+      ...stale.cas,
+      seedAuthority: stale.cas.targetAuthority,
+      seedAuthorityRevision: staleSeedAuthority.authorityRevision,
+      settlement: {
+        outcome: "rejected",
+        failureCode: "SEED_REJECTED",
+        receiptDigest: rejectedDigest,
+      },
+    })).toThrow("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+    expect(store.requireSessionSwitch(stale.switch.attemptId).phase).toBe("seed_dispatching");
+  });
+
+  test("admits only contiguous explicit same-binding seed successor lineage", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 715);
+    advanceDedicatedSessionSwitch(store, prepared, "rebound");
+    const previous = store.requireSessionProviderAuthority(prepared.session.id);
+    const successorAuthority = store.advanceProviderAccountProcessGeneration({
+      profileId: prepared.targetProfile.id,
+      provider: "codex",
+      expectedProcessGeneration: prepared.cas.targetAuthority.processGeneration,
+    });
+    expect(() => store.beginSessionSwitchSeedDispatch({
+      ...prepared.cas,
+      seedAuthority: successorAuthority,
+      seedAuthorityRevision: previous.authorityRevision + 1,
+      seedDigest: prepared.switch.transcript.seedDigest,
+      clientMessageId: prepared.switch.transcript.seedClientMessageId,
+    })).toThrow("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+
+    const successor = installSessionAuthoritySuccessorForTest(
+      store,
+      prepared,
+      successorAuthority,
+    );
+    const interactionId = "30000000-0000-4000-8000-000000000719";
+    store.admitInteraction({
+      publicId: interactionId,
+      sessionId: null,
+      authority: {
+        ...successorAuthority,
+        connectionId: "30000000-0000-4000-8000-000000000720",
+        requestId: { type: "string", value: "successor-interaction" },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "d".repeat(64),
+        threadId: prepared.targetThreadId,
+        turnId: "successor-turn",
+        itemId: "successor-item",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Interaction under proved successor authority",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+    });
+    const dispatching = store.beginSessionSwitchSeedDispatch({
+      ...prepared.cas,
+      seedAuthority: successorAuthority,
+      seedAuthorityRevision: successor.authorityRevision,
+      seedDigest: prepared.switch.transcript.seedDigest,
+      clientMessageId: prepared.switch.transcript.seedClientMessageId,
+    });
+    expect(dispatching.seedAuthority).toMatchObject({
+      authority: successorAuthority,
+      provenance: "successor_lineage",
+    });
+    expect(() => store.prepareInteractionResponse({
+      id: interactionId,
+      expectedRevision: 1,
+      responseDigest: "e".repeat(64),
+    })).toThrow("session switch blocks seed interaction transition");
+    store.markSessionSwitchReconciliationRequired({
+      ...prepared.cas,
+      expectedPhase: "seed_dispatching",
+      diagnosticCode: "SEED_DISPATCH_OUTCOME_UNKNOWN",
+    });
+    const quarantined = store.requireSession(prepared.session.id);
+    const abandoned = store.abandonReconciledSessionSwitch({
+      ...prepared.cas,
+      expectedSessionRevision: quarantined.revision,
+      expectedSessionAuthority: successorAuthority,
+      expectedSessionAuthorityRevision: successor.authorityRevision,
+    });
+    expect(abandoned.interactions).toEqual([
+      expect.objectContaining({ publicId: interactionId, state: "expired" }),
+    ]);
+
+    const wrongRouting = prepareDedicatedSessionSwitch(store, 716);
+    advanceDedicatedSessionSwitch(store, wrongRouting, "rebound");
+    const wrongRoutingAuthority = store.advanceProviderAccountProcessGeneration({
+      profileId: wrongRouting.targetProfile.id,
+      provider: "codex",
+      expectedProcessGeneration: wrongRouting.cas.targetAuthority.processGeneration,
+    });
+    const wrongRoutingCaptured = installSessionAuthoritySuccessorForTest(
+      store,
+      wrongRouting,
+      wrongRoutingAuthority,
+      "managed",
+    );
+    expect(() => store.beginSessionSwitchSeedDispatch({
+      ...wrongRouting.cas,
+      seedAuthority: wrongRoutingAuthority,
+      seedAuthorityRevision: wrongRoutingCaptured.authorityRevision,
+      seedDigest: wrongRouting.switch.transcript.seedDigest,
+      clientMessageId: wrongRouting.switch.transcript.seedClientMessageId,
+    })).toThrow("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+
+    const wrongBinding = prepareDedicatedSessionSwitch(store, 717);
+    advanceDedicatedSessionSwitch(store, wrongBinding, "rebound");
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const changed = database.query(
+        `UPDATE provider_accounts
+         SET binding_generation=binding_generation+1,provider_email=?,updated_at=MAX(updated_at,?)
+         WHERE id=? AND binding_generation=?`,
+      ).run(
+        "changed-binding@example.com",
+        9_100,
+        wrongBinding.cas.targetAuthority.providerAccountId,
+        wrongBinding.cas.targetAuthority.bindingGeneration,
+      );
+      expect(changed.changes).toBe(1);
+    } finally {
+      database.close(false);
+    }
+    const wrongBindingAuthority = store.requireProviderAccountAuthority(
+      wrongBinding.targetProfile.id,
+      "codex",
+    );
+    const wrongBindingCaptured = installSessionAuthoritySuccessorForTest(
+      store,
+      wrongBinding,
+      wrongBindingAuthority,
+    );
+    expect(() => store.beginSessionSwitchSeedDispatch({
+      ...wrongBinding.cas,
+      seedAuthority: wrongBindingAuthority,
+      seedAuthorityRevision: wrongBindingCaptured.authorityRevision,
+      seedDigest: wrongBinding.switch.transcript.seedDigest,
+      clientMessageId: wrongBinding.switch.transcript.seedClientMessageId,
+    })).toThrow("SESSION_SWITCH_SEED_AUTHORITY_UNPROVED");
+  });
+
+  test("keeps exact seed-successor interactions under dedicated restart custody", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 728);
+    advanceDedicatedSessionSwitch(store, prepared, "rebound");
+    const successorAuthority = store.advanceProviderAccountProcessGeneration({
+      profileId: prepared.targetProfile.id,
+      provider: "codex",
+      expectedProcessGeneration: prepared.cas.targetAuthority.processGeneration,
+    });
+    const successor = installSessionAuthoritySuccessorForTest(
+      store,
+      prepared,
+      successorAuthority,
+    );
+    const admit = (
+      publicId: string,
+      connectionId: string,
+      requestId: string,
+      threadId: string,
+      authority: ReturnType<StateStore["requireProviderAccountAuthority"]>,
+    ) => store.admitInteraction({
+      publicId,
+      sessionId: null,
+      authority: {
+        ...authority,
+        connectionId,
+        requestId: { type: "string", value: requestId },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: createHash("sha256").update(requestId).digest("hex"),
+        threadId,
+        turnId: `${requestId}-turn`,
+        itemId: `${requestId}-item`,
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: requestId,
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+    });
+    const dedicatedInteractionId = "30000000-0000-4000-8000-000000000728";
+    admit(
+      dedicatedInteractionId,
+      "30000000-0000-4000-8000-000000000729",
+      "dedicated-seed-successor",
+      prepared.targetThreadId,
+      successorAuthority,
+    );
+    store.beginSessionSwitchSeedDispatch({
+      ...prepared.cas,
+      seedAuthority: successorAuthority,
+      seedAuthorityRevision: successor.authorityRevision,
+      seedDigest: prepared.switch.transcript.seedDigest,
+      clientMessageId: prepared.switch.transcript.seedClientMessageId,
+    });
+
+    const unrelatedInteractionId = "30000000-0000-4000-8000-000000000730";
+    admit(
+      unrelatedInteractionId,
+      "30000000-0000-4000-8000-000000000731",
+      "unrelated-successor-thread",
+      "unrelated-thread-728",
+      successorAuthority,
+    );
+    const otherProfile = signInProfile(
+      store,
+      "Restart cross-authority",
+      "restart-cross-authority@example.com",
+    );
+    const otherAuthority = store.requireProviderAccountAuthority(otherProfile.id, "codex");
+    const crossAuthorityInteractionId = "30000000-0000-4000-8000-000000000732";
+    admit(
+      crossAuthorityInteractionId,
+      "30000000-0000-4000-8000-000000000733",
+      "same-thread-cross-authority",
+      prepared.targetThreadId,
+      otherAuthority,
+    );
+
+    expect(store.nextDaemonGeneration("seed-successor-restart")).toBe(1);
+    expect(store.requireSessionSwitch(prepared.switch.attemptId)).toMatchObject({
+      phase: "reconciliation_required",
+      diagnosticCode: "DAEMON_RESTART_AUTHORITY_RETIRED",
+    });
+    expect(store.requireInteraction(dedicatedInteractionId)).toMatchObject({
+      state: "pending",
+      revision: 1,
+    });
+    expect(store.requireInteraction(unrelatedInteractionId)).toMatchObject({
+      state: "expired",
+      revision: 2,
+    });
+    expect(store.requireInteraction(crossAuthorityInteractionId)).toMatchObject({
+      state: "expired",
+      revision: 2,
+    });
+  });
+
+  test("fails closed when immutable switch evidence is tampered on disk", async () => {
+    const first = await fixture();
+    const noEffect = prepareDedicatedSessionSwitch(first.store, 718);
+    first.store.beginSessionSwitchTargetStart(noEffect.cas);
+    const diagnosticCode = "TARGET_START_REJECTED";
+    first.store.failSessionSwitchTargetStartNoEffect({
+      ...noEffect.cas,
+      expectedPhase: "target_starting",
+      diagnosticCode,
+    });
+    const firstDatabase = new Database(first.store.paths.database, {
+      create: false,
+      strict: true,
+    });
+    try {
+      firstDatabase.exec("DROP TRIGGER session_switch_no_effect_receipts_immutable_update");
+      firstDatabase.query(
+        "UPDATE session_switch_no_effect_receipts SET evidence_digest=? WHERE attempt_id=?",
+      ).run("f".repeat(64), noEffect.switch.attemptId);
+    } finally {
+      firstDatabase.close(false);
+    }
+    expect(() => first.store.requireSessionSwitch(noEffect.switch.attemptId))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+
+    const second = await fixture();
+    const rejected = prepareDedicatedSessionSwitch(second.store, 719);
+    advanceDedicatedSessionSwitch(second.store, rejected, "seed_dispatching");
+    const seedAuthority = second.store.requireSessionProviderAuthority(rejected.session.id);
+    const failureCode = "SEED_REJECTED";
+    second.store.completeSessionSwitchSeed({
+      ...rejected.cas,
+      seedAuthority: rejected.cas.targetAuthority,
+      seedAuthorityRevision: seedAuthority.authorityRevision,
+      settlement: {
+        outcome: "rejected",
+        failureCode,
+        receiptDigest: createHash("sha256")
+          .update(`hra:session-switch-seed-rejected:v1\0${failureCode}`)
+          .digest("hex"),
+      },
+    });
+    const secondDatabase = new Database(second.store.paths.database, {
+      create: false,
+      strict: true,
+    });
+    try {
+      secondDatabase.exec("DROP TRIGGER session_switch_seed_receipts_immutable_update");
+      secondDatabase.query(
+        `UPDATE session_switch_seed_receipts
+         SET public_receipt_json=' '||public_receipt_json WHERE attempt_id=?`,
+      ).run(rejected.switch.attemptId);
+    } finally {
+      secondDatabase.close(false);
+    }
+    expect(() => second.store.requireSessionSwitch(rejected.switch.attemptId))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+  });
+
+  test("rejects altered source-release evidence before it can authorize rebind", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 752);
+    advanceDedicatedSessionSwitch(store, prepared, "source_released");
+    const before = store.requireSession(prepared.session.id);
+    const eventsBefore = store.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events;
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      database.exec("DROP TRIGGER session_switch_source_release_receipts_immutable_update");
+      database.query(
+        `UPDATE session_switch_source_release_receipts
+         SET status='already_released' WHERE attempt_id=?`,
+      ).run(prepared.switch.attemptId);
+    } finally {
+      database.close(false);
+    }
+    expect(() => store.requireSessionSwitch(prepared.switch.attemptId))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(() => store.rebindSessionSwitch(prepared.cas))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(store.requireSession(prepared.session.id)).toEqual(before);
+    expect(store.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events).toEqual(eventsBefore);
+  });
+
+  test("rejects a no-effect receipt with altered time despite a matching inline digest", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 753);
+    advanceDedicatedSessionSwitch(store, prepared, "target_starting");
+    store.failSessionSwitchTargetStartNoEffect({
+      ...prepared.cas,
+      expectedPhase: "target_starting",
+      diagnosticCode: "TARGET_START_REJECTED",
+    });
+    const before = store.requireSession(prepared.session.id);
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      database.exec("DROP TRIGGER session_switch_no_effect_receipts_immutable_update");
+      database.query(
+        `UPDATE session_switch_no_effect_receipts
+         SET recorded_at=recorded_at+1 WHERE attempt_id=?`,
+      ).run(prepared.switch.attemptId);
+    } finally {
+      database.close(false);
+    }
+    expect(() => store.requireSessionSwitch(prepared.switch.attemptId))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(() => store.readSessionSwitchByIdempotencyKey(prepared.switch.idempotencyKey))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(store.requireSession(prepared.session.id)).toEqual(before);
+  });
+
+  test("rejects altered reconciliation evidence before it can authorize abandonment", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 754);
+    advanceDedicatedSessionSwitch(store, prepared, "target_started");
+    store.markSessionSwitchReconciliationRequired({
+      ...prepared.cas,
+      expectedPhase: "target_started",
+      diagnosticCode: "TARGET_STATE_UNEXPECTED",
+    });
+    const before = store.requireSession(prepared.session.id);
+    const authority = store.requireCapturedSessionProviderAuthority(prepared.session.id);
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      database.exec("DROP TRIGGER session_switch_reconciliation_receipts_immutable_update");
+      database.query(
+        `UPDATE session_switch_reconciliation_receipts
+         SET recorded_at=recorded_at+1 WHERE attempt_id=?`,
+      ).run(prepared.switch.attemptId);
+    } finally {
+      database.close(false);
+    }
+    expect(() => store.requireSessionSwitch(prepared.switch.attemptId))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(() => store.abandonReconciledSessionSwitch({
+      ...prepared.cas,
+      expectedSessionRevision: before.revision,
+      expectedSessionAuthority: authority,
+      expectedSessionAuthorityRevision: authority.authorityRevision,
+    })).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(store.requireSession(prepared.session.id)).toEqual(before);
+  });
+
+  for (const [index, phase] of ["failed", "seed_settled", "abandoned", "cancelled"].entries()) {
+    test(`quarantines corrupt ${phase} switch evidence on reopen without unblocking callbacks`, async () => {
+      const { store } = await fixture();
+      const prepared = prepareDedicatedSessionSwitch(store, 755 + index);
+      if (phase === "failed") {
+        advanceDedicatedSessionSwitch(store, prepared, "target_starting");
+        store.failSessionSwitchTargetStartNoEffect({
+          ...prepared.cas,
+          expectedPhase: "target_starting",
+          diagnosticCode: "TARGET_START_REJECTED",
+        });
+      } else if (phase === "seed_settled") {
+        advanceDedicatedSessionSwitch(store, prepared, "seed_dispatching");
+        const authority = store.requireCapturedSessionProviderAuthority(prepared.session.id);
+        store.completeSessionSwitchSeed({
+          ...prepared.cas,
+          seedAuthority: prepared.cas.targetAuthority,
+          seedAuthorityRevision: authority.authorityRevision,
+          settlement: {
+            outcome: "accepted",
+            turnId: "terminal-seed-turn",
+            turnStatus: "completed",
+            runtimeProfile: prepared.targetRuntime,
+            receiptDigest: sessionSwitchDigest({
+              domain: "hra:session-switch-seed-accepted:v1",
+              turnId: "terminal-seed-turn",
+              turnStatus: "completed",
+              runtimeProfile: prepared.targetRuntime,
+            }),
+            seedText: prepared.seedText,
+          },
+        });
+      } else if (phase === "abandoned") {
+        advanceDedicatedSessionSwitch(store, prepared, "target_started");
+        store.markSessionSwitchReconciliationRequired({
+          ...prepared.cas,
+          expectedPhase: "target_started",
+          diagnosticCode: "TARGET_STATE_UNEXPECTED",
+        });
+        const session = store.requireSession(prepared.session.id);
+        const authority = store.requireCapturedSessionProviderAuthority(prepared.session.id);
+        store.abandonReconciledSessionSwitch({
+          ...prepared.cas,
+          expectedSessionRevision: session.revision,
+          expectedSessionAuthority: authority,
+          expectedSessionAuthorityRevision: authority.authorityRevision,
+        });
+      } else {
+        store.cancelPreparedSessionSwitch(prepared.cas);
+      }
+      const unrelated = prepareDedicatedSessionSwitch(store, 759 + index);
+      store.cancelPreparedSessionSwitch(unrelated.cas);
+      const unrelatedBefore = store.requireSession(unrelated.session.id);
+      const before = store.requireSession(prepared.session.id);
+      const currentAuthority = phase === "seed_settled"
+        ? prepared.cas.targetAuthority
+        : prepared.cas.sourceAuthority;
+      const eventsBefore = store.listSessionEvents({
+        sessionId: prepared.session.id,
+        afterSequence: 0,
+      }).events;
+      const paths = store.paths;
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+
+      const corrupt = new Database(paths.database, { create: false, strict: true });
+      try {
+        if (phase === "failed") {
+          corrupt.exec("DROP TRIGGER session_switch_no_effect_receipts_immutable_update");
+          corrupt.query(
+            "UPDATE session_switch_no_effect_receipts SET recorded_at=recorded_at+1 WHERE attempt_id=?",
+          ).run(prepared.switch.attemptId);
+        } else if (phase === "seed_settled") {
+          corrupt.exec("DROP TRIGGER session_switch_seed_receipts_immutable_update");
+          corrupt.query(
+            `UPDATE session_switch_seed_receipts
+             SET public_receipt_json=' '||public_receipt_json WHERE attempt_id=?`,
+          ).run(prepared.switch.attemptId);
+        } else if (phase === "abandoned") {
+          corrupt.exec("DROP TRIGGER session_switch_abandon_receipts_immutable_update");
+          corrupt.query(
+            `UPDATE session_switch_abandon_receipts
+             SET session_json=json_set(session_json,'$.title','forged') WHERE attempt_id=?`,
+          ).run(prepared.switch.attemptId);
+        } else {
+          corrupt.exec("DROP TRIGGER session_switch_plan_anchors_immutable_update");
+          corrupt.query(
+            "UPDATE session_switch_plan_anchors SET plan_digest=? WHERE attempt_id=?",
+          ).run("f".repeat(64), prepared.switch.attemptId);
+        }
+      } finally {
+        corrupt.close(false);
+      }
+
+      const reopened = new StateStore(paths, { now: () => 9_500 });
+      stores.push(reopened);
+      const quarantined = reopened.requireSession(prepared.session.id);
+      expect(quarantined.state).toBe(phase === "abandoned" ? "terminal" : "recovery_required");
+      if (phase === "abandoned") expect(quarantined).toEqual(before);
+      expect(() => reopened.readSessionSwitchByIdempotencyKey(prepared.switch.idempotencyKey))
+        .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+      expect(() => reopened.readSessionSwitchForRecovery(prepared.session.id))
+        .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+      expect(reopened.sessionSwitchAdmissionBlocked({
+        sessionId: prepared.session.id,
+        providerThreadId: before.providerThreadId ?? null,
+        providerAuthority: currentAuthority,
+      })).toEqual({ blocked: true, attemptId: null, role: "session" });
+      expect(() => reopened.appendSessionEvent({
+        sessionId: prepared.session.id,
+        accountId: currentAuthority.profileId,
+        providerGeneration: currentAuthority.processGeneration,
+        providerAuthority: currentAuthority,
+        providerConnectionId: null,
+        body: { type: "warning", code: "LATE_TERMINAL_CALLBACK", message: "Must remain fenced" },
+      })).toThrow("session switch blocks callback event admission");
+      expect(() => reopened.updateSessionMetadata({
+        sessionId: prepared.session.id,
+        expectedRevision: quarantined.revision,
+        note: "Must remain fenced",
+      })).toThrow("session switch blocks session mutation");
+      if (phase !== "abandoned") {
+        const queued = reopened.enqueue(prepared.session.id, "Must not dispatch after corrupt terminal evidence");
+        expect(() => reopened.transitionQueue(queued.id, "pending", "dispatching"))
+          .toThrow("session switch blocks queue dispatch");
+        expect(reopened.requireQueue(queued.id).state).toBe("pending");
+      }
+      expect(reopened.listSessionEvents({
+        sessionId: prepared.session.id,
+        afterSequence: 0,
+      }).events).toEqual(eventsBefore);
+      expect(reopened.requireSession(unrelated.session.id)).toEqual(unrelatedBefore);
+      expect(reopened.sessionSwitchAdmissionBlocked({
+        sessionId: unrelated.session.id,
+        providerThreadId: unrelated.session.providerThreadId ?? null,
+        providerAuthority: unrelated.cas.sourceAuthority,
+      })).toEqual({ blocked: false, attemptId: null, role: null });
+      const unrelatedEvent = reopened.appendSessionEvent({
+        sessionId: unrelated.session.id,
+        accountId: unrelated.cas.sourceAuthority.profileId,
+        providerGeneration: unrelated.cas.sourceAuthority.processGeneration,
+        providerAuthority: unrelated.cas.sourceAuthority,
+        providerConnectionId: null,
+        body: { type: "warning", code: "UNRELATED_CALLBACK", message: "Still admitted" },
+      });
+      expect(unrelatedEvent.body).toMatchObject({ code: "UNRELATED_CALLBACK" });
+      const inspector = new Database(paths.database, { create: false, strict: true });
+      try {
+        expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+        expect(inspector.query(
+          `SELECT switch.phase,mutation.state,malformed.terminal_phase
+           FROM session_switch_attempts switch
+           JOIN mutation_attempts mutation ON mutation.idempotency_key=switch.request_key
+           JOIN session_switch_malformed_dispositions malformed
+             ON malformed.journal_sequence=switch.journal_sequence
+           WHERE switch.attempt_id=?`,
+        ).get(prepared.switch.attemptId)).toEqual({
+          phase,
+          state: phase === "seed_settled" ? "applied" : phase === "abandoned" ? "ambiguous" : phase,
+          terminal_phase: "reconciliation_required",
+        });
+      } finally {
+        inspector.close(false);
+      }
+    });
+  }
+
+  for (const [index, changedField] of [
+    "source_process_generation",
+    "target_process_generation",
+  ].entries()) {
+    test(`keeps disposed switch callback authority when ${changedField} is corrupt`, async () => {
+      const { store } = await fixture();
+      const prepared = prepareDedicatedSessionSwitch(store, 767 + index);
+      advanceDedicatedSessionSwitch(store, prepared, "target_started");
+      const unrelated = prepareDedicatedSessionSwitch(store, 769 + index);
+      store.cancelPreparedSessionSwitch(unrelated.cas);
+      const unrelatedBefore = store.requireSession(unrelated.session.id);
+      const paths = store.paths;
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+      const corrupt = new Database(paths.database, { create: false, strict: true });
+      try {
+        corrupt.exec("DROP TRIGGER session_switch_attempts_immutable_update");
+        corrupt.query(
+          `UPDATE session_switch_attempts SET ${changedField}=${changedField}+1 WHERE attempt_id=?`,
+        ).run(prepared.switch.attemptId);
+        expect(corrupt.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      } finally {
+        corrupt.close(false);
+      }
+
+      const reopened = new StateStore(paths, { now: () => 9_550 });
+      stores.push(reopened);
+      expect(reopened.requireSession(prepared.session.id).state).toBe("recovery_required");
+      for (const [providerThreadId, providerAuthority] of [
+        [prepared.switch.sourceProviderThreadId, prepared.cas.sourceAuthority],
+        [prepared.targetThreadId, prepared.cas.targetAuthority],
+      ] as const) {
+        expect(reopened.sessionSwitchAdmissionBlocked({
+          sessionId: null,
+          providerThreadId,
+          providerAuthority,
+        })).toMatchObject({ blocked: true, attemptId: null });
+      }
+      expect(reopened.sessionSwitchAdmissionBlocked({
+        sessionId: unrelated.session.id,
+        providerThreadId: unrelated.switch.sourceProviderThreadId,
+        providerAuthority: unrelated.cas.sourceAuthority,
+      })).toEqual({ blocked: false, attemptId: null, role: null });
+      expect(reopened.requireSession(unrelated.session.id)).toEqual(unrelatedBefore);
+      expect(reopened.appendSessionEvent({
+        sessionId: unrelated.session.id,
+        accountId: unrelated.cas.sourceAuthority.profileId,
+        providerGeneration: unrelated.cas.sourceAuthority.processGeneration,
+        providerAuthority: unrelated.cas.sourceAuthority,
+        providerConnectionId: null,
+        body: { type: "warning", code: "UNRELATED_CALLBACK", message: "Still admitted" },
+      }).body).toMatchObject({ code: "UNRELATED_CALLBACK" });
+    });
+  }
+
+  test("keeps disposed switch session custody when its journal session identity is corrupt", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 771);
+    advanceDedicatedSessionSwitch(store, prepared, "target_started");
+    const unrelated = prepareDedicatedSessionSwitch(store, 772);
+    store.cancelPreparedSessionSwitch(unrelated.cas);
+    const unrelatedBefore = store.requireSession(unrelated.session.id);
+    const sourceEvents = store.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events;
+    const queued = store.enqueue(prepared.session.id, "Must retain original session custody");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const corrupt = new Database(paths.database, { create: false, strict: true });
+    try {
+      corrupt.exec("DROP TRIGGER session_switch_attempts_immutable_update");
+      corrupt.query(
+        "UPDATE session_switch_attempts SET session_id=? WHERE attempt_id=?",
+      ).run(unrelated.session.id, prepared.switch.attemptId);
+      expect(corrupt.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      corrupt.close(false);
+    }
+
+    const reopened = new StateStore(paths, { now: () => 9_560 });
+    stores.push(reopened);
+    expect(reopened.requireSession(prepared.session.id).state).toBe("recovery_required");
+    expect(reopened.requireSession(unrelated.session.id)).toEqual(unrelatedBefore);
+    expect(reopened.sessionSwitchAdmissionBlocked({
+      sessionId: prepared.session.id,
+      providerThreadId: prepared.switch.sourceProviderThreadId,
+      providerAuthority: prepared.cas.sourceAuthority,
+    })).toMatchObject({ blocked: true, attemptId: null });
+    expect(reopened.sessionSwitchAdmissionBlocked({
+      sessionId: null,
+      providerThreadId: prepared.targetThreadId,
+      providerAuthority: prepared.cas.targetAuthority,
+    })).toMatchObject({ blocked: true, attemptId: null });
+    expect(reopened.sessionSwitchAdmissionBlocked({
+      sessionId: unrelated.session.id,
+      providerThreadId: unrelated.switch.sourceProviderThreadId,
+      providerAuthority: unrelated.cas.sourceAuthority,
+    })).toEqual({ blocked: false, attemptId: null, role: null });
+    expect(() => reopened.transitionQueue(queued.id, "pending", "dispatching"))
+      .toThrow("session switch blocks queue dispatch");
+    expect(reopened.requireQueue(queued.id).state).toBe("pending");
+    expect(() => reopened.appendSessionEvent({
+      sessionId: prepared.session.id,
+      accountId: prepared.cas.sourceAuthority.profileId,
+      providerGeneration: prepared.cas.sourceAuthority.processGeneration,
+      providerAuthority: prepared.cas.sourceAuthority,
+      providerConnectionId: null,
+      body: { type: "warning", code: "SOURCE_CALLBACK", message: "Must stay fenced" },
+    })).toThrow();
+    expect(reopened.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events).toEqual(sourceEvents);
+    expect(reopened.appendSessionEvent({
+      sessionId: unrelated.session.id,
+      accountId: unrelated.cas.sourceAuthority.profileId,
+      providerGeneration: unrelated.cas.sourceAuthority.processGeneration,
+      providerAuthority: unrelated.cas.sourceAuthority,
+      providerConnectionId: null,
+      body: { type: "warning", code: "UNRELATED_CALLBACK", message: "Still admitted" },
+    }).body).toMatchObject({ code: "UNRELATED_CALLBACK" });
+  });
+
+  test("allows later switch recovery after a malformed prepared switch was safely cancelled", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 773);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const corrupt = new Database(paths.database, { create: false, strict: true });
+    try {
+      corrupt.exec("DROP TRIGGER session_switch_plan_anchors_immutable_update");
+      corrupt.query(
+        "UPDATE session_switch_plan_anchors SET plan_digest=? WHERE attempt_id=?",
+      ).run("f".repeat(64), prepared.switch.attemptId);
+    } finally {
+      corrupt.close(false);
+    }
+
+    const reopened = new StateStore(paths, { now: () => 9_570 });
+    stores.push(reopened);
+    expect(reopened.requireSession(prepared.session.id)).toEqual(prepared.session);
+    expect(() => reopened.readSessionSwitchByIdempotencyKey(prepared.switch.idempotencyKey))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(reopened.readSessionSwitchForRecovery(prepared.session.id)).toBeNull();
+    const next = reopened.prepareSessionSwitch({
+      idempotencyKey: "20000000-0000-4000-8000-000000000774",
+      rawRequest: prepared.switch.rawRequest,
+      sessionId: prepared.session.id,
+      sourceAuthority: prepared.cas.sourceAuthority,
+      targetAuthority: prepared.cas.targetAuthority,
+      expectedSessionRevision: prepared.cas.originalSessionRevision,
+      expectedAuthorityRevision: prepared.cas.originalAuthorityRevision,
+      sourcePreset: prepared.switch.sourcePreset,
+      targetPreset: prepared.switch.targetPreset,
+      sourceRuntimeProfileRevision: prepared.switch.sourceRuntimeProfileRevision,
+      transcript: {
+        ...prepared.switch.transcript,
+        seedClientMessageId: "switch-seed-after-safe-cancellation",
+      },
+    });
+    const nextCas = {
+      ...prepared.cas,
+      attemptId: next.switch.attemptId,
+      requestDigest: next.switch.requestDigest,
+    };
+    reopened.beginSessionSwitchTargetStart(nextCas);
+    reopened.markSessionSwitchReconciliationRequired({
+      ...nextCas,
+      expectedPhase: "target_starting",
+      diagnosticCode: "TARGET_START_OUTCOME_UNKNOWN",
+    });
+    expect(reopened.readSessionSwitchForRecovery(prepared.session.id)).toMatchObject({
+      attemptId: next.switch.attemptId,
+      phase: "reconciliation_required",
+    });
+    const session = reopened.requireSession(prepared.session.id);
+    const authority = reopened.requireCapturedSessionProviderAuthority(prepared.session.id);
+    const abandoned = reopened.abandonReconciledSessionSwitch({
+      ...nextCas,
+      expectedSessionRevision: session.revision,
+      expectedSessionAuthority: authority,
+      expectedSessionAuthorityRevision: authority.authorityRevision,
+    });
+    expect(abandoned.session.state).toBe("terminal");
+    expect(abandoned.switch.phase).toBe("abandoned");
+    expect(reopened.readSessionSwitchForRecovery(prepared.session.id)).toBeNull();
+    expect(() => reopened.readSessionSwitchByIdempotencyKey(prepared.switch.idempotencyKey))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+  });
+
+  test("preserves multiple malformed terminal phases in one session without a unique-open conflict", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 764);
+    store.cancelPreparedSessionSwitch(prepared.cas);
+    const repeat = (idempotencyKey: string) => {
+      const repeated = store.prepareSessionSwitch({
+        idempotencyKey,
+        rawRequest: prepared.switch.rawRequest,
+        sessionId: prepared.switch.sessionId,
+        sourceAuthority: prepared.cas.sourceAuthority,
+        targetAuthority: prepared.cas.targetAuthority,
+        expectedSessionRevision: prepared.cas.originalSessionRevision,
+        expectedAuthorityRevision: prepared.cas.originalAuthorityRevision,
+        sourcePreset: prepared.switch.sourcePreset,
+        targetPreset: prepared.switch.targetPreset,
+        sourceRuntimeProfileRevision: prepared.switch.sourceRuntimeProfileRevision,
+        transcript: prepared.switch.transcript,
+      });
+      store.cancelPreparedSessionSwitch({
+        ...prepared.cas,
+        attemptId: repeated.switch.attemptId,
+        requestDigest: repeated.switch.requestDigest,
+      });
+      return repeated.switch;
+    };
+    const second = repeat("20000000-0000-4000-8000-000000000765");
+    const validLatest = repeat("20000000-0000-4000-8000-000000000766");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const corrupt = new Database(paths.database, { create: false, strict: true });
+    try {
+      corrupt.exec(`
+        DROP TRIGGER session_switch_attempts_immutable_update;
+        DROP TRIGGER session_switch_plan_anchors_immutable_update;
+      `);
+      corrupt.query(
+        "UPDATE session_switch_attempts SET request_digest=? WHERE attempt_id=?",
+      ).run("e".repeat(64), prepared.switch.attemptId);
+      corrupt.query(
+        "UPDATE session_switch_plan_anchors SET plan_digest=? WHERE attempt_id=?",
+      ).run("f".repeat(64), second.attemptId);
+    } finally {
+      corrupt.close(false);
+    }
+    const reopened = new StateStore(paths, { now: () => 9_600 });
+    stores.push(reopened);
+    for (const key of [prepared.switch.idempotencyKey, second.idempotencyKey]) {
+      expect(() => reopened.readSessionSwitchByIdempotencyKey(key))
+        .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    }
+    expect(reopened.requireSessionSwitch(validLatest.attemptId).phase).toBe("cancelled");
+    expect(reopened.requireSession(prepared.session.id).state).toBe("recovery_required");
+    expect(reopened.sessionSwitchAdmissionBlocked({
+      sessionId: prepared.session.id,
+      providerThreadId: prepared.session.providerThreadId ?? null,
+      providerAuthority: prepared.cas.sourceAuthority,
+    })).toEqual({ blocked: true, attemptId: null, role: "session" });
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expect(inspector.query(
+        `SELECT phase FROM session_switch_attempts WHERE session_id=? ORDER BY journal_sequence`,
+      ).all(prepared.session.id)).toEqual([
+        { phase: "cancelled" }, { phase: "cancelled" }, { phase: "cancelled" },
+      ]);
+      expect(inspector.query(
+        `SELECT COUNT(*) AS count FROM session_switch_malformed_dispositions
+         WHERE session_id=? AND terminal_phase='reconciliation_required'`,
+      ).get(prepared.session.id)).toEqual({ count: 2 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("requires the cumulative receipt chain and independent action anchors on every read", async () => {
+    const { store } = await fixture();
+    const sourceProfile = signInProfile(store, "Evidence source", "evidence-source@example.com");
+    const targetProfile = signInProfile(store, "Evidence target", "evidence-target@example.com");
+    const options = { sourceProfile, targetProfile } as const;
+    const target = prepareDedicatedSessionSwitch(store, 740, options);
+    advanceDedicatedSessionSwitch(store, target, "target_started");
+    const release = prepareDedicatedSessionSwitch(store, 741, options);
+    advanceDedicatedSessionSwitch(store, release, "source_released");
+    const rebind = prepareDedicatedSessionSwitch(store, 742, options);
+    advanceDedicatedSessionSwitch(store, rebind, "rebound");
+    const seedAuthority = prepareDedicatedSessionSwitch(store, 743, options);
+    advanceDedicatedSessionSwitch(store, seedAuthority, "seed_dispatching");
+    const seed = prepareDedicatedSessionSwitch(store, 744, options);
+    advanceDedicatedSessionSwitch(store, seed, "seed_dispatching");
+    const capturedSeed = store.requireSessionProviderAuthority(seed.session.id);
+    store.completeSessionSwitchSeed({
+      ...seed.cas,
+      seedAuthority: seed.cas.targetAuthority,
+      seedAuthorityRevision: capturedSeed.authorityRevision,
+      settlement: {
+        outcome: "rejected",
+        failureCode: "SEED_REJECTED",
+        receiptDigest: createHash("sha256")
+          .update("hra:session-switch-seed-rejected:v1\0SEED_REJECTED")
+          .digest("hex"),
+      },
+    });
+    const reconciliation = prepareDedicatedSessionSwitch(store, 745, options);
+    advanceDedicatedSessionSwitch(store, reconciliation, "target_started");
+    store.markSessionSwitchReconciliationRequired({
+      ...reconciliation.cas,
+      expectedPhase: "target_started",
+      diagnosticCode: "TARGET_STATE_UNEXPECTED",
+    });
+    const noEffect = prepareDedicatedSessionSwitch(store, 746, options);
+    store.beginSessionSwitchTargetStart(noEffect.cas);
+    store.failSessionSwitchTargetStartNoEffect({
+      ...noEffect.cas,
+      expectedPhase: "target_starting",
+      diagnosticCode: "TARGET_START_REJECTED",
+    });
+    const abandoned = prepareDedicatedSessionSwitch(store, 747, options);
+    advanceDedicatedSessionSwitch(store, abandoned, "target_started");
+    store.markSessionSwitchReconciliationRequired({
+      ...abandoned.cas,
+      expectedPhase: "target_started",
+      diagnosticCode: "TARGET_STATE_UNEXPECTED",
+    });
+    const abandonSession = store.requireSession(abandoned.session.id);
+    const abandonAuthority = store.requireSessionProviderAuthority(abandoned.session.id);
+    store.abandonReconciledSessionSwitch({
+      ...abandoned.cas,
+      expectedSessionRevision: abandonSession.revision,
+      expectedSessionAuthority: abandonAuthority,
+      expectedSessionAuthorityRevision: abandonAuthority.authorityRevision,
+    });
+    const plan = prepareDedicatedSessionSwitch(store, 748, options);
+    const targetResult = prepareDedicatedSessionSwitch(store, 749, options);
+    advanceDedicatedSessionSwitch(store, targetResult, "target_started");
+    const sourceResult = prepareDedicatedSessionSwitch(store, 750, options);
+    advanceDedicatedSessionSwitch(store, sourceResult, "source_released");
+    const sourceRuntime = prepareDedicatedSessionSwitch(store, 751, options);
+
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      database.exec(`
+        PRAGMA foreign_keys=OFF;
+        DROP TRIGGER session_switch_target_start_receipts_immutable_delete;
+        DROP TRIGGER session_switch_source_release_receipts_immutable_delete;
+        DROP TRIGGER session_switch_rebind_receipts_immutable_delete;
+        DROP TRIGGER session_switch_seed_authorities_immutable_delete;
+        DROP TRIGGER session_switch_seed_receipts_immutable_delete;
+        DROP TRIGGER session_switch_reconciliation_receipts_immutable_delete;
+        DROP TRIGGER session_switch_no_effect_receipts_immutable_delete;
+        DROP TRIGGER session_switch_abandon_receipts_immutable_update;
+        DROP TRIGGER session_switch_attempts_immutable_update;
+        DROP TRIGGER session_switch_target_start_receipts_immutable_update;
+        DROP TRIGGER session_switch_source_release_receipts_immutable_update;
+        DROP TRIGGER session_runtime_profiles_immutable_update;
+      `);
+      database.query("DELETE FROM session_switch_target_start_receipts WHERE attempt_id=?")
+        .run(target.switch.attemptId);
+      database.query("DELETE FROM session_switch_source_release_receipts WHERE attempt_id=?")
+        .run(release.switch.attemptId);
+      database.query("DELETE FROM session_switch_rebind_receipts WHERE attempt_id=?")
+        .run(rebind.switch.attemptId);
+      database.query("DELETE FROM session_switch_seed_authorities WHERE attempt_id=?")
+        .run(seedAuthority.switch.attemptId);
+      database.query("DELETE FROM session_switch_seed_receipts WHERE attempt_id=?")
+        .run(seed.switch.attemptId);
+      database.query("DELETE FROM session_switch_reconciliation_receipts WHERE attempt_id=?")
+        .run(reconciliation.switch.attemptId);
+      database.query("DELETE FROM session_switch_no_effect_receipts WHERE attempt_id=?")
+        .run(noEffect.switch.attemptId);
+      database.query(
+        `UPDATE session_switch_abandon_receipts
+         SET session_json=json_set(session_json,'$.title','forged') WHERE attempt_id=?`,
+      ).run(abandoned.switch.attemptId);
+      database.query(
+        "UPDATE session_switch_attempts SET target_preset='high' WHERE attempt_id=?",
+      ).run(plan.switch.attemptId);
+      database.query(
+        `UPDATE session_switch_target_start_receipts
+         SET state='active',active_turn_id='forged-turn' WHERE attempt_id=?`,
+      ).run(targetResult.switch.attemptId);
+      database.query(
+        `UPDATE session_switch_source_release_receipts
+         SET provider_thread_id='forged-source-thread' WHERE attempt_id=?`,
+      ).run(sourceResult.switch.attemptId);
+      database.query(
+        `UPDATE session_runtime_profiles SET source_id='forged-source-runtime'
+         WHERE session_id=? AND revision=?`,
+      ).run(sourceRuntime.session.id, sourceRuntime.switch.sourceRuntimeProfileRevision);
+      database.exec("PRAGMA foreign_keys=ON");
+    } finally {
+      database.close(false);
+    }
+
+    for (const value of [
+      target,
+      release,
+      rebind,
+      seedAuthority,
+      seed,
+      reconciliation,
+      noEffect,
+      abandoned,
+      plan,
+      targetResult,
+      sourceResult,
+      sourceRuntime,
+    ]) {
+      expect(() => store.requireSessionSwitch(value.switch.attemptId)).toThrow();
+    }
+  });
+
+  test("pins the exact transcript range without retaining plaintext in the switch journal", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 711, { pinSourceEvent: true });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const aged = new StateStore(paths, { now: () => SESSION_EVENT_RETAIN_AGE_MS + 50_000 });
+    stores.push(aged);
+    expect(aged.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events).toMatchObject([{ sequence: prepared.switch.transcript.throughSequenceInclusive }]);
+    aged.cancelPreparedSessionSwitch(prepared.cas);
+    expect(aged.listSessionEvents({
+      sessionId: prepared.session.id,
+      afterSequence: 0,
+    }).events).toEqual([]);
+  });
+
+  test("refuses source release unless target ownership and both interaction authorities are quiescent", async () => {
+    const { store } = await fixture();
+
+    const active = prepareDedicatedSessionSwitch(store, 702);
+    store.beginSessionSwitchTargetStart(active.cas);
+    store.completeSessionSwitchTargetStart({
+      ...active.cas,
+      providerThreadId: active.targetThreadId,
+      state: "active",
+      activeTurnId: "target-active-turn",
+      runtimeProfile: active.targetRuntime,
+    });
+    expect(() => store.beginSessionSwitchSourceRelease(active.cas))
+      .toThrow("SESSION_SWITCH_REQUEST_CONFLICT");
+
+    const staleTarget = prepareDedicatedSessionSwitch(store, 710);
+    advanceDedicatedSessionSwitch(store, staleTarget, "target_started");
+    store.advanceProviderAccountProcessGeneration({
+      profileId: staleTarget.targetProfile.id,
+      provider: "codex",
+      expectedProcessGeneration: staleTarget.cas.targetAuthority.processGeneration,
+    });
+    expect(() => store.beginSessionSwitchSourceRelease(staleTarget.cas))
+      .toThrow("SESSION_SWITCH_TARGET_AUTHORITY_STALE");
+    expect(store.requireSessionSwitch(staleTarget.switch.attemptId).phase).toBe("target_started");
+
+    const sameProfile = signInProfile(store, "Same profile switch", "same-profile-switch@example.com");
+    const selfCollision = prepareDedicatedSessionSwitch(store, 703, {
+      sourceProfile: sameProfile,
+      targetProfile: sameProfile,
+      targetPreset: "low",
+      targetThreadId: "source-thread-703",
+    });
+    advanceDedicatedSessionSwitch(store, selfCollision, "target_started");
+    expect(() => store.beginSessionSwitchSourceRelease(selfCollision.cas))
+      .toThrow("SESSION_SWITCH_REQUEST_CONFLICT");
+
+    const terminalCollision = prepareDedicatedSessionSwitch(store, 704);
+    const ownerCreated = store.createSession({
+      profileId: terminalCollision.targetProfile.id,
+      provider: "claude",
+      preset: "fable-max",
+      fastEnabled: false,
+    });
+    const ownerBound = store.bindSession({
+      sessionId: ownerCreated.id,
+      expectedRevision: ownerCreated.revision,
+      providerThreadId: terminalCollision.targetThreadId,
+      state: "idle",
+    });
+    store.setSessionTurnState({
+      sessionId: ownerBound.id,
+      expectedRevision: ownerBound.revision,
+      state: "terminal",
+    });
+    advanceDedicatedSessionSwitch(store, terminalCollision, "target_started");
+    expect(() => store.beginSessionSwitchSourceRelease(terminalCollision.cas))
+      .toThrow("SESSION_SWITCH_REQUEST_CONFLICT");
+
+    const staleOwnerProfile = signInProfile(
+      store,
+      "Stale terminal owner",
+      "stale-terminal-owner@example.com",
+    );
+    const staleOwnerCreated = store.createSession({
+      profileId: staleOwnerProfile.id,
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const staleOwnerBound = store.bindSession({
+      sessionId: staleOwnerCreated.id,
+      expectedRevision: staleOwnerCreated.revision,
+      providerThreadId: "stale-owned-target-thread",
+      state: "idle",
+    });
+    store.setSessionTurnState({
+      sessionId: staleOwnerBound.id,
+      expectedRevision: staleOwnerBound.revision,
+      state: "terminal",
+    });
+    store.advanceProviderAccountProcessGeneration({
+      profileId: staleOwnerProfile.id,
+      provider: "codex",
+      expectedProcessGeneration: store.requireProviderAccountAuthority(
+        staleOwnerProfile.id,
+        "codex",
+      ).processGeneration,
+    });
+    const staleOwnerCollision = prepareDedicatedSessionSwitch(store, 713, {
+      targetProfile: staleOwnerProfile,
+      targetThreadId: "stale-owned-target-thread",
+    });
+    advanceDedicatedSessionSwitch(store, staleOwnerCollision, "target_started");
+    expect(() => store.beginSessionSwitchSourceRelease(staleOwnerCollision.cas))
+      .toThrow("SESSION_SWITCH_REQUEST_CONFLICT");
+
+    const interactionRace = prepareDedicatedSessionSwitch(store, 705);
+    store.beginSessionSwitchTargetStart(interactionRace.cas);
+    store.admitInteraction({
+      publicId: "30000000-0000-4000-8000-000000000705",
+      sessionId: null,
+      authority: {
+        ...interactionRace.cas.targetAuthority,
+        connectionId: "30000000-0000-4000-8000-000000000706",
+        requestId: { type: "string", value: "target-interaction-705" },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "a".repeat(64),
+        threadId: interactionRace.targetThreadId,
+        turnId: "target-turn-705",
+        itemId: "target-item-705",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      requestedAt: 1_000,
+      deadlineAt: 1_001,
+      display: {
+        kind: "command_approval",
+        summary: "Target interaction before receipt",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+    });
+    store.completeSessionSwitchTargetStart({
+      ...interactionRace.cas,
+      providerThreadId: interactionRace.targetThreadId,
+      state: "idle",
+      runtimeProfile: interactionRace.targetRuntime,
+    });
+    expect(() => store.beginSessionSwitchSourceRelease(interactionRace.cas))
+      .toThrow("SESSION_SWITCH_INTERACTION_UNSETTLED");
+
+    const importRace = prepareDedicatedSessionSwitch(store, 714);
+    advanceDedicatedSessionSwitch(store, importRace, "target_started");
+    expect(() => store.upsertProviderSession({
+      providerAuthority: importRace.cas.targetAuthority,
+      providerThreadId: importRace.targetThreadId,
+      title: "Imported while target is reserved",
+      state: "idle",
+      providerUpdatedAt: 30,
+    })).toThrow("SESSION_SWITCH_STORAGE_FENCED");
+    expect(store.findSessionByProviderThread(
+      importRace.cas.targetAuthority.profileId,
+      importRace.targetThreadId,
+    )).toBeNull();
+    const importDatabase = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(() => importDatabase.query(
+        `INSERT INTO sessions(
+           id,profile_id,project_id,provider_thread_id,title,note,provider,preset,
+           fast_enabled,state,active_turn_id,provider_updated_at,archived_at,
+           revision,created_at,updated_at
+         ) VALUES (?, ?, NULL, ?, 'Reserved import', '', 'codex', 'low',
+                   0, 'idle', NULL, 30, NULL, 1, 50000, 50000)`,
+      ).run(
+        `sess_${"f".repeat(32)}`,
+        importRace.cas.targetAuthority.profileId,
+        importRace.targetThreadId,
+      )).toThrow("session switch reserves provider session identity");
+    } finally {
+      importDatabase.close(false);
+    }
+  });
+
+  test("keeps reconciliation fenced until an exact receipt-backed abandonment", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 706);
+    store.beginSessionSwitchTargetStart(prepared.cas);
+    const targetInteractionId = "30000000-0000-4000-8000-000000000716";
+    store.admitInteraction({
+      publicId: targetInteractionId,
+      sessionId: null,
+      authority: {
+        ...prepared.cas.targetAuthority,
+        connectionId: "30000000-0000-4000-8000-000000000717",
+        requestId: { type: "string", value: "abandon-target-interaction" },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "b".repeat(64),
+        threadId: prepared.targetThreadId,
+        turnId: "abandon-target-turn",
+        itemId: "abandon-target-item",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      requestedAt: 1_000,
+      deadlineAt: 1_001,
+      display: {
+        kind: "command_approval",
+        summary: "Target interaction owned by abandoned switch",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+    });
+    store.completeSessionSwitchTargetStart({
+      ...prepared.cas,
+      providerThreadId: prepared.targetThreadId,
+      state: "idle",
+      runtimeProfile: prepared.targetRuntime,
+    });
+    const reconciled = store.markSessionSwitchReconciliationRequired({
+      ...prepared.cas,
+      expectedPhase: "target_started",
+      diagnosticCode: "TARGET_STATE_UNEXPECTED",
+    });
+    expect(reconciled.phase).toBe("reconciliation_required");
+    const unrelatedInteractionId = "30000000-0000-4000-8000-000000000718";
+    store.admitInteraction({
+      publicId: unrelatedInteractionId,
+      sessionId: null,
+      authority: {
+        ...prepared.cas.targetAuthority,
+        connectionId: "30000000-0000-4000-8000-000000000717",
+        requestId: { type: "string", value: "unrelated-generation-interaction" },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "c".repeat(64),
+        threadId: "unrelated-target-thread",
+        turnId: "unrelated-target-turn",
+        itemId: "unrelated-target-item",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      requestedAt: 1_000,
+      deadlineAt: 1_002,
+      display: {
+        kind: "command_approval",
+        summary: "Unrelated generation interaction",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+    });
+    expect(store.listDueInteractions({ now: 2_000 }).map((value) => value.publicId))
+      .toEqual([unrelatedInteractionId]);
+    expect(store.nextInteractionDeadlineAt()).toBe(1_002);
+    expect(store.expireGenerationInteractions({
+      profileId: prepared.cas.targetAuthority.profileId,
+      processGeneration: prepared.cas.targetAuthority.processGeneration,
+      connectionId: "30000000-0000-4000-8000-000000000717",
+      providerAuthority: prepared.cas.targetAuthority,
+      excludeSessionSwitchBlocked: true,
+    })).toEqual([
+      expect.objectContaining({ publicId: unrelatedInteractionId, state: "expired" }),
+    ]);
+    expect(store.requireInteraction(targetInteractionId).state).toBe("pending");
+    expect(store.nextInteractionDeadlineAt()).toBeNull();
+    const quarantined = store.requireSession(prepared.session.id);
+    expect(quarantined).toMatchObject({ state: "recovery_required" });
+    expect(store.sessionSwitchAdmissionBlocked({
+      sessionId: prepared.session.id,
+      providerThreadId: prepared.session.providerThreadId ?? null,
+      providerAuthority: prepared.cas.sourceAuthority,
+    })).toMatchObject({ blocked: true, attemptId: prepared.switch.attemptId });
+    expect(() => store.updateSessionMetadata({
+      sessionId: prepared.session.id,
+      expectedRevision: quarantined.revision,
+      note: "must remain inert",
+    })).toThrow("session switch blocks session mutation");
+    const pendingQueue = store.enqueue(prepared.session.id, "May remain pending while fenced");
+    expect(() => store.transitionQueue(pendingQueue.id, "pending", "dispatching"))
+      .toThrow("session switch blocks queue dispatch");
+    expect(() => store.appendSessionEvent({
+      sessionId: prepared.session.id,
+      accountId: prepared.cas.sourceAuthority.profileId,
+      providerGeneration: prepared.cas.sourceAuthority.processGeneration,
+      providerAuthority: prepared.cas.sourceAuthority,
+      providerConnectionId: null,
+      body: { type: "warning", code: "LATE_FACT", message: "must stay inert" },
+    })).toThrow("session switch blocks callback event admission");
+    expect(() => store.terminalizeSessionFromProviderDeletion({
+      accountId: prepared.cas.sourceAuthority.profileId,
+      providerConnectionId: null,
+      providerGeneration: prepared.cas.sourceAuthority.processGeneration,
+      providerAuthority: prepared.cas.sourceAuthority,
+      sessionId: prepared.session.id,
+    })).toThrow("SESSION_SWITCH_STORAGE_FENCED");
+    expect(store.requireSession(prepared.session.id)).toEqual(quarantined);
+
+    const captured = store.requireCapturedSessionProviderAuthority(prepared.session.id);
+    const abandoned = store.abandonReconciledSessionSwitch({
+      ...prepared.cas,
+      expectedSessionRevision: quarantined.revision,
+      expectedSessionAuthority: captured,
+      expectedSessionAuthorityRevision: captured.authorityRevision,
+    });
+    expect(abandoned).toMatchObject({
+      switch: { phase: "abandoned", abandonment: { terminalSessionRevision: quarantined.revision + 1 } },
+      session: { state: "terminal", revision: quarantined.revision + 1 },
+      interactions: [{ publicId: targetInteractionId, state: "expired", revision: 2 }],
+    });
+    expect(store.requireQueue(pendingQueue.id).state).toBe("cancelled");
+    expect(store.requireInteraction(targetInteractionId)).toMatchObject({
+      state: "expired",
+      revision: 2,
+    });
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT revision,state FROM provider_interaction_transitions
+         WHERE public_id=? ORDER BY revision`,
+      ).all(targetInteractionId)).toEqual([
+        { revision: 1, state: "pending" },
+        { revision: 2, state: "expired" },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+    expect(store.readSessionSwitchForRecovery(prepared.session.id)).toBeNull();
+    expect(store.sessionSwitchAdmissionBlocked({
+      sessionId: prepared.session.id,
+      providerThreadId: prepared.session.providerThreadId ?? null,
+      providerAuthority: prepared.cas.sourceAuthority,
+    })).toEqual({ blocked: false, attemptId: null, role: null });
+  });
+
+  test("requires both abandon evidence tables before the reconciliation phase can terminalize", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 707);
+    advanceDedicatedSessionSwitch(store, prepared, "target_started");
+    store.markSessionSwitchReconciliationRequired({
+      ...prepared.cas,
+      expectedPhase: "target_started",
+      diagnosticCode: "TARGET_STATE_UNEXPECTED",
+    });
+    const session = store.requireSession(prepared.session.id);
+    const captured = store.requireCapturedSessionProviderAuthority(prepared.session.id);
+    const terminal = { ...session, state: "terminal", revision: session.revision + 1 };
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      inspector.query(
+        `INSERT INTO session_switch_abandon_receipts(
+           attempt_id,provider_account_id,profile_id,provider,binding_generation,
+           process_generation,authority_revision,expected_session_revision,
+           terminal_session_revision,session_json,recorded_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        prepared.switch.attemptId,
+        captured.providerAccountId,
+        captured.profileId,
+        captured.provider,
+        captured.bindingGeneration,
+        captured.processGeneration,
+        captured.authorityRevision,
+        session.revision,
+        terminal.revision,
+        JSON.stringify(terminal),
+        50_000,
+      );
+      expect(() => inspector.query(
+        "UPDATE session_switch_attempts SET phase='abandoned' WHERE attempt_id=?",
+      ).run(prepared.switch.attemptId)).toThrow("illegal session switch transition");
+    } finally {
+      inspector.close(false);
+    }
+    expect(() => store.requireSessionSwitch(prepared.switch.attemptId))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+  });
+
+  test("dispositions every dedicated switch crash phase before daemon authority retirement", async () => {
+    const { store } = await fixture();
+    const sourceProfile = signInProfile(store, "Restart source", "restart-source@example.com");
+    const targetProfile = signInProfile(store, "Restart target", "restart-target@example.com");
+    const phases = [
+      "prepared",
+      "target_starting",
+      "target_started",
+      "source_releasing",
+      "source_released",
+      "rebound",
+      "seed_dispatching",
+    ] as const;
+    const attempts = phases.map((phase, index) => {
+      const prepared = prepareDedicatedSessionSwitch(store, 720 + index, {
+        sourceProfile,
+        targetProfile,
+      });
+      if (phase !== "prepared") advanceDedicatedSessionSwitch(store, prepared, phase);
+      return { phase, prepared };
+    });
+
+    expect(store.nextDaemonGeneration("phase4-restart-boot")).toBe(1);
+    for (const { phase, prepared } of attempts) {
+      const record = store.requireSessionSwitch(prepared.switch.attemptId);
+      if (phase === "prepared") {
+        expect(record.phase).toBe("cancelled");
+      } else {
+        expect(record).toMatchObject({
+          phase: "reconciliation_required",
+          diagnosticCode: "DAEMON_RESTART_AUTHORITY_RETIRED",
+        });
+        expect(store.requireSession(prepared.session.id).state).toBe("recovery_required");
+        if (phase === "rebound") {
+          const captured = store.requireCapturedSessionProviderAuthority(prepared.session.id);
+          expect(() => store.beginSessionSwitchSeedDispatch({
+            ...prepared.cas,
+            seedAuthority: prepared.cas.targetAuthority,
+            seedAuthorityRevision: captured.authorityRevision,
+            seedDigest: prepared.switch.transcript.seedDigest,
+            clientMessageId: prepared.switch.transcript.seedClientMessageId,
+          })).toThrow("SESSION_SWITCH_PHASE_CONFLICT");
+        }
+      }
+    }
+    expect(store.recoverSessionSwitchesPage().switches).toEqual([]);
+  });
+
+  test("quarantines a legacy malformed dedicated attempt id without blocking daemon boot", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 727);
+    const malformedAttemptId = `attempt_${"a".repeat(31)}g`;
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      database.exec(`
+        PRAGMA foreign_keys=OFF;
+        PRAGMA ignore_check_constraints=ON;
+        DROP TRIGGER session_switch_attempt_id_repair_guard;
+      `);
+      database.query(
+        "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
+      ).run(malformedAttemptId, prepared.switch.attemptId);
+      database.exec("PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;");
+    } finally {
+      database.close(false);
+    }
+
+    expect(store.nextDaemonGeneration("malformed-switch-boot")).toBe(1);
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT switch.attempt_id,switch.phase,mutation.state,
+                malformed.mutation_request_key
+         FROM session_switch_attempts switch
+         JOIN mutation_attempts mutation ON mutation.id=switch.attempt_id
+         JOIN session_switch_malformed_dispositions malformed
+           ON malformed.journal_sequence=switch.journal_sequence
+         WHERE switch.session_id=?`,
+      ).get(prepared.session.id)).toEqual({
+        attempt_id: prepared.switch.attemptId,
+        phase: "cancelled",
+        state: "cancelled",
+        mutation_request_key: prepared.switch.idempotencyKey,
+      });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("contains oversized dedicated ids by row without blocking unrelated restart recovery", async () => {
+    const value = await fixture();
+    let { store } = value;
+    const malformed = prepareDedicatedSessionSwitch(store, 734);
+    advanceDedicatedSessionSwitch(store, malformed, "target_starting");
+    const unrelated = prepareDedicatedSessionSwitch(store, 735);
+    advanceDedicatedSessionSwitch(store, unrelated, "target_starting");
+    const corruptAttemptId = (attemptId: string, replacement: string) => {
+      const database = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        database.exec(`
+          PRAGMA foreign_keys=OFF;
+          PRAGMA ignore_check_constraints=ON;
+          DROP TRIGGER IF EXISTS session_switch_attempt_id_repair_guard;
+        `);
+        database.query(
+          "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
+        ).run(replacement, attemptId);
+        database.exec("PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;");
+      } finally {
+        database.close(false);
+      }
+    };
+    const oversizedAttemptId = `attempt_${"a".repeat(4096)}`;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    corruptAttemptId(malformed.switch.attemptId, oversizedAttemptId);
+    store = new StateStore(store.paths, { now: () => 9_000 });
+    stores.push(store);
+
+    expect(store.nextDaemonGeneration("oversized-switch-restart")).toBe(1);
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT attempt_id,phase,diagnostic_code
+         FROM session_switch_attempts WHERE session_id=?`,
+      ).get(malformed.session.id)).toEqual({
+        attempt_id: malformed.switch.attemptId,
+        phase: "reconciliation_required",
+        diagnostic_code: "MALFORMED_SWITCH_RECORD",
+      });
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      inspector.exec("VACUUM");
+    } finally {
+      inspector.close(false);
+    }
+    expect(store.requireSessionSwitch(unrelated.switch.attemptId)).toMatchObject({
+      phase: "reconciliation_required",
+      diagnosticCode: "DAEMON_RESTART_AUTHORITY_RETIRED",
+    });
+    expect(store.requireSession(unrelated.session.id).state).toBe("recovery_required");
+    expect(store.requireSession(malformed.session.id).state).toBe("recovery_required");
+    expect(store.recoverEffectStartedMutations()).toEqual({ recovered: [], unresolved: [] });
+    expect(() => store.readSessionSwitchByIdempotencyKey(
+      malformed.switch.idempotencyKey,
+    )).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    store = new StateStore(paths, { now: () => 9_100 });
+    stores.push(store);
+    expect(() => store.readSessionSwitchForRecovery(malformed.session.id))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+
+    const recoveryMalformed = prepareDedicatedSessionSwitch(store, 736);
+    const recoveryOversizedAttemptId = `attempt_${"b".repeat(4096)}`;
+    corruptAttemptId(recoveryMalformed.switch.attemptId, recoveryOversizedAttemptId);
+    const recovery = store.recoverSessionSwitchesPage();
+    expect(recovery.malformedAttemptIds).toHaveLength(1);
+    expect(recovery.malformedAttemptIds[0]).toMatch(/^attempt_[0-9a-f]{32}$/);
+    expect(recovery.malformedAttemptIds[0]).not.toContain("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    const recoveryInspector = new Database(store.paths.database, {
+      create: false,
+      strict: true,
+    });
+    try {
+      expect(recoveryInspector.query(
+        `SELECT phase,diagnostic_code FROM session_switch_attempts WHERE session_id=?`,
+      ).get(recoveryMalformed.session.id)).toEqual({
+        phase: "cancelled",
+        diagnostic_code: "MALFORMED_SWITCH_RECORD",
+      });
+    } finally {
+      recoveryInspector.close(false);
+    }
+  });
+
+  test("quarantines a coherently oversized effect-started switch across writable reopen and vacuum", async () => {
+    const value = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(value.store, 737);
+    advanceDedicatedSessionSwitch(value.store, prepared, "target_starting");
+    const paths = value.store.paths;
+    value.store.close();
+    stores.splice(stores.indexOf(value.store), 1);
+
+    const oversizedAttemptId = `attempt_${"c".repeat(4096)}`;
+    const corrupt = new Database(paths.database, { create: false, strict: true });
+    try {
+      corrupt.exec(`
+        PRAGMA foreign_keys=OFF;
+        PRAGMA ignore_check_constraints=ON;
+        DROP TRIGGER session_switch_attempt_id_repair_guard;
+        DROP TRIGGER session_switch_plan_anchors_immutable_update;
+        DROP TRIGGER mutation_provider_authorities_immutable_update;
+      `);
+      corrupt.query(
+        "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
+      ).run(oversizedAttemptId, prepared.switch.attemptId);
+      corrupt.query(
+        "UPDATE session_switch_plan_anchors SET attempt_id=? WHERE attempt_id=?",
+      ).run(oversizedAttemptId, prepared.switch.attemptId);
+      corrupt.query(
+        "UPDATE mutation_provider_authorities SET attempt_id=? WHERE attempt_id=?",
+      ).run(oversizedAttemptId, prepared.switch.attemptId);
+      corrupt.query(
+        "UPDATE mutation_attempts SET id=? WHERE id=?",
+      ).run(oversizedAttemptId, prepared.switch.attemptId);
+      expect(corrupt.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      corrupt.close(false);
+    }
+
+    let reopened = new StateStore(paths, { now: () => 9_200 });
+    stores.push(reopened);
+    expect(reopened.requireSession(prepared.session.id).state).toBe("recovery_required");
+    expect(() => reopened.readSessionSwitchByIdempotencyKey(
+      prepared.switch.idempotencyKey,
+    )).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(() => reopened.readSessionSwitchForRecovery(prepared.session.id))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(reopened.recoverEffectStartedMutations()).toEqual({ recovered: [], unresolved: [] });
+    expect(reopened.sessionSwitchAdmissionBlocked({
+      sessionId: prepared.session.id,
+      providerThreadId: prepared.session.providerThreadId ?? null,
+      providerAuthority: prepared.cas.sourceAuthority,
+    })).toEqual({ blocked: true, attemptId: null, role: "session" });
+    const inspect = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(inspect.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expect(inspect.query(
+        `SELECT switch.phase,mutation.state,malformed.mutation_request_key
+         FROM session_switch_attempts switch
+         JOIN mutation_attempts mutation ON mutation.idempotency_key=switch.request_key
+         JOIN session_switch_malformed_dispositions malformed
+           ON malformed.journal_sequence=switch.journal_sequence
+         WHERE switch.session_id=?`,
+      ).get(prepared.session.id)).toEqual({
+        phase: "reconciliation_required",
+        state: "ambiguous",
+        mutation_request_key: prepared.switch.idempotencyKey,
+      });
+    } finally {
+      inspect.close(false);
+    }
+    reopened.close();
+    stores.splice(stores.indexOf(reopened), 1);
+    const vacuum = new Database(paths.database, { create: false, strict: true });
+    try {
+      vacuum.exec("VACUUM");
+    } finally {
+      vacuum.close(false);
+    }
+    reopened = new StateStore(paths, { now: () => 9_300 });
+    stores.push(reopened);
+    expect(() => reopened.readSessionSwitchForRecovery(prepared.session.id))
+      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expect(reopened.sessionSwitchAdmissionBlocked({
+      sessionId: prepared.session.id,
+      providerThreadId: prepared.session.providerThreadId ?? null,
+      providerAuthority: prepared.cas.sourceAuthority,
+    }).attemptId).toBeNull();
+  });
+
+  test("repairs a malformed partial v37 journal while completing a v36 migration", async () => {
+    const value = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(value.store, 739);
+    advanceDedicatedSessionSwitch(value.store, prepared, "target_starting");
+    const paths = value.store.paths;
+    value.store.close();
+    stores.splice(stores.indexOf(value.store), 1);
+
+    const corrupt = new Database(paths.database, { create: false, strict: true });
+    try {
+      corrupt.exec(`
+        PRAGMA foreign_keys=OFF;
+        PRAGMA ignore_check_constraints=ON;
+        DROP TRIGGER session_switch_attempt_id_repair_guard;
+      `);
+      corrupt.query(
+        "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
+      ).run(`attempt_${"e".repeat(4096)}`, prepared.switch.attemptId);
+      corrupt.exec(`
+        DELETE FROM migrations WHERE version=37;
+        PRAGMA user_version=36;
+        PRAGMA ignore_check_constraints=OFF;
+        PRAGMA foreign_keys=ON;
+      `);
+    } finally {
+      corrupt.close(false);
+    }
+
+    const migrated = new StateStore(paths, { now: () => 9_250 });
+    stores.push(migrated);
+    expect(migrated.requireSession(prepared.session.id).state).toBe("recovery_required");
+    expect(() => migrated.readSessionSwitchByIdempotencyKey(
+      prepared.switch.idempotencyKey,
+    )).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query(
+        "SELECT COUNT(*) AS count FROM migrations WHERE version=37",
+      ).get()).toEqual({ count: 1 });
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expect(inspector.query(
+        `SELECT switch.attempt_id,switch.phase,malformed.mutation_request_key
+         FROM session_switch_attempts switch
+         JOIN session_switch_malformed_dispositions malformed
+           ON malformed.journal_sequence=switch.journal_sequence
+         WHERE switch.session_id=?`,
+      ).get(prepared.session.id)).toEqual({
+        attempt_id: prepared.switch.attemptId,
+        phase: "reconciliation_required",
+        mutation_request_key: prepared.switch.idempotencyKey,
+      });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("keeps the switch journal sequence bounded and immutable", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 738);
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(() => database.query(
+        `UPDATE session_switch_attempts
+         SET journal_sequence=journal_sequence+100 WHERE attempt_id=?`,
+      ).run(prepared.switch.attemptId)).toThrow("session switch immutable plan changed");
+      database.exec("DROP TRIGGER session_switch_attempts_immutable_update");
+      expect(() => database.query(
+        "UPDATE session_switch_attempts SET journal_sequence=0 WHERE attempt_id=?",
+      ).run(prepared.switch.attemptId)).toThrow();
+    } finally {
+      database.close(false);
+    }
+  });
+
+  test("paginates more than one hundred malformed switch journals by stable sequence", async () => {
+    const { store } = await fixture();
+    const sourceProfile = signInProfile(store, "Malformed page source", "malformed-page-source@example.com");
+    const targetProfile = signInProfile(store, "Malformed page target", "malformed-page-target@example.com");
+    const prepared = Array.from({ length: 101 }, (_, index) =>
+      prepareDedicatedSessionSwitch(store, 800 + index, { sourceProfile, targetProfile }));
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      database.exec(`
+        PRAGMA foreign_keys=OFF;
+        PRAGMA ignore_check_constraints=ON;
+        DROP TRIGGER session_switch_attempt_id_repair_guard;
+      `);
+      const corrupt = database.query(
+        "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
+      );
+      database.transaction(() => {
+        for (const [index, value] of prepared.entries()) {
+          corrupt.run(`malformed-switch-${String(index).padStart(3, "0")}`, value.switch.attemptId);
+        }
+      }).immediate();
+      database.exec("PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;");
+    } finally {
+      database.close(false);
+    }
+
+    const first = store.recoverSessionSwitchesPage({ limit: 100 });
+    expect(first.switches).toEqual([]);
+    expect(first.malformedAttemptIds).toHaveLength(100);
+    expect(first.nextJournalSequence).not.toBeNull();
+    const second = store.recoverSessionSwitchesPage({
+      afterJournalSequence: first.nextJournalSequence!,
+      limit: 100,
+    });
+    expect(second.switches).toEqual([]);
+    expect(second.malformedAttemptIds).toHaveLength(1);
+    expect(second.nextJournalSequence).toBeNull();
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT COUNT(*) AS count FROM session_switch_malformed_dispositions",
+      ).get()).toEqual({ count: 101 });
+      expect(inspector.query(
+        `SELECT COUNT(*) AS count FROM session_switch_attempts
+         WHERE phase NOT IN ('seed_settled','reconciliation_required','failed','cancelled','abandoned')`,
+      ).get()).toEqual({ count: 0 });
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
   test("creates the main database as an exact private single-link file", async () => {
     const { store } = await fixture();
     const metadata = await lstat(store.paths.database);
@@ -3305,7 +5700,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -6731,7 +9126,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -8629,6 +11024,50 @@ describe("StateStore", () => {
     }
   });
 
+  test("repairs weakened same-name v37 switch guards while readonly refuses them", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    try {
+      weakened.exec(`
+        DROP TRIGGER session_switch_session_update_guard;
+        CREATE TRIGGER session_switch_session_update_guard
+        BEFORE UPDATE ON sessions
+        BEGIN SELECT 1; END;
+        DROP INDEX session_switch_one_open_per_session;
+        CREATE UNIQUE INDEX session_switch_one_open_per_session
+          ON session_switch_attempts(session_id)
+          WHERE phase='prepared';
+      `);
+    } finally {
+      weakened.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V37_STRUCTURE_INVALID");
+    const repaired = new StateStore(paths, { now: () => 20_000 });
+    stores.push(repaired);
+    repaired.close();
+    stores.splice(stores.indexOf(repaired), 1);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      const updateGuard = inspector.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='session_switch_session_update_guard'",
+      ).get() as { sql: string };
+      const openIndex = inspector.query(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='session_switch_one_open_per_session'",
+      ).get() as { sql: string };
+      expect(updateGuard.sql).toContain("session switch blocks session mutation");
+      expect(openIndex.sql).toContain("reconciliation_required");
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
   test("audits missing Codex usage authority before startup retention", async () => {
     for (const scopeKind of [
       "usage_snapshot",
@@ -9151,7 +11590,7 @@ describe("StateStore", () => {
        WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
        ORDER BY scope_kind,scope_id`,
     ).all();
-    expect(migratedInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+    expect(migratedInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
     migratedInspector.close(false);
     migrated.close();
     stores.splice(stores.indexOf(migrated), 1);
@@ -9168,7 +11607,7 @@ describe("StateStore", () => {
          WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
          ORDER BY scope_kind,scope_id`,
       ).all()).toEqual(firstV36Rows);
-      expect(rerunInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(rerunInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
     } finally {
       rerunInspector.close(false);
     }
@@ -9644,11 +12083,9 @@ describe("StateStore", () => {
     expect(migrated.listSessionEvents({
       afterSequence: 0,
       sessionId: switchedSession.id,
-    }).events).toContainEqual(expect.objectContaining({
-      accountId: signedIn.id,
-      providerGeneration: signedIn.processGeneration,
-      sequence: historicalEvent.sequence,
-    }));
+    }).events.some((event) => event.accountId === signedIn.id
+      && event.providerGeneration === signedIn.processGeneration
+      && event.sequence === historicalEvent.sequence)).toBe(true);
 
     // The historical trigger branches fail closed: naming a legacy
     // provenance is insufficient without its matching immutable source row.
@@ -10006,8 +12443,8 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }]);
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -10274,7 +12711,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -10383,7 +12820,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -10487,7 +12924,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -10540,7 +12977,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -10631,7 +13068,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -10737,7 +13174,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -10851,7 +13288,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -10889,6 +13326,7 @@ describe("StateStore", () => {
         { version: 34, applied_at: 2000 },
         { version: 35, applied_at: 2000 },
         { version: 36, applied_at: 2000 },
+        { version: 37, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -10935,7 +13373,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 37 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -10955,9 +13393,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 37");
+    newer.exec("PRAGMA user_version = 38");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:37:36");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:38:37");
   });
 });

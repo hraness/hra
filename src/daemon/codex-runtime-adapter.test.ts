@@ -758,7 +758,9 @@ describe("PinnedCodexRuntimeManager", () => {
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async (options) => {
         const bindingGeneration = options.authority.bindingGeneration;
-        if (bindingGeneration === undefined) throw new Error("Missing binding generation fixture.");
+        if (!Number.isSafeInteger(bindingGeneration) || bindingGeneration < 1) {
+          throw new Error("Missing binding generation fixture.");
+        }
         launches.push(bindingGeneration);
         if (bindingGeneration === originalAuthority.bindingGeneration) {
           originalOnFact = options.onFact;
@@ -1093,6 +1095,7 @@ describe("PinnedCodexRuntimeManager", () => {
     let startTurnFailure: Error | undefined;
     let emitInvalidatingFactBeforeFailure = false;
     let emitDeletionDuringContextualDiscovery = false;
+    let emitNonIdleDuringContextualDiscovery = false;
     let onFact: LaunchPinnedCodexOptions["onFact"];
     let sandboxWritableRoots = ["/workspace/project"];
     const providerAuthority = clientAuthority();
@@ -1135,6 +1138,18 @@ describe("PinnedCodexRuntimeManager", () => {
             value: {
               type: "threadDeleted",
               threadId: "thread-1",
+              connectionId,
+            },
+          });
+        }
+        if (emitNonIdleDuringContextualDiscovery) {
+          emitNonIdleDuringContextualDiscovery = false;
+          await onFact?.({
+            authority: providerAuthority,
+            value: {
+              type: "threadStatusChanged",
+              threadId: "thread-1",
+              status: { type: "active", activeFlags: [] },
               connectionId,
             },
           });
@@ -1368,7 +1383,7 @@ describe("PinnedCodexRuntimeManager", () => {
     sandboxWritableRoots = [];
     const legacySandboxReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: new AbortController().signal });
     emitDeletionDuringContextualDiscovery = true;
-    await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: legacySandboxReview, signal: new AbortController().signal })).resolves.toMatchObject({ providerThreadId: "thread-1" });
+    await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: legacySandboxReview, signal: new AbortController().signal })).rejects.toBeInstanceOf(IndeterminateCodexEffectError);
     await expect(manager.observeSession({
       authority,
       providerThreadId: "thread-1",
@@ -1379,6 +1394,14 @@ describe("PinnedCodexRuntimeManager", () => {
       resumeCalls: 3,
       turnListCalls: 3,
     });
+    const nonIdleReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: new AbortController().signal });
+    emitNonIdleDuringContextualDiscovery = true;
+    await expect(manager.startSession({
+      authority,
+      projectRoot: "/workspace/project",
+      review: nonIdleReview,
+      signal: new AbortController().signal,
+    })).rejects.toBeInstanceOf(IndeterminateCodexEffectError);
     sandboxWritableRoots = ["/"];
     const broadRootReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: new AbortController().signal });
     await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: broadRootReview, signal: new AbortController().signal })).rejects.toBeInstanceOf(IndeterminateCodexEffectError);

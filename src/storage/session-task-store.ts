@@ -37,6 +37,7 @@ import {
   type SessionTaskId,
 } from "../domain/values";
 import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
+import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
 
 const maximumSafeInteger = 9_007_199_254_740_991;
 const SESSION_TASK_RECEIPT_RESULT_MAX_BYTES = MESSAGE_MAX_BYTES * 6 + 16_384;
@@ -1153,6 +1154,11 @@ export class SessionTaskStore {
          AND s.state NOT IN ('terminal','recovery_required')
          AND a.state='signed_in'
          AND NOT EXISTS(
+           SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+           WHERE switch.session_id=t.session_id
+             AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         )
+         AND NOT EXISTS(
            SELECT 1
            FROM session_task_occurrences o
            JOIN queue_entries q ON q.id=o.queue_id
@@ -1207,6 +1213,11 @@ export class SessionTaskStore {
          AND s.provider_thread_id IS NOT NULL
          AND s.state NOT IN ('terminal','recovery_required')
          AND a.state='signed_in'
+         AND NOT EXISTS(
+           SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+           WHERE switch.session_id=t.session_id
+             AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         )
          AND (
            ? IS NULL
            OR t.next_due_at>?
@@ -1280,6 +1291,11 @@ export class SessionTaskStore {
              AND s.provider_thread_id IS NOT NULL
              AND s.state NOT IN ('terminal','recovery_required')
              AND a.state='signed_in'
+             AND NOT EXISTS(
+               SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+               WHERE switch.session_id=t.session_id
+                 AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+             )
              AND NOT EXISTS(
                SELECT 1
                FROM session_task_occurrences o
