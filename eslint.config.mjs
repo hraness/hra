@@ -2,11 +2,11 @@ import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 // Source layering. Runtime imports flow one way:
-// domain -> storage -> daemon -> { cli, claude, cloud, codex, desktop, devin }.
+// domain -> storage -> daemon -> { cli, claude, cloud, codex, desktop }.
 // Ports in src/daemon/ports.ts are implemented by adapters through
 // `import type`, so type-only imports may point upward where noted below.
 // Test files are exempt: they compose the whole tree on purpose.
-const sourceDirectories = ["claude", "cli", "cloud", "codex", "daemon", "desktop", "devin", "storage"];
+const sourceDirectories = ["claude", "cli", "cloud", "codex", "daemon", "desktop", "storage"];
 const compositionRoots = "(cli|index)(\\.ts)?";
 
 const siblingDirectoryPattern = (directories) =>
@@ -77,7 +77,7 @@ export default tseslint.config(
     ignores: ["**/*.test.ts"],
     rules: layerRules([
       forbidSiblings(
-        ["claude", "cli", "cloud", "codex", "desktop", "devin"],
+        ["claude", "cli", "cloud", "codex", "desktop"],
         "src/storage imports domain and storage. Move shared shapes into src/domain.",
       ),
       forbidSiblings(
@@ -93,7 +93,7 @@ export default tseslint.config(
     ignores: ["**/*.test.ts"],
     rules: layerRules([
       forbidSiblings(
-        ["claude", "cli", "cloud", "codex", "desktop", "devin"],
+        ["claude", "cli", "cloud", "codex", "desktop"],
         "src/daemon imports domain, storage, and daemon at runtime. Adapters reach it through `import type` of src/daemon/ports.ts.",
         true,
       ),
@@ -117,10 +117,6 @@ export default tseslint.config(
         message: "src/cli reaches src/claude only through the zero-import pin constants in claude/pin.ts. Provider effects go through the daemon.",
       },
       {
-        regex: "^\\.\\./devin/(?!pin(\\.ts)?$)",
-        message: "src/cli reaches src/devin only through the zero-import pin constants in devin/pin.ts. Provider effects go through the daemon.",
-      },
-      {
         regex: "^\\.\\./cloud/(?!(contracts|authCredentials)(\\.ts)?$)",
         message: "src/cli reaches src/cloud only through contracts.ts and authCredentials.ts (the rendering and parsing seam).",
       },
@@ -132,7 +128,7 @@ export default tseslint.config(
     ignores: ["**/*.test.ts"],
     rules: layerRules([
       forbidSiblings(
-        ["claude", "cli", "cloud", "daemon", "desktop", "devin", "storage"],
+        ["claude", "cli", "cloud", "daemon", "desktop", "storage"],
         "src/codex imports codex and domain only.",
       ),
       forbidCompositionRoots,
@@ -143,19 +139,8 @@ export default tseslint.config(
     ignores: ["**/*.test.ts"],
     rules: layerRules([
       forbidSiblings(
-        ["cli", "cloud", "codex", "daemon", "desktop", "devin", "storage"],
+        ["cli", "cloud", "codex", "daemon", "desktop", "storage"],
         "src/claude imports claude and domain only.",
-      ),
-      forbidCompositionRoots,
-    ]),
-  },
-  {
-    files: ["src/devin/**/*.ts"],
-    ignores: ["**/*.test.ts"],
-    rules: layerRules([
-      forbidSiblings(
-        ["claude", "cli", "cloud", "codex", "daemon", "desktop", "storage"],
-        "src/devin imports devin and domain only.",
       ),
       forbidCompositionRoots,
     ]),
@@ -165,7 +150,7 @@ export default tseslint.config(
     ignores: ["**/*.test.ts"],
     rules: layerRules([
       forbidSiblings(
-        ["cli", "cloud", "codex", "devin"],
+        ["cli", "cloud", "codex"],
         "src/desktop imports desktop and domain at runtime.",
       ),
       forbidSiblings(
@@ -181,7 +166,7 @@ export default tseslint.config(
     ignores: ["**/*.test.ts"],
     rules: layerRules([
       forbidSiblings(
-        ["cli", "desktop", "devin"],
+        ["cli", "desktop"],
         "src/cloud imports cloud, domain, storage, daemon, and codex. It never imports the CLI, desktop, or provider-runtime adapters.",
       ),
       forbidCompositionRoots,

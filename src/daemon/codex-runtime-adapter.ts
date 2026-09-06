@@ -1063,6 +1063,34 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
+  hasLiveHostToolCall(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    connectionId: string;
+    turnId: string;
+    callId: string;
+    requestDigest: string;
+  }): boolean {
+    const running = this.#clients.get(input.authority.id);
+    return this.#state === "open"
+      && running !== undefined
+      && running.authority.generation === input.authority.generation
+      && running.client.state === "ready"
+      && running.client.connectionId === input.connectionId
+      && this.#isCurrent(input.authority)
+      && running.client.hasLiveHraHostToolCall({
+        authority: {
+          processGeneration: input.authority.generation,
+          profileId: input.authority.id,
+        },
+        callId: input.callId,
+        connectionId: input.connectionId,
+        requestDigest: input.requestDigest,
+        threadId: input.providerThreadId,
+        turnId: input.turnId,
+      });
+  }
+
   async claimSession(input: {
     authority: ProfileAuthority;
     providerThreadId: string;

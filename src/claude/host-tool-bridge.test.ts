@@ -111,6 +111,41 @@ describe("Claude host-tool binding authority", () => {
     await authority.revoke(lease.bindingId);
   });
 
+  test("rejects wrong or missing providers before minting a binding capability", async () => {
+    const root = await scratch();
+    let bindingIdsMinted = 0;
+    const authority = new ClaudeHostToolBindingAuthority({
+      bridgeArguments: ["/private/hra/host-tool-bridge-main.ts"],
+      bridgeCommand: process.execPath,
+      newBindingId: () => {
+        bindingIdsMinted += 1;
+        return `clhb_${"5".repeat(32)}`;
+      },
+      newCapability: () => "Y".repeat(43),
+    });
+    const invalidIdentities: readonly unknown[] = [
+      { ...identity, provider: "codex" },
+      {
+        processGeneration: identity.processGeneration,
+        profileId: identity.profileId,
+        providerThreadId: identity.providerThreadId,
+      },
+    ];
+
+    for (const invalidIdentity of invalidIdentities) {
+      await expect(authority.provision({
+        callbackSocketPath: join(root, "callback.sock"),
+        identity: invalidIdentity as typeof identity,
+        privateRoot: root,
+      })).rejects.toMatchObject({
+        code: "INVALID_INPUT",
+        message: "Claude host-tool binding provider must be claude",
+      });
+    }
+    expect(bindingIdsMinted).toBe(0);
+    await authority.close();
+  });
+
   test("joins an in-flight provision and retries its private-directory cleanup before close succeeds", async () => {
     const root = await scratch();
     let attempts = 0;

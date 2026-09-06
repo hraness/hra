@@ -1,7 +1,7 @@
 {
   "name": "@hraness/hra",
-  "version": "0.6.0",
-  "description": "Control plane for Codex, Claude Code, and Devin in current source; v0.6.0 is release-ready. Run provider sessions side by side through one durable CLI.",
+  "version": "0.7.0",
+  "description": "Control plane for Codex and Claude Code in current source; v0.7.0 is release-ready. Run provider sessions side by side through one durable CLI.",
   "license": "MIT",
   "publishConfig": {
     "access": "public",
@@ -19,7 +19,8 @@
     "build:app": "NODE_ENV=production vite build --config app/vite.config.ts",
     "build:cli": "bun build ./src/cli.ts --target=bun --outdir=dist/cli",
     "build:site": "bun ./scripts/build-site.ts",
-    "check": "bun run check:install-pins && bun run check:security-primitives && bun run lint && bun run typecheck && bun run test && bun run build:site -- --check && bun run build:app && bun run build && bun run check:package",
+    "check:effect-architecture": "bun ./scripts/check-codex-effect-architecture.ts",
+    "check": "bun run check:install-pins && bun run check:effect-architecture && bun run check:security-primitives && bun run lint && bun run typecheck && bun run test && bun run build:site -- --check && bun run build:app && bun run build && bun run check:package",
     "check:package": "bun run test:package-policy && bun ./scripts/check-package.ts",
     "check:security-primitives": "bun ./scripts/check-security-primitives.ts",
     "check:install-pins": "bun ./scripts/check-install-pins.ts",
@@ -82,10 +83,10 @@
     "multi-account"
   ],
   "dependencies": {
-    "@agentclientprotocol/sdk": "1.4.0",
     "@hraness/oh": "0.4.1",
     "@openai/codex": "0.153.2",
     "convex": "1.45.0",
+    "effect": "3.22.1",
     "zod": "4.4.3"
   },
   "devDependencies": {

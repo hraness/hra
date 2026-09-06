@@ -19,6 +19,7 @@ import {
   IndeterminateCodexEffectError,
 } from "./errors.ts";
 import { JsonLineDecoder } from "./jsonl.ts";
+import { CodexConnectionEffects } from "./session-effects.ts";
 import { record, safeInteger, string } from "./parse.ts";
 import type { CodexProcess } from "./process.ts";
 import {
@@ -116,9 +117,14 @@ const PRE_READY_FACT_LIMIT = 128;
 const PRE_READY_FACT_BYTES = 1 * 1024 * 1024;
 const INBOUND_DYNAMIC_REQUEST_LIMIT = 128;
 const DYNAMIC_REQUEST_LEDGER_LIMIT = 4_096;
+const HOST_TOOL_TURN_FENCE_LIMIT = 4_096;
 const CAPABILITY_DISCOVERY_MAX_DEADLINE_MS = 40_000;
 const DEVELOPER_INSTRUCTIONS_MAX_BYTES = 64 * 1_024;
 const developerInstructionsEncoder = new TextEncoder();
+
+const activeHraHostToolCallKey = (
+  call: Pick<HraHostToolCall, "threadId" | "turnId" | "callId">,
+): string => JSON.stringify([call.threadId, call.turnId, call.callId]);
 
 const exactDeveloperInstructions = (value: string): string => {
   const parsed = boundedText(
@@ -141,9 +147,6 @@ interface PendingRequest {
   readonly bypassAccountAuthorityBarrier: boolean;
   readonly parseAndResolve: (value: unknown, authority: CodexAuthority) => void;
   readonly reject: (reason: unknown) => void;
-  readonly timeout: ReturnType<typeof setTimeout>;
-  readonly signal?: AbortSignal;
-  readonly onAbort?: () => void;
   dispatched: boolean;
   responseReceived: boolean;
 }
@@ -345,11 +348,9 @@ export class CodexAppServerClient {
   readonly #pending = new Map<number, PendingRequest>();
   readonly #serverRequests = new Map<string, PendingServerRequest>();
   readonly #dynamicRequestDigests = new Map<string, string>();
-  readonly #inboundDynamicRequests = new Set<Promise<void>>();
-  readonly #inboundServerRequests = new Set<Promise<void>>();
-  readonly #inboundResponseSettlements = new Set<Promise<void>>();
-  #factTail: Promise<void> = Promise.resolve();
-  #writeTail: Promise<void> = Promise.resolve();
+  readonly #activeHraHostToolCalls = new Map<string, HraHostToolCall>();
+  readonly #hostToolTurnFenceByThread = new Map<string, string | null>();
+  readonly #effects = new CodexConnectionEffects();
   readonly #writeQueue: PendingFrameWrite[] = [];
   #writeDrainActive = false;
   #writeBarrierWake: (() => void) | null = null;
@@ -451,6 +452,34 @@ export class CodexAppServerClient {
 
   get connectionId(): string {
     return this.#connectionId;
+  }
+
+  /** Pure synchronous proof that this exact provider callback is still active. */
+  hasLiveHraHostToolCall(input: {
+    readonly authority: CodexAuthority;
+    readonly connectionId: string;
+    readonly threadId: string;
+    readonly turnId: string;
+    readonly callId: string;
+    readonly requestDigest: string;
+  }): boolean {
+    const retained = this.#activeHraHostToolCalls.get(activeHraHostToolCallKey(input));
+    return this.#state === "ready"
+      && input.authority.profileId === this.#authority.profileId
+      && input.authority.processGeneration === this.#authority.processGeneration
+      && input.connectionId === this.#connectionId
+      && (
+        !this.#hostToolTurnFenceByThread.has(input.threadId)
+        || this.#hostToolTurnFenceByThread.get(input.threadId) === input.turnId
+      )
+      && retained !== undefined
+      && retained.authority.profileId === input.authority.profileId
+      && retained.authority.processGeneration === input.authority.processGeneration
+      && retained.connectionId === input.connectionId
+      && retained.threadId === input.threadId
+      && retained.turnId === input.turnId
+      && retained.callId === input.callId
+      && retained.requestDigest === input.requestDigest;
   }
 
   #requireState(expected: ClientState, message: string): void {
@@ -1244,29 +1273,13 @@ export class CodexAppServerClient {
   async #close(): Promise<void> {
     if (this.#state === "closed") return;
     this.#state = "closing";
+    this.#activeHraHostToolCalls.clear();
+    this.#hostToolTurnFenceByThread.clear();
     this.#wakeWriteBarrier();
     this.#failPending(new CodexError("PROCESS_EXITED", "Codex is shutting down"));
     this.#emitDisconnected("closed");
 
-    let terminated = false;
-    try {
-      this.#process.terminate();
-      terminated = await resolvesWithin(this.#process.exited, this.#shutdownTermGraceMs);
-    } catch {
-      this.#onSafeDiagnostic("Codex TERM failed; forcing process termination");
-    }
-    if (!terminated) {
-      try {
-        this.#process.forceTerminate();
-      } catch {
-        this.#onSafeDiagnostic("Codex force termination failed");
-      }
-    }
-
-    const inboundDynamicRequests = Promise.all([...this.#inboundDynamicRequests]);
-    const inboundServerRequests = Promise.all([...this.#inboundServerRequests]);
-    const inboundResponseSettlements = Promise.all([...this.#inboundResponseSettlements]);
-    const [
+    const {
       exitSettled,
       readSettled,
       factsSettled,
@@ -1274,17 +1287,11 @@ export class CodexAppServerClient {
       inboundSettled,
       serverRequestsSettled,
       responsesSettled,
-    ] = await Promise.all([
-      resolvesWithin(this.#process.exited, this.#shutdownSettlementMs),
-      this.#readTask === null
-        ? Promise.resolve(true)
-        : settlesWithin(this.#readTask, this.#shutdownSettlementMs),
-      settlesWithin(this.#factTail, this.#shutdownSettlementMs),
-      settlesWithin(this.#writeTail, this.#shutdownSettlementMs),
-      settlesWithin(inboundDynamicRequests, this.#shutdownSettlementMs),
-      settlesWithin(inboundServerRequests, this.#shutdownSettlementMs),
-      settlesWithin(inboundResponseSettlements, this.#shutdownSettlementMs),
-    ]);
+    } = await this.#effects.shutdown(this.#process, this.#readTask, {
+      termGraceMs: this.#shutdownTermGraceMs,
+      settlementMs: this.#shutdownSettlementMs,
+      diagnostic: this.#onSafeDiagnostic,
+    });
     if (!exitSettled) this.#onSafeDiagnostic("Codex process exit did not settle after termination");
     if (!readSettled) this.#onSafeDiagnostic("Codex stdout did not settle after termination");
     if (!factsSettled) this.#onSafeDiagnostic("HRA fact delivery did not settle after Codex termination");
@@ -1304,6 +1311,7 @@ export class CodexAppServerClient {
         "Codex process exit could not be proven after force termination",
       );
     }
+    await this.#effects.close();
     this.#state = "closed";
   }
 
@@ -1363,43 +1371,31 @@ export class CodexAppServerClient {
       throw new CodexError("PROCESS_EXITED", "Codex is shutting down");
     }
     const id = this.#allocateRequestId();
-    let exactPending: PendingRequest | undefined;
-    const promise = new Promise<FencedCodexValue<T>>((resolvePromise, rejectPromise) => {
-      const timeout = setTimeout(() => {
+    const completion = this.#effects.completion<FencedCodexValue<T>>("requests", {
+      deadlineMs: descriptor.deadlineMs,
+      ...(signal === undefined ? {} : { signal }),
+      onDeadline: () => {
         const pending = this.#takePending(id);
         if (pending === undefined) return;
-        if (descriptor.lostResponse === "reconcile" && pending.dispatched) {
-          rejectPromise(new IndeterminateCodexEffectError(descriptor.method, id));
-        } else {
-          rejectPromise(new CodexError("TIMEOUT", `${descriptor.method} timed out`));
-        }
-      }, descriptor.deadlineMs);
-      const onAbort = signal === undefined
-        ? undefined
-        : () => {
-          const pending = this.#takePending(id);
-          if (pending !== undefined) pending.reject(abortReason(signal));
-        };
-      exactPending = {
-        id,
-        descriptor,
-        bypassAccountAuthorityBarrier,
-        parseAndResolve: (value, authority) => {
-          resolvePromise({ authority, value: parse(value) });
-        },
-        reject: rejectPromise,
-        timeout,
-        ...(signal === undefined ? {} : { signal }),
-        ...(onAbort === undefined ? {} : { onAbort }),
-        dispatched: false,
-        responseReceived: false,
-      };
-      this.#pending.set(id, exactPending);
-      if (signal !== undefined && onAbort !== undefined) {
-        signal.addEventListener("abort", onAbort, { once: true });
-        if (signal.aborted) onAbort();
-      }
+        pending.reject(descriptor.lostResponse === "reconcile" && pending.dispatched
+          ? new IndeterminateCodexEffectError(descriptor.method, id)
+          : new CodexError("TIMEOUT", `${descriptor.method} timed out`));
+      },
+      onAbort: () => this.#takePending(id) !== undefined,
     });
+    const exactPending: PendingRequest = {
+      id,
+      descriptor,
+      bypassAccountAuthorityBarrier,
+      parseAndResolve: (value, authority) => {
+        completion.succeed({ authority, value: parse(value) });
+      },
+      reject: completion.reject,
+      dispatched: false,
+      responseReceived: false,
+    };
+    this.#pending.set(id, exactPending);
+    const promise = completion.start();
 
     try {
       const write = this.#writeFrame(
@@ -1411,7 +1407,7 @@ export class CodexAppServerClient {
           bypassAccountAuthorityBarrier,
           beforeWrite: () => {
             throwIfAborted(signal);
-            if (exactPending === undefined || this.#pending.get(id) !== exactPending) {
+            if (this.#pending.get(id) !== exactPending) {
               throw new CodexError("TIMEOUT", `${descriptor.method} expired before dispatch`);
             }
             exactPending.dispatched = true;
@@ -1489,6 +1485,7 @@ export class CodexAppServerClient {
   }
 
   #enqueueBufferedFact(fact: CodexFact): void {
+    this.#applyHraHostToolFactFence(fact);
     if (fact.type === "serverRequestResolved") {
       void this.#enqueueFact({
         type: "protocolNotice",
@@ -1528,6 +1525,8 @@ export class CodexAppServerClient {
   }
 
   async #handleParsedFact(fact: CodexFact): Promise<void> {
+    this.#applyHraHostToolFactFence(fact);
+    if (this.#state !== "ready") return;
     const accountAuthoritySignaled = this.#signalAccountAuthority(fact);
     if (!(await this.#authorityIsCurrent())) return;
     if (fact.type === "serverRequestResolved") {
@@ -1540,11 +1539,72 @@ export class CodexAppServerClient {
     );
   }
 
+  #applyHraHostToolFactFence(fact: CodexFact): void {
+    if (fact.type === "providerDisconnected") {
+      this.#activeHraHostToolCalls.clear();
+      this.#hostToolTurnFenceByThread.clear();
+      return;
+    }
+    if (fact.type === "turnStarted") {
+      this.#rememberHostToolTurnFence(fact.threadId, fact.turn.id);
+    } else if (
+      fact.type === "turnCompleted"
+      && (
+        !this.#hostToolTurnFenceByThread.has(fact.threadId)
+        || this.#hostToolTurnFenceByThread.get(fact.threadId) === fact.turn.id
+      )
+    ) {
+      this.#rememberHostToolTurnFence(fact.threadId, null);
+    } else if (
+      (fact.type === "threadDeleted"
+        || (fact.type === "threadStatusChanged" && fact.status.type !== "active"))
+    ) {
+      this.#rememberHostToolTurnFence(fact.threadId, null);
+    } else if (
+      fact.type === "providerError"
+      && fact.terminal
+      && (
+        !this.#hostToolTurnFenceByThread.has(fact.threadId)
+        || this.#hostToolTurnFenceByThread.get(fact.threadId) === fact.turnId
+      )
+    ) {
+      this.#rememberHostToolTurnFence(fact.threadId, null);
+    }
+    for (const [key, call] of this.#activeHraHostToolCalls) {
+      const invalid = fact.type === "threadDeleted"
+        ? call.threadId === fact.threadId
+        : fact.type === "threadStatusChanged"
+          ? fact.status.type !== "active" && call.threadId === fact.threadId
+          : fact.type === "turnCompleted"
+            ? call.threadId === fact.threadId && call.turnId === fact.turn.id
+            : fact.type === "turnStarted"
+              ? call.threadId === fact.threadId && call.turnId !== fact.turn.id
+              : fact.type === "providerError"
+                ? fact.terminal && call.threadId === fact.threadId && call.turnId === fact.turnId
+                : fact.type === "serverRequestResolved"
+                  ? call.threadId === fact.threadId
+                    && providerRequestIdKey(call.requestId) === providerRequestIdKey(fact.requestId)
+                  : false;
+      if (invalid) this.#activeHraHostToolCalls.delete(key);
+    }
+  }
+
+  #rememberHostToolTurnFence(threadId: string, turnId: string | null): void {
+    if (
+      !this.#hostToolTurnFenceByThread.has(threadId)
+      && this.#hostToolTurnFenceByThread.size >= HOST_TOOL_TURN_FENCE_LIMIT
+    ) {
+      this.#quarantineConnection("Codex exceeded the HRA host-tool turn-fence limit");
+      return;
+    }
+    this.#hostToolTurnFenceByThread.set(threadId, turnId);
+  }
+
   async #readLoop(): Promise<void> {
     try {
-      for await (const chunk of this.#process.stdout) {
+      await this.#effects.read("stdout", this.#process.stdout, async chunk => {
         for (const message of this.#decoder.push(chunk)) await this.#handleMessage(message);
-      }
+      }, () => { this.#onSafeDiagnostic("Codex stdout iterator cleanup failed"); });
       for (const message of this.#decoder.finish()) await this.#handleMessage(message);
       if (this.#state !== "closing" && this.#state !== "closed") {
         const error = new CodexError("PROCESS_EXITED", "Codex stdout reached EOF");
@@ -1565,11 +1625,17 @@ export class CodexAppServerClient {
 
   async #drainStderr(): Promise<void> {
     try {
-      for await (const chunk of this.#process.stderr) {
+      await this.#effects.read("stderr", this.#process.stderr, async chunk => {
         this.#onSafeDiagnostic(`Codex wrote ${String(chunk.byteLength)} bytes to stderr`);
-      }
+      }, () => {
+        if (this.#state !== "closing" && this.#state !== "closed") {
+          this.#onSafeDiagnostic("Codex stderr iterator cleanup failed");
+        }
+      });
     } catch {
-      this.#onSafeDiagnostic("Codex stderr closed unexpectedly");
+      if (this.#state !== "closing" && this.#state !== "closed") {
+        this.#onSafeDiagnostic("Codex stderr closed unexpectedly");
+      }
     }
   }
 
@@ -1600,24 +1666,24 @@ export class CodexAppServerClient {
     if (this.#state !== "ready") return;
     if (message.id !== undefined) {
       if (method === "item/tool/call") {
-        if (this.#inboundDynamicRequests.size >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
+        if (this.#effects.count("dynamic") >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
           this.#quarantineConnection("Codex exceeded the bounded dynamic-tool request limit");
           return;
         }
         this.#trackInboundDynamicRequest(
-          this.#handleHraHostToolCall(
+          () => this.#handleHraHostToolCall(
             message.id,
             message.params ?? {},
           ),
         );
         return;
       }
-      if (this.#inboundServerRequests.size >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
+      if (this.#effects.count("server") >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
         this.#quarantineConnection("Codex exceeded the bounded server-request handling limit");
         return;
       }
       this.#trackInboundServerRequest(
-        this.#handleServerRequest(message.id, method, message.params ?? {}),
+        () => this.#handleServerRequest(message.id, method, message.params ?? {}),
       );
       return;
     }
@@ -1658,12 +1724,11 @@ export class CodexAppServerClient {
     pending.responseReceived = true;
     const deferForAccountAuthority = !pending.bypassAccountAuthorityBarrier
       && this.#accountAuthorityWriteBarrier !== null;
-    const settlement = this.#settleResponse(message, pending, id);
     if (deferForAccountAuthority) {
-      this.#trackInboundResponseSettlement(settlement);
+      this.#trackInboundResponseSettlement(() => this.#settleResponse(message, pending, id));
       return;
     }
-    await settlement;
+    await this.#settleResponse(message, pending, id);
   }
 
   async #settleResponse(
@@ -1758,21 +1823,12 @@ export class CodexAppServerClient {
     );
   }
 
-  #trackInboundResponseSettlement(task: Promise<void>): void {
-    const tracked = task.then(
-      () => undefined,
-      (error: unknown) => {
-        if (this.#state !== "ready") return;
-        this.#onSafeDiagnostic(
-          error instanceof Error
-            ? `Codex response settlement failed: ${error.name}`
-            : "Codex response settlement failed",
-        );
-      },
-    );
-    this.#inboundResponseSettlements.add(tracked);
-    void tracked.then(() => {
-      this.#inboundResponseSettlements.delete(tracked);
+  #trackInboundResponseSettlement(task: () => Promise<void>): void {
+    this.#effects.track("responses", task, (error) => {
+      if (this.#state !== "ready") return;
+      this.#onSafeDiagnostic(error instanceof Error
+        ? `Codex response settlement failed: ${error.name}`
+        : "Codex response settlement failed");
     });
   }
 
@@ -1877,78 +1933,101 @@ export class CodexAppServerClient {
       this.#dynamicRequestDigests.set(requestKey, call.requestDigest);
     }
 
-    let text: string;
-    try {
-      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
-      const publicResult = await invokeHostTool();
-      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
-      text = serializeDynamicToolPublicResult(publicResult);
-    } catch {
-      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
-      this.#onSafeDiagnostic("HRA host-tool handler failed");
-      await this.#writeHraHostToolFrame({
-        id: rawProviderRequestId(requestId),
-        result: {
-          contentItems: [{
-            type: "inputText",
-            text: call.tool === "automation_update"
-              ? "HRA could not complete this conversation-bound scheduled task request."
-              : "HRA could not complete this host-tool request.",
-          }],
-          success: false,
-        },
-      });
+    const activeKey = activeHraHostToolCallKey(call);
+    if (this.#activeHraHostToolCalls.has(activeKey)) {
+      this.#quarantineConnection("Codex reused an active HRA host-tool call id");
       return;
     }
-
-    await this.#writeHraHostToolFrame({
-      id: rawProviderRequestId(requestId),
-      result: {
-        contentItems: [{ type: "inputText", text }],
-        success: true,
-      },
-    });
-    if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+    if (this.#activeHraHostToolCalls.size >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
+      this.#quarantineConnection("Codex exceeded the active HRA host-tool call limit");
+      return;
+    }
+    this.#activeHraHostToolCalls.set(activeKey, call);
     try {
-      await notifyResponseWritten();
-    } catch {
-      this.#onSafeDiagnostic("HRA host-tool post-response hook failed");
+      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+      if (
+        this.#activeHraHostToolCalls.get(activeKey) !== call
+        || !this.hasLiveHraHostToolCall(call)
+      ) return;
+      let invocation:
+        | { readonly ok: true; readonly value: DynamicToolPublicResult }
+        | { readonly ok: false };
+      try {
+        invocation = { ok: true, value: await invokeHostTool() };
+      } catch {
+        invocation = { ok: false };
+      }
+      if (
+        this.#activeHraHostToolCalls.get(activeKey) !== call
+        || !this.hasLiveHraHostToolCall(call)
+      ) return;
+
+      let text: string;
+      try {
+        if (!invocation.ok) throw new CodexError("PROTOCOL_ERROR", "HRA host-tool handler failed");
+        if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+        text = serializeDynamicToolPublicResult(invocation.value);
+      } catch {
+        if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+        this.#onSafeDiagnostic("HRA host-tool handler failed");
+        await this.#writeHraHostToolFrame({
+          id: rawProviderRequestId(requestId),
+          result: {
+            contentItems: [{
+              type: "inputText",
+              text: call.tool === "automation_update"
+                ? "HRA could not complete this conversation-bound scheduled task request."
+                : "HRA could not complete this host-tool request.",
+            }],
+            success: false,
+          },
+        }, call);
+        return;
+      }
+
+      if (!(await this.#writeHraHostToolFrame({
+        id: rawProviderRequestId(requestId),
+        result: {
+          contentItems: [{ type: "inputText", text }],
+          success: true,
+        },
+      }, call))) return;
+      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+      if (
+        this.#activeHraHostToolCalls.get(activeKey) !== call
+        || !this.hasLiveHraHostToolCall(call)
+      ) return;
+      try {
+        await notifyResponseWritten();
+      } catch {
+        this.#onSafeDiagnostic("HRA host-tool post-response hook failed");
+      }
+    } finally {
+      if (this.#activeHraHostToolCalls.get(activeKey) === call) {
+        this.#activeHraHostToolCalls.delete(activeKey);
+      }
     }
   }
 
-  #trackInboundDynamicRequest(task: Promise<void>): void {
-    const tracked = task.then(
-      () => undefined,
-      () => {
-        if (this.#state !== "ready") return;
-        try {
-          this.#quarantineConnection("HRA dynamic-tool request handling failed");
-        } catch {
-          this.#onSafeDiagnostic("HRA could not terminate a failed dynamic-tool connection");
-        }
-      },
-    );
-    this.#inboundDynamicRequests.add(tracked);
-    void tracked.then(() => {
-      this.#inboundDynamicRequests.delete(tracked);
+  #trackInboundDynamicRequest(task: () => Promise<void>): void {
+    this.#effects.track("dynamic", task, () => {
+      if (this.#state !== "ready") return;
+      try {
+        this.#quarantineConnection("HRA dynamic-tool request handling failed");
+      } catch {
+        this.#onSafeDiagnostic("HRA could not terminate a failed dynamic-tool connection");
+      }
     });
   }
 
-  #trackInboundServerRequest(task: Promise<void>): void {
-    const tracked = task.then(
-      () => undefined,
-      () => {
-        if (this.#state !== "ready") return;
-        try {
-          this.#quarantineConnection("Codex server-request handling failed");
-        } catch {
-          this.#onSafeDiagnostic("HRA could not terminate a failed server-request connection");
-        }
-      },
-    );
-    this.#inboundServerRequests.add(tracked);
-    void tracked.then(() => {
-      this.#inboundServerRequests.delete(tracked);
+  #trackInboundServerRequest(task: () => Promise<void>): void {
+    this.#effects.track("server", task, () => {
+      if (this.#state !== "ready") return;
+      try {
+        this.#quarantineConnection("Codex server-request handling failed");
+      } catch {
+        this.#onSafeDiagnostic("HRA could not terminate a failed server-request connection");
+      }
     });
   }
 
@@ -1966,19 +2045,38 @@ export class CodexAppServerClient {
     return false;
   }
 
-  async #writeHraHostToolFrame(value: unknown): Promise<void> {
-    await this.#writeFrame(value, {
-      beforeWriteAsync: async () => {
-        if (!(await this.#hraHostToolAuthorityIsCurrent())) {
-          throw new CodexError("AUTHORITY_STALE", "Codex process generation is stale");
-        }
-      },
-      beforeWrite: () => {
-        if (this.#state !== "ready") {
-          throw new CodexError("AUTHORITY_STALE", "Codex provider connection is no longer live");
-        }
-      },
-    });
+  async #writeHraHostToolFrame(value: unknown, call?: HraHostToolCall): Promise<boolean> {
+    try {
+      await this.#writeFrame(value, {
+        beforeWriteAsync: async () => {
+          if (!(await this.#hraHostToolAuthorityIsCurrent())) {
+            throw new CodexError("AUTHORITY_STALE", "Codex process generation is stale");
+          }
+        },
+        beforeWrite: () => {
+          if (this.#state !== "ready") {
+            throw new CodexError("AUTHORITY_STALE", "Codex provider connection is no longer live");
+          }
+          if (
+            call !== undefined
+            && (
+              this.#activeHraHostToolCalls.get(activeHraHostToolCallKey(call)) !== call
+              || !this.hasLiveHraHostToolCall(call)
+            )
+          ) {
+            throw new CodexError("AUTHORITY_STALE", "The HRA host-tool call is no longer live");
+          }
+        },
+      });
+      return true;
+    } catch (error: unknown) {
+      if (
+        call !== undefined
+        && error instanceof CodexFrameRejectedBeforeWriteError
+        && error.rejection.code === "AUTHORITY_STALE"
+      ) return false;
+      throw error;
+    }
   }
 
   async #handleServerRequest(idValue: unknown, method: string, params: unknown): Promise<void> {
@@ -2154,18 +2252,14 @@ export class CodexAppServerClient {
 
   #enqueueFact(fact: CodexFact, accountAuthoritySignaled = false): Promise<void> {
     if (!accountAuthoritySignaled) this.#signalAccountAuthority(fact);
-    const task = this.#factTail.then(async () => {
+    return this.#effects.fact(async () => {
       if (!(await this.#authorityIsCurrent())) return;
       await this.#onFact({ authority: this.#authority, value: fact });
+    }, (error) => {
+      this.#onSafeDiagnostic(error instanceof Error
+        ? `HRA fact observer failed: ${error.name}`
+        : "HRA fact observer failed");
     });
-    this.#factTail = task.catch((error: unknown) => {
-      this.#onSafeDiagnostic(
-        error instanceof Error
-          ? `HRA fact observer failed: ${error.name}`
-          : "HRA fact observer failed",
-      );
-    });
-    return task;
   }
 
   #signalAccountAuthority(fact: CodexFact): boolean {
@@ -2192,6 +2286,8 @@ export class CodexAppServerClient {
   }
 
   #emitDisconnected(reason: "eof" | "process_exit" | "closed" | "protocol_fault"): void {
+    this.#activeHraHostToolCalls.clear();
+    this.#hostToolTurnFenceByThread.clear();
     if (!this.#connectionAnnounced || this.#disconnectEmitted) return;
     this.#disconnectEmitted = true;
     void this.#enqueueFact({
@@ -2204,6 +2300,8 @@ export class CodexAppServerClient {
   #quarantineConnection(message: string): void {
     if (this.#state === "closing" || this.#state === "closed" || this.#state === "failed") return;
     this.#state = "failed";
+    this.#activeHraHostToolCalls.clear();
+    this.#hostToolTurnFenceByThread.clear();
     this.#wakeWriteBarrier();
     this.#onSafeDiagnostic(message);
     this.#failPending(new CodexError("PROTOCOL_ERROR", "Codex provider connection was quarantined"));
@@ -2224,14 +2322,10 @@ export class CodexAppServerClient {
       throw new CodexError("PROTOCOL_LIMIT", "outbound Codex frame exceeded its byte limit");
     }
     const bytes = this.#encoder.encode(`${serialized}\n`);
-    let resolveWrite!: () => void;
-    let rejectWrite!: (reason?: unknown) => void;
-    const write = new Promise<void>((resolve, reject) => {
-      resolveWrite = resolve;
-      rejectWrite = reject;
-    });
-    const settled = write.catch(() => undefined);
-    this.#writeTail = Promise.all([this.#writeTail, settled]).then(() => undefined);
+    const completion = this.#effects.completion<undefined>("writes");
+    const write = completion.start();
+    // The request owns the rejection; shutdown joins the connection's fiber set.
+    void write.catch(() => undefined);
     this.#writeQueue.push({
       bytes,
       bypassAccountAuthorityBarrier:
@@ -2240,8 +2334,8 @@ export class CodexAppServerClient {
       ...(options.beforeWriteAsync === undefined
         ? {}
         : { beforeWriteAsync: options.beforeWriteAsync }),
-      resolve: resolveWrite,
-      reject: rejectWrite,
+      resolve: () => { completion.succeed(undefined); },
+      reject: completion.reject,
     });
     this.#wakeWriteBarrier();
     this.#startWriteDrain();
@@ -2396,10 +2490,6 @@ export class CodexAppServerClient {
     const pending = this.#pending.get(id);
     if (pending === undefined) return undefined;
     this.#pending.delete(id);
-    clearTimeout(pending.timeout);
-    if (pending.signal !== undefined && pending.onAbort !== undefined) {
-      pending.signal.removeEventListener("abort", pending.onAbort);
-    }
     return pending;
   }
 
@@ -2581,40 +2671,4 @@ function boundedShutdownDuration(value: number, label: string): number {
     throw new CodexError("INVALID_INPUT", `${label} must be between 1 and 30000 milliseconds`);
   }
   return value;
-}
-
-async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<false>((resolveTimeout) => {
-    timer = setTimeout(() => resolveTimeout(false), timeoutMs);
-  });
-  try {
-    return await Promise.race([
-      promise.then(
-        () => true as const,
-        () => true as const,
-      ),
-      timeout,
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-async function resolvesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<false>((resolveTimeout) => {
-    timer = setTimeout(() => resolveTimeout(false), timeoutMs);
-  });
-  try {
-    return await Promise.race([
-      promise.then(
-        () => true as const,
-        () => false as const,
-      ),
-      timeout,
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }

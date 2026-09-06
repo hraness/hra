@@ -322,6 +322,38 @@ describe("hosted memory supervision", () => {
       .toEqual([digest("e"), digest("f")]);
   });
 
+  test("reports conflicting bindings despite identical heads without choosing a winner", () => {
+    const original = machine("device_one", "Studio", "e");
+    const conflictingSummary = summary("e");
+    const conflicting = toMachineView({
+      device: { online: true, status: "active" },
+      devicePublicId: "device_two",
+      memorySummary: {
+        ...conflictingSummary,
+        spaces: conflictingSummary.spaces.map((space) => ({
+          ...space,
+          bindingDigest: digest("f"),
+        })),
+      },
+      memorySummaryReady: true,
+      memorySummaryStatus: "available",
+      now,
+      payload: registry({ machineLabel: "Laptop" }),
+      revision: 1,
+      updatedAt: now,
+    });
+
+    for (const machines of [[original, conflicting], [conflicting, original]]) {
+      const grouped = hostedMemorySpaces(machines);
+      expect(grouped).toHaveLength(1);
+      expect(grouped[0]?.agreement).toBe("disagreed");
+      expect(grouped[0]?.observations.map((observation) => observation.space?.head))
+        .toEqual([conflictingSummary.spaces[0]?.head, conflictingSummary.spaces[0]?.head]);
+      expect(new Set(grouped[0]?.observations.map((observation) => observation.space?.bindingDigest)))
+        .toEqual(new Set([digest("c"), digest("f")]));
+    }
+  });
+
   test("excludes stale evidence from agreement and shows a current device's enrollment gap", () => {
     const stale = machine(
       "device_one",
@@ -579,6 +611,22 @@ describe("commandTargetForMachine", () => {
 
 describe("archivedSessionRows", () => {
   const labels = new Map([["dev_a", "studio"]]);
+
+  test("preserves retired-provider authority while keeping archived history visible", () => {
+    expect(archivedSessionRows([{
+      executionDevicePublicId: "dev_a",
+      metadata: { archived: true, name: "Retired conversation", retiredProvider: "devin" },
+      publicId: "sess_retired",
+      updatedAt: now,
+    }], labels)).toEqual([{
+      executionDevicePublicId: "dev_a",
+      machineLabel: "studio",
+      publicId: "sess_retired",
+      retiredProvider: "devin",
+      title: "Retired conversation",
+      updatedAt: now,
+    }]);
+  });
 
   test("keeps only sessions whose decrypted metadata says archived", () => {
     const rows = archivedSessionRows([

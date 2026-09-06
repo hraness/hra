@@ -223,6 +223,46 @@ const expectStoreCode = (
   }
 };
 
+describe("retired provider schedules", () => {
+  test("retains historical tasks without deadlines, new admission, or queue materialization", async () => {
+    let validations = 0;
+    const value = fixture({ resolveProjectDirectory: async (root) => { validations += 1; return root; } });
+    const key = idempotencyKey();
+    const active = createTask(value, { idempotencyKey: key });
+    const paused = createTask(value, { name: "Paused legacy task", status: "paused" });
+    value.database.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(value.sessionId);
+    expect(value.store.nextDueAt()).toBeNull();
+    expect(await value.store.materializeDue({ now: active.nextDueAt! })).toEqual([]);
+    expect(validations).toBe(0);
+    expect(value.store.require(value.sessionId, active.id)).toEqual(active);
+    expect(value.store.listOccurrences(value.sessionId, active.id)).toEqual([]);
+    expect(value.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
+    expectStoreCode(() => createTask(value), "PROVIDER_RETIRED");
+    expectStoreCode(() => createTask(value, { status: "paused" }), "PROVIDER_RETIRED");
+    expectStoreCode(() => value.store.edit({ sessionId: value.sessionId, taskId: paused.id,
+      expectedRevision: paused.revision, patch: { status: "active" }, idempotencyKey: idempotencyKey() }), "PROVIDER_RETIRED");
+    expect(createTask(value, { idempotencyKey: key })).toEqual(active);
+    expect(value.store.edit({ sessionId: value.sessionId, taskId: active.id,
+      expectedRevision: active.revision, patch: { status: "paused" }, idempotencyKey: idempotencyKey() }))
+      .toMatchObject({ status: "paused", nextDueAt: null });
+    expect(value.store.delete({ sessionId: value.sessionId, taskId: paused.id,
+      expectedRevision: paused.revision, idempotencyKey: idempotencyKey() })).toMatchObject({ deleted: true });
+  });
+
+  test("rechecks retirement after asynchronous project validation before writing an occurrence", async () => {
+    const value = fixture({ resolveProjectDirectory: async (root) => {
+      value.database.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(value.sessionId);
+      return root;
+    } });
+    const active = createTask(value);
+    expect(await value.store.materializeDue({ now: active.nextDueAt! })).toEqual([]);
+    expect(value.store.nextDueAt()).toBeNull();
+    expect(value.store.require(value.sessionId, active.id)).toEqual(active);
+    expect(value.store.listOccurrences(value.sessionId, active.id)).toEqual([]);
+    expect(value.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
+  });
+});
+
 describe("SessionTaskStore schema authority", () => {
   const databaseWithSchema = (schema: string): Database => {
     const database = new Database(":memory:", { strict: true });
@@ -694,9 +734,11 @@ describe("SessionTaskStore mutation authority", () => {
 });
 
 describe("SessionTaskStore due materialization", () => {
-  test("materializes a managed Devin task once while its durable profile is signed out", async () => {
-    const value = fixture({
-      isExecutionAuthorityLive: (authority) => authority.provider === "devin",
+  test("retains an inert managed Devin task while its durable profile is signed out", async () => {
+    const value = fixture();
+    const created = createTask(value, {
+      name: "Managed Devin follow-up",
+      prompt: "Continue the native Devin conversation.",
     });
     value.database.query(
       "UPDATE profiles SET state='signed_out',provider_email=NULL,codex_account_key=NULL WHERE id=?",
@@ -707,24 +749,13 @@ describe("SessionTaskStore due materialization", () => {
     value.database.query(
       "DELETE FROM session_provider_account_authorities WHERE session_id=?",
     ).run(value.sessionId);
-    const created = createTask(value, {
-      name: "Managed Devin follow-up",
-      prompt: "Continue the native Devin conversation.",
-    });
     const dueAt = created.nextDueAt ?? 0;
 
-    expect(value.store.nextDueAt()).toBe(dueAt);
-    expect(await value.store.materializeDue({ now: dueAt })).toMatchObject([{
-      task: { id: created.id, sessionId: value.sessionId },
-      occurrence: { taskId: created.id, sessionId: value.sessionId },
-      queue: {
-        message: "Continue the native Devin conversation.",
-        sessionId: value.sessionId,
-        state: "pending",
-      },
-    }]);
+    expect(value.store.nextDueAt()).toBeNull();
     expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
-    expect(value.store.listOccurrences(value.sessionId, created.id)).toHaveLength(1);
+    expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+    expect(value.store.require(value.sessionId, created.id)).toEqual(created);
+    expect(value.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
   });
 
   test("materializes an adopted personal Claude task while its profile is signed out", async () => {
@@ -1210,87 +1241,6 @@ describe("SessionTaskStore due materialization", () => {
       occurrence: { taskId: created.id },
       queue: { sessionId: value.sessionId },
     }]);
-  });
-
-  test("requires positive exact-generation Devin authority and rechecks it at commit", async () => {
-    const unproven = fixture();
-    const unprovenTask = createTask(unproven);
-    unproven.database.query("UPDATE sessions SET provider_v39='devin'").run();
-    unproven.database.query("UPDATE profiles SET state='signed_out'").run();
-    expect(unproven.store.nextDueAt()).toBe(unprovenTask.nextDueAt);
-    expect(await unproven.store.materializeDue({
-      now: unprovenTask.nextDueAt ?? 0,
-    })).toEqual([]);
-    expect(unproven.store.require(unproven.sessionId, unprovenTask.id).nextDueAt)
-      .toBe(unprovenTask.nextDueAt);
-
-    const loadableAuthorities: SessionTaskExecutionAuthority[] = [];
-    const loadable = fixture({
-      isExecutionAuthorityLive: (authority) => {
-        loadableAuthorities.push(authority);
-        return authority.provider === "devin";
-      },
-    });
-    const loadableTask = createTask(loadable);
-    loadable.database.query("UPDATE sessions SET provider_v39='devin'").run();
-    loadable.database.query("UPDATE profiles SET state='signed_out'").run();
-    await expect(loadable.store.materializeDue({
-      now: loadableTask.nextDueAt ?? 0,
-    })).resolves.toMatchObject([{
-      occurrence: { taskId: loadableTask.id },
-      queue: { sessionId: loadable.sessionId },
-    }]);
-    expect(loadableAuthorities).toHaveLength(2);
-    expect(loadableAuthorities[0]).toMatchObject({
-      processGeneration: 1,
-      provider: "devin",
-      providerThreadId: `thread-${loadable.sessionId}`,
-      sessionId: loadable.sessionId,
-    });
-
-    let oracleCalls = 0;
-    const closedDuringReview = fixture({
-      isExecutionAuthorityLive: (authority) => {
-        expect(authority.provider).toBe("devin");
-        oracleCalls += 1;
-        return oracleCalls === 1;
-      },
-    });
-    const closedTask = createTask(closedDuringReview);
-    closedDuringReview.database.query("UPDATE sessions SET provider_v39='devin'").run();
-    expect(await closedDuringReview.store.materializeDue({
-      now: closedTask.nextDueAt ?? 0,
-    })).toEqual([]);
-    expect(oracleCalls).toBe(2);
-    expect(closedDuringReview.store.listOccurrences(
-      closedDuringReview.sessionId,
-      closedTask.id,
-    )).toEqual([]);
-
-    const seenGenerations: number[] = [];
-    let generationFixture: Fixture | undefined;
-    const generationChanged = fixture({
-      isExecutionAuthorityLive: (authority) => {
-        seenGenerations.push(authority.processGeneration);
-        return authority.processGeneration === 1;
-      },
-      resolveProjectDirectory: async (root) => {
-        generationFixture?.database.query(
-          "UPDATE profiles SET process_generation=2",
-        ).run();
-        return root;
-      },
-    });
-    generationFixture = generationChanged;
-    const generationTask = createTask(generationChanged);
-    generationChanged.database.query("UPDATE sessions SET provider_v39='devin'").run();
-    expect(await generationChanged.store.materializeDue({
-      now: generationTask.nextDueAt ?? 0,
-    })).toEqual([]);
-    expect(seenGenerations).toEqual([1, 2]);
-    expect(generationChanged.database.query(
-      "SELECT COUNT(*) AS count FROM queue_entries",
-    ).get()).toEqual({ count: 0 });
   });
 
   test("rolls back queue allocation, occurrence, and due advance as one unit", async () => {

@@ -9,7 +9,7 @@ import {
   hraMemoryRememberInputSchema,
   hraMemoryShareInputSchema,
 } from "./host-tools";
-import { adoptableProviderSchema, presetSchema, providerSchema } from "./presets";
+import { adoptableProviderSchema, presetSchema, providerSchema, supportedPresetSchema, supportedProviderSchema } from "./presets";
 import { interactionResolutionSchema } from "./interactions";
 import { notificationEmailPolicySchema } from "./notification-email";
 import {
@@ -351,33 +351,8 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     acknowledgeChildExited: z.literal(true),
   }).strict(),
-  z.object({
-    kind: z.literal("account.devin-login.prepare"),
-    account: selectorSchema,
-    idempotencyKey: requiredIdempotencyKeySchema,
-    manualTokenFlow: z.boolean(),
-  }).strict(),
-  z.object({
-    kind: z.literal("account.devin-login.complete"),
-    account: selectorSchema,
-    attemptId: attemptIdSchema,
-    idempotencyKey: requiredIdempotencyKeySchema,
-    providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    outcome: z.union([
-      z.object({
-        state: z.literal("joined"),
-        exitCode: z.number().int().nonnegative().max(255),
-        interruptedBy: z.enum(["SIGINT", "SIGTERM"]).nullable(),
-      }).strict(),
-      z.object({ state: z.literal("not_started"), reason: z.literal("spawn_failed") }).strict(),
-      z.object({ state: z.literal("not_started"), reason: z.literal("preflight_stale") }).strict(),
-      z.object({
-        state: z.literal("not_started"),
-        reason: z.literal("interrupted_before_spawn"),
-        interruptedBy: z.enum(["SIGINT", "SIGTERM"]),
-      }).strict(),
-    ]),
-  }).strict(),
+  // Cleanup-only authority for a historical foreground grant. No launch or
+  // authentication completion is admitted for the retired provider.
   z.object({
     kind: z.literal("account.devin-login.abandon"),
     account: selectorSchema,
@@ -493,7 +468,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     limit: z.number().int().min(1).max(100),
     cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
-  z.object({ kind: z.literal("session.start"), account: selectorSchema, project: selectorSchema.optional(), provider: providerSchema.optional(), preset: presetSchema, fast: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.start"), account: selectorSchema, project: selectorSchema.optional(), provider: supportedProviderSchema.optional(), preset: supportedPresetSchema, fast: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
   // `attachments` is optional and absent by default, so a message with no
   // attachment serializes exactly as it did before attachments existed. The
   // references name digests in local custody; no path ever crosses this
@@ -524,7 +499,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.note.edit"), session: selectorSchema }).strict(),
   z.object({ kind: z.literal("session.note.set"), session: selectorSchema, note: noteSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.note.clear"), session: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
-  z.object({ kind: z.literal("session.preset"), session: selectorSchema, preset: presetSchema, idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("session.preset"), session: selectorSchema, preset: supportedPresetSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   /**
    * Move one live conversation to another provider. `preset` and `account`
    * are optional: an omitted preset keeps the session's tier when the target
@@ -534,8 +509,8 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("session.switch"),
     session: selectorSchema,
-    provider: providerSchema,
-    preset: presetSchema.optional(),
+    provider: supportedProviderSchema,
+    preset: supportedPresetSchema.optional(),
     account: selectorSchema.optional(),
     idempotencyKey: idempotencyKeySchema,
   }).strict(),

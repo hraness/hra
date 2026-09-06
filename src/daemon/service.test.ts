@@ -19,8 +19,6 @@ import {
 } from "../codex";
 import { parseFact } from "../codex/protocol";
 import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../claude/pin";
-import { DevinError } from "../devin/errors";
-import { DEVIN_PIN } from "../devin/pin";
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import { AccountKeyLossPreconditionError } from "../cloud/local-control";
 import {
@@ -54,9 +52,9 @@ import type { PreparedAttachment } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
 import { presetRequirements } from "../domain/presets";
+import { createQueueId } from "../domain/values";
 import type {
   EffectiveClaudeRuntimeProfile,
-  EffectiveDevinRuntimeProfile,
   EffectiveRuntimeProfile,
 } from "../domain/runtime-profile";
 import {
@@ -83,7 +81,7 @@ import type {
   HraFactsMemoryLifecyclePort,
   HraFactsMemoryLifecycleReceipt,
 } from "./facts-memory-lifecycle";
-import { ClaudeProcessExitUnprovenError, ClaudeSessionObservationError, CodexClaimReleaseUnprovenError, CodexSessionObservationError, UnavailableClaudeRuntime, UnavailableCloudControl, type ClaudeProcessIdentity, type ClaudeRuntimePort, type ClaudeRuntimeStartReview, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionObservation, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type DevinRuntimePort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
+import { ClaudeProcessExitUnprovenError, ClaudeSessionObservationError, CodexClaimReleaseUnprovenError, CodexSessionObservationError, UnavailableClaudeRuntime, UnavailableCloudControl, type ClaudeProcessIdentity, type ClaudeRuntimePort, type ClaudeRuntimeStartReview, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionObservation, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import {
   BoundedPersonalSessionDiscovery,
   CLAUDE_REGISTRY_MAX_RECORDS,
@@ -146,6 +144,10 @@ class FakeCodex implements CodexRuntimePort {
   observeError?: Error;
   observeErrorOnce?: Error;
   observationConnectionId = "30000000-0000-4000-8000-000000000001";
+  liveHostToolCall = true;
+  readonly liveHostToolCallRequests: Array<Parameters<NonNullable<
+    CodexRuntimePort["hasLiveHostToolCall"]
+  >>[0]> = [];
   observationThreadIdOverride?: string;
   activeObservations = 0;
   maximumConcurrentObservations = 0;
@@ -393,6 +395,13 @@ class FakeCodex implements CodexRuntimePort {
       },
       resumed: true,
     };
+  }
+  hasLiveHostToolCall(
+    input: Parameters<NonNullable<CodexRuntimePort["hasLiveHostToolCall"]>>[0],
+  ): boolean {
+    this.liveHostToolCallRequests.push(input);
+    return this.liveHostToolCall
+      && input.connectionId === this.observationConnectionId;
   }
   async reviewSessionStart(input: Parameters<CodexRuntimePort["reviewSessionStart"]>[0]): Promise<RuntimeStartReview> {
     this.calls.push("review-session");
@@ -642,6 +651,10 @@ class FakeClaude implements ClaudeRuntimePort {
   claimSessionError?: Error;
   disconnectOnObserveRequest?: number;
   observationConnectionId = "30000000-0000-4000-8000-0000000000c1";
+  liveHostToolCall = true;
+  readonly liveHostToolCallRequests: Array<Parameters<NonNullable<
+    ClaudeRuntimePort["hasLiveHostToolCall"]
+  >>[0]> = [];
   observationConnectionIdOnClaim?: string;
   observePause?: Promise<void>;
   observePauseStarted?: () => void;
@@ -701,6 +714,15 @@ class FakeClaude implements ClaudeRuntimePort {
   }): boolean {
     void input.authority;
     return this.controllerLive && this.projection.providerThreadId === input.providerThreadId;
+  }
+
+  hasLiveHostToolCall(
+    input: Parameters<NonNullable<ClaudeRuntimePort["hasLiveHostToolCall"]>>[0],
+  ): boolean {
+    this.liveHostToolCallRequests.push(input);
+    return this.liveHostToolCall
+      && this.controllerLive
+      && input.connectionId === this.observationConnectionId;
   }
 
   async activateSessionHostTools(
@@ -1353,6 +1375,7 @@ afterEach(async () => {
 
 type FixtureAdoptionOptions = Readonly<{
   managedClaude?: ClaudeRuntimePort;
+  memory?: HraMemoryPort;
   personalCodex?: CodexRuntimePort;
   personalClaude?: ClaudeRuntimePort;
   personalDiscovery?: PersonalSessionDiscoveryPort;
@@ -1367,7 +1390,6 @@ type FixtureAdoptionOptions = Readonly<{
 const isHraMemoryPort = (
   value: FixtureAdoptionOptions | HraMemoryPort | NodeJS.Platform | undefined,
 ): value is HraMemoryPort => typeof value === "object"
-  && value !== null
   && typeof (value as Partial<HraMemoryPort>).status === "function"
   && typeof (value as Partial<HraMemoryPort>).remember === "function";
 
@@ -1380,7 +1402,6 @@ async function fixture(
   autorespond: Readonly<{
     beforeMemoryClose?: () => Promise<void>;
     claude?: ClaudeRuntimePort;
-    devin?: DevinRuntimePort;
     gatewayKeys?: GatewayKeyPort;
     proseResponder?: ProseResponder;
   }> = {},
@@ -1402,13 +1423,13 @@ async function fixture(
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  const memory = isHraMemoryPort(adoptionOrMemoryOrPlatform)
-    ? adoptionOrMemoryOrPlatform
-    : undefined;
   const adoption: FixtureAdoptionOptions = typeof adoptionOrMemoryOrPlatform === "object"
     && !isHraMemoryPort(adoptionOrMemoryOrPlatform)
     ? adoptionOrMemoryOrPlatform
     : {};
+  const memory = isHraMemoryPort(adoptionOrMemoryOrPlatform)
+    ? adoptionOrMemoryOrPlatform
+    : adoption.memory;
   const explicitClaude = typeof platformOrClaude === "string"
     ? undefined
     : platformOrClaude;
@@ -1427,7 +1448,6 @@ async function fixture(
       daemonAuthority,
       ...(desktop === undefined ? {} : { desktop }),
       ...(managedClaude === undefined ? {} : { claude: managedClaude }),
-      ...(autorespond.devin === undefined ? {} : { devin: autorespond.devin }),
       eventCursors,
       ...(factsMemory === undefined ? {} : { factsMemory }),
       ...(memory === undefined ? {} : { memory }),
@@ -1687,6 +1707,8 @@ async function adoptedClaudeFixture(
   title = `${label} personal thread`,
   platform: NodeJS.Platform = "linux",
   signInCodex = true,
+  now: () => number = () => personalAdoptionNow,
+  memory?: HraMemoryPort,
 ) {
   const personalIdentity: ClaudeProcessIdentity = {
     pid: 63_001,
@@ -1704,7 +1726,7 @@ async function adoptedClaudeFixture(
     undefined,
     new FakeCloud(),
     () => undefined,
-    () => personalAdoptionNow,
+    now,
     undefined,
     {},
     {
@@ -1712,6 +1734,7 @@ async function adoptedClaudeFixture(
       personalClaude,
       personalCodexHome,
       personalDiscovery: discovery,
+      ...(memory === undefined ? {} : { memory }),
     },
     platform,
   );
@@ -1906,74 +1929,27 @@ async function claudeAccountFixture(
   };
 }
 
-async function devinAccountFixture(initiallySignedIn = false) {
-  let signedIn = initiallySignedIn;
-  let readError: Error | undefined;
-  let readCalls = 0;
-  const providerSessionCalls: string[] = [];
-  const devin = {
-    provider: "devin" as const,
-    readAccount: async () => {
-      readCalls += 1;
-      if (readError !== undefined) throw readError;
-      return { signedIn };
-    },
-    observeSession: async () => {
-      providerSessionCalls.push("observe-session");
-      throw new Error("Devin session observation was not expected.");
-    },
-    readSession: async () => {
-      providerSessionCalls.push("read-session");
-      throw new Error("Devin session read was not expected.");
-    },
-    reviewSessionStart: async () => {
-      providerSessionCalls.push("review-session-start");
-      throw new Error("Devin session start review was not expected.");
-    },
-    reviewTurnStart: async () => {
-      providerSessionCalls.push("review-turn-start");
-      throw new Error("Devin turn review was not expected.");
-    },
-    startSession: async () => {
-      providerSessionCalls.push("start-session");
-      throw new Error("Devin session start was not expected.");
-    },
-    startTurn: async () => {
-      providerSessionCalls.push("start-turn");
-      throw new Error("Devin turn start was not expected.");
-    },
-    steer: async () => {
-      providerSessionCalls.push("steer");
-      throw new Error("Devin steer was not expected.");
-    },
-    interrupt: async () => {
-      providerSessionCalls.push("interrupt");
-      throw new Error("Devin interrupt was not expected.");
-    },
-    endSession: async () => {
-      providerSessionCalls.push("end-session");
-      throw new Error("Devin session end was not expected.");
-    },
-    interactionAuthority: () => { throw new Error("No Devin session interaction expected."); },
-    rebindProfileAuthority: () => undefined,
-    pinnedVersion: () => DEVIN_PIN,
-    close: async () => undefined,
-  } as unknown as DevinRuntimePort;
-  const value = await fixture(
-    undefined,
-    new FakeCloud(),
-    () => undefined,
-    Date.now,
-    undefined,
-    { devin },
-  );
-  return {
-    ...value,
-    devinReadCalls: () => readCalls,
-    providerSessionCalls,
-    setDevinReadError: (value: Error | undefined) => { readError = value; },
-    setDevinSignedIn: (value: boolean) => { signedIn = value; },
-  };
+// Seed the durable v39 representation, not an active retired-provider API.
+function legacyDevinSession(
+  value: Awaited<ReturnType<typeof fixture>>,
+  profileId: Parameters<StateStore["createSession"]>[0]["profileId"],
+) {
+  const created = value.store.createSession({
+    profileId, provider: "codex", preset: "ultra", fastEnabled: false,
+    title: "Historical Devin",
+  });
+  value.store.bindSession({
+    sessionId: created.id, expectedRevision: created.revision,
+    providerThreadId: "historical-devin-thread", state: "idle",
+  });
+  const legacy = new Database(value.paths.database, { strict: true });
+  try {
+    legacy.query("DELETE FROM session_provider_account_authorities WHERE session_id=?").run(created.id);
+    legacy.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(created.id);
+  } finally {
+    legacy.close();
+  }
+  return value.store.requireSession(created.id);
 }
 
 async function createIdleSession(
@@ -3648,7 +3624,7 @@ describe("HraService personal-session adoption", () => {
     if (session === null || session.projectId === undefined) {
       throw new Error("Expected the real scheduled target to become a project-bound session.");
     }
-    expect(value.store.isConversationAutomationEnabled(session.id, providerThreadId)).toBe(true);
+    expect(value.store.isConversationAutomationEnabled(session.id, providerThreadId)).toBe(false);
     expect(value.store.createSessionTaskStore().list(session.id)).toEqual([]);
     expect(await readFile(automationPath, "utf8")).toBe(automationDocument);
 
@@ -5262,7 +5238,7 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.isConversationAutomationEnabled(
       value.session.id,
       "personal-thread-routing",
-    )).toBe(true);
+    )).toBe(false);
     expect(value.store.readSessionPersonalRuntimeBinding(value.session.id)).toMatchObject({
       provider: "codex",
       providerThreadId: "personal-thread-routing",
@@ -5695,7 +5671,7 @@ describe("HraService personal-session adoption", () => {
     )).toBeNull();
   });
 
-  test("pages every authorized local session while provider listing is recovery-blocked", async () => {
+  test("pages every authorized local session and retired history while provider listing is recovery-blocked", async () => {
     const cloud = new FakeCloud();
     const value = await fixture(undefined, cloud);
     const added = await value.service.execute(
@@ -5720,6 +5696,8 @@ describe("HraService personal-session adoption", () => {
       });
       return session.id;
     }));
+    expectedIds.add(legacyDevinSession(value, added.account.id).id);
+    const callsBeforeListing = [...value.codex.calls];
     cloud.unsettledProjectionProfiles.add(added.account.id);
     value.codex.listedProjections = [{
       providerThreadId: "recovery-blocked-provider-thread",
@@ -5729,7 +5707,7 @@ describe("HraService personal-session adoption", () => {
 
     const listedIds: string[] = [];
     let cursor: string | undefined;
-    for (let pageIndex = 0; pageIndex < 3; pageIndex += 1) {
+    for (let pageIndex = 0; pageIndex < expectedIds.size; pageIndex += 1) {
       const page = await value.service.execute({
         kind: "session.list",
         archived: false,
@@ -5744,7 +5722,7 @@ describe("HraService personal-session adoption", () => {
       expect(page.sessions).toHaveLength(1);
       expect(page.recovery.required).toBe(true);
       listedIds.push(page.sessions[0]?.id ?? "missing-session");
-      if (pageIndex < 2) {
+      if (pageIndex < expectedIds.size - 1) {
         expect(page.nextCursor).not.toBeNull();
         cursor = page.nextCursor ?? undefined;
       } else {
@@ -5755,6 +5733,7 @@ describe("HraService personal-session adoption", () => {
     expect(new Set(listedIds)).toEqual(expectedIds);
     expect(listedIds).toHaveLength(expectedIds.size);
     expect(value.codex.sessionListRequests).toEqual([]);
+    expect(value.codex.calls).toEqual(callsBeforeListing);
     expect(value.store.findSessionByProviderThread(
       added.account.id,
       "recovery-blocked-provider-thread",
@@ -7087,6 +7066,56 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.readMutation(idempotencyKey)).toMatchObject({
       resolution: { kind: "proven_applied" },
       state: "reconciled",
+    });
+  });
+
+  test("acknowledges only the exact completed provider switch after its response is lost", async () => {
+    const value = await adoptedClaudeFixture(
+      "Completed Claude switch acknowledgement",
+      "completed-claude-switch-source",
+    );
+    const idempotencyKey = crypto.randomUUID();
+    const complete = value.store.completeSessionProviderSwitch.bind(value.store);
+    Object.defineProperty(value.store, "completeSessionProviderSwitch", {
+      configurable: true,
+      value: (input: Parameters<StateStore["completeSessionProviderSwitch"]>[0]) => {
+        complete(input);
+        throw new Error("simulated lost provider-switch response");
+      },
+    });
+    try {
+      const outcome = await value.service.execute({
+        idempotencyKey,
+        kind: "session.switch",
+        provider: "codex",
+        session: value.session.id,
+      }, { signal }).catch((error: unknown) => ({
+        error,
+        mutation: value.store.readMutation(idempotencyKey),
+      }));
+      expect(outcome).toMatchObject({
+        idempotencyKey,
+        session: { id: value.session.id, provider: "codex" },
+        from: { provider: "claude" },
+        to: { provider: "codex" },
+        seed: { delivered: true },
+      });
+    } finally {
+      Object.defineProperty(value.store, "completeSessionProviderSwitch", {
+        configurable: true,
+        value: complete,
+      });
+    }
+
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({
+      authorityId: value.session.id,
+      idempotencyKey,
+      kind: "session.switch",
+      state: "applied",
+    });
+    expect(value.store.requireSession(value.session.id)).toMatchObject({
+      provider: "codex",
+      state: "active",
     });
   });
 
@@ -9422,12 +9451,179 @@ describe("HraService", () => {
     expect(providerMutationCalls(value.codex)).toHaveLength(providerWritesBefore.length + 1);
   });
 
-  test("fences established and peer Claude and Devin targets with universally unavailable profiles", async () => {
-    for (const provider of ["claude", "devin"] as const) {
+  test("settles an applied nested peer send after restart without replaying the provider", async () => {
+    const value = await fixture();
+    const { sessionId: actorSessionId } = await createIdleSession(
+      value,
+      "Applied peer receipt restart",
+    );
+    const idleActor = value.store.requireSession(actorSessionId);
+    if (idleActor.projectId === undefined || idleActor.providerThreadId === undefined) {
+      throw new Error("Expected a project-bound actor session.");
+    }
+    const targetBase = value.store.createSession({
+      profileId: idleActor.profileId,
+      projectId: idleActor.projectId,
+      title: "Applied peer receipt restart target",
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = value.store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "provider-peer-applied-restart",
+      state: "idle",
+      providerUpdatedAt: 11,
+    });
+    if (target.providerThreadId === undefined) throw new Error("Expected a bound peer target.");
+    value.store.bindSessionProviderAccountAuthority({
+      sessionId: target.id,
+      provider: "codex",
+      runtimeScope: "managed",
+      accountKey: codexProviderAccountKey(),
+    });
+    await value.service.execute({
+      kind: "session.send",
+      session: actorSessionId,
+      message: "Start the applied-receipt peer actor.",
+    }, { signal });
+    const actor = value.store.requireSession(actorSessionId);
+    const profile = value.store.requireProfileById(actor.profileId);
+    if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+      throw new Error("Expected an active bound actor turn.");
+    }
+    value.codex.readProjection = {
+      providerThreadId: target.providerThreadId,
+      title: target.title,
+      status: "idle",
+      providerUpdatedAt: 11,
+    };
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const call = {
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+      },
+      callId: "peer-applied-receipt-restart",
+      connectionId: value.codex.observationConnectionId,
+      input: {
+        sessionId: target.id,
+        expectedRevision: target.revision,
+        delivery: "send" as const,
+        message: "Commit this nested peer send exactly once.",
+        reason: "Prove restart joins the applied nested receipt",
+      },
+      requestDigest: createHash("sha256").update("peer-applied-receipt-restart").digest("hex"),
+      requestId: { type: "string" as const, value: "peer-applied-receipt-restart" },
+      threadId: actor.providerThreadId,
+      tool: "session_message" as const,
+      turnId: actor.activeTurnId,
+    } satisfies HraHostToolCall;
+    const originalSettle = value.store.settlePeerSessionAction.bind(value.store);
+    let injectedSettlements = 0;
+    (value.store as unknown as {
+      settlePeerSessionAction: StateStore["settlePeerSessionAction"];
+    }).settlePeerSessionAction = (input) => {
+      if (input.state === "applied") {
+        injectedSettlements += 1;
+        throw new Error("injected after nested peer receipt commit");
+      }
+      return originalSettle(input);
+    };
+    const providerWritesBefore = providerMutationCalls(value.codex);
+    try {
+      await expect(value.service.handleHraHostToolCall(
+        authority,
+        call,
+        MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+      )).rejects.toThrow("injected after nested peer receipt commit");
+    } finally {
+      (value.store as unknown as {
+        settlePeerSessionAction: StateStore["settlePeerSessionAction"];
+      }).settlePeerSessionAction = originalSettle;
+    }
+
+    expect(injectedSettlements).toBe(2);
+    const [unsettled] = value.store.listUnsettledPeerSessionActions(10);
+    if (unsettled === undefined) throw new Error("Expected an unsettled peer action.");
+    expect(unsettled).toMatchObject({ state: "effect_started", targetSessionId: target.id });
+    expect(value.store.readMutation(unsettled.idempotencyKey)).toMatchObject({
+      state: "applied",
+      result: { turnId: "turn-next-2" },
+    });
+    expect(providerMutationCalls(value.codex)).toHaveLength(providerWritesBefore.length + 1);
+
+    const oldStoreIndex = stores.indexOf(value.store);
+    if (oldStoreIndex < 0) throw new Error("Expected the fixture store to be tracked.");
+    value.daemonAuthority.invalidate();
+    value.store.close();
+    stores.splice(oldStoreIndex, 1);
+    const restartedStore = new StateStore(value.paths);
+    stores.push(restartedStore);
+    const daemonGeneration = restartedStore.nextDaemonGeneration(`boot_${"a".repeat(32)}`);
+    const restartedCodex = new FakeCodex();
+    restartedCodex.observationConnectionId = "30000000-0000-4000-8000-000000000002";
+    expect(restartedCodex.observationConnectionId).not.toBe(call.connectionId);
+    restartedCodex.readProjection = {
+      providerThreadId: actor.providerThreadId,
+      title: actor.title,
+      status: "active",
+      activeTurnId: actor.activeTurnId,
+      providerUpdatedAt: 100,
+    };
+    const restarted = new HraService({
+      store: restartedStore,
+      paths: value.paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
+      eventCursors: value.eventCursors,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    const recoveredAction = restartedStore.requirePeerSessionAction(unsettled.id);
+    expect(recoveredAction.state).toBe("applied");
+    expect(typeof recoveredAction.targetTurnDigest).toBe("string");
+    expect(providerMutationCalls(restartedCodex)).toEqual([]);
+
+    const restartedProfile = restartedStore.requireProfileById(actor.profileId);
+    const replayAuthority = {
+      ...authority,
+      generation: restartedProfile.processGeneration,
+    };
+    const replayCall = {
+      ...call,
+      authority: {
+        ...call.authority,
+        processGeneration: restartedProfile.processGeneration,
+      },
+      connectionId: restartedCodex.observationConnectionId,
+    } satisfies HraHostToolCall;
+    const replayed = await restarted.handleHraHostToolCall(
+      replayAuthority,
+      replayCall,
+      MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+    );
+    expect(replayed).toMatchObject({
+      ok: true,
+      replay: true,
+      action: { state: "applied", targetSessionId: target.id },
+    });
+    expect(providerMutationCalls(restartedCodex)).toEqual([]);
+    await restarted.close();
+  });
+
+  test("fences established and peer Claude targets with universally unavailable profiles", async () => {
+    for (const provider of ["claude"] as const) {
       for (const profileState of ["recovery_required", "removed"] as const) {
-        const value = provider === "claude"
-          ? await claudeAccountFixture(true)
-          : await devinAccountFixture(true);
+        const value = await claudeAccountFixture(true);
         const fence = profileState === "removed" ? "removed" : "recovery-fenced";
         const { sessionId: actorSessionId } = await createIdleSession(
           value,
@@ -9441,7 +9637,7 @@ describe("HraService", () => {
           projectId: idleActor.projectId,
           title: `${provider} ${fence} target`,
           provider,
-          preset: provider === "claude" ? "fable-max" : "astra",
+          preset: "fable-max",
           fastEnabled: false,
         });
         const target = value.store.bindSession({
@@ -10045,14 +10241,141 @@ describe("HraService", () => {
     })).resolves.toMatchObject({ ok: true, version: 1 });
   });
 
-  test("admits Darwin personal-Claude facts and host tools only through their exact provenance", async () => {
+  test("preserves exact native legacy automation without granting adopted callbacks", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Native legacy automation");
+    await value.service.execute({
+      kind: "session.send",
+      session: sessionId,
+      message: "Establish the native legacy automation turn.",
+    }, { signal });
+    const actor = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(actor.profileId);
+    if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+      throw new Error("Expected an active native automation actor.");
+    }
+    expect(value.store.isConversationAutomationEnabled(actor.id, actor.providerThreadId))
+      .toBe(true);
+    const legacy = new Database(value.paths.database, { strict: true });
+    try {
+      // Reproduce the durable row shape accepted from releases predating the
+      // host-capability table. The current delete guard correctly makes this
+      // state impossible to create through a live product path.
+      legacy.run("DROP TRIGGER session_host_capability_binding_delete_guard");
+      legacy.query("DELETE FROM session_host_capability_bindings WHERE session_id=?")
+        .run(actor.id);
+    } finally {
+      legacy.close();
+    }
+    expect(value.store.readSessionHostCapabilityBinding(actor.id)).toBeNull();
+
+    const operation = {
+      mode: "create" as const,
+      name: "Native legacy review",
+      prompt: "Continue the exact native session.",
+      schedule: { kind: "interval_minutes" as const, minutes: 15 },
+      paused: true,
+    };
+    const call = {
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+      },
+      callId: "native-legacy-automation",
+      connectionId: value.codex.observationConnectionId,
+      input: operation,
+      operation,
+      requestDigest: createHash("sha256")
+        .update("native-legacy-automation")
+        .digest("hex"),
+      requestId: { type: "string" as const, value: "native-legacy-automation" },
+      threadId: actor.providerThreadId,
+      tool: "automation_update" as const,
+      turnId: actor.activeTurnId,
+    } satisfies HraHostToolCall;
+    await expect(value.service.handleHraHostToolCall({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, call, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({
+      name: operation.name,
+      sessionId: actor.id,
+      status: "paused",
+    });
+    expect(value.store.createSessionTaskStore().list(actor.id)).toEqual([
+      expect.objectContaining({ name: operation.name, status: "paused" }),
+    ]);
+
+    await expect(value.service.handleHraHostToolCall({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, {
+      ...call,
+      callId: "native-legacy-automation-stale-connection",
+      connectionId: "30000000-0000-4000-8000-999999999999",
+      input: { ...operation, name: "Must not use a stale provider connection" },
+      operation: { ...operation, name: "Must not use a stale provider connection" },
+      requestDigest: createHash("sha256")
+        .update("native-legacy-automation-stale-connection")
+        .digest("hex"),
+      requestId: {
+        type: "string" as const,
+        value: "native-legacy-automation-stale-connection",
+      },
+    }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).rejects.toThrow(
+      "CONVERSATION_AUTOMATION_SESSION_UNAVAILABLE",
+    );
+    expect(value.store.createSessionTaskStore().list(actor.id)).toHaveLength(1);
+
+    const incompatible = new Database(value.paths.database, { strict: true });
+    try {
+      incompatible.query(
+        `INSERT INTO session_host_capability_bindings(
+           session_id,preamble_version,preamble_digest,manifest_version,
+           manifest_digest,recorded_at
+         ) VALUES (?,?,?,?,?,?)`,
+      ).run(actor.id, 999, "a".repeat(64), 999, "b".repeat(64), Date.now());
+    } finally {
+      incompatible.close();
+    }
+    const incompatibleCall = {
+      ...call,
+      callId: "native-legacy-automation-incompatible-binding",
+      input: { ...operation, name: "Must not bypass an incompatible binding" },
+      operation: { ...operation, name: "Must not bypass an incompatible binding" },
+      requestDigest: createHash("sha256")
+        .update("native-legacy-automation-incompatible-binding")
+        .digest("hex"),
+      requestId: {
+        type: "string" as const,
+        value: "native-legacy-automation-incompatible-binding",
+      },
+    } satisfies HraHostToolCall;
+    await expect(value.service.handleHraHostToolCall({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, incompatibleCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).rejects.toThrow(
+      "CONVERSATION_AUTOMATION_SESSION_UNAVAILABLE",
+    );
+    expect(value.store.createSessionTaskStore().list(actor.id)).toHaveLength(1);
+  });
+
+  test("admits Darwin personal-Claude custody without fabricating host-tool authority", async () => {
+    const memory = new FakeMemory();
     const value = await adoptedClaudeFixture(
-      "Darwin Claude host tools",
-      "darwin-personal-claude-host-tools",
+      "Darwin Claude adopted custody",
+      "darwin-personal-claude-adopted-custody",
       undefined,
       undefined,
       "darwin",
       false,
+      undefined,
+      memory,
     );
     const authority = value.personalClaude.claimRequests[0]?.authority;
     if (authority === undefined) throw new Error("Expected personal Claude authority.");
@@ -10061,16 +10384,11 @@ describe("HraService", () => {
       provider: "claude",
       state: "active",
     });
-    expect(value.store.requireSessionHostCapabilityBinding(value.session.id)).toBeDefined();
+    expect(value.store.readSessionHostCapabilityBinding(value.session.id)).toBeNull();
     if (value.session.providerThreadId === undefined) {
       throw new Error("Expected an adopted personal Claude provider thread.");
     }
-    expect(value.personalClaude.hostToolActivationRequests).toEqual([
-      expect.objectContaining({
-        authority,
-        providerThreadId: value.session.providerThreadId,
-      }),
-    ]);
+    expect(value.personalClaude.hostToolActivationRequests).toEqual([]);
 
     await value.service.observePersonalClaudeFact(authority, {
       connectionId: value.personalClaude.observationConnectionId,
@@ -10109,7 +10427,7 @@ describe("HraService", () => {
     await expect(value.service.handleHraHostToolCall(authority, listCall, {
       provider: "claude",
       source: "personal",
-    })).resolves.toMatchObject({ ok: true, version: 1 });
+    })).rejects.toThrow("SESSION_HOST_CAPABILITY_BINDING_MISSING");
     await expect(value.service.handleHraHostToolCall(authority, listCall, {
       provider: "claude",
       source: "managed",
@@ -10137,15 +10455,22 @@ describe("HraService", () => {
       requestId: { type: "string" as const, value: "darwin-personal-claude-automation" },
       tool: "automation_update" as const,
     } satisfies HraHostToolCall;
-    const created = await value.service.handleHraHostToolCall(authority, automationCall, {
+    const forgedAutomation = new Database(value.paths.database, { strict: true });
+    try {
+      forgedAutomation.query(
+        "INSERT INTO session_conversation_automation(session_id,provider_thread_id,enabled_at) VALUES (?,?,?)",
+      ).run(actor.id, actor.providerThreadId, Date.now());
+    } finally {
+      forgedAutomation.close();
+    }
+    expect(value.store.isConversationAutomationEnabled(actor.id, actor.providerThreadId))
+      .toBe(true);
+    expect(value.store.hasNativeConversationAutomationAuthority(actor.id, actor.providerThreadId))
+      .toBe(false);
+    await expect(value.service.handleHraHostToolCall(authority, automationCall, {
       provider: "claude",
       source: "personal",
-    });
-    expect(created).toMatchObject({
-      name: operation.name,
-      sessionId: actor.id,
-      status: "paused",
-    });
+    })).rejects.toThrow("CONVERSATION_AUTOMATION_SESSION_UNAVAILABLE");
     await expect(value.service.handleHraHostToolCall(authority, {
       ...automationCall,
       callId: "darwin-personal-claude-automation-wrong-source",
@@ -10157,19 +10482,25 @@ describe("HraService", () => {
       source: "managed",
     })).rejects.toThrow("CONVERSATION_AUTOMATION_AUTHORITY_STALE");
 
-    expect(() => value.service.notifyHraHostToolResponseWritten(
-      authority,
-      automationCall,
-      { provider: "claude", source: "personal" },
-    )).not.toThrow();
-    expect(() => value.service.notifyHraHostToolResponseWritten(
-      authority,
-      automationCall,
-      { provider: "claude", source: "managed" },
-    )).not.toThrow();
-    expect(value.store.createSessionTaskStore().list(actor.id)).toEqual([
-      expect.objectContaining({ name: operation.name, status: "paused" }),
-    ]);
+    expect(value.store.createSessionTaskStore().list(actor.id)).toEqual([]);
+
+    await expect(value.service.execute({
+      kind: "memory.status",
+      session: actor.id,
+    }, { signal })).resolves.toMatchObject({ kind: "status", sessionId: actor.id });
+    await expect(value.service.execute({
+      kind: "memory.remember",
+      session: actor.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000606",
+      value: {
+        key: "adopted.custody",
+        title: "Adopted custody",
+        summary: "Owner memory remains available without provider host tools.",
+        body: "The adopted provider snapshot grants no HRA callback capability.",
+      },
+    }, { signal })).resolves.toMatchObject({ idempotencyKey: "00000000-0000-4000-8000-000000000606" });
+    expect(memory.statuses).toEqual([{ actorSessionId: actor.id }]);
+    expect(memory.remembers).toHaveLength(1);
 
     await value.service.observePersonalClaudeFact(authority, {
       connectionId: value.personalClaude.observationConnectionId,
@@ -10759,6 +11090,213 @@ describe("HraService", () => {
     expect(memory.queries).toEqual([]);
   });
 
+  test("revalidates peer actor account authority after acquiring both session locks", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud);
+    const { sessionId: actorSessionId } = await createIdleSession(
+      value,
+      "Queued peer actor account authority",
+    );
+    const idleActor = value.store.requireSession(actorSessionId);
+    if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
+    const targetBase = value.store.createSession({
+      profileId: idleActor.profileId,
+      projectId: idleActor.projectId,
+      title: "Queued peer actor account authority target",
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const target = value.store.bindSession({
+      sessionId: targetBase.id,
+      expectedRevision: targetBase.revision,
+      providerThreadId: "provider-peer-actor-account-authority-target",
+      state: "idle",
+      providerUpdatedAt: 11,
+    });
+    value.store.bindSessionProviderAccountAuthority({
+      sessionId: target.id,
+      provider: "codex",
+      runtimeScope: "managed",
+      accountKey: codexProviderAccountKey(),
+    });
+    await value.service.execute({
+      kind: "session.send",
+      message: "Begin the peer actor account-authority call.",
+      session: actorSessionId,
+    }, { signal });
+    const actor = value.store.requireSession(actorSessionId);
+    const profile = value.store.requireProfileById(actor.profileId);
+    if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+      throw new Error("Expected an active peer actor.");
+    }
+    let releaseCheck: (() => void) | undefined;
+    let enteredCheck: (() => void) | undefined;
+    const entered = new Promise<void>((resolve) => { enteredCheck = resolve; });
+    const blocked = new Promise<void>((resolve) => { releaseCheck = resolve; });
+    cloud.beforeProjectionUnsettledSessionReturn = async () => {
+      enteredCheck?.();
+      await blocked;
+    };
+    const providerWritesBefore = providerMutationCalls(value.codex);
+    const pending = value.service.handleHraHostToolCall({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, {
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+      },
+      callId: "peer-actor-account-authority-stale",
+      connectionId: value.codex.observationConnectionId,
+      input: {
+        sessionId: target.id,
+        expectedRevision: target.revision,
+        delivery: "send",
+        message: "Do not dispatch under an unprovable actor account.",
+        reason: "Prove actor account authority is rechecked under both locks",
+      },
+      requestDigest: createHash("sha256")
+        .update("peer-actor-account-authority-stale")
+        .digest("hex"),
+      requestId: { type: "string", value: "peer-actor-account-authority-stale" },
+      threadId: actor.providerThreadId,
+      tool: "session_message",
+      turnId: actor.activeTurnId,
+    }, MANAGED_CODEX_HOST_TOOL_PROVENANCE);
+    await entered;
+    const direct = new Database(value.paths.database, { create: false, strict: true });
+    try {
+      direct.query("DELETE FROM session_provider_account_authorities WHERE session_id=?")
+        .run(actor.id);
+    } finally {
+      direct.close();
+    }
+    expect(value.store.sessionAccountAuthorityMatches(actor.id, profile.id)).toBe(false);
+    releaseCheck?.();
+    await expect(pending).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
+    expect(value.store.listRecentPeerSessionActions()).toEqual([]);
+    expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
+  });
+
+  test("requires exact live runtime authority before and after the host-tool session lock", async () => {
+    const memory = new FakeMemory();
+    const cloud = new FakeCloud();
+    const value = await fixture(
+      undefined,
+      cloud,
+      () => undefined,
+      Date.now,
+      undefined,
+      {},
+      memory,
+    );
+    const { sessionId } = await createIdleSession(value, "Queued runtime host-tool authority");
+    await value.service.execute({
+      kind: "session.send",
+      message: "Begin the runtime-authority host-tool call.",
+      session: sessionId,
+    }, { signal });
+    const actor = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(actor.profileId);
+    if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+      throw new Error("Expected an active runtime-authority actor.");
+    }
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const call = {
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+      },
+      callId: "memory-query-runtime-authority-stale",
+      connectionId: value.codex.observationConnectionId,
+      input: { mode: "list" as const },
+      requestDigest: createHash("sha256")
+        .update("memory-query-runtime-authority-stale")
+        .digest("hex"),
+      requestId: { type: "string" as const, value: "memory-query-runtime-authority-stale" },
+      threadId: actor.providerThreadId,
+      tool: "memory_query" as const,
+      turnId: actor.activeTurnId,
+    } satisfies HraHostToolCall;
+    let releaseCheck: (() => void) | undefined;
+    let enteredCheck: (() => void) | undefined;
+    const entered = new Promise<void>((resolve) => { enteredCheck = resolve; });
+    const blocked = new Promise<void>((resolve) => { releaseCheck = resolve; });
+    cloud.beforeProjectionUnsettledSessionReturn = async () => {
+      enteredCheck?.();
+      await blocked;
+    };
+    const pending = value.service.handleHraHostToolCall(
+      authority,
+      call,
+      MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+    );
+    await entered;
+    value.codex.liveHostToolCall = false;
+    releaseCheck?.();
+    await expect(pending).rejects.toThrow("HRA_HOST_TOOL_RUNTIME_AUTHORITY_STALE");
+    expect(memory.queries).toEqual([]);
+    expect(value.codex.liveHostToolCallRequests).toEqual([
+      {
+        authority,
+        providerThreadId: actor.providerThreadId,
+        connectionId: call.connectionId,
+        turnId: actor.activeTurnId,
+        callId: call.callId,
+        requestDigest: call.requestDigest,
+      },
+      {
+        authority,
+        providerThreadId: actor.providerThreadId,
+        connectionId: call.connectionId,
+        turnId: actor.activeTurnId,
+        callId: call.callId,
+        requestDigest: call.requestDigest,
+      },
+    ]);
+
+    value.codex.liveHostToolCall = true;
+    delete cloud.beforeProjectionUnsettledSessionReturn;
+    const liveProbe = value.codex.hasLiveHostToolCall.bind(value.codex);
+    (value.codex as { hasLiveHostToolCall?: CodexRuntimePort["hasLiveHostToolCall"] })
+      .hasLiveHostToolCall = undefined;
+    await expect(value.service.handleHraHostToolCall(authority, {
+      ...call,
+      callId: "memory-query-runtime-authority-missing",
+      requestDigest: createHash("sha256")
+        .update("memory-query-runtime-authority-missing")
+        .digest("hex"),
+    }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).rejects.toThrow(
+      "HRA_HOST_TOOL_RUNTIME_AUTHORITY_STALE",
+    );
+    expect(memory.queries).toEqual([]);
+
+    (value.codex as { hasLiveHostToolCall?: CodexRuntimePort["hasLiveHostToolCall"] })
+      .hasLiveHostToolCall = liveProbe;
+    await expect(value.service.handleHraHostToolCall(authority, {
+      ...call,
+      callId: "memory-query-runtime-authority-current",
+      requestDigest: createHash("sha256")
+        .update("memory-query-runtime-authority-current")
+        .digest("hex"),
+    }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({
+      kind: "query",
+      ok: true,
+    });
+    expect(memory.queries).toEqual([{
+      actorSessionId: actor.id,
+      value: call.input,
+    }]);
+  });
+
 
   test("sets the two device-command switches locally and reports them", async () => {
     const value = await fixture();
@@ -11011,81 +11549,68 @@ describe("HraService", () => {
     expect(codex.calls).toEqual([]);
   });
 
-  test("reports Devin auth separately, preserves unknown allowance, and settles one foreground login", async () => {
-    const value = await devinAccountFixture();
-    const added = await value.service.execute(
-      { kind: "account.add", label: "Devin private" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
-
-    await expect(value.service.execute({
-      kind: "account.show",
-      account: added.account.id,
-      provider: "devin",
-    }, { signal })).resolves.toMatchObject({
-      account: { id: added.account.id, label: "Devin private" },
-      authentication: { provider: "devin", signedIn: false },
-      nextCommand: `hra account login ${added.account.id} --provider devin`,
-      usage: {
-        allowance: "unknown",
-        source: "devin_acp",
-      },
+  test("reports retired Devin without authentication or provider effects", async () => {
+    const value = await fixture();
+    const profile = value.store.createProfile("Retired");
+    const result = await value.service.execute({
+      kind: "account.show", account: profile.id, provider: "devin",
+    }, { signal });
+    expect(result).toMatchObject({
+      account: { id: profile.id }, provider: "devin", status: "retired",
+      credentialAction: "none",
     });
+    expect(result).not.toHaveProperty("authentication");
+    expect(result).not.toHaveProperty("usage");
+    expect(result).not.toHaveProperty("nextCommand");
+    expect(value.codex.calls).toEqual([]);
+  });
 
+  test("preserves historical Devin login custody until exact acknowledged cleanup", async () => {
+    const value = await fixture();
+    const profile = value.store.createProfile("Retired grant");
     const key = "00000000-0000-4000-8000-000000000711";
-    const prepared = await value.service.execute({
-      kind: "account.devin-login.prepare",
-      account: added.account.id,
-      idempotencyKey: key,
-      manualTokenFlow: true,
-    }, { signal }) as {
-      login: { attemptId: `attempt_${string}`; providerGeneration: number };
-    };
-    expect(prepared).toMatchObject({
-      authentication: { provider: "devin", signedIn: false },
-      login: { status: "launch_granted", idempotencyKey: key },
+    const attemptId = "attempt_00000000000000000000000000000711" as const;
+    const request = JSON.stringify({
+      kind: "account.devin-login", authorityId: profile.id,
+      authorityGeneration: profile.processGeneration, request: { provider: "devin" },
     });
-    const readsBeforeRecovery = value.devinReadCalls();
+    const evidence = JSON.stringify({
+      kind: "account.devin-login", provider: "devin", baselineSignedIn: false,
+    });
+    const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+    const legacy = new Database(value.paths.database, { strict: true });
+    try {
+      legacy.query(
+        "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'account.devin-login',?,?,?,'effect_started',0,0)",
+      ).run(attemptId, key, profile.id, profile.processGeneration, digest(request));
+      legacy.query(
+        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,'account.devin-login',?,?,0)",
+      ).run(attemptId, evidence, digest(evidence));
+    } finally {
+      legacy.close();
+    }
+    const status = await value.service.execute({
+      kind: "account.show", account: profile.id, provider: "devin",
+    }, { signal }) as { recovery: Record<string, unknown> };
+    expect(status.recovery).toMatchObject({ required: true, attemptId, idempotencyKey: key });
+    expect(status.recovery).not.toHaveProperty("sameKeyReplayCommand");
+    expect(value.store.readMutation(key)?.state).toBe("effect_started");
+    const command = {
+      kind: "account.devin-login.abandon", account: profile.id,
+      attemptId, idempotencyKey: key, providerGeneration: profile.processGeneration,
+      acknowledgeChildExited: true,
+    } as const;
     await expect(value.service.execute({
-      kind: "account.show",
-      account: added.account.id,
-      provider: "devin",
-    }, { signal })).resolves.toMatchObject({
-      authentication: { provider: "devin", signedIn: null },
-      recovery: {
-        required: true,
-        attemptId: prepared.login.attemptId,
-        idempotencyKey: key,
-      },
-      usage: { allowance: "unknown", source: "devin_acp" },
+      ...command, providerGeneration: profile.processGeneration + 1,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(value.store.readMutation(key)?.state).toBe("effect_started");
+    await expect(value.service.execute(command, { signal })).resolves.toMatchObject({
+      login: { status: "abandoned", localOnly: true, credentialAction: "none" },
     });
-    expect(value.devinReadCalls()).toBe(readsBeforeRecovery);
-
-    value.setDevinSignedIn(true);
-    await expect(value.service.execute({
-      kind: "account.devin-login.complete",
-      account: added.account.id,
-      attemptId: prepared.login.attemptId,
-      idempotencyKey: key,
-      providerGeneration: prepared.login.providerGeneration,
-      outcome: { state: "joined", exitCode: 0, interruptedBy: null },
-    }, { signal })).resolves.toMatchObject({
-      authentication: { provider: "devin", signedIn: true },
-      login: { status: "signed_in" },
+    expect(value.store.readMutation(key)).toMatchObject({
+      state: "reconciled", resolution: { kind: "abandoned" },
     });
-    expect(value.store.readMutation(key)).toMatchObject({ state: "applied" });
-
-    value.setDevinReadError(new Error("terminal replay must not inspect Devin auth"));
-    await expect(value.service.execute({
-      kind: "account.devin-login.prepare",
-      account: added.account.id,
-      idempotencyKey: key,
-      manualTokenFlow: false,
-    }, { signal })).resolves.toMatchObject({
-      authentication: { provider: "devin", signedIn: true },
-      login: { status: "signed_in" },
-    });
-    expect(value.providerSessionCalls).toEqual([]);
+    expect(value.codex.calls).toEqual([]);
   });
 
   test("grants Claude foreground login once and accepts a status-versus-complete race", async () => {
@@ -11830,23 +12355,12 @@ describe("HraService", () => {
       `This daemon has no Claude Code runtime. Install Claude Code ${CLAUDE_PIN} exactly`,
     );
 
-    await expect(service.execute({
-      kind: "session.start",
-      account: added.account.id,
-      provider: "devin",
-      preset: "ultra",
-      fast: false,
-    }, { signal })).rejects.toThrow("does not support the `ultra` model preset");
-
-    await expect(service.execute({
-      kind: "session.start",
-      account: added.account.id,
-      provider: "devin",
-      preset: "astra",
-      fast: false,
-    }, { signal })).rejects.toThrow(
-      `This daemon has no Devin runtime. Install Devin CLI ${DEVIN_PIN} exactly`,
-    );
+    for (const preset of ["ultra", "astra"]) {
+      expect(localCommandSchema.safeParse({
+        kind: "session.start", account: added.account.id,
+        provider: "devin", preset, fast: false,
+      }).success).toBe(false);
+    }
 
     // Every existing Codex path is unchanged.
     const started = await service.execute({
@@ -11856,194 +12370,6 @@ describe("HraService", () => {
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     expect(started.session.id).toMatch(/^sess_/u);
-  });
-
-  test("starts a native managed Devin session with current keyless authority", async () => {
-    const providerThreadId = "native-managed-devin";
-    const connectionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3d";
-    const reviewed: EffectiveDevinRuntimeProfile[] = [];
-    const devin = {
-      provider: "devin" as const,
-      readAccount: async () => ({ signedIn: true }),
-      reviewSessionStart: async (
-        input: Parameters<DevinRuntimePort["reviewSessionStart"]>[0],
-      ) => {
-        const effectiveRuntimeProfile: EffectiveDevinRuntimeProfile = {
-          profileId: input.authority.id,
-          processGeneration: input.authority.generation,
-          observedAt: 2_000,
-          preset: "astra",
-          model: input.requirement.model,
-          reasoningEffort: "provider-default",
-          devinVersion: DEVIN_PIN,
-          protocolVersion: 1,
-          isolatedHome: true,
-        };
-        reviewed.push(effectiveRuntimeProfile);
-        return {
-          reviewId: crypto.randomUUID(),
-          kind: "session_start" as const,
-          effectiveRuntimeProfile,
-        };
-      },
-      discardRuntimeReview: () => undefined,
-      startSession: async (
-        input: Parameters<DevinRuntimePort["startSession"]>[0],
-      ) => ({
-        providerThreadId,
-        title: "Native managed Devin",
-        status: "idle" as const,
-        providerUpdatedAt: 2_001,
-        effectiveRuntimeProfile: input.review.effectiveRuntimeProfile,
-      }),
-      observeSession: async () => ({
-        connectionId,
-        projection: {
-          providerThreadId,
-          title: "Native managed Devin",
-          status: "idle" as const,
-          providerUpdatedAt: 2_001,
-        },
-        resumed: true,
-      }),
-      endSession: async () => undefined,
-      close: async () => undefined,
-    } as unknown as DevinRuntimePort;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
-      () => undefined,
-      Date.now,
-      undefined,
-      { devin },
-    );
-    const added = await value.service.execute(
-      { kind: "account.add", label: "Native managed Devin" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
-    await value.service.execute({
-      kind: "project.add",
-      label: "Native managed Devin project",
-      path: value.documents,
-    }, { signal });
-
-    const started = await value.service.execute({
-      kind: "session.start",
-      account: added.account.id,
-      provider: "devin",
-      preset: "astra",
-      fast: false,
-    }, { signal }) as {
-      session: SessionRecord;
-      effectiveRuntimeProfile: Record<string, unknown>;
-    };
-
-    expect(reviewed).toHaveLength(1);
-    expect(started.session).toMatchObject({
-      provider: "devin",
-      providerThreadId,
-      preset: "astra",
-      state: "idle",
-    });
-    expect(value.store.readSessionProviderAccountAuthority(started.session.id)).toBeNull();
-    expect(value.store.requireSessionPresetRequirement(started.session.id)).toEqual({
-      preset: "astra",
-      requirement: presetRequirements.astra,
-    });
-    expect(started.effectiveRuntimeProfile).not.toHaveProperty("isolatedHome");
-  });
-
-
-  test("rejects direct Devin steering without injecting host policy or falling back to Codex", async () => {
-    const providerCalls: Array<Readonly<{ kind: string; developerInstructions?: string }>> = [];
-    const devin = {
-      provider: "devin" as const,
-      observeSession: async (input: Parameters<DevinRuntimePort["observeSession"]>[0]) => {
-        providerCalls.push({
-          kind: "observe",
-          ...(input.developerInstructions === undefined
-            ? {}
-            : { developerInstructions: input.developerInstructions }),
-        });
-        return {
-          connectionId: "30000000-0000-4000-8000-000000000003",
-          projection: {
-            activeTurnId: "devin-turn-1",
-            providerThreadId: input.providerThreadId,
-            providerUpdatedAt: 30,
-            status: "active" as const,
-            title: "Devin session",
-          },
-          resumed: false,
-        };
-      },
-      readSession: async (input: Parameters<DevinRuntimePort["readSession"]>[0]) => {
-        providerCalls.push({
-          kind: "read",
-          ...(input.developerInstructions === undefined
-            ? {}
-            : { developerInstructions: input.developerInstructions }),
-        });
-        return {
-          activeTurnId: "devin-turn-1",
-          providerThreadId: input.providerThreadId,
-          providerUpdatedAt: 30,
-          status: "active" as const,
-          title: "Devin session",
-        };
-      },
-      steer: async () => {
-        providerCalls.push({ kind: "steer" });
-        throw new DevinError(
-          "UNSUPPORTED_CAPABILITY",
-          "ACP v1 has no unambiguous in-turn steering; queue the message or interrupt first.",
-        );
-      },
-      close: async () => undefined,
-    } as unknown as DevinRuntimePort;
-    const { service, store, codex } = await fixture(
-      undefined,
-      new FakeCloud(),
-      () => undefined,
-      Date.now,
-      undefined,
-      { devin },
-    );
-    const profile = store.createProfile("Devin steering");
-    const created = store.createSession({
-      fastEnabled: false,
-      preset: "astra",
-      profileId: profile.id,
-      provider: "devin",
-    });
-    const session = store.bindSession({
-      activeTurnId: "devin-turn-1",
-      expectedRevision: created.revision,
-      providerThreadId: "devin-thread-steer",
-      providerUpdatedAt: 30,
-      sessionId: created.id,
-      state: "active",
-    });
-    const idempotencyKey = "00000000-0000-4000-8000-000000000712";
-
-    await expect(service.execute({
-      idempotencyKey,
-      kind: "session.steer",
-      message: "change direction",
-      session: session.id,
-    }, { signal })).rejects.toMatchObject({
-      code: "INVALID_INPUT",
-      details: { reason: "devin_unsupported" },
-      message: "ACP v1 has no unambiguous in-turn steering; queue the message or interrupt first.",
-    });
-
-    expect(providerCalls).toEqual([
-      { kind: "observe" },
-      { kind: "read" },
-      { kind: "steer" },
-    ]);
-    expect(codex.calls).toEqual([]);
-    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "failed" });
   });
 
   test("fails closed for an unrecognized provider-level interaction method", async () => {
@@ -12842,19 +13168,7 @@ describe("HraService", () => {
         state: "idle",
         title: "Durable Claude one",
       });
-    const startingDevin = value.store.createSession({
-        profileId: added.account.id,
-        provider: "devin",
-        preset: "astra",
-        fastEnabled: false,
-        title: "Durable Devin",
-      });
-    const durableDevin = value.store.bindSession({
-      sessionId: startingDevin.id,
-      expectedRevision: startingDevin.revision,
-      providerThreadId: "durable-devin",
-      state: "idle",
-    });
+    const durableDevin = legacyDevinSession(value, added.account.id);
     const secondClaude = value.store.upsertProviderSession({
         profileId: added.account.id,
         provider: "claude",
@@ -12876,6 +13190,7 @@ describe("HraService", () => {
       state: "idle",
       title: "Existing Codex cache",
     });
+    const callsBeforeLocalListing = [...value.codex.calls];
 
     const first = await value.service.execute({
       kind: "session.list",
@@ -12892,6 +13207,7 @@ describe("HraService", () => {
       existingCodex.id,
     ].includes(session.id))).toBe(true);
     expect(value.codex.sessionListRequests).toHaveLength(0);
+    expect(value.codex.calls).toEqual(callsBeforeLocalListing);
 
     value.codex.listedProjections = [{
       providerThreadId: "provider-existing-codex",
@@ -12911,6 +13227,7 @@ describe("HraService", () => {
     };
     expect(second.sessions).toHaveLength(2);
     expect(value.codex.sessionListRequests).toHaveLength(0);
+    expect(value.codex.calls).toEqual(callsBeforeLocalListing);
 
     const third = await value.service.execute({
       kind: "session.list",
@@ -13663,7 +13980,7 @@ describe("HraService", () => {
     });
   });
 
-  test("never moves Claude or Devin project authority away from the provider working directory", async () => {
+  test("never moves Claude project authority away from the provider working directory", async () => {
     const value = await fixture();
     const original = await value.store.createProject(
       "Provider-bound original",
@@ -13677,46 +13994,45 @@ describe("HraService", () => {
     );
     const profile = value.store.createProfile("Provider-bound account");
 
-    for (const provider of ["claude", "devin"] as const) {
-      const created = value.store.createSession({
-        fastEnabled: false,
-        preset: provider === "claude" ? "fable-max" : "astra",
-        profileId: profile.id,
-        projectId: original.id,
+    const provider = "claude" as const;
+    const created = value.store.createSession({
+      fastEnabled: false,
+      preset: "fable-max",
+      profileId: profile.id,
+      projectId: original.id,
+      provider,
+    });
+    const session = value.store.bindSession({
+      expectedRevision: created.revision,
+      providerThreadId: `${provider}-provider-bound-thread`,
+      sessionId: created.id,
+      state: "idle",
+    });
+
+    await expect(value.service.execute({
+      kind: "session.project",
+      project: alternate.id,
+      session: session.id,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      details: {
         provider,
-      });
-      const session = value.store.bindSession({
-        expectedRevision: created.revision,
-        providerThreadId: `${provider}-provider-bound-thread`,
-        sessionId: created.id,
-        state: "idle",
-      });
+        reason: "provider_project_rebind_unsupported",
+        sessionId: session.id,
+      },
+    });
+    expect(value.store.requireSession(session.id)).toMatchObject({
+      projectId: original.id,
+      revision: session.revision,
+    });
 
-      await expect(value.service.execute({
-        kind: "session.project",
-        project: alternate.id,
-        session: session.id,
-      }, { signal })).rejects.toMatchObject({
-        code: "CONFLICT",
-        details: {
-          provider,
-          reason: "provider_project_rebind_unsupported",
-          sessionId: session.id,
-        },
-      });
-      expect(value.store.requireSession(session.id)).toMatchObject({
-        projectId: original.id,
-        revision: session.revision,
-      });
-
-      await expect(value.service.execute({
-        kind: "session.project",
-        project: original.id,
-        session: session.id,
-      }, { signal })).resolves.toMatchObject({
-        session: { projectId: original.id, revision: session.revision + 1 },
-      });
-    }
+    await expect(value.service.execute({
+      kind: "session.project",
+      project: original.id,
+      session: session.id,
+    }, { signal })).resolves.toMatchObject({
+      session: { projectId: original.id, revision: session.revision + 1 },
+    });
   });
 
   test("cleans list-driven terminalization and reconciles a crash-left terminal on restart", async () => {
@@ -18379,117 +18695,390 @@ describe("HraService", () => {
     expect(store.readPendingLoginAuthority(added.account.id, 2)).toBeNull();
   });
 
-  test("scopes an isolated Devin disconnect to its provider session", async () => {
-    const devinConnection = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3c";
-    const devin = {
-      provider: "devin" as const,
-      rebindProfileAuthority: () => undefined,
-      observeSession: async (input: Parameters<DevinRuntimePort["observeSession"]>[0]) => ({
-        connectionId: devinConnection,
-        projection: {
-          providerThreadId: input.providerThreadId,
-          status: "idle" as const,
-          title: "Devin provider-scoped session",
-        },
-        resumed: true,
-      }),
-      close: async () => undefined,
-    } as unknown as DevinRuntimePort;
+  test("reads retired Devin history locally and refuses further provider effects", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const memory = new FakeMemory();
     const value = await fixture(
       undefined,
       new FakeCloud(),
       () => undefined,
       Date.now,
-      undefined,
-      { devin },
+      factsMemory,
+      {},
+      memory,
     );
-    const added = await value.service.execute(
-      { kind: "account.add", label: "Provider-scoped disconnect" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
-    await value.service.execute({
-      kind: "account.login",
-      account: added.account.id,
-      deviceCode: false,
-    }, { signal });
-    const profile = value.store.requireProfileById(added.account.id);
-    const codexSession = value.store.upsertProviderSession({
-      fastEnabled: false,
-      preset: "high",
-      profileId: profile.id,
-      provider: "codex",
-      providerThreadId: "codex-provider-scoped-thread",
-      providerAccountKey: codexProviderAccountKey(),
-      state: "active",
-      activeTurnId: "codex-provider-scoped-turn",
-      title: "Codex provider-scoped session",
+    const profile = value.store.createProfile("Retired session");
+    const session = legacyDevinSession(value, profile.id);
+    const before = value.store.requireSession(session.id);
+    await expect(value.service.execute({
+      kind: "session.show", session: session.id, detail: true,
+    }, { signal })).resolves.toMatchObject({
+      session: { provider: "devin", preset: "astra" }, retiredProvider: "devin",
+      providerObservation: { state: "unavailable", code: "provider_retired" },
     });
-    const devinSession = value.store.upsertProviderSession({
-      fastEnabled: false,
-      preset: "astra",
-      profileId: profile.id,
-      provider: "devin",
-      providerThreadId: "devin-provider-scoped-thread",
-      state: "active",
-      activeTurnId: "devin-provider-scoped-turn",
-      title: "Devin provider-scoped session",
+    await expect(value.service.execute({
+      kind: "session.status", session: session.id,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: { state: "unavailable", code: "provider_retired" },
     });
-    const codexProviderThreadId = "codex-provider-scoped-thread";
-    const authority: ProfileAuthority = {
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    };
-    const codexConnection = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
-    value.codex.observationConnectionId = codexConnection;
-    value.codex.readProjection = {
-      providerThreadId: codexProviderThreadId,
-      status: "idle",
-      title: "Codex provider-scoped session",
-    };
-    await value.service.execute({ kind: "session.status", session: codexSession.id }, { signal });
-    await value.service.execute({ kind: "session.status", session: devinSession.id }, { signal });
-
-    // A provider-scoped observer may not mutate a sibling provider even when
-    // handed its exact thread id.
-    await value.service.observeDevinFact(authority, {
-      connectionId: devinConnection,
-      status: { type: "systemError" },
-      threadId: codexProviderThreadId,
-      type: "threadStatusChanged",
-    });
-    await value.service.observeDevinFact(authority, {
-      connectionId: devinConnection,
-      reason: "process_exit",
-      type: "providerDisconnected",
-    });
-
-    expect(value.store.requireProfileById(profile.id).processGeneration)
-      .toBe(profile.processGeneration);
-    expect(value.store.listSessionEvents({
-      afterSequence: 0,
-      limit: 20,
-      sessionId: codexSession.id,
-    }).events.map((event) => event.body)).toEqual([
-      { state: "connected", type: "connection" },
-      { activeTurnId: null, status: "idle", type: "session_status" },
-    ]);
-    expect(value.store.listSessionEvents({
-      afterSequence: 0,
-      limit: 20,
-      sessionId: devinSession.id,
-    }).events.map((event) => event.body)).toEqual([
-      { state: "connected", type: "connection" },
-      { activeTurnId: null, status: "idle", type: "session_status" },
-      { reason: "process_exit", state: "disconnected", type: "connection" },
+    await expect(value.service.execute({
+      kind: "memory.status", session: session.id,
+    }, { signal })).resolves.toMatchObject({ kind: "status", sessionId: session.id });
+    expect(memory.statuses).toEqual([{ actorSessionId: session.id }]);
+    for (const command of [
       {
-        fromSequence: 4,
-        reason: "provider_disconnect",
-        throughSequence: 4,
-        type: "gap",
+        kind: "memory.query",
+        session: session.id,
+        value: { mode: "search", text: "retired history" },
       },
-    ]);
+      {
+        kind: "memory.explain",
+        session: session.id,
+        value: { queryId: `memq_${"7".repeat(32)}`, row: 1 },
+      },
+      {
+        kind: "memory.remember",
+        session: session.id,
+        idempotencyKey: "00000000-0000-4000-8000-000000000604",
+        value: {
+          key: "retired.history",
+          title: "Retired history",
+          summary: "Do not mutate retired provider memory.",
+          body: "Historical Devin sessions are read-only.",
+        },
+      },
+      {
+        kind: "memory.share",
+        session: session.id,
+        idempotencyKey: "00000000-0000-4000-8000-000000000605",
+        value: { key: "retired.history", reason: "Do not share retired authority" },
+      },
+    ] satisfies LocalCommand[]) {
+      await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+        code: "UNAVAILABLE",
+        details: { reason: "provider_retired" },
+      });
+    }
+    await expect(value.service.execute({
+      kind: "session.send", session: session.id, message: "Do not run",
+    }, { signal })).rejects.toMatchObject({ code: "UNAVAILABLE" });
+    expect(value.store.requireSession(session.id)).toEqual(before);
+    expect(value.codex.calls).toEqual([]);
+    expect(factsMemory.ensures).toEqual([]);
+    expect(memory.queries).toEqual([]);
+    expect(memory.explanations).toEqual([]);
+    expect(memory.remembers).toEqual([]);
+    expect(memory.shares).toEqual([]);
+  });
+
+  test("keeps retired note changes from minting facts-memory authority", async () => {
+    const memory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
+    const profile = value.store.createProfile("Retired note authority");
+    const session = legacyDevinSession(value, profile.id);
+    const beforeMutations = value.store.listUnsettledMutations({ sessionId: session.id });
+    try {
+      for (const command of [
+        { kind: "session.note.set", session: session.id, note: "Do not change history" },
+        { kind: "session.note.clear", session: session.id },
+      ] as const) {
+        await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+          code: "UNAVAILABLE", details: { reason: "provider_retired" },
+        });
+        expect(value.store.requireSession(session.id)).toEqual(session);
+        expect(value.store.listUnsettledMutations({ sessionId: session.id })).toEqual(beforeMutations);
+        expect(memory.ensures).toEqual([]);
+        expect(memory.cleanups).toEqual([]);
+        expect(value.codex.calls).toEqual([]);
+      }
+      await expect(value.service.execute({
+        kind: "session.note.get", session: session.id,
+      }, { signal })).resolves.toMatchObject({ note: session.note, revision: session.revision });
+    } finally {
+      await value.service.close();
+    }
+  });
+
+  test.each([
+    { kind: "session.archive", archived: true },
+    { kind: "session.archive", archived: false },
+    { kind: "autorespond.set", mode: "auto:all" },
+    { kind: "autorespond.set", mode: null },
+  ] as const)("rejects retired session policy writes %j without changing history", async (change) => {
+    const value = await fixture();
+    const profile = value.store.createProfile("Retired session policy");
+    const session = legacyDevinSession(value, profile.id);
+    const approval = value.store.readSessionApprovalMode(session.id);
+    try {
+      await expect(value.service.execute({ ...change, session: session.id }, { signal }))
+        .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
+      expect(value.store.requireSession(session.id)).toEqual(session);
+      expect(value.store.readSessionApprovalMode(session.id)).toEqual(approval);
+      expect(value.codex.calls).toEqual([]);
+      await expect(value.service.execute({ kind: "autorespond.set", mode: "auto:workspace" }, { signal }))
+        .resolves.toMatchObject({ mode: "auto:workspace", source: "default" });
+      await expect(value.service.execute({ kind: "autorespond.status", session: session.id }, { signal }))
+        .resolves.toMatchObject({ mode: "auto:workspace", source: "default" });
+    } finally {
+      await value.service.close();
+    }
+  });
+
+  test("rejects a stale retired cloud account callback before account inspection", async () => {
+    const value = await claudeAccountFixture(true);
+    const profile = value.store.createProfile("Stale retired cloud account");
+    try {
+      await expect(value.service.readProviderAccountProjectionForCloud({
+        profileId: profile.id, provider: "devin" as never,
+        processGeneration: profile.processGeneration, signal,
+      })).rejects.toMatchObject({
+        code: "UNAVAILABLE", details: { reason: "provider_retired" },
+      });
+      expect(value.claudeReadCalls()).toBe(0);
+      expect(value.codex.calls).toEqual([]);
+      expect(value.store.requireProfileById(profile.id)).toEqual(profile);
+      await expect(value.service.readProviderAccountProjectionForCloud({
+        profileId: profile.id, provider: "claude",
+        processGeneration: profile.processGeneration, signal,
+      })).resolves.toEqual({ signedIn: true });
+      expect(value.claudeReadCalls()).toBe(1);
+    } finally {
+      await value.service.close();
+    }
+  });
+
+  test("reports retired provider admission for new scheduled tasks without changing history", async () => {
+    const value = await fixture();
+    const profile = value.store.createProfile("Retired task admission");
+    const session = legacyDevinSession(value, profile.id);
+    const before = value.store.requireSession(session.id);
+    try {
+      await expect(value.service.execute({
+        kind: "session.task.create", session: session.id, name: "Retired task",
+        everyMinutes: 10, paused: false, prompt: "Do not run",
+        idempotencyKey: crypto.randomUUID(),
+      }, { signal })).rejects.toMatchObject({
+        code: "UNAVAILABLE", details: { reason: "provider_retired" },
+      });
+      expect(value.store.requireSession(session.id)).toEqual(before);
+      await expect(value.service.execute({
+        kind: "session.task.list", session: session.id,
+      }, { signal })).resolves.toMatchObject({ tasks: [] });
+      expect(value.codex.calls).toEqual([]);
+    } finally {
+      await value.service.close();
+    }
+  });
+
+  test.each(["bound", "source", "target"] as const)(
+    "keeps retired %s recovery evidence read-only before provider or facts-memory effects",
+    async (side) => {
+      const memory = new FakeFactsMemoryLifecycle();
+      const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
+      const profile = value.store.createProfile(`Retired recovery ${side}`);
+      const session = side === "target"
+        ? (() => {
+            const created = value.store.createSession({
+              profileId: profile.id, provider: "codex", preset: "high", fastEnabled: false,
+            });
+            return value.store.bindSession({
+              sessionId: created.id, expectedRevision: created.revision,
+              providerThreadId: "historical-source-thread", state: "idle",
+            });
+          })()
+        : legacyDevinSession(value, profile.id);
+      const attemptId = `attempt_${crypto.randomUUID().replaceAll("-", "")}`;
+      const key = crypto.randomUUID();
+      const kind = side === "bound" ? "session.send" : "session.switch";
+      const targetRuntimeProfile = side === "target"
+        ? {
+            profileId: profile.id, processGeneration: profile.processGeneration,
+            observedAt: 2_000, preset: "astra", model: "gpt-6-astra",
+            reasoningEffort: "provider-default", devinVersion: "3000.6.14",
+            protocolVersion: 1, isolatedHome: true,
+          }
+        : runtimeProfile({
+            id: profile.id, generation: profile.processGeneration,
+            codexHome: "unused", desktopUserData: "unused",
+          });
+      const evidence = side === "bound"
+        ? {
+            kind, providerThreadId: session.providerThreadId,
+            baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+            clientMessageId: attemptId, messageDigest: "a".repeat(64),
+          }
+        : {
+            kind, requestedAccountId: null, requestedPreset: null,
+            sourceProfileId: profile.id, sourceProcessGeneration: profile.processGeneration,
+            sourceProvider: side === "source" ? "devin" : "codex",
+            sourceProviderThreadId: session.providerThreadId,
+            sourcePreset: side === "source" ? "astra" : "high",
+            targetProfileId: profile.id, targetProcessGeneration: profile.processGeneration,
+            targetProvider: side === "target" ? "devin" : "codex",
+            targetPreset: side === "target" ? "astra" : "high",
+            transcriptDigest: "b".repeat(64), seedDigest: "c".repeat(64),
+            seedIncludedRecords: 0, seedOmittedRecords: 0, runtimeProfile: targetRuntimeProfile,
+          };
+      const encodedEvidence = JSON.stringify(evidence);
+      const legacy = new Database(value.paths.database, { strict: true });
+      try {
+        legacy.query(
+          "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,?,?,?,?,'effect_started',0,0)",
+        ).run(attemptId, key, kind, session.id, profile.processGeneration, "d".repeat(64));
+        legacy.query(
+          "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,0)",
+        ).run(attemptId, kind, encodedEvidence, createHash("sha256").update(encodedEvidence).digest("hex"));
+        if (side !== "bound") {
+          // A started, unseeded opposite-provider target is exactly the old
+          // cleanup branch that must not end another runtime after retirement.
+          legacy.query(
+            "INSERT INTO session_provider_switch_targets(attempt_id,provider_thread_id,recorded_at) VALUES (?,?,0)",
+          ).run(attemptId, "historical-target-thread");
+        }
+      } finally {
+        legacy.close();
+      }
+      const immutableEvidence = value.store.readMutation(key)?.evidence;
+      try {
+        await expect(value.service.recover()).resolves.toBeUndefined();
+        expect(value.store.requireSession(session.id).state).toBe("recovery_required");
+        expect(value.store.readMutation(key)).toMatchObject({
+          state: "effect_started",
+          evidence: immutableEvidence,
+        });
+        expect(value.codex.calls).toEqual([]);
+        expect(memory.ensures).toEqual([]);
+        expect(memory.cleanups).toEqual([]);
+        const beforeSession = value.store.requireSession(session.id);
+        const beforeMutation = value.store.readMutation(key);
+        for (const kind of ["session.recover", "session.abandon"] as const) {
+          await expect(value.service.execute({ kind, session: session.id }, { signal }))
+            .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
+          expect(value.store.requireSession(session.id)).toEqual(beforeSession);
+          expect(value.store.readMutation(key)).toEqual(beforeMutation);
+          expect(memory.cleanups).toEqual([]);
+          expect(memory.ensures).toEqual([]);
+          expect(value.codex.calls).toEqual([]);
+        }
+        const supported = await createIdleSession(value, `Supported after retired ${side}`);
+        expect(value.store.requireSession(supported.sessionId).provider).toBe("codex");
+      } finally {
+        await value.service.close();
+      }
+    },
+  );
+
+  test("quarantines an exact retired in-flight start without blocking supported startup", async () => {
+    const memory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
+    const profile = value.store.createProfile("Retired start recovery");
+    await value.service.execute({ kind: "project.add", label: "Historical start project", path: value.documents }, { signal });
+    const project = value.store.listProjects()[0];
+    if (project === undefined) throw new Error("Expected a registered project.");
+    const session = value.store.createSession({
+      profileId: profile.id, projectId: project.id,
+      provider: "codex", preset: "ultra", fastEnabled: false,
+    });
+    const key = crypto.randomUUID();
+    const attemptId = `attempt_${crypto.randomUUID().replaceAll("-", "")}`;
+    const evidence = JSON.stringify({
+      kind: "session.start", projectId: project.id,
+      clientMessageId: null, messageDigest: null,
+      runtimeProfile: {
+        profileId: profile.id, processGeneration: profile.processGeneration,
+        observedAt: 2_000, preset: "astra", model: "gpt-6-astra",
+        reasoningEffort: "provider-default", devinVersion: "3000.6.14",
+        protocolVersion: 1, isolatedHome: true,
+      },
+    });
+    const legacy = new Database(value.paths.database, { strict: true });
+    try {
+      legacy.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(session.id);
+      legacy.query(
+        "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.start',?,?,?,'effect_started',0,0)",
+      ).run(attemptId, key, profile.id, profile.processGeneration, "d".repeat(64));
+      legacy.query(
+        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,'session.start',?,?,0)",
+      ).run(attemptId, evidence, createHash("sha256").update(evidence).digest("hex"));
+      legacy.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,0)")
+        .run(attemptId, session.id);
+    } finally {
+      legacy.close();
+    }
+    const immutableEvidence = value.store.readMutation(key)?.evidence;
+    try {
+      await expect(value.service.recover()).resolves.toBeUndefined();
+      expect(value.store.requireSession(session.id)).toMatchObject({
+        provider: "devin", state: "recovery_required",
+      });
+      expect(value.store.readMutation(key)).toMatchObject({ state: "ambiguous", evidence: immutableEvidence });
+      expect(value.codex.calls).toEqual([]);
+      expect(memory.ensures).toEqual([]);
+      expect(memory.cleanups).toEqual([]);
+      const added = await value.service.execute({
+        kind: "account.add", label: "Supported after retired start",
+      }, { signal }) as { account: { id: string } };
+      await value.service.execute({
+        kind: "account.login", account: added.account.id, deviceCode: false,
+      }, { signal });
+      await expect(value.service.execute({
+        kind: "session.start", account: added.account.id, project: project.id,
+        preset: "high", fast: false,
+      }, { signal })).resolves.toMatchObject({ session: { provider: "codex" } });
+    } finally {
+      await value.service.close();
+    }
+  });
+
+  test("quarantines a retired queued send after restart without redispatching or blocking supported work", async () => {
+    const memory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
+    const profile = value.store.createProfile("Retired queue restart");
+    const session = legacyDevinSession(value, profile.id);
+    const queueId = createQueueId();
+    const message = "Historical uncertain queued send";
+    const evidence = JSON.stringify({
+      kind: "queue.dispatch", queueId, sessionId: session.id,
+      providerThreadId: session.providerThreadId, profileGeneration: profile.processGeneration,
+      baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+      clientMessageId: queueId, messageDigest: createHash("sha256").update(message).digest("hex"),
+      runtimeProfile: {
+        profileId: profile.id, processGeneration: profile.processGeneration,
+        observedAt: 1_000, preset: "astra", model: "gpt-6-astra",
+        reasoningEffort: "provider-default", devinVersion: "3000.6.14",
+        protocolVersion: 1, isolatedHome: true,
+      },
+    });
+    const legacy = new Database(value.paths.database, { strict: true });
+    try {
+      legacy.transaction(() => {
+        legacy.query(
+          "INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at) VALUES (?,?,?,'dispatching',(SELECT next_sequence FROM queue_sequence_authority WHERE singleton=1),1000,1000)",
+        ).run(queueId, session.id, message);
+        legacy.query("UPDATE queue_sequence_authority SET next_sequence=next_sequence+1 WHERE singleton=1").run();
+        legacy.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,1000)")
+          .run(queueId, evidence, createHash("sha256").update(evidence).digest("hex"));
+      }).immediate();
+    } finally {
+      legacy.close();
+    }
+    const immutableEvidence = value.store.readQueueEffect(queueId);
+    value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
+    try {
+      await expect(value.service.recover()).resolves.toBeUndefined();
+      await value.service.settled();
+      expect(value.store.requireQueue(queueId)).toMatchObject({ state: "ambiguous", message });
+      expect(value.store.requireSession(session.id)).toMatchObject({ provider: "devin", state: "recovery_required" });
+      expect(value.store.readQueueEffect(queueId)).toEqual(immutableEvidence);
+      expect(value.codex.calls).toEqual([]);
+      expect(memory.ensures).toEqual([]);
+      expect(memory.cleanups).toEqual([]);
+      const supported = await createIdleSession(value, "Supported after retired queue");
+      expect(value.store.requireSession(supported.sessionId).provider).toBe("codex");
+      expect(value.store.requireQueue(queueId)).toMatchObject({ state: "ambiguous", message });
+    } finally {
+      await value.service.close();
+    }
   });
 
   test("rebinds exact idle Claude authority on Codex login and disconnect", async () => {
@@ -18677,80 +19266,64 @@ describe("HraService", () => {
     expect(store.listQueue(session.id)).toEqual([]);
   });
 
-  test("materializes a Devin schedule only after this runtime proves the exact thread loadable", async () => {
-    const clock = { value: 1_000 };
-    let loadable = false;
-    const livenessChecks: Array<Readonly<{
-      generation: number;
-      profileId: string;
-      providerThreadId: string;
-    }>> = [];
-    const devin = {
-      provider: "devin" as const,
-      hasLiveOrLoadableSession: (input: {
-        authority: ProfileAuthority;
-        providerThreadId: string;
-      }) => {
-        livenessChecks.push({
-          generation: input.authority.generation,
-          profileId: input.authority.id,
-          providerThreadId: input.providerThreadId,
-        });
-        return loadable;
-      },
-      close: async () => undefined,
-    } as unknown as DevinRuntimePort;
-    const { service, store, documents } = await fixture(
+  test("materializes an adopted personal-Claude schedule from its owning runtime", async () => {
+    const clock = { value: personalAdoptionNow };
+    const value = await adoptedClaudeFixture(
+      "Personal Claude schedule",
+      "personal-claude-schedule-thread",
       undefined,
-      new FakeCloud(),
-      () => undefined,
+      "Personal Claude scheduled task",
+      "linux",
+      true,
       () => clock.value,
-      undefined,
-      { devin },
     );
-    const profile = store.createProfile("Restarted Devin schedule");
-    const project = await store.createProject("Restarted Devin schedule docs", documents);
-    const starting = store.createSession({
-      fastEnabled: false,
-      preset: "astra",
-      profileId: profile.id,
-      projectId: project.id,
-      provider: "devin",
-      title: "Durable Devin schedule",
-    });
-    const providerThreadId = "devin-restart-thread";
-    const session = store.bindSession({
-      expectedRevision: starting.revision,
-      providerThreadId,
-      sessionId: starting.id,
-      state: "idle",
-    });
-    const tasks = store.createSessionTaskStore();
+    expect(value.managedClaude.hasLiveSession({
+      authority: {
+        codexHome: "unused",
+        desktopUserData: "unused",
+        generation: value.store.requireProfileById(value.accountId).processGeneration,
+        id: value.accountId,
+      },
+      providerThreadId: value.session.providerThreadId ?? "missing",
+    })).toBe(false);
+    expect(value.personalClaude.hasLiveSession({
+      authority: {
+        codexHome: "unused",
+        desktopUserData: "unused",
+        generation: value.store.requireProfileById(value.accountId).processGeneration,
+        id: value.accountId,
+      },
+      providerThreadId: value.session.providerThreadId ?? "missing",
+    })).toBe(true);
+
+    if (value.session.providerThreadId === undefined) {
+      throw new Error("Expected an adopted personal Claude provider thread.");
+    }
+    // Model a task retained from the earlier adoption implementation. New
+    // personal adoptions no longer mint provider callback authority, but an
+    // already-durable owner task must still use the exact owning runtime.
+    const legacy = new Database(value.paths.database, { strict: true });
+    try {
+      legacy.query(
+        "INSERT INTO session_conversation_automation(session_id,provider_thread_id,enabled_at) VALUES (?,?,?)",
+      ).run(value.session.id, value.session.providerThreadId, clock.value);
+    } finally {
+      legacy.close();
+    }
+    const tasks = value.store.createSessionTaskStore();
     const task = tasks.create({
-      idempotencyKey: "00000000-0000-4000-8000-000000000902",
+      idempotencyKey: "00000000-0000-4000-8000-000000000903",
       minutes: 15,
-      name: "Resume only with proven Devin load",
-      prompt: "Continue the durable Devin task.",
-      sessionId: session.id,
+      name: "Personal runtime liveness",
+      prompt: "Continue through the exact personal Claude controller.",
+      sessionId: value.session.id,
       status: "active",
     });
     if (task.nextDueAt === null) throw new Error("Expected an active task deadline.");
     clock.value = task.nextDueAt;
 
-    await expect(service.maintainSessionTasks()).resolves.toEqual({ materialized: 0 });
-    expect(tasks.listOccurrences(session.id, task.id)).toEqual([]);
-    expect(tasks.require(session.id, task.id).nextDueAt).toBe(task.nextDueAt);
-    expect(store.listQueue(session.id)).toEqual([]);
-
-    loadable = true;
-    await expect(service.maintainSessionTasks()).resolves.toEqual({ materialized: 1 });
-    expect(tasks.listOccurrences(session.id, task.id)).toHaveLength(1);
-    expect(store.listQueue(session.id)).toHaveLength(1);
-    expect(livenessChecks.length).toBeGreaterThanOrEqual(3);
-    expect(livenessChecks.every((check) =>
-      check.generation === profile.processGeneration
-      && check.profileId === profile.id
-      && check.providerThreadId === providerThreadId)).toBe(true);
+    await expect(value.service.maintainSessionTasks()).resolves.toEqual({ materialized: 1 });
+    expect(tasks.listOccurrences(value.session.id, task.id)).toHaveLength(1);
   });
 
   test("atomically retires an old connection while a fresh login advances the profile", async () => {
@@ -22148,6 +22721,75 @@ describe("HraService", () => {
       truncated: false,
     });
     expect(responseInFlightOnly.advisory.attention).toBe("response_in_flight");
+  });
+
+  test("expires retired pending interactions locally without starving supported deadlines or clearing uncertainty", async () => {
+    let now = 1_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId: supportedSessionId } = await createIdleSession(value, "Historical deadlines");
+    const supportedSession = value.store.requireSession(supportedSessionId);
+    const profile = value.store.requireProfileById(supportedSession.profileId);
+    const retiredSession = legacyDevinSession(value, profile.id);
+    value.codex.calls.length = 0;
+    const admit = (requestId: string, sessionId: Parameters<StateStore["admitInteraction"]>[0]["sessionId"], method: string, deadlineAt = 1_000) =>
+      value.store.admitInteraction({
+        publicId: crypto.randomUUID(), sessionId,
+        authority: {
+          profileId: profile.id, processGeneration: profile.processGeneration,
+          connectionId: value.codex.observationConnectionId,
+          requestId: { type: "string", value: requestId }, method,
+          requestDigest: createHash("sha256").update(requestId).digest("hex"),
+          threadId: sessionId === supportedSession.id ? supportedSession.providerThreadId ?? null : "historical-devin-thread",
+          turnId: null, itemId: null, approvalId: null,
+        },
+        kind: "command_approval", blocking: true,
+        display: {
+          kind: "command_approval", summary: "Historical pending approval", reason: null,
+          commandClass: "test", workingDirectory: null,
+          availableDecisions: ["once", "decline", "cancel"],
+        },
+        requestedAt: 1_000, deadlineAt,
+      }).record;
+    try {
+      // Fill the first bounded batch: session-bound old methods and orphaned
+      // Devin methods both identify retired authority without a live runtime.
+      const pending = Array.from({ length: 32 }, (_, index) => admit(
+        `retired-${index}`,
+        index % 2 === 0 ? retiredSession.id : null,
+        index % 2 === 0 ? "item/commandExecution/requestApproval" : "devin/session/request_permission",
+      ));
+      const prepared = value.store.prepareInteractionResponse({
+        id: admit("retired-prepared", retiredSession.id, "devin/session/request_permission").publicId,
+        expectedRevision: 1, responseDigest: "a".repeat(64),
+      });
+      const unknown = value.store.markInteractionResolutionUnknown({
+        id: admit("retired-unknown", null, "devin/session/request_permission").publicId,
+        expectedRevision: 1,
+      });
+      const supported = admit(
+        "supported-after-retired", supportedSession.id,
+        "item/commandExecution/requestApproval", 1_001,
+      );
+      now = 2_000;
+      expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 32, failed: 0 });
+      for (const record of pending) {
+        expect(value.store.requireInteraction(record.publicId)).toMatchObject({
+          state: "expired", revision: 2, responseDigest: null,
+        });
+      }
+      expect(value.codex.validatedInteractionTimeouts).toHaveLength(0);
+      expect(value.codex.timedOutInteractions).toHaveLength(0);
+      expect(value.codex.calls).toEqual([]);
+      expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 1, failed: 0 });
+      expect(value.store.requireInteraction(supported.publicId).state).toBe("expired");
+      expect(value.codex.validatedInteractionTimeouts).toHaveLength(1);
+      expect(value.codex.timedOutInteractions).toHaveLength(1);
+      expect(value.store.requireInteraction(prepared.publicId)).toEqual(prepared);
+      expect(value.store.requireInteraction(unknown.publicId)).toEqual(unknown);
+      expect(value.codex.calls.every((call) => call === "readAccount")).toBe(true);
+    } finally {
+      await value.service.close();
+    }
   });
 
   test("expires all callback kinds exactly at their receipt-anchored deadline", async () => {

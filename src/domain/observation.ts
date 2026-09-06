@@ -188,6 +188,7 @@ export const providerObservationSchema = z.discriminatedUnion("state", [
     code: z.enum([
       "account_signed_out",
       "provider_platform_unavailable",
+      "provider_retired",
       "resume_unavailable",
     ]),
   }).strict(),

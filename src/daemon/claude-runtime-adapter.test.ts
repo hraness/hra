@@ -1622,6 +1622,7 @@ describe("pinned Claude runtime manager", () => {
     const claimed = await manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1675,6 +1676,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1692,6 +1694,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(invalid.manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1707,6 +1710,7 @@ describe("pinned Claude runtime manager", () => {
     const claimed = await bounded.manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1734,6 +1738,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(replacement.manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1751,6 +1756,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1760,6 +1766,25 @@ describe("pinned Claude runtime manager", () => {
       sourceLiveness: "live" as never,
       title: ADOPTED_TITLE,
     })).rejects.toThrow("source process is not live");
+    expect(processes).toHaveLength(0);
+    await manager.close();
+  });
+
+  test("requires an explicit host-tool admission mode before resuming Claude", async () => {
+    const { manager, processes } = harness();
+    await expect(manager.claimSession({
+      authority,
+      fast: false,
+      // Exercises the runtime boundary against an untyped or stale caller.
+      hostTools: undefined as never,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: ADOPTED_PROVIDER_THREAD_ID,
+      signal: signal(),
+      sourceLiveness: "not_live",
+      title: ADOPTED_TITLE,
+    })).rejects.toThrow("Unknown Claude host-tool admission mode");
     expect(processes).toHaveLength(0);
     await manager.close();
   });
@@ -1776,6 +1801,7 @@ describe("pinned Claude runtime manager", () => {
       await expect(manager.claimSession({
         authority,
         fast: false,
+        hostTools: "required",
         preset: "fable-max",
         requirement: presetRequirements["fable-max"],
         projectRoot: PROJECT_ROOT,
@@ -1799,6 +1825,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -1828,6 +1855,7 @@ describe("pinned Claude runtime manager", () => {
       manager.claimSession({
         authority,
         fast: false,
+        hostTools: "required",
         preset: "fable-max",
         requirement: presetRequirements["fable-max"],
         projectRoot: PROJECT_ROOT,
@@ -1927,6 +1955,7 @@ describe("pinned Claude runtime manager", () => {
       await value.manager.claimSession({
         authority,
         fast: false,
+        hostTools: "required",
         preset: "fable-max",
         requirement: presetRequirements["fable-max"],
         projectRoot: PROJECT_ROOT,
@@ -2019,6 +2048,7 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.claimSession({
       authority,
       fast: false,
+      hostTools: "required",
       preset: "fable-max",
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
@@ -2204,6 +2234,107 @@ describe("pinned Claude runtime manager", () => {
     expect(value.manager.ownsSessionHostToolBinding(routedCall)).toBe(false);
     expect(value.bindingAuthority.revocations).toEqual([bindingId]);
     await value.manager.close();
+  });
+
+  test("rechecks exact live host-tool authority after serialization and fences disconnects", async () => {
+    let markHostToolEntered!: () => void;
+    let releaseHostTool!: () => void;
+    let markDisconnected!: () => void;
+    let markTurnResultReceived!: () => void;
+    let releaseTurnResult!: () => void;
+    const hostToolEntered = new Promise<void>((resolve) => { markHostToolEntered = resolve; });
+    const hostToolGate = new Promise<void>((resolve) => { releaseHostTool = resolve; });
+    const disconnected = new Promise<void>((resolve) => { markDisconnected = resolve; });
+    const turnResultReceived = new Promise<void>((resolve) => { markTurnResultReceived = resolve; });
+    const turnResultGate = new Promise<void>((resolve) => { releaseTurnResult = resolve; });
+    let normalizedCall: HraHostToolCall | undefined;
+    const value = harness({
+      hostTool: async (call) => {
+        normalizedCall = call;
+        markHostToolEntered();
+        await hostToolGate;
+        return { sessions: [] };
+      },
+      onFact: async (_factAuthority, fact) => {
+        if (fact.type === "tokenUsageUpdated") {
+          markTurnResultReceived();
+          await turnResultGate;
+        }
+        if (fact.type === "providerDisconnected") markDisconnected();
+      },
+    });
+    const providerThreadId = await startSession(value.manager);
+    const turnId = await startTurn(value.manager, providerThreadId, "exercise live admission");
+    const bindingId = `clhb_${"1".padStart(32, "0")}`;
+    const call = hostToolCall(providerThreadId, bindingId, "call-live-admission");
+    const pending = value.manager.handleSessionHostToolCall(call);
+    void pending.catch(() => undefined);
+    try {
+      await hostToolEntered;
+      if (normalizedCall === undefined) throw new Error("Expected a normalized host-tool call.");
+      const liveAuthority = {
+        authority,
+        providerThreadId,
+        connectionId: normalizedCall.connectionId,
+        turnId,
+        callId: normalizedCall.callId,
+        requestDigest: normalizedCall.requestDigest,
+      };
+      expect(value.manager.hasLiveHostToolCall(liveAuthority)).toBe(true);
+      expect(value.manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        connectionId: "30000000-0000-4000-8000-000000000099",
+      })).toBe(false);
+      expect(value.manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        turnId: "stale-turn",
+      })).toBe(false);
+      expect(value.manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        requestDigest: "f".repeat(64),
+      })).toBe(false);
+
+      const process = value.processes[0];
+      if (process === undefined) throw new Error("Expected one spawned Claude process.");
+      process.emit({
+        duration_ms: 25,
+        is_error: false,
+        num_turns: 1,
+        result: "complete",
+        session_id: providerThreadId,
+        stop_reason: "end_turn",
+        terminal_reason: "completed",
+        type: "result",
+        usage: { input_tokens: 2, output_tokens: 4 },
+      });
+      await turnResultReceived;
+      expect(value.manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
+      releaseTurnResult();
+      await settle();
+      await expect(value.manager.handleSessionHostToolCall(hostToolCall(
+        providerThreadId,
+        bindingId,
+        "call-after-completion",
+      ))).rejects.toThrow("active turn");
+
+      process.end();
+      await disconnected;
+      expect(value.manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
+      expect(value.bindingAuthority.revocations).toEqual([bindingId]);
+      await expect(value.manager.handleSessionHostToolCall(hostToolCall(
+        providerThreadId,
+        bindingId,
+        "call-after-disconnect",
+      ))).rejects.toThrow("stale");
+
+      releaseHostTool();
+      await expect(pending).resolves.toEqual({ sessions: [] });
+    } finally {
+      releaseTurnResult();
+      releaseHostTool();
+      await pending.catch(() => undefined);
+      await value.manager.close();
+    }
   });
 
   test("fails closed at the bounded session-lifetime host-tool call history", async () => {

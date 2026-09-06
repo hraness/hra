@@ -28,13 +28,13 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 export const HRA_INSTALL_BUN_VERSION = "1.3.14";
 export const HRA_INSTALL_PACKAGE_NAME = "@hraness/hra";
 const HRA_LEGACY_INSTALL_PACKAGE_NAME = "hra";
-export const HRA_INSTALL_PACKAGE_VERSION = "0.6.0";
-export const HRA_INSTALL_CLI_SHA256 = "8a01a01758ed2059540f70b4790aad4cf42219e86f447b8cc9bfdc4a6b1db3e8";
-export const HRA_INSTALL_NORMALIZER_SHA256 = "f7e02e2950f02090352d03d67c2240ecc06baed71ccb02765b819552dd37776b";
-export const HRA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/hra/releases/download/v0.6.0/hraness-hra-0.6.0.tgz";
-export const HRA_INSTALL_ARCHIVE_NAME = "hraness-hra-0.6.0.tgz";
-export const HRA_INSTALL_RELEASE_API_URL = "https://api.github.com/repos/hraness/hra/releases/tags/v0.6.0";
-export const HRA_INSTALL_RELEASE_TAG = "v0.6.0";
+export const HRA_INSTALL_PACKAGE_VERSION = "0.7.0";
+export const HRA_INSTALL_CLI_SHA256 = "168c6872d0cb8e95564367dd73a27e99331de5ea53c91873be068530a56c3133";
+export const HRA_INSTALL_NORMALIZER_SHA256 = "dc150de54e2458edf43fe6fdb77b506139913bed0115b3c2ad6094f72e12ef8b";
+export const HRA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz";
+export const HRA_INSTALL_ARCHIVE_NAME = "hraness-hra-0.7.0.tgz";
+export const HRA_INSTALL_RELEASE_API_URL = "https://api.github.com/repos/hraness/hra/releases/tags/v0.7.0";
+export const HRA_INSTALL_RELEASE_TAG = "v0.7.0";
 export const HRA_INSTALL_REPOSITORY_API_URL = "https://api.github.com/repos/hraness/hra";
 export const HRA_INSTALL_REPOSITORY_ID = 1_343_008_607;
 export const HRA_INSTALL_SUCCESS = "hra-install-safe";
@@ -651,7 +651,7 @@ if (testMode === "normal") {
     heldArchiveIdentity = verifiedArchive.identity;
     archiveSnapshot = verifiedArchive.snapshot;
     if (archiveSnapshot === undefined) throw new Error("The private HRA archive snapshot is unavailable.");
-    const route = "/" + randomUUID() + "/hraness-hra-0.6.0.tgz";
+    const route = "/" + randomUUID() + "/hraness-hra-0.7.0.tgz";
     let requests = 0;
     archiveServer = Bun.serve({
       hostname: "127.0.0.1",

@@ -286,6 +286,10 @@ const capabilityDigest = (value: string): Buffer => createHash("sha256")
   .digest();
 
 const validateIdentity = (value: ClaudeHostToolBindingIdentity): ClaudeHostToolBindingIdentity => {
+  const provider: unknown = value.provider;
+  if (provider !== "claude") {
+    throw new ClaudeError("INVALID_INPUT", "Claude host-tool binding provider must be claude");
+  }
   const providerThreadId = boundedString(value.providerThreadId, "Claude provider thread id");
   const profileId = boundedString(value.profileId, "Claude profile id");
   if (!Number.isSafeInteger(value.processGeneration) || value.processGeneration < 0) {
@@ -302,8 +306,7 @@ const validateIdentity = (value: ClaudeHostToolBindingIdentity): ClaudeHostToolB
 const sameIdentity = (
   actual: ClaudeHostToolBindingIdentity,
   expected: ClaudeHostToolBindingIdentity,
-): boolean => actual.provider === expected.provider
-  && actual.providerThreadId === expected.providerThreadId
+): boolean => actual.providerThreadId === expected.providerThreadId
   && actual.profileId === expected.profileId
   && actual.processGeneration === expected.processGeneration;
 

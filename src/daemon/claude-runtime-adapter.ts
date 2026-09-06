@@ -590,7 +590,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
    */
   async claimSession(input: {
     authority: ProfileAuthority;
-    hostTools?: "required" | "disabled";
+    hostTools: "required" | "disabled";
     admitProcessIdentity?: (identity: ClaudeProcessIdentity) => Promise<void>;
     providerThreadId: string;
     projectRoot: string;
@@ -603,11 +603,10 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveClaudeRuntimeProfile }> {
     this.#assertOpen();
     input.signal.throwIfAborted();
-    if (
-      input.hostTools !== undefined
-      && input.hostTools !== "required"
-      && input.hostTools !== "disabled"
-    ) throw new ClaudeError("INVALID_INPUT", "Unknown Claude host-tool admission mode.");
+    const hostTools: unknown = input.hostTools;
+    if (hostTools !== "required" && hostTools !== "disabled") {
+      throw new ClaudeError("INVALID_INPUT", "Unknown Claude host-tool admission mode.");
+    }
     const sourceLiveness: unknown = input.sourceLiveness;
     if (sourceLiveness !== "not_live") {
       throw new ClaudeError(
@@ -632,7 +631,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
         ? {}
         : { admitProcessIdentity: input.admitProcessIdentity }),
       launch: "resume",
-      hostTools: input.hostTools ?? "required",
+      hostTools: input.hostTools,
       profile: pending.review.effectiveRuntimeProfile,
       projectRoot: pending.projectRoot,
       providerThreadId: input.providerThreadId,
@@ -867,7 +866,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
    * another manager.
    */
   ownsSessionHostToolBinding(
-    call: ClaudeHostToolCall | ClaudeHostToolResponseWritten,
+    call: ClaudeHostToolCall,
   ): boolean {
     const session = this.#sessions.get(call.providerThreadId);
     return this.#state === "open"
@@ -877,6 +876,39 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       && session.hostToolBinding?.bindingId === call.bindingId
       && session.authority.id === call.profileId
       && session.authority.generation === call.processGeneration;
+  }
+
+  hasLiveHostToolCall(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    connectionId: string;
+    turnId: string;
+    callId: string;
+    requestDigest: string;
+  }): boolean {
+    const session = this.#sessions.get(input.providerThreadId);
+    const retained = session?.hostToolCalls.get(this.#hostToolCallKey(input.callId));
+    return this.#state === "open"
+      && session !== undefined
+      && session.authority.id === input.authority.id
+      && session.authority.generation === input.authority.generation
+      && session.connectionId === input.connectionId
+      && session.activeTurnId === input.turnId
+      && session.client.activeTurnId === input.turnId
+      && session.closeState === "open"
+      && session.client.state === "open"
+      && session.hostToolState === "active"
+      && this.#isCurrent(input.authority)
+      && retained !== undefined
+      && retained.bindingId === session.hostToolBinding?.bindingId
+      && retained.requestDigest === input.requestDigest
+      && retained.call.authority.profileId === input.authority.id
+      && retained.call.authority.processGeneration === input.authority.generation
+      && retained.call.connectionId === input.connectionId
+      && retained.call.threadId === input.providerThreadId
+      && retained.call.turnId === input.turnId
+      && retained.call.callId === input.callId
+      && retained.call.requestDigest === input.requestDigest;
   }
 
   async handleSessionHostToolCall(call: ClaudeHostToolCall): Promise<ClaudeHostToolPublicResult> {
@@ -1637,17 +1669,17 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
 
   async #closeSession(providerThreadId: string, session: RunningSession): Promise<void> {
     if (this.#sessions.get(providerThreadId) === session) session.closeState = "closing";
-    const settlements = await Promise.allSettled([
+    const [hostToolCleanup, processCleanup] = await Promise.allSettled([
       this.#revokeSessionHostTools(session),
       session.client.close(),
     ]);
+    const settlements = [hostToolCleanup, processCleanup] as const;
     const failures = settlements.flatMap((settlement) =>
       settlement.status === "rejected" ? [settlement.reason as unknown] : []);
     if (failures.length > 0) {
       if (this.#sessions.get(providerThreadId) === session) session.closeState = "failed";
-      const hostToolCleanupSucceeded = settlements[0]?.status === "fulfilled";
-      const processCleanup = settlements[1];
-      if (hostToolCleanupSucceeded && processCleanup?.status === "rejected") {
+      const hostToolCleanupSucceeded = hostToolCleanup.status === "fulfilled";
+      if (hostToolCleanupSucceeded && processCleanup.status === "rejected") {
         // Preserve the provider client's typed TIMEOUT/PROCESS_EXITED custody
         // error when host-tool cleanup added no second failure.
         throw processCleanup.reason;
@@ -1853,11 +1885,13 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       // The synchronous state change above already fences callbacks. Revoke
       // the external capability too so a disconnected child cannot retain a
       // usable MCP route while process settlement awaits its owner.
-      let revocationFailure: unknown;
+      let revocationFailure: Error | undefined;
       try {
         await this.#revokeSessionHostTools(session);
       } catch (error: unknown) {
-        revocationFailure = error;
+        revocationFailure = error instanceof Error
+          ? error
+          : new ClaudeError("PROTOCOL_ERROR", "Claude host-tool revocation failed");
       }
       await this.#observer.fact(session.authority, { ...fact, connectionId, providerThreadId });
       if (revocationFailure !== undefined) throw revocationFailure;

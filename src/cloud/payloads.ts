@@ -38,8 +38,12 @@ import { isModelPreset, type ModelPreset } from "./projection";
 import {
   presetProviders,
   providerSchema,
+  supportedPresetSchema,
+  supportedProviderSchema,
   type AdoptableProvider,
   type Provider,
+  type SupportedPreset,
+  type SupportedProvider,
 } from "../domain/presets";
 import {
   parseUsageEncryptedEnvelope,
@@ -60,6 +64,11 @@ function isInteractionId(value: unknown): value is string {
 
 const isProvider = (value: unknown): value is Provider =>
   providerSchema.safeParse(value).success;
+
+const isSupportedProvider = (value: unknown): value is SupportedProvider =>
+  supportedProviderSchema.safeParse(value).success;
+const isSupportedPreset = (value: unknown): value is SupportedPreset =>
+  supportedPresetSchema.safeParse(value).success;
 
 function isRemoteInteractionAnswerMap(
   value: unknown,
@@ -223,14 +232,14 @@ export type RemoteCommandPayload =
   | Readonly<{ kind: "send" | "queue" | "steer" | "send_or_steer"; message: string }>
   | RemoteMessagePayload
   | Readonly<{ kind: "stop" }>
-  | Readonly<{ kind: "set_model"; preset: ModelPreset }>
+  | Readonly<{ kind: "set_model"; preset: SupportedPreset }>
   /**
    * Move one session to another provider. The preset is optional: omitted, the
    * custodian keeps the session's tier when the target provider has one. The
    * account is deliberately absent — choosing an account is user-directed and
    * stays on the machine that holds the credentials.
    */
-  | Readonly<{ kind: "set_provider"; preset?: ModelPreset; provider: Provider }>
+  | Readonly<{ kind: "set_provider"; preset?: SupportedPreset; provider: SupportedProvider }>
   | Readonly<{ enabled: boolean; kind: "set_fast" }>
   | ResolveInteractionDecisionPayload
   | ResolveInteractionAnswersPayload
@@ -240,7 +249,7 @@ export type RemoteCommandPayload =
       scope: "session" | "default";
     }>
   | Readonly<{ enabled: boolean; kind: "set_show_thinking"; scope: "session" | "default" }>
-  | Readonly<{ kind: "set_default_preset"; preset: ModelPreset }>
+  | Readonly<{ kind: "set_default_preset"; preset: SupportedPreset }>
   | Readonly<{ archived: boolean; kind: "archive_session" }>
   | Readonly<{ kind: "rename_session"; name: string | null }>
   | Readonly<{ key: string; kind: "set_gateway_key" }>;
@@ -259,10 +268,10 @@ export type DeviceCommandPayload =
   | Readonly<{
       accountPublicId: string;
       kind: "session_start";
-      preset: ModelPreset;
+      preset: SupportedPreset;
       projectPublicId: string;
       prompt: string;
-      provider: Provider;
+      provider: SupportedProvider;
     }>
   | Readonly<{
       accountPublicId: string;
@@ -355,8 +364,8 @@ export function parseDeviceCommandPayload(value: unknown): DeviceCommandPayload 
     ])
     && isOpaqueIdentifier(value.accountPublicId)
     && isOpaqueIdentifier(value.projectPublicId)
-    && isModelPreset(value.preset)
-    && isProvider(value.provider)
+    && isSupportedPreset(value.preset)
+    && isSupportedProvider(value.provider)
     && presetProviders[value.preset] === value.provider
     && typeof value.prompt === "string"
     && value.prompt.length >= 1
@@ -499,6 +508,7 @@ export function parseDeviceCommandResultPayload(
 
 export type SessionMetadataPayload = Readonly<{
   archived?: boolean;
+  retiredProvider?: "devin";
   name: string | null;
   note: string | null;
 }>;
@@ -698,17 +708,17 @@ function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayloa
   if (
     value.kind === "set_model"
     && hasExactKeys(value, ["kind", "preset"])
-    && isModelPreset(value.preset)
+    && isSupportedPreset(value.preset)
   ) return { kind: value.kind, preset: value.preset };
   if (
     value.kind === "set_provider"
-    && isProvider(value.provider)
+    && isSupportedProvider(value.provider)
     && (
       (hasExactKeys(value, ["kind", "provider"]) && value.preset === undefined)
-      || (hasExactKeys(value, ["kind", "preset", "provider"]) && isModelPreset(value.preset))
+      || (hasExactKeys(value, ["kind", "preset", "provider"]) && isSupportedPreset(value.preset))
     )
   ) {
-    if (isModelPreset(value.preset)) {
+    if (isSupportedPreset(value.preset)) {
       return presetProviders[value.preset] === value.provider
         ? { kind: value.kind, preset: value.preset, provider: value.provider }
         : null;
@@ -767,7 +777,7 @@ function parseRemoteCommandPayloadUnchecked(value: unknown): RemoteCommandPayloa
   if (
     value.kind === "set_default_preset"
     && hasExactKeys(value, ["kind", "preset"])
-    && isModelPreset(value.preset)
+    && isSupportedPreset(value.preset)
   ) return { kind: value.kind, preset: value.preset };
   if (
     value.kind === "archive_session"
@@ -840,9 +850,11 @@ export function parseSessionMetadataPayload(value: unknown): SessionMetadataPayl
   // `archived` is an additive optional key: a payload written before session
   // archive existed still parses, and an absent key means "not archived".
   const archived = Object.hasOwn(value, "archived");
+  const retiredProvider = Object.hasOwn(value, "retiredProvider");
   if (
-    !hasExactKeys(value, archived ? ["archived", "name", "note"] : ["name", "note"])
+    !hasExactKeys(value, ["name", "note", ...(archived ? ["archived"] : []), ...(retiredProvider ? ["retiredProvider"] : [])])
     || (archived && typeof value.archived !== "boolean")
+    || (retiredProvider && value.retiredProvider !== "devin")
   ) return null;
   if (
     value.name !== null
@@ -861,6 +873,7 @@ export function parseSessionMetadataPayload(value: unknown): SessionMetadataPayl
   ) return null;
   return {
     ...(archived ? { archived: value.archived as boolean } : {}),
+    ...(retiredProvider ? { retiredProvider: "devin" as const } : {}),
     name: value.name,
     note: value.note,
   };

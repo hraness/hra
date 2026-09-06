@@ -1749,15 +1749,18 @@ export class HraCanonicalMemorySynchronizer implements HraCanonicalMemorySyncPor
 
   async #runBackground(): Promise<void> {
     const signal = this.#lifetime.signal;
+    // AbortSignal changes across awaits even though its property is readonly.
+    // Re-read it through a predicate instead of narrowing a stale loop check.
+    const isAborted = (): boolean => signal.aborted;
     let inventoryFailures = 0;
-    while (!signal.aborted) {
+    while (!isAborted()) {
       const wakeRevision = this.#backgroundWakeRevision;
       let waitMs: number | null;
       try {
         waitMs = await this.#backgroundTick(signal);
         inventoryFailures = 0;
       } catch (error: unknown) {
-        if (signal.aborted) return;
+        if (isAborted()) return;
         inventoryFailures = Math.min(
           inventoryFailures + 1,
           MAXIMUM_BACKGROUND_FAILURE_EXPONENT + 1,
@@ -1775,7 +1778,7 @@ export class HraCanonicalMemorySynchronizer implements HraCanonicalMemorySyncPor
       try {
         await this.#sleepForBackground(waitMs, signal);
       } catch (error: unknown) {
-        if (signal.aborted) return;
+        if (isAborted()) return;
         this.#reportBackgroundFailure({
           code: "CANONICAL_MEMORY_BACKGROUND_SUPERVISOR_FAILED",
           consecutiveFailures: Math.max(1, inventoryFailures),

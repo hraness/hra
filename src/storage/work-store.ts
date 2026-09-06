@@ -172,6 +172,17 @@ const currentWorkSessionAuthorityExistsSql = (
     )
 )`;
 
+/** Runtime admission is narrower than the immutable v40 schema's historical identities. */
+const supportedWorkSessionAuthorityExistsSql = (
+  sessionIdExpression: string,
+  generationPredicate = "",
+): string => currentWorkSessionAuthorityExistsSql(
+  sessionIdExpression,
+  `authority_session.provider_v39 IN ('codex','claude')${
+    generationPredicate.length === 0 ? "" : ` AND (${generationPredicate})`
+  }`,
+);
+
 export const WORK_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS work_clock (
   singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -2340,7 +2351,7 @@ export class WorkStore {
          AND t.preset=s.preset AND t.fast=s.fast_enabled
          AND s.provider_v39='codex'
          AND (s.preset_contract=w.preset_contract OR s.preset='low')
-         AND ${currentWorkSessionAuthorityExistsSql(
+         AND ${supportedWorkSessionAuthorityExistsSql(
            "s.id",
            "authority_profile.process_generation=?",
          )}`,
@@ -2362,7 +2373,7 @@ export class WorkStore {
        JOIN sessions AS s ON s.id=m.session_id
        WHERE w.id=? AND w.work_id=? AND w.to_session_id=? AND w.mode=?
          AND w.target_account_generation=?
-         AND ${currentWorkSessionAuthorityExistsSql(
+         AND ${supportedWorkSessionAuthorityExistsSql(
            "s.id",
            "authority_profile.process_generation=w.target_account_generation",
          )}`,
@@ -2923,7 +2934,7 @@ export class WorkStore {
   ): boolean {
     const authority = this.#database.query(
       `SELECT 1 AS present
-       WHERE ${currentWorkSessionAuthorityExistsSql(
+       WHERE ${supportedWorkSessionAuthorityExistsSql(
          "?",
          "? IS NULL OR authority_profile.process_generation=?",
        )}`,
@@ -3944,7 +3955,7 @@ export class WorkStore {
              AND sm.state IN ('effect_started','ambiguous')
              AND sr.attempt_id IS NULL
          )
-         AND ${currentWorkSessionAuthorityExistsSql("s.id")}`,
+         AND ${supportedWorkSessionAuthorityExistsSql("s.id")}`,
     ).get(
       task.work_id,
       actorSessionId,
@@ -3972,7 +3983,7 @@ export class WorkStore {
            s.preset_contract=w.preset_contract
            OR s.preset='low'
          )
-         AND ${currentWorkSessionAuthorityExistsSql(
+         AND ${supportedWorkSessionAuthorityExistsSql(
            "s.id",
            "authority_profile.process_generation=?",
          )}`,
@@ -5717,7 +5728,7 @@ export class WorkStore {
       `SELECT p.process_generation AS account_generation
        FROM sessions AS s
        JOIN profiles AS p ON p.id=s.profile_id
-       WHERE s.id=? AND ${currentWorkSessionAuthorityExistsSql("s.id")}`,
+       WHERE s.id=? AND ${supportedWorkSessionAuthorityExistsSql("s.id")}`,
     ).get(operation.targetSessionId) as { account_generation: number } | null;
     if (
       targetAuthority === null

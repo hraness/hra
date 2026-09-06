@@ -7,12 +7,10 @@ import { join } from "node:path";
 
 import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { IndeterminateCodexEffectError, type HraHostToolCall } from "../codex";
-import { DEVIN_PIN, DEVIN_PIN_MODEL } from "../devin/pin";
 import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble";
 import type { Preset } from "../domain/presets";
 import type {
   EffectiveClaudeRuntimeProfile,
-  EffectiveDevinRuntimeProfile,
   EffectiveRuntimeProfile,
 } from "../domain/runtime-profile";
 import {
@@ -41,8 +39,6 @@ import {
   type CodexSessionObservation,
   type CodexSessionProjection,
   type CompactProjectionRecoveryBlocker,
-  type DevinRuntimePort,
-  type DevinRuntimeStartReview,
   type ProfileAuthority,
   type RuntimeStartReview,
 } from "./ports";
@@ -87,18 +83,6 @@ const claudeProfile = (authority: ProfileAuthority): EffectiveClaudeRuntimeProfi
   isolatedConfigDir: true,
   outputFormat: "stream-json",
   inputFormat: "stream-json",
-});
-
-const devinProfile = (authority: ProfileAuthority): EffectiveDevinRuntimeProfile => ({
-  profileId: authority.id,
-  processGeneration: authority.generation,
-  observedAt: 2_000,
-  preset: "astra",
-  model: DEVIN_PIN_MODEL,
-  reasoningEffort: "provider-default",
-  devinVersion: DEVIN_PIN,
-  protocolVersion: 1,
-  isolatedHome: true,
 });
 
 /** A Codex seam that starts sessions and turns and records every call. */
@@ -491,139 +475,6 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
   timeoutInteraction(): Promise<never> { return Promise.reject(this.#unsupported()); }
 }
 
-/** A Devin seam that proves ACP routing while deliberately exposing no HRA host tools. */
-class SwitchFakeDevin implements DevinRuntimePort {
-  readonly provider = "devin" as const;
-  readonly pendingReviewIds = new Set<string>();
-  readonly calls: string[] = [];
-  readonly endedThreads: string[] = [];
-  readonly observedDeveloperInstructions: Array<string | undefined> = [];
-  readonly readDeveloperInstructions: Array<string | undefined> = [];
-  readonly seededMessages: string[] = [];
-  turnStatus: "completed" | "inProgress" = "completed";
-  #turns = 0;
-  projection: CodexSessionProjection = {
-    providerThreadId: "devin-thread-1",
-    title: "New session",
-    status: "idle",
-    providerUpdatedAt: 30,
-  };
-
-  discardRuntimeReview(review: DevinRuntimeStartReview): void {
-    this.pendingReviewIds.delete(review.reviewId);
-  }
-  pinnedVersion(): string { return DEVIN_PIN; }
-  rebindProfileAuthority(): void {}
-  hasLiveOrLoadableSession(input: {
-    authority: ProfileAuthority;
-    providerThreadId: string;
-  }): boolean {
-    return input.providerThreadId === this.projection.providerThreadId;
-  }
-  async readAccount(): Promise<CodexAccountProjection> {
-    this.calls.push("read-account");
-    return { signedIn: true };
-  }
-  async close(): Promise<void> {}
-  async reviewSessionStart(
-    input: Parameters<DevinRuntimePort["reviewSessionStart"]>[0],
-  ): Promise<DevinRuntimeStartReview> {
-    this.calls.push("review-session");
-    const review = {
-      reviewId: crypto.randomUUID(),
-      kind: "session_start" as const,
-      effectiveRuntimeProfile: devinProfile(input.authority),
-    };
-    this.pendingReviewIds.add(review.reviewId);
-    return review;
-  }
-  async startSession(
-    input: Parameters<DevinRuntimePort["startSession"]>[0],
-  ): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveDevinRuntimeProfile }> {
-    this.calls.push("start-session");
-    this.pendingReviewIds.delete(input.review.reviewId);
-    return { ...this.projection, effectiveRuntimeProfile: input.review.effectiveRuntimeProfile };
-  }
-  async observeSession(
-    input: Parameters<DevinRuntimePort["observeSession"]>[0],
-  ): Promise<CodexSessionObservation> {
-    this.calls.push("observe");
-    this.observedDeveloperInstructions.push(input.developerInstructions);
-    return {
-      connectionId: "30000000-0000-4000-8000-000000000003",
-      projection: { ...this.projection, providerThreadId: input.providerThreadId },
-      resumed: false,
-    };
-  }
-  async readSession(
-    input: Parameters<DevinRuntimePort["readSession"]>[0],
-  ): Promise<CodexSessionProjection> {
-    this.calls.push("read");
-    this.readDeveloperInstructions.push(input.developerInstructions);
-    return { ...this.projection, providerThreadId: input.providerThreadId };
-  }
-  async endSession(input: Parameters<DevinRuntimePort["endSession"]>[0]): Promise<void> {
-    this.calls.push("end-session");
-    this.endedThreads.push(input.providerThreadId);
-  }
-  async reviewTurnStart(
-    input: Parameters<DevinRuntimePort["reviewTurnStart"]>[0],
-  ): Promise<DevinRuntimeStartReview> {
-    this.calls.push("review-turn");
-    const review = {
-      reviewId: crypto.randomUUID(),
-      kind: "turn_start" as const,
-      effectiveRuntimeProfile: devinProfile(input.authority),
-    };
-    this.pendingReviewIds.add(review.reviewId);
-    return review;
-  }
-  async startTurn(
-    input: Parameters<DevinRuntimePort["startTurn"]>[0],
-  ): Promise<{
-    turnId: string;
-    status: "completed" | "inProgress";
-    effectiveRuntimeProfile: EffectiveDevinRuntimeProfile;
-  }> {
-    this.calls.push("start-turn");
-    this.pendingReviewIds.delete(input.review.reviewId);
-    this.seededMessages.push(input.message);
-    this.#turns += 1;
-    const turnId = `devin-turn-${String(this.#turns)}`;
-    this.projection = {
-      ...this.projection,
-      status: this.turnStatus === "inProgress" ? "active" : "idle",
-      ...(this.turnStatus === "inProgress" ? { activeTurnId: turnId } : {}),
-      providerUpdatedAt: (this.projection.providerUpdatedAt ?? 30) + 1,
-    };
-    if (this.turnStatus !== "inProgress") {
-      delete (this.projection as { activeTurnId?: string }).activeTurnId;
-    }
-    return {
-      effectiveRuntimeProfile: input.review.effectiveRuntimeProfile,
-      status: this.turnStatus,
-      turnId,
-    };
-  }
-  async steer(): Promise<void> { this.calls.push("steer"); }
-  async interrupt(): Promise<void> {
-    this.calls.push("interrupt");
-    this.projection = {
-      ...this.projection,
-      status: "idle",
-      providerUpdatedAt: (this.projection.providerUpdatedAt ?? 30) + 1,
-    };
-    delete (this.projection as { activeTurnId?: string }).activeTurnId;
-  }
-  #unsupported(): never { throw new Error("This fixture does not drive that Devin capability."); }
-  interactionAuthority(): never { return this.#unsupported(); }
-  inspectInteractionAuthority(): Promise<never> { return Promise.reject(this.#unsupported()); }
-  validateInteractionResolution(): Promise<never> { return Promise.reject(this.#unsupported()); }
-  resolveInteraction(): Promise<never> { return Promise.reject(this.#unsupported()); }
-  validateInteractionTimeout(): Promise<never> { return Promise.reject(this.#unsupported()); }
-  timeoutInteraction(): Promise<never> { return Promise.reject(this.#unsupported()); }
-}
-
 class OfflineCloud extends UnavailableCloudControl {
   constructor() {
     super({
@@ -700,7 +551,6 @@ type Fixture = Readonly<{
   claude: SwitchFakeClaude;
   codex: SwitchFakeCodex;
   daemonGeneration: number;
-  devin: SwitchFakeDevin;
   documents: string;
   paths: ReturnType<typeof resolveStatePaths>;
   service: HraService;
@@ -726,12 +576,10 @@ async function fixture(
   store.setDefaultApprovalMode("manual");
   const codex = new SwitchFakeCodex();
   const claude = new SwitchFakeClaude();
-  const devin = new SwitchFakeDevin();
   const service = new HraService({
     claude,
     cloud: new OfflineCloud(),
     codex,
-    devin,
     daemonAuthority,
     daemonGeneration,
     paths,
@@ -741,7 +589,7 @@ async function fixture(
     ...(factsMemory === undefined ? {} : { factsMemory }),
   });
   services.push(service);
-  return { claude, codex, daemonGeneration, devin, documents, paths, service, store };
+  return { claude, codex, daemonGeneration, documents, paths, service, store };
 }
 
 async function reopenFixture(value: Fixture): Promise<Fixture> {
@@ -758,12 +606,10 @@ async function reopenFixture(value: Fixture): Promise<Fixture> {
   );
   const codex = new SwitchFakeCodex();
   const claude = new SwitchFakeClaude();
-  const devin = new SwitchFakeDevin();
   const service = new HraService({
     claude,
     cloud: new OfflineCloud(),
     codex,
-    devin,
     daemonAuthority: {
       assertCurrent: async () => {},
       close: () => {},
@@ -780,7 +626,6 @@ async function reopenFixture(value: Fixture): Promise<Fixture> {
     claude,
     codex,
     daemonGeneration,
-    devin,
     documents: value.documents,
     paths: value.paths,
     service,
@@ -830,31 +675,6 @@ async function claudeSession(value: Fixture): Promise<Readonly<{
       kind: "session.start",
       preset: "fable-max",
       provider: "claude",
-    },
-    { signal },
-  ) as { session: { id: `sess_${string}` } };
-  return { accountId: added.account.id, sessionId: started.session.id };
-}
-
-async function devinSession(value: Fixture): Promise<Readonly<{
-  accountId: `acct_${string}`;
-  sessionId: `sess_${string}`;
-}>> {
-  const added = await value.service.execute(
-    { kind: "account.add", label: "Devin work" },
-    { signal },
-  ) as { account: { id: `acct_${string}` } };
-  await value.service.execute(
-    { kind: "project.add", label: "Devin work docs", path: value.documents },
-    { signal },
-  );
-  const started = await value.service.execute(
-    {
-      account: added.account.id,
-      fast: false,
-      kind: "session.start",
-      preset: "astra",
-      provider: "devin",
     },
     { signal },
   ) as { session: { id: `sess_${string}` } };
@@ -2081,122 +1901,6 @@ describe("provider portability", () => {
     expect(replacementObservation).toBeGreaterThan(claim);
     expect(value.claude.seededMessages).toHaveLength(1);
     expect(value.claude.seededMessages[0]).toContain("[HRA provider handoff]");
-  });
-
-  test("switches Codex to Devin without carrying an unimplemented host-capability binding", async () => {
-    const factsMemory = new BoundMemoryLifecycle();
-    const value = await fixture(undefined, 0, factsMemory);
-    const { sessionId } = await codexSession(value);
-    const source = value.store.requireSession(sessionId);
-    expect(value.store.readSessionHostCapabilityBinding(sessionId)).not.toBeNull();
-
-    const switched = await value.service.execute({
-      idempotencyKey: crypto.randomUUID(),
-      kind: "session.switch",
-      provider: "devin",
-      session: sessionId,
-    }, { signal }) as {
-      from: { provider: string };
-      to: { provider: string };
-    };
-
-    expect(switched).toMatchObject({
-      from: { provider: "codex" },
-      to: { provider: "devin" },
-    });
-    expect(value.store.requireSession(sessionId)).toMatchObject({
-      profileId: source.profileId,
-      provider: "devin",
-      providerThreadId: "devin-thread-1",
-      preset: "astra",
-    });
-    expect(value.store.readSessionHostCapabilityBinding(sessionId)).toBeNull();
-    expect(value.devin.observedDeveloperInstructions).not.toHaveLength(0);
-    expect(value.devin.observedDeveloperInstructions.every((value) => value === undefined)).toBe(true);
-    expect(value.devin.readDeveloperInstructions).toEqual([]);
-    expect(value.codex.endedThreads).toEqual(["codex-thread-1"]);
-    expect(value.devin.seededMessages[0]).toContain(
-      "This conversation ran on codex and now runs on devin.",
-    );
-    expect(factsMemory.readSession(sessionId)).toMatchObject({
-      ownerId: source.profileId,
-      state: "active",
-    });
-    expect(factsMemory.cleanups).toEqual([]);
-  });
-
-  test("switches Devin to Claude and atomically establishes the target host-capability binding", async () => {
-    const factsMemory = new BoundMemoryLifecycle();
-    const value = await fixture(undefined, 0, factsMemory);
-    const { sessionId } = await devinSession(value);
-    const source = value.store.requireSession(sessionId);
-    expect(value.store.readSessionHostCapabilityBinding(sessionId)).toBeNull();
-
-    await value.service.execute(
-      { detail: false, kind: "session.show", session: sessionId },
-      { signal },
-    );
-    expect(value.devin.observedDeveloperInstructions).toEqual([undefined]);
-    expect(value.devin.readDeveloperInstructions).toEqual([undefined]);
-
-    const switchKey = crypto.randomUUID();
-    value.claude.onActivate = (input) => {
-      const current = value.store.requireSession(sessionId);
-      if (current.provider === "claude") {
-        expect(value.store.readMutation(switchKey)).toMatchObject({ state: "applied" });
-        expect(value.store.readSessionHostCapabilityBinding(sessionId)).not.toBeNull();
-        expect(value.store.readSessionClaudeProcessAuthority(sessionId)).toMatchObject({
-          providerThreadId: input.providerThreadId,
-          state: "bound",
-        });
-        return;
-      }
-      expect(value.store.requireSession(sessionId)).toMatchObject({ provider: "devin" });
-      const attempt = value.store.readMutation(switchKey);
-      if (attempt === null) throw new Error("Expected a durable provider-switch attempt.");
-      expect(attempt).toMatchObject({
-        authorityId: sessionId,
-        kind: "session.switch",
-        state: "effect_started",
-      });
-      expect(attempt.evidence?.evidence).toMatchObject({
-        kind: "session.switch",
-        targetProfileId: input.authority.id,
-        targetProcessGeneration: input.authority.generation,
-        targetProvider: "claude",
-      });
-      expect(value.store.readSessionProviderSwitchProgress(attempt.id)).toMatchObject({
-        targetProviderThreadId: input.providerThreadId,
-        targetReleased: false,
-      });
-      expect(value.store.readSessionHostCapabilityBinding(sessionId)).toBeNull();
-    };
-    await value.service.execute({
-      idempotencyKey: switchKey,
-      kind: "session.switch",
-      provider: "claude",
-      session: sessionId,
-    }, { signal });
-
-    expect(value.store.requireSession(sessionId)).toMatchObject({
-      profileId: source.profileId,
-      provider: "claude",
-      providerThreadId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
-      preset: "fable-max",
-    });
-    expect(value.store.readSessionHostCapabilityBinding(sessionId)).toMatchObject({
-      manifestDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
-      manifestVersion: 1,
-      preambleDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
-      preambleVersion: 1,
-    });
-    expect(value.devin.endedThreads).toEqual(["devin-thread-1"]);
-    expect(value.claude.calls).toContain("activate-host-tools");
-    expect(factsMemory.readSession(sessionId)).toMatchObject({
-      ownerId: source.profileId,
-      state: "active",
-    });
-    expect(factsMemory.cleanups).toEqual([]);
   });
 
   test("replays a committed provider switch after response loss without repeating provider effects", async () => {

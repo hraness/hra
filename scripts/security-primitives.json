@@ -2,6 +2,12 @@
   "src/claude/account.ts": {
     "O_NOFOLLOW": 1
   },
+  "src/claude/host-tool-bridge.ts": {
+    "timingSafeEqual": 1,
+    "O_NOFOLLOW": 2,
+    "mode0600": 2,
+    "mode0700": 1
+  },
   "src/claude/process.ts": {
     "safeEnvironmentKeys": 2
   },
@@ -23,6 +29,9 @@
     "assertCurrent": 1,
     "redactCompleteSensitiveText": 1
   },
+  "src/cloud/canonical-memory-sync.ts": {
+    "assertCurrent": 8
+  },
   "src/cloud/daemon-adapters.ts": {
     "O_NOFOLLOW": 5,
     "fsync": 2,
@@ -40,7 +49,8 @@
     "redactCompleteSensitiveText": 1
   },
   "src/cloud/local-control.ts": {
-    "assertCurrent": 20
+    "timingSafeEqual": 2,
+    "assertCurrent": 21
   },
   "src/codex/automations.ts": {
     "O_NOFOLLOW": 1
@@ -57,6 +67,9 @@
   "src/daemon/attachment-ingest.ts": {
     "O_NOFOLLOW": 1
   },
+  "src/daemon/claude-host-tool-transport.ts": {
+    "mode0600": 2
+  },
   "src/daemon/claude-runtime-adapter.ts": {
     "assertCurrent": 8
   },
@@ -67,9 +80,6 @@
     "O_NOFOLLOW": 3,
     "mode0600": 7,
     "assertCurrent": 3
-  },
-  "src/daemon/devin-runtime-adapter.ts": {
-    "assertCurrent": 4
   },
   "src/daemon/local-transport.ts": {
     "timingSafeEqual": 1,
@@ -82,7 +92,7 @@
     "redactCompleteSensitiveText": 1
   },
   "src/daemon/service.ts": {
-    "assertCurrent": 94
+    "assertCurrent": 92
   },
   "src/daemon/session-event-cursor.ts": {
     "timingSafeEqual": 1
@@ -99,15 +109,6 @@
   },
   "src/desktop/switch.ts": {
     "assertCurrent": 4
-  },
-  "src/devin/index.ts": {
-    "safeEnvironmentKeys": 1
-  },
-  "src/devin/process.ts": {
-    "safeEnvironmentKeys": 2
-  },
-  "src/devin/protocol.ts": {
-    "redactCompleteSensitiveText": 1
   },
   "src/install-normalizer.ts": {
     "O_NOFOLLOW": 13,
@@ -141,7 +142,7 @@
     "assertCurrent": 12
   },
   "src/storage/oh-facts-memory-engine.ts": {
-    "O_NOFOLLOW": 10,
+    "O_NOFOLLOW": 11,
     "fsync": 4,
     "mode0600": 5
   },
@@ -160,10 +161,10 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 119,
+    "immediateTransaction": 158,
     "secureDelete": 2,
     "synchronousFull": 1,
-    "redactCompleteSensitiveText": 2
+    "redactCompleteSensitiveText": 3
   },
   "src/storage/work-capability.ts": {
     "timingSafeEqual": 1

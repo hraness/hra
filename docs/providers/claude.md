@@ -94,7 +94,9 @@ entries in the shared `hra.host-tools.v1` manifest. Each model-visible tool
 schema has `additionalProperties: false`; account, project, provider-thread,
 process-generation, clock, and storage authority are never model arguments.
 
-Each Claude process receives a unique MCP config and binding file in a private
+New HRA-created Claude threads receive the HRA preamble and host tools together. Existing personal adoptions and legacy sessions without that durable capability resume with HRA host tools disabled: a saved provider prompt snapshot can ignore a later append, so an MCP configuration alone cannot prove that the combined capability was installed. Their owner-facing memory CLI and ordinary session controls remain available.
+
+Each tool-bound Claude process receives a unique MCP config and binding file in a private
 mode-0700 directory. Both files are mode 0600. The config contains only the
 stdio command and binding-file path; the binding file contains a random
 per-session capability and local callback-socket path beneath the same

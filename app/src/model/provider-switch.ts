@@ -1,5 +1,5 @@
 /**
- * Switching a live session between Codex, Claude Code, and Devin.
+ * Switching a live session between Codex and Claude Code.
  *
  * This module is the single alignment point for the `set_provider` remote
  * command. The daemon-side kind is being added in parallel, so the payload is
@@ -11,13 +11,13 @@
  * structurally over the three fields a command record carries, the same way
  * `deviceCommandNotice` is, so the settling line is provable without a client.
  */
-import { isCommandKind, type ModelPreset, type RemoteCommandPayload } from "../hra/cloud";
+import { isCommandKind, parseRemoteCommandPayload, type SupportedPreset, type RemoteCommandPayload } from "../hra/cloud";
 
-export type SessionProvider = "codex" | "claude" | "devin";
+export type SessionProvider = "codex" | "claude";
 
 export type SessionPresetOption = Readonly<{
   label: string;
-  value: ModelPreset;
+  value: SupportedPreset;
 }>;
 
 const codexPresetOptions: readonly SessionPresetOption[] = Object.freeze([
@@ -30,14 +30,9 @@ const claudePresetOptions: readonly SessionPresetOption[] = Object.freeze([
   { label: "Claude Fable Max", value: "fable-max" },
 ]);
 
-const devinPresetOptions: readonly SessionPresetOption[] = Object.freeze([
-  { label: "GPT-6 Astra", value: "astra" },
-]);
-
 const allPresetOptions: readonly SessionPresetOption[] = Object.freeze([
   ...codexPresetOptions,
   ...claudePresetOptions,
-  ...devinPresetOptions,
 ]);
 
 /**
@@ -52,14 +47,12 @@ export function sessionPresetOptionsForProvider(
 ): readonly SessionPresetOption[] {
   if (provider === "codex") return codexPresetOptions;
   if (provider === "claude") return claudePresetOptions;
-  if (provider === "devin") return devinPresetOptions;
   return allPresetOptions;
 }
 
 /** The pinned preset sent atomically with a provider switch. */
-export function defaultSessionPresetForProvider(provider: SessionProvider): ModelPreset {
+export function defaultSessionPresetForProvider(provider: SessionProvider): SupportedPreset {
   if (provider === "claude") return "fable-max";
-  if (provider === "devin") return "astra";
   return "ultra";
 }
 
@@ -69,7 +62,6 @@ export const providerSwitchOptions: readonly Readonly<{
 }>[] = Object.freeze([
   { label: "Run on Codex", provider: "codex" },
   { label: "Run on Claude Code (Linux machine only)", provider: "claude" },
-  { label: "Run on Devin", provider: "devin" },
 ]);
 
 /**
@@ -96,17 +88,19 @@ export const setProviderCommandKind = "set_provider";
  * the two shapes meet.
  */
 export function buildSetProviderPayload(input: Readonly<{
-  preset?: ModelPreset;
+  preset?: SupportedPreset;
   provider: SessionProvider;
 }>): RemoteCommandPayload {
   const payload: Readonly<{
     kind: string;
-    preset?: ModelPreset;
+    preset?: SupportedPreset;
     provider: SessionProvider;
   }> = input.preset === undefined
     ? { kind: setProviderCommandKind, provider: input.provider }
     : { kind: setProviderCommandKind, preset: input.preset, provider: input.provider };
-  return payload as unknown as RemoteCommandPayload;
+  const parsed = parseRemoteCommandPayload(payload);
+  if (parsed === null) throw new Error("The provider switch payload is not valid.");
+  return parsed;
 }
 
 /** Build the atomic provider-and-default-preset switch used by the session menu. */
@@ -167,7 +161,7 @@ export function providerSwitchNotice(
   if (command === null || provider === null) return null;
   const name = provider === "claude"
     ? "Claude Code"
-    : provider === "devin" ? "Devin" : "Codex";
+    : "Codex";
   switch (command.state) {
     case "pending":
       return { settled: false, text: `Waiting for the machine to pick up the switch to ${name}.` };

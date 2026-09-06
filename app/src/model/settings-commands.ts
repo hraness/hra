@@ -14,7 +14,7 @@
  *
  * Nothing here imports React, so `bun test ./app` runs it without a document.
  */
-import type { RemoteCommandPayload } from "../hra/cloud";
+import type { RemoteCommandPayload, SupportedPreset } from "../hra/cloud";
 
 export type ApprovalMode = "auto:all" | "auto:workspace" | "manual";
 export type PresetChoice = "low" | "high" | "ultra" | "fable-max" | "astra";
@@ -34,17 +34,16 @@ export const approvalModeLabels: Readonly<Record<ApprovalMode, string>> = Object
   manual: "Manual",
 });
 
-export const presetChoices: readonly PresetChoice[] = Object.freeze([
+export const presetChoices: readonly SupportedPreset[] = Object.freeze([
   "low",
   "high",
   "ultra",
   "fable-max",
-  "astra",
 ] as const);
 
 export const presetLabels: Readonly<Record<PresetChoice, string>> = Object.freeze({
   "fable-max": "Fable Max",
-  astra: "Devin Astra",
+  astra: "Devin Astra (retired)",
   high: "Astra Max",
   low: "Luna Max",
   ultra: "Astra Ultra",
@@ -58,7 +57,7 @@ export function showThinkingCommand(enabled: boolean): RemoteCommandPayload {
   return { enabled, kind: "set_show_thinking", scope: defaultSettingScope };
 }
 
-export function defaultPresetCommand(preset: PresetChoice): RemoteCommandPayload {
+export function defaultPresetCommand(preset: SupportedPreset): RemoteCommandPayload {
   return { kind: "set_default_preset", preset };
 }
 

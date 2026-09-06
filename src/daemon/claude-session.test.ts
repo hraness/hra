@@ -438,12 +438,10 @@ describe("Claude sessions on the local authority", () => {
     expect(value.processes).toEqual([process]);
     expect(process.terminated).toBe(true);
     const afterLoginBodies = await eventBodies(value, started.session.id);
-    expect(afterLoginBodies).toContainEqual(
-      expect.objectContaining({ type: "gap", reason: "provider_restart" }),
-    );
-    expect(afterLoginBodies).toContainEqual(
-      expect.objectContaining({ type: "connection", state: "resubscribed" }),
-    );
+    expect(afterLoginBodies.some((body) =>
+      body.type === "gap" && body.reason === "provider_restart")).toBe(true);
+    expect(afterLoginBodies.some((body) =>
+      body.type === "connection" && body.state === "resubscribed")).toBe(true);
 
     await value.service.execute({
       idempotencyKey: crypto.randomUUID(),

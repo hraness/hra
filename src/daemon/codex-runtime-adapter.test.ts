@@ -1412,6 +1412,11 @@ describe("PinnedCodexRuntimeManager", () => {
   test("binds the HRA host service and its post-response wake to the exact live connection", async () => {
     const exactConnectionId = "70000000-0000-4000-8000-000000000777";
     let launched: LaunchPinnedCodexOptions | undefined;
+    let liveHostToolCall: HraHostToolCall | undefined;
+    let markHostToolEntered!: () => void;
+    let releaseHostTool!: () => void;
+    const hostToolEntered = new Promise<void>((resolve) => { markHostToolEntered = resolve; });
+    const hostToolGate = new Promise<void>((resolve) => { releaseHostTool = resolve; });
     const handled: HraHostToolCall[] = [];
     const responseWritten: HraHostToolCall[] = [];
     const fake = {
@@ -1421,6 +1426,21 @@ describe("PinnedCodexRuntimeManager", () => {
         authority: { profileId: authority.id, processGeneration: authority.generation },
         value: { account: null, requiresOpenaiAuth: true },
       }),
+      hasLiveHraHostToolCall: (input: {
+        authority: { profileId: string; processGeneration: number };
+        callId: string;
+        connectionId: string;
+        requestDigest: string;
+        threadId: string;
+        turnId: string;
+      }) => liveHostToolCall !== undefined
+        && liveHostToolCall.authority.profileId === input.authority.profileId
+        && liveHostToolCall.authority.processGeneration === input.authority.processGeneration
+        && liveHostToolCall.callId === input.callId
+        && liveHostToolCall.connectionId === input.connectionId
+        && liveHostToolCall.requestDigest === input.requestDigest
+        && liveHostToolCall.threadId === input.threadId
+        && liveHostToolCall.turnId === input.turnId,
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
     const manager = createRuntimeManager({
@@ -1431,9 +1451,16 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       observer: {
         account: () => undefined,
-        hraHostTool: (_authority, call) => {
+        hraHostTool: async (_authority, call) => {
           handled.push(call);
-          return { scope: "conversation", task: { id: "stask_exact" } };
+          liveHostToolCall = call;
+          markHostToolEntered();
+          try {
+            await hostToolGate;
+            return { scope: "conversation", task: { id: "stask_exact" } };
+          } finally {
+            liveHostToolCall = undefined;
+          }
         },
         hraHostToolResponseWritten: (_authority, call) => {
           responseWritten.push(call);
@@ -1473,10 +1500,36 @@ describe("PinnedCodexRuntimeManager", () => {
       tool: "automation_update",
       input: call.operation,
     } as const;
-    await expect(launched.onHraHostToolCall(hostCall)).resolves.toEqual({
+    const liveAuthority = {
+      authority,
+      providerThreadId: hostCall.threadId,
+      connectionId: hostCall.connectionId,
+      turnId: hostCall.turnId,
+      callId: hostCall.callId,
+      requestDigest: hostCall.requestDigest,
+    };
+    expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
+    const pending = Promise.resolve(launched.onHraHostToolCall(hostCall));
+    void pending.catch(() => undefined);
+    await hostToolEntered;
+    try {
+      expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(true);
+      expect(manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        connectionId: "70000000-0000-4000-8000-999999999999",
+      })).toBe(false);
+      expect(manager.hasLiveHostToolCall({
+        ...liveAuthority,
+        requestDigest: "b".repeat(64),
+      })).toBe(false);
+    } finally {
+      releaseHostTool();
+    }
+    await expect(pending).resolves.toEqual({
       scope: "conversation",
       task: { id: "stask_exact" },
     });
+    expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
     expect(handled).toEqual([hostCall]);
     expect(responseWritten).toEqual([]);
     await launched.onHraHostToolResponseWritten(hostCall);
@@ -1496,7 +1549,9 @@ describe("PinnedCodexRuntimeManager", () => {
     await launched.onHraHostToolResponseWritten(staleHostCall);
     expect(handled).toEqual([hostCall]);
     expect(responseWritten).toEqual([hostCall]);
-    await manager.close();
+    const close = manager.close();
+    expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
+    await close;
   });
 
   test("preserves the provider login ID and cancels only that exact current-generation login", async () => {

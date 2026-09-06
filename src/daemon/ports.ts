@@ -2,7 +2,6 @@ import type { AttachmentManifestEntry, PreparedAttachment } from "../domain/atta
 import type { Preset, PresetRequirement, Provider } from "../domain/presets";
 import type {
   EffectiveClaudeRuntimeProfile,
-  EffectiveDevinRuntimeProfile,
   EffectiveRuntimeProfile,
 } from "../domain/runtime-profile";
 import type { AccountRateLimitResetOutcome } from "../domain/usage-metrics";
@@ -41,8 +40,6 @@ export type RuntimeStartReviewOf<Profile> = {
 export type RuntimeStartReview = RuntimeStartReviewOf<EffectiveRuntimeProfile>;
 
 export type ClaudeRuntimeStartReview = RuntimeStartReviewOf<EffectiveClaudeRuntimeProfile>;
-
-export type DevinRuntimeStartReview = RuntimeStartReviewOf<EffectiveDevinRuntimeProfile>;
 
 export type CodexAccountProjection = {
   signedIn: boolean;
@@ -199,7 +196,7 @@ export type CodexSessionPage = {
  * listing) stays on that provider's own port. `Profile` is the reviewed
  * runtime-profile document the provider proves before it runs.
  *
- * D4/W3 seam: Codex, Claude Code, and Devin each implement this interface,
+ * D4/W3 seam: Codex and Claude Code each implement this interface,
  * and the daemon selects one per session by the session's recorded provider.
  */
 export interface SessionRuntimePort<Profile> {
@@ -233,6 +230,20 @@ export interface SessionRuntimePort<Profile> {
     providerThreadId: string;
     signal: AbortSignal;
   }): Promise<void>;
+  /**
+   * Synchronous post-serialization admission for a provider-originated host
+   * call. Callers must treat an absent method or `false` as stale authority.
+   * A `true` result is the runtime linearization point: revocation before it
+   * is refused, while a call admitted before later revocation may finish.
+   */
+  hasLiveHostToolCall?(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    connectionId: string;
+    turnId: string;
+    callId: string;
+    requestDigest: string;
+  }): boolean;
   /**
    * Release this runtime's hold on one provider thread without deleting it.
    * `hra session switch` calls it on the provider a session is leaving, so a
@@ -294,8 +305,8 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
    */
   claimSession(input: {
     authority: ProfileAuthority;
-    /** Disable only when resuming an existing row with no admitted HRA tools. */
-    hostTools?: "required" | "disabled";
+    /** Every reclaim explicitly proves whether its durable row admits HRA tools. */
+    hostTools: "required" | "disabled";
     /** Persists exact child custody before the resumed process is admitted. */
     admitProcessIdentity?: (identity: ClaudeProcessIdentity) => Promise<void>;
     providerThreadId: string;
@@ -336,28 +347,6 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
    * Codex publishes its own request authority on the notification; Claude's
    * control request carries only an id, so the daemon asks the port for it.
    */
-  interactionAuthority(providerThreadId: string, requestId: string): ProviderInteractionAuthority;
-}
-
-/**
- * The Devin implementation of the neutral seam. Devin owns authentication and
- * native sessions inside its isolated XDG home; HRA observes only signed-in
- * state and the bounded ACP facts required by the neutral session timeline.
- */
-export interface DevinRuntimePort extends SessionRuntimePort<EffectiveDevinRuntimeProfile> {
-  readonly provider: "devin";
-  readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
-  /** Synchronous scheduler fence: exact live writer, or proven ACP load support plus an exact local root. */
-  hasLiveOrLoadableSession?(input: {
-    authority: ProfileAuthority;
-    providerThreadId: string;
-  }): boolean;
-  rebindProfileAuthority(input: {
-    profileId: ProfileId;
-    expectedGeneration: number;
-    nextGeneration: number;
-  }): void;
-  pinnedVersion(): string;
   interactionAuthority(providerThreadId: string, requestId: string): ProviderInteractionAuthority;
 }
 
@@ -584,45 +573,6 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
   claimSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSessionProcessIdentity(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  discardRuntimeReview(): void {}
-  startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  endSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  reviewTurnStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  startTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  steer(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  interrupt(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  inspectInteractionAuthority(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  validateInteractionResolution(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  resolveInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  validateInteractionTimeout(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  timeoutInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  async close(): Promise<void> {}
-}
-
-/** Fails closed when the exact pinned Devin CLI is absent or incompatible. */
-export class UnavailableDevinRuntime implements DevinRuntimePort {
-  readonly provider = "devin" as const;
-  readonly #pinnedVersion: string;
-
-  constructor(pinnedVersion: string) {
-    this.#pinnedVersion = pinnedVersion;
-  }
-
-  #unavailable(): never {
-    throw new ProviderRuntimeUnavailableError(
-      `This daemon has no Devin runtime. Install Devin CLI ${this.#pinnedVersion} exactly, `
-      + "put `devin` on this daemon's PATH, restart the daemon with `hra daemon restart`, then sign in "
-      + "inside the account's isolated Devin profile.",
-    );
-  }
-  interactionAuthority(): ProviderInteractionAuthority { return this.#unavailable(); }
-  pinnedVersion(): string { return this.#unavailable(); }
-  readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  hasLiveOrLoadableSession(): boolean { return false; }
-  rebindProfileAuthority(): void {}
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   discardRuntimeReview(): void {}
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }

@@ -121,7 +121,7 @@ describe("domain laws", () => {
     }).success).toBe(false);
   });
 
-  test("binds Devin foreground login to an explicit flow and exact terminal authority", () => {
+  test("retires Devin login while retaining exact acknowledged cleanup authority", () => {
     const account = `acct_${"a".repeat(32)}`;
     const attemptId = `attempt_${"b".repeat(32)}`;
     const idempotencyKey = "00000000-0000-4000-8000-000000000303";
@@ -130,7 +130,7 @@ describe("domain laws", () => {
       idempotencyKey,
       kind: "account.devin-login.prepare",
       manualTokenFlow: true,
-    }).success).toBe(true);
+    }).success).toBe(false);
     expect(localCommandSchema.safeParse({
       account,
       idempotencyKey,
@@ -149,7 +149,7 @@ describe("domain laws", () => {
       { state: "not_started", reason: "spawn_failed" },
       { state: "not_started", reason: "preflight_stale" },
       { state: "not_started", reason: "interrupted_before_spawn", interruptedBy: "SIGTERM" },
-    ]) expect(localCommandSchema.safeParse({ ...completion, outcome }).success).toBe(true);
+    ]) expect(localCommandSchema.safeParse({ ...completion, outcome }).success).toBe(false);
     expect(localCommandSchema.safeParse({
       ...completion,
       outcome: { state: "joined", exitCode: 0, interruptedBy: null, token: "forbidden" },
@@ -165,6 +165,14 @@ describe("domain laws", () => {
     expect(localCommandSchema.safeParse({ ...abandon, acknowledgeChildExited: true }).success)
       .toBe(true);
     expect(localCommandSchema.safeParse(abandon).success).toBe(false);
+    expect(localCommandSchema.safeParse({ kind: "account.show", account, provider: "devin" }).success)
+      .toBe(true);
+    for (const command of [
+      { kind: "session.start", account, provider: "devin", preset: "astra", fast: false },
+      { kind: "session.start", account, provider: "codex", preset: "astra", fast: false },
+      { kind: "session.preset", session: "legacy", preset: "astra" },
+      { kind: "session.switch", session: "legacy", provider: "devin" },
+    ]) expect(localCommandSchema.safeParse(command).success).toBe(false);
   });
 
   test("keeps owner memory commands on the same closed values as provider memory tools", () => {
