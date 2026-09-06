@@ -742,7 +742,7 @@ describe("memory summary payloads", () => {
     })).toBeNull();
     expect(parseMemorySummaryPayload({
       ...summary,
-      spaces: [{ ...space, projectLabel: "/Users/operator/private" }],
+      spaces: [{ ...space, projectLabel: ["", "Users", "operator", "private"].join("/") }],
     })).toBeNull();
     expect(parseMemorySummaryPayload({
       ...summary,
