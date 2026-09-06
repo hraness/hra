@@ -9289,7 +9289,7 @@ describe("StateStore", () => {
             { provider: "codex", from_generation: profile.processGeneration + 1, to_generation: profile.processGeneration + 2 },
           ]);
         expect(database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId)).toEqual(before);
-        expect(store.readMutation(key)?.evidence?.evidence).toEqual(evidence);
+        expect(JSON.stringify(store.readMutation(key)?.evidence?.evidence)).toBe(evidenceJson);
       } finally {
         database.close(false);
       }
