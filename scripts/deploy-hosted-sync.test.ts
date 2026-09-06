@@ -27,8 +27,11 @@ import {
   resolvedTargetAssertionCommand,
 } from "./deploy-hosted-sync";
 import {
+  deployEvidenceSchema,
   parseDeployEvidenceFile,
   type RuntimeReleaseAttestation,
+  withSelfDigest,
+  writeProtectedJsonNoReplace,
 } from "./release-evidence";
 import {
   HRA_EXPECTED_CONVEX_DEPLOY_URL,
@@ -117,6 +120,85 @@ const outputWriter = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({
     return true;
   },
 });
+
+const makeDeployEvidenceHarness = async () => {
+  const repositoryRoot = await makeTemporaryDirectory("hra-hosted-chain-source-");
+  const temporaryRoot = await makeTemporaryDirectory("hra-hosted-chain-temp-");
+  const evidenceDirectory = await realpath(
+    await makeTemporaryDirectory("hra-hosted-chain-output-"),
+  );
+  await chmod(evidenceDirectory, 0o700);
+  let activeSourceCommit = sourceCommit;
+  let runtime: RuntimeReleaseAttestation | null = null;
+  let deploymentCalls = 0;
+  let authorityReads = 0;
+  const runner: CommandRunner = async (request) => {
+    if (request.executable === "/usr/bin/git") {
+      return request.arguments[0] === "rev-parse"
+        ? { exitCode: 0, stderr: "", stdout: `${activeSourceCommit}\n` }
+        : { exitCode: 0, stderr: "", stdout: "" };
+    }
+    if (request.executable === "/usr/bin/tar") {
+      await materializeArchivedSource(request);
+      return { exitCode: 0, stderr: "", stdout: "" };
+    }
+    if (request.phase === "source-dependency-install") {
+      await materializeArchivedDependencies(request);
+      return { exitCode: 0, stderr: "", stdout: "installed" };
+    }
+    deploymentCalls += 1;
+    const overlay = await readFile(join(request.cwd, "convex", "releaseAttestation.ts"), "utf8");
+    const match = /Object\.freeze\((\{.*\}) as const\)/u.exec(overlay);
+    if (match?.[1] === undefined) throw new Error("missing attestation overlay");
+    runtime = JSON.parse(match[1]) as RuntimeReleaseAttestation;
+    return { exitCode: 0, stderr: "", stdout: "deployed" };
+  };
+
+  return {
+    get authorityReads() {
+      return authorityReads;
+    },
+    get deploymentCalls() {
+      return deploymentCalls;
+    },
+    evidenceDirectory,
+    async deploy(options: Readonly<{
+      evidenceName: string;
+      now: number;
+      phase: "bootstrap" | "candidate";
+      previousEvidenceName?: string;
+      revision: string;
+      sourceCommit: string;
+      target?: ConvexTarget;
+    }>) {
+      activeSourceCommit = options.sourceCommit;
+      return await deployHostedSync({
+        evidencePath: join(evidenceDirectory, options.evidenceName),
+        now: () => options.now,
+        phase: options.phase,
+        ...(options.previousEvidenceName === undefined
+          ? {}
+          : {
+              previousDeployEvidencePath: join(
+                evidenceDirectory,
+                options.previousEvidenceName,
+              ),
+            }),
+        readAttestation: async () => {
+          authorityReads += 1;
+          return runtime;
+        },
+        repositoryRoot,
+        revision: () => options.revision,
+        runner,
+        sourceCommit: options.sourceCommit,
+        target: options.target ?? target,
+        temporaryRoot,
+        verifyTarget: async () => undefined,
+      });
+    },
+  };
+};
 
 describe("verified hosted deployment", () => {
   test("ships the Convex typecheck project required by the deploy gate", async () => {
@@ -1374,6 +1456,130 @@ describe("verified hosted deployment", () => {
     expect(deploymentCalls).toBe(1);
     expect(requests.slice(requestCount).every((request) => request.executable === "/usr/bin/git"))
       .toBe(true);
+  });
+
+  test("chains every later candidate from the immediately current candidate receipt", async () => {
+    const harness = await makeDeployEvidenceHarness();
+    const bootstrap = await harness.deploy({
+      evidenceName: "bootstrap.json",
+      now: 1_000,
+      phase: "bootstrap",
+      revision: "00000000-0000-4000-8000-000000000010",
+      sourceCommit,
+    });
+    const firstCandidate = await harness.deploy({
+      evidenceName: "candidate-one.json",
+      now: 2_000,
+      phase: "candidate",
+      previousEvidenceName: "bootstrap.json",
+      revision: "00000000-0000-4000-8000-000000000020",
+      sourceCommit: "b".repeat(40),
+    });
+    const secondCandidate = await harness.deploy({
+      evidenceName: "candidate-two.json",
+      now: 3_000,
+      phase: "candidate",
+      previousEvidenceName: "candidate-one.json",
+      revision: "00000000-0000-4000-8000-000000000030",
+      sourceCommit: "c".repeat(40),
+    });
+
+    expect(bootstrap?.phase).toBe("bootstrap");
+    expect(firstCandidate).toMatchObject({
+      before: bootstrap?.after,
+      phase: "candidate",
+      previousDeployDigest: bootstrap?.selfDigest,
+      sourceCommit: "b".repeat(40),
+    });
+    expect(secondCandidate).toMatchObject({
+      before: firstCandidate?.after,
+      phase: "candidate",
+      previousDeployDigest: firstCandidate?.selfDigest,
+      sourceCommit: "c".repeat(40),
+    });
+    expect(harness.deploymentCalls).toBe(3);
+  });
+
+  test("refuses a candidate predecessor receipt from another target before attestation read or mutation", async () => {
+    const harness = await makeDeployEvidenceHarness();
+    await harness.deploy({
+      evidenceName: "bootstrap.json",
+      now: 1_000,
+      phase: "bootstrap",
+      revision: "00000000-0000-4000-8000-000000000010",
+      sourceCommit,
+    });
+    const authorityReads = harness.authorityReads;
+    const deploymentCalls = harness.deploymentCalls;
+    const otherTarget: ConvexTarget = {
+      ...target,
+      deploymentId: target.deploymentId + 1,
+      deploymentName: "steady-otter-322",
+      deploymentUrl: "https://steady-otter-322.convex.cloud",
+    };
+
+    await expect(harness.deploy({
+      evidenceName: "wrong-target-candidate.json",
+      now: 2_000,
+      phase: "candidate",
+      previousEvidenceName: "bootstrap.json",
+      revision: "00000000-0000-4000-8000-000000000020",
+      sourceCommit: "b".repeat(40),
+      target: otherTarget,
+    })).rejects.toThrow("source_changed");
+    expect(harness.authorityReads).toBe(authorityReads);
+    expect(harness.deploymentCalls).toBe(deploymentCalls);
+    expect((await readdir(harness.evidenceDirectory)).sort()).toEqual([
+      "bootstrap.json",
+      "bootstrap.json.intent",
+    ]);
+  });
+
+  test("refuses completed candidate evidence whose before state differs from its predecessor", async () => {
+    const harness = await makeDeployEvidenceHarness();
+    const bootstrap = await harness.deploy({
+      evidenceName: "bootstrap.json",
+      now: 1_000,
+      phase: "bootstrap",
+      revision: "00000000-0000-4000-8000-000000000010",
+      sourceCommit,
+    });
+    const candidate = await harness.deploy({
+      evidenceName: "candidate.json",
+      now: 2_000,
+      phase: "candidate",
+      previousEvidenceName: "bootstrap.json",
+      revision: "00000000-0000-4000-8000-000000000020",
+      sourceCommit: "b".repeat(40),
+    });
+    if (bootstrap === undefined || candidate === undefined) {
+      throw new Error("missing deployment evidence");
+    }
+    const { selfDigest: _selfDigest, ...candidateBody } = candidate;
+    void _selfDigest;
+    const malformed = deployEvidenceSchema.parse(withSelfDigest({
+      ...candidateBody,
+      before: {
+        ...bootstrap.after,
+        deployedAtMs: bootstrap.after.deployedAtMs + 1,
+      },
+    }));
+    writeProtectedJsonNoReplace(
+      join(harness.evidenceDirectory, "malformed-candidate.json"),
+      malformed,
+      deployEvidenceSchema,
+    );
+    const deploymentCalls = harness.deploymentCalls;
+
+    await expect(harness.deploy({
+      evidenceName: "malformed-candidate.json",
+      now: 3_000,
+      phase: "candidate",
+      previousEvidenceName: "bootstrap.json",
+      revision: "00000000-0000-4000-8000-000000000030",
+      sourceCommit: "b".repeat(40),
+    })).rejects.toThrow("source_changed");
+    expect(harness.deploymentCalls).toBe(deploymentCalls);
   });
 
   test("reconciles a committed bootstrap intent across invocations without redeploying", async () => {
