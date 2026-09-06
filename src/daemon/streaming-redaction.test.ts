@@ -29,6 +29,7 @@ const createRedactor = (
   options: Omit<RedactorOptions, "projectPublicProviderIdentifier"> = {},
 ): SessionEventStreamRedactor => new SessionEventStreamRedactor({
   ...options,
+  isCodexSession: options.isCodexSession ?? (() => true),
   projectPublicProviderIdentifier: publicProviderId,
 });
 
@@ -216,6 +217,67 @@ describe("SessionEventStreamRedactor", () => {
     expect(serialized.match(/\[protected\]/gu)?.length).toBeGreaterThanOrEqual(4);
     expect(texts(output, "authorization")).toContain("Safe prefix.");
     expect(texts(output, "authorization")).toContain("Safe suffix.");
+  });
+
+  test("protects a split exact heartbeat envelope before any live delta is released", () => {
+    const redactor = createRedactor();
+    const output: SessionEventWrite[] = [...redactor.accept(start("heartbeat-echo"))];
+    const heartbeat = [
+      "<heartbeat>",
+      "  <automation_id>weekly-project-maintenance</automation_id>",
+      "  <current_time_iso>2030-01-02T03:04:05.678Z</current_time_iso>",
+      "  <instructions>",
+      "  Review the synthetic fixture project.",
+      "  </instructions>",
+      "</heartbeat>",
+    ].join("\n");
+    const chunks = [
+      heartbeat.slice(0, 7),
+      heartbeat.slice(7, 31),
+      heartbeat.slice(31, 79),
+      heartbeat.slice(79, 151),
+      heartbeat.slice(151),
+    ];
+    for (const chunk of chunks) {
+      const released = redactor.accept(assistant("heartbeat-echo", chunk));
+      expect(JSON.stringify(released)).not.toContain("weekly-project-maintenance");
+      expect(JSON.stringify(released)).not.toContain("2030-01-02T03:04:05.678Z");
+      expect(JSON.stringify(released)).not.toContain("synthetic fixture project");
+      output.push(...released);
+    }
+    output.push(...redactor.accept(complete("heartbeat-echo")));
+
+    expect(texts(output, "heartbeat-echo")).toBe("[protected]");
+    expect(JSON.stringify(output)).not.toContain("weekly-project-maintenance");
+    expect(JSON.stringify(output)).not.toContain("2030-01-02T03:04:05.678Z");
+    expect(JSON.stringify(output)).not.toContain("synthetic fixture project");
+
+    const nearMatch = heartbeat.replace(
+      "2030-01-02T03:04:05.678Z",
+      "2030-01-02T03:04:05Z",
+    );
+    const nearOutput: SessionEventWrite[] = [
+      ...redactor.accept(start("heartbeat-near")),
+      ...redactor.accept(assistant("heartbeat-near", nearMatch)),
+      ...redactor.accept(complete("heartbeat-near")),
+    ];
+    const ordinaryNear = createRedactor({ isCodexSession: () => false });
+    const ordinaryNearOutput: SessionEventWrite[] = [
+      ...ordinaryNear.accept(start("heartbeat-near")),
+      ...ordinaryNear.accept(assistant("heartbeat-near", nearMatch)),
+      ...ordinaryNear.accept(complete("heartbeat-near")),
+    ];
+    expect(texts(nearOutput, "heartbeat-near"))
+      .toBe(texts(ordinaryNearOutput, "heartbeat-near"));
+
+    const nonCodex = createRedactor({ isCodexSession: () => false });
+    const nonCodexOutput: SessionEventWrite[] = [
+      ...nonCodex.accept(start("non-codex-envelope")),
+      ...nonCodex.accept(assistant("non-codex-envelope", heartbeat)),
+      ...nonCodex.accept(complete("non-codex-envelope")),
+    ];
+    expect(texts(nonCodexOutput, "non-codex-envelope")).not.toBe("[protected]");
+    expect(texts(nonCodexOutput, "non-codex-envelope")).toContain("<heartbeat>");
   });
 
   test("keeps interleaved items and reasoning parts isolated and ordered", () => {

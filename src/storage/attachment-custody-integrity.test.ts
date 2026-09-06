@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
 import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
-import { ATTACHMENT_CUSTODY_COLUMNS } from "./attachment-custody-schema";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
 
@@ -18,22 +18,34 @@ afterEach(async () => {
   for (const store of stores.splice(0)) store.close();
   for (const path of roots.splice(0)) await rm(path, { recursive: true, force: true });
 });
-async function fixture() {
+async function fixture(legacy = false) {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-custody-integrity-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
+  if (legacy) {
+    await writeFile(paths.database, canonical40QueuesDatabaseBytes());
+    await chmod(paths.database, 0o600);
+  }
   const calls: string[] = [];
   const store = new StateStore(paths, { now: () => 2_000_000_000_000,
     attachmentCleanupPort: { unlinkCleanupCandidateSync: () => { calls.push("unlink"); return { kind: "absent" }; } } });
   stores.push(store);
-  const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
-  const daemon = { daemonGeneration: store.nextDaemonGeneration(bootId), bootId };
-  const profile = store.nextProfileGeneration(store.createProfile("custody").id);
-  store.setProfileState(profile.id, profile.processGeneration, "signed_in", { email: "custody@example.com", plan: "Plus" });
-  const created = store.createSession({ profileId: profile.id, provider: "codex", preset: "high", fastEnabled: false });
-  const session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision, providerThreadId: "custody-thread", state: "idle" });
+  const bootId = legacy ? canonical40QueuesFixture.bootId : `boot_${randomUUID().replaceAll("-", "")}`;
+  const daemon = { daemonGeneration: legacy ? canonical40QueuesFixture.daemonGeneration : store.nextDaemonGeneration(bootId), bootId };
+  const historical = legacy ? canonical40QueuesFixture.sessionInputs.find((entry) => entry.kind === "session.send") : undefined;
+  if (legacy && historical === undefined) throw new Error("Missing archived prepared send.");
+  const profile = historical === undefined ? store.nextProfileGeneration(store.createProfile("custody").id)
+    : store.requireProfileById(canonical40QueuesFixture.profileId);
+  if (historical === undefined) store.setProfileState(profile.id, profile.processGeneration, "signed_in", { email: "custody@example.com", plan: "Plus" });
   const authority = store.requireProviderAccountAuthority(profile.id, "codex");
+  const session = (() => {
+    if (historical !== undefined) return store.requireSession(historical.sessionId);
+    const imported = store.upsertProviderSession({ profileId: profile.id, provider: "codex", providerAuthority: authority,
+      providerAccountKey: `v1:codex:${createHash("sha256").update("custody@example.com").digest("hex")}`,
+      title: "Custody integrity", preset: "high", fastEnabled: false, providerThreadId: "custody-thread", state: "idle" });
+    return store.updateSessionMetadata({ sessionId: imported.id, expectedRevision: imported.revision, preset: "high" });
+  })();
   const db = new Database(paths.database);
   databases.push(db);
   const attachment = { digest: "c".repeat(64), byteLength: 4, mediaType: "text/plain" as const, name: "file.txt" };
@@ -47,14 +59,7 @@ async function fixture() {
   const prepare = () => { const value = reserve(); return { ...value, prepared: store.prepareSessionInputMutation({ ...value.request, reservation: value.reservation }) }; };
   const cleanup = () => store.cleanupAttachmentCandidate({ ...daemon, candidate: { kind: "blob", digest: attachment.digest, canonicalMediaType: "text/plain" } });
   const reopen = (readonly: boolean) => { const reopened = new StateStore(paths, { readonly, now: () => 2_000_000_000_000 }); stores.push(reopened); return reopened; };
-  return { store, paths, db, daemon, session, authority, attachment, input, reserve, prepare, cleanup, calls, reopen };
-}
-function drop48(db: Database): void {
-  for (const type of ["trigger", "index", "table"] as const) for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
-    if (object.type === type) db.exec(`DROP ${type.toUpperCase()} ${object.name}`);
-  }
-  for (const column of [...ATTACHMENT_CUSTODY_COLUMNS].reverse()) db.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${column.split(" ")[0]}`);
-  db.exec("DELETE FROM migrations WHERE version=48; PRAGMA user_version=47");
+  return { store, paths, db, daemon, session, authority, attachment, input, reserve, prepare, cleanup, calls, reopen, historical };
 }
 function bypassTableGuards(db: Database, table: string, action: () => void): void {
   const guards = db.query("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?").all(table) as { name: string; sql: string }[];
@@ -62,11 +67,11 @@ function bypassTableGuards(db: Database, table: string, action: () => void): voi
   try { action(); } finally { for (const guard of guards) db.exec(guard.sql); }
 }
 describe("attachment custody immutable integrity", () => {
-  test("fresh48 and both reopens preserve exact positive empty identity without a live slot", async () => {
+  test("fresh49 and both reopens preserve exact positive empty identity without a live slot", async () => {
     const f = await fixture();
     const request = f.input([]);
     const prepared = f.store.prepareSessionInputMutation(request);
-    expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+    expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     expect(f.db.query("SELECT COUNT(*) AS n FROM attachment_custody_slots").get()).toEqual({ n: 0 });
     expect(f.cleanup()).toEqual({ kind: "absent" });
     expect(f.reopen(true).readMutation(f.input([]).idempotencyKey)).toBeNull();
@@ -124,40 +129,42 @@ describe("attachment custody immutable integrity", () => {
     expect(() => f.reopen(false)).toThrow();
   });
 
-  test("migration47 classifies an old prepared request as unknown without inventing empty custody", async () => {
-    const f = await fixture();
-    drop48(f.db);
-    const old = { id: `attempt_${randomUUID().replaceAll("-", "")}` };
-    const idempotencyKey = randomUUID();
-    const requestDigest = createHash("sha256").update(JSON.stringify({ kind: "session.send", authorityId: f.session.id,
-      authorityGeneration: f.authority.processGeneration, request: { message: "input" } })).digest("hex");
-    f.db.query("INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES(?,?,'session.send',?,?,?,'prepared',?,?)")
-      .run(old.id, idempotencyKey, f.session.id, f.authority.processGeneration, requestDigest, 2_000_000_000_000, 2_000_000_000_000);
-    f.db.query("INSERT INTO mutation_provider_authorities(attempt_id,role,provider_account_id,profile_id,provider,binding_generation,process_generation,provenance,recorded_at) VALUES(?,'primary',?,?,?,?,?,'session_send',?)")
-      .run(old.id, f.authority.providerAccountId, f.authority.profileId, f.authority.provider, f.authority.bindingGeneration, f.authority.processGeneration, 2_000_000_000_000);
+  test("canonical40 classifies an actual old prepared request as unknown without inventing empty custody", async () => {
+    const f = await fixture(true);
+    const old = f.historical;
+    if (old === undefined) throw new Error("Expected archived prepared send.");
+    const { idempotencyKey } = old;
     const migrated = f.reopen(false);
-    expect(f.db.query("SELECT attachment_input_format FROM mutation_attempts WHERE id=?").get(old.id)).toEqual({ attachment_input_format: null });
-    expect(f.db.query("SELECT COUNT(*) AS n FROM attachment_legacy_cleanup_blockers").get()).toEqual({ n: 1 });
+    expect(f.db.query("SELECT attachment_input_format FROM mutation_attempts WHERE id=?").get(old.attemptId)).toEqual({ attachment_input_format: null });
+    expect(f.db.query("SELECT COUNT(*) AS n FROM attachment_legacy_cleanup_blockers WHERE attempt_id=?").get(old.attemptId)).toEqual({ n: 1 });
     expect(migrated.cleanupAttachmentCandidate({ ...f.daemon, candidate: { kind: "blob", digest: "c".repeat(64), canonicalMediaType: "text/plain" } }).kind).toBe("retained");
     const historical = migrated.readMutation(idempotencyKey);
     if (historical === null) throw new Error("Expected historical mutation");
-    const replayInput = { kind: "session.send" as const, sessionId: f.session.id, idempotencyKey, message: "input", attachments: [] };
+    const replayInput = { kind: "session.send" as const, sessionId: f.session.id, idempotencyKey, message: old.message, attachments: [] };
     expect(migrated.readSessionInputReplay(replayInput)).toBeNull();
     expect(() => migrated.readSessionInputReplay({ ...replayInput, message: "changed" })).toThrow("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
     expect(migrated.prepareMutation({ kind: "session.send", authorityId: f.session.id, authorityGeneration: f.authority.processGeneration,
-      request: { message: "input" }, idempotencyKey }).replay).toBe(true);
+      request: { message: old.message }, idempotencyKey }).replay).toBe(true);
     expect(migrated.transitionMutation(historical.id, "prepared", "cancelled")).toBe(true);
     expect(migrated.readSessionInputReplay(replayInput)?.state).toBe("cancelled");
-    expect(f.db.query("SELECT terminal_digest IS NOT NULL AS settled FROM attachment_legacy_cleanup_blockers WHERE attempt_id=?").get(old.id)).toEqual({ settled: 1 });
+    expect(f.db.query("SELECT terminal_digest IS NOT NULL AS settled FROM attachment_legacy_cleanup_blockers WHERE attempt_id=?").get(old.attemptId)).toEqual({ settled: 1 });
   });
 
-  test("a surviving partial48 trigger is refused before repair or a migration stamp", async () => {
+  test("a surviving partial custody trigger in current49 is refused without repair or row changes", async () => {
     const f = await fixture();
-    drop48(f.db);
-    f.db.exec("CREATE TRIGGER attachment_unknown_capture AFTER INSERT ON mutation_attempts BEGIN SELECT 1; END");
+    f.store.prepareSessionInputMutation(f.input([]));
+    for (const type of ["trigger", "index", "table"] as const) for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
+      if (object.type === type && object.name !== "attachment_unknown_capture") f.db.exec(`DROP ${type.toUpperCase()} ${object.name}`);
+    }
+    const snapshot = () => ({ schema: f.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+      migrations: f.db.query("SELECT * FROM migrations ORDER BY version").all(),
+      mutations: f.db.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
+      sessions: f.db.query("SELECT * FROM sessions ORDER BY id").all() });
+    const before = snapshot();
     expect(() => f.reopen(false)).toThrow("ATTACHMENT_CUSTODY_CORRUPT");
-    expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 47 });
-    expect(f.db.query("SELECT 1 FROM migrations WHERE version=48").get()).toBeNull();
+    expect(() => f.reopen(true)).toThrow("ATTACHMENT_CUSTODY_CORRUPT");
+    expect(snapshot()).toEqual(before);
+    expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
   });
 
   test("a missing parent cannot free its live slot or its original global key", async () => {

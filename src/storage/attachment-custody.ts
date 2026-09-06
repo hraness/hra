@@ -10,6 +10,7 @@ import { sessionIdSchema, unixMillisecondsSchema, utf8Bytes } from "../domain/va
 import { ATTACHMENT_CUSTODY_COLUMNS, type InitialAttachmentInput } from "./attachment-custody-schema";
 import { requireSessionSendOwner } from "./session-send-owner";
 import { queueAttachmentIdentityDigest, queueAttachmentManifestDigest, readQueueAttachmentIdentity } from "./queue-attachment-identity";
+import { normalizeSchemaSql } from "./schema-cohort";
 
 export class AttachmentCustodyError extends Error {
   constructor(readonly code: "ATTACHMENT_CUSTODY_CORRUPT" | "ATTACHMENT_CUSTODY_REQUEST_CONFLICT"
@@ -395,7 +396,6 @@ export const ATTACHMENT_CUSTODY_SCHEMA_OBJECTS = [
   ...permanent.map((table) => ({ name: `${table}_permanent`, table, type: "trigger", sql: `CREATE TRIGGER IF NOT EXISTS ${table}_permanent BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'ATTACHMENT_CUSTODY_CORRUPT'); END;` })),
   ...indexes.map(([name, table, expression]) => { const [columns, where] = expression.split(" WHERE "); return { name, table, type: "index", sql: `CREATE INDEX IF NOT EXISTS ${name} ON ${table}(${columns})${where === undefined ? "" : ` WHERE ${where}`};` }; }),
 ];
-const normalized = (sql: string): string => sql.replace(/\bIF NOT EXISTS\b/giu, "").replace(/\s+/gu, "").replace(/;$/u, "");
 export function applyAttachmentCustodySchema(db: Database): void {
   for (const column of ATTACHMENT_CUSTODY_COLUMNS) db.exec(`ALTER TABLE mutation_attempts ADD COLUMN ${column}`);
   for (const object of ATTACHMENT_CUSTODY_SCHEMA_OBJECTS) db.exec(object.sql);
@@ -406,10 +406,10 @@ export function applyAttachmentCustodySchema(db: Database): void {
 }
 export function assertAttachmentCustodySchema(db: Database): void {
   const row = db.query("SELECT sql FROM sqlite_master WHERE name='mutation_attempts' AND type='table'").get() as { sql: string } | null;
-  if (row === null || !normalized(row.sql).endsWith(`${ATTACHMENT_CUSTODY_COLUMNS.map(normalized).join(",")})STRICT`)) fail();
+  if (row === null || !normalizeSchemaSql(row.sql).endsWith(`${ATTACHMENT_CUSTODY_COLUMNS.map(normalizeSchemaSql).join(", ")}) STRICT`)) fail();
   for (const object of ATTACHMENT_CUSTODY_SCHEMA_OBJECTS) {
     const actual = db.query("SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?").get(object.name) as { type: string; tbl_name: string; sql: string } | null;
-    if (actual === null || actual.type !== object.type || actual.tbl_name !== object.table || normalized(actual.sql) !== normalized(object.sql)) fail();
+    if (actual === null || actual.type !== object.type || actual.tbl_name !== object.table || normalizeSchemaSql(actual.sql) !== normalizeSchemaSql(object.sql)) fail();
   }
 }
 export function hasAttachmentCustodyArtifacts(db: Database): boolean {

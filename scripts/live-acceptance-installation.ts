@@ -14,7 +14,11 @@ import { z } from "zod";
 
 import { canonicalCloudDeploymentUrl } from "../src/cloud/identity-custody";
 import type { HraInstallation } from "../src/installation";
-import { ensurePrivateDirectory, resolveStatePaths } from "../src/storage/paths";
+import {
+  ensurePrivateDirectory,
+  personalProviderPaths,
+  resolveStatePaths,
+} from "../src/storage/paths";
 import {
   FileSecretBackend,
   GenerationalSecretCustody,
@@ -235,6 +239,7 @@ export function createAcceptanceInstallation(
     expectedHomeDirectory,
     kind: "live_acceptance",
     paths,
+    personalProviderHomes: personalProviderPaths(join(paths.root, "personal-home")),
     prepareCodexHome: prepareAcceptanceCodexHome,
   };
 }

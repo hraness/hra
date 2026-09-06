@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,10 +39,12 @@ async function fixture() {
   expect(store.setProfileState(profile.id, profile.processGeneration, "signed_in", {
     email: "queue@example.com", plan: "Plus",
   })).toBe(true);
-  const created = store.createSession({ profileId: profile.id, provider: "codex", preset: "high", fastEnabled: false });
-  const session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
-    providerThreadId: "queue-attachment-thread", state: "idle" });
   const authority = store.requireProviderAccountAuthority(profile.id, "codex");
+  const imported = store.upsertProviderSession({ profileId: profile.id, provider: "codex",
+    providerAuthority: authority, providerAccountKey: `v1:codex:${createHash("sha256").update("queue@example.com").digest("hex")}`,
+    preset: "high", fastEnabled: false, title: "Queue attachments",
+    providerThreadId: "queue-attachment-thread", state: "idle" });
+  const session = store.updateSessionMetadata({ sessionId: imported.id, expectedRevision: imported.revision, preset: "high" });
   const database = new Database(paths.database, { strict: true });
   databases.push(database);
   database.exec("PRAGMA foreign_keys=ON");

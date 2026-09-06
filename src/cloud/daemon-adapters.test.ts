@@ -22,6 +22,8 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import type { LocalCommand } from "../domain/contracts";
+import { presetRequirements } from "../domain/presets";
+import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import type { SessionId } from "../domain/values";
 import {
   createStoredAccountUsageSnapshot,
@@ -53,6 +55,7 @@ import {
   BridgedCloudControl,
   deviceRegistryAccountAddress,
   StateBackedCloudDaemonAdapter,
+  type CloudProviderAccountProjectionReader,
 } from "./daemon-adapters";
 import { parseDeviceRegistryPayload, type RemoteCommandPayload } from "./payloads";
 import type { CloudRemoteControlPort } from "./local-control";
@@ -64,6 +67,8 @@ const bearerFixture = ["Bearer", "secret-token-value"].join(" ");
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
+
+const codexProviderAccountKey = `v1:codex:${sha256("person@example.com")}`;
 
 class FakeCodex implements CodexRuntimePort {
   readonly provider = "codex" as const;
@@ -113,6 +118,15 @@ class FakeCodex implements CodexRuntimePort {
   close(): Promise<void> { return Promise.resolve(); }
 
   endSession(): Promise<void> { return Promise.resolve(); }
+
+  readonly readSessionProjectionForCloud = async (
+    _sessionPublicId: string,
+    signal: AbortSignal,
+  ): Promise<CodexSessionProjection> => {
+    signal.throwIfAborted();
+    this.readSessionCalls += 1;
+    return this.projection;
+  };
 
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection> {
     this.readSessionCalls += 1;
@@ -210,18 +224,17 @@ async function fixture(): Promise<Readonly<{
     email: "person@example.com",
     plan: `file://${privateRootFixture}/plan`,
   })).toBe(true);
-  const starting = store.createSession({
+  const bound = store.upsertProviderSession({
+    providerAuthority: store.requireProviderAccountAuthority(current.id, "codex"),
     profileId: current.id,
     title: `Work ${privateRootFixture}`,
     preset: "high",
     fastEnabled: true,
-  });
-  const bound = store.bindSession({
-    sessionId: starting.id,
-    expectedRevision: starting.revision,
+    provider: "codex",
     providerThreadId: "thread_0001",
     state: "idle",
     providerUpdatedAt: 1_000,
+    providerAccountKey: `v1:codex:${sha256("person@example.com")}`,
   });
   store.updateSessionMetadata({
     sessionId: bound.id,
@@ -256,6 +269,56 @@ async function fixture(): Promise<Readonly<{
   };
 }
 
+function adoptPersonalCodexSession(
+  value: Awaited<ReturnType<typeof fixture>>,
+  providerThreadId: string,
+) {
+  const profile = value.store.requireProfileById(
+    value.store.requireSession(value.sessionId).profileId,
+  );
+  value.store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+  const candidate = value.store.upsertSessionAdoptionCandidate({
+    provider: "codex",
+    providerThreadId,
+    title: `Adopted ${providerThreadId}`,
+    state: "idle",
+    liveness: "not_live",
+  });
+  const claiming = value.store.fenceSessionAdoptionCandidateForClaim({
+    provider: "codex",
+    providerThreadId,
+    expectedRevision: candidate.revision,
+  });
+  return value.store.adoptSessionCandidate({
+    providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
+    expectedCandidateRevision: claiming.revision,
+    fastEnabled: false,
+    preset: "high",
+    requirement: presetRequirements.high,
+    profileId: profile.id,
+    profileGeneration: profile.processGeneration,
+    runtimeProfile: {
+      approvalPolicy: "on-request",
+      computerUse: true,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-6-astra",
+      observedAt: 2_000,
+      permissionProfile: ":workspace",
+      pluginCapability: true,
+      preset: "high",
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      reasoningEffort: "max",
+      reviewMode: "auto_review",
+      serviceTier: null,
+    },
+    providerAccountKey: codexProviderAccountKey,
+    provider: "codex",
+    providerThreadId,
+  });
+}
+
 function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, input: Readonly<{
   fast: boolean;
   preset: "low" | "high" | "ultra";
@@ -267,13 +330,17 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
   const session = value.store.requireSession(value.sessionId);
   const profile = value.store.requireProfileById(session.profileId);
   const providerAuthority = value.store.requireProviderAccountAuthority(profile.id, "codex");
-  const runtime = {
+  const presetSelection = value.store.requireSessionPresetRequirement(session.id);
+  if (presetSelection.preset !== input.preset) {
+    throw new Error("Expected the fixture preset to match the session preset.");
+  }
+  const runtime = effectiveRuntimeProfileSchema.parse({
     profileId: profile.id,
     processGeneration: profile.processGeneration,
     observedAt: 2_000,
     preset: input.preset,
-    model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-6-astra",
-    reasoningEffort: input.preset === "ultra" ? "ultra" as const : "max" as const,
+    model: presetSelection.requirement.model,
+    reasoningEffort: presetSelection.requirement.effort,
     serviceTier: input.fast ? "priority" as const : null,
     fast: input.fast,
     approvalPolicy: "on-request" as const,
@@ -282,7 +349,7 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
     computerUse: true as const,
     pluginCapability: true as const,
     enabledApps: [],
-  };
+  });
   const { attempt } = value.store.prepareSessionInputMutation({
     kind: "session.send",
     sessionId: session.id,
@@ -346,23 +413,24 @@ async function materializeScheduledTaskQueue(
   const current = value.store.requireSession(value.sessionId);
   const profile = value.store.requireProfileById(current.profileId);
   const providerAuthority = value.store.requireProviderAccountAuthority(profile.id, "codex");
+  const presetSelection = value.store.requireSessionPresetRequirement(current.id);
   if (current.providerThreadId === undefined) throw new Error("Expected a bound session.");
-  const runtime = {
+  const runtime = effectiveRuntimeProfileSchema.parse({
     profileId: profile.id,
     processGeneration: profile.processGeneration,
     observedAt: 2_000,
-    preset: "high" as const,
-    model: "gpt-6-astra",
-    reasoningEffort: "max" as const,
-    serviceTier: "priority" as const,
-    fast: true,
+    preset: presetSelection.preset,
+    model: presetSelection.requirement.model,
+    reasoningEffort: presetSelection.requirement.effort,
+    serviceTier: current.fastEnabled ? "priority" as const : null,
+    fast: current.fastEnabled,
     approvalPolicy: "on-request" as const,
     reviewMode: "auto_review" as const,
     permissionProfile: ":workspace" as const,
     computerUse: true as const,
     pluginCapability: true as const,
     enabledApps: [],
-  };
+  });
   const evidence = value.store.beginQueueEffect({
     queueId: occurrence.queue.id,
     sessionId: current.id,
@@ -504,6 +572,10 @@ class FakeClaude implements ClaudeRuntimePort {
   }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unused()); }
   startSession(): Promise<never> { return Promise.reject(this.#unused()); }
+  claimSession(): Promise<never> { return Promise.reject(this.#unused()); }
+  readSessionProcessIdentity(): ReturnType<ClaudeRuntimePort["readSessionProcessIdentity"]> {
+    return Promise.reject(this.#unused());
+  }
   observeSession(): ReturnType<ClaudeRuntimePort["observeSession"]> { return Promise.reject(this.#unused()); }
   reviewTurnStart(): Promise<never> { return Promise.reject(this.#unused()); }
   startTurn(): Promise<never> { return Promise.reject(this.#unused()); }
@@ -581,8 +653,61 @@ class FakeDevin implements DevinRuntimePort {
   async close(): Promise<void> {}
 }
 
+async function readFixtureProviderSession(
+  value: Awaited<ReturnType<typeof fixture>>,
+  runtime: ClaudeRuntimePort | DevinRuntimePort,
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<CodexSessionProjection> {
+  const session = value.store.requireSession(sessionId);
+  const captured = value.store.requireSessionProviderAuthority(session.id);
+  if (session.providerThreadId === undefined) throw new Error("Fixture session is unbound.");
+  return await runtime.readSession({
+    authority: {
+      id: captured.profileId,
+      generation: captured.processGeneration,
+      provider: captured.provider,
+      providerAccountId: captured.providerAccountId,
+      bindingGeneration: captured.bindingGeneration,
+      codexHome: join(value.paths.root, "private-provider-home"),
+      desktopUserData: join(value.paths.root, "private-provider-data"),
+    },
+    providerThreadId: session.providerThreadId,
+    detail: true,
+    signal,
+  });
+}
+
 describe("state-backed cloud daemon adapter", () => {
-  test("projects a Claude session through its own port exactly like a Codex one", async () => {
+  test("routes list and recovery projection reads through the service-owned exact seam", async () => {
+    const value = await fixture();
+    const projectedSessionIds: string[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      readSessionProjectionForCloud: (sessionPublicId, signal) => {
+        signal.throwIfAborted();
+        projectedSessionIds.push(sessionPublicId);
+        return Promise.resolve(value.codex.projection);
+      },
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      await adapter.planCompactProjectionRecovery({
+        idempotencyKey: "00000000-0000-7000-8000-00000000072a",
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(projectedSessionIds).toEqual([value.sessionId, value.sessionId]);
+    } finally {
+      await adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("projects a Claude session through the service-owned exact reader", async () => {
     const value = await fixture();
     const profile = value.store.requireProfileById(
       value.store.requireSession(value.sessionId).profileId,
@@ -618,11 +743,17 @@ describe("state-backed cloud daemon adapter", () => {
     expect(value.store.requireSessionProviderAuthority(starting.id).routingProvenance)
       .toBe("explicit");
     const bound = value.store.bindSession({
+      sessionId: starting.id,
       expectedRevision: starting.revision,
       providerThreadId: "thread_claude_0001",
-      sessionId: starting.id,
       state: "idle",
       providerUpdatedAt: 1_000,
+    });
+    value.store.bindSessionProviderAccountAuthority({
+      sessionId: bound.id,
+      provider: "claude",
+      runtimeScope: "managed",
+      accountKey: `v1:claude:${sha256("managed-claude-account")}`,
     });
     // Bind the turn's reviewed Claude profile the way a dispatched queue entry
     // does, so the compact turn summary can name its model.
@@ -673,8 +804,13 @@ describe("state-backed cloud daemon adapter", () => {
     const remoteAuthorities: unknown[] = [];
     const commands: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      claude,
-      codex: value.codex,
+      readSessionProjectionForCloud: async (sessionPublicId, signal) => {
+        if (sessionPublicId === bound.id) {
+          signal.throwIfAborted();
+          return await readFixtureProviderSession(value, claude, sessionPublicId, signal);
+        }
+        return await value.codex.readSessionProjectionForCloud(sessionPublicId, signal);
+      },
       executeRemote: (command, expected) => {
         commands.push(command);
         remoteAuthorities.push(expected);
@@ -814,28 +950,32 @@ describe("state-backed cloud daemon adapter", () => {
     }
   });
 
-  test("does not read or authorize an established Claude session on Darwin", async () => {
+  test("does not read or authorize a managed Claude session on Darwin", async () => {
     const value = await fixture();
     const profile = value.store.requireProfileById(
       value.store.requireSession(value.sessionId).profileId,
     );
-    const created = value.store.createSession({
+    const bound = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "claude"),
       fastEnabled: false,
       preset: "fable-max",
       profileId: profile.id,
       provider: "claude",
       title: "Durable Claude work",
-    });
-    const bound = value.store.bindSession({
-      expectedRevision: created.revision,
       providerThreadId: "thread_claude_darwin",
-      sessionId: created.id,
       state: "idle",
+      providerAccountKey: `v1:claude:${sha256("managed-claude-darwin-account")}`,
     });
     const claude = new FakeClaude();
+    const projectedSessionIds: string[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      claude,
-      codex: value.codex,
+      readSessionProjectionForCloud: async (sessionPublicId, signal) => {
+        signal.throwIfAborted();
+        projectedSessionIds.push(sessionPublicId);
+        return sessionPublicId === bound.id
+          ? await readFixtureProviderSession(value, claude, sessionPublicId, signal)
+          : await value.codex.readSessionProjectionForCloud(sessionPublicId, signal);
+      },
       executeRemote: () => Promise.reject(new Error("remote effect was not expected")),
       paths: value.paths,
       platform: "darwin",
@@ -845,6 +985,7 @@ describe("state-backed cloud daemon adapter", () => {
       const signal = new AbortController().signal;
       const projected = await adapter.listSessions({ limit: 25, signal });
       expect(projected.sessions.map((session) => session.publicId)).not.toContain(bound.id);
+      expect(projectedSessionIds).not.toContain(bound.id);
       expect(claude.readSessionCalls).toBe(0);
       await expect(adapter.resolveCommandAuthority({
         sessionPublicId: bound.id,
@@ -947,8 +1088,13 @@ describe("state-backed cloud daemon adapter", () => {
     const devin = new FakeDevin();
     const remoteAuthorities: unknown[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
-      devin,
+      readSessionProjectionForCloud: async (sessionPublicId, signal) => {
+        signal.throwIfAborted();
+        if (sessionPublicId === bound.id) {
+          return await readFixtureProviderSession(value, devin, sessionPublicId, signal);
+        }
+        return await value.codex.readSessionProjectionForCloud(sessionPublicId, signal);
+      },
       executeRemote: (_command, authority) => {
         remoteAuthorities.push(authority);
         return Promise.resolve({});
@@ -1038,11 +1184,164 @@ describe("state-backed cloud daemon adapter", () => {
     }
   });
 
+  test("projects and authorizes an actively bound personal Claude session on Darwin", async () => {
+    const value = await fixture();
+    const profile = value.store.createProfile("Signed-out Codex, personal Claude");
+    expect(profile).toMatchObject({ processGeneration: 0, state: "signed_out" });
+    const providerAuthority = value.store.advanceProviderAccountProcessGeneration({
+      profileId: profile.id, provider: "claude", expectedProcessGeneration: 0,
+    });
+    value.store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const candidate = value.store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "thread_personal_claude_darwin",
+      title: "Personal Claude work",
+      state: "idle",
+      providerUpdatedAt: 1_000,
+      liveness: "not_live",
+    });
+    value.store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const processIdentity = {
+      pid: 42_701,
+      pidDomain: "darwin" as const,
+      procStart: "Fri Sep  4 12:00:00 2026",
+    };
+    value.store.recordClaimedClaudeProcessAuthority({
+      providerAuthority,
+      providerThreadId: candidate.providerThreadId,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      identity: processIdentity,
+    });
+    const claimed = value.store.listSessionAdoptionCandidates({ provider: "claude" })
+      .find((entry) => entry.providerThreadId === candidate.providerThreadId);
+    if (claimed === undefined) throw new Error("Expected the claimed personal Claude candidate.");
+    const adopted = value.store.adoptSessionCandidate({
+      providerAuthority,
+      provider: "claude",
+      providerThreadId: candidate.providerThreadId,
+      expectedCandidateRevision: claimed.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      fastEnabled: false,
+      runtimeProfile: {
+        claudeVersion: "2.1.260",
+        configHome: "personal",
+        inputFormat: "stream-json",
+        model: "claude-fable-5-1",
+        observedAt: 2_100,
+        outputFormat: "stream-json",
+        permissionMode: "default",
+        preset: "fable-max",
+        processGeneration: providerAuthority.processGeneration,
+        profileId: profile.id,
+        reasoningEffort: "max",
+      },
+      providerAccountKey: `v1:claude:${sha256("personal-claude-account")}`,
+      claudeProcessIdentity: processIdentity,
+    });
+    const claude = new FakeClaude();
+    const projectedSessionIds: string[] = [];
+    const commands: LocalCommand[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      readSessionProjectionForCloud: async (sessionPublicId, signal) => {
+        signal.throwIfAborted();
+        projectedSessionIds.push(sessionPublicId);
+        if (sessionPublicId !== adopted.session.id) {
+          return await value.codex.readSessionProjectionForCloud(sessionPublicId, signal);
+        }
+        return {
+          ...await readFixtureProviderSession(value, claude, sessionPublicId, signal),
+          providerThreadId: candidate.providerThreadId,
+          title: candidate.title,
+        };
+      },
+      executeRemote: (command) => {
+        commands.push(command);
+        return Promise.resolve({});
+      },
+      paths: value.paths,
+      platform: "darwin",
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const projected = await adapter.listSessions({ limit: 25, signal });
+      const head = projected.sessions.find((session) => session.publicId === adopted.session.id);
+      if (head === undefined) throw new Error("Expected the adopted Claude session projection.");
+      expect(head).not.toHaveProperty("adopted");
+      expect(head).not.toHaveProperty("origin");
+      expect(head).not.toHaveProperty("runtimeScope");
+      expect(projectedSessionIds).toContain(adopted.session.id);
+
+      await expect(adapter.planCompactProjectionRecovery({
+        idempotencyKey: "018bcfe5-6800-7000-8000-0000000000c5",
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).resolves.toMatchObject({
+        localAuthority: {
+          provider: "claude",
+          providerAccountId: providerAuthority.providerAccountId,
+          bindingGeneration: providerAuthority.bindingGeneration,
+          processGeneration: providerAuthority.processGeneration,
+          profileId: profile.id,
+          providerThreadId: candidate.providerThreadId,
+        },
+      });
+      const authority = await adapter.resolveCommandAuthority({
+        sessionPublicId: adopted.session.id,
+        signal,
+      });
+      expect(authority).not.toBeNull();
+      await expect(adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000c6",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        payload: { kind: "send", message: "Continue" },
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).resolves.toEqual({ code: "APPLIED", state: "applied" });
+      expect(commands.map((command) => command.kind)).toEqual(["session.send"]);
+
+      value.store.beginPersonalSessionDetach({ sessionId: adopted.session.id });
+      const readsBeforeDetachingChecks = claude.readSessionCalls;
+      await expect(adapter.resolveCommandAuthority({
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).resolves.toBeNull();
+      await expect(adapter.planCompactProjectionRecovery({
+        idempotencyKey: "018bcfe5-6800-7000-8000-0000000000c7",
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).rejects.toThrow("local authority changed");
+      await adapter.listSessions({ limit: 25, signal });
+      expect(claude.readSessionCalls).toBe(readsBeforeDetachingChecks);
+      await expect(adapter.execute({
+        authority: authority as CloudLocalCommandAuthority,
+        idempotencyKey: "00000000-0000-7000-8000-0000000000c8",
+        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 2 },
+        payload: { kind: "stop" },
+        sessionPublicId: adopted.session.id,
+        signal,
+      })).resolves.toEqual({ code: "LOCAL_AUTHORITY_CHANGED", state: "failed" });
+    } finally {
+      await adapter.close();
+      value.store.close();
+    }
+  });
+
   test("persists bounded compact sequences and projects polled usage without exporting local paths", async () => {
     const value = await fixture();
     const commands: LocalCommand[] = [];
     let adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
       now: () => 5_000,
       paths: value.paths,
@@ -1102,7 +1401,7 @@ describe("state-backed cloud daemon adapter", () => {
 
       await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
         paths: value.paths,
         store: value.store,
@@ -1161,7 +1460,7 @@ describe("state-backed cloud daemon adapter", () => {
     expect(value.store.latestUsage(profile.id)).toMatchObject({ sourceRevision: 3 });
 
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       now: value.now,
       paths: value.paths,
@@ -1250,7 +1549,7 @@ describe("state-backed cloud daemon adapter", () => {
       ],
     };
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       now: value.now,
       paths: value.paths,
@@ -1295,22 +1594,21 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const profileId = value.store.requireSession(value.sessionId).profileId;
     for (let index = 0; index < 30; index += 1) {
-      const created = value.store.createSession({
+      value.store.upsertProviderSession({
+        providerAuthority: value.store.requireProviderAccountAuthority(profileId, "codex"),
         fastEnabled: false,
         preset: "high",
         profileId,
-        title: `Paged ${index}`,
-      });
-      value.store.bindSession({
-        expectedRevision: created.revision,
+        provider: "codex",
         providerThreadId: `thread_page_${index.toString().padStart(4, "0")}`,
         providerUpdatedAt: 2_000 + index,
-        sessionId: created.id,
+        providerAccountKey: `v1:codex:${sha256("person@example.com")}`,
         state: "idle",
+        title: `Paged ${index}`,
       });
     }
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       now: value.now,
       paths: value.paths,
@@ -1387,7 +1685,7 @@ describe("state-backed cloud daemon adapter", () => {
       sessionId: value.sessionId as `sess_${string}`,
     });
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       now: value.now,
       paths: value.paths,
@@ -1471,7 +1769,7 @@ describe("state-backed cloud daemon adapter", () => {
       "80000000-0000-4000-8000-000000000201",
     );
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       now: value.now,
       paths: value.paths,
@@ -1579,7 +1877,7 @@ describe("state-backed cloud daemon adapter", () => {
       "8fffffff-ffff-4fff-8fff-ffffffffffff",
     );
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -1669,7 +1967,7 @@ describe("state-backed cloud daemon adapter", () => {
       "80000000-0000-4000-8002-000000000001",
     );
     let adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       now: value.now,
       paths: value.paths,
@@ -1723,7 +2021,7 @@ describe("state-backed cloud daemon adapter", () => {
       )).toEqual([value.sessionId]);
       await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         now: value.now,
         paths: value.paths,
@@ -1765,7 +2063,7 @@ describe("state-backed cloud daemon adapter", () => {
     value.store.expireInteraction({ id: terminalId, expectedRevision: 1 });
 
     let adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -1791,7 +2089,7 @@ describe("state-backed cloud daemon adapter", () => {
       );
       value.store.expireInteraction({ id: newestTerminalId, expectedRevision: 1 });
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -1833,7 +2131,7 @@ describe("state-backed cloud daemon adapter", () => {
       "8fffffff-ffff-4fff-8ffd-ffffffffffff",
     );
     let adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -1894,7 +2192,7 @@ describe("state-backed cloud daemon adapter", () => {
 
       await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -1932,7 +2230,7 @@ describe("state-backed cloud daemon adapter", () => {
       const value = await fixture();
       const cachePath = join(value.paths.root, "cloud-projection.sqlite");
       let adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -2008,7 +2306,7 @@ describe("state-backed cloud daemon adapter", () => {
           "signed_out",
         )).toBe(true);
         adapter = new StateBackedCloudDaemonAdapter({
-          codex: value.codex,
+          readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
           executeRemote: () => Promise.resolve({}),
           paths: value.paths,
           store: value.store,
@@ -2040,7 +2338,7 @@ describe("state-backed cloud daemon adapter", () => {
       const value = await fixture();
       const cachePath = join(value.paths.root, "cloud-projection.sqlite");
       let adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -2077,7 +2375,7 @@ describe("state-backed cloud daemon adapter", () => {
         }
         database.close(false);
         adapter = new StateBackedCloudDaemonAdapter({
-          codex: value.codex,
+          readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
           executeRemote: () => Promise.resolve({}),
           paths: value.paths,
           store: value.store,
@@ -2104,7 +2402,7 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2153,7 +2451,7 @@ describe("state-backed cloud daemon adapter", () => {
     );
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2194,7 +2492,7 @@ describe("state-backed cloud daemon adapter", () => {
       "80000000-0000-4000-8003-000000000001",
     );
     let adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2221,7 +2519,7 @@ describe("state-backed cloud daemon adapter", () => {
         "signed_out",
       )).toBe(true);
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -2262,7 +2560,7 @@ describe("state-backed cloud daemon adapter", () => {
       }), usageAuthority);
     }
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2320,7 +2618,7 @@ describe("state-backed cloud daemon adapter", () => {
       sessionId: current.id,
     });
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2353,7 +2651,7 @@ describe("state-backed cloud daemon adapter", () => {
         message.role === "user" ? { ...message, clientId: binding.attemptId } : message),
     };
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2397,7 +2695,7 @@ describe("state-backed cloud daemon adapter", () => {
       },
     };
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2431,7 +2729,7 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     const initial = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2460,7 +2758,7 @@ describe("state-backed cloud daemon adapter", () => {
     }
     database.close(false);
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2516,7 +2814,7 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const commands: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
       now: value.now,
       paths: value.paths,
@@ -2570,7 +2868,7 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2630,7 +2928,7 @@ describe("state-backed cloud daemon adapter", () => {
   test("recovers at the global remote head and omits later scheduled-task prompts", async () => {
     const value = await fixture();
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2638,12 +2936,14 @@ describe("state-backed cloud daemon adapter", () => {
     try {
       const signal = new AbortController().signal;
       await adapter.listSessions({ limit: 25, signal });
+      expect(value.codex.readSessionCalls).toBe(1);
       const idempotencyKey = "00000000-0000-7000-8000-000000000701";
       const plan = await adapter.planCompactProjectionRecovery({
         idempotencyKey,
         sessionPublicId: value.sessionId,
         signal,
       });
+      expect(value.codex.readSessionCalls).toBe(2);
       expect(plan.baselineCompletedTurns).toHaveLength(1);
       const installation = {
         ...plan,
@@ -2771,7 +3071,7 @@ describe("state-backed cloud daemon adapter", () => {
       sessionId: value.sessionId as `sess_${string}`,
     });
     let adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       now: value.now,
       paths: value.paths,
@@ -2821,7 +3121,7 @@ describe("state-backed cloud daemon adapter", () => {
 
       await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         now: value.now,
         paths: value.paths,
@@ -2854,7 +3154,7 @@ describe("state-backed cloud daemon adapter", () => {
 
       await adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -2901,7 +3201,7 @@ describe("state-backed cloud daemon adapter", () => {
       },
     };
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -2981,7 +3281,7 @@ describe("state-backed cloud daemon adapter", () => {
       ],
     };
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3005,7 +3305,7 @@ describe("state-backed cloud daemon adapter", () => {
     const corruptBytes = "corrupt projection sentinel";
     await writeFile(cachePath, corruptBytes, { mode: 0o600 });
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3057,7 +3357,7 @@ describe("state-backed cloud daemon adapter", () => {
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     await writeFile(cachePath, "corrupt projection sentinel", { mode: 0o600 });
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3104,7 +3404,7 @@ describe("state-backed cloud daemon adapter", () => {
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     const movedPath = join(value.paths.root, "cloud-projection-original.sqlite");
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3158,7 +3458,7 @@ describe("state-backed cloud daemon adapter", () => {
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     const movedPath = join(value.paths.root, "cloud-projection-installed.sqlite");
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3203,7 +3503,7 @@ describe("state-backed cloud daemon adapter", () => {
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     const originalPath = join(value.paths.root, "cloud-projection-source.sqlite");
     let adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3237,7 +3537,7 @@ describe("state-backed cloud daemon adapter", () => {
       await rm(cachePath);
       await rename(originalPath, cachePath);
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -3308,7 +3608,7 @@ describe("state-backed cloud daemon adapter", () => {
     expect(before[0]).toMatchObject({ path: cachePath, present: true });
 
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3345,7 +3645,7 @@ describe("state-backed cloud daemon adapter", () => {
         await chmod(cachePath, 0o600);
       }
       const adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -3444,7 +3744,7 @@ describe("state-backed cloud daemon adapter", () => {
     database.close(false);
     await chmod(cachePath, 0o600);
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3538,7 +3838,7 @@ describe("state-backed cloud daemon adapter", () => {
     await chmod(cachePath, 0o600);
 
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3574,7 +3874,7 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     let adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3594,7 +3894,7 @@ describe("state-backed cloud daemon adapter", () => {
       previous.close(false);
 
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -3623,7 +3923,7 @@ describe("state-backed cloud daemon adapter", () => {
     );
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     let adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3642,7 +3942,7 @@ describe("state-backed cloud daemon adapter", () => {
       previous.close(false);
 
       adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: () => Promise.resolve({}),
         paths: value.paths,
         store: value.store,
@@ -3668,7 +3968,7 @@ describe("state-backed cloud daemon adapter", () => {
   test("reconciles an exact committed compact upload after its response is lost", async () => {
     const value = await fixture();
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -3721,7 +4021,7 @@ describe("state-backed cloud daemon adapter", () => {
       }
       const commands: LocalCommand[] = [];
       const adapter = new StateBackedCloudDaemonAdapter({
-        codex: value.codex,
+        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
         executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
         paths: value.paths,
         store: value.store,
@@ -3757,7 +4057,7 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const commands: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
       paths: value.paths,
       store: value.store,
@@ -3826,7 +4126,7 @@ describe("state-backed cloud daemon adapter", () => {
     const commands: LocalCommand[] = [];
     const expectedAuthorities: unknown[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: (command, expected) => {
         commands.push(command);
         expectedAuthorities.push(expected);
@@ -3900,7 +4200,7 @@ describe("state-backed cloud daemon adapter", () => {
     const value = await fixture();
     const commands: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: (command) => {
         commands.push(command);
         return Promise.resolve({});
@@ -4118,7 +4418,7 @@ describe("remote decisions at the custodian", () => {
     const value = await fixture();
     const commands: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
       paths: value.paths,
       store: value.store,
@@ -4212,7 +4512,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
   }>> {
     const commands: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
       now: value.now,
       paths: value.paths,
@@ -5091,7 +5391,7 @@ describe("settings commands and the device registry", () => {
     const commands: LocalCommand[] = [];
     const gatewayKeys: string[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
       gatewayKeyCustody: {
         hasKey: () => Promise.resolve(gatewayKeys.length > 0),
@@ -5174,7 +5474,7 @@ describe("settings commands and the device registry", () => {
   test("live projection honours the stored show-thinking setting", async () => {
     const value = await fixture();
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -5208,38 +5508,123 @@ describe("settings commands and the device registry", () => {
     }
   });
 
-  test("projects labels only, merges Codex automations, and marks archived sessions", async () => {
+  test("projects labels and adoption aggregates without private candidate detail", async () => {
     const value = await fixture();
+    const profileId = value.store.requireSession(value.sessionId).profileId;
+    const profileGeneration = value.store.requireProfileById(profileId).processGeneration;
+    const adoptionRuntimeProfile = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-6-astra",
+      observedAt: 2_000,
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: profileGeneration,
+      profileId,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+    };
+    value.store.setSessionAdoptionPolicy({ provider: "codex", profileId });
+    const pending = value.store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "private-pending-thread",
+      title: "PRIVATE PENDING TITLE",
+      state: "idle",
+      liveness: "unknown",
+    });
+    const adopted = value.store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "private-adopted-thread",
+      title: "PRIVATE ADOPTED TITLE",
+      state: "idle",
+      liveness: "not_live",
+    });
+    const claimedAdopted = value.store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: adopted.providerThreadId,
+      expectedRevision: adopted.revision,
+    });
+    const activeAdoption = value.store.adoptSessionCandidate({
+      providerAuthority: value.store.requireProviderAccountAuthority(profileId, "codex"),
+      expectedCandidateRevision: claimedAdopted.revision,
+      fastEnabled: false,
+      preset: "high",
+      requirement: presetRequirements.high,
+      profileId,
+      profileGeneration,
+      runtimeProfile: adoptionRuntimeProfile,
+      providerAccountKey: codexProviderAccountKey,
+      provider: "codex",
+      providerThreadId: adopted.providerThreadId,
+    });
+    const fenced = value.store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "private-fenced-thread",
+      title: "PRIVATE FENCED TITLE",
+      state: "idle",
+      liveness: "not_live",
+    });
+    const claimedFenced = value.store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: fenced.providerThreadId,
+      expectedRevision: fenced.revision,
+    });
+    const fencedAdoption = value.store.adoptSessionCandidate({
+      providerAuthority: value.store.requireProviderAccountAuthority(profileId, "codex"),
+      expectedCandidateRevision: claimedFenced.revision,
+      fastEnabled: false,
+      preset: "high",
+      requirement: presetRequirements.high,
+      profileId,
+      profileGeneration,
+      runtimeProfile: adoptionRuntimeProfile,
+      providerAccountKey: codexProviderAccountKey,
+      provider: "codex",
+      providerThreadId: fenced.providerThreadId,
+    });
+    value.store.detachPersonalSession({ sessionId: fencedAdoption.session.id });
+    expect(pending.status).toBe("pending");
+    const hraTask = value.store.createSessionTaskStore().create({
+      idempotencyKey: "00000000-0000-4000-8000-000000000711",
+      minutes: 60,
+      name: "Public HRA conversation task",
+      prompt: "Continue the ordinary HRA conversation.",
+      sessionId: activeAdoption.session.id,
+      status: "paused",
+    });
+    const projectedSessionIds: string[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: (sessionPublicId, signal) => {
+        signal.throwIfAborted();
+        projectedSessionIds.push(sessionPublicId);
+        const session = value.store.requireSession(sessionPublicId);
+        if (session.providerThreadId === undefined) {
+          throw new Error("missing provider binding");
+        }
+        return Promise.resolve({
+          ...value.codex.projection,
+          providerThreadId: session.providerThreadId,
+          title: session.title,
+        });
+      },
       executeRemote: () => Promise.resolve({}),
       gatewayKeyCustody: { hasKey: () => Promise.resolve(true), setKey: () => Promise.resolve() },
       machineLabel: "Studio",
       paths: value.paths,
-      readCodexAutomations: () => Promise.resolve([
-        {
-          cadence: "FREQ=WEEKLY;BYDAY=MO",
-          id: "upload-usage",
-          kind: "heartbeat",
-          label: "Upload usage",
-          status: "active" as const,
-          targetThreadId: "thread_0001",
-          updatedAt: 1_000,
-        },
-        {
-          cadence: "FREQ=HOURLY;INTERVAL=6",
-          id: "unknown-thread",
-          kind: "heartbeat",
-          label: "Other machine automation",
-          status: "paused" as const,
-          targetThreadId: "thread_9999",
-          updatedAt: 1_000,
-        },
-      ]),
       store: value.store,
     });
     try {
       const signal = new AbortController().signal;
+      const sessions = await adapter.listSessions({ limit: 25, signal });
+      expect(sessions.sessions.map((session) => session.publicId)).toContain(
+        activeAdoption.session.id,
+      );
+      expect(projectedSessionIds).toContain(value.sessionId);
+      expect(projectedSessionIds).toContain(activeAdoption.session.id);
       const registry = await adapter.readDeviceRegistry({ signal });
       expect(parseDeviceRegistryPayload(registry)).toEqual(registry);
       expect(registry).toMatchObject({
@@ -5247,29 +5632,34 @@ describe("settings commands and the device registry", () => {
         defaultPreset: "ultra",
         machineLabel: "Studio",
         proseAutorespondConfigured: true,
+        sessionAdoption: {
+          claude: { adopted: 0, enabled: false, fenced: 0, pending: 0 },
+          codex: { adopted: 1, enabled: true, fenced: 1, pending: 1 },
+        },
         showThinkingDefault: false,
         version: 1,
       });
       // The fixture account and session labels embed a private path; the
       // projection replaces them rather than leaking a filesystem location.
       expect(JSON.stringify(registry)).not.toContain(privateRootFixture);
+      expect(JSON.stringify(registry)).not.toContain("private-pending-thread");
+      expect(JSON.stringify(registry)).not.toContain("PRIVATE PENDING TITLE");
+      expect(JSON.stringify(registry)).not.toContain("upload-usage");
+      expect(JSON.stringify(registry)).not.toContain("FREQ=WEEKLY;BYDAY=MO");
+      expect(JSON.stringify(registry)).not.toContain(adopted.providerThreadId);
+      expect(JSON.stringify(registry)).not.toContain(fenced.providerThreadId);
       expect(registry.accounts).toEqual([
         expect.objectContaining({ provider: "codex", publicId: expect.any(String), status: "signed_in" }),
       ]);
       expect(registry.scheduledTasks).toEqual([
-        expect.objectContaining({
-          cadence: "FREQ=WEEKLY;BYDAY=MO",
-          id: "upload-usage",
-          kind: "codex_automation",
-          label: "Upload usage",
+        {
+          cadence: "every 60 minutes",
+          id: hraTask.id,
+          kind: "hra_conversation",
+          label: "Public HRA conversation task",
           nextRunAt: null,
-          sessionPublicId: value.sessionId,
-        }),
-        expect.objectContaining({
-          id: "unknown-thread",
-          kind: "codex_automation",
-          sessionPublicId: null,
-        }),
+          sessionPublicId: activeAdoption.session.id,
+        },
       ]);
       const notificationProjection = await adapter.readDeviceRegistryProjection({ signal });
       expect(notificationProjection).toMatchObject({
@@ -5334,10 +5724,92 @@ describe("settings commands and the device registry", () => {
     }
   });
 
+  test("projects native and adopted HRA tasks with the same public shape", async () => {
+    const value = await fixture();
+    const nativeSession = value.store.requireSession(value.sessionId);
+    const adopted = adoptPersonalCodexSession(value, "old-personal-codex-thread");
+    const privateDesktopAutomation = {
+      cadence: "FREQ=WEEKLY;BYDAY=MO",
+      id: "desktop-private-automation-id",
+      label: "Desktop private automation label",
+      sessionPublicId: "sess_private_target_correlation",
+    } as const;
+    let desktopAutomationReads = 0;
+    const taskStore = value.store.createSessionTaskStore();
+    const nativeTask = taskStore.create({
+      idempotencyKey: "00000000-0000-4000-8000-000000000721",
+      minutes: 30,
+      name: "Native public task",
+      prompt: "Continue the native conversation.",
+      sessionId: nativeSession.id,
+      status: "paused",
+    });
+    const adoptedTask = taskStore.create({
+      idempotencyKey: "00000000-0000-4000-8000-000000000722",
+      minutes: 30,
+      name: "Adopted public task",
+      prompt: "Continue the adopted conversation.",
+      sessionId: adopted.session.id,
+      status: "paused",
+    });
+    const adapterOptions = {
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      // Deliberately model the retired adapter option. Even if a caller still
+      // carries it, Desktop automations remain private age-gate authority and
+      // cannot become registry schedules or an origin marker.
+      readCodexAutomations: () => {
+        desktopAutomationReads += 1;
+        return Promise.resolve([privateDesktopAutomation]);
+      },
+      store: value.store,
+    };
+    const adapter = new StateBackedCloudDaemonAdapter(
+      adapterOptions as unknown as ConstructorParameters<typeof StateBackedCloudDaemonAdapter>[0],
+    );
+    try {
+      const signal = new AbortController().signal;
+      const registry = await adapter.readDeviceRegistry({ signal });
+      const nativeRow = registry.scheduledTasks.find((task) => task.id === nativeTask.id);
+      const adoptedRow = registry.scheduledTasks.find((task) => task.id === adoptedTask.id);
+      expect(nativeRow).toEqual({
+        cadence: "every 30 minutes",
+        id: nativeTask.id,
+        kind: "hra_conversation",
+        label: "Native public task",
+        nextRunAt: null,
+        sessionPublicId: nativeSession.id,
+      });
+      expect(adoptedRow).toEqual({
+        cadence: "every 30 minutes",
+        id: adoptedTask.id,
+        kind: "hra_conversation",
+        label: "Adopted public task",
+        nextRunAt: null,
+        sessionPublicId: adopted.session.id,
+      });
+      expect(Object.keys(nativeRow ?? {}).sort()).toEqual(Object.keys(adoptedRow ?? {}).sort());
+      expect({ ...nativeRow, id: "task", label: "task", sessionPublicId: "session" })
+        .toEqual({ ...adoptedRow, id: "task", label: "task", sessionPublicId: "session" });
+      const publicRegistry = JSON.stringify(registry);
+      expect(desktopAutomationReads).toBe(0);
+      expect(publicRegistry).not.toContain("codex_automation");
+      expect(publicRegistry).not.toContain("thread_0001");
+      expect(publicRegistry).not.toContain("old-personal-codex-thread");
+      for (const privateValue of Object.values(privateDesktopAutomation)) {
+        expect(publicRegistry).not.toContain(privateValue);
+      }
+    } finally {
+      await adapter.close();
+      value.store.close();
+    }
+  });
+
   test("uploads the archived flag in session metadata only while archived", async () => {
     const value = await fixture();
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeRemote: () => Promise.resolve({}),
       paths: value.paths,
       store: value.store,
@@ -5352,6 +5824,37 @@ describe("settings commands and the device registry", () => {
       value.store.setSessionArchived(value.sessionId as SessionId, false);
       const restored = await adapter.listSessions({ limit: 10, signal });
       expect(restored.sessions.at(0)?.metadata.archived).toBeUndefined();
+    } finally {
+      await adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("publishes an archived cloud head after personal-session detach without reopening provider authority", async () => {
+    const value = await fixture();
+    const adopted = adoptPersonalCodexSession(value, "detached-cloud-head-thread");
+    value.store.detachPersonalSession({ sessionId: adopted.session.id });
+    const projectedSessionIds: string[] = [];
+    const adapter = new StateBackedCloudDaemonAdapter({
+      readSessionProjectionForCloud: (sessionPublicId) => {
+        projectedSessionIds.push(sessionPublicId);
+        return Promise.reject(new Error("detached provider authority must stay closed"));
+      },
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const page = await adapter.listSessions({
+        limit: 100,
+        signal: new AbortController().signal,
+      });
+      const detachedHead = page.sessions.find((session) => session.publicId === adopted.session.id);
+      expect(detachedHead).toMatchObject({
+        publicId: adopted.session.id,
+        metadata: { archived: true },
+      });
+      expect(projectedSessionIds).not.toContain(adopted.session.id);
     } finally {
       await adapter.close();
       value.store.close();
@@ -5380,9 +5883,33 @@ async function deviceCommandFixture(options: Readonly<{
   const executed: LocalCommand[] = [];
   const notices: string[] = [];
   const adapter = new StateBackedCloudDaemonAdapter({
-    ...(options.claude === undefined ? {} : { claude: options.claude }),
-    codex: value.codex,
-    ...(options.devin === undefined ? {} : { devin: options.devin }),
+    readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
+    ...((options.claude === undefined && options.devin === undefined) ? {} : {
+      readProviderAccountProjectionForCloud: async (input: Parameters<CloudProviderAccountProjectionReader>[0]) => {
+        const authority = input.authority;
+        const request = {
+          authority: {
+            codexHome: join(value.paths.root, "private-provider-home"),
+            desktopUserData: join(value.paths.root, "private-provider-data"),
+            generation: authority.processGeneration,
+            id: authority.profileId,
+            provider: authority.provider,
+            providerAccountId: authority.providerAccountId,
+            bindingGeneration: authority.bindingGeneration,
+          },
+          signal: input.signal,
+        };
+        if (authority.provider === "claude" && options.claude !== undefined) {
+          const projection = await options.claude.readAccount(request);
+          return { signedIn: projection.readiness === "signed_in" ? true
+            : projection.readiness === "signed_out" ? false : null };
+        }
+        if (authority.provider === "devin" && options.devin !== undefined) {
+          return { signedIn: (await options.devin.readAccount(request)).signedIn };
+        }
+        throw new Error("runtime unavailable");
+      },
+    }),
     executeLocal: (command) => {
       executed.push(command);
       if (command.kind === "session.start") {
@@ -5402,7 +5929,6 @@ async function deviceCommandFixture(options: Readonly<{
     executeRemote: () => Promise.resolve({}),
     notifyOperator: (input) => { notices.push(input.title); return Promise.resolve(); },
     now: options.now ?? (() => 1_760_000_000_000),
-    readCodexAutomations: async () => [],
     paths: value.paths,
     store: value.store,
   });
@@ -6024,7 +6550,7 @@ describe("device command execution", () => {
     const account = value.store.listProfiles()[0];
     if (account === undefined) throw new Error("missing account fixture");
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeLocal: (command) => command.kind === "session.start"
         ? Promise.resolve({ session: { id: value.sessionId } })
         : Promise.reject(new Error("the provider connection dropped")),
@@ -6190,7 +6716,7 @@ describe("device command execution", () => {
     value.store.setAccountLinkingAllowed(true);
     const executed: LocalCommand[] = [];
     const adapter = new StateBackedCloudDaemonAdapter({
-      codex: value.codex,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
       executeLocal: (command) => {
         executed.push(command);
         return Promise.resolve({

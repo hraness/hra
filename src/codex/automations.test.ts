@@ -1,28 +1,32 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { constants, Dir } from "node:fs";
+import { mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  CODEX_AUTOMATION_AUTHORITY_PAGE_ENTRY_LIMIT,
   parseCodexAutomationToml,
+  readCodexAutomationAuthority,
   readCodexAutomations,
   type CodexAutomation,
 } from "./automations.ts";
 
-// The exact shape observed on disk (kb/notes/codex-schedules.md), including the
-// `prompt` and `version` keys this reader must never surface.
-const OBSERVED_PROMPT = "Upload this machine's local usage data to the saved account.";
+// A synthetic fixture with the exact field shape documented in
+// kb/notes/codex-schedules.md, including `prompt` and `version` keys this reader
+// must never surface.
+const SYNTHETIC_PROMPT = "Review the registered project and report maintenance work.";
 const WELL_FORMED = [
   "version = 1",
-  'id = "upload-usage-to-tokscale"',
+  'id = "weekly-project-maintenance"',
   'kind = "heartbeat"',
-  'name = "Upload Codex and Claude usage to Tokscale"',
-  `prompt = "${OBSERVED_PROMPT}"`,
+  'name = "Weekly project maintenance"',
+  `prompt = "${SYNTHETIC_PROMPT}"`,
   'status = "ACTIVE"',
   'rrule = "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=22;BYMINUTE=0"',
-  'target_thread_id = "01a06277-c3f2-7360-ab88-e5cdc7aa1504"',
-  "created_at = 1788358694391",
-  "updated_at = 1788358694391",
+  'target_thread_id = "00000000-0000-4000-8000-000000000001"',
+  "created_at = 1700000000000",
+  "updated_at = 1700000000000",
   "",
 ].join("\n");
 
@@ -30,12 +34,12 @@ const MALFORMED = 'id = "broken"\nkind = "heartbeat\nname = ';
 
 const EXPECTED: CodexAutomation = {
   cadence: "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=22;BYMINUTE=0",
-  id: "upload-usage-to-tokscale",
+  id: "weekly-project-maintenance",
   kind: "heartbeat",
-  label: "Upload Codex and Claude usage to Tokscale",
+  label: "Weekly project maintenance",
   status: "active",
-  targetThreadId: "01a06277-c3f2-7360-ab88-e5cdc7aa1504",
-  updatedAt: 1788358694391,
+  targetThreadId: "00000000-0000-4000-8000-000000000001",
+  updatedAt: 1700000000000,
 };
 
 const roots: string[] = [];
@@ -50,6 +54,41 @@ async function automationsRoot(): Promise<string> {
   const directory = join(root, "automations");
   await mkdir(directory);
   return directory;
+}
+
+function fifoTestsSupported(): boolean {
+  return process.platform !== "win32" && Bun.which("mkfifo") !== null;
+}
+
+function makeFifo(path: string): void {
+  const created = Bun.spawnSync({ cmd: ["mkfifo", path] });
+  if (created.exitCode !== 0) {
+    throw new Error(`mkfifo failed: ${new TextDecoder().decode(created.stderr)}`);
+  }
+}
+
+async function settleBeforeFifoWriter<T>(pending: Promise<T>, fifo: string): Promise<T> {
+  type Outcome =
+    | Readonly<{ kind: "blocked" }>
+    | Readonly<{ kind: "rejected"; error: unknown }>
+    | Readonly<{ kind: "resolved"; value: T }>;
+  const completion: Promise<Outcome> = pending.then(
+    (value) => ({ kind: "resolved", value }),
+    (error: unknown) => ({ kind: "rejected", error }),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const blocked = new Promise<Outcome>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: "blocked" }), 1_000);
+  });
+  const outcome = await Promise.race([completion, blocked]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (outcome.kind === "resolved") return outcome.value;
+  if (outcome.kind === "rejected") throw outcome.error;
+
+  const writer = await open(fifo, constants.O_WRONLY | constants.O_NONBLOCK);
+  await writer.close();
+  await completion;
+  throw new Error("Automation FIFO open blocked instead of failing promptly.");
 }
 
 async function writeAutomation(
@@ -76,7 +115,7 @@ describe("parseCodexAutomationToml", () => {
     ]);
     const serialized = JSON.stringify(automation);
     expect(serialized).not.toContain("prompt");
-    expect(serialized).not.toContain(OBSERVED_PROMPT);
+    expect(serialized).not.toContain(SYNTHETIC_PROMPT);
     expect(serialized).not.toContain("version");
     expect(serialized).not.toContain("created");
   });
@@ -89,7 +128,7 @@ describe("parseCodexAutomationToml", () => {
         'project_id = "p-1"',
         'model = "gpt-x"',
         'reasoning_effort = "high"',
-        "next_run_at = 1788358694391",
+        "next_run_at = 1700000000000",
         "",
         "[unknown_table]",
         'anything = "at all"',
@@ -103,13 +142,13 @@ describe("parseCodexAutomationToml", () => {
   test("falls back to the directory name and tolerates absent optional fields", () => {
     const automation = parseCodexAutomationToml(
       ['kind = "heartbeat"', 'name = "   "', ""].join("\n"),
-      "finish-contacts-import",
+      "weekly-project-maintenance",
     );
     expect(automation).toEqual({
       cadence: "",
-      id: "finish-contacts-import",
+      id: "weekly-project-maintenance",
       kind: "heartbeat",
-      label: "finish-contacts-import",
+      label: "weekly-project-maintenance",
       // An absent status means "running": only an explicit PAUSED pauses.
       status: "active",
       targetThreadId: null,
@@ -229,6 +268,21 @@ describe("parseCodexAutomationToml", () => {
       parseCodexAutomationToml(['id = "a"', 'name = "A"', ""].join("\n"), "a"),
     ).toBeNull();
   });
+
+  test("never trims authority-bearing heartbeat kind or target identity", () => {
+    expect(
+      parseCodexAutomationToml(
+        ['id = "a"', 'kind = " heartbeat "', 'target_thread_id = "thread-a"', ""].join("\n"),
+        "a",
+      ),
+    ).toBeNull();
+    expect(
+      parseCodexAutomationToml(
+        ['id = "a"', 'kind = "heartbeat"', 'target_thread_id = " thread-a "', ""].join("\n"),
+        "a",
+      ),
+    ).toBeNull();
+  });
 });
 
 describe("readCodexAutomations", () => {
@@ -286,7 +340,7 @@ describe("readCodexAutomations", () => {
     const scan = await readCodexAutomations({
       automationsDirectory: join(directory, "not-installed"),
     });
-    expect(scan).toEqual({ automations: [], diagnostics: [] });
+    expect(scan).toEqual({ automations: [], complete: true, diagnostics: [] });
   });
 
   test("honours the limit over directories sorted by name", async () => {
@@ -300,12 +354,14 @@ describe("readCodexAutomations", () => {
     }
 
     const limited = await readCodexAutomations({ automationsDirectory: directory, limit: 2 });
+    expect(limited.complete).toBe(false);
     expect(limited.automations.map((automation) => automation.id)).toEqual([
       "a-first",
       "b-second",
     ]);
 
     const all = await readCodexAutomations({ automationsDirectory: directory });
+    expect(all.complete).toBe(true);
     expect(all.automations.map((automation) => automation.id)).toEqual([
       "a-first",
       "b-second",
@@ -313,7 +369,7 @@ describe("readCodexAutomations", () => {
     ]);
 
     const none = await readCodexAutomations({ automationsDirectory: directory, limit: 0 });
-    expect(none).toEqual({ automations: [], diagnostics: [] });
+    expect(none).toEqual({ automations: [], complete: true, diagnostics: [] });
   });
 
   test("ignores dot directories and plain files beside the automations", async () => {
@@ -338,5 +394,821 @@ describe("readCodexAutomations", () => {
     const scan = await readCodexAutomations({ automationsDirectory: directory });
     expect(scan.automations).toEqual([]);
     expect(scan.diagnostics).toEqual([{ automationId: "a-huge", reason: "unreadable" }]);
+  });
+
+  test("rejects malformed UTF-8 instead of replacing bytes before parsing", async () => {
+    const directory = await automationsRoot();
+    await writeAutomation(directory, "invalid-utf8", null);
+    const prefix = new TextEncoder().encode([
+      'kind = "heartbeat"',
+      'target_thread_id = "scheduled-thread"',
+      "# ",
+    ].join("\n"));
+    await writeFile(
+      join(directory, "invalid-utf8", "automation.toml"),
+      Uint8Array.from([...prefix, 0xff, 0x0a]),
+    );
+
+    await expect(readCodexAutomations({ automationsDirectory: directory })).resolves.toEqual({
+      automations: [],
+      complete: true,
+      diagnostics: [{ automationId: "invalid-utf8", reason: "unreadable" }],
+    });
+    await expect(readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "sources",
+      sourceDirectoryNames: ["invalid-utf8"],
+    })).resolves.toEqual({
+      complete: true,
+      diagnostics: [{ automationId: "invalid-utf8", reason: "unreadable" }],
+      entries: [],
+      nextCursor: null,
+    });
+  });
+
+  test("never follows an automation.toml symlink", async () => {
+    const directory = await automationsRoot();
+    const outside = join(directory, "outside.toml");
+    await writeFile(outside, WELL_FORMED);
+    await writeAutomation(directory, "a-linked", null);
+    await symlink(outside, join(directory, "a-linked", "automation.toml"));
+
+    const scan = await readCodexAutomations({ automationsDirectory: directory });
+    expect(scan.automations).toEqual([]);
+    expect(scan.diagnostics).toEqual([{ automationId: "a-linked", reason: "unreadable" }]);
+  });
+
+  test("fails the public projection promptly when automation.toml is a FIFO", async () => {
+    if (!fifoTestsSupported()) return;
+    const directory = await automationsRoot();
+    await writeAutomation(directory, "a-fifo", null);
+    const fifo = join(directory, "a-fifo", "automation.toml");
+    makeFifo(fifo);
+
+    const scan = await settleBeforeFifoWriter(
+      readCodexAutomations({ automationsDirectory: directory }),
+      fifo,
+    );
+    expect(scan).toEqual({
+      automations: [],
+      complete: true,
+      diagnostics: [{ automationId: "a-fifo", reason: "unreadable" }],
+    });
+  });
+});
+
+describe("readCodexAutomationAuthority", () => {
+  test("honors cancellation and an already-expired deadline", async () => {
+    const directory = await automationsRoot();
+    const controller = new AbortController();
+    controller.abort(new Error("authority read cancelled"));
+    await expect(readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "page",
+      signal: controller.signal,
+    })).rejects.toThrow("authority read cancelled");
+
+    await expect(readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      deadlineAt: Date.now() - 1,
+      kind: "page",
+    })).resolves.toEqual({
+      complete: false,
+      diagnostics: [],
+      entries: [],
+      nextCursor: null,
+    });
+  });
+
+  test("fairly pages beyond 200 directories without an unbounded page", async () => {
+    const directory = await automationsRoot();
+    const expected = Array.from(
+      { length: 205 },
+      (_, index) => `automation-${String(index).padStart(3, "0")}`,
+    );
+    for (const name of expected) {
+      await writeAutomation(
+        directory,
+        name,
+        [
+          'kind = "heartbeat"',
+          `target_thread_id = "thread-${name}"`,
+          "",
+        ].join("\n"),
+      );
+    }
+
+    const observed: string[] = [];
+    let after: string | null = null;
+    let pages = 0;
+    do {
+      const scan = await readCodexAutomationAuthority({
+        after,
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 50,
+      });
+      pages += 1;
+      expect(scan.entries.length).toBeLessThanOrEqual(50);
+      expect(scan.diagnostics).toEqual([]);
+      observed.push(...scan.entries.map((entry) => entry.sourceDirectoryName));
+      after = scan.nextCursor;
+      if (scan.complete) expect(after).toBeNull();
+      else expect(after).not.toBeNull();
+    } while (after !== null);
+
+    expect(pages).toBe(5);
+    expect(observed.toSorted()).toEqual(expected);
+  });
+
+  test("bounds examined entries per page and reaches a valid entry across hostile prefixes", async () => {
+    const directory = await automationsRoot();
+    const hiddenDirectoryCount = CODEX_AUTOMATION_AUTHORITY_PAGE_ENTRY_LIMIT * 2;
+    for (let index = 0; index < hiddenDirectoryCount; index += 1) {
+      await mkdir(join(directory, `.ignored-${String(index).padStart(4, "0")}`));
+    }
+    await writeAutomation(
+      directory,
+      "eventual-target",
+      ['kind = "heartbeat"', 'target_thread_id = "thread-eventual"', ""].join("\n"),
+    );
+
+    const observed: string[] = [];
+    let after: string | null = null;
+    let pages = 0;
+    do {
+      const scan = await readCodexAutomationAuthority({
+        after,
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 50,
+      });
+      pages += 1;
+      if (pages < 3) {
+        expect(scan.complete).toBe(false);
+        expect(scan.nextCursor).not.toBeNull();
+      }
+      observed.push(...scan.entries.map((entry) => entry.sourceDirectoryName));
+      after = scan.nextCursor;
+    } while (after !== null && pages < 4);
+
+    expect(pages).toBe(3);
+    expect(after).toBeNull();
+    expect(observed).toEqual(["eventual-target"]);
+  });
+
+  test("fails closed on concurrent cursor use and recovers an unknown cursor without evidence", async () => {
+    const directory = await automationsRoot();
+    const expected = Array.from(
+      { length: 10 },
+      (_, index) => `concurrent-${String(index).padStart(2, "0")}`,
+    );
+    for (const name of expected) {
+      await writeAutomation(
+        directory,
+        name,
+        ['kind = "heartbeat"', `target_thread_id = "thread-${name}"`, ""].join("\n"),
+      );
+    }
+
+    const first = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 1,
+    });
+    expect(first).toMatchObject({ complete: false });
+    if (first.nextCursor === null) throw new Error("Expected a retained authority cursor.");
+    const staleCursor = first.nextCursor;
+    const concurrent = await Promise.all([
+      readCodexAutomationAuthority({
+        after: staleCursor,
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 1,
+      }),
+      readCodexAutomationAuthority({
+        after: staleCursor,
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 1,
+      }),
+    ]);
+    const continued = concurrent.filter((scan) => scan.entries.length === 1);
+    const refused = concurrent.filter((scan) => scan.entries.length === 0);
+    expect(refused).toHaveLength(1);
+    expect(continued).toHaveLength(1);
+    expect(refused[0]).toMatchObject({ complete: false, diagnostics: [] });
+    expect(refused[0]?.nextCursor).not.toBe(staleCursor);
+    expect(continued[0]?.nextCursor).not.toBe(staleCursor);
+
+    const observed = [
+      ...first.entries.map((entry) => entry.sourceDirectoryName),
+      ...continued.flatMap((scan) => scan.entries.map((entry) => entry.sourceDirectoryName)),
+    ];
+    let after: string | null = continued[0]?.nextCursor ?? null;
+    while (after !== null) {
+      const scan = await readCodexAutomationAuthority({
+        after,
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 1,
+      });
+      observed.push(...scan.entries.map((entry) => entry.sourceDirectoryName));
+      after = scan.nextCursor;
+    }
+    expect(observed.toSorted()).toEqual(expected);
+
+    let refusedCursor: string | null = refused[0]?.nextCursor ?? null;
+    while (refusedCursor !== null) {
+      const scan = await readCodexAutomationAuthority({
+        after: refusedCursor,
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 50,
+      });
+      refusedCursor = scan.nextCursor;
+    }
+
+    const unknownCursor = "authority_scan_0_00000000-0000-4000-8000-000000000000";
+    const recovered = await readCodexAutomationAuthority({
+      after: unknownCursor,
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 1,
+    });
+    expect(recovered).toMatchObject({
+      complete: false,
+      diagnostics: [],
+      entries: [],
+    });
+    expect(recovered.nextCursor).not.toBeNull();
+    expect(recovered.nextCursor).not.toBe(unknownCursor);
+
+    let recoveryCursor: string | null = recovered.nextCursor;
+    while (recoveryCursor !== null) {
+      const scan = await readCodexAutomationAuthority({
+        after: recoveryCursor,
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 50,
+      });
+      recoveryCursor = scan.nextCursor;
+    }
+  });
+
+  test("recovers a safe position after reader expiry and rotates a fresh daemon page", async () => {
+    const directory = await automationsRoot();
+    const expected = Array.from(
+      { length: 60 },
+      (_, index) => `restart-${String(index).padStart(3, "0")}`,
+    );
+    for (const name of expected) {
+      await writeAutomation(
+        directory,
+        name,
+        ['kind = "heartbeat"', `target_thread_id = "thread-${name}"`, ""].join("\n"),
+      );
+    }
+
+    const first = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+    });
+    expect(first).toMatchObject({ complete: false });
+    const firstNames = first.entries.map((entry) => entry.sourceDirectoryName);
+    expect(firstNames).toHaveLength(50);
+    const remaining = expected.filter((name) => !firstNames.includes(name));
+    expect(remaining).toHaveLength(10);
+
+    // A syntactically valid cursor absent from this process models a reader
+    // recreation or TTL expiry. The first read restores no authority; its live
+    // successor resumes from the safe raw position.
+    const expired = await readCodexAutomationAuthority({
+      after: "authority_scan_50_10000000-0000-4000-8000-000000000000",
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+    });
+    expect(expired).toMatchObject({ complete: false, diagnostics: [], entries: [] });
+    if (expired.nextCursor === null) throw new Error("Expected a rebuilt live cursor.");
+    const resumed = await readCodexAutomationAuthority({
+      after: expired.nextCursor,
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+    });
+    expect(resumed).toMatchObject({ complete: true, diagnostics: [], nextCursor: null });
+    expect(resumed.entries.map((entry) => entry.sourceDirectoryName).toSorted())
+      .toEqual(remaining.toSorted());
+
+    const restarted = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+      restartPage: 1,
+    });
+    expect(restarted).toMatchObject({ complete: true, diagnostics: [], nextCursor: null });
+    expect(restarted.entries.map((entry) => entry.sourceDirectoryName).toSorted())
+      .toEqual(remaining.toSorted());
+
+    const ordered = [...firstNames, ...resumed.entries.map((entry) => entry.sourceDirectoryName)];
+    const hugeRestartPage = Number.MAX_SAFE_INTEGER;
+    const hugeOffset = Number(
+      (BigInt(hugeRestartPage) * 50n) % BigInt(ordered.length),
+    );
+    const hugeRestart = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+      restartPage: hugeRestartPage,
+    });
+    expect(hugeRestart.entries.map((entry) => entry.sourceDirectoryName))
+      .toEqual(ordered.slice(hugeOffset, hugeOffset + 50));
+  });
+
+  test("wraps a restart offset equal to the raw directory cardinality", async () => {
+    const directory = await automationsRoot();
+    for (let index = 0; index < 50; index += 1) {
+      const name = `exact-cardinality-${String(index).padStart(3, "0")}`;
+      await writeAutomation(
+        directory,
+        name,
+        ['kind = "heartbeat"', `target_thread_id = "thread-${String(index)}"`, ""].join("\n"),
+      );
+    }
+
+    const baseline = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+    });
+    expect(baseline.entries).toHaveLength(50);
+    if (baseline.nextCursor === null) throw new Error("Expected an exact-cardinality cursor.");
+    await expect(readCodexAutomationAuthority({
+      after: baseline.nextCursor,
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+    })).resolves.toMatchObject({ complete: true, entries: [], nextCursor: null });
+
+    const recovered = await readCodexAutomationAuthority({
+      after: "authority_scan_50_40000000-0000-4000-8000-000000000000",
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+    });
+    expect(recovered).toMatchObject({ complete: false, entries: [] });
+    if (recovered.nextCursor === null) throw new Error("Expected an exact-end recovery cursor.");
+    await expect(readCodexAutomationAuthority({
+      after: recovered.nextCursor,
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+    })).resolves.toMatchObject({ complete: true, entries: [], nextCursor: null });
+
+    const restarted = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+      restartPage: 1,
+    });
+    expect(restarted.entries.map((entry) => entry.sourceDirectoryName))
+      .toEqual(baseline.entries.map((entry) => entry.sourceDirectoryName));
+  });
+
+  test("refuses invalid restart hints and safely wraps a large recovered cursor position", async () => {
+    const directory = await automationsRoot();
+    await writeAutomation(
+      directory,
+      "first",
+      ['kind = "heartbeat"', 'target_thread_id = "thread-first"', ""].join("\n"),
+    );
+
+    for (const restartPage of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      await expect(readCodexAutomationAuthority({
+        automationsDirectory: directory,
+        kind: "page",
+        restartPage,
+      })).resolves.toEqual({
+        complete: false,
+        diagnostics: [],
+        entries: [],
+        nextCursor: null,
+      });
+    }
+    await expect(readCodexAutomationAuthority({
+      after: "authority_scan_9007199254740992_20000000-0000-4000-8000-000000000000",
+      automationsDirectory: directory,
+      kind: "page",
+    })).resolves.toEqual({
+      complete: false,
+      diagnostics: [],
+      entries: [],
+      nextCursor: null,
+    });
+
+    const huge = await readCodexAutomationAuthority({
+      after: "authority_scan_9007199254740991_30000000-0000-4000-8000-000000000000",
+      automationsDirectory: directory,
+      kind: "page",
+    });
+    expect(huge).toMatchObject({ complete: false, diagnostics: [], entries: [] });
+    if (huge.nextCursor === null) throw new Error("Expected a wrapped recovery cursor.");
+    await expect(readCodexAutomationAuthority({
+      after: huge.nextCursor,
+      automationsDirectory: directory,
+      kind: "page",
+    })).resolves.toMatchObject({
+      complete: true,
+      diagnostics: [],
+      entries: [{ sourceDirectoryName: "first" }],
+      nextCursor: null,
+    });
+  });
+
+  test("wraps a maximum safe restart page over an empty directory", async () => {
+    const directory = await automationsRoot();
+    await expect(readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+      restartPage: Number.MAX_SAFE_INTEGER,
+    })).resolves.toEqual({
+      complete: true,
+      diagnostics: [],
+      entries: [],
+      nextCursor: null,
+    });
+  });
+
+  test("closes retained directory handles at EOF and when a missing root resets a scan", async () => {
+    const closeSpy = spyOn(Dir.prototype, "close");
+    try {
+      const directory = await automationsRoot();
+      for (const name of ["a", "b", "c"]) {
+        await writeAutomation(
+          directory,
+          name,
+          ['kind = "heartbeat"', `target_thread_id = "thread-${name}"`, ""].join("\n"),
+        );
+      }
+
+      let cursor: string | null = null;
+      do {
+        const scan = await readCodexAutomationAuthority({
+          after: cursor,
+          automationsDirectory: directory,
+          kind: "page",
+          limit: 1,
+        });
+        cursor = scan.nextCursor;
+      } while (cursor !== null);
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+
+      const retained = await readCodexAutomationAuthority({
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 1,
+      });
+      if (retained.nextCursor === null) throw new Error("Expected a retained authority cursor.");
+      await rm(directory, { force: true, recursive: true });
+      const reset = await readCodexAutomationAuthority({
+        after: retained.nextCursor,
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 1,
+      });
+      expect(reset).toEqual({
+        complete: true,
+        diagnostics: [],
+        entries: [],
+        nextCursor: null,
+      });
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      closeSpy.mockRestore();
+    }
+  });
+
+  test("returns no authority when directory-handle cleanup initially fails", async () => {
+    const closeSpy = spyOn(Dir.prototype, "close");
+    closeSpy.mockImplementationOnce(() => {
+      throw new Error("Synthetic directory close failure.");
+    });
+    try {
+      const directory = await automationsRoot();
+      await writeAutomation(
+        directory,
+        "scheduled",
+        ['kind = "heartbeat"', 'target_thread_id = "thread-scheduled"', ""].join("\n"),
+      );
+
+      const scan = await readCodexAutomationAuthority({
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 50,
+      });
+      expect(scan).toEqual({
+        complete: false,
+        diagnostics: [],
+        entries: [],
+        nextCursor: null,
+      });
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      closeSpy.mockRestore();
+    }
+  });
+
+  test("retries synchronous handle cleanup when a restart seek fails", async () => {
+    const readSpy = spyOn(Dir.prototype, "read");
+    const closeSpy = spyOn(Dir.prototype, "close");
+    readSpy.mockImplementationOnce(() => {
+      throw new Error("Synthetic restart seek failure.");
+    });
+    closeSpy.mockImplementationOnce(() => {
+      throw new Error("Synthetic restart handle close failure.");
+    });
+    try {
+      const directory = await automationsRoot();
+      await writeAutomation(
+        directory,
+        "scheduled",
+        ['kind = "heartbeat"', 'target_thread_id = "thread-scheduled"', ""].join("\n"),
+      );
+
+      await expect(readCodexAutomationAuthority({
+        automationsDirectory: directory,
+        kind: "page",
+        limit: 1,
+        restartPage: 1,
+      })).resolves.toEqual({
+        complete: false,
+        diagnostics: [],
+        entries: [],
+        nextCursor: null,
+      });
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      readSpy.mockRestore();
+      closeSpy.mockRestore();
+    }
+  });
+
+  test("revalidates exact source directories independently of page movement", async () => {
+    const directory = await automationsRoot();
+    await writeAutomation(
+      directory,
+      "scheduled-source",
+      ['kind = "heartbeat"', 'target_thread_id = "thread-original"', ""].join("\n"),
+    );
+
+    const page = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "page",
+      limit: 50,
+    });
+    expect(page).toMatchObject({ complete: true, nextCursor: null });
+    expect(page.entries).toHaveLength(1);
+    expect(page.entries[0]).toMatchObject({
+      sourceDirectoryName: "scheduled-source",
+      automation: { kind: "heartbeat", targetThreadId: "thread-original" },
+    });
+    expect(JSON.stringify(page.entries[0])).not.toContain("prompt");
+
+    await writeFile(
+      join(directory, "scheduled-source", "automation.toml"),
+      ['kind = "heartbeat"', 'target_thread_id = "thread-retargeted"', ""].join("\n"),
+    );
+    const exact = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "sources",
+      sourceDirectoryNames: ["scheduled-source"],
+    });
+    expect(exact).toMatchObject({ complete: true, nextCursor: null });
+    expect(exact.entries).toHaveLength(1);
+    expect(exact.entries[0]?.automation.targetThreadId).toBe("thread-retargeted");
+  });
+
+  test("derives minimal authority independently of rejected display fields", async () => {
+    const directory = await automationsRoot();
+    await writeAutomation(
+      directory,
+      "path-bearing-name",
+      [
+        'id = "path-bearing-name"',
+        'kind = "heartbeat"',
+        'name = "Sweep /srv/private\\u202e"',
+        'rrule = "FREQ=HOURLY"',
+        'status = "PAUSED"',
+        'target_thread_id = "thread-path-name"',
+        "updated_at = 10",
+        "",
+      ].join("\n"),
+    );
+    await writeAutomation(
+      directory,
+      "sanitized-display-field",
+      [
+        'id = "sanitized-display-field"',
+        'kind = "heartbeat"',
+        'name = "Safe display label"',
+        'status = "ACTIVE"',
+        'target_thread_id = "thread-sanitized-display"',
+        "updated_at = -1",
+        "",
+      ].join("\n"),
+    );
+    await writeAutomation(
+      directory,
+      "unusable-display-fields",
+      [
+        "id = 42",
+        'kind = "heartbeat"',
+        'name = ["not", "display text"]',
+        "rrule = 17",
+        'target_thread_id = "thread-unusable-display"',
+        'updated_at = "not-a-timestamp"',
+        "",
+      ].join("\n"),
+    );
+
+    const projection = await readCodexAutomations({ automationsDirectory: directory });
+    expect(projection.automations).toEqual([
+      {
+        cadence: "",
+        id: "sanitized-display-field",
+        kind: "heartbeat",
+        label: "Safe display label",
+        status: "active",
+        targetThreadId: "thread-sanitized-display",
+        updatedAt: null,
+      },
+    ]);
+    expect(projection.diagnostics).toEqual([
+      { automationId: "path-bearing-name", reason: "invalid_fields" },
+      { automationId: "unusable-display-fields", reason: "invalid_fields" },
+    ]);
+
+    const authority = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "sources",
+      sourceDirectoryNames: [
+        "path-bearing-name",
+        "sanitized-display-field",
+        "unusable-display-fields",
+      ],
+    });
+    expect(authority).toMatchObject({ complete: true, diagnostics: [], nextCursor: null });
+    expect(authority.entries).toEqual([
+      {
+        automation: {
+          kind: "heartbeat",
+          status: "paused",
+          targetThreadId: "thread-path-name",
+        },
+        sourceDirectoryName: "path-bearing-name",
+      },
+      {
+        automation: {
+          kind: "heartbeat",
+          status: "active",
+          targetThreadId: "thread-sanitized-display",
+        },
+        sourceDirectoryName: "sanitized-display-field",
+      },
+      {
+        automation: {
+          kind: "heartbeat",
+          status: "active",
+          targetThreadId: "thread-unusable-display",
+        },
+        sourceDirectoryName: "unusable-display-fields",
+      },
+    ]);
+    expect(Object.keys(authority.entries[0]?.automation ?? {})).toEqual([
+      "kind",
+      "status",
+      "targetThreadId",
+    ]);
+    const serialized = JSON.stringify(authority.entries);
+    expect(serialized).not.toContain("/srv/private");
+    expect(serialized).not.toContain("FREQ=HOURLY");
+    expect(serialized).not.toContain("not-a-timestamp");
+    expect(serialized).not.toContain("display text");
+    expect(serialized).not.toContain("Safe display label");
+  });
+
+  test("accepts only exact authority fields and documented status forms", async () => {
+    const directory = await automationsRoot();
+    const records = new Map<string, readonly string[]>([
+      ["accepted-active", ['kind = "heartbeat"', 'status = "ACTIVE"', 'target_thread_id = "thread-active"']],
+      ["accepted-blank", ['kind = "heartbeat"', 'status = "   "', 'target_thread_id = "thread-blank"']],
+      ["accepted-missing", ['kind = "heartbeat"', 'target_thread_id = "thread-missing"']],
+      ["accepted-paused", ['kind = "heartbeat"', 'status = "PAUSED"', 'target_thread_id = "thread-paused"']],
+      ["drift-kind", ['kind = "Heartbeat"', 'status = "ACTIVE"', 'target_thread_id = "thread-kind"']],
+      ["drift-status-case", ['kind = "heartbeat"', 'status = "active"', 'target_thread_id = "thread-status-case"']],
+      ["drift-status-padding", ['kind = "heartbeat"', 'status = " ACTIVE "', 'target_thread_id = "thread-status-padding"']],
+      ["drift-status-type", ['kind = "heartbeat"', "status = 1", 'target_thread_id = "thread-status-type"']],
+      ["drift-target-blank", ['kind = "heartbeat"', 'status = "ACTIVE"', 'target_thread_id = ""']],
+      ["drift-target-padding", ['kind = "heartbeat"', 'status = "ACTIVE"', 'target_thread_id = " thread-target "']],
+    ]);
+    for (const [name, lines] of records) {
+      await writeAutomation(directory, name, [...lines, ""].join("\n"));
+    }
+
+    const authority = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "sources",
+      sourceDirectoryNames: [...records.keys()],
+    });
+    expect(authority.entries).toEqual([
+      {
+        automation: { kind: "heartbeat", status: "active", targetThreadId: "thread-active" },
+        sourceDirectoryName: "accepted-active",
+      },
+      {
+        automation: { kind: "heartbeat", status: "active", targetThreadId: "thread-blank" },
+        sourceDirectoryName: "accepted-blank",
+      },
+      {
+        automation: { kind: "heartbeat", status: "active", targetThreadId: "thread-missing" },
+        sourceDirectoryName: "accepted-missing",
+      },
+      {
+        automation: { kind: "heartbeat", status: "paused", targetThreadId: "thread-paused" },
+        sourceDirectoryName: "accepted-paused",
+      },
+    ]);
+    expect(authority.diagnostics).toEqual([
+      { automationId: "drift-kind", reason: "invalid_fields" },
+      { automationId: "drift-status-case", reason: "invalid_fields" },
+      { automationId: "drift-status-padding", reason: "invalid_fields" },
+      { automationId: "drift-status-type", reason: "invalid_fields" },
+      { automationId: "drift-target-blank", reason: "invalid_fields" },
+      { automationId: "drift-target-padding", reason: "invalid_fields" },
+    ]);
+  });
+
+  test("refuses unsafe exact source identities", async () => {
+    const directory = await automationsRoot();
+    const scan = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "sources",
+      sourceDirectoryNames: ["../outside"],
+    });
+    expect(scan).toEqual({
+      complete: false,
+      diagnostics: [],
+      entries: [],
+      nextCursor: null,
+    });
+  });
+
+  test("never accepts authority through a replaced source-directory symlink", async () => {
+    const directory = await automationsRoot();
+    const outside = join(directory, "..", "outside-source");
+    await mkdir(outside);
+    await writeFile(
+      join(outside, "automation.toml"),
+      ['kind = "heartbeat"', 'target_thread_id = "outside-thread"', ""].join("\n"),
+    );
+    await symlink(outside, join(directory, "scheduled-source"));
+
+    const scan = await readCodexAutomationAuthority({
+      automationsDirectory: directory,
+      kind: "sources",
+      sourceDirectoryNames: ["scheduled-source"],
+    });
+    expect(scan).toEqual({
+      complete: true,
+      diagnostics: [{ automationId: "scheduled-source", reason: "unreadable" }],
+      entries: [],
+      nextCursor: null,
+    });
+  });
+
+  test("fails private authority promptly when automation.toml is a FIFO", async () => {
+    if (!fifoTestsSupported()) return;
+    const directory = await automationsRoot();
+    await writeAutomation(directory, "scheduled-fifo", null);
+    const fifo = join(directory, "scheduled-fifo", "automation.toml");
+    makeFifo(fifo);
+
+    const scan = await settleBeforeFifoWriter(
+      readCodexAutomationAuthority({
+        automationsDirectory: directory,
+        kind: "sources",
+        sourceDirectoryNames: ["scheduled-fifo"],
+      }),
+      fifo,
+    );
+    expect(scan).toEqual({
+      complete: true,
+      diagnostics: [{ automationId: "scheduled-fifo", reason: "unreadable" }],
+      entries: [],
+      nextCursor: null,
+    });
   });
 });

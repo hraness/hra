@@ -9,6 +9,7 @@ import { attemptIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../dom
 import { assertNoAutomaticPointerMoveOwnership, AutomaticPointerMoveStoreError } from "./automatic-pointer-move";
 import { assertQueueAttachmentMutationIntegrity, QueueAttachmentIdentityError } from "./queue-attachment-identity";
 import { ATTACHMENT_CUSTODY_COLUMNS, assertAttachmentCustodyNamespace, AttachmentCustodyNamespaceError, type InitialAttachmentInput } from "./attachment-custody-schema";
+import { normalizeSchemaSql } from "./schema-cohort";
 
 export const SESSION_SEND_REQUEST_FORMAT = "original_send_v1";
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
@@ -240,23 +241,22 @@ export function applySessionSendOwnerSchema(database: Database): void {
   }
   for (const object of SESSION_SEND_OWNER_SCHEMA_OBJECTS) database.exec(object.sql);
 }
-const normalizeSql = (value: string): string => value.replace(/\bIF NOT EXISTS\b/giu, "").replace(/\s+/gu, " ").trim().replace(/;$/u, "");
 export function assertSessionSendOwnerSchema(database: Database): void {
   const column = database.query("SELECT type,\"notnull\" AS required,dflt_value FROM pragma_table_info('mutation_attempts') WHERE name='request_format'").get() as
     { type: string; required: number; dflt_value: string | null } | null;
   if (column?.type !== "TEXT" || column.required !== 0 || column.dflt_value !== null) throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
   const parent = database.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='mutation_attempts'").get() as { sql: string } | null;
-  const suffix = `,request_formatTEXTCHECK(request_formatISNULLORrequest_format='${SESSION_SEND_REQUEST_FORMAT}')`;
-  const custodySuffix = ATTACHMENT_CUSTODY_COLUMNS.map((column) => column.replace(/\s+/gu, "")).join(",");
-  const compact = parent === null ? "" : normalizeSql(parent.sql).replace(/\s+/gu, "");
+  const suffix = `, request_format TEXT CHECK(request_format IS NULL OR request_format='${SESSION_SEND_REQUEST_FORMAT}')`;
+  const custodySuffix = ATTACHMENT_CUSTODY_COLUMNS.map(normalizeSchemaSql).join(", ");
+  const parentSql = parent === null ? "" : normalizeSchemaSql(parent.sql);
   if (parent === null || /\/\*|--/u.test(parent.sql)
-    || (!compact.endsWith(`${suffix})STRICT`) && !compact.endsWith(`${suffix},${custodySuffix})STRICT`))) {
+    || (!parentSql.endsWith(`${suffix}) STRICT`) && !parentSql.endsWith(`${suffix}, ${custodySuffix}) STRICT`))) {
     throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
   }
   for (const object of SESSION_SEND_OWNER_SCHEMA_OBJECTS) {
     const row = database.query("SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?").get(object.name) as
       { type: string; tbl_name: string; sql: string } | null;
-    if (row === null || row.type !== object.type || row.tbl_name !== object.table || normalizeSql(row.sql) !== normalizeSql(object.sql)) {
+    if (row === null || row.type !== object.type || row.tbl_name !== object.table || normalizeSchemaSql(row.sql) !== normalizeSchemaSql(object.sql)) {
       throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
     }
   }

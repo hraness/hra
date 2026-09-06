@@ -35,7 +35,12 @@ import {
   type NotificationHoursPolicy,
 } from "../domain/notification-hours-contract";
 import { isModelPreset, type ModelPreset } from "./projection";
-import { presetProviders, providerSchema, type Provider } from "../domain/presets";
+import {
+  presetProviders,
+  providerSchema,
+  type AdoptableProvider,
+  type Provider,
+} from "../domain/presets";
 import {
   parseUsageEncryptedEnvelope,
   parseUsageProjection,
@@ -510,11 +515,27 @@ export type DeviceRegistryProject = Readonly<{ label: string; publicId: string }
 export type DeviceRegistryScheduledTask = Readonly<{
   cadence: string;
   id: string;
-  kind: "codex_automation" | "hra_conversation";
+  kind: "hra_conversation";
   label: string;
   nextRunAt: number | null;
   sessionPublicId: string | null;
 }>;
+
+/**
+ * Provider-level personal-home adoption state. Candidate identity, content,
+ * liveness, project paths, and runtime provenance remain local; only these
+ * exact aggregates enter the encrypted device registry.
+ */
+export type DeviceRegistrySessionAdoptionStatus = Readonly<{
+  adopted: number;
+  enabled: boolean;
+  fenced: number;
+  pending: number;
+}>;
+
+export type DeviceRegistrySessionAdoption = Readonly<
+  Record<AdoptableProvider, DeviceRegistrySessionAdoptionStatus>
+>;
 
 /**
  * One device's settings projection: what the web settings screen needs to
@@ -539,6 +560,9 @@ export type DeviceRegistryPayload = Readonly<{
   projects: readonly DeviceRegistryProject[];
   proseAutorespondConfigured: boolean;
   scheduledTasks: readonly DeviceRegistryScheduledTask[];
+  // Additive and optional so a registry published by an older daemon remains
+  // readable. Absence means unsupported/unknown, never disabled.
+  sessionAdoption?: DeviceRegistrySessionAdoption;
   showThinkingDefault: boolean;
   version: 1;
 }>;
@@ -783,6 +807,10 @@ function isRegistryTimestamp(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
+function isRegistryCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
 function parseRegistryAccounts(value: unknown): readonly DeviceRegistryAccount[] | null {
   if (!Array.isArray(value) || value.length > deviceRegistryLimits.accounts) return null;
   const accounts: DeviceRegistryAccount[] = [];
@@ -832,9 +860,15 @@ function parseRegistryScheduledTasks(
     if (
       !isRecord(entry)
       || !hasExactKeys(entry, ["cadence", "id", "kind", "label", "nextRunAt", "sessionPublicId"])
-      || !isRegistryLabel(entry.cadence, deviceRegistryLimits.cadenceCharacters)
+    ) return null;
+    // Old daemons could publish Codex Desktop automation rows. They are
+    // private age-gate inputs, not public HRA schedules, so readers discard
+    // those legacy rows without retaining any of their metadata.
+    if (entry.kind === "codex_automation") continue;
+    if (
+      !isRegistryLabel(entry.cadence, deviceRegistryLimits.cadenceCharacters)
       || !isRegistryLabel(entry.id, deviceRegistryLimits.scheduledTaskIdCharacters)
-      || (entry.kind !== "codex_automation" && entry.kind !== "hra_conversation")
+      || entry.kind !== "hra_conversation"
       || !isRegistryLabel(entry.label)
       || (entry.nextRunAt !== null && !isRegistryTimestamp(entry.nextRunAt))
       || (entry.sessionPublicId !== null && !isOpaqueIdentifier(entry.sessionPublicId))
@@ -851,13 +885,44 @@ function parseRegistryScheduledTasks(
   return tasks;
 }
 
+function parseRegistrySessionAdoptionStatus(
+  value: unknown,
+): DeviceRegistrySessionAdoptionStatus | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["adopted", "enabled", "fenced", "pending"])
+    || !isRegistryCount(value.adopted)
+    || typeof value.enabled !== "boolean"
+    || !isRegistryCount(value.fenced)
+    || !isRegistryCount(value.pending)
+  ) return null;
+  return {
+    adopted: value.adopted,
+    enabled: value.enabled,
+    fenced: value.fenced,
+    pending: value.pending,
+  };
+}
+
+function parseRegistrySessionAdoption(value: unknown): DeviceRegistrySessionAdoption | null {
+  if (!isRecord(value) || !hasExactKeys(value, ["claude", "codex"])) return null;
+  const claude = parseRegistrySessionAdoptionStatus(value.claude);
+  const codex = parseRegistrySessionAdoptionStatus(value.codex);
+  return claude === null || codex === null ? null : { claude, codex };
+}
+
 function parseDeviceRegistryPayloadUnchecked(value: unknown): DeviceRegistryPayload | null {
   if (!isRecord(value)) return null;
   const hasAccountLinking = Object.hasOwn(value, "accountLinkingAllowed");
   const hasDeviceCommands = Object.hasOwn(value, "deviceCommandsAllowed");
+  const hasSessionAdoption = Object.hasOwn(value, "sessionAdoption");
+  const sessionAdoption = hasSessionAdoption
+    ? parseRegistrySessionAdoption(value.sessionAdoption)
+    : null;
   if (
     (hasAccountLinking && typeof value.accountLinkingAllowed !== "boolean")
     || (hasDeviceCommands && typeof value.deviceCommandsAllowed !== "boolean")
+    || (hasSessionAdoption && sessionAdoption === null)
   ) return null;
   if (
     !hasExactKeys(value, [
@@ -872,6 +937,7 @@ function parseDeviceRegistryPayloadUnchecked(value: unknown): DeviceRegistryPayl
       "projects",
       "proseAutorespondConfigured",
       "scheduledTasks",
+      ...(hasSessionAdoption ? ["sessionAdoption"] : []),
       "showThinkingDefault",
       "version",
     ])
@@ -906,6 +972,9 @@ function parseDeviceRegistryPayloadUnchecked(value: unknown): DeviceRegistryPayl
     projects,
     proseAutorespondConfigured: value.proseAutorespondConfigured,
     scheduledTasks,
+    ...(hasSessionAdoption
+      ? { sessionAdoption: sessionAdoption as DeviceRegistrySessionAdoption }
+      : {}),
     showThinkingDefault: value.showThinkingDefault,
     version: 1,
   };
@@ -1053,10 +1122,11 @@ export async function encryptDeviceRegistry(
   key: Uint8Array,
   authority: CloudPayloadAuthority,
 ): Promise<EncryptedEnvelope> {
-  if (authority.kind !== "device_registry" || parseDeviceRegistryPayload(payload) === null) {
+  const parsed = parseDeviceRegistryPayload(payload);
+  if (authority.kind !== "device_registry" || parsed === null) {
     throw new Error("Invalid device registry payload.");
   }
-  const envelope = await encryptJson(payload, key, authority);
+  const envelope = await encryptJson(parsed, key, authority);
   if (envelope.ciphertext.length > cloudLimits.registryCiphertextCharacters) {
     throw new Error("Encrypted device registry exceeds its closed envelope bound.");
   }

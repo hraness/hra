@@ -1,13 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
-import { renameSync, symlinkSync } from "node:fs";
+import { existsSync, renameSync, symlinkSync } from "node:fs";
 import { chmod, lstat, mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gunzipSync } from "node:zlib";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
 
+import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
+import { canonical40UsageDatabaseBytes, canonical40UsageFixture } from "../../scripts/fixtures/canonical40-usage";
+import { canonical30WorkDatabaseBytes, canonical30WorkFixture } from "../../scripts/fixtures/canonical30-work";
 import { deriveDesktopProfilePaths } from "../desktop/profile";
 import {
   ROOT_STATUS_ATTENTION_LIMIT,
@@ -70,18 +74,129 @@ import {
   type MachineTimeZoneResolver,
   type SecurityScrubCheckpointPolicy,
 } from "./state-store";
-import { WORK_SCHEMA_SQL } from "./work-store";
 import { SESSION_SEND_OWNER_SCHEMA_OBJECTS } from "./session-send-owner";
 import { AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS } from "./automatic-pointer-move";
 import { QUEUE_ATTACHMENT_SCHEMA_OBJECTS } from "./queue-attachment-identity";
 import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
 import { ATTACHMENT_CUSTODY_COLUMNS } from "./attachment-custody-schema";
+import { CLAUDE_PROCESS_CUSTODY_COLUMN, CLAUDE_PROCESS_CUSTODY_OBJECT_NAMES } from "./claude-process-custody";
+import { SESSION_SWITCH_ADOPTION_GUARDS, SESSION_SWITCH_ADOPTION_TABLES } from "./session-switch-adoption";
+import { schemaCohortObjects } from "./schema-cohort";
 
 const stores: StateStore[] = [];
 const privateUserPathRoot = ["", "Users", "private"].join("/");
 const publicProviderIdentifierKey = new Uint8Array(32).fill(19);
 const publicProviderIdentifier = (value: string) =>
   projectPublicProviderIdentifier(value, publicProviderIdentifierKey);
+const testProviderAccountKey = (provider: "codex" | "claude"): string =>
+  `v1:${provider}:${createHash("sha256").update(`test-${provider}-account`).digest("hex")}`;
+const namedProviderAccountKey = (
+  provider: "codex" | "claude",
+  name: string,
+): string => `v1:${provider}:${createHash("sha256").update(name).digest("hex")}`;
+const providerAccountKeyForProfile = (
+  store: StateStore,
+  profileId: string,
+  provider: "codex" | "claude",
+): string => {
+  if (provider === "claude") return testProviderAccountKey("claude");
+  const email = store.requireProfileById(profileId).providerEmail;
+  if (email === undefined) throw new Error("Expected identifiable Codex profile authority.");
+  return namedProviderAccountKey("codex", email.trim().toLowerCase());
+};
+
+type ProviderSessionInput = Parameters<StateStore["upsertProviderSession"]>[0];
+type ProvenProviderSessionInput = Omit<ProviderSessionInput, "provider" | "providerAuthority" | "providerAccountKey" | "title"> &
+  Partial<Pick<ProviderSessionInput, "provider" | "providerAuthority" | "providerAccountKey" | "title">>;
+const upsertProvenTestSession = (
+  store: StateStore,
+  input: ProvenProviderSessionInput,
+) => {
+  const provider = input.provider ?? "codex";
+  return store.upsertProviderSession({
+    ...input,
+    provider,
+    providerAuthority: input.providerAuthority ?? store.requireProviderAccountAuthority(input.profileId, provider),
+    title: input.title ?? "Untitled session",
+    ...(provider === "devin"
+      ? (input.providerAccountKey === undefined
+          ? {}
+          : { providerAccountKey: input.providerAccountKey })
+      : {
+          providerAccountKey: input.providerAccountKey
+            ?? providerAccountKeyForProfile(store, input.profileId, provider),
+        }),
+  });
+};
+
+let provenTestSessionSequence = 0;
+type CreateProvenTestSessionInput =
+  & Omit<ProvenProviderSessionInput, "provider" | "providerThreadId" | "providerAccountKey" | "state" | "title">
+  & Partial<Pick<
+    ProviderSessionInput,
+    "provider" | "providerThreadId" | "providerAccountKey" | "state" | "title"
+  >>;
+const createProvenTestSession = (
+  store: StateStore,
+  input: CreateProvenTestSessionInput,
+) => {
+  const { providerThreadId, state, ...rest } = input;
+  provenTestSessionSequence += 1;
+  return upsertProvenTestSession(store, {
+    ...rest,
+    providerThreadId: providerThreadId ?? `test-provider-thread-${provenTestSessionSequence}`,
+    state: state ?? "idle",
+  });
+};
+
+const createRevocationWorkStore = (store: StateStore, generation = 1) =>
+  store.createWorkStore(
+    generation,
+    () => "unused-revocation-cursor",
+    {
+      issue: () => `hrac1_${"A".repeat(43)}`,
+      verify: () => true,
+    },
+  );
+
+const completeCodexRuntimeAccountAuthorityRetirement = (
+  store: StateStore,
+  profileId: string,
+  profileGeneration: number,
+  runtimeScope: "personal" | "managed",
+): void => {
+  const workStore = createRevocationWorkStore(store);
+  const begun = store.beginProviderRuntimeAccountRevocation({
+    profileId,
+    expectedGeneration: profileGeneration,
+    provider: "codex",
+    runtimeScope,
+    currentAccountKey: null,
+    workStore,
+  });
+  store.completeProviderRuntimeAccountRevocation({
+    profileId,
+    expectedGeneration: profileGeneration,
+    provider: "codex",
+    runtimeScope,
+    expectedRevision: begun.revocation.revision,
+  });
+};
+
+const completeCodexAccountMutationAuthorityRetirement = (
+  store: StateStore,
+  profileId: string,
+  profileGeneration: number,
+): void => {
+  for (const runtimeScope of ["personal", "managed"] as const) {
+    completeCodexRuntimeAccountAuthorityRetirement(
+      store,
+      profileId,
+      profileGeneration,
+      runtimeScope,
+    );
+  }
+};
 
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
@@ -89,6 +204,7 @@ afterEach(() => {
 
 async function fixture(
   options: Readonly<{
+    now?: () => number;
     resolveMachineTimeZone?: MachineTimeZoneResolver;
     securityScrubCheckpoint?: SecurityScrubCheckpointPolicy;
   }> = {},
@@ -104,6 +220,579 @@ async function fixture(
   stores.push(store);
   return { store, home };
 }
+
+async function canonical40QueueArchive() {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical40-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  await writeFile(paths.database, canonical40QueuesDatabaseBytes(), { mode: 0o600 });
+  return paths;
+}
+
+function withRemovedTestGuards(database: Database, names: readonly string[], corrupt: () => void): void {
+  const guards = names.map((name) => {
+    if (!/^[a-z_0-9]+$/u.test(name)) throw new Error("Unsafe test guard name.");
+    const guard = z.object({ sql: z.string() }).parse(database.query(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+    ).get(name));
+    return { name, sql: guard.sql };
+  });
+  for (const guard of guards) database.exec(`DROP TRIGGER ${guard.name}`);
+  try { corrupt(); } finally { for (const guard of guards) database.exec(guard.sql); }
+}
+
+function expectInertSchemaRefusal(paths: StateStore["paths"], code: string, readonlyCode = code): void {
+  const database = new Database(paths.database, { readonly: true, strict: true });
+  try {
+    const snapshot = () => ({
+      version: database.query("PRAGMA user_version").get(),
+      schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+      tables: database.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((row) => {
+        const { name } = z.object({ name: z.string() }).parse(row);
+        return { name, rows: database.query(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all() };
+      }),
+    });
+    const before = snapshot();
+    for (const readonly of [true, false]) {
+      expect(() => new StateStore(paths, { readonly })).toThrow(readonly ? readonlyCode : code);
+      expect(snapshot()).toEqual(before);
+    }
+  } finally { database.close(false); }
+}
+
+const dropProviderSwitchProgressSchema = (database: Database): void => {
+  database.exec(`
+    DROP TRIGGER IF EXISTS session_mutation_authority_rebinds_v39_immutable_delete;
+    DROP TRIGGER IF EXISTS session_mutation_authority_rebinds_v39_immutable_update;
+    DROP TABLE IF EXISTS session_mutation_authority_rebinds_v39;
+    DROP TABLE IF EXISTS session_provider_switch_source_releases;
+    DROP TABLE IF EXISTS session_provider_switch_seed_results;
+    DROP TABLE IF EXISTS session_provider_switch_seed_intents;
+    DROP TABLE IF EXISTS session_provider_switch_target_releases;
+    DROP TABLE IF EXISTS session_provider_switch_targets;
+    DROP TABLE IF EXISTS session_mutation_authority_rebinds;
+  `);
+};
+
+const dropProviderV39SessionColumn = (database: Database): readonly Readonly<{
+  name: string;
+  sql: string;
+}>[] => {
+  if (database.query(
+    "SELECT 1 FROM pragma_table_info('sessions') WHERE name='provider_v39'",
+  ).get() === null) return [];
+  const triggers = z.object({
+    name: z.string().regex(/^[a-z0-9_]+$/u),
+    sql: z.string().min(1),
+  }).strict().array().parse(database.query(
+    `SELECT name,sql FROM sqlite_master
+     WHERE type='trigger' AND sql LIKE '%provider_v39%'
+     ORDER BY name`,
+  ).all());
+  for (const trigger of triggers) {
+    database.exec(`DROP TRIGGER "${trigger.name}"`);
+  }
+  database.exec("ALTER TABLE sessions DROP COLUMN provider_v39");
+  return triggers;
+};
+
+const downgradeProviderV39SessionColumn = (database: Database): void => {
+  const triggers = dropProviderV39SessionColumn(database);
+  if (triggers.length === 0) return;
+  database.exec(`
+    DROP TRIGGER IF EXISTS session_mutation_authority_rebinds_v39_immutable_delete;
+    DROP TRIGGER IF EXISTS session_mutation_authority_rebinds_v39_immutable_update;
+    DROP TABLE IF EXISTS session_mutation_authority_rebinds_v39;
+  `);
+  for (const trigger of triggers) {
+    if (trigger.name.includes("devin")) continue;
+    database.exec(trigger.sql.replace(/\bprovider_v39\b/gu, "provider"));
+  }
+};
+
+const sessionAdoptionTableNames = [
+  "session_claude_process_authorities",
+  "session_claude_process_launch_intents",
+  "session_personal_runtime_bindings",
+  "session_adoption_candidates",
+  "session_adoption_policies",
+  "session_adoption_profile_generation_permits",
+  "profile_personal_authority_revocations",
+  "provider_runtime_account_revocations",
+  "session_provider_account_authorities",
+  "session_account_authorities",
+] as const;
+
+const dropSessionSwitchAdoptionSchema = (database: Database): void => {
+  const objects = schemaCohortObjects(SESSION_SWITCH_ADOPTION_TABLES, SESSION_SWITCH_ADOPTION_GUARDS);
+  for (const type of ["trigger", "index", "table"] as const) {
+    for (const object of [...objects].reverse()) if (object.type === type) {
+      if (!/^[a-z0-9_]+$/u.test(object.name)) throw new Error("Unexpected switch adoption schema object");
+      database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
+    }
+  }
+};
+
+// Exact released 6f056dc adoption guards. Combined49 overrides reference the
+// new process-proof markers, so restore these bytes before removing markers.
+const releasedAdoptionControllerGuards = `
+CREATE TRIGGER IF NOT EXISTS session_adoption_profile_generation_guard
+BEFORE UPDATE OF process_generation ON profiles
+WHEN NEW.process_generation!=OLD.process_generation AND (
+  EXISTS(
+    SELECT 1 FROM session_claude_process_authorities a
+    WHERE a.profile_id=OLD.id
+      AND a.profile_generation=OLD.process_generation
+      AND a.state!='released'
+  )
+  OR EXISTS(
+    SELECT 1 FROM session_claude_process_launch_intents i
+    WHERE i.profile_id=OLD.id
+      AND i.profile_generation=OLD.process_generation
+  )
+  OR (
+    EXISTS(
+      SELECT 1 FROM session_personal_runtime_bindings b
+      JOIN sessions s ON s.id=b.session_id
+      WHERE s.profile_id=OLD.id AND b.state IN ('active','detaching')
+    )
+    AND NOT (
+      EXISTS(
+        SELECT 1 FROM session_adoption_profile_generation_permits permit
+        WHERE permit.profile_id=OLD.id
+          AND permit.from_generation=OLD.process_generation
+          AND permit.to_generation=NEW.process_generation
+      )
+      AND (
+        NEW.state=OLD.state
+        OR (
+          NEW.state='login_pending'
+          AND NOT EXISTS(
+            SELECT 1 FROM session_personal_runtime_bindings b
+            JOIN sessions s ON s.id=b.session_id
+            WHERE s.profile_id=OLD.id AND s.provider_v39='codex'
+              AND b.provider='codex' AND b.state IN ('active','detaching')
+          )
+        )
+      )
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'live session controllers must release before account generation changes'); END;
+CREATE TRIGGER IF NOT EXISTS profile_controller_authority_recovery_guard
+BEFORE UPDATE OF state ON profiles
+WHEN NEW.state='recovery_required' AND OLD.state!='recovery_required'
+  AND EXISTS(
+    SELECT 1 FROM session_claude_process_authorities a
+    WHERE a.profile_id=OLD.id
+      AND a.profile_generation=OLD.process_generation
+      AND a.state!='released'
+    UNION ALL
+    SELECT 1 FROM session_claude_process_launch_intents i
+    WHERE i.profile_id=OLD.id
+      AND i.profile_generation=OLD.process_generation
+  )
+  AND NOT EXISTS(
+    SELECT 1 FROM profile_personal_authority_revocations r
+    WHERE r.profile_id=OLD.id
+      AND r.profile_generation=OLD.process_generation
+      AND r.state='releasing'
+  )
+BEGIN SELECT RAISE(ABORT, 'controller revocation must be staged before account recovery'); END;
+`;
+
+const dropClaudeProcessCustodySchema = (database: Database): void => {
+  const guards = schemaCohortObjects(releasedAdoptionControllerGuards);
+  for (const guard of guards) {
+    if (database.query("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?").get(guard.name) !== null) {
+      database.exec(`DROP TRIGGER ${guard.name}`);
+      database.exec(guard.sql);
+    }
+  }
+  const objects = z.object({ name: z.string().regex(/^[a-z0-9_]+$/u), type: z.enum(["trigger", "index", "table"]) })
+    .strict().array().parse(database.query(`SELECT name,type FROM sqlite_master WHERE name IN (${CLAUDE_PROCESS_CUSTODY_OBJECT_NAMES.map(() => "?").join(",")})`).all(...CLAUDE_PROCESS_CUSTODY_OBJECT_NAMES));
+  for (const object of objects) if (object.type !== "table") database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS ${object.name}`);
+  const column = CLAUDE_PROCESS_CUSTODY_COLUMN.split(" ")[0];
+  if (column === undefined || !/^[a-z0-9_]+$/u.test(column)) throw new Error("Invalid custody marker fixture");
+  for (const table of ["session_claude_process_launch_intents", "session_claude_process_authorities"]) {
+    if (database.query(`SELECT 1 FROM pragma_table_info('${table}') WHERE name=?`).get(column) !== null) {
+      database.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+    }
+  }
+  for (const object of objects.toReversed()) if (object.type === "table") database.exec(`DROP TABLE IF EXISTS ${object.name}`);
+};
+
+const dropSessionAdoptionSchema = (database: Database): void => {
+  dropSessionSwitchAdoptionSchema(database);
+  dropClaudeProcessCustodySchema(database);
+  const objects = z.object({
+    name: z.string().regex(/^[a-z0-9_]+$/u),
+    type: z.enum(["index", "trigger"]),
+  }).strict().array().parse(database.query(`
+    SELECT name,type FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%' AND (
+      (type='index' AND (
+        tbl_name IN (${sessionAdoptionTableNames.map(() => "?").join(",")})
+        OR name='sessions_profile_created'
+      ))
+      OR (type='trigger' AND (
+        sql LIKE '%session_account_authorit%'
+        OR sql LIKE '%provider_runtime_account_revocation%'
+        OR sql LIKE '%session_adoption_%'
+        OR sql LIKE '%session_personal_runtime_%'
+          OR sql LIKE '%session_claude_process_%'
+          OR sql LIKE '%profile_personal_authority_%'
+          OR sql LIKE '%codex_account_key%'
+        ))
+    )
+    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
+  `).all(...sessionAdoptionTableNames));
+  for (const object of objects) {
+    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
+  }
+  for (const table of sessionAdoptionTableNames) {
+    database.exec(`DROP TABLE IF EXISTS "${table}"`);
+  }
+};
+
+const dropSessionAdoptionAndPresetContractSchema = (database: Database): void => {
+  downgradeProviderAccountsToReleasedVersion(database);
+  dropSessionAdoptionSchema(database);
+  downgradeProviderV39SessionColumn(database);
+  const presetTriggers = z.object({
+    name: z.string().regex(/^[a-z0-9_]+$/u),
+  }).strict().array().parse(database.query(
+    `SELECT name FROM sqlite_master
+     WHERE type='trigger' AND sql LIKE '%preset_contract%'
+     ORDER BY name`,
+  ).all());
+  for (const trigger of presetTriggers) {
+    database.exec(`DROP TRIGGER IF EXISTS "${trigger.name}"`);
+  }
+  if (database.query("SELECT 1 FROM pragma_table_info('profiles') WHERE name='codex_account_key'").get() !== null) {
+    database.exec("ALTER TABLE profiles DROP COLUMN codex_account_key");
+  }
+  database.exec("ALTER TABLE sessions DROP COLUMN preset_contract");
+  database.exec("ALTER TABLE works DROP COLUMN preset_contract");
+};
+
+const dropPostProviderSwitchSchema = (database: Database): void => {
+  dropSessionAdoptionAndPresetContractSchema(database);
+  database.exec(`
+    DROP TABLE IF EXISTS attention_email_policy;
+    DROP TABLE IF EXISTS notification_hours;
+  `);
+};
+
+const dropSchemaAfterVersion34 = (database: Database): void => {
+  downgradeProviderAccountsToReleasedVersion(database);
+  dropPostProviderSwitchSchema(database);
+  dropProviderSwitchProgressSchema(database);
+};
+
+const providerVersion39WorkSignalMemberGuardSql = `
+CREATE TRIGGER work_signal_member_guard
+BEFORE INSERT ON work_signals
+WHEN NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND session_id=NEW.from_session_id)
+  OR NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND session_id=NEW.to_session_id)
+  OR NOT EXISTS (
+    SELECT 1 FROM sessions AS s JOIN profiles AS p ON p.id=s.profile_id
+    WHERE s.id=NEW.to_session_id AND s.state IN ('active','idle')
+      AND p.state!='removed' AND (s.provider_v39 IN ('claude','devin') OR p.state='signed_in')
+      AND p.process_generation=NEW.target_account_generation
+  )
+BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_MEMBER_INVALID'); END;
+`;
+
+const downgradeToExactProviderVersion39 = (database: Database): void => {
+  downgradeProviderAccountsToReleasedVersion(database, 39);
+  database.exec(`
+    DROP TRIGGER IF EXISTS work_profile_attempt_identity_guard;
+    DROP TRIGGER IF EXISTS work_signal_member_guard;
+    ${providerVersion39WorkSignalMemberGuardSql}
+    DELETE FROM migrations WHERE version>39;
+    PRAGMA user_version=39;
+  `);
+};
+
+// Exact sqlite_master SQL emitted by StateStore at 42c4235e35daed1dec7eca4ff985bd9e8606b78a.
+// Keeping the generated predecessor surface compressed makes this bridge test
+// independent of the current schema builders that it is intended to challenge.
+const historicalAdoptionVersion35SchemaSha256 =
+  "b9ee8e59273df62581aad7ec065e518034bf3700f35e1cbea542bdf806209e0f";
+const historicalAdoptionVersion35SchemaGzipBase64 =
+  "H4sIAAAAAAAAE+0d23IaR/ZdX9F+QmywSkq8yToJrkLS2GYtQRbw2qnULjViWtKsYYbMDHL891t9v/f0DOAoNnmIEX07ffrcz+nmYhINZhGYDc6vIrAu8tt0CedrWJR5Fi/n8aa6z4u0+jQv4EO+iKs0z0pwfAR41zQBs+j9DPwyGV4PJr+CN9GvYBK9jCbR6CKasm7lcZp0wXgELqOraBaBi8H0YnAZ9aSJ7mAGC7wAGI5m0atoAkbjGRi9vboCF6+jizfHlp7n0exdFI3AKRiMLsHz09Mfzp4///bvz354dvr8+VkXzV9WcQUJjNp8pGU4AsedAi5hXKbZXafXWeSr9RJWMOl08QQFfEhLD1i8nQFz5gZmUcC4gsk8rlyzST1e9MEpHrVZJzWjpB4v+tIqZFG2IXkCuprSNCVTjifqEHNGMpggsC8jrG/OSAHtdo+6YDqbDC9mPx1daET3kCawmBebrEpXcB4vFvkmq2pJjuPgUdEb246V5HgjprpFnsA/EMUt400CGblRLJSLfG2nW7UHnmkVZ/EdTDq9DmNdOttiUxQwqzhOP8BPZE4y1REA9j6UFnD7eAI44H0KNN7/EmZ31f2xZXy3/8N3eCzAHcvNTVkVto69s97zbr/zcPYjnvfHTuCo0y7Gyqur8Tno/O23/54+fR4/vf3P3zpdG8gEv/UwPwuF+eyUAo1nDob6zAf1QVo9JmmFBko6jQuDNOkxwuopjOiUbyUskXrglMB0agqJWGPtNZqUdguQbKHyEY1xyAWLKECIpsxzMZjOlC6DKTi/Gp93u5oO/O5bosAKuMiLxKvB5C5Y8dWiM8nXSCbPF3GWpEj9cS2xlfzl6qi6L2CcmNgkM1FUmL11HHx7SnCwLvL/wUXF5kNfVWm1tIt4GdGkVx2KOSBue0frglEQL6r0AXZ6nTRZon8qWKxSoT5I87zaFII+GYUoLSaRqB1MrDz7hwq3ZMJMooEBs2wDibVszdxsWqYPMINlaccwa8RoQH91ep0sr+b04yb7kOUfM4qHMt8UCzhfo50qIkluEGDJX7+gxoL01c9903TQlpkn+SpOMxnjZqO0oqUR7SuJi49p1ul1lmm2+UPbTJEvECkUlW0V0ejgf7Oji0TPviVHvVjG6QoT38Z+JkoHDP8aZgm1ylEb+Yg5Hxs7tzBbcDudy4H5bZrdwWJdpFnl4y7rgG7/+2cYavt0RHX/JhQ3WpmAYS5LVrO0yqRCgTF7cUgsExhg7NxTuU2LsponabnIH2DhFd22roIJ47Ka5zclLB68kxj9XvRtMIg5F/dxdlc/pdSN7doGLzYNNRDEWnFVwdUa/auxv9Eq8YrW5NmPZmcQ48KiWYQxg+1NhV/6jBlcJCNbN9xGlmd4EjQFHW7AYhGEqtTThZbcaggbASG1rA1jXra41aXpJq0dZCDc/VRw5H5468GWyTpfpovUapfIRl4T00Qx8Dx2XVDUA2bxzRIL0iQtyccvJOShUCax+9lmMaQSJq18QcdwtNgGMU4IJwcjnoACbau02nFE7bbIVwHhDb2bN7ZBTqXKA+ZVOvW1Vb4hRGHpWUdLdWgmnIKZF5al4WXt0axv7HTtOwS12xCS7p/W+6TTiCyG9yqZzPrmJOvYZRbTKRRz2Jym3ubVjV2Pv9XAog2SsljHYsTe5JsM/StHm8nnvUjeNl43GUdAMs0dpUWYOvLXL/ryupb4i9hw35hPib5IiHzSp7jDro6gR3mMbkgpJN6zhG8k3m4oW5bxJlvcz9OsghkV3uSzKQXejob/ehupVMb7dvvffb/vmMNBODGpu0vWKiskKz2MJTq0Nmn4FHslbZ7qY5PepNjl3n1s8lFG5YIkOA+SJbCKF/dEcJPPexHcNMDhoRSpR2v6EnPg4Ww/ptRXWoTUl782pyOCr9adfTmeRMNXo1rXF1vmJsXZosCNXGiqlOgJ4yOxbNd0DDghNBzCfAl9hOSB1LMs29bnyCg8olymkavQ5iIn6stU1mYom2Umm2UkDfDMrGRtNrJpFrJh9nE3eZrh6DJ6H5TWn3NL+AggCgwZI4ULegFJOQDevY4mEVCsT8S4GrgegcLMvwKui/wGElB9AkgPJDoEGgHMHtmi8QZr7kMOSOFIdUjYnFBhTbgsLFhWGyprgFoKaT1O+fkageLLaHrhxbAaJmW44UBSE12F1R1NwAmieZrArEqrTyrg7lGSl9pbE3KliNNI9InkITnw6IGNdgmGSmiKHl5dAsbqZYVBpPpHLO7lBUodomXbtRBIj1vGtmNvdK4apCHo0yAVeGqJO6cBPidGiQqMs7dgECtEipljh4Qf1JxKWGVl5UykiC3mPhnts8nwFdIb3MLhIItCCJwZxjDN7zZxkRydR8gQBG9/uURTjF8SgHtaklmC5ujd62gEjkfRuxPNhBtPAPrWkp9mNhYWYNH74XQ2RTbDNLqKLmbgDLycjK8D/KIbjtWbE4HrPlo0TbiAvCFwPeGASS1c5KMx7A9Lu6Bqpaf4+qh7dB69Go7YHiaD4TQ6HpyPJ7Me4BYnYHthm0O5zSyvwA1c5CtIk/yd7k8gGl02OEfEAgUanGfqMQ5H02gyUxS61JeeHT46K6Ps4Hz+OR4KWgElppyTNOnLJ+Y+RqVPg+MsAw+z3P1RxosFXFfCYJfx3fxkf9/ADXSdKWmEWVWkkJ7l4bDaHBZGZAI+5sWH5kdUxeWHeZqVsKhcByV3lZmOGkKyz3s4wIYHWKUPKDxUom6b5XanSMx7nybcEAl2OM/HcZ7cTsqzqsiXSxSKkS5K4OqOT17LhupGnBVUORP7qHSGAv6+SQsWMhpfXXIlZHY5AhojuxSnJ08a42FEKcYnwt7ro6WpMiTLiFYp1Yt6sWnF18oow8XBrW9Hw/EIDKh7GQS2loJJJchTL+RpI8iRBY1GIdPEjdrAazOFBGThBbJohd7ixAhy4C14OENQMBCQgtWmRMYhzUCAG3ibF8hMxLEYwGivjju82JizeLidTUaBOBW8w+Z7gvHE/vrmjPkDIobyM+og/vShh8sLvriMJh7ST0uQZg/xMk08OKkLbIVgpDY4tm98MPOSgiDRRBusuCrjPz0OF1FlertYsoXgY+aAMAkP1vj8kAMii1XugMSmH6lJWeEBsnwuDhCyjZXpXQaTeZoJtyQ+0Wv4Ze9qLXQoXMXp0hrjU6boL/OPsDiuinR1rI9Gd7t8ZMO0LaMWwU1JDkuANPAqrhb3oLqHgOzlaZpJzgwNtjWnI2IgHw1ezqKJaRmXBOgjwJqGo9nYd7RyvEwKh8hRdrn4QVANOdSeeoYo4g5QuiVCdDCyHwo6sRlmavQpuppGwHsSCEFkYrSYCNSgXJukqxBN0vgzIksVsJ+OmmJ5j4GArbnQEgaQGY6Es2VO03h0O1bWFjqwbB0xNY09HOjj6xLpBUSRPirShTUgqUbDBlClG7GIJN5lSoBO5hEqWADNpLU0wUkEr4ziY4q9PUh5avlL/wULeJzsVdK9uINkBJqpDGqYNNUNu41THZj962L2fcXHDnT0ddGRQkJoX4Z37Zf6WBzqtoYzWFUCMoYLUSaBfVanKqHJbSP5BpTaruswEQUinq3h+qH+0tfygPGMLwL0fpabUu5ljD4GutzxPW9RGwlMyij12Nm8Lyl5Yf+S/7eiThTJWK02FboLBD6m1X2agTwT0Q96DrVkaZS18DKSOZ/fFHCecsae7Sqjv5AmiD/pMHEHlrOegosWG64Lcvkgr41toYIFEtrRi4RwjEv/UusuboqK3uK7lnhrEw0zsUarrTi1YOSx4IbTnnLjkHI84UrMPcbtTS791WbtFqe1l3GbkwbSuTCTixnMsjcLPLpGcsPk6+m61hmqtczTJTOrzLHjQyaayyMVBB6kj6zUzNh6baHdgUIeG4XgW8SfmqkKqUDLdtzsYnKjTRE4ttQEdDM8vdVMkHG49ZSpcrnXZ9wL71gU4Jr+sStUV28zd9uglCZxSxBnFL23KbY1FBu4kYlhxbNLlpBMijWCcsD9Nrin+TqR49sLvXtovf5hvcIT4ZaT1EfWzLWFbYqa8sbiRKnQ74tbHp4ktictvrYlxbvbZjFxCpy9DsYz4Ixv0xKwE9gZUXwG5jwQyl+HUBo7SiYJ7KUEwK3D2js6dMubrIRVtYQJKvZJV/68fyOGEEUABBe0BougwXwLRI2tyDVAksekvRCieBzmSyG8WZ3b6rP4IkyNSo2CJbunLsno11QUq6Pswt147seJ4VocB2HZhufW2rMxppvgui22ga6L6fxCF8u9XBrZ6Gg/PjnExriFoDUgWGp9yHGhEOXCvg1y+e1Evd7FL7zZCUser17B9FNDkzJEAXhah9luUyjtlN9+A/YoK4uxei01Ws1JUS4YdBd7st8E2fu+NHp31avKPeS8siWE70THTjbtvwQjCab6qzAygm6CxAa9EuN8IqGr9S+b4Mprl3FDgRd0P71HF5kwIRKLrIAVCgmit7W4pUIFeLhZYr7X5TBJTEFsL/A2+/FiBH08k6F/wYJuGuttDPlnrOnmjBiioOq5rAGPsYygsZ8GPCXucsu5O2EzcRM32Nhp8lYd+VcTGeRL5ykxKGg37VE4P6FpY9Xn5excZREnXoGCrnSLOyG8Jr5ksgTTtl4HLzErSRM5L9qFY3ee5Y5AwKjJGdU4tWiUDD7aLcofUhS3jOzyo5fzF+4YNQ2euuSkJcAq6yLaEi4l65g4mIW3Z+C28vEg2Wsl++65nKc72vI4zR7km4rFOahHa5Qw1t8ME3OZV8KkNmdFoxEdMesZ0bONuufdY8GdvggikQpCETPqXw/eSw9M4VJ38afy3IkcPGaVMGq0sqbI0IZihN+WN+4Is0r4Q68yrvIHFLQTSWQ9enQQPQejcr+iRxQgwSypFTwOZREeSXZrm4DKG8/eL/C8zEdSr9I1DRk7N8k6hCXYQrZKRRJ9dzSwaJRU/jmr/rjdXnrqX+qqAtXxW74R4jwcRqzUTAKrtMS1mTs6IWe2S1yw4mL7cGqf+9QUTzzEJ/F68g3ojwykr+k28kO8O+DWov8Cgn8XQS+d1Jjs9gAklqzyN1Lpdb0siBvIAl/gptv6nBZ5drtMF1WJi2Px7+6YtLntAYo6lq0OcPviII5EWwJG6asFJOru/9VVlzfKSNUWa9Sn8zxbUcZZf5jDnlqyU3p9erA9bfLaKvqDfGZNVTiJumIIkparIVBnFCL4LmMLC8NahrMzC4K/kcCKJJju4ZUCXDuFaiMnnkNqINUr2s7KefFc8VHQ+bTBQKtSSefmVYlIQkq1Lm8o4am+sP2da1YHYfGG274+4w35Szc88EIykbcXCOxxk0WcLeASJZGo22U8DkR23vq8Qv2ugKPZ7+MmOtm28Muct3fYEwy1gtFz/ccmG2tuXgXcu3LIRvfNpa3KQyzquGxY7yHfoeLQ2GwQ3z1gx6J6rtZXxNlGu4fUj+DbbiKhhWu2fI95azfQ7A96a50CHvU2RgQ+7G291OKH91kIvPWPfBtj/A99h1T38RKb2quaKCNIR20hJHxXfAOFxHa7aqChS1+oDcnQusyX/xc7zOcLduRzauqUvzEk6X3zB4oQxcjPs7XV6g6dXmdcYlfSGe1gqpz5sEyTs/Mmx1F7nB4N/mccZ+OXhxulH73oJiOA0zIQCK/Qo4PN8I1eVBQ/iGmIAIeBII8yLAEgY5G9cOS5yY1+0IuvaLwPNJhS64E/E8S6+p8L4r08zwYNpvLLQfYRlFEti2LNijCBfrzZ9PVs8+EhDAWKX+j89eduUJTCGfVgi1miHgJA39Xy8AcJbNO1f5ig8248eTMfzGbR9S+z+eDiYvx2NJsP3s5ejyfD2a/z6+H0ejC7eO0l7EWeF0maxVVeNCPu3RC1lZh38d6VSrhBT17JqLBGJrakwHhHVLRL6rkYjyeXw9FgNp40pZwVXN1YjSKfRCSDvjza+Vro5Tq6Po8akwryzOHHhqRCBu2RVKj2F4aOnWxo2x6Jh+zUriPZ8l8gLU2ifw+jd82pCW0P3SBqRE1k0JcneHBJ6hcjfWgk5Qs5myrfy8k4LdkqLu6g8FFsBu0jFAPT4avR4Kqt/cqFwYdWAgE9ew9T4aJF704+pFmCXl37oFfPWOlRFi6Y1vBHjQqd1IqgUciGDDco588iaQoOM3IIymRatoBLnap9WdFrG/UzOP7aDPAmhAn+D9/+9+D5kgAA";
+
+const downgradeToHistoricalAdoptionVersion35 = (database: Database): void => {
+  dropSchemaAfterVersion34(database);
+  const schema = gunzipSync(
+    Buffer.from(historicalAdoptionVersion35SchemaGzipBase64, "base64"),
+  ).toString("utf8");
+  if (createHash("sha256").update(schema).digest("hex")
+    !== historicalAdoptionVersion35SchemaSha256) {
+    throw new Error("Historical adoption-v35 fixture digest mismatch.");
+  }
+  database.exec(schema);
+  database.exec("DELETE FROM migrations WHERE version>35; PRAGMA user_version=35;");
+};
+
+const dropPostLegacyAdoptionVersion36Schema = (database: Database): void => {
+  downgradeProviderAccountsToReleasedVersion(database, 40);
+  database.exec("PRAGMA foreign_keys=OFF");
+  try {
+    // Replace combined Work guards before rebuilding their referenced tables.
+    // The released v36 guards below contain no task provider-account sidecars.
+    for (const guard of schemaCohortObjects(legacyAdoptionWorkAuthorityGuards)) {
+      database.exec(`DROP TRIGGER IF EXISTS ${guard.name}`);
+      database.exec(guard.sql);
+    }
+    downgradeProviderV39SessionColumn(database);
+    const presetTriggers = z.object({
+      name: z.string().regex(/^[a-z0-9_]+$/u),
+    }).strict().array().parse(database.query(
+      `SELECT name FROM sqlite_master
+       WHERE type='trigger' AND sql LIKE '%preset_contract%'
+       ORDER BY name`,
+    ).all());
+    for (const trigger of presetTriggers) {
+      database.exec(`DROP TRIGGER IF EXISTS "${trigger.name}"`);
+    }
+    database.exec("ALTER TABLE sessions DROP COLUMN preset_contract");
+    database.exec("ALTER TABLE works DROP COLUMN preset_contract");
+    database.exec("ALTER TABLE session_adoption_candidates DROP COLUMN last_live_observed_at");
+    database.exec("ALTER TABLE session_adoption_candidates DROP COLUMN provider_project_root");
+    database.exec("DROP TABLE IF EXISTS attention_email_policy");
+    database.exec("DROP TABLE IF EXISTS notification_hours");
+  } finally {
+    database.exec("PRAGMA foreign_keys=ON");
+  }
+};
+
+const legacyAdoptionWorkAuthorityGuards = `
+CREATE TRIGGER IF NOT EXISTS work_coordinator_account_authority_guard
+BEFORE INSERT ON works
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM session_account_authorities AS a
+  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
+  JOIN profiles AS p ON p.id=a.profile_id
+  WHERE a.session_id=NEW.coordinator_session_id
+    AND s.state IN ('active','idle')
+    AND p.state='signed_in'
+    AND a.account_key IS NOT NULL
+    AND p.provider_email IS NOT NULL
+    AND a.account_key=lower(trim(p.provider_email))
+)
+BEGIN SELECT RAISE(ABORT,'WORK_COORDINATOR_AUTHORITY_MISMATCH'); END;
+CREATE TRIGGER IF NOT EXISTS work_member_account_authority_guard
+BEFORE INSERT ON work_members
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM session_account_authorities AS a
+  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
+  JOIN profiles AS p ON p.id=a.profile_id
+  WHERE a.session_id=NEW.session_id
+    AND s.state IN ('active','idle')
+    AND p.state='signed_in'
+    AND a.account_key IS NOT NULL
+    AND p.provider_email IS NOT NULL
+    AND a.account_key=lower(trim(p.provider_email))
+)
+BEGIN SELECT RAISE(ABORT,'WORK_MEMBER_AUTHORITY_MISMATCH'); END;
+CREATE TRIGGER IF NOT EXISTS work_attempt_account_authority_guard
+BEFORE INSERT ON work_attempts
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM session_account_authorities AS authority
+  JOIN sessions AS s
+    ON s.id=authority.session_id AND s.profile_id=authority.profile_id
+  JOIN profiles AS p ON p.id=authority.profile_id
+  WHERE authority.session_id=NEW.worker_session_id
+    AND authority.profile_id=NEW.account_id
+    AND s.state IN ('active','idle')
+    AND p.state='signed_in'
+    AND p.process_generation=NEW.account_generation
+    AND authority.account_key IS NOT NULL
+    AND p.provider_email IS NOT NULL
+    AND authority.account_key=lower(trim(p.provider_email))
+)
+BEGIN SELECT RAISE(ABORT,'WORK_ATTEMPT_ACCOUNT_AUTHORITY_MISMATCH'); END;
+CREATE TRIGGER IF NOT EXISTS work_review_account_authority_guard
+BEFORE INSERT ON work_reviews
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM session_account_authorities AS a
+  JOIN sessions AS session ON session.id=a.session_id AND session.profile_id=a.profile_id
+  JOIN profiles AS p ON p.id=a.profile_id
+  WHERE a.session_id=NEW.reviewer_session_id
+    AND session.state IN ('active','idle')
+    AND p.state='signed_in'
+    AND a.account_key IS NOT NULL
+    AND p.provider_email IS NOT NULL
+    AND a.account_key=lower(trim(p.provider_email))
+)
+BEGIN SELECT RAISE(ABORT,'WORK_REVIEWER_AUTHORITY_MISMATCH'); END;
+CREATE TRIGGER IF NOT EXISTS work_signal_account_authority_guard
+BEFORE INSERT ON work_signals
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM session_account_authorities AS a
+  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
+  JOIN profiles AS p ON p.id=a.profile_id
+  WHERE a.session_id=NEW.from_session_id
+    AND s.state IN ('active','idle')
+    AND p.state='signed_in'
+    AND a.account_key IS NOT NULL
+    AND p.provider_email IS NOT NULL
+    AND a.account_key=lower(trim(p.provider_email))
+)
+OR NOT EXISTS (
+  SELECT 1
+  FROM session_account_authorities AS a
+  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
+  JOIN profiles AS p ON p.id=a.profile_id
+  WHERE a.session_id=NEW.to_session_id
+    AND s.state IN ('active','idle')
+    AND p.state='signed_in'
+    AND p.process_generation=NEW.target_account_generation
+    AND a.account_key IS NOT NULL
+    AND p.provider_email IS NOT NULL
+    AND a.account_key=lower(trim(p.provider_email))
+)
+BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_ACCOUNT_AUTHORITY_MISMATCH'); END;
+CREATE TRIGGER IF NOT EXISTS work_signal_ack_account_authority_guard
+BEFORE INSERT ON work_signal_receipts
+WHEN NEW.kind='ack' AND NOT EXISTS (
+  SELECT 1
+  FROM work_signals AS signal
+  JOIN session_account_authorities AS a ON a.session_id=signal.to_session_id
+  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
+  JOIN profiles AS p ON p.id=a.profile_id
+  WHERE signal.id=NEW.signal_id
+    AND signal.to_session_id=NEW.actor_session_id
+    AND s.state IN ('active','idle')
+    AND p.state='signed_in'
+    AND p.process_generation=signal.target_account_generation
+    AND a.account_key IS NOT NULL
+    AND p.provider_email IS NOT NULL
+    AND a.account_key=lower(trim(p.provider_email))
+)
+BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_ACK_ACCOUNT_AUTHORITY_MISMATCH'); END;
+`;
+
+const downgradeToExactLegacyAdoptionVersion36 = (database: Database): void => {
+  dropPostLegacyAdoptionVersion36Schema(database);
+  database.exec(`
+    DROP TRIGGER IF EXISTS work_attempt_account_authority_guard;
+    DROP TRIGGER IF EXISTS work_coordinator_account_authority_guard;
+    DROP TRIGGER IF EXISTS work_member_account_authority_guard;
+    DROP TRIGGER IF EXISTS work_review_account_authority_guard;
+    DROP TRIGGER IF EXISTS work_signal_account_authority_guard;
+    DROP TRIGGER IF EXISTS work_signal_ack_account_authority_guard;
+  `);
+  database.exec(legacyAdoptionWorkAuthorityGuards);
+  database.exec(`
+    DELETE FROM migrations WHERE version > 36;
+    PRAGMA user_version=36;
+  `);
+};
+
+const codexAdoptionRuntimeProfile = (
+  profile: Readonly<{ id: string; processGeneration: number }>,
+  preset: "low" | "high" | "ultra",
+  fast: boolean,
+) => ({
+  approvalPolicy: "on-request" as const,
+  computerUse: true as const,
+  enabledApps: [],
+  fast,
+  model: presetRequirements[preset].model,
+  observedAt: 2_000,
+  permissionProfile: ":workspace" as const,
+  pluginCapability: true as const,
+  preset,
+  processGeneration: profile.processGeneration,
+  profileId: profile.id,
+  reasoningEffort: presetRequirements[preset].effort,
+  reviewMode: "auto_review" as const,
+  serviceTier: fast ? "priority" as const : null,
+});
+
+const claudeAdoptionRuntimeProfile = (
+  authority: Readonly<{ profileId: string; processGeneration: number }>,
+) => ({
+  claudeVersion: "2.1.260",
+  configHome: "personal" as const,
+  inputFormat: "stream-json" as const,
+  model: presetRequirements["fable-max"].model,
+  observedAt: 2_000,
+  outputFormat: "stream-json" as const,
+  permissionMode: "default" as const,
+  preset: "fable-max" as const,
+  processGeneration: authority.processGeneration,
+  profileId: authority.profileId,
+  reasoningEffort: "max" as const,
+});
+
+const managedClaudeRuntimeProfile = (
+  authority: Readonly<{ profileId: string; processGeneration: number }>,
+) => ({
+  ...claudeAdoptionRuntimeProfile(authority),
+  configHome: "isolated" as const,
+});
+
+let personalClaudeSessionSequence = 0;
+const adoptPersonalClaudeTestSession = (
+  store: StateStore,
+  profile: Readonly<{ id: string; processGeneration: number }>,
+) => {
+  personalClaudeSessionSequence += 1;
+  const providerThreadId = `personal-claude-thread-${personalClaudeSessionSequence}`;
+  const processIdentity = {
+    pid: 60_000 + personalClaudeSessionSequence,
+    pidDomain: "darwin" as const,
+    procStart: `personal-claude-process-${personalClaudeSessionSequence}`,
+  };
+  const candidate = store.upsertSessionAdoptionCandidate({
+    provider: "claude",
+    providerThreadId,
+    title: `Personal Claude session ${personalClaudeSessionSequence}`,
+    state: "idle",
+    providerUpdatedAt: 10,
+    liveness: "not_live",
+    sourceProcessIdentity: processIdentity,
+  });
+  store.fenceSessionAdoptionCandidateForClaim({
+    provider: "claude",
+    providerThreadId,
+    expectedRevision: candidate.revision,
+  });
+  store.recordClaimedClaudeProcessAuthority({
+    providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+    providerThreadId,
+    profileId: profile.id,
+    profileGeneration: profile.processGeneration,
+    runtimeScope: "personal",
+    identity: processIdentity,
+  });
+  const claimed = store.listSessionAdoptionCandidates({ provider: "claude" })
+    .find((current) => current.providerThreadId === providerThreadId);
+  if (claimed === undefined) throw new Error("Expected claimed personal Claude candidate.");
+  return store.adoptSessionCandidate({
+    providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+    provider: "claude",
+    providerThreadId,
+    expectedCandidateRevision: claimed.revision,
+    profileId: profile.id,
+    profileGeneration: profile.processGeneration,
+    preset: "fable-max",
+    requirement: presetRequirements["fable-max"],
+    fastEnabled: false,
+    runtimeProfile: claudeAdoptionRuntimeProfile(store.requireProviderAccountAuthority(profile.id, "claude")),
+    providerAccountKey: testProviderAccountKey("claude"),
+    claudeProcessIdentity: processIdentity,
+  }).session;
+};
 
 const startInputFixtureDaemon = (store: StateStore) => {
   const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
@@ -121,6 +810,10 @@ const dropAutomaticUsagePolicySchema = (database: Database): void => {
 };
 
 function dropAttachmentCustodySchema(database: Database): void {
+  // Combined v49 proof guards must disappear before SQLite rebuilds their
+  // parent tables; canonical adoption-v40 rows remain untouched here.
+  dropSessionSwitchAdoptionSchema(database);
+  dropClaudeProcessCustodySchema(database);
   for (const type of ["trigger", "index"] as const) {
     for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) if (object.type === type) database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
   }
@@ -129,7 +822,7 @@ function dropAttachmentCustodySchema(database: Database): void {
     if (name !== undefined && database.query("SELECT 1 FROM pragma_table_info('mutation_attempts') WHERE name=?").get(name) !== null) database.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${name}`);
   }
   for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) if (object.type === "table") database.exec(`DROP TABLE IF EXISTS ${object.name}`);
-  database.exec("DELETE FROM migrations WHERE version=48");
+  database.exec("DELETE FROM migrations WHERE version=49");
 }
 
 function dropSessionSendOwnerSchema(database: Database): void {
@@ -140,13 +833,13 @@ function dropSessionSendOwnerSchema(database: Database): void {
   for (const type of ["index", "table"] as const) {
     for (const object of [...QUEUE_ATTACHMENT_SCHEMA_OBJECTS].reverse()) if (object.type === type) database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
   }
-  database.exec("DELETE FROM migrations WHERE version=47");
+  database.exec("DELETE FROM migrations WHERE version=48");
   for (const type of ["trigger", "index", "table"] as const) {
     for (const object of [...AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS].reverse()) {
       if (object.type === type) database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
     }
   }
-  database.exec("DELETE FROM migrations WHERE version=46");
+  database.exec("DELETE FROM migrations WHERE version=47");
   for (const type of ["trigger", "index", "table"] as const) {
     for (const object of [...SESSION_SEND_OWNER_SCHEMA_OBJECTS].reverse()) {
       if (object.type === type) database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
@@ -208,7 +901,7 @@ describe("automatic usage policy configuration", () => {
     try {
       const baseline = unrelatedRows(database);
       expect(store.readAutomaticUsagePolicyConfiguration()).toEqual(initialAutomaticUsagePolicyConfiguration());
-      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       const request = command();
       expect(store.updateAutomaticUsagePolicyConfiguration(request)).toEqual({
         ...initialAutomaticUsagePolicyConfiguration(), defaultEnabled: false, automaticPolicyRevision: 2,
@@ -369,7 +1062,7 @@ describe("automatic usage policy configuration", () => {
       expect(() => store.updateAutomaticUsagePolicyConfiguration(request)).toThrow();
       expect(() => new StateStore(pathsFor(home), { readonly: true })).toThrow();
       expect(() => new StateStore(pathsFor(home))).toThrow();
-      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     } finally { database.close(false); }
   });
 
@@ -445,43 +1138,57 @@ describe("automatic usage policy configuration", () => {
     } finally { database.close(false); }
   });
 
-  test.each([false, true])("upgrades exact v42 or a valid partial v43 without rewriting prior state (partial=%s)", async (partial) => {
+  test.each([false, true])("refuses unsupported intermediate v43 or partial v44 without rewriting prior state (partial=%s)", async (partial) => {
     const { store, home } = await fixture();
     seedUnrelatedState(store);
-    const configured = partial ? store.updateAutomaticUsagePolicyConfiguration(command()) : initialAutomaticUsagePolicyConfiguration();
+    if (partial) store.updateAutomaticUsagePolicyConfiguration(command());
     const database = inspect(home);
     try {
-      const baseline = unrelatedRows(database);
+      const beforeDowngrade = unrelatedRows(database);
       if (!partial) dropAutomaticUsagePolicySchema(database);
       else {
         dropSessionSendOwnerSchema(database);
         database.exec("DROP TRIGGER automatic_usage_policy_immutable_update");
       }
-      database.exec("DELETE FROM migrations WHERE version>=43; PRAGMA user_version=42");
-      expect(() => new StateStore(pathsFor(home), { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:48");
-      const migrated = reopen(home);
-      expect(migrated.readAutomaticUsagePolicyConfiguration()).toEqual(configured);
+      database.exec("DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
+      const baseline = unrelatedRows(database);
+      expect(baseline.filter(([, rows]) => Array.isArray(rows) && rows.length > 0))
+        .toEqual(beforeDowngrade.filter(([, rows]) => Array.isArray(rows) && rows.length > 0));
+      const beforeAdmission = {
+        schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+        migrations: database.query("SELECT * FROM migrations ORDER BY version").all(),
+        policy: partial ? database.query("SELECT * FROM automatic_usage_policy_revisions ORDER BY automatic_policy_revision").all() : null,
+      };
+      expect(() => new StateStore(pathsFor(home), { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:43:49");
+      // Only the archived private48 checkpoint is admitted by the bridge.
+      // An intermediate restamp must not gain repair authority from its number.
+      expect(() => reopen(home)).toThrow("STATE_SCHEMA_COHORT_UNSUPPORTED:43");
       expect(unrelatedRows(database)).toEqual(baseline);
-      expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=43").get()).toEqual({ count: 1 });
-      expect(reopen(home).readAutomaticUsagePolicyConfiguration()).toEqual(configured);
+      expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=44").get()).toEqual({ count: 0 });
+      expect(() => reopen(home)).toThrow("STATE_SCHEMA_COHORT_UNSUPPORTED:43");
+      expect({
+        schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+        migrations: database.query("SELECT * FROM migrations ORDER BY version").all(),
+        policy: partial ? database.query("SELECT * FROM automatic_usage_policy_revisions ORDER BY automatic_policy_revision").all() : null,
+      }).toEqual(beforeAdmission);
     } finally { database.close(false); }
   });
 
-  test("refuses a malformed partial v43 schema and rolls back its migration stamp", async () => {
+  test("refuses a malformed partial v44 schema and rolls back its migration stamp", async () => {
     const { home } = await fixture();
     const database = inspect(home);
     try {
       dropAutomaticUsagePolicySchema(database);
       database.exec(`CREATE TABLE automatic_usage_policy_revisions(automatic_policy_revision INTEGER PRIMARY KEY);
-        DELETE FROM migrations WHERE version>=43; PRAGMA user_version=42`);
+        DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43`);
       expect(() => new StateStore(pathsFor(home))).toThrow();
-      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
-      expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=43").get()).toEqual({ count: 0 });
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
+      expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=44").get()).toEqual({ count: 0 });
       expect(database.query("SELECT COUNT(*) AS count FROM automatic_usage_policy_revisions").get()).toEqual({ count: 0 });
     } finally { database.close(false); }
   });
 
-  test.each([false, true])("rolls back migration genesis after an interrupted partial authority (retained receipt=%s)", async (retainedReceipt) => {
+  test.each([false, true])("refuses interrupted intermediate v43 configuration authority without repair (retained receipt=%s)", async (retainedReceipt) => {
     const { store, home } = await fixture();
     if (retainedReceipt) store.updateAutomaticUsagePolicyConfiguration(command());
     const database = inspect(home);
@@ -489,17 +1196,28 @@ describe("automatic usage policy configuration", () => {
       const original = (database.query("SELECT sql FROM sqlite_master WHERE name='automatic_usage_policy_immutable_delete'").get() as { sql: string }).sql;
       database.exec("DROP TRIGGER automatic_usage_policy_immutable_delete; DELETE FROM automatic_usage_policy_revisions");
       database.exec(original);
-      dropAttachmentCustodySchema(database);
-      database.exec("DELETE FROM migrations WHERE version>=43; PRAGMA user_version=42");
+      dropSessionSendOwnerSchema(database);
+      database.exec("DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
       if (!retainedReceipt) database.exec(`CREATE TRIGGER test_policy_migration_fault AFTER INSERT ON automatic_usage_policy_revisions
         BEGIN SELECT RAISE(ABORT,'migration fixture fault'); END`);
-      expect(() => new StateStore(pathsFor(home))).toThrow(retainedReceipt ? "AUTOMATIC_USAGE_POLICY_INVALID" : "migration fixture fault");
-      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      const snapshot = () => ({
+        schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+        rows: unrelatedRows(database),
+        mutations: database.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
+        policy: database.query("SELECT * FROM automatic_usage_policy_revisions ORDER BY automatic_policy_revision").all(),
+        migrations: database.query("SELECT * FROM migrations ORDER BY version").all(),
+      });
+      const beforeAdmission = snapshot();
+      expect(() => new StateStore(pathsFor(home))).toThrow("STATE_SCHEMA_COHORT_UNSUPPORTED:43");
+      expect(snapshot()).toEqual(beforeAdmission);
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
       expect(database.query("SELECT COUNT(*) AS count FROM automatic_usage_policy_revisions").get()).toEqual({ count: 0 });
-      expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=43").get()).toEqual({ count: 0 });
+      expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=44").get()).toEqual({ count: 0 });
       if (!retainedReceipt) {
         database.exec("DROP TRIGGER test_policy_migration_fault");
-        expect(reopen(home).readAutomaticUsagePolicyConfiguration()).toEqual(initialAutomaticUsagePolicyConfiguration());
+        const withoutInjectedFault = snapshot();
+        expect(() => reopen(home)).toThrow("STATE_SCHEMA_COHORT_UNSUPPORTED:43");
+        expect(snapshot()).toEqual(withoutInjectedFault);
       }
     } finally { database.close(false); }
   });
@@ -522,7 +1240,6 @@ const dropProviderAuthorityObjectsForLegacyFeatureFixture = (database: Database)
   dropAttachmentCustodySchema(database);
   database.exec(`
     PRAGMA foreign_keys=OFF;
-    DROP TABLE session_mutation_authority_rebinds_v39;
     DROP TABLE session_provider_switch_source_releases;
     DROP TABLE session_provider_switch_seed_results;
     DROP TABLE session_provider_switch_seed_intents;
@@ -531,6 +1248,10 @@ const dropProviderAuthorityObjectsForLegacyFeatureFixture = (database: Database)
     DROP TABLE session_mutation_authority_rebinds;
     PRAGMA foreign_keys=ON;
   `);
+};
+
+const dropProviderSwitchVersion35Objects = (database: Database): void => {
+  dropProviderAuthorityObjectsForLegacyFeatureFixture(database);
 };
 
 const providerSwitchSchemaObjectCount = (database: Database): number =>
@@ -544,7 +1265,7 @@ const replaceAutorespondEvidenceWithVersion30Fixture = (
   database: Database,
   sessionId: string,
 ): void => {
-  dropAttachmentCustodySchema(database);
+  dropSchemaAfterVersion34(database);
   database.query("DROP TABLE IF EXISTS autorespond_message_sources").run();
   database.query("DROP TABLE IF EXISTS autorespond_evidence_next").run();
   database.query("DROP TABLE autorespond_evidence").run();
@@ -744,6 +1465,32 @@ const reviewedClaudeProfile = (
 const sessionSwitchDigest = (value: unknown): string =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
+// Corrupt the intended row, not the schema cohort. Reopen must still inspect
+// the exact installed guards rather than repair a fixture's missing trigger.
+const restoreSwitchGuardsForTest = (database: Database, names: readonly string[]) => {
+  const definitions = names.map((name) => z.object({ sql: z.string() }).strict().parse(
+    database.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(name),
+  ).sql);
+  return () => {
+    for (const definition of definitions) database.exec(definition);
+  };
+};
+
+const snapshotSwitchContainmentForTest = (database: Database) => {
+  const tables = z.object({ name: z.string().regex(/^[a-z0-9_]+$/u) }).strict().array().parse(
+    database.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all(),
+  );
+  return {
+    schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+    version: database.query("PRAGMA user_version").get(),
+    rows: tables.map(({ name }) => {
+      const rows = database.query(`SELECT * FROM ${name} ORDER BY rowid LIMIT 201`).all();
+      if (rows.length > 200) throw new Error("Containment refusal fixture exceeded its row bound.");
+      return { name, rows };
+    }),
+  };
+};
+
 type SignedInTestProfile = ReturnType<typeof signInProfile>;
 
 const prepareDedicatedSessionSwitch = (
@@ -766,16 +1513,13 @@ const prepareDedicatedSessionSwitch = (
   const targetPreset = options.targetPreset ?? "low";
   const sourceAuthority = store.requireProviderAccountAuthority(sourceProfile.id, "codex");
   const targetAuthority = store.requireProviderAccountAuthority(targetProfile.id, "codex");
-  const created = store.createSession({
+  const targetAccountKey = providerAccountKeyForProfile(store, targetProfile.id, "codex");
+  const session = upsertProvenTestSession(store, {
     profileId: sourceProfile.id,
     provider: "codex",
     preset: "high",
     fastEnabled: false,
     title: `Switch ${sequence}`,
-  });
-  const session = store.bindSession({
-    sessionId: created.id,
-    expectedRevision: created.revision,
     providerThreadId: `source-thread-${sequence}`,
     providerUpdatedAt: 10 + sequence,
     state: "idle",
@@ -784,10 +1528,16 @@ const prepareDedicatedSessionSwitch = (
     sessionId: session.id,
     sourceKind: "session_start",
     sourceId: `10000000-0000-4000-8000-${suffix}`,
-    profile: reviewedCodexProfile({
-      id: sourceProfile.id,
-      processGeneration: sourceAuthority.processGeneration,
-    }, 2_000 + sequence),
+    // Provider import deliberately preserves the released preset contract.
+    // The source observation must describe that exact model; only the new
+    // switch target selects the current preset contract below.
+    profile: effectiveRuntimeProfileSchema.parse({
+      ...reviewedCodexProfile({
+        id: sourceProfile.id,
+        processGeneration: sourceAuthority.processGeneration,
+      }, 2_000 + sequence),
+      model: store.requireSessionPresetRequirement(session.id).requirement.model,
+    }),
     providerAuthority: sourceAuthority,
   });
   if (options.pinSourceEvent === true) {
@@ -812,6 +1562,7 @@ const prepareDedicatedSessionSwitch = (
     .update(seedText, "utf8")
     .digest("hex");
   const prepared = store.prepareSessionSwitch({
+    targetAccountKey,
     idempotencyKey: `20000000-0000-4000-8000-${suffix}`,
     rawRequest: {
       session: session.id,
@@ -856,6 +1607,7 @@ const prepareDedicatedSessionSwitch = (
   } as const;
   return {
     ...prepared,
+    targetAccountKey,
     cas,
     pendingQueue,
     seedText,
@@ -1013,7 +1765,7 @@ const desktopSwitchBinding = (plan: Readonly<{
   targetProviderAuthority: plan.targetProviderAuthority,
 });
 
-const schemaVersion40Tables = [
+const schemaVersion41Tables = [
   "work_signal_provider_authorities",
   "account_rate_limit_reset_provider_authorities",
   "session_event_provider_authorities",
@@ -1028,14 +1780,14 @@ const schemaVersion40Tables = [
   "provider_accounts",
 ] as const;
 
-const schemaVersion41ProviderUsageTables = [
+const schemaVersion42ProviderUsageTables = [
   "provider_usage_observation_components",
   "provider_usage_prune_targets",
   "provider_usage_observation_receipts",
   "codex_usage_authority_prune_targets",
 ] as const;
 
-const schemaVersion42SessionSwitchTables = [
+const schemaVersion43SessionSwitchTables = [
   "session_switch_seed_anchors",
   "session_switch_rebind_anchors",
   "session_switch_target_start_anchors",
@@ -1058,6 +1810,7 @@ const schemaVersion42SessionSwitchTables = [
 ] as const;
 
 const dropDedicatedSessionSwitchSchema = (database: Database): void => {
+  dropSessionSwitchAdoptionSchema(database);
   const switchTriggers = database.query(
     `SELECT name FROM sqlite_schema
      WHERE type='trigger' AND name GLOB 'session_switch_*'
@@ -1069,12 +1822,12 @@ const dropDedicatedSessionSwitchSchema = (database: Database): void => {
     }
     database.exec(`DROP TRIGGER "${name}"`);
   }
-  for (const table of schemaVersion42SessionSwitchTables) {
+  for (const table of schemaVersion43SessionSwitchTables) {
     database.exec(`DROP TABLE IF EXISTS ${table}`);
   }
 };
 
-const downgradeProviderAccountsToReleasedVersion = (database: Database, targetVersion: 38 | 39 = 38): void => {
+const downgradeProviderAccountsToReleasedVersion = (database: Database, targetVersion: 38 | 39 | 40 = 38): void => {
   database.exec("PRAGMA foreign_keys=OFF");
   try {
     database.exec(`DROP TRIGGER IF EXISTS devin_joined_close_successor_guard;
@@ -1084,6 +1837,12 @@ const downgradeProviderAccountsToReleasedVersion = (database: Database, targetVe
       DROP TABLE IF EXISTS devin_joined_close_snapshots;
       DROP TABLE IF EXISTS devin_joined_close_intents;`);
     dropAutomaticUsagePolicySchema(database);
+    if (targetVersion < 40) {
+      dropSessionAdoptionSchema(database);
+      if (database.query("SELECT 1 FROM pragma_table_info('profiles') WHERE name='codex_account_key'").get() !== null) {
+        database.exec("ALTER TABLE profiles DROP COLUMN codex_account_key");
+      }
+    }
     dropDedicatedSessionSwitchSchema(database);
     database.exec(`
       DROP TRIGGER IF EXISTS mutation_transition_guard;
@@ -1102,10 +1861,10 @@ const downgradeProviderAccountsToReleasedVersion = (database: Database, targetVe
       DROP TRIGGER IF EXISTS usage_poll_failures_prune_authority;
       DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_prune_authority;
     `);
-    for (const table of schemaVersion41ProviderUsageTables) {
+    for (const table of schemaVersion42ProviderUsageTables) {
       database.exec(`DROP TABLE IF EXISTS ${table}`);
     }
-    for (const table of schemaVersion40Tables) {
+    for (const table of schemaVersion41Tables) {
       database.exec(`DROP TABLE IF EXISTS ${table}`);
     }
     if (targetVersion === 38) {
@@ -1175,30 +1934,6 @@ const downgradeProviderAccountsToReleasedVersion = (database: Database, targetVe
   }
 };
 
-const downgradeProviderUsageSchemaToVersion40 = (database: Database): void => {
-  database.exec("PRAGMA foreign_keys=OFF");
-  try {
-    dropAutomaticUsagePolicySchema(database);
-    dropDedicatedSessionSwitchSchema(database);
-    database.exec(`
-      DROP TRIGGER IF EXISTS account_scoped_provider_authorities_insert_guard;
-      DROP TRIGGER IF EXISTS account_scoped_provider_authorities_immutable_update;
-      DROP TRIGGER IF EXISTS account_scoped_provider_authorities_immutable_delete;
-      DROP TRIGGER IF EXISTS usage_snapshots_prune_authority;
-      DROP TRIGGER IF EXISTS usage_poll_failures_prune_authority;
-      DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_prune_authority;
-      DROP TRIGGER IF EXISTS usage_snapshots_immutable_update;
-      DROP TRIGGER IF EXISTS usage_poll_failures_immutable_update;
-      DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_immutable_update;
-    `);
-    for (const table of schemaVersion41ProviderUsageTables) {
-      database.exec(`DROP TABLE IF EXISTS ${table}`);
-    }
-    database.exec("DELETE FROM migrations WHERE version>=41; PRAGMA user_version=40");
-  } finally {
-    database.exec("PRAGMA foreign_keys=ON");
-  }
-};
 function admitRestartCommandInteraction(
   store: StateStore,
   input: Readonly<{
@@ -1576,7 +2311,7 @@ function seedLegacyMcpUrlInteraction(input: Readonly<{
   sessionId: string;
 }>): void {
   const legacy = new Database(input.paths.database, { create: false, strict: true });
-  downgradeProviderAccountsToReleasedVersion(legacy);
+  dropSchemaAfterVersion34(legacy);
   legacy.exec(`
     DROP TRIGGER IF EXISTS provider_interactions_mcp_url_guard_insert;
     DROP TRIGGER IF EXISTS provider_interactions_mcp_url_guard_update;
@@ -1643,12 +2378,12 @@ function seedLegacyPermissionValueInteraction(input: Readonly<{
   sessionId: string;
 }>): void {
   const legacy = new Database(input.paths.database, { create: false, strict: true });
-  downgradeProviderAccountsToReleasedVersion(legacy);
+  dropSchemaAfterVersion34(legacy);
   legacy.exec(`
     PRAGMA secure_delete=OFF;
     DROP TRIGGER IF EXISTS provider_interactions_permission_value_guard_insert;
     DROP TRIGGER IF EXISTS provider_interactions_permission_value_guard_update;
-    DELETE FROM migrations WHERE version=15;
+    DELETE FROM migrations WHERE version>14;
     PRAGMA user_version=14;
   `);
   const legacyPrivatePath = ["", "Users", "alice", "private"].join("/");
@@ -1930,6 +2665,10 @@ describe("StateStore", () => {
 
   test("original send ownership bounds unclaimed requests without making them account execution blockers", async () => {
     const value = await ownedSendFixture("claude");
+    value.store.bindSessionProviderAccountAuthority({
+      sessionId: value.session.id, provider: "claude", runtimeScope: "managed",
+      accountKey: testProviderAccountKey("claude"),
+    });
     for (let index = 1; index < 64; index += 1) value.store.prepareOwnedSessionSend({ ...value.request, idempotencyKey: randomUUID() });
     expect(() => value.store.prepareOwnedSessionSend({ ...value.request, idempotencyKey: randomUUID() })).toThrow("SESSION_SEND_OWNER_LIMIT");
     expect(value.store.listUnsettledMutations({ sessionId: value.session.id })).toEqual([]);
@@ -1991,23 +2730,23 @@ describe("StateStore", () => {
     } finally { database.close(false); }
   });
 
-  test("original send ownership migration 45 preserves legacy receipt bytes without fabricating ownership", async () => {
-    const { store } = await fixture();
-    const request = { kind: "legacy.test", authorityId: "legacy-authority", authorityGeneration: 1,
-      request: { value: "unchanged" }, idempotencyKey: randomUUID() };
-    const attempt = store.prepareMutation(request);
-    store.transitionMutation(attempt.id, "prepared", "effect_started");
-    store.transitionMutation(attempt.id, "effect_started", "applied", { exact: "legacy receipt" });
-    const database = new Database(store.paths.database, { strict: true });
+  test("original send ownership preserves authentic canonical40 receipt bytes without fabricating ownership", async () => {
+    const paths = await canonical40QueueArchive();
+    const { mutation, request, receipt } = canonical40QueuesFixture.legacy;
+    const database = new Database(paths.database, { strict: true });
     try {
-      const before = database.query("SELECT id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,result_json,created_at,updated_at FROM mutation_attempts WHERE id=?").get(attempt.id);
-      dropSessionSendOwnerSchema(database);
-      database.exec("DELETE FROM migrations WHERE version=45; PRAGMA user_version=44");
-      const upgraded = new StateStore(store.paths);
+      const readLegacy = () => database.query("SELECT id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,result_json,created_at,updated_at FROM mutation_attempts WHERE id=?").get(mutation.id);
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(readLegacy()).toEqual(mutation);
+      const ledger = database.query("SELECT * FROM migrations ORDER BY version").all();
+      const upgraded = new StateStore(paths);
       stores.push(upgraded);
-      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
-      expect(database.query("SELECT id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,result_json,created_at,updated_at FROM mutation_attempts WHERE id=?").get(attempt.id)).toEqual(before);
-      expect(upgraded.prepareMutation(request)).toMatchObject({ replay: true, state: "applied", result: { exact: "legacy receipt" } });
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(database.query("SELECT * FROM migrations WHERE version<=40 ORDER BY version").all()).toEqual(ledger);
+      expect(readLegacy()).toEqual(mutation);
+      expect(upgraded.prepareMutation({ kind: mutation.kind, authorityId: mutation.authority_id,
+        authorityGeneration: mutation.authority_generation, request, idempotencyKey: mutation.idempotency_key }))
+        .toMatchObject({ replay: true, state: "applied", result: receipt });
       expect(database.query("SELECT COUNT(*) AS count FROM session_send_owners").get()).toEqual({ count: 0 });
     } finally { database.close(false); }
   });
@@ -2153,7 +2892,7 @@ describe("StateStore", () => {
         expect(() => value.store.requireCapturedSessionProviderAuthority(value.session.id)).toThrow();
         expect(() => new StateStore(value.store.paths, { readonly: true })).toThrow();
         expect(() => new StateStore(value.store.paths)).toThrow();
-        expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+        expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       } finally { database.close(false); }
     },
   );
@@ -2299,34 +3038,29 @@ describe("StateStore", () => {
     expect(value.store.requireProviderAccountAuthority(value.profile.id, "devin")).toEqual(value.authority);
   });
 
-  test("Devin joined close migration preserves version 43 history without manufacturing a close receipt", async () => {
-    const value = await devinCloseFixture();
-    const original = value.store.requireCapturedSessionProviderAuthority(value.session.id);
-    const runtime = value.store.latestSessionRuntimeProfile(value.session.id);
-    value.store.close();
-    const database = new Database(value.store.paths.database, { create: false, strict: true });
-    try {
-      database.exec("PRAGMA foreign_keys=OFF");
-      database.exec("DROP TRIGGER devin_joined_close_successor_guard");
-      dropAttachmentCustodySchema(database);
-      for (const suffix of ["consumptions", "anchors", "receipts", "snapshots", "intents"]) database.exec(`DROP TABLE devin_joined_close_${suffix}`);
-      database.exec("DELETE FROM migrations WHERE version>=44");
-      database.exec("PRAGMA user_version=43");
-    } finally { database.close(false); }
-    const migrated = new StateStore(value.store.paths);
+  test("Devin joined close preserves authentic canonical40 history without manufacturing a close receipt", async () => {
+    const paths = await canonical40QueueArchive();
+    const session = canonical40QueuesFixture.devin;
+    const migrated = new StateStore(paths);
     stores.push(migrated);
-    expect(migrated.requireCapturedSessionProviderAuthority(value.session.id)).toEqual(original);
-    expect(migrated.latestSessionRuntimeProfile(value.session.id)).toEqual(runtime);
-    expect(migrated.requireProviderAccountAuthority(value.profile.id, "devin")).toEqual(value.authority);
+    expect(migrated.requireSession(session.id)).toEqual(session);
+    expect(() => migrated.requireCapturedSessionProviderAuthority(session.id))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+    const authority = migrated.requireProviderAccountAuthority(session.profileId, "devin");
+    expect(migrated.latestSessionRuntimeProfile(session.id)).toBeNull();
     const inspector = new Database(migrated.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query("SELECT COUNT(*) AS count FROM devin_joined_close_intents").get()).toEqual({ count: 0 });
       expect(inspector.query("SELECT COUNT(*) AS count FROM devin_joined_close_receipts").get()).toEqual({ count: 0 });
+      expect(inspector.query("SELECT * FROM session_provider_authorities WHERE session_id=?").all(session.id)).toEqual([]);
+      expect(inspector.query("SELECT * FROM session_provider_authority_successors WHERE session_id=?").all(session.id)).toEqual([]);
     } finally { inspector.close(false); }
     migrated.nextDaemonGeneration(`boot_${"6".repeat(32)}`);
-    expect(migrated.requireSession(value.session.id).state).toBe("recovery_required");
-    expect(migrated.requireCapturedSessionProviderAuthority(value.session.id)).toEqual(original);
+    expect(migrated.requireSession(session.id).state).toBe("recovery_required");
+    expect(() => migrated.requireCapturedSessionProviderAuthority(session.id))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+    expect(migrated.requireProviderAccountAuthority(session.profileId, "devin")).toEqual(authority);
   });
 
   test("Devin joined close requires positive boot proof even when a foreground grant preserves the numeric generation", async () => {
@@ -2444,6 +3178,7 @@ describe("StateStore", () => {
       sourcePreset: baseline.switch.sourcePreset,
       sourcePresetContract: baseline.switch.sourcePresetContract,
       targetPreset: "fable-max",
+      targetAccountKey: testProviderAccountKey("claude"),
       targetPresetContract: currentPresetContract,
       sourceRuntimeProfileRevision: baseline.switch.sourceRuntimeProfileRevision,
       transcript: baseline.switch.transcript,
@@ -2466,7 +3201,11 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const prepared = prepareDedicatedSessionSwitch(store, 701);
     expect(prepared.status).toBe("prepared");
+    expect(prepared.switch.sourcePresetContract).toBe(legacyPresetContract);
+    expect(store.latestSessionRuntimeProfile(prepared.session.id)?.profile.model).toBe("gpt-5.6-sol");
+    expect(prepared.switch.targetPresetContract).toBe(currentPresetContract);
     expect(store.prepareSessionSwitch({
+      targetAccountKey: prepared.targetAccountKey,
       idempotencyKey: prepared.switch.idempotencyKey,
       rawRequest: prepared.switch.rawRequest,
       sessionId: prepared.switch.sessionId,
@@ -3274,6 +4013,12 @@ describe("StateStore", () => {
       stores.splice(stores.indexOf(store), 1);
 
       const corrupt = new Database(paths.database, { create: false, strict: true });
+      const restoreGuard = restoreSwitchGuardsForTest(corrupt, [
+        phase === "failed" ? "session_switch_no_effect_receipts_immutable_update"
+          : phase === "seed_settled" ? "session_switch_seed_receipts_immutable_update"
+            : phase === "abandoned" ? "session_switch_abandon_receipts_immutable_update"
+              : "session_switch_plan_anchors_immutable_update",
+      ]);
       try {
         if (phase === "failed") {
           corrupt.exec("DROP TRIGGER session_switch_no_effect_receipts_immutable_update");
@@ -3299,6 +4044,7 @@ describe("StateStore", () => {
           ).run("f".repeat(64), prepared.switch.attemptId);
         }
       } finally {
+        restoreGuard();
         corrupt.close(false);
       }
 
@@ -3388,13 +4134,17 @@ describe("StateStore", () => {
       store.close();
       stores.splice(stores.indexOf(store), 1);
       const corrupt = new Database(paths.database, { create: false, strict: true });
+      const restoreGuard = restoreSwitchGuardsForTest(corrupt, [
+        "session_switch_attempts_immutable_update", "session_switch_adoption_parent_update",
+      ]);
       try {
-        corrupt.exec("DROP TRIGGER session_switch_attempts_immutable_update");
+        corrupt.exec("DROP TRIGGER session_switch_attempts_immutable_update; DROP TRIGGER session_switch_adoption_parent_update");
         corrupt.query(
           `UPDATE session_switch_attempts SET ${changedField}=${changedField}+1 WHERE attempt_id=?`,
         ).run(prepared.switch.attemptId);
         expect(corrupt.query("PRAGMA foreign_key_check").all()).toEqual([]);
       } finally {
+        restoreGuard();
         corrupt.close(false);
       }
 
@@ -3445,13 +4195,17 @@ describe("StateStore", () => {
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const corrupt = new Database(paths.database, { create: false, strict: true });
+    const restoreGuard = restoreSwitchGuardsForTest(corrupt, [
+      "session_switch_attempts_immutable_update", "session_switch_adoption_parent_update",
+    ]);
     try {
-      corrupt.exec("DROP TRIGGER session_switch_attempts_immutable_update");
+      corrupt.exec("DROP TRIGGER session_switch_attempts_immutable_update; DROP TRIGGER session_switch_adoption_parent_update");
       corrupt.query(
         "UPDATE session_switch_attempts SET session_id=? WHERE attempt_id=?",
       ).run(unrelated.session.id, prepared.switch.attemptId);
       expect(corrupt.query("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
+      restoreGuard();
       corrupt.close(false);
     }
 
@@ -3506,12 +4260,14 @@ describe("StateStore", () => {
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const corrupt = new Database(paths.database, { create: false, strict: true });
+    const restoreGuard = restoreSwitchGuardsForTest(corrupt, ["session_switch_plan_anchors_immutable_update"]);
     try {
       corrupt.exec("DROP TRIGGER session_switch_plan_anchors_immutable_update");
       corrupt.query(
         "UPDATE session_switch_plan_anchors SET plan_digest=? WHERE attempt_id=?",
       ).run("f".repeat(64), prepared.switch.attemptId);
     } finally {
+      restoreGuard();
       corrupt.close(false);
     }
 
@@ -3522,6 +4278,7 @@ describe("StateStore", () => {
       .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
     expect(reopened.readSessionSwitchForRecovery(prepared.session.id)).toBeNull();
     const next = reopened.prepareSessionSwitch({
+      targetAccountKey: prepared.targetAccountKey,
       idempotencyKey: "20000000-0000-4000-8000-000000000774",
       rawRequest: prepared.switch.rawRequest,
       sessionId: prepared.session.id,
@@ -3575,6 +4332,7 @@ describe("StateStore", () => {
     store.cancelPreparedSessionSwitch(prepared.cas);
     const repeat = (idempotencyKey: string) => {
       const repeated = store.prepareSessionSwitch({
+        targetAccountKey: prepared.targetAccountKey,
         idempotencyKey,
         rawRequest: prepared.switch.rawRequest,
         sessionId: prepared.switch.sessionId,
@@ -3602,10 +4360,15 @@ describe("StateStore", () => {
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const corrupt = new Database(paths.database, { create: false, strict: true });
+    const restoreGuard = restoreSwitchGuardsForTest(corrupt, [
+      "session_switch_attempts_immutable_update", "session_switch_plan_anchors_immutable_update",
+      "session_switch_adoption_parent_update",
+    ]);
     try {
       corrupt.exec(`
         DROP TRIGGER session_switch_attempts_immutable_update;
         DROP TRIGGER session_switch_plan_anchors_immutable_update;
+        DROP TRIGGER session_switch_adoption_parent_update;
       `);
       corrupt.query(
         "UPDATE session_switch_attempts SET request_digest=? WHERE attempt_id=?",
@@ -3614,6 +4377,7 @@ describe("StateStore", () => {
         "UPDATE session_switch_plan_anchors SET plan_digest=? WHERE attempt_id=?",
       ).run("f".repeat(64), second.attemptId);
     } finally {
+      restoreGuard();
       corrupt.close(false);
     }
     const reopened = new StateStore(paths, { now: () => 9_600 });
@@ -3942,6 +4706,11 @@ describe("StateStore", () => {
     advanceDedicatedSessionSwitch(store, importRace, "target_started");
     expect(() => store.upsertProviderSession({
       providerAuthority: importRace.cas.targetAuthority,
+      providerAccountKey: importRace.targetAccountKey,
+      profileId: importRace.cas.targetAuthority.profileId,
+      provider: importRace.cas.targetAuthority.provider,
+      preset: importRace.switch.targetPreset,
+      fastEnabled: false,
       providerThreadId: importRace.targetThreadId,
       title: "Imported while target is reserved",
       state: "idle",
@@ -4222,17 +4991,22 @@ describe("StateStore", () => {
     const prepared = prepareDedicatedSessionSwitch(store, 727);
     const malformedAttemptId = `attempt_${"a".repeat(31)}g`;
     const database = new Database(store.paths.database, { create: false, strict: true });
+    const restoreGuard = restoreSwitchGuardsForTest(database, [
+      "session_switch_attempt_id_repair_guard", "session_switch_adoption_parent_update",
+    ]);
     try {
       database.exec(`
         PRAGMA foreign_keys=OFF;
         PRAGMA ignore_check_constraints=ON;
         DROP TRIGGER session_switch_attempt_id_repair_guard;
+        DROP TRIGGER session_switch_adoption_parent_update;
       `);
       database.query(
         "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
       ).run(malformedAttemptId, prepared.switch.attemptId);
       database.exec("PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;");
     } finally {
+      restoreGuard();
       database.close(false);
     }
 
@@ -4267,17 +5041,22 @@ describe("StateStore", () => {
     advanceDedicatedSessionSwitch(store, unrelated, "target_starting");
     const corruptAttemptId = (attemptId: string, replacement: string) => {
       const database = new Database(store.paths.database, { create: false, strict: true });
+      const restoreGuard = restoreSwitchGuardsForTest(database, [
+        "session_switch_attempt_id_repair_guard", "session_switch_adoption_parent_update",
+      ]);
       try {
         database.exec(`
           PRAGMA foreign_keys=OFF;
           PRAGMA ignore_check_constraints=ON;
           DROP TRIGGER IF EXISTS session_switch_attempt_id_repair_guard;
+          DROP TRIGGER session_switch_adoption_parent_update;
         `);
         database.query(
           "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
         ).run(replacement, attemptId);
         database.exec("PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;");
       } finally {
+        restoreGuard();
         database.close(false);
       }
     };
@@ -4345,16 +5124,147 @@ describe("StateStore", () => {
     }
   });
 
-  test("quarantines a coherently oversized effect-started switch across writable reopen and vacuum", async () => {
+  test("contains a prepared switch with an orphan effect anchor without inventing no-effect proof", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 777);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      const readOriginalProof = () => ({
+        capsule: inspector.query("SELECT * FROM session_switch_adoption_capsules WHERE attempt_id=?").get(prepared.switch.attemptId),
+        anchor: inspector.query("SELECT * FROM session_switch_adoption_anchors WHERE attempt_id=?").get(prepared.switch.attemptId),
+        authorities: inspector.query("SELECT * FROM mutation_provider_authorities WHERE attempt_id=? ORDER BY role").all(prepared.switch.attemptId),
+      });
+      const originalProof = readOriginalProof();
+      expect(originalProof.capsule).toMatchObject({ kind: "exact_v1" });
+      expect(originalProof.authorities).toHaveLength(2);
+      const originalMutation = inspector.query("SELECT * FROM mutation_attempts WHERE id=?").get(prepared.switch.attemptId);
+      const originalJournal = inspector.query("SELECT * FROM session_switch_attempts WHERE attempt_id=?").get(prepared.switch.attemptId);
+      const restore = restoreSwitchGuardsForTest(inspector, ["session_switch_target_start_anchors_insert_guard"]);
+      inspector.exec("DROP TRIGGER session_switch_target_start_anchors_insert_guard");
+      try {
+        // Deliberate single-table corruption: the effect receipt is absent,
+        // but an independent anchor remains. Its FK only names the journal;
+        // neither that FK nor the missing receipt proves no dispatch occurred.
+        inspector.query("INSERT INTO session_switch_target_start_anchors(attempt_id,result_digest,recorded_at) VALUES(?,?,?)")
+          .run(prepared.switch.attemptId, "a".repeat(64), 9_000);
+      } finally { restore(); }
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const orphanAnchor = inspector.query("SELECT * FROM session_switch_target_start_anchors WHERE attempt_id=?").get(prepared.switch.attemptId);
+      const reopened = new StateStore(paths, { now: () => 9_200 });
+      stores.push(reopened);
+      const fenced = reopened.requireSession(prepared.session.id);
+      expect(fenced.state).toBe("recovery_required");
+      expect(fenced.activeTurnId).toBeUndefined();
+      expect(inspector.query("SELECT active_turn_id FROM sessions WHERE id=?").get(prepared.session.id))
+        .toEqual({ active_turn_id: null });
+      expect(inspector.query(`SELECT mutation_request_key,session_id,from_phase,terminal_phase,
+        diagnostic_code,evidence_depth FROM session_switch_malformed_dispositions`).all()).toEqual([{
+        mutation_request_key: prepared.switch.idempotencyKey,
+        session_id: prepared.session.id,
+        from_phase: "prepared",
+        terminal_phase: "reconciliation_required",
+        diagnostic_code: "MALFORMED_SWITCH_RECORD",
+        evidence_depth: 0,
+      }]);
+      const retained = () => ({
+        proof: readOriginalProof(),
+        mutation: inspector.query("SELECT * FROM mutation_attempts WHERE id=?").get(prepared.switch.attemptId),
+        journal: inspector.query("SELECT * FROM session_switch_attempts WHERE attempt_id=?").get(prepared.switch.attemptId),
+        effectAnchor: inspector.query("SELECT * FROM session_switch_target_start_anchors WHERE attempt_id=?").get(prepared.switch.attemptId),
+        targetReceipts: inspector.query("SELECT * FROM session_switch_target_start_receipts").all(),
+        noEffectReceipts: inspector.query("SELECT * FROM session_switch_no_effect_receipts").all(),
+        seedAuthorities: inspector.query("SELECT * FROM session_switch_seed_authorities").all(),
+        seedReceipts: inspector.query("SELECT * FROM session_switch_seed_receipts").all(),
+      });
+      expect(retained()).toEqual({ proof: originalProof, mutation: originalMutation, journal: originalJournal,
+        effectAnchor: orphanAnchor, targetReceipts: [], noEffectReceipts: [], seedAuthorities: [], seedReceipts: [] });
+      expect(() => reopened.beginSessionSwitchTargetStart(prepared.cas)).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+      expect(() => reopened.cancelPreparedSessionSwitch(prepared.cas)).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+      expect(() => reopened.readSessionSwitchByIdempotencyKey(prepared.switch.idempotencyKey)).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+      const beforeReopen = retained();
+      reopened.close();
+      stores.splice(stores.indexOf(reopened), 1);
+      for (const readonly of [true, false]) {
+        const stable = new StateStore(paths, { readonly, now: () => 9_300 });
+        try {
+          expect(stable.requireSession(prepared.session.id)).toEqual(fenced);
+          expect(() => stable.readSessionSwitchForRecovery(prepared.session.id)).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+          expect(retained()).toEqual(beforeReopen);
+          expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+        } finally { stable.close(); }
+      }
+    } finally { inspector.close(false); }
+  });
+
+  test.each(["missing_anchor", "ambiguous_association", "wrong_disposition"] as const)(
+    "refuses unproved switch containment without writes: %s", async (scenario) => {
+      const { store } = await fixture();
+      const prepared = prepareDedicatedSessionSwitch(store, 776);
+      const alternateKey = "40000000-0000-4000-8000-000000000776";
+      if (scenario === "ambiguous_association") {
+        // A second real mutation is an independent key owner, not a fabricated
+        // replacement receipt or a reason to choose the journal's other ID.
+        store.prepareMutation({ kind: "test.containment-conflict", authorityId: "independent-containment-key-owner",
+          authorityGeneration: prepared.cas.sourceAuthority.processGeneration,
+          idempotencyKey: alternateKey, request: { purpose: "independent-key-owner" } });
+      }
+      const paths = store.paths;
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+      const corrupt = new Database(paths.database, { create: false, strict: true });
+      try {
+        if (scenario === "missing_anchor") {
+          const restore = restoreSwitchGuardsForTest(corrupt, ["session_switch_adoption_anchors_delete"]);
+          corrupt.exec("PRAGMA foreign_keys=OFF; DROP TRIGGER session_switch_adoption_anchors_delete");
+          try { corrupt.query("DELETE FROM session_switch_adoption_anchors WHERE attempt_id=?").run(prepared.switch.attemptId); }
+          finally { restore(); }
+        } else if (scenario === "ambiguous_association") {
+          const restore = restoreSwitchGuardsForTest(corrupt, [
+            "session_switch_attempts_immutable_update", "session_switch_adoption_parent_update",
+          ]);
+          corrupt.exec("DROP TRIGGER session_switch_attempts_immutable_update; DROP TRIGGER session_switch_adoption_parent_update");
+          try { corrupt.query("UPDATE session_switch_attempts SET request_key=?,source_process_generation=source_process_generation+1 WHERE attempt_id=?")
+            .run(alternateKey, prepared.switch.attemptId); }
+          finally { restore(); }
+        } else {
+          // The old insertion guard allows this shape, but the prepared
+          // mutation is not cancelled and the original session is not fenced.
+          // Mere presence of a disposition cannot authorize final recognition.
+          corrupt.query(`INSERT INTO session_switch_malformed_dispositions(
+            journal_sequence,mutation_request_key,session_id,from_phase,terminal_phase,
+            diagnostic_code,evidence_depth,recorded_at)
+            SELECT journal_sequence,request_key,session_id,'prepared','reconciliation_required',
+              'MALFORMED_SWITCH_RECORD',0,9000 FROM session_switch_attempts WHERE attempt_id=?`)
+            .run(prepared.switch.attemptId);
+        }
+      } finally { corrupt.close(false); }
+      const inspector = new Database(paths.database, { create: false, strict: true });
+      try {
+        const before = snapshotSwitchContainmentForTest(inspector);
+        for (const readonly of [true, false]) {
+          expect(() => new StateStore(paths, { now: () => 9_200, readonly })).toThrow();
+          expect(snapshotSwitchContainmentForTest(inspector)).toEqual(before);
+        }
+      } finally { inspector.close(false); }
+    },
+  );
+
+  test("refuses a wholly relocated switch parent without rewriting independent adoption proof", async () => {
     const value = await fixture();
     const prepared = prepareDedicatedSessionSwitch(value.store, 737);
     advanceDedicatedSessionSwitch(value.store, prepared, "target_starting");
     const paths = value.store.paths;
     value.store.close();
     stores.splice(stores.indexOf(value.store), 1);
-
     const oversizedAttemptId = `attempt_${"c".repeat(4096)}`;
     const corrupt = new Database(paths.database, { create: false, strict: true });
+    const restoreGuard = restoreSwitchGuardsForTest(corrupt, [
+      "session_switch_attempt_id_repair_guard", "session_switch_plan_anchors_immutable_update",
+      "mutation_provider_authorities_immutable_update", "session_switch_adoption_parent_update",
+    ]);
     try {
       corrupt.exec(`
         PRAGMA foreign_keys=OFF;
@@ -4362,133 +5272,52 @@ describe("StateStore", () => {
         DROP TRIGGER session_switch_attempt_id_repair_guard;
         DROP TRIGGER session_switch_plan_anchors_immutable_update;
         DROP TRIGGER mutation_provider_authorities_immutable_update;
+        DROP TRIGGER session_switch_adoption_parent_update;
       `);
-      corrupt.query(
-        "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
-      ).run(oversizedAttemptId, prepared.switch.attemptId);
-      corrupt.query(
-        "UPDATE session_switch_plan_anchors SET attempt_id=? WHERE attempt_id=?",
-      ).run(oversizedAttemptId, prepared.switch.attemptId);
-      corrupt.query(
-        "UPDATE mutation_provider_authorities SET attempt_id=? WHERE attempt_id=?",
-      ).run(oversizedAttemptId, prepared.switch.attemptId);
-      corrupt.query(
-        "UPDATE mutation_attempts SET id=? WHERE id=?",
-      ).run(oversizedAttemptId, prepared.switch.attemptId);
-      expect(corrupt.query("PRAGMA foreign_key_check").all()).toEqual([]);
-    } finally {
-      corrupt.close(false);
-    }
+      for (const table of ["session_switch_attempts", "session_switch_plan_anchors", "mutation_provider_authorities"]) {
+        corrupt.query(`UPDATE ${table} SET attempt_id=? WHERE attempt_id=?`)
+          .run(oversizedAttemptId, prepared.switch.attemptId);
+      }
+      corrupt.query("UPDATE mutation_attempts SET id=? WHERE id=?").run(oversizedAttemptId, prepared.switch.attemptId);
+      // The adoption capsule independently freezes the ORIGINAL parent ID.
+      // Relocating the task-only rows cannot prove a replacement parent.
+      expect(corrupt.query("SELECT attempt_id FROM session_switch_adoption_capsules").all())
+        .toEqual([{ attempt_id: prepared.switch.attemptId }]);
+      expect(corrupt.query("PRAGMA foreign_key_check").all()).toHaveLength(1);
+    } finally { restoreGuard(); corrupt.close(false); }
 
-    let reopened = new StateStore(paths, { now: () => 9_200 });
-    stores.push(reopened);
-    expect(reopened.requireSession(prepared.session.id).state).toBe("recovery_required");
-    expect(() => reopened.readSessionSwitchByIdempotencyKey(
-      prepared.switch.idempotencyKey,
-    )).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-    expect(() => reopened.readSessionSwitchForRecovery(prepared.session.id))
-      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-    expect(reopened.recoverEffectStartedMutations()).toEqual({ recovered: [], unresolved: [] });
-    expect(reopened.sessionSwitchAdmissionBlocked({
-      sessionId: prepared.session.id,
-      providerThreadId: prepared.session.providerThreadId ?? null,
-      providerAuthority: prepared.cas.sourceAuthority,
-    })).toEqual({ blocked: true, attemptId: null, role: "session" });
     const inspect = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspect.query("PRAGMA foreign_key_check").all()).toEqual([]);
-      expect(inspect.query(
-        `SELECT switch.phase,mutation.state,malformed.mutation_request_key
-         FROM session_switch_attempts switch
-         JOIN mutation_attempts mutation ON mutation.idempotency_key=switch.request_key
-         JOIN session_switch_malformed_dispositions malformed
-           ON malformed.journal_sequence=switch.journal_sequence
-         WHERE switch.session_id=?`,
-      ).get(prepared.session.id)).toEqual({
-        phase: "reconciliation_required",
-        state: "ambiguous",
-        mutation_request_key: prepared.switch.idempotencyKey,
-      });
-    } finally {
-      inspect.close(false);
-    }
-    reopened.close();
-    stores.splice(stores.indexOf(reopened), 1);
-    const vacuum = new Database(paths.database, { create: false, strict: true });
-    try {
-      vacuum.exec("VACUUM");
-    } finally {
-      vacuum.close(false);
-    }
-    reopened = new StateStore(paths, { now: () => 9_300 });
-    stores.push(reopened);
-    expect(() => reopened.readSessionSwitchForRecovery(prepared.session.id))
-      .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-    expect(reopened.sessionSwitchAdmissionBlocked({
-      sessionId: prepared.session.id,
-      providerThreadId: prepared.session.providerThreadId ?? null,
-      providerAuthority: prepared.cas.sourceAuthority,
-    }).attemptId).toBeNull();
+      const before = snapshotSwitchContainmentForTest(inspect);
+      for (const readonly of [true, false]) {
+        expect(() => new StateStore(paths, { now: () => 9_200, readonly })).toThrow();
+        expect(snapshotSwitchContainmentForTest(inspect)).toEqual(before);
+      }
+      inspect.exec("VACUUM");
+      const afterVacuum = snapshotSwitchContainmentForTest(inspect);
+      expect(() => new StateStore(paths, { now: () => 9_300 })).toThrow();
+      expect(snapshotSwitchContainmentForTest(inspect)).toEqual(afterVacuum);
+    } finally { inspect.close(false); }
   });
 
-  test("repairs a malformed partial v42 journal while completing a v41 migration", async () => {
+  test("refuses an unrecognized partial v42/v43 cohort without rewriting switch evidence", async () => {
     const value = await fixture();
     const prepared = prepareDedicatedSessionSwitch(value.store, 739);
     advanceDedicatedSessionSwitch(value.store, prepared, "target_starting");
     const paths = value.store.paths;
     value.store.close();
     stores.splice(stores.indexOf(value.store), 1);
-
     const corrupt = new Database(paths.database, { create: false, strict: true });
     try {
-      corrupt.exec(`
-        PRAGMA foreign_keys=OFF;
-        PRAGMA ignore_check_constraints=ON;
-        DROP TRIGGER session_switch_attempt_id_repair_guard;
-      `);
-      corrupt.query(
-        "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
-      ).run(`attempt_${"e".repeat(4096)}`, prepared.switch.attemptId);
-      dropAttachmentCustodySchema(corrupt);
-      corrupt.exec(`
-        DELETE FROM migrations WHERE version=42 OR version>=44;
-        PRAGMA user_version=41;
-        PRAGMA ignore_check_constraints=OFF;
-        PRAGMA foreign_keys=ON;
-      `);
-    } finally {
-      corrupt.close(false);
-    }
-
-    const migrated = new StateStore(paths, { now: () => 9_250 });
-    stores.push(migrated);
-    expect(migrated.requireSession(prepared.session.id).state).toBe("recovery_required");
-    expect(() => migrated.readSessionSwitchByIdempotencyKey(
-      prepared.switch.idempotencyKey,
-    )).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-    const inspector = new Database(paths.database, { create: false, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
-      expect(inspector.query(
-        "SELECT COUNT(*) AS count FROM migrations WHERE version=42",
-      ).get()).toEqual({ count: 1 });
-      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
-      expect(inspector.query(
-        `SELECT switch.attempt_id,switch.phase,malformed.mutation_request_key
-         FROM session_switch_attempts switch
-         JOIN session_switch_malformed_dispositions malformed
-           ON malformed.journal_sequence=switch.journal_sequence
-         WHERE switch.session_id=?`,
-      ).get(prepared.session.id)).toEqual({
-        attempt_id: prepared.switch.attemptId,
-        phase: "reconciliation_required",
-        mutation_request_key: prepared.switch.idempotencyKey,
+      corrupt.exec("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON");
+      withRemovedTestGuards(corrupt, ["session_switch_attempt_id_repair_guard", "session_switch_adoption_parent_update"], () => {
+        corrupt.query("UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?")
+          .run(`attempt_${"e".repeat(4096)}`, prepared.switch.attemptId);
       });
-    } finally {
-      inspector.close(false);
-    }
+      corrupt.exec("DELETE FROM migrations WHERE version>42; PRAGMA user_version=42");
+    } finally { corrupt.close(false); }
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_COHORT_UNSUPPORTED:42", "STATE_SCHEMA_MIGRATION_REQUIRED:42:49");
   });
-
   test("keeps the switch journal sequence bounded and immutable", async () => {
     const { store } = await fixture();
     const prepared = prepareDedicatedSessionSwitch(store, 738);
@@ -4514,11 +5343,15 @@ describe("StateStore", () => {
     const prepared = Array.from({ length: 101 }, (_, index) =>
       prepareDedicatedSessionSwitch(store, 800 + index, { sourceProfile, targetProfile }));
     const database = new Database(store.paths.database, { create: false, strict: true });
+    const restoreGuard = restoreSwitchGuardsForTest(database, [
+      "session_switch_attempt_id_repair_guard", "session_switch_adoption_parent_update",
+    ]);
     try {
       database.exec(`
         PRAGMA foreign_keys=OFF;
         PRAGMA ignore_check_constraints=ON;
         DROP TRIGGER session_switch_attempt_id_repair_guard;
+        DROP TRIGGER session_switch_adoption_parent_update;
       `);
       const corrupt = database.query(
         "UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?",
@@ -4530,6 +5363,7 @@ describe("StateStore", () => {
       }).immediate();
       database.exec("PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;");
     } finally {
+      restoreGuard();
       database.close(false);
     }
 
@@ -4721,6 +5555,7 @@ describe("StateStore", () => {
     expect(firstClaude.id).not.toBe(first.id);
 
     const source = store.requireProviderAccountAuthority(second.id, "codex");
+    completeCodexAccountMutationAuthorityRetirement(store, second.id, source.processGeneration);
     const login = store.prepareMutation({
       authorityGeneration: 1,
       authorityId: second.id,
@@ -4912,15 +5747,11 @@ describe("StateStore", () => {
   test("a new daemon boot fences every prior provider process and terminalizes callbacks", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Daemon restart", "restart@example.com");
-    const session = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: profile.id,
+      providerThreadId: "thread-restart",
       preset: "high",
       fastEnabled: false,
-    });
-    store.bindSession({
-      sessionId: session.id,
-      expectedRevision: session.revision,
-      providerThreadId: "thread-restart",
       state: "idle",
     });
     const sessionAuthorityBeforeRestart = store.requireSessionProviderAuthority(session.id);
@@ -5030,7 +5861,7 @@ describe("StateStore", () => {
     });
   });
 
-  test("terminalizes a generation-zero Claude session once on daemon restart", async () => {
+  test("quarantines a generation-zero Claude session without inventing released-process authority on restart", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Unverified Claude restart");
     const session = store.createSession({
@@ -5044,9 +5875,16 @@ describe("StateStore", () => {
       provider: "claude",
     });
 
-    const bootId = `boot_${"z".repeat(32)}`;
+    const captured = store.requireCapturedSessionProviderAuthority(session.id);
+    const bootId = `boot_${"c".repeat(32)}`;
     expect(store.nextDaemonGeneration(bootId)).toBe(1);
-    expect(store.requireSession(session.id)).toMatchObject({ state: "terminal" });
+    expect(store.requireSession(session.id)).toMatchObject({ state: "recovery_required" });
+    expect(store.requireCapturedSessionProviderAuthority(session.id)).toEqual(captured);
+    expect(store.readSessionClaudeProcessAuthority(session.id, true)).toBeNull();
+    const inspector = new Database(store.paths.database, { readonly: true });
+    try {
+      expect(inspector.query("SELECT * FROM session_provider_authority_successors WHERE session_id=?").all(session.id)).toEqual([]);
+    } finally { inspector.close(false); }
     expect(store.listSessionEvents({
       afterSequence: 0,
       sessionId: session.id,
@@ -5055,7 +5893,7 @@ describe("StateStore", () => {
       providerGeneration: event.providerGeneration,
     }))).toEqual([{
       body: {
-        reason: "daemon_restart_no_resume",
+        reason: "daemon_restart",
         state: "disconnected",
         type: "connection",
       },
@@ -5068,17 +5906,11 @@ describe("StateStore", () => {
         type: "gap",
       },
       providerGeneration: 0,
-    }, {
-      body: {
-        activeTurnId: null,
-        status: "terminal",
-        type: "session_status",
-      },
-      providerGeneration: 0,
     }]);
 
     expect(store.nextDaemonGeneration(bootId)).toBe(1);
-    expect(store.eventStreamPosition(session.id).observedThroughSequence).toBe(3);
+    expect(store.eventStreamPosition(session.id).observedThroughSequence).toBe(2);
+    expect(store.requireCapturedSessionProviderAuthority(session.id)).toEqual(captured);
   });
 
   test("adopts one exact graceful-close plus restart lineage once per boot identity", async () => {
@@ -5329,7 +6161,7 @@ describe("StateStore", () => {
 
   test("keeps imported sessions legacy until an explicit preset selection", async () => {
     const { store } = await fixture();
-    const profile = store.createProfile("Preset contracts");
+    const profile = signInProfile(store, "Preset contracts", "preset-contracts@example.com");
     const created = store.createSession({
       profileId: profile.id,
       preset: "high",
@@ -5342,9 +6174,14 @@ describe("StateStore", () => {
 
     const imported = store.upsertProviderSession({
       providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
       providerThreadId: "thread-imported-contract",
       title: "Imported",
+      preset: "high",
+      fastEnabled: false,
       state: "idle",
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
     });
     expect(store.requireSessionPresetRequirement(imported.id)).toEqual({
       preset: "high",
@@ -5368,13 +6205,19 @@ describe("StateStore", () => {
 
   test("settles immutable legacy evidence before permitting a preset-contract upgrade", async () => {
     let { store } = await fixture();
+    const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(store, "Legacy recovery preset", "legacy-recovery@example.com");
     const session = store.upsertProviderSession({
       providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
       providerThreadId: "thread-legacy-recovery-preset",
       title: "Legacy recovery preset",
+      preset: "high",
+      fastEnabled: false,
       state: "idle",
       providerUpdatedAt: 10,
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
     });
     const runtimeProfile = {
       approvalPolicy: "on-request" as const,
@@ -5393,46 +6236,29 @@ describe("StateStore", () => {
       serviceTier: null,
     };
     const idempotencyKey = "00000000-0000-4000-8000-0000000006c0";
-    const attempt = { id: createAttemptId() };
-    const evidenceValue = {
-      kind: "session.send",
-      providerThreadId: "thread-legacy-recovery-preset",
-      baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
-      clientMessageId: attempt.id,
-      messageDigest: createHash("sha256").update("legacy recovery").digest("hex"),
-      runtimeProfile: effectiveRuntimeProfileSchema.parse(runtimeProfile),
-    };
-    const evidenceJson = JSON.stringify(evidenceValue);
-    const evidence = { digest: createHash("sha256").update(evidenceJson).digest("hex") };
     const providerAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
-    const requestDigest = createHash("sha256").update(JSON.stringify({
-      kind: "session.send", authorityId: session.id, authorityGeneration: profile.processGeneration,
-      request: { message: "legacy recovery" },
-    })).digest("hex");
+    const { attempt } = store.prepareSessionInputMutation({
+      ...daemon, kind: "session.send", sessionId: session.id, idempotencyKey,
+      message: "legacy recovery", attachments: [], providerAuthority,
+    });
+    const evidence = store.beginSessionMutationEffect({
+      ...daemon, attemptId: attempt.id, sessionId: session.id,
+      profileGeneration: providerAuthority.processGeneration, providerAuthority, attachments: [],
+      evidence: {
+        kind: "session.send", providerThreadId: "thread-legacy-recovery-preset",
+        baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
+        clientMessageId: attempt.id,
+        messageDigest: createHash("sha256").update("legacy recovery").digest("hex"),
+        runtimeProfile: effectiveRuntimeProfileSchema.parse(runtimeProfile),
+      },
+    });
+    const frozen = store.readMutation(idempotencyKey);
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    try {
-      // Retain a genuine pre48 effect. Current closed admission must never
-      // manufacture empty attachment proof for this historical request.
-      dropAttachmentCustodySchema(legacy);
-      legacy.exec("PRAGMA user_version=47");
-      legacy.query(`INSERT INTO mutation_attempts(
-        id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at
-      ) VALUES (?,?,'session.send',?,?,?,'prepared',2000,2000)`)
-        .run(attempt.id, idempotencyKey, session.id, profile.processGeneration, requestDigest);
-      legacy.query(`INSERT INTO mutation_provider_authorities(
-        attempt_id,role,provider_account_id,profile_id,provider,binding_generation,process_generation,provenance,recorded_at
-      ) VALUES (?,'primary',?,?,'codex',?,?,'session_effect',2000)`)
-        .run(attempt.id, providerAuthority.providerAccountId, profile.id,
-          providerAuthority.bindingGeneration, profile.processGeneration);
-      legacy.query(`INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at)
-        VALUES (?,'session.send',?,?,2000)`).run(attempt.id, evidenceJson, evidence.digest);
-      legacy.query("UPDATE mutation_attempts SET state='effect_started' WHERE id=?").run(attempt.id);
-    } finally { legacy.close(false); }
     store = new StateStore(paths, { now: () => 3_000 });
     stores.push(store);
+    expect(store.readMutation(idempotencyKey)).toEqual(frozen);
     expect(store.readMutation(idempotencyKey)?.evidence?.digest).toBe(evidence.digest);
     expect(store.transitionMutation(attempt.id, "effect_started", "ambiguous", {
       code: "LOST_RESPONSE",
@@ -5562,7 +6388,11 @@ describe("StateStore", () => {
   test("keeps show-thinking and the default preset as daemon settings with session overrides", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Settings");
-    const session = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
 
     expect(store.readDefaultShowThinking()).toBe(false);
     expect(store.readSessionShowThinking(session.id)).toEqual({ enabled: false, source: "default" });
@@ -5582,6 +6412,4707 @@ describe("StateStore", () => {
     expect(() => store.setDefaultPreset("max" as "low")).toThrow();
   });
 
+  test("adopts personal-home candidates atomically and keeps provenance private", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Personal runtime", "personal-runtime@example.com");
+    expect(store.readSessionAdoptionPolicy("codex")).toBeNull();
+    expect(store.setSessionAdoptionPolicy({
+      provider: "codex",
+      profileId: profile.id,
+    })).toMatchObject({
+      enabled: true,
+      profileId: profile.id,
+      provider: "codex",
+      revision: 1,
+    });
+
+    const providerProjectRoot = "/private/provider-project/alias/..";
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "personal-thread",
+      providerProjectRoot,
+      title: "Personal terminal session",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    expect(candidate).toMatchObject({
+      provider: "codex",
+      providerThreadId: "personal-thread",
+      providerProjectRoot,
+      status: "pending",
+    });
+    const refreshedCandidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "personal-thread",
+      providerProjectRoot,
+      title: "Personal terminal session",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    expect(() => store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedCandidateRevision: candidate.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "ultra",
+      requirement: presetRequirements.ultra,
+      fastEnabled: true,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "ultra", true),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    })).toThrow("SESSION_ADOPTION_CANDIDATE_STALE");
+    expect(() => store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedCandidateRevision: refreshedCandidate.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "ultra",
+      requirement: presetRequirements.ultra,
+      fastEnabled: true,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "ultra", true),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    })).toThrow("SESSION_ADOPTION_CANDIDATE_NOT_CLAIMED");
+    const firstPreflight = store.recordSessionAdoptionCandidatePreflightAttempt({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: refreshedCandidate.revision,
+    });
+    expect(firstPreflight).toMatchObject({ status: "pending" });
+    expect(firstPreflight.lastAttemptAt).not.toBeNull();
+    const secondPreflight = store.recordSessionAdoptionCandidatePreflightAttempt({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: firstPreflight.revision,
+    });
+    expect(secondPreflight.lastAttemptAt).toBeGreaterThan(firstPreflight.lastAttemptAt ?? 0);
+    expect(() => store.recordSessionAdoptionCandidatePreflightAttempt({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: firstPreflight.revision,
+    })).toThrow("SESSION_ADOPTION_CANDIDATE_PREFLIGHT_CONFLICT");
+    const claimedCandidate = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: secondPreflight.revision,
+    });
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedCandidateRevision: claimedCandidate.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "ultra",
+      requirement: presetRequirements.ultra,
+      fastEnabled: true,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "ultra", true),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    expect(adopted.session).toMatchObject({
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "personal-thread",
+      preset: "ultra",
+      fastEnabled: true,
+      state: "idle",
+    });
+    expect(adopted.candidate.status).toBe("adopted");
+    expect(adopted.binding).toMatchObject({
+      sessionId: adopted.session.id,
+      state: "active",
+    });
+    expect(store.latestSessionRuntimeProfile(adopted.session.id)).toMatchObject({
+      sourceKind: "session_start",
+      profile: codexAdoptionRuntimeProfile(profile, "ultra", true),
+    });
+    expect(Object.keys(adopted.session)).not.toContain("origin");
+    expect(Object.keys(adopted.session)).not.toContain("adopted");
+    expect(Object.keys(adopted.session)).not.toContain("providerProjectRoot");
+    expect(store.isConversationAutomationEnabled(
+      adopted.session.id,
+      adopted.session.providerThreadId ?? "",
+    )).toBe(true);
+    expect(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      limit: 1,
+    })).toEqual({ sessions: [adopted.session], nextPosition: null });
+    store.setSessionArchived(adopted.session.id, true);
+    expect(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      limit: 1,
+    }).sessions).toEqual([]);
+    expect(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      includeArchived: true,
+      limit: 1,
+    }).sessions).toEqual([store.requireSession(adopted.session.id)]);
+    store.setSessionArchived(adopted.session.id, false);
+
+    const detached = store.detachPersonalSession({ sessionId: adopted.session.id });
+    expect(detached.binding.state).toBe("detached");
+    expect(detached.candidate.status).toBe("fenced");
+    expect(detached.session.archivedAt).toBeDefined();
+    expect(store.readSessionPersonalRuntimeBinding(adopted.session.id)).toBeNull();
+    expect(store.readSessionPersonalRuntimeBinding(adopted.session.id, true)?.state)
+      .toBe("detached");
+    expect(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      includeArchived: true,
+      limit: 1,
+    }).sessions).toEqual([store.requireSession(adopted.session.id)]);
+
+    // A liveness-only observation does not invent conversation activity and
+    // therefore cannot defeat an explicit detach fence.
+    expect(store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "personal-thread",
+      providerProjectRoot,
+      title: "Personal terminal session",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    }).status).toBe("fenced");
+    const changedProviderProjectRoot = "/private/provider-project/changed/..";
+    expect(store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "personal-thread",
+      providerProjectRoot: changedProviderProjectRoot,
+      title: "Personal terminal session",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    })).toMatchObject({
+      providerProjectRoot: changedProviderProjectRoot,
+      status: "pending",
+    });
+
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: null });
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    const pendingAgain = store.listSessionAdoptionCandidates({ provider: "codex" })[0];
+    expect(pendingAgain?.status).toBe("pending");
+    if (pendingAgain === undefined) throw new Error("Expected the candidate to be pending again.");
+    const claimedAgain = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: pendingAgain.providerThreadId,
+      expectedRevision: pendingAgain.revision,
+    });
+    const readopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      provider: "codex",
+      providerThreadId: "personal-thread",
+      expectedCandidateRevision: claimedAgain.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    expect(readopted.session).toMatchObject({
+      id: adopted.session.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    expect("archivedAt" in readopted.session).toBe(false);
+    expect(readopted.binding).toMatchObject({ state: "active", revision: 4 });
+    expect(store.isConversationAutomationEnabled(
+      readopted.session.id,
+      readopted.session.providerThreadId ?? "",
+    )).toBe(true);
+
+    store.detachPersonalSession({ sessionId: adopted.session.id, archive: false });
+    expect(store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "personal-thread",
+      providerProjectRoot,
+      title: "Personal terminal session",
+      state: "idle",
+      providerUpdatedAt: 11,
+      liveness: "not_live",
+    }).status).toBe("pending");
+  });
+
+  test("records candidate preflight fairness across wall-clock rollback", async () => {
+    let now = 2_000;
+    const { store } = await fixture({ now: () => now });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "rollback-preflight-candidate",
+      title: "Rollback preflight candidate",
+      state: "idle",
+      liveness: "not_live",
+    });
+    now = 3_000;
+    const laterCandidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "later-rollback-preflight-candidate",
+      title: "Later rollback preflight candidate",
+      state: "idle",
+      liveness: "not_live",
+    });
+
+    now = 1_000;
+    const firstAttempt = store.recordSessionAdoptionCandidatePreflightAttempt({
+      provider: candidate.provider,
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const laterAttempt = store.recordSessionAdoptionCandidatePreflightAttempt({
+      provider: laterCandidate.provider,
+      providerThreadId: laterCandidate.providerThreadId,
+      expectedRevision: laterCandidate.revision,
+    });
+    const retriedFirst = store.recordSessionAdoptionCandidatePreflightAttempt({
+      provider: firstAttempt.provider,
+      providerThreadId: firstAttempt.providerThreadId,
+      expectedRevision: firstAttempt.revision,
+    });
+
+    expect(firstAttempt.lastAttemptAt).toBe(candidate.lastObservedAt);
+    expect(laterAttempt.lastAttemptAt).toBe(laterCandidate.lastObservedAt);
+    expect(retriedFirst.lastAttemptAt).toBe((laterAttempt.lastAttemptAt ?? 0) + 1);
+    expect(retriedFirst.revision).toBe(candidate.revision + 2);
+    expect(retriedFirst.status).toBe("pending");
+  });
+
+  test("stores truthful provider configuration and refuses adoption collisions", async () => {
+    const { store } = await fixture();
+    const first = signInProfile(store, "First adopter", "first-adopter@example.com");
+    const second = signInProfile(store, "Second adopter", "second-adopter@example.com");
+    const claude = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(first.id, "claude"),
+      profileId: first.id,
+      provider: "claude",
+      providerThreadId: "truthful-thread",
+      title: "Truthful provider",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+      providerUpdatedAt: 1,
+      providerAccountKey: testProviderAccountKey("claude"),
+    });
+    expect(claude).toMatchObject({
+      provider: "claude",
+      preset: "fable-max",
+      fastEnabled: false,
+    });
+    expect(() => store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(first.id, "codex"),
+      profileId: first.id,
+      provider: "codex",
+      providerThreadId: "truthful-thread",
+      title: "Conflicting provider",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerUpdatedAt: 2,
+      providerAccountKey: providerAccountKeyForProfile(store, first.id, "codex"),
+    })).toThrow("PROVIDER_SESSION_IMPORT_AUTHORITY_MISMATCH");
+
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: first.id });
+    const ownerCandidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "one-owner-thread",
+      title: "One owner",
+      state: "idle",
+      liveness: "not_live",
+    });
+    const claimedOwner = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: ownerCandidate.providerThreadId,
+      expectedRevision: ownerCandidate.revision,
+    });
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(first.id, "codex"),
+      provider: "codex",
+      providerThreadId: "one-owner-thread",
+      expectedCandidateRevision: claimedOwner.revision,
+      profileId: first.id,
+      profileGeneration: first.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(first, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, first.id, "codex"),
+    });
+    expect(() => store.setSessionAdoptionPolicy({
+      provider: "codex",
+      profileId: second.id,
+    })).toThrow("SESSION_ADOPTION_POLICY_ACTIVE_BINDINGS");
+    expect(store.readSessionAdoptionPolicy("codex")?.profileId).toBe(first.id);
+    store.detachPersonalSession({ sessionId: adopted.session.id, archive: false });
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: second.id });
+    const reassignedCandidate = store.listSessionAdoptionCandidates({
+      provider: "codex",
+      status: "pending",
+    })[0];
+    if (reassignedCandidate === undefined) throw new Error("Expected a reassigned candidate.");
+    const claimedReassignment = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: reassignedCandidate.providerThreadId,
+      expectedRevision: reassignedCandidate.revision,
+    });
+    expect(() => store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(second.id, "codex"),
+      provider: "codex",
+      providerThreadId: "one-owner-thread",
+      expectedCandidateRevision: claimedReassignment.revision,
+      profileId: second.id,
+      profileGeneration: second.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(second, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, second.id, "codex"),
+    })).toThrow("SESSION_ADOPTION_BINDING_COLLISION");
+    expect(store.requireSession(adopted.session.id).profileId).toBe(first.id);
+  });
+
+  test("cannot adopt Codex after the selected profile loses identifiable authority", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Codex identity loss",
+      "codex-identity-loss@example.com",
+    );
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { plan: "apiKey" },
+    )).toBe(true);
+    expect(store.requireProfileById(profile.id).providerEmail).toBeUndefined();
+    expect(store.readSessionAdoptionPolicy("codex")).toMatchObject({
+      enabled: false,
+      profileId: null,
+    });
+
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "codex-identity-loss-thread",
+      title: "Codex identity loss candidate",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+
+    // Simulate a damaged pre-release database in which stale policy authority
+    // survived identity loss. The adoption transaction must still fail closed.
+    const raw = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      raw.exec("DROP TRIGGER session_adoption_policy_profile_guard_update");
+      raw.exec("DROP TRIGGER session_adoption_policy_unsettled_claim_guard");
+      raw.query(
+        `UPDATE session_adoption_policies
+         SET profile_id=?,state='enabled',revision=revision+1,updated_at=updated_at+1
+         WHERE provider='codex'`,
+      ).run(profile.id);
+    } finally {
+      raw.close(false);
+    }
+    expect(() => store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      provider: "codex",
+      providerThreadId: claiming.providerThreadId,
+      expectedCandidateRevision: claiming.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
+      providerAccountKey: testProviderAccountKey("codex"),
+    })).toThrow("SESSION_ADOPTION_PROFILE_NOT_SIGNED_IN");
+    expect(store.findSessionPersonalRuntimeBinding(
+      "codex",
+      candidate.providerThreadId,
+    )).toBeNull();
+  });
+
+  test("recovers an interrupted claim only after a later quiet observation", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Interrupted adopter", "interrupted-adopter@example.com");
+    const otherProfile = signInProfile(
+      store,
+      "Other interrupted adopter",
+      "other-interrupted-adopter@example.com",
+    );
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "interrupted-claim-thread",
+      title: "Interrupted claim",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+
+    expect(() => store.recoverSessionAdoptionClaimAfterObservation({
+      provider: "codex",
+      providerThreadId: claiming.providerThreadId,
+      profileId: profile.id,
+      expectedRevision: claiming.revision,
+    })).toThrow("SESSION_ADOPTION_CLAIM_RECOVERY_NOT_PROVEN");
+    expect(() => store.setSessionAdoptionPolicy({
+      provider: "codex",
+      profileId: null,
+    })).toThrow("SESSION_ADOPTION_POLICY_UNSETTLED_CLAIM");
+    expect(() => store.setSessionAdoptionPolicy({
+      provider: "codex",
+      profileId: otherProfile.id,
+    })).toThrow("SESSION_ADOPTION_POLICY_UNSETTLED_CLAIM");
+    expect(store.readSessionAdoptionPolicy("codex")?.profileId).toBe(profile.id);
+    expect(store.listSessionAdoptionCandidates({ provider: "codex" })[0]?.status)
+      .toBe("claiming");
+
+    const observedAgain = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: claiming.providerThreadId,
+      title: "Interrupted claim",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    expect(store.recoverSessionAdoptionClaimAfterObservation({
+      provider: "codex",
+      providerThreadId: claiming.providerThreadId,
+      profileId: profile.id,
+      expectedRevision: observedAgain.revision,
+    }).status).toBe("pending");
+  });
+
+  test("round-trips Claude source identity and applies exact-probe liveness with a strict CAS", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-probe-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const store = new StateStore(paths, { now: () => 1_000 });
+    stores.push(store);
+    const profile = signInProfile(store, "Claude probe", "claude-probe@example.com");
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const identity = {
+      pid: 41_001,
+      pidDomain: "darwin" as const,
+      procStart: "Fri Sep  4 11:00:00 2026",
+    };
+    const replacementIdentity = {
+      pid: 41_002,
+      pidDomain: "darwin" as const,
+      procStart: "Fri Sep  4 11:01:00 2026",
+    };
+    const observed = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "claude-retained-probe",
+      title: "Retained Claude candidate",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "live",
+      sourceProcessIdentity: identity,
+      trustedLiveObservation: true,
+    });
+    expect(observed.sourceProcessIdentity).toEqual(identity);
+    const preserved = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: observed.providerThreadId,
+      title: observed.title,
+      state: observed.providerState,
+      ...(observed.providerUpdatedAt === null
+        ? {}
+        : { providerUpdatedAt: observed.providerUpdatedAt }),
+      liveness: observed.liveness,
+    });
+    expect(preserved.sourceProcessIdentity).toEqual(identity);
+
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: preserved.providerThreadId,
+      expectedRevision: preserved.revision,
+    });
+    const probed = store.updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+      providerThreadId: claiming.providerThreadId,
+      expectedRevision: claiming.revision,
+      expectedSourceProcessIdentity: identity,
+      liveness: "not_live",
+    });
+    expect(probed).toMatchObject({
+      liveness: "not_live",
+      sourceProcessIdentity: identity,
+      status: "claiming",
+    });
+    expect(probed.lastObservedAt).toBeGreaterThan(probed.lastAttemptAt ?? Number.MAX_VALUE);
+    expect(() => store.updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+      providerThreadId: probed.providerThreadId,
+      expectedRevision: claiming.revision,
+      expectedSourceProcessIdentity: identity,
+      liveness: "live",
+    })).toThrow("SESSION_ADOPTION_CANDIDATE_PROBE_CONFLICT");
+    expect(() => store.updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+      providerThreadId: probed.providerThreadId,
+      expectedRevision: probed.revision,
+      expectedSourceProcessIdentity: replacementIdentity,
+      liveness: "live",
+    })).toThrow("SESSION_ADOPTION_CANDIDATE_PROBE_CONFLICT");
+
+    const recovered = store.recoverSessionAdoptionClaimAfterObservation({
+      provider: "claude",
+      providerThreadId: probed.providerThreadId,
+      profileId: profile.id,
+      expectedRevision: probed.revision,
+    });
+    const reclaimed = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: recovered.providerThreadId,
+      expectedRevision: recovered.revision,
+    });
+    store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: reclaimed.providerThreadId,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      identity,
+    });
+    const claimedWithAuthority = store.listSessionAdoptionCandidates({
+      provider: "claude",
+    }).find((candidate) => candidate.providerThreadId === reclaimed.providerThreadId);
+    if (claimedWithAuthority === undefined) {
+      throw new Error("Expected the claimed candidate after process custody was recorded.");
+    }
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      provider: "claude",
+      providerThreadId: reclaimed.providerThreadId,
+      expectedCandidateRevision: claimedWithAuthority.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      fastEnabled: false,
+      runtimeProfile: claudeAdoptionRuntimeProfile(store.requireProviderAccountAuthority(profile.id, "claude")),
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity: identity,
+    });
+    expect(() => store.updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+      providerThreadId: adopted.candidate.providerThreadId,
+      expectedRevision: adopted.candidate.revision,
+      expectedSourceProcessIdentity: identity,
+      liveness: "live",
+    })).toThrow("SESSION_ADOPTION_CANDIDATE_PROBE_CONFLICT");
+
+    const authority = store.readClaudeProcessAuthority({
+      providerThreadId: adopted.candidate.providerThreadId,
+      profileId: profile.id,
+      runtimeScope: "personal",
+    });
+    if (authority === null) throw new Error("Expected retained Claude process authority.");
+    const releasing = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: authority.providerThreadId,
+      profileId: authority.profileId,
+      runtimeScope: authority.runtimeScope,
+      expectedRevision: authority.revision,
+      identity: authority.identity,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasing.providerThreadId,
+      profileId: releasing.profileId,
+      runtimeScope: releasing.runtimeScope,
+      expectedRevision: releasing.revision,
+      identity: releasing.identity,
+    });
+    const detached = store.detachPersonalSession({
+      sessionId: adopted.session.id,
+      archive: false,
+    });
+    expect(detached.candidate.status).toBe("fenced");
+    expect(() => store.updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+      providerThreadId: detached.candidate.providerThreadId,
+      expectedRevision: detached.candidate.revision,
+      expectedSourceProcessIdentity: identity,
+      liveness: "live",
+    })).toThrow("SESSION_ADOPTION_CANDIDATE_PROBE_CONFLICT");
+
+    const sameIdentity = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: detached.candidate.providerThreadId,
+      title: detached.candidate.title,
+      state: detached.candidate.providerState,
+      ...(detached.candidate.providerUpdatedAt === null
+        ? {}
+        : { providerUpdatedAt: detached.candidate.providerUpdatedAt }),
+      liveness: detached.candidate.liveness,
+    });
+    expect(sameIdentity).toMatchObject({
+      sourceProcessIdentity: identity,
+      status: "fenced",
+    });
+    const changedIdentity = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: detached.candidate.providerThreadId,
+      title: detached.candidate.title,
+      state: detached.candidate.providerState,
+      ...(detached.candidate.providerUpdatedAt === null
+        ? {}
+        : { providerUpdatedAt: detached.candidate.providerUpdatedAt }),
+      liveness: detached.candidate.liveness,
+      sourceProcessIdentity: replacementIdentity,
+    });
+    expect(changedIdentity).toMatchObject({
+      sourceProcessIdentity: replacementIdentity,
+      status: "pending",
+    });
+    expect(store.listRecentClaudeSessionAdoptionCandidatesWithSourceIdentity({
+      providerUpdatedAfter: 10,
+    }).map((candidate) => candidate.providerThreadId)).toContain(
+      changedIdentity.providerThreadId,
+    );
+    const detachedBindingProbed = store
+      .updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+        providerThreadId: changedIdentity.providerThreadId,
+        expectedRevision: changedIdentity.revision,
+        expectedSourceProcessIdentity: replacementIdentity,
+        liveness: "not_live",
+      });
+    expect(detachedBindingProbed.status).toBe("pending");
+    expect(store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: detached.candidate.providerThreadId,
+      title: detached.candidate.title,
+      state: detached.candidate.providerState,
+      ...(detached.candidate.providerUpdatedAt === null
+        ? {}
+        : { providerUpdatedAt: detached.candidate.providerUpdatedAt }),
+      liveness: detached.candidate.liveness,
+      sourceProcessIdentity: null,
+    }).sourceProcessIdentity).toBeNull();
+    expect(() => store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "codex-cannot-own-source-pid",
+      title: "Invalid Codex source",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+      sourceProcessIdentity: identity,
+    })).toThrow("SESSION_ADOPTION_SOURCE_PROCESS_PROVIDER_INVALID");
+  });
+
+  test("rejects unsafe private provider project roots without disclosing them", async () => {
+    const { store } = await fixture();
+    const invalidRoots = [
+      "relative/provider-root",
+      `/private/${"x".repeat(8_192)}`,
+      "/private/unsafe\u0000provider-root",
+    ] as const;
+    for (const [index, providerProjectRoot] of invalidRoots.entries()) {
+      let failure: unknown;
+      try {
+        store.upsertSessionAdoptionCandidate({
+          provider: "codex",
+          providerThreadId: `invalid-provider-root-${index}`,
+          providerProjectRoot,
+          title: "Invalid provider root",
+          state: "idle",
+          liveness: "not_live",
+        });
+      } catch (error: unknown) {
+        failure = error;
+      }
+      expect(String(failure)).toContain("Provider project root is invalid.");
+      expect(String(failure)).not.toContain(providerProjectRoot);
+    }
+  });
+
+  test("fairly bounds recent retained Claude candidates eligible for exact reprobe", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-fair-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const store = new StateStore(paths, { now: () => 1_000 });
+    stores.push(store);
+    const identity = (pid: number) => ({
+      pid,
+      pidDomain: "darwin" as const,
+      procStart: `claude-process-${pid}`,
+    });
+    const first = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "a-retained-claude",
+      title: "First retained Claude candidate",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "live",
+      sourceProcessIdentity: identity(43_001),
+    });
+    const second = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "b-retained-claude",
+      title: "Second retained Claude candidate",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "live",
+      sourceProcessIdentity: identity(43_002),
+    });
+    store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "c-old-claude",
+      title: "Old Claude candidate",
+      state: "terminal",
+      providerUpdatedAt: 9,
+      liveness: "live",
+      sourceProcessIdentity: identity(43_003),
+    });
+    store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "d-identity-free-claude",
+      title: "Identity-free Claude candidate",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "unknown",
+      sourceProcessIdentity: null,
+    });
+    expect(store.listRecentClaudeSessionAdoptionCandidatesWithSourceIdentity({
+      providerUpdatedAfter: 10,
+      limit: 1,
+    }).map((candidate) => candidate.providerThreadId)).toEqual([first.providerThreadId]);
+    store.updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+      providerThreadId: first.providerThreadId,
+      expectedRevision: first.revision,
+      expectedSourceProcessIdentity: identity(43_001),
+      liveness: "live",
+    });
+    expect(store.listRecentClaudeSessionAdoptionCandidatesWithSourceIdentity({
+      providerUpdatedAfter: 10,
+      limit: 2,
+    }).map((candidate) => candidate.providerThreadId)).toEqual([
+      second.providerThreadId,
+      first.providerThreadId,
+    ]);
+  });
+
+  test("retains HRA live time only for an exact-pinned Claude process identity", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-live-time-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const identity = {
+      pid: 44_001,
+      pidDomain: "darwin" as const,
+      procStart: "claude-live-time-original",
+    };
+    const first = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "claude-live-time",
+      title: "Claude live time",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "live",
+      sourceProcessIdentity: identity,
+      trustedLiveObservation: true,
+    });
+    expect(first.lastLiveObservedAt).toBe(1_000);
+
+    now = 1_100;
+    const nonLiveObservation = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: first.providerThreadId,
+      title: first.title,
+      state: first.providerState,
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    expect(nonLiveObservation.lastLiveObservedAt).toBe(1_000);
+
+    now = 1_200;
+    const nonLiveProbe = store.updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+      providerThreadId: first.providerThreadId,
+      expectedRevision: nonLiveObservation.revision,
+      expectedSourceProcessIdentity: identity,
+      liveness: "not_live",
+    });
+    expect(nonLiveProbe.lastLiveObservedAt).toBe(1_000);
+
+    now = 1_300;
+    const unpinnedLiveObservation = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: first.providerThreadId,
+      title: first.title,
+      state: first.providerState,
+      providerUpdatedAt: 10,
+      liveness: "live",
+    });
+    expect(unpinnedLiveObservation.lastLiveObservedAt).toBe(1_000);
+
+    now = 1_400;
+    const liveProbe = store.updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+      providerThreadId: first.providerThreadId,
+      expectedRevision: unpinnedLiveObservation.revision,
+      expectedSourceProcessIdentity: identity,
+      liveness: "live",
+    });
+    expect(liveProbe.lastLiveObservedAt).toBe(1_400);
+
+    now = 1_500;
+    const replacement = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: first.providerThreadId,
+      title: first.title,
+      state: first.providerState,
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+      sourceProcessIdentity: {
+        pid: 44_002,
+        pidDomain: "darwin",
+        procStart: "claude-live-time-replacement",
+      },
+    });
+    expect(replacement.lastLiveObservedAt).toBeNull();
+
+    expect(() => store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "claude-unpinned-trusted-live",
+      title: "Claude unpinned trusted live",
+      state: "active",
+      liveness: "live",
+      trustedLiveObservation: true,
+    })).toThrow("SESSION_ADOPTION_TRUSTED_LIVE_OBSERVATION_INVALID");
+    expect(() => store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "codex-non-live-trusted-observation",
+      title: "Codex non-live trusted observation",
+      state: "idle",
+      liveness: "not_live",
+      trustedLiveObservation: true,
+    })).toThrow("SESSION_ADOPTION_TRUSTED_LIVE_OBSERVATION_INVALID");
+
+    now = 1_600;
+    const codexLive = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "codex-trusted-live-time",
+      title: "Codex trusted live time",
+      state: "active",
+      activeTurnId: "codex-active-turn",
+      liveness: "live",
+      trustedLiveObservation: true,
+    });
+    expect(codexLive.lastLiveObservedAt).toBe(1_600);
+    now = 1_700;
+    const codexQuiet = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: codexLive.providerThreadId,
+      title: codexLive.title,
+      state: "idle",
+      liveness: "not_live",
+    });
+    expect(codexQuiet.lastLiveObservedAt).toBe(1_600);
+    const codexClaiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: codexQuiet.providerThreadId,
+      expectedRevision: codexQuiet.revision,
+    });
+    now = 1_800;
+    expect(store.updateCodexSessionAdoptionCandidateLivenessAfterExactRead({
+      providerThreadId: codexClaiming.providerThreadId,
+      expectedRevision: codexClaiming.revision,
+      liveness: "live",
+      trustedLiveObservation: true,
+    }).lastLiveObservedAt).toBe(1_800);
+  });
+
+  test("excludes current Claude discoveries before bounding retained reprobes", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-retained-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const store = new StateStore(paths, { now: () => 2_000 });
+    stores.push(store);
+    const identity = (pid: number) => ({
+      pid,
+      pidDomain: "darwin" as const,
+      procStart: `claude-retained-${pid}`,
+    });
+    const vanished = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "z-vanished-retained-claude",
+      title: "Vanished retained Claude",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "live",
+      sourceProcessIdentity: identity(45_000),
+      trustedLiveObservation: true,
+    });
+    const vanishedNonLive = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: vanished.providerThreadId,
+      title: vanished.title,
+      state: vanished.providerState,
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    expect(vanishedNonLive.lastLiveObservedAt).toBe(2_000);
+
+    const currentProviderThreadIds: string[] = [];
+    for (let index = 0; index < 125; index += 1) {
+      const providerThreadId = `a-current-claude-${String(index).padStart(3, "0")}`;
+      currentProviderThreadIds.push(providerThreadId);
+      store.upsertSessionAdoptionCandidate({
+        provider: "claude",
+        providerThreadId,
+        title: `Current Claude ${index}`,
+        state: "terminal",
+        providerUpdatedAt: 10,
+        liveness: "live",
+        sourceProcessIdentity: identity(45_001 + index),
+        trustedLiveObservation: true,
+      });
+    }
+    store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "a-no-exact-live-proof",
+      title: "No exact live proof",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "live",
+    });
+
+    expect(store.listRetainedClaudeSessionAdoptionCandidatesWithSourceIdentity({
+      excludeProviderThreadIds: currentProviderThreadIds,
+      liveObservedAfter: 2_000,
+      limit: 1,
+    }).map((candidate) => candidate.providerThreadId)).toEqual([
+      vanished.providerThreadId,
+    ]);
+    expect(store.listRetainedClaudeSessionAdoptionCandidatesWithSourceIdentity({
+      excludeProviderThreadIds: currentProviderThreadIds,
+      liveObservedAfter: 2_001,
+    })).toEqual([]);
+    expect(() => store.listRetainedClaudeSessionAdoptionCandidatesWithSourceIdentity({
+      excludeProviderThreadIds: Array.from({ length: 201 }, () => "duplicate-thread"),
+      liveObservedAfter: 0,
+    })).toThrow();
+    expect(() => store.listRetainedClaudeSessionAdoptionCandidatesWithSourceIdentity({
+      excludeProviderThreadIds: [],
+      liveObservedAfter: 0,
+      limit: 201,
+    })).toThrow();
+  });
+
+  test("orders retained Claude reprobes by attempt age then HRA live age", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-order-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const observe = (providerThreadId: string, pid: number) =>
+      store.upsertSessionAdoptionCandidate({
+        provider: "claude",
+        providerThreadId,
+        title: providerThreadId,
+        state: "terminal",
+        liveness: "live",
+        sourceProcessIdentity: {
+          pid,
+          pidDomain: "darwin",
+          procStart: `retained-order-${pid}`,
+        },
+        trustedLiveObservation: true,
+      });
+    const neverAttemptedOld = observe("z-never-attempted-old", 47_001);
+    now = 2_000;
+    const neverAttemptedNew = observe("a-never-attempted-new", 47_002);
+    now = 3_000;
+    const attemptedOld = observe("a-attempted-old", 47_003);
+    now = 4_000;
+    const attemptedNew = observe("z-attempted-new", 47_004);
+    now = 5_000;
+    store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: attemptedOld.providerThreadId,
+      expectedRevision: attemptedOld.revision,
+    });
+    now = 6_000;
+    store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: attemptedNew.providerThreadId,
+      expectedRevision: attemptedNew.revision,
+    });
+
+    expect(store.listRetainedClaudeSessionAdoptionCandidatesWithSourceIdentity({
+      excludeProviderThreadIds: [],
+      liveObservedAfter: 0,
+      limit: 4,
+    }).map((candidate) => candidate.providerThreadId)).toEqual([
+      neverAttemptedOld.providerThreadId,
+      neverAttemptedNew.providerThreadId,
+      attemptedOld.providerThreadId,
+      attemptedNew.providerThreadId,
+    ]);
+  });
+
+  test("claims Claude only after liveness ends and fences profile removal", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Claude adopter", "claude-adopter@example.com");
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const live = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "claude-personal-thread",
+      title: "Claude terminal session",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "live",
+    });
+    const processIdentity = {
+      pid: 42_001,
+      pidDomain: "darwin" as const,
+      procStart: "Fri Sep  4 12:00:00 2026",
+    };
+    store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: live.providerThreadId,
+      expectedRevision: live.revision,
+    });
+    store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: live.providerThreadId,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      identity: processIdentity,
+    });
+    const claimedLive = store.listSessionAdoptionCandidates({ provider: "claude" })[0];
+    if (claimedLive === undefined) throw new Error("Expected the claimed Claude candidate.");
+    expect(() => store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      provider: "claude",
+      providerThreadId: live.providerThreadId,
+      expectedCandidateRevision: claimedLive.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      fastEnabled: false,
+      runtimeProfile: claudeAdoptionRuntimeProfile(store.requireProviderAccountAuthority(profile.id, "claude")),
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity: processIdentity,
+    })).toThrow("SESSION_ADOPTION_SOURCE_STILL_LIVE");
+
+    const stopped = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "claude-personal-thread",
+      title: "Claude terminal session",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      provider: "claude",
+      providerThreadId: stopped.providerThreadId,
+      expectedCandidateRevision: stopped.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      fastEnabled: false,
+      runtimeProfile: claudeAdoptionRuntimeProfile(store.requireProviderAccountAuthority(profile.id, "claude")),
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity: processIdentity,
+    });
+    expect(adopted.session.state).toBe("terminal");
+    expect(() => store.removeProfile(profile.id))
+      .toThrow("SESSION_ADOPTION_PROFILE_ACTIVE_BINDINGS");
+
+    expect(store.setSessionAdoptionPolicy({
+      provider: "claude",
+      profileId: null,
+    })).toMatchObject({ enabled: false, profileId: null });
+    expect(store.readSessionPersonalRuntimeBinding(adopted.session.id)).toMatchObject({
+      state: "active",
+    });
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: live.providerThreadId,
+      profileId: profile.id,
+      runtimeScope: "personal",
+    })).toMatchObject({ state: "bound", sessionId: adopted.session.id });
+
+    const claimedProcess = store.readClaudeProcessAuthority({
+      providerThreadId: live.providerThreadId,
+      profileId: profile.id,
+      runtimeScope: "personal",
+    });
+    if (claimedProcess === null) throw new Error("Expected Claude process custody.");
+    const releasingProcess = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: claimedProcess.providerThreadId,
+      profileId: claimedProcess.profileId,
+      runtimeScope: claimedProcess.runtimeScope,
+      expectedRevision: claimedProcess.revision,
+      identity: claimedProcess.identity,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasingProcess.providerThreadId,
+      profileId: releasingProcess.profileId,
+      runtimeScope: releasingProcess.runtimeScope,
+      expectedRevision: releasingProcess.revision,
+      identity: releasingProcess.identity,
+    });
+    store.detachPersonalSession({ sessionId: adopted.session.id });
+    store.removeProfile(profile.id);
+    expect(store.requireProfileById(profile.id, { includeRemoved: true }).state).toBe("removed");
+    expect(store.readSessionAdoptionPolicy("claude")).toMatchObject({
+      enabled: false,
+      profileId: null,
+    });
+  });
+
+  test("adopts and queues personal Claude while the sibling Codex profile is signed out", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Signed-out Codex Claude adopter");
+    expect(profile).toMatchObject({ processGeneration: 0, state: "signed_out" });
+    const unproven = store.createSession({
+      profileId: profile.id,
+      provider: "claude",
+      preset: "fable-max",
+      fastEnabled: false,
+    });
+    expect(() => store.bindSessionProviderAccountAuthority({
+      sessionId: unproven.id,
+      provider: "claude",
+      runtimeScope: "managed",
+      accountKey: testProviderAccountKey("codex"),
+    })).toThrow("SESSION_PROVIDER_ACCOUNT_AUTHORITY_KEY_MISMATCH");
+    expect(store.setSessionAdoptionPolicy({
+      provider: "claude",
+      profileId: profile.id,
+    })).toMatchObject({ enabled: true, profileId: profile.id, provider: "claude" });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "signed-out-codex-claude-personal-thread",
+      title: "Claude remains authoritative",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: "signed-out-codex-claude-personal-thread",
+      expectedRevision: candidate.revision,
+    });
+    const processIdentity = {
+      pid: 42_099,
+      pidDomain: "darwin" as const,
+      procStart: "Fri Sep  4 12:09:00 2026",
+    };
+    store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: candidate.providerThreadId,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      identity: processIdentity,
+    });
+    const claimed = store.listSessionAdoptionCandidates({ provider: "claude" })
+      .find((entry) => entry.providerThreadId === candidate.providerThreadId);
+    if (claimed === undefined) throw new Error("Expected the claimed Claude candidate.");
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      provider: "claude",
+      providerThreadId: candidate.providerThreadId,
+      expectedCandidateRevision: claimed.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      fastEnabled: false,
+      runtimeProfile: claudeAdoptionRuntimeProfile(store.requireProviderAccountAuthority(profile.id, "claude")),
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity: processIdentity,
+    });
+    expect(store.sessionAccountAuthorityMatches(adopted.session.id, profile.id)).toBe(true);
+    expect(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      limit: 10,
+      requireCurrentAccountAuthority: true,
+    }).sessions.map((session) => session.id)).toEqual([adopted.session.id]);
+    expect(store.enqueue(adopted.session.id, "Continue from the schedule")).toMatchObject({
+      sessionId: adopted.session.id,
+      state: "pending",
+    });
+  });
+
+  test("restarts a generation-zero adopted Claude session after exact process release", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Generation-zero Claude restart");
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const session = adoptPersonalClaudeTestSession(store, profile);
+    const authority = store.readClaudeProcessAuthority({
+      providerThreadId: session.providerThreadId as string,
+      profileId: profile.id,
+      runtimeScope: "personal",
+    });
+    if (authority === null) throw new Error("Expected Claude process authority.");
+    const releasing = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: authority.providerThreadId,
+      profileId: authority.profileId,
+      runtimeScope: authority.runtimeScope,
+      expectedRevision: authority.revision,
+      identity: authority.identity,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasing.providerThreadId,
+      profileId: releasing.profileId,
+      runtimeScope: releasing.runtimeScope,
+      expectedRevision: releasing.revision,
+      identity: releasing.identity,
+    });
+
+    expect(store.nextDaemonGeneration(`boot_${"0".repeat(32)}`)).toBe(1);
+    expect(store.requireProfileById(profile.id)).toMatchObject({
+      processGeneration: 1,
+      state: "signed_out",
+    });
+    expect(store.requireSession(session.id)).toMatchObject({ state: "idle" });
+    expect(store.readSessionPersonalRuntimeBinding(session.id)).toMatchObject({
+      state: "active",
+    });
+  });
+
+  test("carries generation-zero personal and scoped revocations through restart", async () => {
+    const { store } = await fixture();
+    const globalProfile = store.createProfile("Generation-zero global revocation");
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: globalProfile.id });
+    const globalSession = adoptPersonalClaudeTestSession(store, globalProfile);
+    const global = store.beginProfilePersonalAuthorityRevocation({
+      profileId: globalProfile.id,
+      expectedGeneration: globalProfile.processGeneration,
+      workStore: createRevocationWorkStore(store),
+    });
+    const releasePersonalClaudeAuthority = (
+      targetStore: StateStore,
+      profile: Readonly<{ id: string }>,
+      session: Readonly<{ providerThreadId?: string | null }>,
+    ): void => {
+      const authority = targetStore.readClaudeProcessAuthority({
+        providerThreadId: session.providerThreadId as string,
+        profileId: profile.id,
+        runtimeScope: "personal",
+      });
+      if (authority === null) throw new Error("Expected Claude process authority.");
+      const releasing = targetStore.beginClaudeProcessAuthorityRelease({
+        providerThreadId: authority.providerThreadId,
+        profileId: authority.profileId,
+        runtimeScope: authority.runtimeScope,
+        expectedRevision: authority.revision,
+        identity: authority.identity,
+      });
+      targetStore.completeClaudeProcessAuthorityRelease({
+        providerThreadId: releasing.providerThreadId,
+        profileId: releasing.profileId,
+        runtimeScope: releasing.runtimeScope,
+        expectedRevision: releasing.revision,
+        identity: releasing.identity,
+      });
+    };
+    releasePersonalClaudeAuthority(store, globalProfile, globalSession);
+
+    expect(store.nextDaemonGeneration(`boot_${"1".repeat(32)}`)).toBe(1);
+    const rolledGlobal = store.requireProfileById(globalProfile.id);
+    expect(store.readProfilePersonalAuthorityRevocation(globalProfile.id)).toMatchObject({
+      profileGeneration: rolledGlobal.processGeneration,
+      revision: global.revocation.revision + 1,
+      state: "releasing",
+    });
+    expect(rolledGlobal.processGeneration).toBe(1);
+    // This is Codex-only revocation. The separate Claude binding was never
+    // detached, and a proved process release is not permission to detach it.
+    expect(global.bindings).toEqual([]);
+    expect(global.sessionIds).toEqual([]);
+    const retainedClaude = store.requireCapturedSessionProviderAuthority(globalSession.id);
+    expect(store.readSessionPersonalRuntimeBinding(globalSession.id)?.state).toBe("active");
+    expect(store.completeProfilePersonalAuthorityRevocation({
+      profileId: globalProfile.id,
+      expectedGeneration: rolledGlobal.processGeneration,
+    })).toMatchObject({ processGeneration: 2, state: "signed_out" });
+    expect(store.requireCapturedSessionProviderAuthority(globalSession.id)).toEqual(retainedClaude);
+    expect(store.readSessionPersonalRuntimeBinding(globalSession.id)?.state).toBe("active");
+
+    const { store: scopedStore } = await fixture();
+    const scopedProfile = scopedStore.createProfile("Generation-zero scoped revocation");
+    scopedStore.setSessionAdoptionPolicy({ provider: "claude", profileId: scopedProfile.id });
+    const scopedSession = adoptPersonalClaudeTestSession(scopedStore, scopedProfile);
+    const scoped = scopedStore.beginProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      expectedGeneration: scopedProfile.processGeneration,
+      provider: "claude",
+      runtimeScope: "personal",
+      currentAccountKey: null,
+      workStore: createRevocationWorkStore(scopedStore),
+    });
+    releasePersonalClaudeAuthority(scopedStore, scopedProfile, scopedSession);
+
+    expect(scopedStore.nextDaemonGeneration(`boot_${"2".repeat(32)}`)).toBe(1);
+    const rolledScoped = scopedStore.requireProfileById(scopedProfile.id);
+    expect(scopedStore.readProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      provider: "claude",
+      runtimeScope: "personal",
+    })).toMatchObject({
+      profileGeneration: rolledScoped.processGeneration,
+      revision: scoped.revocation.revision + 1,
+      state: "releasing",
+    });
+    expect(rolledScoped.processGeneration).toBe(1);
+
+    scopedStore.completePersonalSessionDetach({ sessionId: scopedSession.id, archive: false });
+    const rolledScopedRevocation = scopedStore.readProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      provider: "claude",
+      runtimeScope: "personal",
+    });
+    if (rolledScopedRevocation === null) throw new Error("Expected scoped revocation.");
+    expect(scopedStore.completeProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      expectedGeneration: rolledScoped.processGeneration,
+      provider: "claude",
+      runtimeScope: "personal",
+      expectedRevision: rolledScopedRevocation.revision,
+    })).toMatchObject({ state: "completed" });
+  });
+
+  test("advances generation-zero revocations even before a session exists", async () => {
+    const { store } = await fixture();
+    const globalProfile = store.createProfile("Generation-zero empty global revocation");
+    const scopedProfile = store.createProfile("Generation-zero empty scoped revocation");
+    const global = store.beginProfilePersonalAuthorityRevocation({
+      profileId: globalProfile.id,
+      expectedGeneration: globalProfile.processGeneration,
+      workStore: createRevocationWorkStore(store),
+    });
+    const scoped = store.beginProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      expectedGeneration: scopedProfile.processGeneration,
+      provider: "claude",
+      runtimeScope: "personal",
+      currentAccountKey: null,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(global.sessionIds).toEqual([]);
+    expect(scoped.sessionIds).toEqual([]);
+
+    expect(store.nextDaemonGeneration(`boot_${"3".repeat(32)}`)).toBe(1);
+    const rolledGlobal = store.requireProfileById(globalProfile.id);
+    const rolledScoped = store.requireProfileById(scopedProfile.id);
+    expect(rolledGlobal.processGeneration).toBe(1);
+    expect(rolledScoped.processGeneration).toBe(1);
+    expect(store.readProfilePersonalAuthorityRevocation(globalProfile.id)).toMatchObject({
+      profileGeneration: 1,
+      revision: global.revocation.revision + 1,
+      state: "releasing",
+    });
+    expect(store.readProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      provider: "claude",
+      runtimeScope: "personal",
+    })).toMatchObject({
+      profileGeneration: 1,
+      revision: scoped.revocation.revision + 1,
+      state: "releasing",
+    });
+
+    expect(store.completeProfilePersonalAuthorityRevocation({
+      profileId: globalProfile.id,
+      expectedGeneration: rolledGlobal.processGeneration,
+    })).toMatchObject({ processGeneration: 2, state: "signed_out" });
+    const rolledScopedRevocation = store.readProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      provider: "claude",
+      runtimeScope: "personal",
+    });
+    if (rolledScopedRevocation === null) throw new Error("Expected scoped revocation.");
+    expect(store.completeProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      expectedGeneration: rolledScoped.processGeneration,
+      provider: "claude",
+      runtimeScope: "personal",
+      expectedRevision: rolledScopedRevocation.revision,
+    })).toMatchObject({ profileGeneration: 1, state: "completed" });
+  });
+
+  test("scopes Claude process authority by provider home and releases only the exact row", async () => {
+    const { store } = await fixture();
+    const first = signInProfile(store, "First Claude home", "first-claude-home@example.com");
+    const second = signInProfile(store, "Second Claude home", "second-claude-home@example.com");
+    const sharedThreadId = "same-opaque-claude-thread";
+    const records = [
+      store.recordClaimedClaudeProcessAuthority({
+        providerAuthority: store.requireProviderAccountAuthority(first.id, "claude"),
+        providerThreadId: sharedThreadId,
+        profileId: first.id,
+        profileGeneration: first.processGeneration,
+        runtimeScope: "managed",
+        identity: { pid: 51_001, pidDomain: "darwin", procStart: "managed-first" },
+      }),
+      store.recordClaimedClaudeProcessAuthority({
+        providerAuthority: store.requireProviderAccountAuthority(first.id, "claude"),
+        providerThreadId: sharedThreadId,
+        profileId: first.id,
+        profileGeneration: first.processGeneration,
+        runtimeScope: "personal",
+        identity: { pid: 51_002, pidDomain: "darwin", procStart: "personal-first" },
+      }),
+      store.recordClaimedClaudeProcessAuthority({
+        providerAuthority: store.requireProviderAccountAuthority(second.id, "claude"),
+        providerThreadId: sharedThreadId,
+        profileId: second.id,
+        profileGeneration: second.processGeneration,
+        runtimeScope: "personal",
+        identity: { pid: 51_003, pidDomain: "darwin", procStart: "personal-second" },
+      }),
+    ];
+    expect(records.map((record) => [record.runtimeScope, record.profileId])).toEqual([
+      ["managed", first.id],
+      ["personal", first.id],
+      ["personal", second.id],
+    ]);
+
+    const selected = records[2];
+    if (selected === undefined) throw new Error("Expected a selected authority row.");
+    const releasing = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: selected.providerThreadId,
+      profileId: selected.profileId,
+      runtimeScope: selected.runtimeScope,
+      expectedRevision: selected.revision,
+      identity: selected.identity,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasing.providerThreadId,
+      profileId: releasing.profileId,
+      runtimeScope: releasing.runtimeScope,
+      expectedRevision: releasing.revision,
+      identity: releasing.identity,
+    });
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: sharedThreadId,
+      profileId: second.id,
+      runtimeScope: "personal",
+    })?.state).toBe("released");
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: sharedThreadId,
+      profileId: first.id,
+      runtimeScope: "managed",
+    })?.state).toBe("claimed");
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: sharedThreadId,
+      profileId: first.id,
+      runtimeScope: "personal",
+    })?.state).toBe("claimed");
+  });
+
+  test("stages one-shot Claude launch intent authority and fences restaging ABA", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Claude launch intent",
+      "claude-launch-intent@example.com",
+    );
+    const firstSession = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "launch-intent-thread",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const secondSession = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "second-launch-for-same-session",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const staged = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "launch-intent-thread",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: firstSession.id,
+    });
+    expect(staged).toMatchObject({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      providerThreadId: "launch-intent-thread",
+      revision: 1,
+      runtimeScope: "managed",
+      sessionId: firstSession.id,
+    });
+    expect(staged.intentId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
+    );
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(staged.profileId, "claude"),
+      providerThreadId: staged.providerThreadId,
+      profileId: staged.profileId,
+      profileGeneration: staged.profileGeneration,
+      runtimeScope: staged.runtimeScope,
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: firstSession.id,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
+    expect(store.readClaudeProcessLaunchIntent({
+      providerThreadId: staged.providerThreadId,
+      profileId: staged.profileId,
+      runtimeScope: staged.runtimeScope,
+    })).toEqual(staged);
+    expect(store.listClaudeProcessLaunchIntents()).toEqual([staged]);
+    expect(store.profileHasClaudeProcessLaunchIntents(
+      profile.id,
+      profile.processGeneration,
+    )).toBe(true);
+
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(staged.profileId, "claude"),
+      providerThreadId: staged.providerThreadId,
+      profileId: staged.profileId,
+      profileGeneration: staged.profileGeneration,
+      runtimeScope: staged.runtimeScope,
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: secondSession.id,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_AUTHORITY_MISMATCH");
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(staged.profileId, "claude"),
+      providerThreadId: "second-launch-for-same-session",
+      profileId: staged.profileId,
+      profileGeneration: staged.profileGeneration,
+      runtimeScope: staged.runtimeScope,
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: firstSession.id,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_AUTHORITY_MISMATCH");
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "stale-launch-intent",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration + 1,
+      runtimeScope: "managed",
+      providerAccountKey: testProviderAccountKey("claude"),
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_PROFILE_STALE");
+    const signedOut = store.createProfile("Signed-out Claude launch");
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(signedOut.id, "claude"),
+      providerThreadId: "signed-out-launch-intent",
+      profileId: signedOut.id,
+      profileGeneration: signedOut.processGeneration,
+      runtimeScope: "managed",
+      providerAccountKey: testProviderAccountKey("claude"),
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_ADOPTION_AUTHORITY_MISMATCH");
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "missing-personal-adoption-candidate",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      providerAccountKey: testProviderAccountKey("claude"),
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_ADOPTION_AUTHORITY_MISMATCH");
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const adoptionCandidate = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "personal-adoption-launch-intent",
+      title: "Personal adoption launch intent",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: adoptionCandidate.providerThreadId,
+      expectedRevision: adoptionCandidate.revision,
+    });
+    const adoptionIntent = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: adoptionCandidate.providerThreadId,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      providerAccountKey: testProviderAccountKey("claude"),
+    });
+    expect(adoptionIntent.sessionId).toBeNull();
+    store.cancelClaudeProcessLaunchIntent({
+      providerThreadId: adoptionIntent.providerThreadId,
+      profileId: adoptionIntent.profileId,
+      profileGeneration: adoptionIntent.profileGeneration,
+      runtimeScope: adoptionIntent.runtimeScope,
+      intentId: adoptionIntent.intentId,
+      expectedRevision: adoptionIntent.revision,
+    });
+
+    expect(() => store.cancelClaudeProcessLaunchIntent({
+      providerThreadId: staged.providerThreadId,
+      profileId: staged.profileId,
+      profileGeneration: staged.profileGeneration,
+      runtimeScope: staged.runtimeScope,
+      intentId: "00000000-0000-4000-8000-000000000001",
+      expectedRevision: staged.revision,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
+    expect(store.cancelClaudeProcessLaunchIntent({
+      providerThreadId: staged.providerThreadId,
+      profileId: staged.profileId,
+      profileGeneration: staged.profileGeneration,
+      runtimeScope: staged.runtimeScope,
+      intentId: staged.intentId,
+      expectedRevision: staged.revision,
+    })).toEqual(staged);
+    const restaged = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(staged.profileId, "claude"),
+      providerThreadId: staged.providerThreadId,
+      profileId: staged.profileId,
+      profileGeneration: staged.profileGeneration,
+      runtimeScope: staged.runtimeScope,
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: firstSession.id,
+    });
+    expect(restaged.intentId).not.toBe(staged.intentId);
+    expect(() => store.cancelClaudeProcessLaunchIntent({
+      providerThreadId: staged.providerThreadId,
+      profileId: staged.profileId,
+      profileGeneration: staged.profileGeneration,
+      runtimeScope: staged.runtimeScope,
+      intentId: staged.intentId,
+      expectedRevision: staged.revision,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
+    expect(store.readClaudeProcessLaunchIntent({
+      providerThreadId: restaged.providerThreadId,
+      profileId: restaged.profileId,
+      runtimeScope: restaged.runtimeScope,
+    })).toEqual(restaged);
+
+    const liveSession = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "already-live-launch-intent",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const process = store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "already-live-launch-intent",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      sessionId: liveSession.id,
+      identity: {
+        pid: 51_050,
+        pidDomain: "darwin",
+        procStart: "already-live-before-launch-intent",
+      },
+    });
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(process.profileId, "claude"),
+      providerThreadId: process.providerThreadId,
+      profileId: process.profileId,
+      profileGeneration: process.profileGeneration,
+      runtimeScope: process.runtimeScope,
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: liveSession.id,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_PROCESS_LIVE");
+  });
+
+  test("atomically hands exact Claude launch intent authority to exact process custody", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Claude launch handoff",
+      "claude-launch-handoff@example.com",
+    );
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "launch-handoff-thread",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const otherSession = store.createSession({
+      profileId: profile.id,
+      provider: "claude",
+      preset: "fable-max",
+      fastEnabled: false,
+    });
+    const intent = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "launch-handoff-thread",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: session.id,
+    });
+    const collidingIdentity = {
+      pid: 51_051,
+      pidDomain: "darwin" as const,
+      procStart: "launch-handoff-collision",
+    };
+    store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "launch-handoff-existing-process",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      identity: collidingIdentity,
+    });
+    const claim = (overrides: Partial<Parameters<
+      StateStore["recordClaimedClaudeProcessAuthority"]
+    >[0]> = {}) => store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(intent.profileId, "claude"),
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      profileGeneration: intent.profileGeneration,
+      runtimeScope: intent.runtimeScope,
+      ...(intent.sessionId === null ? {} : { sessionId: intent.sessionId }),
+      identity: {
+        pid: 51_052,
+        pidDomain: "darwin",
+        procStart: "launch-handoff-exact-process",
+      },
+      expectedLaunchIntentId: intent.intentId,
+      expectedLaunchIntentRevision: intent.revision,
+      ...overrides,
+    });
+
+    expect(() => claim({
+      expectedLaunchIntentId: "00000000-0000-4000-8000-000000000002",
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
+    expect(() => claim({ sessionId: otherSession.id }))
+      .toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
+    expect(() => claim({ identity: collidingIdentity })).toThrow();
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toBeNull();
+    expect(store.readClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toEqual(intent);
+
+    const claimed = claim();
+    expect(claimed).toMatchObject({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      profileGeneration: intent.profileGeneration,
+      runtimeScope: intent.runtimeScope,
+      sessionId: session.id,
+      state: "claimed",
+      identity: {
+        pid: 51_052,
+        pidDomain: "darwin",
+        procStart: "launch-handoff-exact-process",
+      },
+    });
+    expect(store.readClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toBeNull();
+    expect(() => claim()).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toEqual(claimed);
+  });
+
+  test("fences Claude launch intents across completed scoped account revocations", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Claude launch account fence",
+      "claude-launch-account-fence@example.com",
+    );
+    const accountKey = testProviderAccountKey("claude");
+    const replacementKey = namedProviderAccountKey("claude", "replacement-launch-account");
+    const selector = {
+      profileId: profile.id,
+      provider: "claude" as const,
+      runtimeScope: "managed" as const,
+    };
+
+    const unavailable = store.beginProviderRuntimeAccountRevocation({
+      ...selector,
+      expectedGeneration: profile.processGeneration,
+      currentAccountKey: null,
+      workStore: createRevocationWorkStore(store),
+    });
+    store.completeProviderRuntimeAccountRevocation({
+      ...selector,
+      expectedGeneration: profile.processGeneration,
+      expectedRevision: unavailable.revocation.revision,
+    });
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "completed-null-launch",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      providerAccountKey: accountKey,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_ACCOUNT_STALE");
+    expect(() => store.clearCompletedProviderRuntimeAccountRevocation({
+      ...selector,
+      expectedGeneration: profile.processGeneration,
+      currentAccountKey: accountKey,
+    })).toThrow("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_NOT_RECONCILED");
+
+    const reconciled = store.beginProviderRuntimeAccountRevocation({
+      ...selector,
+      expectedGeneration: profile.processGeneration,
+      currentAccountKey: accountKey,
+      workStore: createRevocationWorkStore(store),
+    });
+    store.completeProviderRuntimeAccountRevocation({
+      ...selector,
+      expectedGeneration: profile.processGeneration,
+      expectedRevision: reconciled.revocation.revision,
+    });
+    store.clearCompletedProviderRuntimeAccountRevocation({
+      ...selector,
+      expectedGeneration: profile.processGeneration,
+      currentAccountKey: accountKey,
+    });
+    expect(store.readProviderRuntimeAccountRevocation(selector)).toBeNull();
+
+    const exactSession = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "completed-mismatch-launch",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: accountKey,
+    });
+    const intent = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "completed-mismatch-launch",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      providerAccountKey: accountKey,
+      sessionId: exactSession.id,
+    });
+    const mismatched = store.beginProviderRuntimeAccountRevocation({
+      ...selector,
+      expectedGeneration: profile.processGeneration,
+      currentAccountKey: replacementKey,
+      workStore: createRevocationWorkStore(store),
+    });
+    // Simulate a pre-fix crash state that incorrectly marked the fence complete
+    // while the launch intent survived. Both stage and claim must still fail.
+    const raw = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      raw.query(
+        `UPDATE provider_runtime_account_revocations
+         SET state='completed',revision=revision+1,
+           updated_at=updated_at+1,completed_at=updated_at+1
+         WHERE profile_id=? AND provider='claude' AND runtime_scope='managed'
+           AND revision=? AND state='releasing'`,
+      ).run(profile.id, mismatched.revocation.revision);
+    } finally {
+      raw.close(false);
+    }
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "second-completed-mismatch-launch",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      providerAccountKey: accountKey,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_ACCOUNT_STALE");
+    expect(() => store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(intent.profileId, "claude"),
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      profileGeneration: intent.profileGeneration,
+      runtimeScope: intent.runtimeScope,
+      sessionId: exactSession.id,
+      identity: {
+        pid: 51_053,
+        pidDomain: "darwin",
+        procStart: "completed-mismatch-launch-process",
+      },
+      expectedLaunchIntentId: intent.intentId,
+      expectedLaunchIntentRevision: intent.revision,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_ACCOUNT_STALE");
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toBeNull();
+    expect(store.readClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toEqual(intent);
+  });
+
+  test("launch intents isolate Claude authority from Codex state and identity changes", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Claude launch guards",
+      "claude-launch-guards@example.com",
+    );
+    const otherProfile = signInProfile(
+      store,
+      "Other Claude launch guards",
+      "other-claude-launch-guards@example.com",
+    );
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "launch-guard-thread",
+      title: "Claude launch guard candidate",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const intent = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "launch-guard-thread",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      providerAccountKey: testProviderAccountKey("claude"),
+    });
+
+    expect(() => store.setSessionAdoptionPolicy({
+      provider: "claude",
+      profileId: null,
+    })).toThrow("SESSION_ADOPTION_POLICY_UNSETTLED_CLAIM");
+    expect(() => store.setSessionAdoptionPolicy({
+      provider: "claude",
+      profileId: otherProfile.id,
+    })).toThrow("SESSION_ADOPTION_POLICY_UNSETTLED_CLAIM");
+    expect(store.readSessionAdoptionPolicy("claude")?.profileId).toBe(profile.id);
+
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_out",
+    )).toBe(true);
+    expect(() => store.removeProfile(profile.id)).toThrow();
+    const rolled = store.advanceProfileGeneration(
+      profile.id,
+      profile.processGeneration,
+    );
+    expect(rolled.processGeneration).toBe(profile.processGeneration + 1);
+    expect(intent.providerAuthority).toEqual(store.requireProviderAccountAuthority(profile.id, "claude"));
+    expect(store.readClaudeProcessLaunchIntent({ providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId, runtimeScope: intent.runtimeScope })).toEqual(intent);
+    expect(store.setProfileState(
+      profile.id,
+      rolled.processGeneration,
+      "signed_in",
+    )).toBe(true);
+    expect(store.setProfileState(
+      profile.id,
+      rolled.processGeneration,
+      "signed_in",
+      { email: "replacement-launch-identity@example.com", plan: "Plus" },
+    )).toBe(true);
+    expect(store.setProfileState(
+      profile.id,
+      rolled.processGeneration,
+      "recovery_required",
+      { email: "claude-launch-guards@example.com", plan: "Plus" },
+    )).toBe(true);
+    const retainedPolicy = store.readSessionAdoptionPolicy("claude");
+    expect(retainedPolicy).toMatchObject({ enabled: true, profileId: profile.id });
+
+    const { revocation } = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: rolled.processGeneration,
+      provider: "claude", runtimeScope: "personal", currentAccountKey: null,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(store.setProfileState(
+      profile.id,
+      rolled.processGeneration,
+      "recovery_required",
+      { email: "claude-launch-guards@example.com", plan: "Plus" },
+    )).toBe(true);
+    expect(() => store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: rolled.processGeneration,
+      provider: "claude", runtimeScope: "personal", expectedRevision: revocation.revision,
+    })).toThrow("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_CLAUDE_LAUNCH_INTENT_LIVE");
+    expect(store.readProviderRuntimeAccountRevocation({ profileId: profile.id,
+      provider: "claude", runtimeScope: "personal" })).toEqual(revocation);
+    store.cancelClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      profileGeneration: intent.profileGeneration,
+      runtimeScope: intent.runtimeScope,
+      intentId: intent.intentId,
+      expectedRevision: intent.revision,
+    });
+    expect(store.requireProfileById(profile.id)).toMatchObject({
+      processGeneration: rolled.processGeneration,
+      state: "recovery_required",
+    });
+    expect(store.readSessionAdoptionPolicy("claude")).toMatchObject({
+      enabled: false,
+      profileId: null,
+      revision: (retainedPolicy?.revision ?? 0) + 1,
+    });
+    expect(store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: rolled.processGeneration,
+      provider: "claude", runtimeScope: "personal", expectedRevision: revocation.revision,
+    }).state).toBe("completed");
+    expect(intent.providerAuthority).toEqual(store.requireProviderAccountAuthority(profile.id, "claude"));
+  });
+
+  test("launch intents fence session rebind and personal detach", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Claude launch session fences",
+      "claude-launch-session-fences@example.com",
+    );
+    const projectRoot = join(home, "claude-launch-session-fences");
+    await mkdir(projectRoot);
+    const project = await store.createProject(
+      "Claude launch session fences",
+      projectRoot,
+      true,
+    );
+    store.advanceProviderAccountProcessGeneration({ profileId: profile.id, provider: "claude", expectedProcessGeneration: 0 });
+    const startAuthority = store.advanceProviderAccountProcessGeneration({ profileId: profile.id, provider: "claude", expectedProcessGeneration: 1 });
+    expect(startAuthority.processGeneration).not.toBe(profile.processGeneration);
+    const startAttempt = store.prepareMutation({
+      kind: "session.start",
+      authorityId: profile.id,
+      authorityGeneration: startAuthority.processGeneration,
+      request: {
+        projectId: project.id,
+        provider: "claude",
+        preset: "fable-max",
+        fast: false,
+      },
+      idempotencyKey: "00000000-0000-4000-8000-000000000920",
+    });
+    const starting = store.beginSessionStartEffect({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      attemptId: startAttempt.id,
+      profileId: profile.id,
+      profileGeneration: startAuthority.processGeneration,
+      projectId: project.id,
+      provider: "claude",
+      preset: "fable-max",
+      fastEnabled: false,
+      providerAccountKey: testProviderAccountKey("claude"),
+      providerAuthentication: {
+        profileId: profile.id,
+        processGeneration: startAuthority.processGeneration,
+        provider: "claude",
+        signedIn: true,
+      },
+      evidence: {
+        kind: "session.start",
+        projectId: project.id,
+        clientMessageId: null,
+        messageDigest: null,
+        runtimeProfile: managedClaudeRuntimeProfile(store.requireProviderAccountAuthority(profile.id, "claude")),
+      },
+    });
+    const stageStartIntent = (overrides: Partial<Parameters<
+      StateStore["stageClaudeProcessLaunchIntent"]
+    >[0]> = {}) => store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "00000000-0000-4000-8000-000000000921",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: starting.id,
+      ...overrides,
+    });
+    expect(() => stageStartIntent({
+      providerThreadId: "not-a-reserved-start-thread",
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_AUTHORITY_MISMATCH");
+    expect(() => stageStartIntent({
+      providerAccountKey: namedProviderAccountKey("claude", "wrong-start-account"),
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_AUTHORITY_MISMATCH");
+    expect(() => stageStartIntent({
+      runtimeScope: "personal",
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_AUTHORITY_MISMATCH");
+    const startIntent = stageStartIntent();
+    expect(() => store.bindSession({
+      sessionId: starting.id,
+      expectedRevision: starting.revision,
+      providerThreadId: startIntent.providerThreadId,
+      state: "idle",
+    })).toThrow("live Claude process authority must be released before session rebind");
+    store.cancelClaudeProcessLaunchIntent({
+      providerThreadId: startIntent.providerThreadId,
+      profileId: startIntent.profileId,
+      profileGeneration: startIntent.profileGeneration,
+      runtimeScope: startIntent.runtimeScope,
+      intentId: startIntent.intentId,
+      expectedRevision: startIntent.revision,
+    });
+
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const adopted = adoptPersonalClaudeTestSession(store, profile);
+    if (adopted.providerThreadId === undefined) {
+      throw new Error("Expected an adopted Claude provider thread.");
+    }
+    const adoptedProcess = store.readClaudeProcessAuthority({
+      providerThreadId: adopted.providerThreadId,
+      profileId: profile.id,
+      runtimeScope: "personal",
+    });
+    if (adoptedProcess === null) throw new Error("Expected adopted Claude process custody.");
+    const releasing = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: adoptedProcess.providerThreadId,
+      profileId: adoptedProcess.profileId,
+      runtimeScope: adoptedProcess.runtimeScope,
+      expectedRevision: adoptedProcess.revision,
+      identity: adoptedProcess.identity,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasing.providerThreadId,
+      profileId: releasing.profileId,
+      runtimeScope: releasing.runtimeScope,
+      expectedRevision: releasing.revision,
+      identity: releasing.identity,
+    });
+    const detachIntent = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: adopted.providerThreadId,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: adopted.id,
+    });
+    expect(() => store.beginPersonalSessionDetach({
+      sessionId: adopted.id,
+    })).toThrow("Claude process launch intent must be cancelled before personal session detach");
+    store.cancelClaudeProcessLaunchIntent({
+      providerThreadId: detachIntent.providerThreadId,
+      profileId: detachIntent.profileId,
+      profileGeneration: detachIntent.profileGeneration,
+      runtimeScope: detachIntent.runtimeScope,
+      intentId: detachIntent.intentId,
+      expectedRevision: detachIntent.revision,
+    });
+    expect(store.detachPersonalSession({
+      sessionId: adopted.id,
+      archive: false,
+    }).binding.state).toBe("detached");
+  });
+
+  test("reopens durable Claude launch intents without changing their authority", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Claude launch reopen",
+      "claude-launch-reopen@example.com",
+    );
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "launch-reopen-thread",
+      title: "Claude launch reopen candidate",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const intent = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "launch-reopen-thread",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "personal",
+      providerAccountKey: testProviderAccountKey("claude"),
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const reopened = new StateStore(paths);
+    stores.push(reopened);
+    expect(reopened.readClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toEqual(intent);
+    expect(reopened.listClaudeProcessLaunchIntents()).toEqual([intent]);
+    expect(reopened.profileHasClaudeProcessLaunchIntents(
+      profile.id,
+      profile.processGeneration,
+    )).toBe(true);
+    const rolled = reopened.advanceProfileGeneration(
+      profile.id,
+      profile.processGeneration,
+    );
+    expect(rolled.processGeneration).toBe(profile.processGeneration + 1);
+    expect(intent.providerAuthority).toEqual(reopened.requireProviderAccountAuthority(profile.id, "claude"));
+    const bootId = `boot_${"b".repeat(32)}`;
+    expect(reopened.nextDaemonGeneration(bootId)).toBe(1);
+    expect(reopened.nextDaemonGeneration(bootId)).toBe(1);
+    expect(reopened.requireProfileById(profile.id)).toMatchObject({
+      processGeneration: rolled.processGeneration + 1,
+      state: "signed_in",
+    });
+    expect(reopened.readClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toEqual(intent);
+    expect(() => reopened.removeProfile(profile.id)).toThrow();
+  });
+
+  test("preserves exact legacy adoption-v36 launch authority and rows", async () => {
+    const value = await fixture();
+    let store = value.store;
+    const profile = signInProfile(
+      store,
+      "Legacy Claude launch proof",
+      "legacy-claude-launch-proof@example.com",
+    );
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "legacy-v36-launch-proof",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const intent = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "legacy-v36-launch-proof",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: session.id,
+    });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "legacy-v36-retained-candidate",
+      title: "Legacy v36 retained candidate",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "live",
+      sourceProcessIdentity: {
+        pid: 41_036,
+        pidDomain: "darwin",
+        procStart: "legacy-v36-retained-process",
+      },
+      trustedLiveObservation: true,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactLegacyAdoptionVersion36(legacy);
+      expect(legacy.query("SELECT name FROM pragma_table_info('sessions') WHERE name='preset_contract'").all()).toEqual([]);
+      expect(legacy.query("SELECT name FROM pragma_table_info('works') WHERE name='preset_contract'").all()).toEqual([]);
+    } finally {
+      legacy.close(false);
+    }
+
+    store = new StateStore(paths);
+    stores.push(store);
+    const retained = store.readClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    });
+    expect(retained).toEqual({ ...intent, providerAuthority: null });
+    expect(store.requireSession(session.id)).toMatchObject({
+      id: session.id,
+      providerThreadId: session.providerThreadId,
+    });
+    expect(store.readSessionAdoptionCandidate(
+      candidate.provider,
+      candidate.providerThreadId,
+    )).toMatchObject({
+      lastLiveObservedAt: null,
+      providerProjectRoot: null,
+      providerThreadId: candidate.providerThreadId,
+      sourceProcessIdentity: candidate.sourceProcessIdentity,
+      status: candidate.status,
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query(
+        "SELECT version FROM migrations WHERE version>=35 ORDER BY version",
+      ).all()).toEqual([
+        { version: 35 },
+        { version: 36 },
+        { version: 37 },
+        { version: 38 },
+        { version: 39 },
+        { version: 40 },
+        { version: 41 }, { version: 42 }, { version: 43 },
+        { version: 44 }, { version: 45 }, { version: 46 },
+        { version: 47 }, { version: 48 }, { version: 49 },
+      ]);
+      expect(inspector.query(
+        "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name='provider_project_root'",
+      ).get()).toEqual({ name: "provider_project_root" });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rejects a weakened same-name Work guard in legacy adoption-v36 without writes", async () => {
+    const { store } = await fixture();
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "legacy-v36-weakened-work-guard",
+      title: "Legacy v36 weakened Work guard",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "unknown",
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactLegacyAdoptionVersion36(legacy);
+      legacy.exec(`
+        DROP TRIGGER work_member_account_authority_guard;
+        CREATE TRIGGER work_member_account_authority_guard
+        BEFORE INSERT ON work_members BEGIN SELECT 1; END;
+      `);
+    } finally {
+      legacy.close(false);
+    }
+
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_SCHEMA_V39_LEGACY_ADOPTION_WORK_INVALID");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
+      expect(inspector.query(
+        `SELECT revision,claim_status FROM session_adoption_candidates
+         WHERE provider=? AND provider_thread_id=?`,
+      ).get(candidate.provider, candidate.providerThreadId)).toEqual({
+        claim_status: "pending",
+        revision: candidate.revision,
+      });
+      expect(inspector.query(
+        "SELECT 1 FROM sqlite_master WHERE name='notification_hours'",
+      ).get()).toBeNull();
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rejects a weakened same-name Work authority guard in current adoption-v39", async () => {
+    const { store } = await fixture();
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "current-v39-weakened-work-guard",
+      title: "Current v39 weakened Work guard",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "unknown",
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const weakened = new Database(paths.database, { create: false, strict: true });
+    try {
+      weakened.exec(`
+        DROP TRIGGER work_member_account_authority_guard;
+        CREATE TRIGGER work_member_account_authority_guard
+        BEFORE INSERT ON work_members BEGIN SELECT 1; END;
+      `);
+    } finally {
+      weakened.close(false);
+    }
+
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_SCHEMA_V39_ADOPTION_WORK_INVALID");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query(
+        `SELECT revision,claim_status FROM session_adoption_candidates
+         WHERE provider=? AND provider_thread_id=?`,
+      ).get(candidate.provider, candidate.providerThreadId)).toEqual({
+        claim_status: "pending",
+        revision: candidate.revision,
+      });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("carries an interrupted personal revocation across daemon generation rollover", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Restarted personal revocation",
+      "restarted-personal-revocation@example.com",
+    );
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "restarted-personal-revocation-thread",
+      title: "Restarted personal revocation",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      provider: "codex",
+      providerThreadId: claiming.providerThreadId,
+      expectedCandidateRevision: claiming.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    const workStore = store.createWorkStore(
+      11,
+      () => "unused-revocation-rollover-cursor",
+      {
+        issue: () => `hrac1_${"B".repeat(43)}`,
+        verify: () => true,
+      },
+    );
+    const begun = store.beginProfilePersonalAuthorityRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      workStore,
+    });
+    expect(begun.revocation).toMatchObject({
+      profileGeneration: profile.processGeneration,
+      state: "releasing",
+    });
+    expect(begun.bindings).toEqual([
+      expect.objectContaining({ sessionId: adopted.session.id, state: "detaching" }),
+    ]);
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths, { now: () => 2_000 });
+    stores.push(restarted);
+
+    expect(restarted.nextDaemonGeneration(`boot_${"v".repeat(32)}`)).toBe(1);
+    const rolledProfile = restarted.requireProfileById(profile.id);
+    const rolledRevocation = restarted.readProfilePersonalAuthorityRevocation(profile.id);
+    expect(rolledProfile).toMatchObject({
+      processGeneration: profile.processGeneration + 1,
+      state: "recovery_required",
+    });
+    expect(rolledRevocation).toMatchObject({
+      profileGeneration: rolledProfile.processGeneration,
+      revision: begun.revocation.revision + 1,
+      state: "releasing",
+    });
+    expect(rolledRevocation?.updatedAt).toBeGreaterThanOrEqual(begun.revocation.updatedAt);
+
+    expect(restarted.completePersonalSessionDetach({
+      sessionId: adopted.session.id,
+      archive: true,
+    }).binding.state).toBe("detached");
+    expect(restarted.completeProfilePersonalAuthorityRevocation({
+      profileId: profile.id,
+      expectedGeneration: rolledProfile.processGeneration,
+    })).toMatchObject({
+      processGeneration: rolledProfile.processGeneration + 1,
+      state: "signed_out",
+    });
+  });
+
+  test("allows Codex sign-out and rollover without releasing managed Claude custody", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Managed Claude controller",
+      "managed-claude-controller@example.com",
+    );
+    const authority = store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "managed-controller-thread",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      identity: {
+        pid: 51_101,
+        pidDomain: "darwin",
+        procStart: "managed-controller-current-generation",
+      },
+    });
+
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_out",
+    )).toBe(true);
+    const rolled = store.advanceProfileGeneration(
+      profile.id,
+      profile.processGeneration,
+    );
+    expect(rolled.processGeneration).toBe(profile.processGeneration + 1);
+    expect(authority.providerAuthority).toEqual(store.requireProviderAccountAuthority(profile.id, "claude"));
+    expect(() => store.removeProfile(profile.id)).toThrow();
+
+    expect(store.requireProfileById(profile.id)).toMatchObject({
+      processGeneration: rolled.processGeneration,
+      state: "signed_out",
+    });
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: authority.providerThreadId,
+      profileId: authority.profileId,
+      runtimeScope: authority.runtimeScope,
+    })).toEqual(authority);
+  });
+
+  test("pages unbound Claude custody by exact profile generation and scope", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Paged Claude custody",
+      "paged-claude-custody@example.com",
+    );
+    for (const [index, providerThreadId] of ["custody-a", "custody-b"].entries()) {
+      store.recordClaimedClaudeProcessAuthority({
+        providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+        providerThreadId,
+        profileId: profile.id,
+        profileGeneration: profile.processGeneration,
+        runtimeScope: "managed",
+        identity: {
+          pid: 53_000 + index,
+          pidDomain: "darwin",
+          procStart: `paged-custody-${index}`,
+        },
+      });
+    }
+    const first = store.listUnreleasedClaudeProcessAuthorityPage({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      afterProviderThreadId: null,
+      limit: 1,
+    });
+    expect(first.authorities).toEqual([
+      expect.objectContaining({ providerThreadId: "custody-a", sessionId: null }),
+    ]);
+    expect(first.continueAfterProviderThreadId).toBe("custody-a");
+    const second = store.listUnreleasedClaudeProcessAuthorityPage({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      afterProviderThreadId: first.continueAfterProviderThreadId,
+      limit: 1,
+    });
+    expect(second.authorities).toEqual([
+      expect.objectContaining({ providerThreadId: "custody-b", sessionId: null }),
+    ]);
+  });
+
+  test("binds native and adopted-neutral session authority to the original account identity", async () => {
+    const { store } = await fixture();
+    const snapshot = () => {
+      const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+      try {
+        return Object.fromEntries([
+          "profiles", "provider_accounts", "sessions", "session_provider_authorities",
+          "session_provider_account_authorities", "queue_entries", "queue_provider_authorities",
+          "queue_attachment_identities", "queue_attachment_identity_anchors",
+          "mutation_attempts", "mutation_provider_authorities", "sqlite_sequence",
+        ].map((table) => [table, inspector.query(`SELECT * FROM ${table} ORDER BY 1`).all()]));
+      } finally {
+        inspector.close(false);
+      }
+    };
+    const profile = signInProfile(
+      store,
+      "Session identity binding",
+      "original-session-owner@example.com",
+    );
+    const originalAccountKey = providerAccountKeyForProfile(store, profile.id, "codex");
+    const unproven = store.createSession({
+      profileId: profile.id,
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    expect(store.sessionAccountAuthorityMatches(unproven.id, profile.id)).toBe(false);
+    expect(store.readSessionProviderAccountAuthority(unproven.id)).toBeNull();
+    const merelyBound = store.bindSession({
+      sessionId: unproven.id,
+      expectedRevision: unproven.revision,
+      providerThreadId: "account-unproven-native-thread",
+      state: "idle",
+    });
+    expect(store.sessionAccountAuthorityMatches(merelyBound.id, profile.id)).toBe(false);
+    const unprovenBefore = snapshot();
+    expect(() => store.enqueue(merelyBound.id, "must have provider identity proof"))
+      .toThrow("session provider account authority is not current");
+    expect(snapshot()).toEqual(unprovenBefore);
+
+    const originalAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
+    const session = store.upsertProviderSession({
+      providerAuthority: originalAuthority,
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "account-bound-native-thread",
+      title: "Provider-proven session",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: originalAccountKey,
+    });
+    expect(store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(true);
+    expect(store.readSessionProviderAccountAuthority(session.id)).toMatchObject({
+      accountKey: originalAccountKey,
+      provider: "codex",
+      runtimeScope: "managed",
+    });
+    const capturedAuthority = store.requireCapturedSessionProviderAuthority(session.id);
+    const capturedScope = store.readSessionProviderAccountAuthority(session.id);
+    expect(store.requireSessionProviderAuthority(session.id)).toEqual(capturedAuthority);
+    expect(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      limit: 10,
+      requireCurrentAccountAuthority: true,
+    }).sessions).toEqual([session]);
+
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: "replacement-session-owner@example.com", plan: "Plus" },
+    )).toBe(true);
+    expect(store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(false);
+    expect(store.requireProviderAccountAuthority(profile.id, "codex")).toEqual({
+      ...originalAuthority, bindingGeneration: originalAuthority.bindingGeneration + 1,
+    });
+    expect(store.requireCapturedSessionProviderAuthority(session.id)).toEqual(capturedAuthority);
+    expect(store.readSessionProviderAccountAuthority(session.id)).toEqual(capturedScope);
+    expect(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      limit: 10,
+      requireCurrentAccountAuthority: true,
+    }).sessions).toEqual([]);
+    const replacementBefore = snapshot();
+    expect(() => store.enqueue(session.id, "must not cross account identities"))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+    expect(() => store.setSessionTurnState({
+      sessionId: session.id,
+      expectedRevision: session.revision,
+      state: "active",
+      activeTurnId: "replacement-account-turn",
+    })).toThrow("session provider account authority is not current");
+    expect(snapshot()).toEqual(replacementBefore);
+
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: "ORIGINAL-SESSION-OWNER@example.com", plan: "Plus" },
+    )).toBe(true);
+    expect(store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(true);
+    expect(store.readSessionProviderAccountAuthority(session.id)).toEqual(capturedScope);
+    expect(store.requireCapturedSessionProviderAuthority(session.id)).toEqual(capturedAuthority);
+    expect(store.requireProviderAccountAuthority(profile.id, "codex")).toEqual({
+      ...originalAuthority, bindingGeneration: originalAuthority.bindingGeneration + 2,
+    });
+    expect(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      limit: 10,
+      requireCurrentAccountAuthority: true,
+    }).sessions).toEqual([store.requireSession(session.id)]);
+    // Matching account metadata is not a successor for the original captured
+    // execution tuple. A -> B -> A must not revive the old binding.
+    const returnedBefore = snapshot();
+    expect(() => store.requireSessionProviderAuthority(session.id))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+    expect(() => store.enqueue(session.id, "same identity still needs current execution authority"))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+    expect(store.listQueue(session.id)).toEqual([]);
+    expect(snapshot()).toEqual(returnedBefore);
+
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { plan: "apiKey" },
+    )).toBe(true);
+    expect(store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(false);
+    expect(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      limit: 10,
+      requireCurrentAccountAuthority: true,
+    }).sessions).toEqual([]);
+    const unprovableBefore = snapshot();
+    expect(() => store.enqueue(session.id, "unprovable credentials stay fenced"))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+    expect(() => store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "unprovable-imported-thread",
+      title: "Unprovable imported thread",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: originalAccountKey,
+    })).toThrow("SESSION_PROVIDER_ACCOUNT_AUTHORITY_ACCOUNT_MISMATCH");
+    expect(store.requireCapturedSessionProviderAuthority(session.id)).toEqual(capturedAuthority);
+    expect(store.readSessionProviderAccountAuthority(session.id)).toEqual(capturedScope);
+    expect(snapshot()).toEqual(unprovableBefore);
+  });
+
+  test("durably pages a scoped account fence and supersedes dirty observations", async () => {
+    const value = await fixture();
+    let store = value.store;
+    const profile = signInProfile(
+      store,
+      "Paged scoped revocation",
+      "paged-scoped-revocation@example.com",
+    );
+    const accountA = providerAccountKeyForProfile(store, profile.id, "codex");
+    const replacementEmail = "paged-scoped-replacement@example.com";
+    const accountB = namedProviderAccountKey("codex", replacementEmail);
+    const accountC = namedProviderAccountKey("codex", "scoped-account-c");
+    const affected = Array.from({ length: 502 }, (_, index) =>
+      store.upsertProviderSession({
+        providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+        profileId: profile.id,
+        provider: "codex",
+        providerThreadId: `paged-scoped-${String(index).padStart(4, "0")}`,
+        title: `Paged scoped ${index}`,
+        preset: "high",
+        fastEnabled: false,
+        state: "idle",
+        providerAccountKey: accountA,
+      }));
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: replacementEmail, plan: "Plus" },
+    )).toBe(true);
+    const safe = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "paged-scoped-safe",
+      title: "Paged scoped safe",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: accountB,
+    });
+
+    // Missing and falsely scoped provider rows must not disappear from the
+    // selection merely because the old implementation used an inner join.
+    const raw = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const guard = z.object({ sql: z.string() }).strict().parse(raw.query(
+        `SELECT sql FROM sqlite_master
+         WHERE type='trigger' AND name='session_provider_account_authority_update_guard'`,
+      ).get());
+      raw.exec("DROP TRIGGER session_provider_account_authority_update_guard");
+      raw.query(
+        "DELETE FROM session_provider_account_authorities WHERE session_id=?",
+      ).run(affected[0]?.id ?? "");
+      raw.query(
+        `UPDATE session_provider_account_authorities SET runtime_scope='personal'
+         WHERE session_id=?`,
+      ).run(affected[1]?.id ?? "");
+      raw.exec(guard.sql);
+    } finally {
+      raw.close(false);
+    }
+
+    const begun = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      currentAccountKey: accountB,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(begun.revocation).toMatchObject({
+      currentAccountKey: accountB,
+      revision: 1,
+      state: "releasing",
+    });
+    expect(begun.sessionIds).toHaveLength(502);
+    expect(new Set(begun.sessionIds)).toEqual(new Set(affected.map((session) => session.id)));
+    expect(store.requireSession(safe.id).state).toBe("idle");
+    const fencedRevision = store.requireSession(affected[0]?.id ?? "").revision;
+    for (const session of affected) {
+      expect(store.requireSession(session.id).state).toBe("recovery_required");
+    }
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    store = new StateStore(paths, { now: () => 5_000 });
+    stores.push(store);
+    expect(store.listReleasingProviderRuntimeAccountRevocations()).toEqual([
+      expect.objectContaining({
+        profileId: profile.id,
+        currentAccountKey: accountB,
+        revision: begun.revocation.revision,
+      }),
+    ]);
+
+    expect(store.nextDaemonGeneration(`boot_${"r".repeat(32)}`)).toBe(1);
+    const rolledProfile = store.requireProfileById(profile.id);
+    const rolled = store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider: "codex",
+      runtimeScope: "managed",
+    });
+    expect(rolled).toMatchObject({
+      profileGeneration: rolledProfile.processGeneration,
+      revision: begun.revocation.revision + 1,
+      state: "releasing",
+    });
+    if (rolled === null) throw new Error("Expected the scoped revocation after restart.");
+    const repeated = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: rolledProfile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      currentAccountKey: accountB,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(repeated.revocation.revision).toBe(rolled.revision);
+    expect(store.requireSession(affected[0]?.id ?? "").revision).toBe(fencedRevision);
+
+    const superseding = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: rolledProfile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      currentAccountKey: accountC,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(superseding.revocation).toMatchObject({
+      currentAccountKey: accountC,
+      revision: rolled.revision + 1,
+      state: "releasing",
+    });
+    expect(() => store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: rolledProfile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      expectedRevision: rolled.revision,
+    })).toThrow("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_CONFLICT");
+    const completed = store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: rolledProfile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      expectedRevision: superseding.revocation.revision,
+    });
+    expect(completed.state).toBe("completed");
+    expect(store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: rolledProfile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      expectedRevision: superseding.revocation.revision,
+    })).toEqual(completed);
+  });
+
+  test("keeps completed scoped revocations closed over every stale session authority guard", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Completed scoped revocation",
+      "completed-scoped-revocation@example.com",
+    );
+    const staleAccountKey = providerAccountKeyForProfile(store, profile.id, "codex");
+    const currentEmail = "completed-current-account@example.com";
+    const currentAccountKey = namedProviderAccountKey("codex", currentEmail);
+    const stale = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "completed-scoped-stale",
+      title: "Completed scoped stale",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: staleAccountKey,
+    });
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: currentEmail, plan: "Plus" },
+    )).toBe(true);
+    const current = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "completed-scoped-current",
+      title: "Completed scoped current",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: currentAccountKey,
+    });
+    const tasks = store.createSessionTaskStore();
+    const stalePausedTask = tasks.create({
+      sessionId: stale.id,
+      name: "Stale paused task",
+      prompt: "Must stay paused",
+      minutes: 15,
+      status: "paused",
+      idempotencyKey: "00000000-0000-4000-8000-000000000871",
+    });
+    const currentPausedTask = tasks.create({
+      sessionId: current.id,
+      name: "Current paused task",
+      prompt: "May resume",
+      minutes: 15,
+      status: "paused",
+      idempotencyKey: "00000000-0000-4000-8000-000000000872",
+    });
+
+    const begun = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      currentAccountKey,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(begun.sessionIds).toEqual([stale.id]);
+    const completed = store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      expectedRevision: begun.revocation.revision,
+    });
+    expect(completed).toMatchObject({
+      currentAccountKey,
+      state: "completed",
+    });
+    expect(() => store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "completed-scoped-new-stale",
+      title: "Completed scoped new stale",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: staleAccountKey,
+    })).toThrow("SESSION_PROVIDER_ACCOUNT_AUTHORITY_ACCOUNT_MISMATCH");
+    const postCompletionCurrent = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "completed-scoped-new-current",
+      title: "Completed scoped new current",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: currentAccountKey,
+    });
+
+    expect(store.nextDaemonGeneration(`boot_${"s".repeat(32)}`)).toBe(1);
+    const currentProfile = store.requireProfileById(profile.id);
+
+    expect(store.sessionAccountAuthorityMatches(stale.id, profile.id)).toBe(false);
+    expect(store.sessionAccountAuthorityMatches(current.id, profile.id)).toBe(true);
+    expect(new Set(store.listLocalSessionPage({
+      profileId: profile.id,
+      after: null,
+      limit: 10,
+      requireCurrentAccountAuthority: true,
+    }).sessions.map((session) => session.id))).toEqual(new Set([
+      current.id,
+      postCompletionCurrent.id,
+    ]));
+    const staleAuthority = store.requireCapturedSessionProviderAuthority(stale.id);
+    const staleScope = store.readSessionProviderAccountAuthority(stale.id);
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      const snapshot = () => Object.fromEntries([
+        "provider_accounts", "sessions", "session_provider_authorities",
+        "session_provider_account_authorities", "queue_entries", "queue_provider_authorities",
+        "queue_attachment_identities", "queue_attachment_identity_anchors",
+        "mutation_attempts", "mutation_provider_authorities", "sqlite_sequence",
+      ].map((table) => [table, inspector.query(`SELECT * FROM ${table} ORDER BY 1`).all()]));
+      const before = snapshot();
+      expect(() => store.enqueue(stale.id, "stale queue authority"))
+        .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+      expect(store.requireCapturedSessionProviderAuthority(stale.id)).toEqual(staleAuthority);
+      expect(store.readSessionProviderAccountAuthority(stale.id)).toEqual(staleScope);
+      expect(store.listQueue(stale.id)).toEqual([]);
+      expect(snapshot()).toEqual(before);
+    } finally {
+      inspector.close(false);
+    }
+    expect(store.enqueue(current.id, "current queue authority")).toMatchObject({
+      sessionId: current.id,
+      state: "pending",
+    });
+
+    const staleAfterFence = store.requireSession(stale.id);
+    expect(() => store.setSessionTurnState({
+      sessionId: stale.id,
+      expectedRevision: staleAfterFence.revision,
+      state: "active",
+      activeTurnId: "stale-revocation-turn",
+    })).toThrow("session provider account authority is not current");
+    expect(store.setSessionTurnState({
+      sessionId: current.id,
+      expectedRevision: store.requireSession(current.id).revision,
+      state: "active",
+      activeTurnId: "current-revocation-turn",
+    })).toMatchObject({ state: "active", activeTurnId: "current-revocation-turn" });
+
+    const admit = (session: typeof stale, suffix: string) => store.admitInteraction({
+      publicId: `00000000-0000-4000-8000-000000000${suffix}`,
+      sessionId: session.id,
+      authority: {
+        profileId: profile.id,
+        processGeneration: currentProfile.processGeneration,
+        connectionId: `00000000-0000-4000-8000-000000001${suffix}`,
+        ...codexInteractionBinding(store, profile.id),
+        requestId: { type: "string" as const, value: `completed-${suffix}` },
+        method: "item/fileChange/requestApproval",
+        requestDigest: suffix.repeat(64).slice(0, 64),
+        threadId: session.providerThreadId ?? "",
+        turnId: `completed-turn-${suffix}`,
+        itemId: `completed-item-${suffix}`,
+        approvalId: null,
+      },
+      kind: "file_change_approval" as const,
+      blocking: true,
+      display: {
+        kind: "file_change_approval" as const,
+        summary: "Completed revocation guard",
+        reason: null,
+        grantRoot: null,
+        availableDecisions: ["once", "decline", "cancel"] as const,
+      },
+    });
+    expect(() => admit(stale, "873"))
+      .toThrow("provider interaction authority mismatch");
+    expect(store.readInteractionProviderAuthority("00000000-0000-4000-8000-000000000873"))
+      .toBeNull();
+    expect(admit(current, "874").record.sessionId).toBe(current.id);
+
+    expect(() => tasks.create({
+      sessionId: stale.id,
+      name: "Stale active task",
+      prompt: "Must not activate",
+      minutes: 15,
+      status: "active",
+      idempotencyKey: "00000000-0000-4000-8000-000000000875",
+    })).toThrow("session provider account authority is not current");
+    expect(tasks.create({
+      sessionId: current.id,
+      name: "Current active task",
+      prompt: "May activate",
+      minutes: 15,
+      status: "active",
+      idempotencyKey: "00000000-0000-4000-8000-000000000876",
+    }).status).toBe("active");
+    expect(() => tasks.edit({
+      sessionId: stale.id,
+      taskId: stalePausedTask.id,
+      expectedRevision: stalePausedTask.revision,
+      patch: { status: "active" },
+      idempotencyKey: "00000000-0000-4000-8000-000000000877",
+    })).toThrow("session provider account authority is not current");
+    expect(tasks.edit({
+      sessionId: current.id,
+      taskId: currentPausedTask.id,
+      expectedRevision: currentPausedTask.revision,
+      patch: { status: "active" },
+      idempotencyKey: "00000000-0000-4000-8000-000000000878",
+    }).status).toBe("active");
+  });
+
+  test("a personal scoped revocation fences an overlapping claim before disabling adoption", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Overlapping adoption claim",
+      "overlapping-adoption-claim@example.com",
+    );
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "overlapping-adoption-claim",
+      title: "Overlapping adoption claim",
+      state: "idle",
+      liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    expect(claiming.status).toBe("claiming");
+
+    const begun = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "personal",
+      currentAccountKey: namedProviderAccountKey("codex", "replacement-personal-home"),
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(begun.sessionIds).toEqual([]);
+    expect(store.readSessionAdoptionPolicy("codex")).toMatchObject({
+      enabled: false,
+      profileId: null,
+    });
+    expect(store.listSessionAdoptionCandidates({ provider: "codex" })).toEqual([
+      expect.objectContaining({
+        providerThreadId: candidate.providerThreadId,
+        status: "fenced",
+      }),
+    ]);
+    expect(() => store.setSessionAdoptionPolicy({
+      provider: "codex",
+      profileId: profile.id,
+    })).toThrow("provider runtime account revocation must complete before adoption is enabled");
+    store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "personal",
+      expectedRevision: begun.revocation.revision,
+    });
+    expect(() => store.setSessionAdoptionPolicy({
+      provider: "codex",
+      profileId: profile.id,
+    })).toThrow("provider runtime account revocation must complete before adoption is enabled");
+  });
+
+  test("refuses a foreign WorkStore before staging a scoped fence", async () => {
+    const { store } = await fixture();
+    const other = await fixture();
+    const profile = signInProfile(
+      store,
+      "Scoped work transaction",
+      "scoped-work-transaction@example.com",
+    );
+    const session = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "scoped-work-transaction",
+      title: "Scoped work transaction",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    expect(() => store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      currentAccountKey: namedProviderAccountKey("codex", "scoped-work-b"),
+      workStore: createRevocationWorkStore(other.store),
+    })).toThrow("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_WORK_STORE_MISMATCH");
+    expect(store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider: "codex",
+      runtimeScope: "managed",
+    })).toBeNull();
+    expect(store.requireSession(session.id).state).toBe("idle");
+  });
+
+  test("rolls back work retirement with a failed scoped session fence", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Atomic scoped work fence",
+      "atomic-scoped-work-fence@example.com",
+    );
+    const projectRoot = join(home, "atomic-scoped-work-fence");
+    await mkdir(projectRoot);
+    const project = await store.createProject(
+      "Atomic scoped work fence",
+      projectRoot,
+      true,
+    );
+    const accountA = providerAccountKeyForProfile(store, profile.id, "codex");
+    const importedSession = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "atomic-scoped-work-fence",
+      projectId: project.id,
+      title: "Atomic scoped work fence",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: accountA,
+    });
+    const session = store.updateSessionMetadata({
+      sessionId: importedSession.id,
+      expectedRevision: importedSession.revision,
+      preset: "high",
+    });
+    const workStore = createRevocationWorkStore(store);
+    const created = workStore.apply({
+      kind: "work.create",
+      idempotencyKey: "01890f31-a123-7000-8000-000000000901",
+      clientRef: "atomic-scoped-work-fence",
+      coordinatorSessionId: session.id,
+      objective: "Prove the shared authority transaction.",
+      routes: [{
+        accountId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fast: false,
+      }],
+      tasks: [{
+        clientRef: "atomic-scoped-work-task",
+        dependsOnRefs: [],
+        dependsOnTaskIds: [],
+        objective: "Hold one claimed task.",
+        instructions: "Remain claimed until authority is fenced.",
+        criteria: ["The authority fence retires the claim."],
+        route: { accountId: profile.id, projectId: project.id },
+        preset: "high",
+        fast: false,
+        priority: 0,
+        maxAttempts: 3,
+        requiredReviews: 0,
+        resultKind: "text",
+        minEvidence: 0,
+      }],
+    });
+    if (created.kind !== "work.create") throw new Error("Expected a created work item.");
+    const task = created.tasks[0];
+    if (task === undefined) throw new Error("Expected one work task.");
+    const claimed = workStore.apply({
+      kind: "task.claim",
+      idempotencyKey: "01890f31-a123-7000-8000-000000000902",
+      workId: created.work.id,
+      taskId: task.id,
+      expectedTaskRevision: task.revision,
+      actorSessionId: session.id,
+      actorCapability: `hrac1_${"A".repeat(43)}`,
+      leaseMs: 5_000,
+    });
+    if (claimed.kind !== "task.claim") throw new Error("Expected a claimed work task.");
+
+    const raw = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      raw.exec(`
+        CREATE TRIGGER injected_scoped_session_fence_failure
+        BEFORE UPDATE OF state ON sessions
+        WHEN OLD.id='${session.id}' AND NEW.state='recovery_required'
+        BEGIN SELECT RAISE(ABORT,'INJECTED_SCOPED_SESSION_FENCE_FAILURE'); END;
+      `);
+      expect(() => store.beginProviderRuntimeAccountRevocation({
+        profileId: profile.id,
+        expectedGeneration: profile.processGeneration,
+        provider: "codex",
+        runtimeScope: "managed",
+        currentAccountKey: namedProviderAccountKey("codex", "atomic-scoped-work-b"),
+        workStore,
+      })).toThrow("INJECTED_SCOPED_SESSION_FENCE_FAILURE");
+      expect(store.readProviderRuntimeAccountRevocation({
+        profileId: profile.id,
+        provider: "codex",
+        runtimeScope: "managed",
+      })).toBeNull();
+      expect(store.requireSession(session.id).state).toBe("idle");
+      expect(workStore.task(task.id).activeAttempt).toMatchObject({
+        id: claimed.attempt.id,
+        status: "claimed",
+      });
+      raw.exec("DROP TRIGGER injected_scoped_session_fence_failure");
+    } finally {
+      raw.close(false);
+    }
+
+    const begun = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      currentAccountKey: namedProviderAccountKey("codex", "atomic-scoped-work-b"),
+      workStore,
+    });
+    expect(begun.affectedWorkIds).toEqual([created.work.id]);
+    expect(store.requireSession(session.id).state).toBe("recovery_required");
+    expect(workStore.task(task.id).activeAttempt).toBeNull();
+  });
+
+  test("scoped revocation preserves an unresolved Claude launch and its fence through restart", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Revoked Claude launch",
+      "revoked-claude-launch@example.com",
+    );
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "revoked-claude-launch",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const intent = store.stageClaudeProcessLaunchIntent({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "revoked-claude-launch",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: session.id,
+    });
+    const begun = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "claude",
+      runtimeScope: "managed",
+      currentAccountKey: null,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(begun.sessionIds).toEqual([session.id]);
+    expect(store.requireSession(session.id).state).toBe("recovery_required");
+    expect(store.readClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toEqual(intent);
+    expect(() => store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "claude",
+      runtimeScope: "managed",
+      expectedRevision: begun.revocation.revision,
+    })).toThrow("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_CLAUDE_LAUNCH_INTENT_LIVE");
+    const captured = store.requireCapturedSessionProviderAuthority(session.id);
+    expect(store.nextDaemonGeneration(`boot_${"d".repeat(32)}`)).toBe(1);
+    expect(store.readClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    })).toEqual(intent);
+    const carried = store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider: "claude",
+      runtimeScope: "managed",
+    });
+    expect(carried).toMatchObject({ profileGeneration: profile.processGeneration + 1,
+      revision: begun.revocation.revision + 1, state: "releasing", currentAccountKey: null });
+    expect(store.requireCapturedSessionProviderAuthority(session.id)).toEqual(captured);
+    expect(store.requireSession(session.id).state).toBe("recovery_required");
+    if (carried === null) throw new Error("Expected retained Claude revocation.");
+    expect(() => store.completeProviderRuntimeAccountRevocation({ profileId: profile.id,
+      expectedGeneration: carried.profileGeneration, provider: "claude", runtimeScope: "managed",
+      expectedRevision: carried.revision })).toThrow("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_CLAUDE_LAUNCH_INTENT_LIVE");
+    const inspector = new Database(store.paths.database, { readonly: true });
+    try {
+      expect(inspector.query("SELECT * FROM session_provider_authority_successors WHERE session_id=?").all(session.id)).toEqual([]);
+      expect(inspector.query("SELECT * FROM session_claude_launch_dispositions").all()).toEqual([]);
+    } finally { inspector.close(false); }
+  });
+
+  test("global account replacement retires native and adopted sessions identically", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Native adopted parity",
+      "native-adopted-parity@example.com",
+    );
+    const accountKey = providerAccountKeyForProfile(store, profile.id, "codex");
+    const native = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "native-parity-thread",
+      title: "Native parity",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: accountKey,
+    });
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "adopted-parity-thread",
+      title: "Adopted parity",
+      state: "idle",
+      liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedCandidateRevision: claiming.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
+      providerAccountKey: accountKey,
+    }).session;
+    const queueIds = [native, adopted].map((session, index) =>
+      store.enqueue(session.id, `parity queue ${index}`).id);
+    const mutationKeys = [native, adopted].map((session, index) => {
+      const idempotencyKey = `00000000-0000-4000-8000-${String(820 + index).padStart(12, "0")}`;
+      store.prepareMutation({
+        kind: "session.rename",
+        authorityId: session.id,
+        authorityGeneration: profile.processGeneration,
+        request: { name: `parity ${index}` },
+        idempotencyKey,
+      });
+      return idempotencyKey;
+    });
+    const taskStore = store.createSessionTaskStore();
+    const taskIds = [native, adopted].map((session, index) =>
+      taskStore.create({
+        sessionId: session.id,
+        name: `Parity task ${index}`,
+        prompt: `Run parity task ${index}`,
+        minutes: 15,
+        status: "active",
+        idempotencyKey: `00000000-0000-4000-8000-${String(830 + index).padStart(12, "0")}`,
+      }).id);
+    const interactions = [native, adopted].map((session, index) =>
+      store.admitInteraction({
+        publicId: `00000000-0000-4000-8000-${String(840 + index).padStart(12, "0")}`,
+        sessionId: session.id,
+        authority: {
+
+          ...codexInteractionBinding(store, profile.id),
+          profileId: profile.id,
+          processGeneration: profile.processGeneration,
+          connectionId: `00000000-0000-4000-8000-${String(850 + index).padStart(12, "0")}`,
+          requestId: { type: "string", value: `parity-${index}` },
+          method: "item/fileChange/requestApproval",
+          requestDigest: String(index + 1).repeat(64),
+          threadId: session.providerThreadId ?? "",
+          turnId: `parity-turn-${index}`,
+          itemId: `parity-item-${index}`,
+          approvalId: null,
+        },
+        kind: "file_change_approval",
+        blocking: true,
+        display: {
+          kind: "file_change_approval",
+          summary: "Approve parity change",
+          reason: null,
+          grantRoot: null,
+          availableDecisions: ["once", "decline", "cancel"],
+        },
+      }).record);
+
+    const begun = store.beginProfilePersonalAuthorityRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(new Set(begun.sessionIds)).toEqual(new Set([native.id, adopted.id]));
+    for (const session of [native, adopted]) {
+      const fenced = store.requireSession(session.id);
+      expect(fenced.state).toBe("recovery_required");
+      expect(fenced.activeTurnId).toBeUndefined();
+    }
+    for (const queueId of queueIds) {
+      expect(store.requireQueue(queueId).state).toBe("cancelled");
+    }
+    for (const mutationKey of mutationKeys) {
+      expect(store.readMutation(mutationKey)?.state).toBe("cancelled");
+    }
+    for (const [index, taskId] of taskIds.entries()) {
+      const sessionId = [native, adopted][index]?.id ?? "";
+      expect(taskStore.list(sessionId).find((task) => task.id === taskId)).toMatchObject({
+        status: "paused",
+        nextDueAt: null,
+      });
+    }
+    for (const interaction of interactions) {
+      expect(store.requireInteraction(interaction.publicId).state).toBe("expired");
+    }
+
+    store.completePersonalSessionDetach({ sessionId: adopted.id, archive: false });
+    store.completeProfilePersonalAuthorityRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+    });
+    for (const session of [native, adopted]) {
+      const retired = store.requireSession(session.id);
+      expect(retired.state).toBe("recovery_required");
+      expect(retired.archivedAt).toBeUndefined();
+    }
+  });
+
+  test.each(["releasing", "completed_after_rollover"] as const)(
+    "refuses a legacy switch into a releasing Claude scope with a divergent own generation: %s",
+    async (disposition) => {
+    const { store } = await fixture();
+    const sourceProfile = signInProfile(store, "Scope switch source", "scope-source@example.com");
+    const targetProfile = signInProfile(store, "Scope switch target", "scope-target@example.com");
+    const source = upsertProvenTestSession(store, {
+      profileId: sourceProfile.id, provider: "codex", providerThreadId: "scope-switch-source",
+      preset: "high", fastEnabled: false, state: "idle",
+    });
+    const sourceProviderThreadId = source.providerThreadId;
+    if (sourceProviderThreadId === undefined) throw new Error("Expected a bound source thread.");
+    const sourceAuthority = store.requireProviderAccountAuthority(sourceProfile.id, "codex");
+    store.advanceProviderAccountProcessGeneration({
+      profileId: targetProfile.id, provider: "claude", expectedProcessGeneration: 0,
+    });
+    const targetAuthority = store.advanceProviderAccountProcessGeneration({
+      profileId: targetProfile.id, provider: "claude", expectedProcessGeneration: 1,
+    });
+    expect(targetAuthority.processGeneration).not.toBe(targetProfile.processGeneration);
+    const key = crypto.randomUUID();
+    const attempt = store.prepareMutation({
+      authorityGeneration: targetAuthority.processGeneration, authorityId: source.id,
+      idempotencyKey: key, kind: "session.switch",
+      request: { preset: "fable-max", provider: "claude" },
+      providerAuthorities: [
+        { role: "source", authority: sourceAuthority, provenance: "legacy_switch_source" },
+        { role: "target", authority: targetAuthority, provenance: "legacy_switch_target" },
+      ],
+    });
+    const { revocation } = store.beginProviderRuntimeAccountRevocation({
+      profileId: targetProfile.id, expectedGeneration: targetProfile.processGeneration,
+      provider: "claude", runtimeScope: "managed", currentAccountKey: null,
+      workStore: createRevocationWorkStore(store),
+    });
+    if (disposition === "completed_after_rollover") {
+      store.completeProviderRuntimeAccountRevocation({
+        profileId: targetProfile.id, expectedGeneration: targetProfile.processGeneration,
+        provider: "claude", runtimeScope: "managed", expectedRevision: revocation.revision,
+      });
+      store.advanceProfileGeneration(targetProfile.id, targetProfile.processGeneration);
+      expect(store.requireProfileById(targetProfile.id).processGeneration).toBe(targetProfile.processGeneration + 1);
+    }
+    const retainedRevocation = store.readProviderRuntimeAccountRevocation({
+      profileId: targetProfile.id, provider: "claude", runtimeScope: "managed",
+    });
+    const before = store.readMutation(key);
+    expect(before).toMatchObject({ state: "prepared" });
+    expect(() => store.beginSessionProviderSwitchEffect({
+      attemptId: attempt.id, sessionId: source.id,
+      providerAuthentication: {
+        profileId: targetProfile.id, provider: "claude", signedIn: true,
+        processGeneration: targetAuthority.processGeneration,
+      },
+      evidence: {
+        kind: "session.switch", daemonGeneration: 0, requestedAccountId: null,
+        requestedPreset: "fable-max", runtimeProfile: claudeAdoptionRuntimeProfile(targetAuthority),
+        seedDigest: "8".repeat(64), seedIncludedRecords: 1, seedOmittedRecords: 0,
+        sourcePreset: "high", sourceProcessGeneration: sourceAuthority.processGeneration,
+        sourceProfileId: sourceProfile.id, sourceProvider: "codex",
+        sourceProviderThreadId,
+        targetPreset: "fable-max", targetProcessGeneration: targetAuthority.processGeneration,
+        targetProfileId: targetProfile.id, targetProvider: "claude",
+        targetProviderAccountKey: testProviderAccountKey("claude"), transcriptDigest: "9".repeat(64),
+      },
+    })).toThrow("SESSION_PROVIDER_SWITCH_AUTHORITY_CHANGED");
+    expect(store.readMutation(key)).toEqual(before);
+    expect(store.requireProviderAccountAuthority(targetProfile.id, "claude")).toEqual(targetAuthority);
+    expect(store.readProviderRuntimeAccountRevocation({
+      profileId: targetProfile.id, provider: "claude", runtimeScope: "managed",
+    })).toEqual(retainedRevocation);
+    expect(store.requireSession(source.id)).toEqual(source);
+    expect(store.profileHasClaudeProcessLaunchIntents(targetProfile.id)).toBe(false);
+  });
+
+  test("refuses a Claude launch into a completed accountless scope after sibling Codex rollover", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Accountless launch", "accountless-launch@example.com");
+    store.advanceProviderAccountProcessGeneration({
+      profileId: profile.id, provider: "claude", expectedProcessGeneration: 0,
+    });
+    const authority = store.advanceProviderAccountProcessGeneration({
+      profileId: profile.id, provider: "claude", expectedProcessGeneration: 1,
+    });
+    const { revocation } = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id, expectedGeneration: profile.processGeneration,
+      provider: "claude", runtimeScope: "personal", currentAccountKey: null,
+      workStore: createRevocationWorkStore(store),
+    });
+    const completed = store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id, expectedGeneration: profile.processGeneration,
+      provider: "claude", runtimeScope: "personal", expectedRevision: revocation.revision,
+    });
+    const rolled = store.advanceProfileGeneration(profile.id, profile.processGeneration);
+    expect(rolled.processGeneration).not.toBe(completed.profileGeneration);
+    expect(store.requireProviderAccountAuthority(profile.id, "claude")).toEqual(authority);
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "claude", providerThreadId: "accountless-scope-launch",
+      title: "Accountless scope launch candidate", state: "idle",
+      providerUpdatedAt: 10, liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "claude", providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const input = {
+      profileId: profile.id, profileGeneration: rolled.processGeneration,
+      providerAuthority: authority, providerThreadId: "accountless-scope-launch",
+      runtimeScope: "personal" as const, providerAccountKey: testProviderAccountKey("claude"),
+    };
+    expect(() => store.stageClaudeProcessLaunchIntent(input))
+      .toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_ACCOUNT_STALE");
+    expect(store.readClaudeProcessLaunchIntent({
+      profileId: profile.id, runtimeScope: "personal", providerThreadId: input.providerThreadId,
+    })).toBeNull();
+    expect(store.readSessionAdoptionCandidate("claude", input.providerThreadId)).toEqual(claiming);
+    expect(store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id, provider: "claude", runtimeScope: "personal",
+    })).toEqual(completed);
+    expect(store.requireProviderAccountAuthority(profile.id, "claude")).toEqual(authority);
+  });
+
+  test("preserves an ambiguous cross-profile switch across sibling Codex revocation without granting Claude restart authority", async () => {
+    const { store } = await fixture();
+    const sourceProfile = signInProfile(
+      store,
+      "Revoked switch source",
+      "revoked-switch-source@example.com",
+    );
+    const targetProfile = signInProfile(
+      store,
+      "Revoked switch target",
+      "revoked-switch-target@example.com",
+    );
+    const source = upsertProvenTestSession(store, {
+      profileId: sourceProfile.id,
+      provider: "codex",
+      providerThreadId: "revoked-switch-source-thread",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    store.advanceProviderAccountProcessGeneration({ profileId: targetProfile.id, provider: "claude", expectedProcessGeneration: 0 });
+    const targetAuthority = store.advanceProviderAccountProcessGeneration({ profileId: targetProfile.id, provider: "claude", expectedProcessGeneration: 1 });
+    expect(targetAuthority.processGeneration).not.toBe(targetProfile.processGeneration);
+    const attempt = store.prepareMutation({
+      authorityGeneration: targetAuthority.processGeneration,
+      authorityId: source.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000879",
+      kind: "session.switch",
+      request: { preset: "fable-max", provider: "claude" },
+      providerAuthorities: [
+        { role: "source", authority: store.requireProviderAccountAuthority(sourceProfile.id, "codex"), provenance: "legacy_switch_source" },
+        { role: "target", authority: targetAuthority, provenance: "legacy_switch_target" },
+      ],
+    });
+    const targetRuntimeProfile = claudeAdoptionRuntimeProfile(store.requireProviderAccountAuthority(targetProfile.id, "claude"));
+    store.beginSessionProviderSwitchEffect({
+      attemptId: attempt.id,
+      sessionId: source.id,
+      providerAuthentication: {
+        profileId: targetProfile.id,
+        processGeneration: targetAuthority.processGeneration,
+        provider: "claude",
+        signedIn: true,
+      },
+      evidence: {
+        kind: "session.switch",
+        daemonGeneration: 0,
+        requestedAccountId: null,
+        requestedPreset: "fable-max",
+        runtimeProfile: targetRuntimeProfile,
+        seedDigest: "8".repeat(64),
+        seedIncludedRecords: 1,
+        seedOmittedRecords: 0,
+        sourcePreset: "high",
+        sourceProcessGeneration: sourceProfile.processGeneration,
+        sourceProfileId: sourceProfile.id,
+        sourceProvider: "codex",
+        sourceProviderThreadId: source.providerThreadId ?? "",
+        targetPreset: "fable-max",
+        targetProcessGeneration: targetAuthority.processGeneration,
+        targetProfileId: targetProfile.id,
+        targetProvider: "claude",
+        targetProviderAccountKey: testProviderAccountKey("claude"),
+        transcriptDigest: "9".repeat(64),
+      },
+    });
+
+    store.beginProfilePersonalAuthorityRevocation({
+      profileId: targetProfile.id,
+      expectedGeneration: targetProfile.processGeneration,
+      workStore: createRevocationWorkStore(store),
+    });
+    const released = store.completeProfilePersonalAuthorityRevocation({
+      profileId: targetProfile.id,
+      expectedGeneration: targetProfile.processGeneration,
+    });
+    expect(released).toMatchObject({
+      processGeneration: targetProfile.processGeneration + 1,
+      state: "signed_out",
+    });
+    expect(store.isSessionMutationProviderAuthorityCurrent({
+      attemptId: attempt.id,
+      profileId: targetProfile.id,
+      provider: "claude",
+      originGeneration: targetAuthority.processGeneration,
+    })).toBe(true);
+    expect(store.requireProviderAccountAuthority(targetProfile.id, "claude")).toEqual(targetAuthority);
+    const frozenEvidence = store.readMutation("00000000-0000-4000-8000-000000000879")?.evidence;
+
+    expect(store.nextDaemonGeneration(`boot_${"w".repeat(32)}`)).toBe(1);
+    expect(store.isSessionMutationProviderAuthorityCurrent({
+      attemptId: attempt.id,
+      profileId: targetProfile.id,
+      provider: "claude",
+      originGeneration: targetAuthority.processGeneration,
+    })).toBe(false);
+    expect(store.readMutation("00000000-0000-4000-8000-000000000879")).toMatchObject({ state: "ambiguous", evidence: frozenEvidence });
+    expect(store.requireSession(source.id).state).toBe("recovery_required");
+  });
+
+  test("stages scoped recovery before releasing exact managed Claude custody", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Managed Claude recovery",
+      "managed-claude-recovery@example.com",
+    );
+    const authority = store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "managed-recovery-thread",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      identity: {
+        pid: 51_102,
+        pidDomain: "darwin",
+        procStart: "managed-controller-recovery",
+      },
+    });
+
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "recovery_required",
+      { email: "managed-claude-recovery@example.com", plan: "Plus" },
+    )).toBe(true);
+    const { revocation } = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "claude", runtimeScope: "managed", currentAccountKey: null,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(revocation).toMatchObject({
+      profileGeneration: profile.processGeneration,
+      state: "releasing",
+    });
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "recovery_required",
+      { email: "managed-claude-recovery@example.com", plan: "Plus" },
+    )).toBe(true);
+    expect(() => store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "claude", runtimeScope: "managed", expectedRevision: revocation.revision,
+    })).toThrow("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_CLAUDE_PROCESS_LIVE");
+
+    expect(() => store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: authority.providerThreadId,
+      profileId: authority.profileId,
+      runtimeScope: authority.runtimeScope,
+      expectedRevision: authority.revision,
+      identity: { ...authority.identity, procStart: "wrong-controller-identity" },
+    })).toThrow("SESSION_CLAUDE_PROCESS_AUTHORITY_IDENTITY_MISMATCH");
+    const releasing = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: authority.providerThreadId,
+      profileId: authority.profileId,
+      runtimeScope: authority.runtimeScope,
+      expectedRevision: authority.revision,
+      identity: authority.identity,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasing.providerThreadId,
+      profileId: releasing.profileId,
+      runtimeScope: releasing.runtimeScope,
+      expectedRevision: releasing.revision,
+      identity: releasing.identity,
+    });
+    expect(store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "claude", runtimeScope: "managed", expectedRevision: revocation.revision,
+    })).toMatchObject({
+      profileGeneration: profile.processGeneration,
+      state: "completed",
+    });
+    expect(store.readProviderRuntimeAccountRevocation({ profileId: profile.id,
+      provider: "claude", runtimeScope: "managed" })).toMatchObject({
+      profileGeneration: profile.processGeneration,
+      state: "completed",
+    });
+    expect(authority.providerAuthority).toEqual(store.requireProviderAccountAuthority(profile.id, "claude"));
+  });
+
+  test("keeps exact managed Claude release identity across Codex daemon retirement", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Managed Claude restart",
+      "managed-claude-restart@example.com",
+    );
+    const authority = store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerThreadId: "managed-restart-thread",
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      runtimeScope: "managed",
+      identity: {
+        pid: 51_103,
+        pidDomain: "darwin",
+        procStart: "managed-controller-before-restart",
+      },
+    });
+    const workStore = store.createWorkStore(
+      9,
+      () => "unused-test-cursor",
+      {
+        issue: () => `hrac1_${"A".repeat(43)}`,
+        verify: () => true,
+      },
+    );
+
+    const rolled = store.advanceProfileGenerationForDaemonShutdown(
+      profile.id,
+      profile.processGeneration,
+      workStore,
+    ).profile;
+    expect(store.requireProfileById(profile.id)).toMatchObject({
+      processGeneration: profile.processGeneration + 1,
+      state: "signed_in",
+    });
+    expect(authority.providerAuthority).toEqual(store.requireProviderAccountAuthority(profile.id, "claude"));
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: authority.providerThreadId,
+      profileId: authority.profileId,
+      runtimeScope: authority.runtimeScope,
+    })).toEqual(authority);
+    expect(() => store.beginClaudeProcessAuthorityRelease({ providerThreadId: authority.providerThreadId,
+      profileId: authority.profileId, runtimeScope: authority.runtimeScope, expectedRevision: authority.revision,
+      identity: { ...authority.identity, procStart: "unproved-after-codex-retirement" } }))
+      .toThrow("SESSION_CLAUDE_PROCESS_AUTHORITY_IDENTITY_MISMATCH");
+
+    const releasing = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: authority.providerThreadId,
+      profileId: authority.profileId,
+      runtimeScope: authority.runtimeScope,
+      expectedRevision: authority.revision,
+      identity: authority.identity,
+    });
+    const released = store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasing.providerThreadId,
+      profileId: releasing.profileId,
+      runtimeScope: releasing.runtimeScope,
+      expectedRevision: releasing.revision,
+      identity: releasing.identity,
+    });
+    expect(store.advanceProfileGenerationForDaemonShutdown(
+      profile.id,
+      rolled.processGeneration,
+      workStore,
+    )).toMatchObject({
+      affectedWorkIds: [],
+      profile: {
+        processGeneration: rolled.processGeneration + 1,
+        state: "signed_in",
+      },
+    });
+    expect(store.readClaudeProcessAuthority({
+      providerThreadId: authority.providerThreadId,
+      profileId: authority.profileId,
+      runtimeScope: authority.runtimeScope,
+    })).toEqual(released);
+    expect(store.listUnreleasedClaudeProcessAuthorities()).not.toContainEqual(released);
+    expect(authority.providerAuthority).toEqual(store.requireProviderAccountAuthority(profile.id, "claude"));
+  });
+
+  test("carries releasing revocations through clean daemon retirement atomically", async () => {
+    const { store } = await fixture();
+    const workStore = createRevocationWorkStore(store);
+    const globalProfile = signInProfile(
+      store,
+      "Clean global revocation rollover",
+      "clean-global-revocation@example.com",
+    );
+    const scopedProfile = signInProfile(
+      store,
+      "Clean scoped revocation rollover",
+      "clean-scoped-revocation@example.com",
+    );
+    const global = store.beginProfilePersonalAuthorityRevocation({
+      profileId: globalProfile.id,
+      expectedGeneration: globalProfile.processGeneration,
+      workStore,
+    });
+    const scoped = store.beginProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      expectedGeneration: scopedProfile.processGeneration,
+      provider: "claude",
+      runtimeScope: "personal",
+      currentAccountKey: null,
+      workStore,
+    });
+
+    const rolledGlobal = store.advanceProfileGenerationForDaemonShutdown(
+      globalProfile.id,
+      globalProfile.processGeneration,
+      workStore,
+    ).profile;
+    const rolledScoped = store.advanceProfileGenerationForDaemonShutdown(
+      scopedProfile.id,
+      scopedProfile.processGeneration,
+      workStore,
+    ).profile;
+    expect(store.readProfilePersonalAuthorityRevocation(globalProfile.id)).toMatchObject({
+      profileGeneration: rolledGlobal.processGeneration,
+      revision: global.revocation.revision + 1,
+      state: "releasing",
+    });
+    expect(store.readProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      provider: "claude",
+      runtimeScope: "personal",
+    })).toMatchObject({
+      profileGeneration: rolledScoped.processGeneration,
+      revision: scoped.revocation.revision + 1,
+      state: "releasing",
+    });
+    expect(store.completeProfilePersonalAuthorityRevocation({
+      profileId: globalProfile.id,
+      expectedGeneration: rolledGlobal.processGeneration,
+    })).toMatchObject({
+      processGeneration: rolledGlobal.processGeneration + 1,
+      state: "signed_out",
+    });
+    const rolledScopedRevocation = store.readProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      provider: "claude",
+      runtimeScope: "personal",
+    });
+    if (rolledScopedRevocation === null) throw new Error("Expected scoped revocation.");
+    expect(store.completeProviderRuntimeAccountRevocation({
+      profileId: scopedProfile.id,
+      expectedGeneration: rolledScoped.processGeneration,
+      provider: "claude",
+      runtimeScope: "personal",
+      expectedRevision: rolledScopedRevocation.revision,
+    })).toMatchObject({
+      profileGeneration: rolledScoped.processGeneration,
+      state: "completed",
+    });
+
+    const blockedProfile = signInProfile(
+      store,
+      "Blocked clean revocation rollover",
+      "blocked-clean-revocation@example.com",
+    );
+    const retainedProcess = store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(blockedProfile.id, "claude"),
+      providerThreadId: "blocked-clean-revocation-process",
+      profileId: blockedProfile.id,
+      profileGeneration: blockedProfile.processGeneration,
+      runtimeScope: "managed",
+      identity: {
+        pid: 51_104,
+        pidDomain: "darwin",
+        procStart: "blocked-clean-revocation-process",
+      },
+    });
+    const blocked = store.beginProviderRuntimeAccountRevocation({
+      profileId: blockedProfile.id,
+      expectedGeneration: blockedProfile.processGeneration,
+      provider: "claude",
+      runtimeScope: "managed",
+      currentAccountKey: null,
+      workStore,
+    });
+    expect(() => store.advanceProfileGeneration(
+      blockedProfile.id, blockedProfile.processGeneration,
+    )).toThrow("CLAUDE_REVOCATION_PROFILE_ROLLOVER_BLOCKED");
+    const carriedProfile = store.advanceProfileGenerationForDaemonShutdown(
+      blockedProfile.id,
+      blockedProfile.processGeneration,
+      workStore,
+    ).profile;
+    expect(store.requireProfileById(blockedProfile.id).processGeneration)
+      .toBe(blockedProfile.processGeneration + 1);
+    const carriedRevocation = store.readProviderRuntimeAccountRevocation({
+      profileId: blockedProfile.id,
+      provider: "claude",
+      runtimeScope: "managed",
+    });
+    expect(carriedRevocation).toMatchObject({ profileGeneration: carriedProfile.processGeneration,
+      revision: blocked.revocation.revision + 1, state: "releasing" });
+    expect(store.readClaudeProcessAuthority({ profileId: retainedProcess.profileId,
+      providerThreadId: retainedProcess.providerThreadId, runtimeScope: retainedProcess.runtimeScope })).toEqual(retainedProcess);
+    if (carriedRevocation === null) throw new Error("Expected carried Claude revocation.");
+    expect(() => store.completeProviderRuntimeAccountRevocation({ profileId: blockedProfile.id,
+      expectedGeneration: carriedProfile.processGeneration, provider: "claude", runtimeScope: "managed",
+      expectedRevision: carriedRevocation.revision })).toThrow("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_CLAUDE_PROCESS_LIVE");
+  });
+
+  test("rejects a malformed current Claude authority table without rewriting custody", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Legacy Claude authority", "legacy-claude@example.com");
+    const identities = [
+      { pid: 52_001, pidDomain: "darwin" as const, procStart: "legacy-claimed" },
+      { pid: 52_002, pidDomain: "darwin" as const, procStart: "legacy-releasing" },
+      { pid: 52_003, pidDomain: "darwin" as const, procStart: "legacy-released" },
+    ];
+    const claimed = identities.map((identity, index) =>
+      store.recordClaimedClaudeProcessAuthority({
+        providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+        providerThreadId: `legacy-thread-${index}`,
+        profileId: profile.id,
+        profileGeneration: profile.processGeneration,
+        runtimeScope: "managed",
+        identity,
+      }));
+    const releasing = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: claimed[1]?.providerThreadId ?? "",
+      profileId: profile.id,
+      runtimeScope: "managed",
+      expectedRevision: claimed[1]?.revision ?? 0,
+      identity: identities[1] ?? identities[0]!,
+    });
+    const releasedBegin = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: claimed[2]?.providerThreadId ?? "",
+      profileId: profile.id,
+      runtimeScope: "managed",
+      expectedRevision: claimed[2]?.revision ?? 0,
+      identity: identities[2] ?? identities[0]!,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasedBegin.providerThreadId,
+      profileId: releasedBegin.profileId,
+      runtimeScope: releasedBegin.runtimeScope,
+      expectedRevision: releasedBegin.revision,
+      identity: releasedBegin.identity,
+    });
+    expect(releasing.state).toBe("releasing");
+    const databasePath = store.paths.database;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(databasePath, { create: false, strict: true });
+    try {
+      legacy.exec(`
+        DROP TRIGGER IF EXISTS session_claude_process_authority_session_guard_insert;
+        DROP TRIGGER IF EXISTS session_claude_process_authority_session_guard_update;
+        DROP TRIGGER IF EXISTS session_claude_process_authority_revision_guard;
+        DROP TRIGGER IF EXISTS sessions_claude_process_authority_rebind_guard;
+        DROP INDEX IF EXISTS session_claude_process_authorities_live_identity;
+        DROP INDEX IF EXISTS session_claude_process_authorities_session;
+        ALTER TABLE session_claude_process_authorities
+          RENAME TO session_claude_process_authorities_scoped_backup;
+        CREATE TABLE session_claude_process_authorities (
+          provider_thread_id TEXT PRIMARY KEY,
+          profile_id TEXT NOT NULL,
+          profile_generation INTEGER NOT NULL,
+          runtime_scope TEXT NOT NULL,
+          session_id TEXT,
+          pid INTEGER NOT NULL,
+          pid_domain TEXT NOT NULL,
+          proc_start TEXT NOT NULL,
+          state TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          recorded_at INTEGER NOT NULL,
+          released_at INTEGER
+        ) STRICT;
+        INSERT INTO session_claude_process_authorities
+          SELECT provider_thread_id,profile_id,profile_generation,runtime_scope,
+            session_id,pid,pid_domain,proc_start,state,revision,recorded_at,released_at
+          FROM session_claude_process_authorities_scoped_backup;
+        DROP TABLE session_claude_process_authorities_scoped_backup;
+      `);
+    } finally {
+      legacy.close(false);
+    }
+
+    expect(() => new StateStore(store.paths))
+      .toThrow("STATE_SCHEMA_V39_OBJECT_MISSING:session_claude_process_authorities_live_identity");
+    const primaryKey = new Database(databasePath, { readonly: true, strict: true });
+    try {
+      expect((primaryKey.query(
+        "PRAGMA table_info(session_claude_process_authorities)",
+      ).all() as { name: string; pk: number }[])
+        .filter((column) => column.pk > 0)
+        .sort((left, right) => left.pk - right.pk)
+        .map((column) => column.name)).toEqual(["provider_thread_id"]);
+      expect(primaryKey.query(
+        "SELECT state FROM session_claude_process_authorities ORDER BY provider_thread_id",
+      ).all()).toEqual([
+        { state: "claimed" },
+        { state: "releasing" },
+        { state: "released" },
+      ]);
+    } finally {
+      primaryKey.close(false);
+    }
+  });
+
+  test("quarantines mismatched and legacy session identity without inventing provenance", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Legacy provider provenance",
+      "legacy-provider-provenance@example.com",
+    );
+    const projectRoot = join(home, "legacy-provider-provenance");
+    await mkdir(projectRoot);
+    const project = await store.createProject(
+      "Legacy provider provenance",
+      projectRoot,
+      true,
+    );
+    const key = providerAccountKeyForProfile(store, profile.id, "codex");
+    const proven = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "proven-v35-session",
+      title: "Proven v35 session",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: key,
+    });
+    const importedPartial = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "partial-v35-session",
+      projectId: project.id,
+      title: "Partial v35 session",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: key,
+    });
+    const partial = store.updateSessionMetadata({
+      sessionId: importedPartial.id,
+      expectedRevision: importedPartial.revision,
+      preset: "high",
+    });
+    const queue = store.enqueue(partial.id, "legacy queued effect");
+    const mutationKey = "00000000-0000-4000-8000-000000000903";
+    store.prepareMutation({
+      kind: "session.rename",
+      authorityId: partial.id,
+      authorityGeneration: profile.processGeneration,
+      request: { name: "Legacy prepared rename" },
+      idempotencyKey: mutationKey,
+    });
+    const sessionTask = store.createSessionTaskStore().create({
+      sessionId: partial.id,
+      name: "Legacy active task",
+      prompt: "Do not dispatch after migration.",
+      minutes: 15,
+      status: "active",
+      idempotencyKey: "00000000-0000-4000-8000-000000000904",
+    });
+    const interaction = store.admitInteraction({
+      publicId: "00000000-0000-4000-8000-000000000905",
+      sessionId: partial.id,
+      authority: {
+        ...codexInteractionBinding(store, profile.id),
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId: "00000000-0000-4000-8000-000000000906",
+        requestId: { type: "string", value: "legacy-migration" },
+        method: "item/fileChange/requestApproval",
+        requestDigest: "9".repeat(64),
+        threadId: partial.providerThreadId ?? "",
+        turnId: "legacy-migration-turn",
+        itemId: "legacy-migration-item",
+        approvalId: null,
+      },
+      kind: "file_change_approval",
+      blocking: true,
+      display: {
+        kind: "file_change_approval",
+        summary: "Legacy migration approval",
+        reason: null,
+        grantRoot: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    }).record;
+    const workStore = createRevocationWorkStore(store);
+    const createdWork = workStore.apply({
+      kind: "work.create",
+      idempotencyKey: "01890f31-a123-7000-8000-000000000907",
+      clientRef: "legacy-migration-work",
+      coordinatorSessionId: partial.id,
+      objective: "Prove migration-time work retirement.",
+      routes: [{
+        accountId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fast: false,
+      }],
+      tasks: [{
+        clientRef: "legacy-migration-work-task",
+        dependsOnRefs: [],
+        dependsOnTaskIds: [],
+        objective: "Hold one legacy claim.",
+        instructions: "Retire this claim during v35 repair.",
+        criteria: ["The claim is no longer active."],
+        route: { accountId: profile.id, projectId: project.id },
+        preset: "high",
+        fast: false,
+        priority: 0,
+        maxAttempts: 3,
+        requiredReviews: 0,
+        resultKind: "text",
+        minEvidence: 0,
+      }],
+    });
+    if (createdWork.kind !== "work.create") throw new Error("Expected legacy work.");
+    const workTask = createdWork.tasks[0];
+    if (workTask === undefined) throw new Error("Expected one legacy work task.");
+    const workClaim = workStore.apply({
+      kind: "task.claim",
+      idempotencyKey: "01890f31-a123-7000-8000-000000000908",
+      workId: createdWork.work.id,
+      taskId: workTask.id,
+      expectedTaskRevision: workTask.revision,
+      actorSessionId: partial.id,
+      actorCapability: `hrac1_${"A".repeat(43)}`,
+      leaseMs: 5_000,
+    });
+    if (workClaim.kind !== "task.claim") throw new Error("Expected legacy work claim.");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const partialV35 = new Database(paths.database, { create: false, strict: true });
+    try {
+      const guard = z.object({ sql: z.string() }).strict().parse(partialV35.query(
+        `SELECT sql FROM sqlite_master
+         WHERE type='trigger' AND name='session_provider_account_authority_update_guard'`,
+      ).get());
+      partialV35.exec("DROP TRIGGER session_provider_account_authority_update_guard");
+      partialV35.query(
+        "UPDATE session_provider_account_authorities SET account_key=? WHERE session_id=?",
+      ).run(`v1:codex:${"f".repeat(64)}`, partial.id);
+      partialV35.exec(guard.sql);
+      downgradeToExactLegacyAdoptionVersion36(partialV35);
+    } finally {
+      partialV35.close(false);
+    }
+    const repaired = new StateStore(paths);
+    stores.push(repaired);
+    expect(repaired.sessionAccountAuthorityMatches(proven.id, profile.id)).toBe(true);
+    expect(repaired.sessionAccountAuthorityMatches(partial.id, profile.id)).toBe(false);
+    expect(repaired.readSessionProviderAccountAuthority(partial.id)).toBeNull();
+    expect(repaired.requireSession(partial.id).state).toBe("recovery_required");
+    expect(repaired.requireQueue(queue.id)).toMatchObject({ state: "pending", message: queue.message });
+    expect(repaired.hasUnsettledQueueAttachmentQuarantineForSession(partial.id)).toBe(true);
+    expect(repaired.nextPendingQueue(partial.id)).toBeNull();
+    expect(repaired.readMutation(mutationKey)?.state).toBe("cancelled");
+    expect(repaired.createSessionTaskStore().list(partial.id)
+      .find((task) => task.id === sessionTask.id)).toMatchObject({
+        status: "paused",
+        nextDueAt: null,
+      });
+    expect(() => repaired.requireInteraction(interaction.publicId))
+      .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+    expect(createRevocationWorkStore(repaired).task(workTask.id).activeAttempt).toBeNull();
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query("SELECT state,display_json FROM provider_interactions WHERE public_id=?")
+        .get(interaction.publicId)).toEqual({ state: "pending", display_json: JSON.stringify(interaction.display) });
+      expect(inspector.query("SELECT * FROM interaction_provider_authorities WHERE public_id=?")
+        .all(interaction.publicId)).toEqual([]);
+      expect(inspector.query("SELECT reason FROM legacy_provider_authority_quarantines WHERE scope_kind='interaction' AND scope_id=?")
+        .get(interaction.publicId)).toEqual({ reason: "unsettled_provider_authority_unproved" });
+      expect(inspector.query(
+        "SELECT account_key FROM session_account_authorities WHERE session_id=?",
+      ).get(partial.id)).toEqual({ account_key: null });
+      expect(() => inspector.query(
+        `INSERT INTO session_provider_account_authorities(
+           session_id,provider,runtime_scope,account_key,recorded_at
+         ) VALUES (?,'codex','managed',?,?)`,
+      ).run(partial.id, `v1:codex:${"f".repeat(64)}`, 1))
+        .toThrow("session provider account authority does not match its session");
+    } finally {
+      inspector.close(false);
+    }
+
+    const legacyValue = await fixture();
+    const legacyProfile = signInProfile(
+      legacyValue.store,
+      "Version 34 legacy session",
+      "version-34-legacy-session@example.com",
+    );
+    const legacySession = legacyValue.store.createSession({
+      profileId: legacyProfile.id,
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    legacyValue.store.close();
+    stores.splice(stores.indexOf(legacyValue.store), 1);
+    const legacy = new Database(legacyValue.store.paths.database, {
+      create: false,
+      strict: true,
+    });
+    try {
+      dropSchemaAfterVersion34(legacy);
+      legacy.exec("DELETE FROM migrations WHERE version>34; PRAGMA user_version=34;");
+    } finally {
+      legacy.close(false);
+    }
+    const migrated = new StateStore(legacyValue.store.paths);
+    stores.push(migrated);
+    expect(migrated.sessionAccountAuthorityMatches(
+      legacySession.id,
+      legacyProfile.id,
+    )).toBe(false);
+    expect(migrated.requireSession(legacySession.id).state).toBe("recovery_required");
+    expect(migrated.readSessionProviderAccountAuthority(legacySession.id)).toBeNull();
+  });
+
+  test("quarantines malformed pre-release v36 Claude authority and every admitted effect", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Legacy Claude provider provenance",
+      "legacy-claude-provider-provenance@example.com",
+    );
+    const unaffectedProfile = store.createProfile("Unaffected signed-out Claude profile");
+    const projectRoot = join(home, "legacy-claude-provider-provenance");
+    await mkdir(projectRoot);
+    const project = await store.createProject(
+      "Legacy Claude provider provenance",
+      projectRoot,
+      true,
+    );
+    const malformed = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "pre-release-v36-malformed-claude",
+      projectId: project.id,
+      title: "Malformed pre-release v36 Claude",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const revoked = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "pre-release-v36-revoked-claude",
+      title: "Revoked pre-release v36 Claude",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const unaffected = upsertProvenTestSession(store, {
+      profileId: unaffectedProfile.id,
+      provider: "claude",
+      providerThreadId: "valid-signed-out-claude",
+      title: "Valid signed-out Claude",
+      preset: "fable-max",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const queue = store.enqueue(malformed.id, "legacy Claude queued effect");
+    const mutationKey = "00000000-0000-4000-8000-000000000909";
+    store.prepareMutation({
+      kind: "session.rename",
+      authorityId: malformed.id,
+      authorityGeneration: profile.processGeneration,
+      request: { name: "Legacy Claude prepared rename" },
+      idempotencyKey: mutationKey,
+    });
+    const sessionTask = store.createSessionTaskStore().create({
+      sessionId: malformed.id,
+      name: "Legacy Claude active task",
+      prompt: "Do not dispatch after migration.",
+      minutes: 15,
+      status: "active",
+      idempotencyKey: "00000000-0000-4000-8000-000000000910",
+    });
+    const interaction = store.admitInteraction({
+      publicId: "00000000-0000-4000-8000-000000000911",
+      sessionId: malformed.id,
+      authority: {
+        provider: "claude",
+        providerAccountId: store.requireProviderAccountAuthority(profile.id, "claude").providerAccountId,
+        bindingGeneration: store.requireProviderAccountAuthority(profile.id, "claude").bindingGeneration,
+        profileId: profile.id,
+        processGeneration: store.requireProviderAccountAuthority(profile.id, "claude").processGeneration,
+        connectionId: "00000000-0000-4000-8000-000000000912",
+        requestId: { type: "string", value: "legacy-claude-migration" },
+        method: "claude/control_request/can_use_tool",
+        requestDigest: "8".repeat(64),
+        threadId: malformed.providerThreadId ?? "",
+        turnId: "legacy-claude-migration-turn",
+        itemId: "legacy-claude-migration-item",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Legacy Claude migration approval",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    }).record;
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const preReleaseV36 = new Database(paths.database, { create: false, strict: true });
+    try {
+      const guard = z.object({ sql: z.string() }).strict().parse(preReleaseV36.query(
+        `SELECT sql FROM sqlite_master
+         WHERE type='trigger' AND name='session_provider_account_authority_update_guard'`,
+      ).get());
+      preReleaseV36.exec("DROP TRIGGER session_provider_account_authority_update_guard");
+      preReleaseV36.query(
+        "UPDATE session_provider_account_authorities SET runtime_scope='personal' WHERE session_id=?",
+      ).run(malformed.id);
+      preReleaseV36.query(
+        `INSERT INTO provider_runtime_account_revocations(
+           profile_id,profile_generation,provider,runtime_scope,current_account_key,
+           state,revision,created_at,updated_at,completed_at
+         ) VALUES (?,?,'claude','managed',NULL,'completed',1,?,?,?)`,
+      ).run(
+        profile.id,
+        profile.processGeneration,
+        2_000,
+        2_000,
+        2_000,
+      );
+      preReleaseV36.exec(guard.sql);
+      downgradeToExactLegacyAdoptionVersion36(preReleaseV36);
+    } finally {
+      preReleaseV36.close(false);
+    }
+
+    const repaired = new StateStore(paths);
+    stores.push(repaired);
+    expect(repaired.sessionAccountAuthorityMatches(unaffected.id, unaffectedProfile.id)).toBe(true);
+    expect(repaired.readSessionProviderAccountAuthority(unaffected.id)).not.toBeNull();
+    for (const invalid of [malformed, revoked]) {
+      expect(repaired.sessionAccountAuthorityMatches(invalid.id, profile.id)).toBe(false);
+      expect(repaired.readSessionProviderAccountAuthority(invalid.id)).toBeNull();
+      expect(repaired.requireSession(invalid.id).state).toBe("recovery_required");
+    }
+    expect(repaired.requireQueue(queue.id)).toMatchObject({ state: "pending", message: queue.message });
+    expect(repaired.hasUnsettledQueueAttachmentQuarantineForSession(malformed.id)).toBe(true);
+    expect(repaired.nextPendingQueue(malformed.id)).toBeNull();
+    expect(repaired.readMutation(mutationKey)?.state).toBe("cancelled");
+    expect(repaired.createSessionTaskStore().list(malformed.id)
+      .find((task) => task.id === sessionTask.id)).toMatchObject({
+        status: "paused",
+        nextDueAt: null,
+      });
+    expect(() => repaired.requireInteraction(interaction.publicId))
+      .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("SELECT state,display_json FROM provider_interactions WHERE public_id=?")
+        .get(interaction.publicId)).toEqual({ state: "pending", display_json: JSON.stringify(interaction.display) });
+      expect(inspector.query("SELECT * FROM interaction_provider_authorities WHERE public_id=?")
+        .all(interaction.publicId)).toEqual([]);
+      expect(inspector.query("SELECT reason FROM legacy_provider_authority_quarantines WHERE scope_kind='interaction' AND scope_id=?")
+        .get(interaction.publicId)).toEqual({ reason: "unsettled_provider_authority_unproved" });
+    } finally { inspector.close(false); }
+  });
+
+  test("rejects a malformed current adoption candidate table without releasing fences", async () => {
+    const { store } = await fixture();
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "legacy-v35-candidate",
+      title: "Legacy v35 candidate",
+      state: "terminal",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const databasePath = store.paths.database;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(databasePath, { create: false, strict: true });
+    try {
+      legacy.query(
+        `UPDATE session_adoption_candidates
+         SET claim_status='fenced',fenced_fingerprint=candidate_fingerprint,
+           revision=revision+1
+         WHERE provider=? AND provider_thread_id=?`,
+      ).run(candidate.provider, candidate.providerThreadId);
+      legacy.exec(`
+        PRAGMA foreign_keys=OFF;
+        PRAGMA legacy_alter_table=ON;
+        BEGIN IMMEDIATE;
+        DROP TRIGGER IF EXISTS session_adoption_candidate_identity_immutable;
+        DROP TRIGGER IF EXISTS session_adoption_candidate_revision_guard;
+        DROP TRIGGER IF EXISTS session_adoption_candidate_source_identity_guard_insert;
+        DROP TRIGGER IF EXISTS session_adoption_candidate_source_identity_guard_update;
+        DROP INDEX IF EXISTS session_adoption_candidates_pending;
+        DROP INDEX IF EXISTS session_adoption_candidates_claude_reprobe;
+        ALTER TABLE session_adoption_candidates
+          RENAME TO session_adoption_candidates_v35_early;
+        CREATE TABLE session_adoption_candidates (
+          provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
+          provider_thread_id TEXT NOT NULL CHECK(length(provider_thread_id) BETWEEN 1 AND 200),
+          project_id TEXT,
+          title TEXT NOT NULL CHECK(length(CAST(title AS BLOB)) BETWEEN 1 AND 320),
+          provider_state TEXT NOT NULL CHECK(provider_state IN ('active','idle','terminal')),
+          active_turn_id TEXT CHECK(active_turn_id IS NULL OR length(active_turn_id) BETWEEN 1 AND 2048),
+          provider_updated_at REAL CHECK(provider_updated_at IS NULL OR provider_updated_at >= 0),
+          liveness TEXT NOT NULL CHECK(liveness IN ('live','not_live','unknown')),
+          claim_status TEXT NOT NULL CHECK(claim_status IN ('pending','claiming','adopted','fenced')),
+          candidate_fingerprint TEXT NOT NULL CHECK(length(candidate_fingerprint)=64 AND candidate_fingerprint GLOB '[0-9a-f]*'),
+          fenced_fingerprint TEXT CHECK(fenced_fingerprint IS NULL OR (length(fenced_fingerprint)=64 AND fenced_fingerprint GLOB '[0-9a-f]*')),
+          revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+          first_discovered_at INTEGER NOT NULL CHECK(first_discovered_at >= 0),
+          last_observed_at INTEGER NOT NULL CHECK(last_observed_at >= first_discovered_at),
+          last_changed_at INTEGER NOT NULL CHECK(last_changed_at BETWEEN first_discovered_at AND last_observed_at),
+          last_attempt_at INTEGER CHECK(last_attempt_at IS NULL OR last_attempt_at >= first_discovered_at),
+          PRIMARY KEY(provider,provider_thread_id),
+          CHECK(
+            (claim_status='fenced' AND fenced_fingerprint IS NOT NULL)
+            OR (claim_status!='fenced' AND fenced_fingerprint IS NULL)
+          )
+        ) STRICT;
+        INSERT INTO session_adoption_candidates(
+          provider,provider_thread_id,project_id,title,provider_state,
+          active_turn_id,provider_updated_at,liveness,claim_status,
+          candidate_fingerprint,fenced_fingerprint,revision,
+          first_discovered_at,last_observed_at,last_changed_at,last_attempt_at
+        )
+        SELECT provider,provider_thread_id,project_id,title,provider_state,
+          active_turn_id,provider_updated_at,liveness,claim_status,
+          candidate_fingerprint,fenced_fingerprint,revision,
+          first_discovered_at,last_observed_at,last_changed_at,last_attempt_at
+        FROM session_adoption_candidates_v35_early;
+        DROP TABLE session_adoption_candidates_v35_early;
+        COMMIT;
+        PRAGMA legacy_alter_table=OFF;
+      `);
+    } finally {
+      legacy.close(false);
+    }
+
+    expect(() => new StateStore(store.paths))
+      .toThrow("STATE_SCHEMA_V39_OBJECT_MISSING:session_adoption_candidates_claude_reprobe");
+    const inspector = new Database(databasePath, { readonly: true, strict: true });
+    try {
+      const candidateColumns = inspector.query(
+        "PRAGMA table_info(session_adoption_candidates)",
+      ).all() as Array<{ name: string }>;
+      const candidateColumnNames = candidateColumns.map((column) => column.name);
+      for (const name of [
+        "source_pid",
+        "source_pid_domain",
+        "source_proc_start",
+        "last_live_observed_at",
+        "provider_project_root",
+      ]) {
+        expect(candidateColumnNames.includes(name)).toBe(false);
+      }
+      expect(inspector.query(
+        `SELECT claim_status,fenced_fingerprint FROM session_adoption_candidates
+         WHERE provider=? AND provider_thread_id=?`,
+      ).get(candidate.provider, candidate.providerThreadId)).toMatchObject({
+        claim_status: "fenced",
+      });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
   test("keeps session recovery absorbing across passive and exact-state reconciliation", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Recovery", "recovery@example.com");
@@ -5598,11 +11129,16 @@ describe("StateStore", () => {
 
     const passive = store.upsertProviderSession({
       providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
       providerThreadId: "thread-recovery",
+      preset: "high",
+      fastEnabled: false,
       title: "Passive projection",
       state: "active",
       activeTurnId: "turn-passive",
       providerUpdatedAt: 11,
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
     });
     expect(passive).toMatchObject({ state: "recovery_required", title: "Untitled session", revision: quarantined.revision });
 
@@ -5622,8 +11158,8 @@ describe("StateStore", () => {
   });
 
   test("deletes only exact unbound and evidence-free starting sessions", async () => {
-    const { store } = await fixture();
-    const profile = store.createProfile("Cleanup");
+    const { store, home } = await fixture();
+    const profile = signInProfile(store, "Cleanup", "cleanup@example.com");
     const removable = store.createSession({
       profileId: profile.id,
       preset: "high",
@@ -5642,7 +11178,33 @@ describe("StateStore", () => {
     });
     expect(store.deleteUnboundStartingSession(bound.id, bound.revision)).toBe(false);
 
-    const queued = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    const projectRoot = join(home, "starting-queue-evidence");
+    await mkdir(projectRoot);
+    const project = await store.createProject("Starting queue evidence", projectRoot);
+    const startAttempt = store.prepareMutation({
+      kind: "session.start",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+      request: { projectId: project.id, preset: "high", fast: false },
+      idempotencyKey: "00000000-0000-4000-8000-0000000006c0",
+    });
+    const queued = store.beginSessionStartEffect({
+      provider: "codex",
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      attemptId: startAttempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      projectId: project.id,
+      preset: "high",
+      fastEnabled: false,
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      evidence: {
+        kind: "session.start",
+        projectId: project.id,
+        clientMessageId: null,
+        messageDigest: null,
+      },
+    });
     store.enqueue(queued.id, "retained queue evidence");
     expect(store.deleteUnboundStartingSession(queued.id, queued.revision)).toBe(false);
 
@@ -6145,7 +11707,6 @@ describe("StateStore", () => {
       outcome: { state: "joined", exitCode: 1, interruptedBy: null },
     })).toThrow("DEVIN_LOGIN_TERMINAL_OUTCOME_CONFLICT");
   });
-
   test("classifies effect-started authorities at restart and rejects new keys", async () => {
     const { store } = await fixture();
     const daemon = startInputFixtureDaemon(store);
@@ -6198,6 +11759,7 @@ describe("StateStore", () => {
 
     const loginProfile = store.createProfile("Restarted login");
     const loginSource = store.requireProviderAccountAuthority(loginProfile.id, "codex");
+    completeCodexAccountMutationAuthorityRetirement(store, loginProfile.id, loginSource.processGeneration);
     const login = store.prepareMutation({
       kind: "account.login",
       authorityId: loginProfile.id,
@@ -6216,6 +11778,7 @@ describe("StateStore", () => {
 
     const logoutProfile = signInProfile(store, "Restarted logout", "logout-restart@example.com");
     const logoutAuthority = store.requireProviderAccountAuthority(logoutProfile.id, "codex");
+    completeCodexAccountMutationAuthorityRetirement(store, logoutProfile.id, logoutAuthority.processGeneration);
     const logout = store.prepareMutation({
       kind: "account.logout",
       authorityId: logoutProfile.id,
@@ -6234,6 +11797,7 @@ describe("StateStore", () => {
 
     const cancelProfile = store.createProfile("Restarted login cancellation");
     const pendingSource = store.requireProviderAccountAuthority(cancelProfile.id, "codex");
+    completeCodexAccountMutationAuthorityRetirement(store, cancelProfile.id, pendingSource.processGeneration);
     const pendingLogin = store.prepareMutation({
       kind: "account.login",
       authorityId: cancelProfile.id,
@@ -6313,6 +11877,7 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const profile = store.createProfile("Pending login origin");
     const source = store.requireProviderAccountAuthority(profile.id, "codex");
+    completeCodexAccountMutationAuthorityRetirement(store, profile.id, source.processGeneration);
     const key = "00000000-0000-4000-8000-000000000627";
     const attempt = store.prepareMutation({
       kind: "account.login",
@@ -6440,6 +12005,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       provider: "codex",
       providerAuthority,
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
       evidence: {
         kind: "session.start",
         projectId: project.id,
@@ -6467,14 +12033,10 @@ describe("StateStore", () => {
   test("quarantines an effect-started queue under retired restart authority", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Queue restart", "queue-restart@example.com");
-    const local = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: local.id,
-      expectedRevision: local.revision,
       providerThreadId: "thread-queue-restart",
       state: "idle",
       providerUpdatedAt: 10,
@@ -6501,7 +12063,10 @@ describe("StateStore", () => {
         messageDigest: new Bun.CryptoHasher("sha256")
           .update("possibly accepted before restart")
           .digest("hex"),
-        runtimeProfile: reviewedCodexProfile(profile),
+        runtimeProfile: {
+          ...reviewedCodexProfile(profile),
+          model: store.requireSessionPresetRequirement(session.id).requirement.model,
+        },
       },
     });
 
@@ -6525,18 +12090,14 @@ describe("StateStore", () => {
 
   test("terminalizes only exact quiescent idle Claude authority for account login", async () => {
     const { store } = await fixture();
-    const profile = store.createProfile("Claude relink");
+    const profile = signInProfile(store, "Claude relink", "claude-relink@example.com");
     const providerAuthority = store.requireProviderAccountAuthority(profile.id, "claude");
-    const created = store.createSession({
+    let session = upsertProvenTestSession(store, {
       fastEnabled: false,
       preset: "fable-max",
       profileId: profile.id,
       provider: "claude",
-    });
-    let session = store.bindSession({
-      expectedRevision: created.revision,
       providerThreadId: "claude-thread-relink",
-      sessionId: created.id,
       state: "idle",
     });
     const input = {
@@ -6549,7 +12110,7 @@ describe("StateStore", () => {
 
     expect(store.canReleaseIdleClaudeSessionForAccountLogin({
       profileId: profile.id,
-      profileGeneration: profile.processGeneration,
+      profileGeneration: providerAuthority.processGeneration,
       sessionId: session.id,
     })).toBe(true);
     session = store.setSessionTurnState({
@@ -6560,7 +12121,7 @@ describe("StateStore", () => {
     });
     expect(store.canReleaseIdleClaudeSessionForAccountLogin({
       profileId: profile.id,
-      profileGeneration: profile.processGeneration,
+      profileGeneration: providerAuthority.processGeneration,
       sessionId: session.id,
     })).toBe(false);
     expect(() => store.terminalizeIdleClaudeSessionForAccountLogin(input))
@@ -6573,7 +12134,7 @@ describe("StateStore", () => {
     const queued = store.enqueue(session.id, "preserve this queued send");
     expect(store.canReleaseIdleClaudeSessionForAccountLogin({
       profileId: profile.id,
-      profileGeneration: profile.processGeneration,
+      profileGeneration: providerAuthority.processGeneration,
       sessionId: session.id,
     })).toBe(false);
     expect(() => store.terminalizeIdleClaudeSessionForAccountLogin(input))
@@ -6666,19 +12227,593 @@ describe("StateStore", () => {
     });
   });
 
+  test("fences managed Claude login retirement with its own captured tuple, not the Codex shadow", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Claude login tuple", "claude-login-tuple@example.com");
+    const authority = store.advanceProviderAccountProcessGeneration({
+      profileId: profile.id, provider: "claude", expectedProcessGeneration: 0,
+    });
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id, provider: "claude", preset: "fable-max", fastEnabled: false,
+      providerThreadId: "claude-login-tuple-thread", state: "idle",
+    });
+    store.nextProfileGeneration(profile.id);
+    const input = { profileId: profile.id, profileGeneration: authority.processGeneration, sessionId: session.id };
+    expect(store.requireProviderAccountAuthority(profile.id, "claude")).toEqual(authority);
+    expect(store.canReleaseIdleManagedClaudeSessionForAccountLogin(input)).toBe(true);
+    expect(store.canReleaseIdleManagedClaudeSessionForAccountLogin({
+      ...input, profileGeneration: store.requireProfileById(profile.id).processGeneration,
+    })).toBe(false);
+    store.advanceProviderAccountProcessGeneration({
+      profileId: profile.id, provider: "claude", expectedProcessGeneration: authority.processGeneration,
+    });
+    expect(store.canReleaseIdleManagedClaudeSessionForAccountLogin(input)).toBe(false);
+    expect(store.canReleaseIdleManagedClaudeSessionForAccountLogin({
+      ...input, profileGeneration: authority.processGeneration + 1,
+    })).toBe(false);
+    expect(store.requireSession(session.id)).toEqual(session);
+  });
+
+  test("scopes managed Claude login sessions and activity away from personal custody", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Managed Claude login scope",
+      "managed-claude-login-scope@example.com",
+    );
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: profile.id });
+
+    const personalIdle = adoptPersonalClaudeTestSession(store, profile);
+    const personalActive = adoptPersonalClaudeTestSession(store, profile);
+    const personalUnsettled = adoptPersonalClaudeTestSession(store, profile);
+    store.setSessionTurnState({
+      activeTurnId: "personal-active-turn",
+      expectedRevision: personalActive.revision,
+      sessionId: personalActive.id,
+      state: "active",
+    });
+    const personalMutation = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: personalUnsettled.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000617",
+      kind: "session.rename",
+      request: { name: "Personal unsettled rename" },
+    });
+    expect(store.transitionMutation(
+      personalMutation.id,
+      "prepared",
+      "effect_started",
+    )).toBe(true);
+
+    expect(store.listNonterminalManagedClaudeSessions(profile.id)).toEqual([]);
+    expect(store.managedClaudeLoginAuthorityBlocker(profile.id)).toBeNull();
+    expect(store.canReleaseIdleManagedClaudeSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: personalIdle.id,
+    })).toBe(false);
+    expect(store.canReleaseIdleClaudeSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: personalIdle.id,
+    })).toBe(false);
+    expect(() => store.terminalizeIdleClaudeSessionForAccountLogin({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: store.requireProviderAccountAuthority(profile.id, "claude").processGeneration,
+      sessionId: personalIdle.id,
+    })).toThrow("CLAUDE_LOGIN_SESSION_NOT_QUIESCENT");
+    expect(store.beginPersonalSessionDetach({ sessionId: personalIdle.id }).binding.state)
+      .toBe("detaching");
+    expect(store.canReleaseIdleManagedClaudeSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      sessionId: personalIdle.id,
+    })).toBe(false);
+    expect(store.listNonterminalManagedClaudeSessions(profile.id)).toEqual([]);
+    expect(store.managedClaudeLoginAuthorityBlocker(profile.id)).toBeNull();
+    const personalIdleProcess = store.readSessionClaudeProcessAuthority(personalIdle.id);
+    if (personalIdleProcess === null) throw new Error("Expected detached personal Claude custody.");
+    const personalIdleReleasing = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: personalIdleProcess.providerThreadId,
+      profileId: personalIdleProcess.profileId,
+      runtimeScope: personalIdleProcess.runtimeScope,
+      expectedRevision: personalIdleProcess.revision,
+      identity: personalIdleProcess.identity,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: personalIdleReleasing.providerThreadId,
+      profileId: personalIdleReleasing.profileId,
+      runtimeScope: personalIdleReleasing.runtimeScope,
+      expectedRevision: personalIdleReleasing.revision,
+      identity: personalIdleReleasing.identity,
+    });
+    expect(store.completePersonalSessionDetach({
+      sessionId: personalIdle.id,
+      archive: false,
+    }).binding.state).toBe("detached");
+    expect(store.requireSession(personalIdle.id).state).toBe("idle");
+    expect(store.listNonterminalManagedClaudeSessions(profile.id)).toEqual([]);
+    expect(store.managedClaudeLoginAuthorityBlocker(profile.id)).toBeNull();
+    expect(store.quarantineSession(personalIdle.id).state).toBe("recovery_required");
+    expect(store.listNonterminalManagedClaudeSessions(profile.id)).toEqual([]);
+    expect(store.managedClaudeLoginAuthorityBlocker(profile.id)).toBeNull();
+
+    let managed = upsertProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "fable-max",
+      profileId: profile.id,
+      provider: "claude",
+      providerThreadId: "managed-claude-login-thread",
+      state: "idle",
+    });
+    expect(store.listNonterminalManagedClaudeSessions(profile.id).map((session) => session.id))
+      .toEqual([managed.id]);
+    expect(store.canReleaseIdleManagedClaudeSessionForAccountLogin({
+      profileId: profile.id,
+      profileGeneration: store.requireCapturedSessionProviderAuthority(managed.id).processGeneration,
+      sessionId: managed.id,
+    })).toBe(true);
+
+    managed = store.setSessionTurnState({
+      activeTurnId: "managed-active-turn",
+      expectedRevision: managed.revision,
+      sessionId: managed.id,
+      state: "active",
+    });
+    expect(store.managedClaudeLoginAuthorityBlocker(profile.id)).toBe("active_session");
+    managed = store.setSessionTurnState({
+      expectedRevision: managed.revision,
+      sessionId: managed.id,
+      state: "idle",
+    });
+    const managedMutation = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: managed.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000618",
+      kind: "session.rename",
+      request: { name: "Managed unsettled rename" },
+    });
+    expect(store.transitionMutation(
+      managedMutation.id,
+      "prepared",
+      "effect_started",
+    )).toBe(true);
+    expect(store.managedClaudeLoginAuthorityBlocker(profile.id))
+      .toBe("unsettled_authority");
+    expect(store.transitionMutation(
+      managedMutation.id,
+      "effect_started",
+      "applied",
+      { renamed: true },
+    )).toBe(true);
+    expect(store.managedClaudeLoginAuthorityBlocker(profile.id)).toBeNull();
+
+    const mismatchedCandidate = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "mismatched-personal-claude-thread",
+      title: "Mismatched personal Claude authority",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const direct = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      direct.exec("DROP TRIGGER session_personal_runtime_binding_identity_immutable");
+      direct.query(
+        `UPDATE session_personal_runtime_bindings
+         SET provider_thread_id=?,revision=revision+1,updated_at=updated_at+1
+         WHERE session_id=?`,
+      ).run(mismatchedCandidate.providerThreadId, personalActive.id);
+    } finally {
+      direct.close(false);
+    }
+    expect(store.listNonterminalManagedClaudeSessions(profile.id).map((session) => session.id))
+      .toEqual([managed.id]);
+    expect(store.managedClaudeLoginAuthorityBlocker(profile.id))
+      .toBe("unsettled_authority");
+  });
+
+  test("scopes managed Claude login provider-switch authority by source and target", async () => {
+    const { store } = await fixture();
+    const claudeProfile = signInProfile(
+      store,
+      "Claude switch login scope",
+      "claude-switch-login-scope@example.com",
+    );
+    const codexProfile = signInProfile(
+      store,
+      "Codex switch login scope",
+      "codex-switch-login-scope@example.com",
+    );
+    const claudeAuthority = store.advanceProviderAccountProcessGeneration({
+      profileId: claudeProfile.id, provider: "claude", expectedProcessGeneration: 0,
+    });
+    const codexAuthority = store.requireProviderAccountAuthority(codexProfile.id, "codex");
+    store.setSessionAdoptionPolicy({ provider: "claude", profileId: claudeProfile.id });
+    const personalSource = adoptPersonalClaudeTestSession(store, claudeProfile);
+    if (personalSource.providerThreadId === undefined) {
+      throw new Error("Expected the personal Claude source provider thread.");
+    }
+    const sourceSwitch = store.prepareMutation({
+      authorityGeneration: codexProfile.processGeneration,
+      authorityId: personalSource.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000619",
+      kind: "session.switch",
+      request: { preset: "high", provider: "codex" },
+      providerAuthorities: [
+        { role: "source", authority: claudeAuthority, provenance: "legacy_switch_source" },
+        { role: "target", authority: codexAuthority, provenance: "legacy_switch_target" },
+      ],
+    });
+    const personalSourceSeedText = "personal Claude source seed";
+    const personalSourceSeed = createHash("sha256")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update(personalSourceSeedText, "utf8")
+      .digest("hex");
+    const personalSourceTranscript = createHash("sha256")
+      .update("personal Claude source transcript")
+      .digest("hex");
+    const sourceSwitchEvidence = store.beginSessionProviderSwitchEffect({
+      attemptId: sourceSwitch.id,
+      sessionId: personalSource.id,
+      evidence: {
+        kind: "session.switch",
+        daemonGeneration: 0,
+        requestedAccountId: null,
+        requestedPreset: "high",
+        runtimeProfile: codexAdoptionRuntimeProfile(codexProfile, "high", false),
+        seedDigest: personalSourceSeed,
+        seedIncludedRecords: 1,
+        seedOmittedRecords: 0,
+        sourcePreset: "fable-max",
+        sourceProcessGeneration: claudeAuthority.processGeneration,
+        sourceProfileId: claudeProfile.id,
+        sourceProvider: "claude",
+        sourceProviderThreadId: personalSource.providerThreadId,
+        targetPreset: "high",
+        targetProcessGeneration: codexProfile.processGeneration,
+        targetProfileId: codexProfile.id,
+        targetProvider: "codex",
+        targetProviderAccountKey: providerAccountKeyForProfile(store, codexProfile.id, "codex"),
+        transcriptDigest: personalSourceTranscript,
+      },
+    });
+    expect(store.managedClaudeLoginAuthorityBlocker(claudeProfile.id)).toBeNull();
+
+    const recoveredTargetThreadId = "recovered-codex-switch-target";
+    store.recordSessionProviderSwitchTarget({
+      attemptId: sourceSwitch.id,
+      sessionId: personalSource.id,
+      providerThreadId: recoveredTargetThreadId,
+    });
+    store.recordSessionProviderSwitchSeedIntent({
+      attemptId: sourceSwitch.id,
+      sessionId: personalSource.id,
+      providerThreadId: recoveredTargetThreadId,
+      runtimeProfile: codexAdoptionRuntimeProfile(codexProfile, "high", false),
+      seedText: personalSourceSeedText,
+    });
+    store.recordSessionProviderSwitchSeedResult({
+      attemptId: sourceSwitch.id,
+      sessionId: personalSource.id,
+      providerThreadId: recoveredTargetThreadId,
+      runtimeProfile: codexAdoptionRuntimeProfile(codexProfile, "high", false),
+      turnId: "recovered-codex-seed-turn",
+      turnStatus: "completed",
+    });
+    const sourceProcess = store.readClaudeProcessAuthority({
+      providerThreadId: personalSource.providerThreadId,
+      profileId: claudeProfile.id,
+      runtimeScope: "personal",
+    });
+    if (sourceProcess === null) throw new Error("Expected personal Claude source process.");
+    const releasingSource = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: sourceProcess.providerThreadId,
+      profileId: sourceProcess.profileId,
+      runtimeScope: sourceProcess.runtimeScope,
+      expectedRevision: sourceProcess.revision,
+      identity: sourceProcess.identity,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasingSource.providerThreadId,
+      profileId: releasingSource.profileId,
+      runtimeScope: releasingSource.runtimeScope,
+      expectedRevision: releasingSource.revision,
+      identity: releasingSource.identity,
+    });
+    store.recordSessionProviderSwitchSourceReleased({
+      attemptId: sourceSwitch.id,
+      sessionId: personalSource.id,
+    });
+    expect(store.readSessionProviderSwitchProgress(sourceSwitch.id)).toMatchObject({
+      targetProviderAccountKey: providerAccountKeyForProfile(store, codexProfile.id, "codex"),
+      targetProviderThreadId: recoveredTargetThreadId,
+    });
+    expect(() => store.bindSessionProviderSwitchRecoveryTarget({
+      attemptId: sourceSwitch.id,
+      sessionId: personalSource.id,
+      expectedSessionRevision: personalSource.revision,
+      providerAccountKey: `v1:codex:${"f".repeat(64)}`,
+      title: "Wrong-account Codex target",
+      providerUpdatedAt: 20,
+    })).toThrow("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_MISMATCH");
+    const recoveredTarget = store.bindSessionProviderSwitchRecoveryTarget({
+      attemptId: sourceSwitch.id,
+      sessionId: personalSource.id,
+      expectedSessionRevision: personalSource.revision,
+      providerAccountKey: providerAccountKeyForProfile(store, codexProfile.id, "codex"),
+      title: "Recovered Codex target",
+      providerUpdatedAt: 20,
+    });
+    expect(recoveredTarget).toMatchObject({
+      profileId: codexProfile.id,
+      provider: "codex",
+      providerThreadId: recoveredTargetThreadId,
+      state: "recovery_required",
+    });
+    expect(store.readSessionPersonalRuntimeBinding(personalSource.id, true))
+      .toMatchObject({ state: "detached" });
+    expect(store.readSessionProviderAccountAuthority(personalSource.id)).toEqual({
+      sessionId: personalSource.id,
+      provider: "codex",
+      runtimeScope: "managed",
+      accountKey: providerAccountKeyForProfile(store, codexProfile.id, "codex"),
+      recordedAt: expect.any(Number),
+    });
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      inspector.query(
+        `INSERT INTO provider_runtime_account_revocations(
+           profile_id,profile_generation,provider,runtime_scope,current_account_key,
+           state,revision,created_at,updated_at,completed_at
+         ) VALUES (?,?,'codex','managed',NULL,'completed',1,?,?,?)`,
+      ).run(
+        codexProfile.id,
+        codexProfile.processGeneration,
+        3_000,
+        3_000,
+        3_000,
+      );
+      expect(() => store.bindSessionProviderSwitchRecoveryTarget({
+        attemptId: sourceSwitch.id,
+        sessionId: personalSource.id,
+        expectedSessionRevision: recoveredTarget.revision,
+        providerAccountKey: providerAccountKeyForProfile(store, codexProfile.id, "codex"),
+        title: "Revoked Codex target",
+        providerUpdatedAt: 20,
+      })).toThrow("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_ACCOUNT_AUTHORITY_MISMATCH");
+      expect(() => store.resolveSessionMutation({
+        attemptId: sourceSwitch.id,
+        expectedOriginalState: "effect_started",
+        expectedEvidenceDigest: sourceSwitchEvidence.digest,
+        resolution: "proven_applied",
+        resolutionEvidence: { source: "revoked_target_read" },
+        receipt: { revoked: true },
+        provider: {
+          providerThreadId: recoveredTargetThreadId,
+          title: "Recovered Codex target",
+          status: "idle",
+          providerUpdatedAt: 20,
+        },
+      })).toThrow("SESSION_PROVIDER_SWITCH_RECOVERY_BINDING_MISMATCH");
+      inspector.query(
+        `DELETE FROM provider_runtime_account_revocations
+         WHERE profile_id=? AND provider='codex' AND runtime_scope='managed'`,
+      ).run(codexProfile.id);
+      inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
+      inspector.exec("DROP TRIGGER session_provider_account_authority_update_guard");
+      const storedEvidence = inspector.query(
+        "SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?",
+      ).get(sourceSwitch.id) as { evidence_json: string; evidence_digest: string };
+      const legacyEvidence = JSON.parse(storedEvidence.evidence_json) as Record<string, unknown>;
+      delete legacyEvidence.targetProviderAccountKey;
+      const legacyEvidenceJson = JSON.stringify(legacyEvidence);
+      const legacyEvidenceDigest = createHash("sha256").update(legacyEvidenceJson).digest("hex");
+      inspector.query(
+        "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
+      ).run(legacyEvidenceJson, legacyEvidenceDigest, sourceSwitch.id);
+      expect(() => store.resolveSessionMutation({
+        attemptId: sourceSwitch.id,
+        expectedOriginalState: "effect_started",
+        expectedEvidenceDigest: legacyEvidenceDigest,
+        resolution: "proven_applied",
+        resolutionEvidence: { source: "legacy_target_read" },
+        receipt: { legacy: true },
+        provider: {
+          providerThreadId: recoveredTargetThreadId,
+          title: "Recovered Codex target",
+          status: "idle",
+          providerUpdatedAt: 20,
+        },
+      })).toThrow("SESSION_PROVIDER_SWITCH_RECOVERY_BINDING_MISMATCH");
+      inspector.query(
+        "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
+      ).run(storedEvidence.evidence_json, storedEvidence.evidence_digest, sourceSwitch.id);
+      inspector.query(
+        "UPDATE session_provider_account_authorities SET account_key=? WHERE session_id=?",
+      ).run(`v1:codex:${"f".repeat(64)}`, personalSource.id);
+      expect(() => store.resolveSessionMutation({
+        attemptId: sourceSwitch.id,
+        expectedOriginalState: "effect_started",
+        expectedEvidenceDigest: sourceSwitchEvidence.digest,
+        resolution: "proven_applied",
+        resolutionEvidence: { source: "mismatched_target_read" },
+        receipt: { mismatch: true },
+        provider: {
+          providerThreadId: recoveredTargetThreadId,
+          title: "Recovered Codex target",
+          status: "idle",
+          providerUpdatedAt: 20,
+        },
+      })).toThrow("SESSION_PROVIDER_SWITCH_RECOVERY_BINDING_MISMATCH");
+      inspector.query(
+        "UPDATE session_provider_account_authorities SET account_key=? WHERE session_id=?",
+      ).run(providerAccountKeyForProfile(store, codexProfile.id, "codex"), personalSource.id);
+    } finally {
+      inspector.close(false);
+    }
+    const sourceSwitchReceipt = {
+      from: {
+        account: claudeProfile.id,
+        preset: "fable-max" as const,
+        provider: "claude" as const,
+      },
+      providerThreadId: recoveredTargetThreadId,
+      request: { accountId: null, preset: "high" as const, provider: "codex" as const },
+      seed: {
+        digest: personalSourceSeed,
+        includedRecords: 1,
+        omittedRecords: 0,
+        status: "completed" as const,
+      },
+      sessionId: personalSource.id,
+      to: {
+        account: codexProfile.id,
+        preset: "high" as const,
+        provider: "codex" as const,
+      },
+      transcriptDigest: personalSourceTranscript,
+      turnId: "recovered-codex-seed-turn",
+    };
+    expect(store.resolveSessionMutation({
+      attemptId: sourceSwitch.id,
+      expectedOriginalState: "effect_started",
+      expectedEvidenceDigest: sourceSwitchEvidence.digest,
+      resolution: "proven_applied",
+      resolutionEvidence: { source: "target_read_after_source_release" },
+      receipt: sourceSwitchReceipt,
+      provider: {
+        providerThreadId: recoveredTargetThreadId,
+        title: "Recovered Codex target",
+        status: "idle",
+        providerUpdatedAt: 20,
+      },
+    })).toMatchObject({
+      profileId: codexProfile.id,
+      provider: "codex",
+      providerThreadId: recoveredTargetThreadId,
+      state: "idle",
+    });
+    expect(store.managedClaudeLoginAuthorityBlocker(claudeProfile.id)).toBeNull();
+
+    const managedCodexSource = upsertProvenTestSession(store, {
+      fastEnabled: false,
+      preset: "high",
+      profileId: codexProfile.id,
+      provider: "codex",
+      providerThreadId: "managed-codex-source-for-claude",
+      state: "idle",
+    });
+    const targetSwitch = store.prepareMutation({
+      authorityGeneration: claudeAuthority.processGeneration,
+      authorityId: managedCodexSource.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000620",
+      kind: "session.switch",
+      request: { preset: "fable-max", provider: "claude" },
+      providerAuthorities: [
+        { role: "source", authority: codexAuthority, provenance: "legacy_switch_source" },
+        { role: "target", authority: claudeAuthority, provenance: "legacy_switch_target" },
+      ],
+    });
+    store.beginSessionProviderSwitchEffect({
+      attemptId: targetSwitch.id,
+      sessionId: managedCodexSource.id,
+      providerAuthentication: {
+        profileId: claudeProfile.id,
+        processGeneration: claudeAuthority.processGeneration,
+        provider: "claude",
+        signedIn: true,
+      },
+      evidence: {
+        kind: "session.switch",
+        daemonGeneration: 0,
+        requestedAccountId: null,
+        requestedPreset: "fable-max",
+        runtimeProfile: {
+          ...claudeAdoptionRuntimeProfile(store.requireProviderAccountAuthority(claudeProfile.id, "claude")),
+          configHome: "isolated",
+        },
+        seedDigest: createHash("sha256")
+          .update("managed Claude target seed")
+          .digest("hex"),
+        seedIncludedRecords: 1,
+        seedOmittedRecords: 0,
+        sourcePreset: "high",
+        sourceProcessGeneration: codexProfile.processGeneration,
+        sourceProfileId: codexProfile.id,
+        sourceProvider: "codex",
+        sourceProviderThreadId: managedCodexSource.providerThreadId ?? "",
+        targetPreset: "fable-max",
+        targetProcessGeneration: claudeAuthority.processGeneration,
+        targetProfileId: claudeProfile.id,
+        targetProvider: "claude",
+        targetProviderAccountKey: testProviderAccountKey("claude"),
+        transcriptDigest: createHash("sha256")
+          .update("managed Claude target transcript")
+          .digest("hex"),
+      },
+    });
+    const switchTargetLaunchInput = {
+      providerAuthority: store.requireProviderAccountAuthority(claudeProfile.id, "claude"),
+      providerThreadId: "00000000-0000-4000-8000-000000000922",
+      profileId: claudeProfile.id,
+      profileGeneration: claudeProfile.processGeneration,
+      runtimeScope: "managed" as const,
+      providerAccountKey: testProviderAccountKey("claude"),
+      sessionId: managedCodexSource.id,
+    };
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      ...switchTargetLaunchInput,
+      providerAuthority: store.requireProviderAccountAuthority(codexProfile.id, "claude"),
+      profileId: codexProfile.id,
+      profileGeneration: codexProfile.processGeneration,
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_AUTHORITY_MISMATCH");
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      ...switchTargetLaunchInput,
+      providerAccountKey: namedProviderAccountKey("claude", "wrong-switch-target-account"),
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_AUTHORITY_MISMATCH");
+    expect(() => store.stageClaudeProcessLaunchIntent({
+      ...switchTargetLaunchInput,
+      runtimeScope: "personal",
+    })).toThrow("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_SESSION_AUTHORITY_MISMATCH");
+    const switchTargetLaunch = store.stageClaudeProcessLaunchIntent(
+      switchTargetLaunchInput,
+    );
+    expect(switchTargetLaunch).toMatchObject({
+      providerThreadId: switchTargetLaunchInput.providerThreadId,
+      profileId: claudeProfile.id,
+      profileGeneration: claudeProfile.processGeneration,
+      runtimeScope: "managed",
+      sessionId: managedCodexSource.id,
+    });
+    store.cancelClaudeProcessLaunchIntent({
+      providerThreadId: switchTargetLaunch.providerThreadId,
+      profileId: switchTargetLaunch.profileId,
+      profileGeneration: switchTargetLaunch.profileGeneration,
+      runtimeScope: switchTargetLaunch.runtimeScope,
+      intentId: switchTargetLaunch.intentId,
+      expectedRevision: switchTargetLaunch.revision,
+    });
+    expect(store.managedClaudeLoginAuthorityBlocker(claudeProfile.id))
+      .toBe("unsettled_authority");
+  });
+
   test("provider deletion atomically terminalizes pending and in-flight session authority", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Provider deletion", "deleted@example.com");
-    const created = store.createSession({
+    const importedSession = upsertProvenTestSession(store, {
       fastEnabled: false,
       preset: "high",
       profileId: profile.id,
-    });
-    const session = store.bindSession({
-      expectedRevision: created.revision,
       providerThreadId: "thread-provider-deleted",
-      sessionId: created.id,
       state: "idle",
+    });
+    const session = store.updateSessionMetadata({
+      sessionId: importedSession.id,
+      expectedRevision: importedSession.revision,
+      preset: "high",
     });
     const queued = store.enqueue(session.id, "possibly dispatched queue");
     store.prepareMutation({
@@ -6742,6 +12877,17 @@ describe("StateStore", () => {
         sessionId: session.id,
       },
     });
+    const taskStore = store.createSessionTaskStore();
+    const activeTask = taskStore.create({
+      sessionId: session.id,
+      name: "Provider-deleted task",
+      prompt: "Must not run after the provider deletes this session.",
+      minutes: 15,
+      status: "active",
+      idempotencyKey: "00000000-0000-4000-8000-000000000605",
+    });
+    const readTask = () => taskStore.list(session.id).find((task) =>
+      task.id === activeTask.id);
 
     expect(() => store.terminalizeSessionFromProviderDeletion({
       accountId: profile.id,
@@ -6756,6 +12902,12 @@ describe("StateStore", () => {
     expect(store.readMutation("00000000-0000-4000-8000-000000000604"))
       .toMatchObject({ state: "effect_started" });
     expect(store.requireQueue(queued.id)).toMatchObject({ state: "dispatching" });
+    expect(readTask()).toMatchObject({
+      status: "active",
+      revision: activeTask.revision,
+      nextDueAt: activeTask.nextDueAt,
+      updatedAt: activeTask.updatedAt,
+    });
 
     const terminal = store.terminalizeSessionFromProviderDeletion({
       accountId: profile.id,
@@ -6791,6 +12943,12 @@ describe("StateStore", () => {
     });
     expect(store.listUnsettledMutations({ sessionId: session.id })).toEqual([]);
     expect(store.listUnsettledQueueEffects(session.id)).toEqual([]);
+    const pausedTask = readTask();
+    expect(pausedTask).toMatchObject({
+      status: "paused",
+      revision: activeTask.revision + 1,
+      nextDueAt: null,
+    });
     expect(store.terminalizeSessionFromProviderDeletion({
       accountId: profile.id,
       providerConnectionId: null,
@@ -6802,12 +12960,234 @@ describe("StateStore", () => {
       interactions: [],
       session: { state: "terminal" },
     });
+    expect(readTask()).toEqual(pausedTask);
     expect(store.listSessionEvents({
       afterSequence: 0,
       sessionId: session.id,
     }).events.filter((event) =>
       event.body.type === "session_status" && event.body.status === "terminal"))
       .toHaveLength(1);
+  });
+
+  test("late accepted Work dispatch stays in recovery after provider deletion and restart", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Provider-deleted Work authority",
+      "provider-deleted-work@example.com",
+    );
+    const projectRoot = join(home, "provider-deleted-work");
+    await mkdir(projectRoot);
+    const project = await store.createProject(
+      "Provider-deleted Work",
+      projectRoot,
+      true,
+    );
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "provider-deleted-work-thread",
+      title: "Provider-deleted Work",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      provider: "codex",
+      providerThreadId: claiming.providerThreadId,
+      expectedCandidateRevision: claiming.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    const session = store.updateSessionMetadata({
+      sessionId: adopted.session.id,
+      expectedRevision: adopted.session.revision,
+      projectId: project.id,
+    });
+    const workCapability = `hrac1_${"A".repeat(43)}`;
+    const encodeWorkCursor = (payload: unknown) =>
+      `hra1.${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}.${"A".repeat(43)}`;
+    const createWorkStore = (generation: number) => store.createWorkStore(
+      generation,
+      encodeWorkCursor,
+      {
+        issue: () => workCapability,
+        verify: (candidateCapability) => candidateCapability === workCapability,
+      },
+    );
+    const workStore = createWorkStore(17);
+    const created = workStore.apply({
+      kind: "work.create",
+      idempotencyKey: "01890f31-a123-7000-8000-000000000951",
+      clientRef: "provider-deleted-work",
+      coordinatorSessionId: session.id,
+      objective: "Keep late provider receipts from resurrecting deleted session authority.",
+      routes: [{
+        accountId: profile.id,
+        projectId: project.id,
+        preset: "high",
+        fast: false,
+      }],
+      tasks: [{
+        clientRef: "provider-deleted-work-task",
+        dependsOnRefs: [],
+        dependsOnTaskIds: [],
+        objective: "Hold one dispatch across provider deletion.",
+        instructions: "Remain fail-closed when the accepted receipt arrives late.",
+        criteria: ["The attempt never returns to running."],
+        route: { accountId: profile.id, projectId: project.id },
+        preset: "high",
+        fast: false,
+        priority: 0,
+        maxAttempts: 3,
+        requiredReviews: 0,
+        resultKind: "text",
+        minEvidence: 0,
+      }],
+    });
+    if (created.kind !== "work.create") throw new Error("Expected a created work item.");
+    const task = created.tasks[0];
+    if (task === undefined) throw new Error("Expected one work task.");
+    const claimed = workStore.apply({
+      kind: "task.claim",
+      idempotencyKey: "01890f31-a123-7000-8000-000000000952",
+      workId: created.work.id,
+      taskId: task.id,
+      expectedTaskRevision: task.revision,
+      actorSessionId: session.id,
+      actorCapability: workCapability,
+      leaseMs: 50_000,
+    });
+    if (claimed.kind !== "task.claim") throw new Error("Expected a claimed work task.");
+    const dispatchKey = "01890f31-a123-7000-8000-000000000953";
+    const prepared = workStore.apply({
+      kind: "attempt.dispatch",
+      idempotencyKey: dispatchKey,
+      workId: created.work.id,
+      attemptId: claimed.attempt.id,
+      expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence,
+      actorSessionId: session.id,
+      attemptCapability: workCapability,
+      targetSessionId: session.id,
+      mode: "send",
+    });
+    if (prepared.kind !== "attempt.dispatch") throw new Error("Expected a dispatch effect.");
+    expect(workStore.authorizePreparedEffect(dispatchKey)).toMatchObject({
+      executable: true,
+      status: { state: "effect_started" },
+    });
+
+    expect(store.terminalizeSessionFromProviderDeletion({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toMatchObject({
+      changed: true,
+      session: { state: "terminal" },
+    });
+    const acceptedReceipt = {
+      kind: "turn_started" as const,
+      turnId: `opaque_v2_${"d".repeat(64)}`,
+      runtimeProfileDigest: "e".repeat(64),
+      mutationAttemptId: createAttemptId(),
+      accountGeneration: profile.processGeneration,
+    };
+    const recovered = workStore.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt: acceptedReceipt,
+    });
+    expect(recovered).toMatchObject({
+      id: claimed.attempt.id,
+      status: "unknown",
+      dispatchReceipt: acceptedReceipt,
+    });
+    const rawAttempt = () => {
+      const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+      try {
+        return inspector.query(
+          "SELECT state,revision FROM work_attempts WHERE id=?",
+        ).get(claimed.attempt.id);
+      } finally {
+        inspector.close(false);
+      }
+    };
+    expect(rawAttempt()).toEqual({
+      state: "recovery_required",
+      revision: recovered.revision,
+    });
+    expect(workStore.task(task.id)).toMatchObject({
+      task: { status: "blocked" },
+      activeAttempt: { id: claimed.attempt.id, status: "unknown" },
+    });
+    const afterFinalization = workStore.events(created.work.id, 0, 50);
+    expect(afterFinalization.events.at(-1)?.body).toEqual({
+      type: "attempt.dispatch_finalized",
+      attemptId: claimed.attempt.id,
+      outcome: "accepted",
+    });
+
+    expect(workStore.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt: acceptedReceipt,
+    })).toEqual(recovered);
+    expect(workStore.snapshot(created.work.id).tasks[0]).toMatchObject({
+      id: task.id,
+      status: "blocked",
+    });
+    expect(workStore.events(created.work.id, 0, 50)).toEqual(afterFinalization);
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const restarted = new StateStore(paths);
+    stores.push(restarted);
+    const restartedWork = restarted.createWorkStore(
+      18,
+      encodeWorkCursor,
+      {
+        issue: () => workCapability,
+        verify: (candidateCapability) => candidateCapability === workCapability,
+      },
+    );
+    expect(restartedWork.authorizePreparedEffect(dispatchKey)).toMatchObject({
+      executable: false,
+      disposition: "settled",
+      status: { state: "accepted" },
+    });
+    expect(restartedWork.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt: acceptedReceipt,
+    })).toEqual(recovered);
+    expect(restartedWork.snapshot(created.work.id).tasks[0]).toMatchObject({
+      id: task.id,
+      status: "blocked",
+    });
+    expect(restartedWork.events(created.work.id, 0, 50)).toEqual(afterFinalization);
+    const restartedInspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(restartedInspector.query(
+        "SELECT state,revision FROM work_attempts WHERE id=?",
+      ).get(claimed.attempt.id)).toEqual({
+        state: "recovery_required",
+        revision: recovered.revision,
+      });
+    } finally {
+      restartedInspector.close(false);
+    }
   });
 
   test("atomically binds a session-start placeholder before its provider effect is admitted", async () => {
@@ -6832,6 +13212,7 @@ describe("StateStore", () => {
       fastEnabled: false,
       provider: "codex",
       providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
       evidence: { kind: "session.start", projectId: project.id, clientMessageId: null, messageDigest: null },
     });
     expect(store.readMutation("00000000-0000-4000-8000-000000000610")).toMatchObject({
@@ -6842,6 +13223,75 @@ describe("StateStore", () => {
     expect(store.recoverEffectStartedMutations()).toEqual({ recovered: [attempt.id], unresolved: [] });
     expect(store.requireSession(session.id)).toMatchObject({ state: "recovery_required" });
     expect(store.requireSession(session.id).providerThreadId).toBeUndefined();
+    expect(store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(true);
+    expect(store.readSessionProviderAccountAuthority(session.id)).toMatchObject({
+      accountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      provider: "codex",
+      runtimeScope: "managed",
+    });
+  });
+
+  test("rolls back idle Codex start completion after identifiable authority is lost", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Start completion identity loss",
+      "start-completion-identity-loss@example.com",
+    );
+    const projectRoot = join(home, "start-completion-identity-loss");
+    await mkdir(projectRoot);
+    const project = await store.createProject(
+      "Start completion identity loss",
+      projectRoot,
+      true,
+    );
+    const runtimeProfile = codexAdoptionRuntimeProfile(profile, "high", false);
+    const providerAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
+    const attempt = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006c9",
+      kind: "session.start",
+      request: { fast: false, preset: "high", projectId: project.id },
+    });
+    const starting = store.beginSessionStartEffect({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      attemptId: attempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        projectId: project.id,
+        runtimeProfile,
+      },
+      fastEnabled: false,
+      preset: "high",
+      profileGeneration: profile.processGeneration,
+      profileId: profile.id,
+      projectId: project.id,
+      provider: "codex",
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { plan: "apiKey" },
+    )).toBe(true);
+    expect(() => store.completeSessionStartEffect({
+      providerAuthority,
+      attemptId: attempt.id,
+      sessionId: starting.id,
+      expectedSessionRevision: starting.revision,
+      providerThreadId: "identity-lost-completed-thread",
+      state: "idle",
+      runtimeProfile,
+      receipt: { sessionId: starting.id },
+    })).toThrow("SESSION_START_ACCOUNT_AUTHORITY_MISMATCH");
+    expect(store.requireSession(starting.id).state).toBe("starting");
+    expect(store.requireSession(starting.id).providerThreadId).toBeUndefined();
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006c9"))
+      .toMatchObject({ state: "effect_started" });
   });
 
   test("keeps a bound unresolved session-start authority current across close and restart advances", async () => {
@@ -6890,6 +13340,7 @@ describe("StateStore", () => {
       profileId: profile.id,
       projectId: project.id,
       provider: "codex",
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
     });
     const bound = store.bindSessionStartRecoveryTarget({
       attemptId: attempt.id,
@@ -6937,21 +13388,24 @@ describe("StateStore", () => {
     });
   });
 
-  test("abandons a terminal generation-zero Claude start without fabricating restart successors", async () => {
+  test("preserves an unresolved terminal generation-zero Claude start without fabricating restart successors", async () => {
     const { store, home } = await fixture();
     const key = "00000000-0000-4000-8000-0000000006c1";
-    const { attempt, profile, project } = await prepareSignedOutSessionStart(
-      store,
-      home,
-      {
-        idempotencyKey: key,
-        label: "Terminal zero start",
-        preset: "fable-max",
-        provider: "claude",
-      },
-    );
+    const profile = signInProfile(store, "Terminal Claude start", "terminal-claude@example.com");
+    const claudeAuthority = store.requireProviderAccountAuthority(profile.id, "claude");
+    expect(claudeAuthority.processGeneration).toBe(0);
+    const projectRoot = join(home, "terminal-claude-start-project");
+    await mkdir(projectRoot);
+    const project = await store.createProject("Terminal Claude start project", projectRoot, true);
+    const attempt = store.prepareMutation({
+      authorityGeneration: claudeAuthority.processGeneration,
+      authorityId: profile.id,
+      idempotencyKey: key,
+      kind: "session.start",
+      request: { fast: false, preset: "fable-max", projectId: project.id, provider: "claude" },
+    });
     const starting = store.beginSessionStartEffect({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
+      providerAuthority: claudeAuthority,
       attemptId: attempt.id,
       evidence: {
         clientMessageId: null,
@@ -6961,13 +13415,14 @@ describe("StateStore", () => {
       },
       fastEnabled: false,
       preset: "fable-max",
-      profileGeneration: profile.processGeneration,
+      profileGeneration: claudeAuthority.processGeneration,
       profileId: profile.id,
       projectId: project.id,
       provider: "claude",
+      providerAccountKey: testProviderAccountKey("claude"),
       providerAuthentication: {
         profileId: profile.id,
-        processGeneration: profile.processGeneration,
+        processGeneration: claudeAuthority.processGeneration,
         provider: "claude",
         signedIn: true,
       },
@@ -6977,6 +13432,10 @@ describe("StateStore", () => {
       sessionId: starting.id,
       state: "terminal",
     })).toMatchObject({ state: "terminal" });
+    const original = store.readMutation(key);
+    const frozenAuthorities = store.readMutationProviderAuthorities(attempt.id);
+    const captured = store.requireCapturedSessionProviderAuthority(starting.id);
+    expect(captured).toMatchObject(claudeAuthority);
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -6984,20 +13443,26 @@ describe("StateStore", () => {
     const firstRestart = new StateStore(paths, { now: () => 2_000 });
     stores.push(firstRestart);
     expect(firstRestart.nextDaemonGeneration(`boot_${"d".repeat(32)}`)).toBe(1);
-    expect(firstRestart.requireProfileById(profile.id).processGeneration).toBe(0);
+    expect(firstRestart.requireProfileById(profile.id).processGeneration).toBe(profile.processGeneration + 1);
     expect(firstRestart.requireSession(starting.id).state).toBe("terminal");
     expect(firstRestart.readMutation(key)).toMatchObject({
-      state: "reconciled", originalState: "ambiguous",
-      resolution: { kind: "abandoned", evidence: { reason: "claude_transport_no_resume" } },
+      state: "ambiguous", authorityGeneration: claudeAuthority.processGeneration,
+      evidence: original?.evidence,
     });
+    const firstMutation = firstRestart.readMutation(key);
+    expect(firstMutation?.resolution).toBeUndefined();
+    expect(firstRestart.requireCapturedSessionProviderAuthority(starting.id)).toEqual(captured);
+    expect(firstRestart.readMutationProviderAuthorities(attempt.id)).toEqual(frozenAuthorities);
     firstRestart.close();
     stores.splice(stores.indexOf(firstRestart), 1);
 
     const secondRestart = new StateStore(paths, { now: () => 3_000 });
     stores.push(secondRestart);
     expect(secondRestart.nextDaemonGeneration(`boot_${"e".repeat(32)}`)).toBe(2);
-    expect(secondRestart.requireProfileById(profile.id).processGeneration).toBe(0);
-    expect(secondRestart.hasUnsettledSessionMutationAuthority(profile.id, "claude")).toBe(false);
+    expect(secondRestart.requireProfileById(profile.id).processGeneration).toBe(profile.processGeneration + 2);
+    expect(secondRestart.readMutation(key)).toEqual(firstMutation);
+    expect(secondRestart.requireCapturedSessionProviderAuthority(starting.id)).toEqual(captured);
+    expect(secondRestart.readMutationProviderAuthorities(attempt.id)).toEqual(frozenAuthorities);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(inspector.query(
@@ -7008,13 +13473,9 @@ describe("StateStore", () => {
       ).all(attempt.id, profile.id)).toEqual([]);
       expect(inspector.query(
         "SELECT resolution_kind,evidence_json FROM mutation_resolutions WHERE attempt_id=?",
-      ).get(attempt.id)).toMatchObject({
-        resolution_kind: "abandoned",
-        evidence_json: JSON.stringify({
-          source: "daemon_restart", reason: "claude_transport_no_resume",
-          providerEffectRetried: false, providerStateDeleted: false, outcome: "indeterminate",
-        }),
-      });
+      ).get(attempt.id)).toBeNull();
+      expect(inspector.query("SELECT * FROM session_provider_authority_successors WHERE session_id=?")
+        .all(starting.id)).toEqual([]);
     } finally {
       inspector.close(false);
     }
@@ -7055,6 +13516,7 @@ describe("StateStore", () => {
       profileId: loginStart.profile.id,
       projectId: loginStart.project.id,
       provider: "claude",
+      providerAccountKey: testProviderAccountKey("claude"),
       providerAuthentication: {
         profileId: loginStart.profile.id,
         processGeneration: loginStart.profile.processGeneration,
@@ -7063,6 +13525,8 @@ describe("StateStore", () => {
       },
     });
     const claudeAuthority = loginFixture.store.requireProviderAccountAuthority(loginStart.profile.id, "claude");
+    completeCodexAccountMutationAuthorityRetirement(loginFixture.store, loginStart.profile.id,
+      loginFixture.store.requireProviderAccountAuthority(loginStart.profile.id, "codex").processGeneration);
     expect(loginFixture.store.beginAccountMutationEffect({
       providerAuthority: loginFixture.store.requireProviderAccountAuthority(loginStart.profile.id, "codex"),
       attemptId: loginAttempt.id,
@@ -7079,7 +13543,6 @@ describe("StateStore", () => {
       .toEqual(claudeAuthority);
     expect(loginFixture.store.hasUnsettledSessionMutationAuthority(loginStart.profile.id, "claude"))
       .toBe(true);
-
     const logoutFixture = await fixture();
     const logoutProfile = signInProfile(
       logoutFixture.store,
@@ -7123,6 +13586,11 @@ describe("StateStore", () => {
       profileId: logoutProfile.id,
       projectId: logoutProject.id,
       provider: "codex",
+      providerAccountKey: providerAccountKeyForProfile(
+        logoutFixture.store,
+        logoutProfile.id,
+        "codex",
+      ),
     });
     expect(() => logoutFixture.store.beginAccountMutationEffect({
       providerAuthority: logoutFixture.store.requireProviderAccountAuthority(logoutProfile.id, "codex"),
@@ -7138,7 +13606,7 @@ describe("StateStore", () => {
     });
   });
 
-  test("admits a signed-out Claude session start with an exact provider authentication proof", async () => {
+  test("starts Claude under exact provider authority while Codex remains signed out", async () => {
     const { store, home } = await fixture();
     const { attempt, profile, project } = await prepareSignedOutSessionStart(
       store,
@@ -7166,6 +13634,7 @@ describe("StateStore", () => {
       profileId: profile.id,
       projectId: project.id,
       provider: "claude",
+      providerAccountKey: testProviderAccountKey("claude"),
       providerAuthentication: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
@@ -7174,12 +13643,18 @@ describe("StateStore", () => {
       },
     });
 
+    expect(store.requireProfileById(profile.id)).toMatchObject({
+      processGeneration: 0,
+      state: "signed_out",
+    });
     expect(session).toMatchObject({
       profileId: profile.id,
       provider: "claude",
       state: "starting",
     });
-    expect(store.requireProfileById(profile.id).state).toBe("signed_out");
+    expect(store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(true);
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006a3"))
+      .toMatchObject({ state: "effect_started" });
   });
 
   test("refuses missing or mismatched Claude session-start authentication proof", async () => {
@@ -7214,6 +13689,7 @@ describe("StateStore", () => {
       profileId: profile.id,
       projectId: project.id,
       provider: "claude",
+      providerAccountKey: testProviderAccountKey("claude"),
       ...(providerAuthentication === undefined ? {} : { providerAuthentication }),
     });
 
@@ -7263,6 +13739,7 @@ describe("StateStore", () => {
       profileId: profile.id,
       projectId: project.id,
       provider: "codex",
+      providerAccountKey: testProviderAccountKey("codex"),
       providerAuthentication: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
@@ -7270,11 +13747,34 @@ describe("StateStore", () => {
         signedIn: true,
       },
     })).toThrow("MUTATION_EFFECT_AUTHORITY_CHANGED");
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { plan: "apiKey" },
+    )).toBe(true);
+    expect(() => store.beginSessionStartEffect({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      attemptId: attempt.id,
+      evidence: {
+        clientMessageId: null,
+        kind: "session.start",
+        messageDigest: null,
+        projectId: project.id,
+      },
+      fastEnabled: false,
+      preset: "high",
+      profileGeneration: profile.processGeneration,
+      profileId: profile.id,
+      projectId: project.id,
+      provider: "codex",
+      providerAccountKey: testProviderAccountKey("codex"),
+    })).toThrow("MUTATION_EFFECT_AUTHORITY_CHANGED");
     expect(store.readMutation("00000000-0000-4000-8000-0000000006a5"))
       .toMatchObject({ state: "prepared" });
   });
 
-  test("carries every provider's reviewed runtime profile through one session-start evidence row", async () => {
+  test("carries either provider's reviewed runtime profile through one session-start evidence row", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Both providers", "both-providers@example.com");
     const projectRoot = join(home, "both-providers-project");
@@ -7347,6 +13847,14 @@ describe("StateStore", () => {
       preset: "high" | "fable-max" | "astra",
       runtimeProfile: typeof codexProfile | typeof claudeProfile | typeof devinProfile,
     ) => {
+      const providerThreadId = `thread-${provider}`;
+      const claudeProcessIdentity = provider === "claude"
+        ? {
+            pid: 42_101,
+            pidDomain: "darwin" as const,
+            procStart: "Fri Sep  4 12:01:00 2026",
+          }
+        : undefined;
       const attempt = store.prepareMutation({
         authorityGeneration: runtimeProfile.processGeneration,
         authorityId: profile.id,
@@ -7370,6 +13878,9 @@ describe("StateStore", () => {
         projectId: project.id,
         provider,
         providerAuthority: store.requireProviderAccountAuthority(profile.id, provider),
+        ...(provider === "devin" ? {} : {
+          providerAccountKey: providerAccountKeyForProfile(store, profile.id, provider),
+        }),
         ...(provider !== "codex"
           ? {
               providerAuthentication: {
@@ -7382,6 +13893,17 @@ describe("StateStore", () => {
           : {}),
       });
       const providerAuthority = store.requireProviderAccountAuthority(profile.id, provider);
+      if (claudeProcessIdentity !== undefined) {
+        store.recordClaimedClaudeProcessAuthority({
+          providerThreadId,
+          profileId: profile.id,
+          profileGeneration: profile.processGeneration,
+          providerAuthority,
+          runtimeScope: "managed",
+          sessionId: session.id,
+          identity: claudeProcessIdentity,
+        });
+      }
       const conflictingAuthority = provider === "codex"
         ? claudeAuthority
         : store.requireProviderAccountAuthority(profile.id, "codex");
@@ -7403,6 +13925,7 @@ describe("StateStore", () => {
         providerThreadId: `thread-${provider}`,
         receipt: { effectiveRuntimeProfile: runtimeProfile, sessionId: session.id },
         runtimeProfile,
+        ...(claudeProcessIdentity === undefined ? {} : { claudeProcessIdentity }),
         sessionId: session.id,
         state: "idle",
       });
@@ -7461,6 +13984,118 @@ describe("StateStore", () => {
       .toMatchObject({ profile: devinProfile });
   });
 
+  test("rejects only exact same-home provider-switch target aliases", async () => {
+    const { store } = await fixture();
+    const sourceProfile = signInProfile(
+      store,
+      "Switch alias source",
+      "switch-alias-source@example.com",
+    );
+    const otherProfile = signInProfile(
+      store,
+      "Switch alias other home",
+      "switch-alias-other@example.com",
+    );
+    const stageSwitch = (
+      session: ReturnType<StateStore["upsertProviderSession"]>,
+      targetProfile: typeof sourceProfile,
+      idempotencyKey: string,
+      seedName: string,
+    ) => {
+      if (session.providerThreadId === undefined) {
+        throw new Error("Expected a provider thread for switch alias testing.");
+      }
+      const mutation = store.prepareMutation({
+        authorityGeneration: targetProfile.processGeneration,
+        authorityId: session.id,
+        idempotencyKey,
+        kind: "session.switch",
+        request: { preset: "high", provider: "codex" },
+        providerAuthorities: [
+          { role: "source", authority: store.requireProviderAccountAuthority(sourceProfile.id, "codex"), provenance: "legacy_switch_source" },
+          { role: "target", authority: store.requireProviderAccountAuthority(targetProfile.id, "codex"), provenance: "legacy_switch_target" },
+        ],
+      });
+      const seedDigest = createHash("sha256")
+        .update("hra:session-transcript-seed:v1\0", "utf8")
+        .update(seedName, "utf8")
+        .digest("hex");
+      return store.beginSessionProviderSwitchEffect({
+        attemptId: mutation.id,
+        sessionId: session.id,
+        evidence: {
+          kind: "session.switch",
+          daemonGeneration: 0,
+          requestedAccountId: targetProfile.id,
+          requestedPreset: "high",
+          runtimeProfile: codexAdoptionRuntimeProfile(targetProfile, "high", false),
+          seedDigest,
+          seedIncludedRecords: 1,
+          seedOmittedRecords: 0,
+          sourcePreset: "high",
+          sourceProcessGeneration: sourceProfile.processGeneration,
+          sourceProfileId: sourceProfile.id,
+          sourceProvider: "codex",
+          sourceProviderThreadId: session.providerThreadId,
+          targetPreset: "high",
+          targetProcessGeneration: targetProfile.processGeneration,
+          targetProfileId: targetProfile.id,
+          targetProvider: "codex",
+          targetProviderAccountKey: providerAccountKeyForProfile(
+            store,
+            targetProfile.id,
+            "codex",
+          ),
+          transcriptDigest: createHash("sha256").update(seedName).digest("hex"),
+        },
+      });
+    };
+
+    const sameHome = upsertProvenTestSession(store, {
+      profileId: sourceProfile.id,
+      provider: "codex",
+      providerThreadId: "same-home-switch-alias",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const sameHomeEvidence = stageSwitch(
+      sameHome,
+      sourceProfile,
+      "00000000-0000-4000-8000-0000000006a8",
+      "same-home-switch-alias-seed",
+    );
+    expect(() => store.recordSessionProviderSwitchTarget({
+      attemptId: sameHomeEvidence.attemptId,
+      sessionId: sameHome.id,
+      providerThreadId: sameHome.providerThreadId ?? "",
+    })).toThrow("SESSION_PROVIDER_SWITCH_TARGET_AUTHORITY_MISMATCH");
+    expect(store.readSessionProviderSwitchProgress(sameHomeEvidence.attemptId))
+      .toMatchObject({ sourceReleased: false, targetReleased: false });
+
+    const crossHome = upsertProvenTestSession(store, {
+      profileId: sourceProfile.id,
+      provider: "codex",
+      providerThreadId: "cross-home-switch-alias",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const crossHomeEvidence = stageSwitch(
+      crossHome,
+      otherProfile,
+      "00000000-0000-4000-8000-0000000006a9",
+      "cross-home-switch-alias-seed",
+    );
+    store.recordSessionProviderSwitchTarget({
+      attemptId: crossHomeEvidence.attemptId,
+      sessionId: crossHome.id,
+      providerThreadId: crossHome.providerThreadId ?? "",
+    });
+    expect(store.readSessionProviderSwitchProgress(crossHomeEvidence.attemptId))
+      .toMatchObject({ targetProviderThreadId: crossHome.providerThreadId });
+  });
+
   test.each(["current", "source_binding_changed", "target_binding_changed", "target_removed"] as const)(
     "recovers retained generic switch evidence before generation retirement only with exact authorities: %s",
     async (authorityState) => {
@@ -7481,12 +14116,8 @@ describe("StateStore", () => {
       });
       const sourceAuthority = store.requireProviderAccountAuthority(source.id, "codex");
       const targetAuthority = store.requireProviderAccountAuthority(target.id, "claude");
-      const created = store.createSession({
+      const session = upsertProvenTestSession(store, {
         profileId: source.id, provider: "codex", preset: "high", fastEnabled: false,
-      });
-      const session = store.bindSession({
-        sessionId: created.id,
-        expectedRevision: created.revision,
         providerThreadId: "legacy-recovery-source-thread",
         state: "idle",
       });
@@ -7531,6 +14162,7 @@ describe("StateStore", () => {
           targetProcessGeneration: targetAuthority.processGeneration,
           targetProfileId: target.id,
           targetProvider: "claude",
+          targetProviderAccountKey: testProviderAccountKey("claude"),
           transcriptDigest: "b".repeat(64),
         },
       });
@@ -7574,6 +14206,95 @@ describe("StateStore", () => {
         .toBe(targetAuthority.processGeneration);
       expect(store.requireSessionSwitch(dedicated.switch.attemptId)).toEqual(dedicatedBefore);
       expect(store.readMutation(dedicated.switch.idempotencyKey)).toMatchObject({ state: "effect_started" });
+    },
+  );
+
+  test.each(["claimed", "bound", "own_tuple_changed"] as const)(
+    "retains exact Claude switch recovery custody across sibling rollover: %s",
+    async (processState) => {
+      const { store } = await fixture();
+      const source = signInProfile(store, "Retained source", "retained-source@example.com");
+      const target = signInProfile(store, "Retained target", "retained-target@example.com");
+      const targetAuthority = store.advanceProviderAccountProcessGeneration({
+        profileId: target.id, provider: "claude", expectedProcessGeneration: 0,
+      });
+      const sourceAuthority = store.requireProviderAccountAuthority(source.id, "codex");
+      const session = upsertProvenTestSession(store, {
+        profileId: source.id, provider: "codex", preset: "high", fastEnabled: false,
+        providerThreadId: "retained-source-thread", state: "idle",
+      });
+      const runtimeProfile = reviewedClaudeProfile({ id: target.id, processGeneration: targetAuthority.processGeneration });
+      const key = "00000000-0000-4000-8000-0000000006e0";
+      const attempt = store.prepareMutation({
+        kind: "session.switch", authorityId: session.id,
+        authorityGeneration: targetAuthority.processGeneration,
+        idempotencyKey: key, request: { provider: "claude", preset: "fable-max" },
+        providerAuthorities: [
+          { role: "source", authority: sourceAuthority, provenance: "legacy_switch_source" },
+          { role: "target", authority: targetAuthority, provenance: "legacy_switch_target" },
+        ],
+      });
+      const seedText = "Continue the retained switch.";
+      const seedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0")
+        .update(seedText).digest("hex");
+      store.beginSessionProviderSwitchEffect({
+        attemptId: attempt.id, sessionId: session.id,
+        providerAuthentication: {
+          profileId: target.id, provider: "claude", signedIn: true,
+          processGeneration: targetAuthority.processGeneration,
+        },
+        evidence: {
+          kind: "session.switch", daemonGeneration: 0, requestedAccountId: target.id,
+          requestedPreset: "fable-max", runtimeProfile, seedDigest,
+          seedIncludedRecords: 1, seedOmittedRecords: 0,
+          sourcePreset: "high", sourceProcessGeneration: sourceAuthority.processGeneration,
+          sourceProfileId: source.id, sourceProvider: "codex",
+          sourceProviderThreadId: "retained-source-thread", targetPreset: "fable-max",
+          targetProcessGeneration: targetAuthority.processGeneration,
+          targetProfileId: target.id, targetProvider: "claude",
+          targetProviderAccountKey: testProviderAccountKey("claude"), transcriptDigest: "b".repeat(64),
+        },
+      });
+      const targetInput = { attemptId: attempt.id, sessionId: session.id, providerThreadId: "retained-target-thread" };
+      store.recordSessionProviderSwitchTarget(targetInput);
+      store.recordSessionProviderSwitchSeedIntent({ ...targetInput, runtimeProfile, seedText });
+      store.recordSessionProviderSwitchSeedResult({ ...targetInput, runtimeProfile, turnId: "retained-seed-turn", turnStatus: "completed" });
+      store.recordSessionProviderSwitchSourceReleased({ attemptId: attempt.id, sessionId: session.id });
+      const processInput = { profileId: target.id, providerThreadId: targetInput.providerThreadId, runtimeScope: "managed" as const };
+      store.recordClaimedClaudeProcessAuthority({
+        ...processInput, profileGeneration: target.processGeneration, providerAuthority: targetAuthority,
+        sessionId: session.id, identity: { pid: 43_201, pidDomain: "darwin", procStart: "Fri Sep  4 12:03:01 2026" },
+      });
+      const bind = () => store.bindSessionProviderSwitchRecoveryTarget({
+        attemptId: attempt.id, sessionId: session.id,
+        expectedSessionRevision: store.requireSession(session.id).revision,
+        providerAccountKey: testProviderAccountKey("claude"), title: "Retained target", providerUpdatedAt: 2_200,
+      });
+      if (processState === "bound") expect(bind().provider).toBe("claude");
+      store.nextProfileGeneration(target.id);
+      expect(store.requireProviderAccountAuthority(target.id, "claude")).toEqual(targetAuthority);
+      expect(store.requireProfileById(target.id).processGeneration).not.toBe(target.processGeneration);
+      if (processState === "own_tuple_changed") {
+        store.advanceProviderAccountProcessGeneration({
+          profileId: target.id, provider: "claude", expectedProcessGeneration: targetAuthority.processGeneration,
+        });
+      }
+      const beforeSession = store.requireSession(session.id);
+      const beforeMutation = store.readMutation(key);
+      const beforeProcess = store.readClaudeProcessAuthority(processInput);
+      if (processState === "own_tuple_changed") {
+        expect(bind).toThrow("SESSION_PROVIDER_SWITCH_RECOVERY_TARGET_MISMATCH");
+        expect(store.requireSession(session.id)).toEqual(beforeSession);
+        expect(store.readClaudeProcessAuthority(processInput)).toEqual(beforeProcess);
+      } else {
+        expect(bind()).toMatchObject({ provider: "claude", profileId: target.id, state: "recovery_required" });
+        expect(store.readClaudeProcessAuthority(processInput)).toMatchObject({
+          state: "bound", providerAuthority: targetAuthority, profileGeneration: target.processGeneration,
+        });
+        expect(store.requireCapturedSessionProviderAuthority(session.id)).toMatchObject(targetAuthority);
+        if (processState === "bound") expect(store.requireSession(session.id)).toEqual(beforeSession);
+      }
+      expect(store.readMutation(key)).toEqual(beforeMutation);
     },
   );
 
@@ -7651,6 +14372,7 @@ describe("StateStore", () => {
       projectId: project.id,
       provider: "codex",
       providerAuthority: store.requireProviderAccountAuthority(codexAccount.id, "codex"),
+      providerAccountKey: providerAccountKeyForProfile(store, codexAccount.id, "codex"),
     });
     store.completeSessionStartEffect({
       attemptId: startAttempt.id,
@@ -7699,6 +14421,7 @@ describe("StateStore", () => {
       targetProcessGeneration: claudeAuthority.processGeneration,
       targetProfileId: claudeAccount.id,
       targetProvider: "claude" as const,
+      targetProviderAccountKey: testProviderAccountKey("claude"),
       transcriptDigest,
     };
     expect(() => store.beginSessionProviderSwitchEffect({
@@ -7747,6 +14470,12 @@ describe("StateStore", () => {
       sessionId: started.id,
       providerThreadId: "claude-thread",
     });
+    expect(() => store.recordSessionProviderSwitchTargetReleased({
+      attemptId: switchAttempt.id,
+      sessionId: started.id,
+      providerThreadId: "claude-thread",
+      providerAccountKey: `v1:claude:${"f".repeat(64)}`,
+    })).toThrow("SESSION_PROVIDER_SWITCH_TARGET_RELEASE_AUTHORITY_MISMATCH");
     store.recordSessionProviderSwitchSeedIntent({
       attemptId: switchAttempt.id,
       sessionId: started.id,
@@ -7767,6 +14496,20 @@ describe("StateStore", () => {
       sessionId: started.id,
     });
     const before = store.requireSession(started.id);
+    const claudeProcessIdentity = {
+      pid: 42_102,
+      pidDomain: "darwin" as const,
+      procStart: "Fri Sep  4 12:01:01 2026",
+    };
+    store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(claudeAccount.id, "claude"),
+      providerThreadId: "claude-thread",
+      profileId: claudeAccount.id,
+      profileGeneration: claudeAccount.processGeneration,
+      runtimeScope: "managed",
+      sessionId: started.id,
+      identity: claudeProcessIdentity,
+    });
     const switchReceipt = {
       from: { account: codexAccount.id, preset: "high" as const, provider: "codex" as const },
       providerThreadId: "claude-thread",
@@ -7786,10 +14529,13 @@ describe("StateStore", () => {
       providerAuthority: store.requireProviderAccountAuthority(claudeAccount.id, "claude"),
       attemptId: switchAttempt.id,
       expectedSessionRevision: before.revision,
+      expectedTargetProfileGeneration: claudeAccount.processGeneration,
       preset: "fable-max",
       profileId: claudeAccount.id,
       provider: "claude",
       providerThreadId: "claude-thread",
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity,
       receipt: { ...switchReceipt, turnId: "wrong-turn" },
       runtimeProfile: claudeProfile,
       seedTurnId: "claude-turn",
@@ -7801,10 +14547,13 @@ describe("StateStore", () => {
       providerAuthority: store.requireProviderAccountAuthority(claudeAccount.id, "claude"),
       attemptId: switchAttempt.id,
       expectedSessionRevision: before.revision - 1,
+      expectedTargetProfileGeneration: claudeAccount.processGeneration,
       preset: "fable-max",
       profileId: claudeAccount.id,
       provider: "claude",
       providerThreadId: "claude-thread",
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity,
       receipt: switchReceipt,
       runtimeProfile: claudeProfile,
       seedTurnId: "claude-turn",
@@ -7814,6 +14563,7 @@ describe("StateStore", () => {
     const switched = store.completeSessionProviderSwitch({
       attemptId: switchAttempt.id,
       expectedSessionRevision: before.revision,
+      expectedTargetProfileGeneration: claudeAccount.processGeneration,
       preset: "fable-max",
       profileId: claudeAccount.id,
       provider: "claude",
@@ -7821,6 +14571,8 @@ describe("StateStore", () => {
       receipt: switchReceipt,
       runtimeProfile: claudeProfile,
       providerAuthority: claudeAuthority,
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity,
       seedTurnId: "claude-turn",
       sessionId: started.id,
       state: "idle",
@@ -7850,10 +14602,63 @@ describe("StateStore", () => {
       state: "applied",
     });
 
-    // A preset the target cannot run is refused before anything is written.
+    // A stale revision never rebinds, and a preset the target cannot run is
+    // refused before anything is written.
+    const sourceProcess = store.readClaudeProcessAuthority({
+      providerThreadId: "claude-thread",
+      profileId: claudeAccount.id,
+      runtimeScope: "managed",
+    });
+    if (sourceProcess === null) throw new Error("Expected the bound Claude process authority.");
+    const releasingSource = store.beginClaudeProcessAuthorityRelease({
+      providerThreadId: sourceProcess.providerThreadId,
+      profileId: sourceProcess.profileId,
+      runtimeScope: sourceProcess.runtimeScope,
+      expectedRevision: sourceProcess.revision,
+      identity: sourceProcess.identity,
+    });
+    store.completeClaudeProcessAuthorityRelease({
+      providerThreadId: releasingSource.providerThreadId,
+      profileId: releasingSource.profileId,
+      runtimeScope: releasingSource.runtimeScope,
+      expectedRevision: releasingSource.revision,
+      identity: releasingSource.identity,
+    });
+    const replacementProcessIdentity = {
+      pid: 42_103,
+      pidDomain: "darwin" as const,
+      procStart: "Fri Sep  4 12:01:02 2026",
+    };
+    store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(claudeAccount.id, "claude"),
+      providerThreadId: "claude-thread-2",
+      profileId: claudeAccount.id,
+      profileGeneration: claudeAccount.processGeneration,
+      runtimeScope: "managed",
+      sessionId: started.id,
+      identity: replacementProcessIdentity,
+    });
+    expect(() => store.completeSessionProviderSwitch({
+      providerAuthority: store.requireProviderAccountAuthority(claudeAccount.id, "claude"),
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: before.revision,
+      expectedTargetProfileGeneration: claudeAccount.processGeneration,
+      preset: "fable-max",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claude-thread-2",
+      receipt: {},
+      runtimeProfile: claudeProfile,
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity: replacementProcessIdentity,
+      seedTurnId: "claude-turn",
+      sessionId: started.id,
+      state: "idle",
+    })).toThrow("SESSION_PROVIDER_SWITCH_CAS_CONFLICT");
     expect(() => store.completeSessionProviderSwitch({
       attemptId: switchAttempt.id,
       expectedSessionRevision: switched.revision,
+      expectedTargetProfileGeneration: claudeAccount.processGeneration,
       preset: "high",
       profileId: claudeAccount.id,
       provider: "claude",
@@ -7861,11 +14666,403 @@ describe("StateStore", () => {
       receipt: {},
       runtimeProfile: claudeProfile,
       providerAuthority: claudeAuthority,
+      providerAccountKey: testProviderAccountKey("claude"),
       seedTurnId: "claude-turn",
       sessionId: started.id,
       state: "idle",
     })).toThrow("does not support the `high` model preset");
     expect(store.requireSession(started.id).providerThreadId).toBe("claude-thread");
+  });
+
+  test("rejects provider-switch completion after target generation changes without rebinding", async () => {
+    const scenarios: readonly ("signed_out" | "new_generation")[] = ["new_generation"];
+    for (const scenario of scenarios) {
+      const { store } = await fixture();
+      const sourceAccount = signInProfile(
+        store,
+        `Switch source ${scenario}`,
+        `source-${scenario}@example.com`,
+      );
+      const targetAccount = signInProfile(
+        store,
+        `Switch target ${scenario}`,
+        `target-${scenario}@example.com`,
+      );
+      const targetAuthority = store.requireProviderAccountAuthority(targetAccount.id, "claude");
+      const session = upsertProvenTestSession(store, {
+        profileId: sourceAccount.id,
+        provider: "codex",
+        preset: "high",
+        fastEnabled: false,
+        providerThreadId: `source-thread-${scenario}`,
+        state: "idle",
+      });
+      const idempotencyKey = scenario === "signed_out"
+        ? "00000000-0000-4000-8000-0000000006b3"
+        : "00000000-0000-4000-8000-0000000006b4";
+      const attempt = store.prepareMutation({
+        authorityGeneration: targetAccount.processGeneration,
+        authorityId: session.id,
+        idempotencyKey,
+        kind: "session.switch",
+        request: { preset: "fable-max", provider: "claude" },
+      });
+      expect(store.transitionMutation(attempt.id, "prepared", "effect_started")).toBe(true);
+      const processIdentity = {
+        pid: scenario === "signed_out" ? 42_104 : 42_105,
+        pidDomain: "darwin" as const,
+        procStart: scenario === "signed_out"
+          ? "Fri Sep  4 12:01:03 2026"
+          : "Fri Sep  4 12:01:04 2026",
+      };
+      const providerThreadId = `target-thread-${scenario}`;
+
+      if (scenario === "signed_out") {
+        expect(store.setProfileState(
+          targetAccount.id,
+          targetAccount.processGeneration,
+          "signed_out",
+        )).toBe(true);
+        expect(store.requireProfileById(targetAccount.id)).toMatchObject({
+          state: "signed_out",
+          processGeneration: targetAccount.processGeneration,
+        });
+      } else {
+        // Normal generation advancement now rejects unresolved switch authority
+        // unless the daemon records an explicit successor binding. Mutate the
+        // fixture directly to exercise completion's independent stale-target
+        // guard for a database that lacks that rebind evidence.
+        const direct = new Database(store.paths.database, { create: false, strict: true });
+        try {
+          expect(direct.query(
+            `UPDATE profiles SET process_generation=process_generation+1
+             WHERE id=? AND process_generation=? RETURNING id,process_generation`,
+          ).get(targetAccount.id, targetAccount.processGeneration)).toEqual({
+            id: targetAccount.id, process_generation: targetAccount.processGeneration + 1,
+          });
+        } finally {
+          direct.close(false);
+        }
+        expect(store.requireProfileById(targetAccount.id)).toMatchObject({
+          state: "signed_in",
+          processGeneration: targetAccount.processGeneration + 1,
+        });
+      }
+      const beforeSession = store.requireSession(session.id);
+      const beforeMutation = store.readMutation(idempotencyKey);
+      expect(beforeMutation).toMatchObject({
+        authorityGeneration: targetAccount.processGeneration,
+        authorityId: session.id,
+        state: "effect_started",
+      });
+
+      expect(() => store.completeSessionProviderSwitch({
+        providerAuthority: targetAuthority,
+        attemptId: attempt.id,
+        expectedSessionRevision: session.revision,
+        expectedTargetProfileGeneration: targetAccount.processGeneration,
+        preset: "fable-max",
+        profileId: targetAccount.id,
+        provider: "claude",
+        providerThreadId,
+        receipt: { providerThreadId, sessionId: session.id, toProvider: "claude" },
+        providerAccountKey: testProviderAccountKey("claude"),
+        runtimeProfile: reviewedClaudeProfile({ id: targetAccount.id, processGeneration: targetAuthority.processGeneration }),
+        claudeProcessIdentity: processIdentity,
+        seedTurnId: "unused-target-drift-turn",
+        sessionId: session.id,
+        state: "idle",
+      })).toThrow("SESSION_PROVIDER_SWITCH_TARGET_AUTHORITY_CHANGED");
+
+      expect(store.requireSession(session.id)).toEqual(beforeSession);
+      expect(store.readMutation(idempotencyKey)).toEqual(beforeMutation);
+      expect(store.latestSessionRuntimeProfile(session.id)).toBeNull();
+    }
+  });
+
+  test("retires personal runtime custody and readopts its old identity after a provider switch", async () => {
+    const { store } = await fixture();
+    const codexAccount = signInProfile(store, "Adopted Codex", "adopted-codex@example.com");
+    const claudeAccount = signInProfile(store, "Adopted Claude", "adopted-claude@example.com");
+    const claudeAuthority = store.advanceProviderAccountProcessGeneration({ profileId: claudeAccount.id,
+      provider: "claude", expectedProcessGeneration: 0 });
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: codexAccount.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: "adopted-switch-thread",
+      title: "Adopted switch",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const claimed = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedRevision: candidate.revision,
+    });
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(codexAccount.id, "codex"),
+      provider: "codex",
+      providerThreadId: candidate.providerThreadId,
+      expectedCandidateRevision: claimed.revision,
+      profileId: codexAccount.id,
+      profileGeneration: codexAccount.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(codexAccount, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, codexAccount.id, "codex"),
+    });
+
+    const direct = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(() => direct.query(
+        "UPDATE sessions SET provider_thread_id=? WHERE id=?",
+      ).run("unfenced-thread", adopted.session.id))
+        .toThrow("active personal runtime binding must be retired before session rebind");
+    } finally {
+      direct.close(false);
+    }
+
+    const switchAttempt = store.prepareMutation({
+      authorityGeneration: claudeAuthority.processGeneration,
+      authorityId: adopted.session.id,
+      idempotencyKey: "00000000-0000-4000-8000-0000000006b2",
+      kind: "session.switch",
+      request: { preset: "fable-max", provider: "claude" },
+      providerAuthorities: [
+        { role: "source", authority: store.requireProviderAccountAuthority(codexAccount.id, "codex"), provenance: "legacy_switch_source" },
+        { role: "target", authority: claudeAuthority, provenance: "legacy_switch_target" },
+      ],
+    });
+    const claudeProfile = reviewedClaudeProfile({ id: claudeAccount.id, processGeneration: claudeAuthority.processGeneration });
+    const seedText = "Continue the adopted session on Claude.";
+    const seedDigest = createHash("sha256")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update(seedText, "utf8")
+      .digest("hex");
+    const transcriptDigest = createHash("sha256")
+      .update("adopted provider-switch transcript")
+      .digest("hex");
+    store.beginSessionProviderSwitchEffect({
+      attemptId: switchAttempt.id,
+      sessionId: adopted.session.id,
+      providerAuthentication: {
+        profileId: claudeAccount.id,
+        processGeneration: claudeAccount.processGeneration,
+        provider: "claude",
+        signedIn: true,
+      },
+      evidence: {
+        kind: "session.switch",
+        daemonGeneration: 0,
+        requestedAccountId: null,
+        requestedPreset: "fable-max",
+        runtimeProfile: claudeProfile,
+        seedDigest,
+        seedIncludedRecords: 1,
+        seedOmittedRecords: 0,
+        sourcePreset: "high",
+        sourceProcessGeneration: codexAccount.processGeneration,
+        sourceProfileId: codexAccount.id,
+        sourceProvider: "codex",
+        sourceProviderThreadId: candidate.providerThreadId,
+        targetPreset: "fable-max",
+        targetProcessGeneration: claudeAccount.processGeneration,
+        targetProfileId: claudeAccount.id,
+        targetProvider: "claude",
+        targetProviderAccountKey: testProviderAccountKey("claude"),
+        transcriptDigest,
+      },
+    });
+    store.recordSessionProviderSwitchTarget({
+      attemptId: switchAttempt.id,
+      sessionId: adopted.session.id,
+      providerThreadId: "claimed-claude-thread",
+    });
+    store.recordSessionProviderSwitchSeedIntent({
+      attemptId: switchAttempt.id,
+      sessionId: adopted.session.id,
+      providerThreadId: "claimed-claude-thread",
+      runtimeProfile: claudeProfile,
+      seedText,
+    });
+    store.recordSessionProviderSwitchSeedResult({
+      attemptId: switchAttempt.id,
+      sessionId: adopted.session.id,
+      providerThreadId: "claimed-claude-thread",
+      runtimeProfile: claudeProfile,
+      turnId: "claimed-claude-turn",
+      turnStatus: "inProgress",
+    });
+    store.recordSessionProviderSwitchSourceReleased({
+      attemptId: switchAttempt.id,
+      sessionId: adopted.session.id,
+    });
+    const switchReceipt = {
+      from: { account: codexAccount.id, preset: "high" as const, provider: "codex" as const },
+      providerThreadId: "claimed-claude-thread",
+      request: { accountId: null, preset: "fable-max" as const, provider: "claude" as const },
+      seed: {
+        digest: seedDigest,
+        includedRecords: 1,
+        omittedRecords: 0,
+        status: "inProgress" as const,
+      },
+      sessionId: adopted.session.id,
+      to: {
+        account: claudeAccount.id,
+        preset: "fable-max" as const,
+        provider: "claude" as const,
+      },
+      transcriptDigest,
+      turnId: "claimed-claude-turn",
+    };
+    const targetProcessIdentity = {
+      pid: 42_002,
+      pidDomain: "darwin" as const,
+      procStart: "Fri Sep  4 12:00:01 2026",
+    };
+    store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(claudeAccount.id, "claude"),
+      providerThreadId: "claimed-claude-thread",
+      profileId: claudeAccount.id,
+      profileGeneration: claudeAccount.processGeneration,
+      runtimeScope: "managed",
+      sessionId: adopted.session.id,
+      identity: targetProcessIdentity,
+    });
+    let switched = store.completeSessionProviderSwitch({
+      providerAuthority: store.requireProviderAccountAuthority(claudeAccount.id, "claude"),
+      attemptId: switchAttempt.id,
+      expectedSessionRevision: adopted.session.revision,
+      expectedTargetProfileGeneration: claudeAccount.processGeneration,
+      preset: "fable-max",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claimed-claude-thread",
+      receipt: switchReceipt,
+      runtimeProfile: claudeProfile,
+      providerAccountKey: testProviderAccountKey("claude"),
+      claudeProcessIdentity: targetProcessIdentity,
+      seedTurnId: "claimed-claude-turn",
+      sessionId: adopted.session.id,
+      state: "active",
+      activeTurnId: "claimed-claude-turn",
+    });
+    expect(switched).toMatchObject({
+      activeTurnId: "claimed-claude-turn",
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claimed-claude-thread",
+      revision: adopted.session.revision + 2,
+      state: "active",
+    });
+    switched = store.reconcileSessionFromProvider({
+      sessionId: switched.id,
+      state: "idle",
+      activeTurnId: null,
+    });
+    expect(store.readSessionPersonalRuntimeBinding(switched.id)).toBeNull();
+    expect(store.readSessionPersonalRuntimeBinding(switched.id, true)).toMatchObject({
+      provider: "codex",
+      providerThreadId: "adopted-switch-thread",
+      state: "detached",
+    });
+    expect(store.canReleaseIdleManagedClaudeSessionForAccountLogin({
+      profileId: claudeAccount.id,
+      profileGeneration: claudeAccount.processGeneration,
+      sessionId: switched.id,
+    })).toBe(true);
+    expect(store.listNonterminalManagedClaudeSessions(claudeAccount.id))
+      .toEqual([switched]);
+    expect(store.listLocalSessionPage({
+      profileId: claudeAccount.id,
+      after: null,
+      limit: 1,
+    })).toEqual({ sessions: [switched], nextPosition: null });
+    expect(store.listSessionAdoptionCandidates({ provider: "codex" })[0]?.status)
+      .toBe("fenced");
+
+    const switchEvents = store.listSessionEvents({
+      sessionId: switched.id,
+      afterSequence: 0,
+    }).events;
+    expect(switchEvents).toEqual([
+      expect.objectContaining({
+        body: expect.objectContaining({
+          type: "provider_switched",
+          fromProvider: "codex",
+          toProvider: "claude",
+          transcriptDigest,
+          seedDigest,
+        }),
+      }),
+      expect.objectContaining({
+        body: expect.objectContaining({
+          type: "user_message",
+          actor: "provider_switch",
+          text: seedText,
+        }),
+      }),
+    ]);
+
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: null });
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: codexAccount.id });
+    const pendingAgain = store.listSessionAdoptionCandidates({
+      provider: "codex",
+      status: "pending",
+    })[0];
+    if (pendingAgain === undefined) throw new Error("Expected the switched identity to be pending again.");
+    const claimedAgain = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: pendingAgain.providerThreadId,
+      expectedRevision: pendingAgain.revision,
+    });
+    const readopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(codexAccount.id, "codex"),
+      provider: "codex",
+      providerThreadId: pendingAgain.providerThreadId,
+      expectedCandidateRevision: claimedAgain.revision,
+      profileId: codexAccount.id,
+      profileGeneration: codexAccount.processGeneration,
+      preset: "ultra",
+      requirement: presetRequirements.ultra,
+      fastEnabled: true,
+      runtimeProfile: codexAdoptionRuntimeProfile(codexAccount, "ultra", true),
+      providerAccountKey: providerAccountKeyForProfile(store, codexAccount.id, "codex"),
+    });
+
+    expect(readopted.session).toMatchObject({
+      profileId: codexAccount.id,
+      provider: "codex",
+      providerThreadId: "adopted-switch-thread",
+      preset: "ultra",
+      fastEnabled: true,
+    });
+    expect(readopted.session.id).not.toBe(switched.id);
+    expect(readopted.binding).toMatchObject({
+      sessionId: readopted.session.id,
+      provider: "codex",
+      providerThreadId: "adopted-switch-thread",
+      state: "active",
+    });
+    expect(store.requireSession(switched.id)).toMatchObject({
+      profileId: claudeAccount.id,
+      provider: "claude",
+      providerThreadId: "claimed-claude-thread",
+      preset: "fable-max",
+    });
+    expect(store.readSessionPersonalRuntimeBinding(switched.id, true)).toBeNull();
+    expect(store.latestSessionRuntimeProfile(switched.id)).toMatchObject({
+      sourceId: switchAttempt.id,
+      sourceKind: "turn_start",
+      profile: claudeProfile,
+    });
+    expect(store.listSessionEvents({
+      sessionId: switched.id,
+      afterSequence: 0,
+    }).events).toEqual(switchEvents);
   });
 
   test("fences provider-switch seed reviews to the exact historical preset contract", async () => {
@@ -7892,16 +15089,12 @@ describe("StateStore", () => {
     };
     const solProfile = { ...astraProfile, model: "gpt-5.6-sol" };
     const stageSwitch = (suffix: string, seedText: string) => {
-      const starting = store.createSession({
+      const session = upsertProvenTestSession(store, {
         fastEnabled: false,
         preset: "fable-max",
         profileId: sourceProfile.id,
         provider: "claude",
-      });
-      const session = store.bindSession({
-        expectedRevision: starting.revision,
         providerThreadId: `source-${suffix}`,
-        sessionId: starting.id,
         state: "idle",
       });
       const attempt = store.prepareMutation({
@@ -7934,6 +15127,11 @@ describe("StateStore", () => {
         sourceProvider: "claude" as const,
         sourceProviderThreadId: `source-${suffix}`,
         targetPreset: "high" as const,
+        targetProviderAccountKey: providerAccountKeyForProfile(
+          store,
+          targetProfile.id,
+          "codex",
+        ),
         targetProcessGeneration: targetProfile.processGeneration,
         targetProfileId: targetProfile.id,
         targetProvider: "codex" as const,
@@ -8149,6 +15347,7 @@ describe("StateStore", () => {
       targetProcessGeneration: account.processGeneration,
       targetProfileId: account.id,
       targetProvider: "codex" as const,
+      targetProviderAccountKey: providerAccountKeyForProfile(store, account.id, "codex"),
       transcriptDigest,
     };
     store.beginSessionProviderSwitchEffect({
@@ -8188,6 +15387,7 @@ describe("StateStore", () => {
     const switched = store.completeSessionProviderSwitch({
       providerAuthority: codexAuthority,
       attemptId: switchAttempt.id,
+      expectedTargetProfileGeneration: codexAuthority.processGeneration,
       expectedSessionRevision: before.revision,
       preset: "high",
       profileId: account.id,
@@ -8209,6 +15409,7 @@ describe("StateStore", () => {
         turnId: "codex-seed-turn",
       },
       runtimeProfile: codexProfile,
+      providerAccountKey: providerAccountKeyForProfile(store, account.id, "codex"),
       seedTurnId: "codex-seed-turn",
       sessionId: started.id,
       state: "idle",
@@ -8281,6 +15482,7 @@ describe("StateStore", () => {
       projectId: project.id,
       provider: "claude",
       providerAuthority: claudeAuthority,
+      providerAccountKey: testProviderAccountKey("claude"),
       providerAuthentication: {
         profileId: profile.id,
         processGeneration: claudeAuthority.processGeneration,
@@ -8460,8 +15662,8 @@ describe("StateStore", () => {
 
   test("enforces every queue transition at both the store and SQLite boundaries", async () => {
     const { store } = await fixture();
-    const profile = store.createProfile("Queue graph");
-    const session = store.createSession({
+    const profile = signInProfile(store, "Queue graph", "queue-graph@example.com");
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
@@ -8504,8 +15706,8 @@ describe("StateStore", () => {
     await initializeStatePaths(paths);
     const store = new StateStore(paths, { now: () => 1_000 });
     stores.push(store);
-    const profile = store.createProfile("Queue FIFO");
-    const session = store.createSession({
+    const profile = signInProfile(store, "Queue FIFO", "queue-fifo@example.com");
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
@@ -8567,8 +15769,8 @@ describe("StateStore", () => {
 
   test("selects the oldest pending queue row without scanning terminal history", async () => {
     const { store } = await fixture();
-    const profile = store.createProfile("Bounded queue lookup");
-    const session = store.createSession({
+    const profile = signInProfile(store, "Bounded queue lookup", "bounded-queue@example.com");
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
@@ -8615,17 +15817,18 @@ describe("StateStore", () => {
   test("removes settled queue bodies without losing replay or recovery authority", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Queue body custody", "queue-body@example.com");
-    const created = store.createSession({
+    const importedSession = upsertProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: created.id,
-      expectedRevision: created.revision,
       providerThreadId: "thread-queue-body-custody",
       state: "idle",
       providerUpdatedAt: 10,
+    });
+    const session = store.updateSessionMetadata({
+      sessionId: importedSession.id,
+      expectedRevision: importedSession.revision,
+      preset: "high",
     });
     const runtime = {
       profileId: profile.id,
@@ -8902,17 +16105,18 @@ describe("StateStore", () => {
   test("migrates and physically scrubs v20 terminal and resolved-ambiguous queue bodies", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Legacy queue bodies", "legacy-queue@example.com");
-    const created = store.createSession({
+    const importedSession = upsertProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: created.id,
-      expectedRevision: created.revision,
       providerThreadId: "thread-legacy-queue-bodies",
       state: "idle",
       providerUpdatedAt: 10,
+    });
+    const session = store.updateSessionMetadata({
+      sessionId: importedSession.id,
+      expectedRevision: importedSession.revision,
+      preset: "high",
     });
     const terminal = store.enqueue(session.id, "already terminal body");
     expect(store.transitionQueue(terminal.id, "pending", "cancelled")).toBe(true);
@@ -8958,6 +16162,7 @@ describe("StateStore", () => {
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const legacy = new Database(paths.database, { create: false, strict: true });
+    dropSchemaAfterVersion34(legacy);
     legacy.exec(`
       PRAGMA secure_delete=OFF;
       DROP TRIGGER IF EXISTS queue_message_settlement_guard;
@@ -8967,7 +16172,7 @@ describe("StateStore", () => {
       DROP TRIGGER IF EXISTS queue_message_scrub_authority_record;
       DROP TRIGGER IF EXISTS queue_effect_resolution_authority_guard;
       DROP TABLE IF EXISTS queue_message_scrub_authority;
-      DELETE FROM migrations WHERE version IN (21,22,23,24,44,45,46,47);
+      DELETE FROM migrations WHERE version>20;
       PRAGMA user_version=20;
     `);
     dropAttachmentCustodySchema(legacy);
@@ -9018,7 +16223,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -9039,7 +16244,7 @@ describe("StateStore", () => {
   test("keeps a pinned-reader queue scrub unavailable until restart can truncate its WAL", async () => {
     const { store } = await fixture({ securityScrubCheckpoint: shortScrubCheckpoint });
     const profile = signInProfile(store, "Pinned queue scrub", "pinned-queue@example.com");
-    const session = store.createSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
@@ -9108,7 +16313,7 @@ describe("StateStore", () => {
   test("completes a queue scrub after a brief reader releases its WAL snapshot", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Brief reader queue scrub", "brief-reader@example.com");
-    const session = store.createSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
@@ -9155,7 +16360,7 @@ describe("StateStore", () => {
   test("settles queue messages while a readonly status reader reopens the same state directory", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Status reader settlement", "status-reader@example.com");
-    const session = store.createSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
@@ -9221,7 +16426,7 @@ describe("StateStore", () => {
   test("repairs stale current-version queue triggers before accepting more state", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Stale queue trigger", "stale-trigger@example.com");
-    const session = store.createSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
@@ -9274,7 +16479,7 @@ describe("StateStore", () => {
   test("retains a newer scrub generation when a settlement follows a checkpoint snapshot", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Scrub generation", "scrub-generation@example.com");
-    const session = store.createSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
@@ -10033,8 +17238,19 @@ describe("StateStore", () => {
       enabledApps: [],
     };
 
-    const localSend = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const sendSession = store.bindSession({ sessionId: localSend.id, expectedRevision: localSend.revision, providerThreadId: "thread-send-cas", state: "idle", providerUpdatedAt: 10 });
+    const importedSendSession = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-send-cas",
+      state: "idle",
+      providerUpdatedAt: 10,
+    });
+    const sendSession = store.updateSessionMetadata({
+      sessionId: importedSendSession.id,
+      expectedRevision: importedSendSession.revision,
+      preset: "high",
+    });
     const sendKey = "00000000-0000-4000-8000-000000000711";
     const { attempt: sendAttempt } = store.prepareSessionInputMutation({ kind: "session.send", sessionId: sendSession.id,
       ...daemon, providerAuthority, message: "send", attachments: [], idempotencyKey: sendKey });
@@ -10083,8 +17299,19 @@ describe("StateStore", () => {
     expect(store.latestSessionRuntimeProfile(sendSession.id)).toBeNull();
     expect(store.requireSession(sendSession.id)).toMatchObject({ state: "idle", note: "concurrent" });
 
-    const localQueue = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const queueSession = store.bindSession({ sessionId: localQueue.id, expectedRevision: localQueue.revision, providerThreadId: "thread-queue-cas", state: "idle", providerUpdatedAt: 10 });
+    const importedQueueSession = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-queue-cas",
+      state: "idle",
+      providerUpdatedAt: 10,
+    });
+    const queueSession = store.updateSessionMetadata({
+      sessionId: importedQueueSession.id,
+      expectedRevision: importedQueueSession.revision,
+      preset: "high",
+    });
     const queue = store.enqueue(queueSession.id, "queued");
     const queueEvidence = store.beginQueueEffect({
       queueId: queue.id,
@@ -10137,11 +17364,10 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Cadence authority", "cadence@example.com");
     expect(store.hasSessionWithActiveTurn()).toBe(false);
-    const created = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    expect(store.hasSessionWithActiveTurn()).toBe(false);
-    const bound = store.bindSession({
-      sessionId: created.id,
-      expectedRevision: created.revision,
+    const bound = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
       providerThreadId: "thread-cadence",
       state: "active",
       activeTurnId: "turn-cadence",
@@ -10158,10 +17384,10 @@ describe("StateStore", () => {
   test("appends ordered bounded session events and reads an atomic snapshot cursor", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Event authority", "events@example.com");
-    const created = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({
-      sessionId: created.id,
-      expectedRevision: created.revision,
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
       providerThreadId: "thread-events",
       state: "active",
       activeTurnId: "turn-events",
@@ -10246,20 +17472,16 @@ describe("StateStore", () => {
   test("projects legacy private identifiers and MCP summaries on every public read", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Legacy public projection", "legacy-projection@example.com");
-    const created = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: profile.id,
       title: "Legacy public projection",
       preset: "high",
       fastEnabled: false,
-    });
-    const rawTurnId = `${privateUserPathRoot}/api_key=LEGACY-TURN-SECRET-1234`;
-    const session = store.bindSession({
-      sessionId: created.id,
-      expectedRevision: created.revision,
       providerThreadId: "thread-legacy-public-projection",
       state: "active",
-      activeTurnId: rawTurnId,
+      activeTurnId: `${privateUserPathRoot}/api_key=LEGACY-TURN-SECRET-1234`,
     });
+    const rawTurnId = `${privateUserPathRoot}/api_key=LEGACY-TURN-SECRET-1234`;
     const connectionId = "10000000-0000-4000-8000-000000000099";
     const providerAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
     const interaction = store.admitInteraction({
@@ -10477,15 +17699,11 @@ describe("StateStore", () => {
   test("reads one bounded local session observation with exact interaction and queue semantics", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Observation account", "observation@example.com");
-    const created = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: profile.id,
       title: `Observed api_key=TITLE-SECRET-1234 ${privateUserPathRoot}/work`,
       preset: "high",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: created.id,
-      expectedRevision: created.revision,
       providerThreadId: "thread-observation",
       state: "idle",
     });
@@ -10628,15 +17846,11 @@ describe("StateStore", () => {
     expect(expandedSnapshot.session.title).not.toContain("/a");
 
     const privateTurnId = `${privateUserPathRoot}/api_key=TURN-SECRET-1234`;
-    const privateTurnCreated = store.createSession({
+    const privateTurnSession = upsertProvenTestSession(store, {
       profileId: profile.id,
       title: "Private provider identifier",
       preset: "high",
       fastEnabled: false,
-    });
-    const privateTurnSession = store.bindSession({
-      sessionId: privateTurnCreated.id,
-      expectedRevision: privateTurnCreated.revision,
       providerThreadId: "thread-private-provider-id",
       state: "active",
       activeTurnId: privateTurnId,
@@ -10650,15 +17864,11 @@ describe("StateStore", () => {
     expect(store.requireSession(privateTurnSession.id).activeTurnId).toBe(privateTurnId);
 
     const longTurnId = "l".repeat(201);
-    const longTurnCreated = store.createSession({
+    const longTurnSession = upsertProvenTestSession(store, {
       profileId: profile.id,
       title: "Long provider identifier",
       preset: "high",
       fastEnabled: false,
-    });
-    const longTurnSession = store.bindSession({
-      sessionId: longTurnCreated.id,
-      expectedRevision: longTurnCreated.revision,
       providerThreadId: "thread-long-provider-id",
       state: "active",
       activeTurnId: longTurnId,
@@ -10754,14 +17964,11 @@ describe("StateStore", () => {
     recordUsageForTest(store, removed.id, 1, 100, { sentinel: "removed-account-payload" });
     store.removeProfile(removed.id);
 
-    const starting = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: observed.id,
       title: "private session title",
       preset: "high",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
       providerThreadId: "private-thread", state: "idle",
     });
     store.updateSessionMetadata({
@@ -10852,14 +18059,11 @@ describe("StateStore", () => {
   test("emits executable root attention intents for every interaction kind and in-flight state", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Actionable attention", "attention@example.com");
-    const starting = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: profile.id,
       title: "Actionable attention",
       preset: "high",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
       providerThreadId: "thread-actionable-attention", state: "idle",
     });
     const cases = [
@@ -11027,14 +18231,10 @@ describe("StateStore", () => {
   test("atomically retires one provider generation before an account login advances it", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Login retirement", "login-retirement@example.com");
-    const created = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: created.id,
-      expectedRevision: created.revision,
       providerThreadId: "thread-login-retirement",
       state: "idle",
     });
@@ -11082,6 +18282,11 @@ describe("StateStore", () => {
       request: { deviceCode: false },
       idempotencyKey: "00000000-0000-4000-8000-000000000811",
     });
+    completeCodexAccountMutationAuthorityRetirement(
+      store,
+      profile.id,
+      profile.processGeneration,
+    );
 
     const begun = store.beginAccountMutationEffect({
       attemptId: attempt.id,
@@ -11136,6 +18341,12 @@ describe("StateStore", () => {
     expect(events.map((event) => event.body)).toEqual([
       { type: "connection", state: "connected" },
       {
+        type: "interaction_state",
+        interactionId: interaction.publicId,
+        state: "expired",
+        revision: interaction.revision + 1,
+      },
+      {
         type: "assistant_delta",
         turnId: publicProviderIdentifier("turn-login-retirement"),
         itemId: publicProviderIdentifier("item-login-retirement"),
@@ -11145,12 +18356,6 @@ describe("StateStore", () => {
         type: "warning",
         code: "provider_resume_unavailable",
         message: "Provider observation is unavailable.",
-      },
-      {
-        type: "interaction_state",
-        interactionId: interaction.publicId,
-        state: "expired",
-        revision: interaction.revision + 1,
       },
       { type: "connection", state: "disconnected", reason: "closed" },
       {
@@ -11272,17 +18477,199 @@ describe("StateStore", () => {
     }
   });
 
+  test("rolls back a logout retirement snapshot after its event writes and permits one exact retry", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Late logout rollback", "late-logout-rollback@example.com");
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-late-logout-rollback",
+      state: "idle",
+    });
+    const providerAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
+    const connectionId = "11600000-0000-4000-8000-000000000001";
+    store.appendSessionEvent({
+      sessionId: session.id,
+      accountId: profile.id,
+      providerGeneration: providerAuthority.processGeneration,
+      providerAuthority,
+      providerConnectionId: connectionId,
+      body: { type: "connection", state: "connected" },
+    });
+    const interaction = store.admitInteraction({
+      publicId: "11600000-0000-4000-8000-000000000002",
+      sessionId: session.id,
+      authority: {
+        ...codexInteractionBinding(store, profile.id),
+        profileId: profile.id,
+        processGeneration: providerAuthority.processGeneration,
+        connectionId,
+        requestId: { type: "string", value: "late-logout-rollback" },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "6".repeat(64),
+        threadId: "thread-late-logout-rollback",
+        turnId: "turn-late-logout-rollback",
+        itemId: "item-late-logout-rollback",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Retain exact expired interaction after rollback",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    }).record;
+    const idempotencyKey = "00000000-0000-4000-8000-000000000816";
+    const attempt = store.prepareMutation({
+      kind: "account.logout",
+      authorityId: profile.id,
+      authorityGeneration: providerAuthority.processGeneration,
+      request: {},
+      idempotencyKey,
+      providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "account_logout" }],
+    });
+    const releasedBody = {
+      type: "assistant_delta" as const,
+      turnId: publicProviderIdentifier("turn-late-logout-rollback"),
+      itemId: publicProviderIdentifier("item-late-logout-rollback"),
+      text: "[protected]",
+    };
+    const input: Parameters<StateStore["beginAccountMutationEffect"]>[0] = {
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: providerAuthority.processGeneration,
+      providerAuthority,
+      evidence: { kind: "account.logout", baselineSignedIn: true },
+      providerRetirements: [{
+        sessionId: session.id,
+        connectionId,
+        providerAuthority,
+        releasedEvents: [{
+          accountId: profile.id,
+          sessionId: session.id,
+          providerGeneration: providerAuthority.processGeneration,
+          providerConnectionId: connectionId,
+          body: releasedBody,
+        }],
+      }],
+    };
+    const workStore = createRevocationWorkStore(store);
+    const personal = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id, expectedGeneration: profile.processGeneration,
+      provider: "codex", runtimeScope: "personal", currentAccountKey: null, workStore,
+    });
+    store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id, expectedGeneration: profile.processGeneration,
+      provider: "codex", runtimeScope: "personal", expectedRevision: personal.revocation.revision,
+    });
+    store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id, expectedGeneration: profile.processGeneration,
+      provider: "codex", runtimeScope: "managed", currentAccountKey: null, workStore,
+    });
+    const expired = store.requireInteraction(interaction.publicId);
+    expect(expired).toMatchObject({ state: "expired", revision: interaction.revision + 1 });
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const snapshot = () => ({
+        profile: database.query("SELECT * FROM profiles WHERE id=?").get(profile.id),
+        accounts: database.query("SELECT * FROM provider_accounts WHERE profile_id=? ORDER BY provider").all(profile.id),
+        providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+        capturedAuthority: store.requireCapturedSessionProviderAuthority(session.id),
+        session: database.query("SELECT * FROM sessions WHERE id=?").get(session.id),
+        mutation: database.query("SELECT * FROM mutation_attempts WHERE id=?").get(attempt.id),
+        mutationAuthorities: store.readMutationProviderAuthorities(attempt.id),
+        evidence: database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").all(attempt.id),
+        events: database.query("SELECT * FROM session_events WHERE session_id=? ORDER BY sequence").all(session.id),
+        eventAuthorities: database.query("SELECT * FROM session_event_provider_authorities WHERE session_id=? ORDER BY sequence").all(session.id),
+        stream: database.query("SELECT * FROM session_event_streams WHERE session_id=?").get(session.id),
+        cursor: store.eventStreamPosition(session.id),
+        interaction: store.requireInteraction(interaction.publicId),
+      });
+      const before = snapshot();
+      expect(before.evidence).toEqual([]);
+      expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "prepared" });
+      // The failure fires only after all three captured retirement events
+      // have reached SQLite, so rollback is not merely an input rejection.
+      database.exec(`CREATE TRIGGER test_logout_retirement_evidence_failure
+        BEFORE INSERT ON mutation_effect_evidence
+        WHEN NEW.attempt_id='${attempt.id}' AND NEW.kind='account.logout'
+        BEGIN
+          SELECT CASE WHEN (
+            SELECT COUNT(*) FROM session_events WHERE session_id='${session.id}'
+          )=${before.events.length + 3}
+          THEN RAISE(ABORT,'INJECTED_LOGOUT_EVIDENCE_FAILURE')
+          ELSE RAISE(ABORT,'LOGOUT_RETIREMENT_NOT_WRITTEN_BEFORE_EVIDENCE') END;
+        END;`);
+      try {
+        expect(() => store.beginAccountMutationEffect(input))
+          .toThrow("INJECTED_LOGOUT_EVIDENCE_FAILURE");
+        expect(snapshot()).toEqual(before);
+      } finally {
+        database.exec("DROP TRIGGER test_logout_retirement_evidence_failure");
+      }
+
+      expect(store.beginAccountMutationEffect(input)).toMatchObject({
+        profile: { state: "signed_in", processGeneration: profile.processGeneration },
+        retiredSessionIds: [session.id],
+      });
+      const after = snapshot();
+      expect(after.profile).toEqual(before.profile);
+      expect(after.accounts).toEqual(before.accounts);
+      expect(after.providerAuthority).toEqual(providerAuthority);
+      expect(after.capturedAuthority).toEqual(before.capturedAuthority);
+      expect(after.session).toEqual(before.session);
+      expect(after.mutationAuthorities).toEqual(before.mutationAuthorities);
+      expect(after.interaction).toEqual(expired);
+      expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "effect_started" });
+      expect(after.evidence).toHaveLength(1);
+      expect(after.evidence).toMatchObject([{
+        attempt_id: attempt.id,
+        kind: "account.logout",
+        evidence_json: JSON.stringify(input.evidence),
+        evidence_digest: createHash("sha256").update(JSON.stringify(input.evidence)).digest("hex"),
+      }]);
+      expect(after.events.slice(0, before.events.length)).toEqual(before.events);
+      expect(after.eventAuthorities.slice(0, before.eventAuthorities.length)).toEqual(before.eventAuthorities);
+      expect(after.events).toHaveLength(before.events.length + 3);
+      expect(after.eventAuthorities).toHaveLength(before.eventAuthorities.length + 3);
+      expect(after.cursor.observedThroughSequence).toBe(before.cursor.observedThroughSequence + 3);
+      const events = store.listSessionEvents({ sessionId: session.id, afterSequence: 0, limit: 100 }).events;
+      expect(events.slice(-3).map((event) => event.body)).toEqual([
+        releasedBody,
+        { type: "connection", state: "disconnected", reason: "closed" },
+        {
+          type: "gap", reason: "provider_disconnect",
+          fromSequence: before.cursor.observedThroughSequence + 3,
+          throughSequence: before.cursor.observedThroughSequence + 3,
+        },
+      ]);
+      expect(database.query(`SELECT provider_account_id,profile_id,provider,binding_generation,process_generation
+        FROM session_event_provider_authorities WHERE session_id=? ORDER BY sequence`).all(session.id))
+        .toEqual(events.map(() => ({
+          provider_account_id: providerAuthority.providerAccountId,
+          profile_id: providerAuthority.profileId,
+          provider: providerAuthority.provider,
+          binding_generation: providerAuthority.bindingGeneration,
+          process_generation: providerAuthority.processGeneration,
+        })));
+    } finally {
+      database.close(false);
+    }
+  });
+
   test("rolls an invalid account-login retirement back and permits an exact retry", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Rollback retirement", "rollback-retirement@example.com");
     const other = signInProfile(store, "Other retirement", "other-retirement@example.com");
-    const starting = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
       providerThreadId: "thread-rollback-retirement", state: "idle",
     });
     const otherSession = store.createSession({
@@ -11337,17 +18724,22 @@ describe("StateStore", () => {
         evidence: { kind: "account.login", method: "browser" },
         ...(providerRetirements === undefined ? {} : { providerRetirements }),
       });
+    completeCodexAccountMutationAuthorityRetirement(
+      store,
+      profile.id,
+      profile.processGeneration,
+    );
     const assertUnchanged = (): void => {
       expect(store.requireProfileById(profile.id)).toMatchObject({
         processGeneration: profile.processGeneration,
         state: "signed_in",
       });
       expect(store.requireInteraction(interaction.publicId)).toMatchObject({
-        revision: interaction.revision,
-        state: "pending",
+        revision: interaction.revision + 1,
+        state: "expired",
       });
       expect(store.readMutation(key)).toMatchObject({ state: "prepared" });
-      expect(store.eventStreamPosition(session.id).observedThroughSequence).toBe(0);
+      expect(store.eventStreamPosition(session.id).observedThroughSequence).toBe(1);
     };
 
     expect(() => begin([{
@@ -11406,6 +18798,245 @@ describe("StateStore", () => {
     expect(store.requireInteraction(interaction.publicId).state).toBe("expired");
   });
 
+  test("requires completed Codex authority retirement before ordinary login and logout effects", async () => {
+    const { store } = await fixture();
+    for (const [kind, idempotencyKey] of [
+      ["account.login", "00000000-0000-4000-8000-000000000813"],
+      ["account.logout", "00000000-0000-4000-8000-000000000814"],
+    ] as const) {
+      const profile = signInProfile(
+        store,
+        `Retirement parity ${kind}`,
+        `retirement-parity-${kind.slice("account.".length)}@example.com`,
+      );
+      const effectGeneration = kind === "account.login"
+        ? profile.processGeneration + 1
+        : profile.processGeneration;
+      const attempt = store.prepareMutation({
+        kind,
+        authorityId: profile.id,
+        authorityGeneration: effectGeneration,
+        request: kind === "account.login" ? { deviceCode: false } : {},
+        idempotencyKey,
+      });
+      const evidence = kind === "account.login"
+        ? { kind, method: "browser" as const }
+        : { kind, baselineSignedIn: true };
+
+      expect(() => store.beginAccountMutationEffect({
+        providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+        attemptId: attempt.id,
+        profileId: profile.id,
+        profileGeneration: effectGeneration,
+        evidence,
+      })).toThrow("ACCOUNT_MUTATION_CODEX_AUTHORITY_NOT_RETIRED");
+      expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "prepared" });
+
+      completeCodexRuntimeAccountAuthorityRetirement(
+        store,
+        profile.id,
+        profile.processGeneration,
+        kind === "account.login" ? "personal" : "managed",
+      );
+      expect(() => store.beginAccountMutationEffect({
+        providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+        attemptId: attempt.id,
+        profileId: profile.id,
+        profileGeneration: effectGeneration,
+        evidence,
+      })).toThrow("ACCOUNT_MUTATION_CODEX_AUTHORITY_NOT_RETIRED");
+      expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "prepared" });
+
+      completeCodexAccountMutationAuthorityRetirement(
+        store,
+        profile.id,
+        profile.processGeneration,
+      );
+      expect(store.beginAccountMutationEffect({
+        providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+        attemptId: attempt.id,
+        profileId: profile.id,
+        profileGeneration: effectGeneration,
+        evidence,
+      })).toMatchObject({
+        profile: {
+          processGeneration: effectGeneration,
+          state: kind === "account.login" ? "login_pending" : "signed_in",
+        },
+      });
+      expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "effect_started" });
+      for (const runtimeScope of ["personal", "managed"] as const) {
+        expect(store.readProviderRuntimeAccountRevocation({
+          profileId: profile.id,
+          provider: "codex",
+          runtimeScope,
+        })).toMatchObject({
+          currentAccountKey: null,
+          profileGeneration: profile.processGeneration,
+          state: "completed",
+        });
+      }
+    }
+  });
+
+  test("starts logout after personal retirement while its exact managed null fence is still releasing", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Ordered logout retirement",
+      "ordered-logout-retirement@example.com",
+    );
+    const idempotencyKey = "00000000-0000-4000-8000-000000000815";
+    const attempt = store.prepareMutation({
+      kind: "account.logout",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration,
+      request: {},
+      idempotencyKey,
+    });
+    const workStore = createRevocationWorkStore(store);
+    const personal = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "personal",
+      currentAccountKey: null,
+      workStore,
+    });
+    const managed = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      currentAccountKey: null,
+      workStore,
+    });
+
+    expect(() => store.beginAccountMutationEffect({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      evidence: { kind: "account.logout", baselineSignedIn: true },
+    })).toThrow("ACCOUNT_MUTATION_CODEX_AUTHORITY_NOT_RETIRED");
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "prepared" });
+
+    store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "personal",
+      expectedRevision: personal.revocation.revision,
+    });
+    expect(store.beginAccountMutationEffect({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      evidence: { kind: "account.logout", baselineSignedIn: true },
+    })).toMatchObject({
+      profile: {
+        processGeneration: profile.processGeneration,
+        state: "signed_in",
+      },
+    });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "effect_started" });
+    expect(store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider: "codex",
+      runtimeScope: "personal",
+    })).toMatchObject({ currentAccountKey: null, state: "completed" });
+    expect(store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider: "codex",
+      runtimeScope: "managed",
+    })).toMatchObject({
+      currentAccountKey: null,
+      profileGeneration: profile.processGeneration,
+      revision: managed.revocation.revision,
+      state: "releasing",
+    });
+  });
+
+  test("does not extend logout's releasing exception to login or a non-null managed fence", async () => {
+    const { store } = await fixture();
+    const loginProfile = signInProfile(
+      store,
+      "Still fenced login",
+      "still-fenced-login@example.com",
+    );
+    const loginAttempt = store.prepareMutation({
+      kind: "account.login",
+      authorityId: loginProfile.id,
+      authorityGeneration: loginProfile.processGeneration + 1,
+      request: { deviceCode: false },
+      idempotencyKey: "00000000-0000-4000-8000-000000000816",
+    });
+    completeCodexRuntimeAccountAuthorityRetirement(
+      store,
+      loginProfile.id,
+      loginProfile.processGeneration,
+      "personal",
+    );
+    store.beginProviderRuntimeAccountRevocation({
+      profileId: loginProfile.id,
+      expectedGeneration: loginProfile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      currentAccountKey: null,
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(() => store.beginAccountMutationEffect({
+      providerAuthority: store.requireProviderAccountAuthority(loginProfile.id, "codex"),
+      attemptId: loginAttempt.id,
+      profileId: loginProfile.id,
+      profileGeneration: loginProfile.processGeneration + 1,
+      evidence: { kind: "account.login", method: "browser" },
+    })).toThrow("ACCOUNT_MUTATION_CODEX_AUTHORITY_NOT_RETIRED");
+
+    const logoutProfile = signInProfile(
+      store,
+      "Non-null fenced logout",
+      "non-null-fenced-logout@example.com",
+    );
+    const logoutAttempt = store.prepareMutation({
+      kind: "account.logout",
+      authorityId: logoutProfile.id,
+      authorityGeneration: logoutProfile.processGeneration,
+      request: {},
+      idempotencyKey: "00000000-0000-4000-8000-000000000817",
+    });
+    completeCodexRuntimeAccountAuthorityRetirement(
+      store,
+      logoutProfile.id,
+      logoutProfile.processGeneration,
+      "personal",
+    );
+    store.beginProviderRuntimeAccountRevocation({
+      profileId: logoutProfile.id,
+      expectedGeneration: logoutProfile.processGeneration,
+      provider: "codex",
+      runtimeScope: "managed",
+      currentAccountKey: providerAccountKeyForProfile(
+        store,
+        logoutProfile.id,
+        "codex",
+      ),
+      workStore: createRevocationWorkStore(store),
+    });
+    expect(() => store.beginAccountMutationEffect({
+      providerAuthority: store.requireProviderAccountAuthority(logoutProfile.id, "codex"),
+      attemptId: logoutAttempt.id,
+      profileId: logoutProfile.id,
+      profileGeneration: logoutProfile.processGeneration,
+      evidence: { kind: "account.logout", baselineSignedIn: true },
+    })).toThrow("ACCOUNT_MUTATION_CODEX_AUTHORITY_NOT_RETIRED");
+    expect(store.readMutation("00000000-0000-4000-8000-000000000816"))
+      .toMatchObject({ state: "prepared" });
+    expect(store.readMutation("00000000-0000-4000-8000-000000000817"))
+      .toMatchObject({ state: "prepared" });
+  });
+
   test("evicts a deterministic contiguous event prefix by age and reports the exact floor gap", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-event-retention-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
@@ -11414,7 +19045,12 @@ describe("StateStore", () => {
     const store = new StateStore(paths, { now: () => currentTime });
     stores.push(store);
     const profile = signInProfile(store, "Retention", "retention@example.com");
-    const session = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-interaction",
+    });
     const append = (message: string) => store.appendSessionEvent({
       sessionId: session.id,
       accountId: profile.id,
@@ -11485,7 +19121,12 @@ describe("StateStore", () => {
   test("caps event pages by encoded bytes without splitting or reordering events", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Page bytes", "page-bytes@example.com");
-    const session = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-interaction-page",
+    });
     for (let index = 0; index < 18; index += 1) {
       store.appendSessionEvent({
         sessionId: session.id,
@@ -11512,12 +19153,9 @@ describe("StateStore", () => {
   test.each(["codex", "claude", "devin"] as const)("rejects a bound interaction from another provider thread for %s", async (provider) => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Exact interaction thread", "exact-thread@example.com");
-    const starting = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: profile.id, provider, preset: provider === "codex" ? "high" : provider === "claude" ? "fable-max" : "astra",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
       providerThreadId: "exact-interaction-thread", state: "idle",
     });
     const captured = store.requireProviderAccountAuthority(profile.id, provider);
@@ -11564,10 +19202,11 @@ describe("StateStore", () => {
   test("brokers tagged provider requests with exact replay and write-ahead CAS states", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Interactions", "interactions@example.com");
-    const starting = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
-      providerThreadId: "thread-interaction", state: "idle",
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-interaction",
     });
     const connectionId = "20000000-0000-4000-8000-000000000001";
     const authority = {
@@ -11712,10 +19351,11 @@ describe("StateStore", () => {
     const store = new StateStore(paths, { now: () => 20_000 });
     stores.push(store);
     const profile = signInProfile(store, "Interaction pages", "interaction-pages@example.com");
-    const starting = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
-      providerThreadId: "thread-interaction-page", state: "idle",
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-interaction-page",
     });
     const display = {
       kind: "command_approval" as const,
@@ -11784,10 +19424,12 @@ describe("StateStore", () => {
     const store = new StateStore(paths, { now: () => now });
     stores.push(store);
     const profile = signInProfile(store, "Attention snapshot", "attention-snapshot@example.com");
-    const starting = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
-      providerThreadId: "thread-attention-snapshot", state: "idle",
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-attention-snapshot",
+      state: "idle",
     });
     const connectionId = "24000000-0000-4000-8000-999999999999";
     const display = {
@@ -11889,10 +19531,12 @@ describe("StateStore", () => {
     const store = new StateStore(paths, { now: () => now });
     stores.push(store);
     const profile = signInProfile(store, "Attention overflow", "attention-overflow@example.com");
-    const starting = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
-      providerThreadId: "thread-attention-overflow", state: "idle",
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-attention-overflow",
+      state: "idle",
     });
     const connectionId = "25000000-0000-4000-8000-999999999999";
     const admit = (index: number, sessionId: string | null) => store.admitInteraction({
@@ -11956,10 +19600,11 @@ describe("StateStore", () => {
     const store = new StateStore(paths, { now: () => now });
     stores.push(store);
     const profile = signInProfile(store, "Deadline", "deadline@example.com");
-    const starting = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
-      providerThreadId: "thread-deadline", state: "idle",
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-deadline",
     });
     const authority = {
       ...codexInteractionBinding(store, profile.id),
@@ -12054,10 +19699,11 @@ describe("StateStore", () => {
     const store = new StateStore(paths, { now: () => now });
     stores.push(store);
     const profile = signInProfile(store, "Timeout CAS", "timeout-cas@example.com");
-    const starting = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
-      providerThreadId: "thread-timeout-cas", state: "idle",
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-timeout-cas",
     });
     const authority = {
       ...codexInteractionBinding(store, profile.id),
@@ -12168,6 +19814,41 @@ describe("StateStore", () => {
     }
   });
 
+  test("expires generation interactions only for the requested session on a shared connection", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Scoped interaction drain", "scoped-drain@example.com");
+    const providerAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
+    const connectionId = "30000000-0000-4000-8000-000000000091";
+    const sessions = [1, 2].map((index) => upsertProvenTestSession(store, {
+      profileId: profile.id, provider: "codex", preset: "high", fastEnabled: false,
+      providerThreadId: `scoped-drain-thread-${index}`, state: "idle",
+    }));
+    const interactions = sessions.map((session, index) => store.admitInteraction({
+      publicId: randomUUID(), sessionId: session.id,
+      authority: {
+        ...providerAuthority, connectionId, requestId: { type: "number", value: index + 1 },
+        method: "item/commandExecution/requestApproval", requestDigest: String(index + 1).repeat(64),
+        threadId: `scoped-drain-thread-${index + 1}`, turnId: null, itemId: null, approvalId: null,
+      },
+      kind: "command_approval", blocking: true,
+      display: { kind: "command_approval", summary: "Approve scoped command", reason: null,
+        commandClass: "test", workingDirectory: null, availableDecisions: ["once", "decline"] },
+    }).record);
+    const selected = interactions[0]!;
+    const sibling = interactions[1]!;
+    const siblingEvents = store.listSessionEvents({ sessionId: sessions[1]!.id, afterSequence: 0 });
+    const input = {
+      profileId: profile.id, processGeneration: providerAuthority.processGeneration,
+      providerAuthority, connectionId, sessionId: sessions[0]!.id,
+    };
+    expect(store.expireGenerationInteractions(input)).toMatchObject([{ publicId: selected.publicId, state: "expired" }]);
+    expect(store.requireInteraction(sibling.publicId)).toEqual(sibling);
+    expect(store.listSessionEvents({ sessionId: sessions[1]!.id, afterSequence: 0 })).toEqual(siblingEvents);
+    expect(store.expireGenerationInteractions(input)).toEqual([]);
+    expect(store.expireGenerationInteractions({ ...input, sessionId: sessions[1]!.id }))
+      .toMatchObject([{ publicId: sibling.publicId, state: "expired" }]);
+  });
+
   test("expires untouched generation interactions and quarantines write-adjacent responses", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Interaction restart", "interaction-restart@example.com");
@@ -12241,10 +19922,12 @@ describe("StateStore", () => {
     const profile = signInProfile(store, "Active restart attention", "active-restart-attention@example.com");
     const threadId = "thread-active-restart-attention";
     const turnId = "turn-active-restart-attention";
-    const session = store.upsertProviderSession({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
       providerThreadId: threadId,
       title: "Active restart attention",
+      preset: "high",
+      fastEnabled: false,
       state: "active",
       activeTurnId: turnId,
     });
@@ -12320,9 +20003,8 @@ describe("StateStore", () => {
       store.advanceProviderAccountProcessGeneration({ profileId: profile.id, provider, expectedProcessGeneration: 0 });
       store.advanceProviderAccountProcessGeneration({ profileId: profile.id, provider, expectedProcessGeneration: 1 });
     }
-    const created = store.createSession({ profileId: profile.id, provider,
-      preset: provider === "claude" ? "fable-max" : "high", fastEnabled: false });
-    const session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+    const session = upsertProvenTestSession(store, { profileId: profile.id, provider,
+      preset: provider === "claude" ? "fable-max" : "high", fastEnabled: false,
       providerThreadId: `${provider}-close-attention-thread`, state: "idle" });
     const captured = store.requireCapturedSessionProviderAuthority(session.id);
     const authority = { provider: captured.provider, providerAccountId: captured.providerAccountId,
@@ -12393,6 +20075,12 @@ describe("StateStore", () => {
     const created = value.store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
     const session = value.store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
       providerThreadId: "unproved-restart-attention-thread", state: "idle" });
+    // The current callback must first be admitted under real account custody.
+    // The exact v39 downgrade removes this later scope proof; no runtime
+    // observation is created that could prove the historical session tuple.
+    value.store.bindSessionProviderAccountAuthority({ sessionId: session.id, provider: "codex",
+      runtimeScope: "managed",
+      accountKey: `v1:codex:${createHash("sha256").update("unproved-restart@example.com").digest("hex")}` });
     const interaction = pendingCallback ? admitRestartCommandInteraction(value.store, { index: 44,
       profileId: profile.id, processGeneration: profile.processGeneration, sessionId: session.id,
       threadId: "unproved-restart-attention-thread", turnId: null }) : null;
@@ -12402,7 +20090,7 @@ describe("StateStore", () => {
     value.store.close();
     stores.splice(stores.indexOf(value.store), 1);
     const downgrade = new Database(value.store.paths.database, { strict: true });
-    try { downgradeProviderAccountsToReleasedVersion(downgrade, 39); }
+    try { downgradeToExactProviderVersion39(downgrade); }
     finally { downgrade.close(false); }
     const store = new StateStore(value.store.paths, { now: () => 9_000 });
     stores.push(store);
@@ -12424,14 +20112,45 @@ describe("StateStore", () => {
     expect(store.nextDaemonGeneration(bootId)).toBe(1);
   });
 
+  test.each(["codex", "claude"] as const)("restart preserves historical attention when the %s account binding has changed", async (provider) => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Retired binding attention", "retired-binding-attention@example.com");
+    const session = upsertProvenTestSession(store, { profileId: profile.id, provider,
+      preset: provider === "codex" ? "high" : "fable-max", fastEnabled: false,
+      providerThreadId: `retired-binding-${provider}`, state: "idle" });
+    const captured = store.requireCapturedSessionProviderAuthority(session.id);
+    const state = store.upsertSessionState({ sessionId: session.id, state: "needs_approval", attention: true,
+      reason: "pending command_approval", verbatimRequired: false, verbatimLiteral: undefined,
+      lastActivityAt: 1_000, revision: 1 });
+    if (provider === "codex") {
+      completeCodexAccountMutationAuthorityRetirement(store, profile.id, profile.processGeneration);
+      store.setProfileState(profile.id, profile.processGeneration, "recovery_required");
+    } else {
+      store.observeProviderAccountReadiness({ profileId: profile.id, provider,
+        expectedBindingGeneration: captured.bindingGeneration, readiness: "signed_in" });
+    }
+    expect(store.requireProviderAccountAuthority(profile.id, provider).bindingGeneration)
+      .toBe(captured.bindingGeneration + 1);
+    const events = store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events;
+    const bootId = `boot_${"b".repeat(32)}`;
+    expect(store.nextDaemonGeneration(bootId)).toBe(1);
+    expect(store.readSessionState(session.id)).toEqual(state);
+    expect(store.requireCapturedSessionProviderAuthority(session.id)).toEqual(captured);
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events).toEqual(events);
+    expect(store.nextDaemonGeneration(bootId)).toBe(1);
+    expect(store.readSessionState(session.id)).toEqual(state);
+  });
+
   test("repairs interaction-owned attention to aborted when an idle session loses its callback", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Idle restart attention", "idle-restart-attention@example.com");
     const threadId = "thread-idle-restart-attention";
-    const session = store.upsertProviderSession({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
       providerThreadId: threadId,
       title: "Idle restart attention",
+      preset: "high",
+      fastEnabled: false,
       state: "idle",
     });
     const interaction = admitRestartCommandInteraction(store, {
@@ -12512,10 +20231,12 @@ describe("StateStore", () => {
     for (const input of cases) {
       const threadId = `thread-non-interaction-attention-${String(input.index)}`;
       const turnId = `turn-non-interaction-attention-${String(input.index)}`;
-      const session = store.upsertProviderSession({
-        providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      const session = createProvenTestSession(store, {
+        profileId: profile.id,
         providerThreadId: threadId,
         title: `Non-interaction attention ${String(input.index)}`,
+        preset: "high",
+        fastEnabled: false,
         state: "active",
         activeTurnId: turnId,
       });
@@ -12559,10 +20280,12 @@ describe("StateStore", () => {
     const profile = signInProfile(store, "Multi restart attention", "multi-restart-attention@example.com");
     const threadId = "thread-multi-restart-attention";
     const turnId = "turn-multi-restart-attention";
-    const session = store.upsertProviderSession({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
       providerThreadId: threadId,
       title: "Multi restart attention",
+      preset: "high",
+      fastEnabled: false,
       state: "active",
       activeTurnId: turnId,
     });
@@ -12616,10 +20339,12 @@ describe("StateStore", () => {
     const profile = signInProfile(store, "Restart repair rollback", "restart-repair-rollback@example.com");
     const threadId = "thread-restart-repair-rollback";
     const turnId = "turn-restart-repair-rollback";
-    const session = store.upsertProviderSession({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
       providerThreadId: threadId,
       title: "Restart repair rollback",
+      preset: "high",
+      fastEnabled: false,
       state: "active",
       activeTurnId: turnId,
     });
@@ -12674,6 +20399,101 @@ describe("StateStore", () => {
     }
   });
 
+  test("repairs adopted Codex attention before advancing personal authority", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(
+      store,
+      "Adopted restart attention",
+      "adopted-restart-attention@example.com",
+    );
+    const threadId = "thread-adopted-restart-attention";
+    store.setSessionAdoptionPolicy({ provider: "codex", profileId: profile.id });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "codex",
+      providerThreadId: threadId,
+      title: "Adopted restart attention",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const claiming = store.fenceSessionAdoptionCandidateForClaim({
+      provider: "codex",
+      providerThreadId: threadId,
+      expectedRevision: candidate.revision,
+    });
+    const adopted = store.adoptSessionCandidate({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      provider: "codex",
+      providerThreadId: threadId,
+      expectedCandidateRevision: claiming.revision,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      preset: "high",
+      requirement: presetRequirements.high,
+      fastEnabled: false,
+      runtimeProfile: codexAdoptionRuntimeProfile(profile, "high", false),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    const interaction = admitRestartCommandInteraction(store, {
+      index: 41,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      sessionId: adopted.session.id,
+      threadId,
+      turnId: null,
+    });
+    const beforeState = store.upsertSessionState({
+      sessionId: adopted.session.id,
+      state: "needs_approval",
+      attention: true,
+      reason: "autorespond_protected_authority_required",
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+      lastActivityAt: 941,
+      revision: 41,
+    });
+
+    expect(store.nextDaemonGeneration(`boot_${"6".repeat(32)}`)).toBe(1);
+
+    expect(store.requireInteraction(interaction.publicId)).toMatchObject({
+      state: "expired",
+      revision: interaction.revision + 1,
+    });
+    expect(store.readSessionState(adopted.session.id)).toMatchObject({
+      state: "aborted",
+      attention: false,
+      reason: "provider interaction ended during daemon restart",
+      revision: beforeState.revision + 1,
+    });
+    expect(store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    expect(store.readSessionPersonalRuntimeBinding(adopted.session.id)).toMatchObject({
+      provider: "codex",
+      providerThreadId: threadId,
+      state: "active",
+    });
+    expect(store.sessionAccountAuthorityMatches(adopted.session.id, profile.id)).toBe(true);
+    expect(store.listSessionEvents({
+      sessionId: adopted.session.id,
+      afterSequence: 0,
+    }).events.map((event) => ({
+      type: event.body.type,
+      providerGeneration: event.providerGeneration,
+    }))).toEqual([
+      { type: "gap", providerGeneration: profile.processGeneration },
+      { type: "interaction_state", providerGeneration: profile.processGeneration },
+      { type: "session_state", providerGeneration: profile.processGeneration },
+    ]);
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT COUNT(*) AS count FROM session_adoption_profile_generation_permits",
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
   for (const effect of ["known_unsent", "possibly_sent"] as const) {
     test(`atomically quarantines an interaction persistence boundary that is ${effect}`, async () => {
       const { store } = await fixture();
@@ -12682,13 +20502,10 @@ describe("StateStore", () => {
         `Persistence ${effect}`,
         `persistence-${effect}@example.com`,
       );
-      const starting = store.createSession({
+      const session = upsertProvenTestSession(store, {
         profileId: profile.id,
         preset: "high",
         fastEnabled: false,
-      });
-      const session = store.bindSession({
-        sessionId: starting.id, expectedRevision: starting.revision,
         providerThreadId: "thread-persistence-quarantine", state: "idle",
       });
       const connectionId = effect === "known_unsent"
@@ -12758,11 +20575,8 @@ describe("StateStore", () => {
       const claudeAuthority = store.advanceProviderAccountProcessGeneration({
         profileId: profile.id, provider: "claude", expectedProcessGeneration: 0,
       });
-      const claudeStarting = store.createSession({
+      const claudeSession = upsertProvenTestSession(store, {
         profileId: profile.id, provider: "claude", preset: "fable-max", fastEnabled: false,
-      });
-      const claudeSession = store.bindSession({
-        sessionId: claudeStarting.id, expectedRevision: claudeStarting.revision,
         providerThreadId: "thread-persistence-quarantine-claude", state: "idle",
       });
       const coincidentClaudeInteraction = store.admitInteraction({
@@ -12880,13 +20694,10 @@ describe("StateStore", () => {
   test("rolls back every quarantine transition when its generation fence cannot commit", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Persistence rollback", "persistence-rollback@example.com");
-    const starting = store.createSession({
+    const session = upsertProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
       providerThreadId: "thread-persistence-rollback", state: "idle",
     });
     const connectionId = "30300000-0000-4000-8000-000000000001";
@@ -13093,7 +20904,7 @@ describe("StateStore", () => {
 
     const legacy = new Database(paths.database, { create: false, strict: true });
     try {
-      dropAttachmentCustodySchema(legacy);
+      dropSchemaAfterVersion34(legacy);
       legacy.exec(`
         DROP TRIGGER account_rate_limit_reset_attempt_policy_insert_guard;
         DROP TRIGGER account_rate_limit_reset_attempt_policy_begin_guard;
@@ -13103,7 +20914,7 @@ describe("StateStore", () => {
         DROP TRIGGER account_rate_limit_reset_policy_transition_guard;
         DROP TRIGGER account_rate_limit_reset_policy_delete_guard;
         DROP TABLE account_rate_limit_reset_policies;
-        DELETE FROM migrations WHERE version=28 OR version>=44;
+        DELETE FROM migrations WHERE version>27;
         PRAGMA user_version=27;
       `);
     } finally {
@@ -13181,7 +20992,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query(
         "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
       ).get()).toEqual({ count: 1 });
@@ -13210,8 +21021,8 @@ describe("StateStore", () => {
 
     const partial = new Database(paths.database, { create: false, strict: true });
     try {
-      dropAttachmentCustodySchema(partial);
-      partial.exec("DELETE FROM migrations WHERE version=28 OR version>=44; PRAGMA user_version=27");
+      dropSchemaAfterVersion34(partial);
+      partial.exec("DELETE FROM migrations WHERE version>27; PRAGMA user_version=27");
     } finally {
       partial.close(false);
     }
@@ -13503,10 +21314,9 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
     const damaged = new Database(paths.database, { create: false, strict: true });
     try {
-      damaged.exec("DROP TRIGGER account_rate_limit_reset_policy_delete_guard");
-      damaged.query(
-        "DELETE FROM account_rate_limit_reset_policies WHERE profile_id=?",
-      ).run(profile.id);
+      withRemovedTestGuards(damaged, ["account_rate_limit_reset_policy_delete_guard"], () => {
+        damaged.query("DELETE FROM account_rate_limit_reset_policies WHERE profile_id=?").run(profile.id);
+      });
     } finally {
       damaged.close(false);
     }
@@ -14983,21 +22793,19 @@ describe("StateStore", () => {
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const corrupt = new Database(paths.database, { create: false, strict: true });
-    corrupt.exec("DROP TRIGGER usage_snapshots_immutable_update");
-    corrupt.query(
-      `UPDATE usage_snapshots SET digest=?
-       WHERE profile_id=? AND source_revision=1`,
-    ).run("0".repeat(64), profile.id);
+    withRemovedTestGuards(corrupt, ["usage_snapshots_immutable_update"], () => {
+      corrupt.query("UPDATE usage_snapshots SET digest=? WHERE profile_id=? AND source_revision=1")
+        .run("0".repeat(64), profile.id);
+    });
     corrupt.close(false);
 
     expect(() => new StateStore(paths)).toThrow("CODEX_USAGE_SNAPSHOT_DIGEST_INVALID");
   });
 
-  test("repairs weakened same-name v41 guards while readonly refuses them", async () => {
+  test("refuses weakened same-name usage guards in current49 without rewriting authority", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Repair v36 guards", "repair-v36@example.com");
     const codexAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
-    const claudeAuthority = store.requireProviderAccountAuthority(profile.id, "claude");
     const snapshot = usageSnapshot({
       lifetimeTokens: 100,
       observedAt: 10_000,
@@ -15031,56 +22839,10 @@ describe("StateStore", () => {
       weakened.close(false);
     }
 
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V41_STRUCTURE_INVALID");
-
-    const repaired = new StateStore(paths, { now: () => 20_000 });
-    stores.push(repaired);
-    repaired.close();
-    stores.splice(stores.indexOf(repaired), 1);
-    const writer = new Database(paths.database, { create: false, strict: true });
-    try {
-      expect(() => writer.query(
-        `UPDATE usage_snapshots SET observed_at=observed_at
-         WHERE profile_id=? AND source_revision=1`,
-      ).run(profile.id)).toThrow("Codex usage snapshot is immutable");
-      expect(() => writer.query(
-        `UPDATE account_scoped_provider_authorities SET recorded_at=recorded_at
-         WHERE scope_kind='usage_snapshot' AND scope_id=?`,
-      ).run(`${profile.id}:1`)).toThrow(
-        "account provider compatibility authority is immutable",
-      );
-      expect(() => writer.query(
-        `INSERT INTO provider_usage_observation_receipts(
-           idempotency_key,component,provider_account_id,profile_id,provider,
-           binding_generation,process_generation,session_id,turn_id,
-           observation_revision,source,source_event_digest,component_digest,
-           observed_at,received_at,recorded_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      ).run(
-        "d".repeat(64),
-        "quota",
-        claudeAuthority.providerAccountId,
-        claudeAuthority.profileId,
-        "claude",
-        claudeAuthority.bindingGeneration,
-        claudeAuthority.processGeneration,
-        "missing-session",
-        "missing-turn",
-        1,
-        "claude_rate_limit_event",
-        "e".repeat(64),
-        "f".repeat(64),
-        10_000,
-        10_000,
-        10_000,
-      )).toThrow("provider usage turn authority mismatch");
-    } finally {
-      writer.close(false);
-    }
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_COHORT_INVALID:private-task48:account_scoped_provider_authorities_immutable_update",
+      "STATE_SCHEMA_COHORT_INVALID:combined49:account_scoped_provider_authorities_immutable_update");
   });
-
-  test("repairs weakened same-name v42 switch guards while readonly refuses them", async () => {
+  test("refuses weakened same-name switch guards in current49 without rewriting authority", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -15102,28 +22864,8 @@ describe("StateStore", () => {
       weakened.close(false);
     }
 
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V42_STRUCTURE_INVALID");
-    const repaired = new StateStore(paths, { now: () => 20_000 });
-    stores.push(repaired);
-    repaired.close();
-    stores.splice(stores.indexOf(repaired), 1);
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      const updateGuard = inspector.query(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='session_switch_session_update_guard'",
-      ).get() as { sql: string };
-      const openIndex = inspector.query(
-        "SELECT sql FROM sqlite_master WHERE type='index' AND name='session_switch_one_open_per_session'",
-      ).get() as { sql: string };
-      expect(updateGuard.sql).toContain("session switch blocks session mutation");
-      expect(openIndex.sql).toContain("reconciliation_required");
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
-    } finally {
-      inspector.close(false);
-    }
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_V42_STRUCTURE_INVALID");
   });
-
   test("audits missing Codex usage authority before startup retention", async () => {
     for (const scopeKind of [
       "usage_snapshot",
@@ -15153,16 +22895,16 @@ describe("StateStore", () => {
       stores.splice(stores.indexOf(store), 1);
 
       const corrupt = new Database(paths.database, { create: false, strict: true });
-      corrupt.exec("DROP TRIGGER account_scoped_provider_authorities_immutable_delete");
-      corrupt.query(
-        `DELETE FROM account_scoped_provider_authorities
-         WHERE scope_kind=? AND scope_id=?`,
-      ).run(scopeKind, `${profile.id}:${sourceRevision}`);
+      withRemovedTestGuards(corrupt, ["account_scoped_provider_authorities_immutable_delete"], () => {
+        corrupt.query("DELETE FROM account_scoped_provider_authorities WHERE scope_kind=? AND scope_id=?")
+          .run(scopeKind, `${profile.id}:${sourceRevision}`);
+      });
       corrupt.close(false);
 
       expect(() => new StateStore(paths, {
         now: () => USAGE_LOCAL_RETAIN_AGE_MS + 100_000,
-      })).toThrow("CODEX_USAGE_AUTHORITY_MISSING");
+      })).toThrow("ACCOUNT_SCOPED_PROVIDER_AUTHORITY_MISSING");
+      expectInertSchemaRefusal(paths, "ACCOUNT_SCOPED_PROVIDER_AUTHORITY_MISSING");
     }
   });
 
@@ -15514,167 +23256,79 @@ describe("StateStore", () => {
     }
   }, 30_000);
 
-  test("migrates v40 Codex usage sidecars byte-identically and reruns v41", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Legacy Codex usage", "legacy-usage@example.com");
-    const first = usageSnapshot({
-      lifetimeTokens: 100,
-      observedAt: 10_000,
-      previous: null,
-      providerGeneration: profile.processGeneration,
-      receivedAt: 1_000,
-      sourceSequence: 1,
-    });
-    const third = usageSnapshot({
-      lifetimeTokens: 300,
-      observedAt: 30_000,
-      previous: first,
-      providerGeneration: profile.processGeneration,
-      receivedAt: 1_001,
-      sourceSequence: 3,
-    });
-    recordUsageForTest(store, profile.id, 1, 10_000, first);
-    recordUsagePollFailureForTest(store, profile.id, usageFingerprint, 2, 20_000);
-    recordUsageForTest(store, profile.id, 3, 30_000, third);
-    recordUsagePollFailureForTest(store, profile.id, usageFingerprint, 4, 40_000);
-    const fifth = usageSnapshot({
-      lifetimeTokens: 500,
-      observedAt: 50_000,
-      previous: third,
-      providerGeneration: profile.processGeneration,
-      receivedAt: 1_000 + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
-      sourceSequence: 5,
-    });
-    recordUsageForTest(store, profile.id, 5, 50_000, fifth);
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    downgradeProviderUsageSchemaToVersion40(legacy);
-    legacy.query(
-      `UPDATE account_scoped_provider_authorities
-       SET process_generation=NULL,provenance=CASE scope_kind
-         WHEN 'usage_snapshot' THEN 'usage_snapshot'
-         WHEN 'usage_poll_failure' THEN 'usage_poll_failure'
-         WHEN 'usage_upload_anchor' THEN 'usage_upload_anchor'
-       END
-       WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')`,
-    ).run();
-    legacy.query(
-      `UPDATE account_scoped_provider_authorities
-       SET provenance='legacy_codex_compatibility'
-       WHERE scope_kind='usage_snapshot' AND scope_id=?`,
-    ).run(`${profile.id}:3`);
-    legacy.query(
-      "DELETE FROM usage_poll_failures WHERE profile_id=? AND source_revision=4",
-    ).run(profile.id);
-    legacy.query(
-      "DELETE FROM usage_cloud_upload_anchors WHERE profile_id=? AND source_revision=5",
-    ).run(profile.id);
-    legacy.query(
-      "DELETE FROM usage_snapshots WHERE profile_id=? AND source_revision=5",
-    ).run(profile.id);
-    const storedBytes = {
-      failures: legacy.query(
-        "SELECT * FROM usage_poll_failures WHERE profile_id=? ORDER BY source_revision",
-      ).all(profile.id),
-      snapshots: legacy.query(
-        `SELECT source_revision,observed_at,payload_json,digest FROM usage_snapshots
-         WHERE profile_id=? ORDER BY source_revision`,
-      ).all(profile.id),
-    };
-    legacy.close(false);
-
-    const migrated = new StateStore(paths, { now: () => 40_000 });
-    stores.push(migrated);
-    expect(migrated.readCodexUsageAuthorityMetadata("usage_snapshot", profile.id, 1))
-      .toMatchObject({
-        binding: { processGeneration: null, provenance: "usage_snapshot" },
-        canAuthorizeQuota: false,
-        mode: "compatibility_display_only",
-      });
-    expect(migrated.readCodexUsageAuthorityMetadata("usage_poll_failure", profile.id, 2))
-      .toMatchObject({
-        binding: { processGeneration: null, provenance: "usage_poll_failure" },
-        canAuthorizeQuota: false,
-        mode: "compatibility_display_only",
-      });
-    expect(migrated.readCodexUsageAuthorityMetadata("usage_upload_anchor", profile.id, 1))
-      .toMatchObject({
-        binding: { processGeneration: null, provenance: "usage_upload_anchor" },
-        canAuthorizeQuota: false,
-        mode: "compatibility_display_only",
-      });
-    expect(migrated.readCodexUsageAuthorityMetadata("usage_snapshot", profile.id, 3))
-      .toMatchObject({
-        binding: { processGeneration: null, provenance: "legacy_codex_compatibility" },
-        canAuthorizeQuota: false,
-        mode: "compatibility_display_only",
-      });
-    const currentAuthority = migrated.requireProviderAccountAuthority(profile.id, "codex");
-    expect(() => migrated.recordUsage(
-      profile.id,
-      1,
-      10_000,
-      first,
-      currentAuthority,
-    )).toThrow("CODEX_USAGE_AUTHORITY_REPLAY_CONFLICT");
-    expect(() => migrated.recordUsagePollFailure(
-      profile.id,
-      usageFingerprint,
-      2,
-      20_000,
-      currentAuthority,
-    )).toThrow("CODEX_USAGE_FAILURE_AUTHORITY_REPLAY_CONFLICT");
-    const orphanInspector = new Database(paths.database, { readonly: true, strict: true });
+  test("migrates authentic canonical40 Codex usage bytes as display-only authority and reopens current49", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical40-usage-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    await writeFile(paths.database, canonical40UsageDatabaseBytes(), { mode: 0o600 });
+    const profileId = canonical40UsageFixture.profileId;
+    const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(orphanInspector.query(
-        `SELECT scope_kind,scope_id FROM account_scoped_provider_authorities
-         WHERE scope_id IN (?,?) ORDER BY scope_kind,scope_id`,
-      ).all(`${profile.id}:4`, `${profile.id}:5`)).toEqual([]);
-      expect(orphanInspector.query(
-        "SELECT COUNT(*) AS count FROM codex_usage_authority_prune_targets",
-      ).get()).toEqual({ count: 0 });
-    } finally {
-      orphanInspector.close(false);
-    }
-    const migratedInspector = new Database(paths.database, { readonly: true, strict: true });
-    expect({
-      failures: migratedInspector.query(
-        "SELECT * FROM usage_poll_failures WHERE profile_id=? ORDER BY source_revision",
-      ).all(profile.id),
-      snapshots: migratedInspector.query(
-        `SELECT source_revision,observed_at,payload_json,digest FROM usage_snapshots
-         WHERE profile_id=? ORDER BY source_revision`,
-      ).all(profile.id),
-    }).toEqual(storedBytes);
-    const firstV40Rows = migratedInspector.query(
-      `SELECT * FROM account_scoped_provider_authorities
-       WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
-       ORDER BY scope_kind,scope_id`,
-    ).all();
-    expect(migratedInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
-    migratedInspector.close(false);
-    migrated.close();
-    stores.splice(stores.indexOf(migrated), 1);
-
-    const interrupted = new Database(paths.database, { create: false, strict: true });
-    dropAttachmentCustodySchema(interrupted);
-    interrupted.exec("DELETE FROM migrations WHERE version>=40; PRAGMA user_version=39");
-    interrupted.close(false);
-    const rerun = new StateStore(paths, { now: () => 40_001 });
-    stores.push(rerun);
-    const rerunInspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(rerunInspector.query(
+      const storedBytes = () => ({
+        snapshots: inspector.query("SELECT * FROM usage_snapshots ORDER BY profile_id,source_revision").all(),
+        failures: inspector.query("SELECT * FROM usage_poll_failures ORDER BY profile_id,source_revision").all(),
+        anchors: inspector.query("SELECT * FROM usage_cloud_upload_anchors ORDER BY profile_id,source_revision").all(),
+      });
+      const archived = {
+        snapshots: [...canonical40UsageFixture.snapshots],
+        failures: [...canonical40UsageFixture.failures],
+        anchors: [...canonical40UsageFixture.anchors],
+      };
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      expect(storedBytes()).toEqual(archived);
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE name='account_scoped_provider_authorities'",
+      ).get()).toBeNull();
+      const migrated = new StateStore(paths, { now: () => 40_000 });
+      stores.push(migrated);
+      for (const [scope, revision] of [
+        ["usage_snapshot", 1], ["usage_snapshot", 3],
+        ["usage_poll_failure", 2], ["usage_upload_anchor", 1],
+      ] as const) {
+        expect(migrated.readCodexUsageAuthorityMetadata(scope, profileId, revision))
+          .toMatchObject({
+            binding: { processGeneration: null, provenance: "legacy_codex_compatibility" },
+            canAuthorizeQuota: false,
+            mode: "compatibility_display_only",
+          });
+      }
+      const authority = migrated.requireProviderAccountAuthority(profileId, "codex");
+      expect(() => migrated.recordUsage(profileId, 1, 10_000, canonical40UsageFixture.first, authority))
+        .toThrow("CODEX_USAGE_AUTHORITY_REPLAY_CONFLICT");
+      expect(() => migrated.recordUsagePollFailure(
+        profileId, canonical40UsageFixture.fingerprint, 2, 20_000, authority,
+      )).toThrow("CODEX_USAGE_FAILURE_AUTHORITY_REPLAY_CONFLICT");
+      const sidecars = () => inspector.query(
         `SELECT * FROM account_scoped_provider_authorities
          WHERE scope_kind IN ('usage_snapshot','usage_poll_failure','usage_upload_anchor')
          ORDER BY scope_kind,scope_id`,
-      ).all()).toEqual(firstV40Rows);
-      expect(rerunInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      ).all();
+      const admittedSidecars = sidecars();
+      expect(admittedSidecars).toHaveLength(4);
+      expect(() => inspector.query(
+        `UPDATE account_scoped_provider_authorities SET process_generation=?
+         WHERE scope_kind='usage_snapshot' AND scope_id=?`,
+      ).run(authority.processGeneration, `${profileId}:1`)).toThrow("account provider compatibility authority is immutable");
+      expect(sidecars()).toEqual(admittedSidecars);
+      expect(storedBytes()).toEqual(archived);
+      expect(inspector.query("SELECT COUNT(*) AS count FROM codex_usage_authority_prune_targets").get())
+        .toEqual({ count: 0 });
+      expect(inspector.query("SELECT version,applied_at FROM migrations WHERE version<=40 ORDER BY version").all())
+        .toEqual([...canonical40UsageFixture.migrations]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+      migrated.close();
+      stores.splice(stores.indexOf(migrated), 1);
+      const reopened = new StateStore(paths, { now: () => 40_001 });
+      stores.push(reopened);
+      const readonly = new StateStore(paths, { readonly: true });
+      readonly.close();
+      expect(storedBytes()).toEqual(archived);
+      expect(sidecars()).toEqual(admittedSidecars);
+      expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledger);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     } finally {
-      rerunInspector.close(false);
+      inspector.close(false);
     }
   });
 
@@ -15699,12 +23353,11 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const corrupt = new Database(paths.database, { create: false, strict: true });
-    corrupt.exec("DROP TRIGGER provider_usage_observation_components_immutable_update");
-    corrupt.query(
-      `UPDATE provider_usage_observation_components
-       SET component_json=json_set(component_json,'$.observedAt',?)
-       WHERE idempotency_key=?`,
-    ).run(observation.observedAt + 1, observation.idempotencyKey);
+    withRemovedTestGuards(corrupt, ["provider_usage_observation_components_immutable_update"], () => {
+      corrupt.query(`UPDATE provider_usage_observation_components
+        SET component_json=json_set(component_json,'$.observedAt',?) WHERE idempotency_key=?`)
+        .run(observation.observedAt + 1, observation.idempotencyKey);
+    });
     corrupt.close(false);
     expect(() => new StateStore(paths))
       .toThrow("PROVIDER_USAGE_COMPONENT_EVIDENCE_MISMATCH");
@@ -15735,11 +23388,10 @@ describe("StateStore", () => {
     canonicalFixture.store.close();
     stores.splice(stores.indexOf(canonicalFixture.store), 1);
     const noncanonical = new Database(canonicalPaths.database, { create: false, strict: true });
-    noncanonical.exec("DROP TRIGGER provider_usage_observation_components_immutable_update");
-    noncanonical.query(
-      `UPDATE provider_usage_observation_components
-       SET component_json=' '||component_json WHERE idempotency_key=?`,
-    ).run(observation.idempotencyKey);
+    withRemovedTestGuards(noncanonical, ["provider_usage_observation_components_immutable_update"], () => {
+      noncanonical.query("UPDATE provider_usage_observation_components SET component_json=' '||component_json WHERE idempotency_key=?")
+        .run(observation.idempotencyKey);
+    });
     noncanonical.close(false);
     expect(() => new StateStore(canonicalPaths)).toThrow("PROVIDER_USAGE_COMPONENT_INVALID");
 
@@ -15760,10 +23412,9 @@ describe("StateStore", () => {
     orphanFixture.store.close();
     stores.splice(stores.indexOf(orphanFixture.store), 1);
     const orphan = new Database(orphanPaths.database, { create: false, strict: true });
-    orphan.exec("DROP TRIGGER usage_poll_failures_prune_authority");
-    orphan.query(
-      "DELETE FROM usage_poll_failures WHERE profile_id=? AND source_revision=1",
-    ).run(orphanProfile.id);
+    withRemovedTestGuards(orphan, ["usage_poll_failures_prune_authority"], () => {
+      orphan.query("DELETE FROM usage_poll_failures WHERE profile_id=? AND source_revision=1").run(orphanProfile.id);
+    });
     orphan.close(false);
     expect(() => new StateStore(orphanPaths)).toThrow("CODEX_USAGE_AUTHORITY_ORPHANED");
   });
@@ -15771,10 +23422,11 @@ describe("StateStore", () => {
   test("reopens v9 event and interaction state read-only without rotating authority", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Readonly v9", "readonly-v9@example.com");
-    const starting = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
-      providerThreadId: "thread-readonly", state: "idle",
+    const session = createProvenTestSession(store, {
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+      providerThreadId: "thread-readonly",
     });
     const providerAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
     const event = store.appendSessionEvent({
@@ -15829,6 +23481,7 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const first = store.createProfile("Earlier signed out");
     const signedIn = signInProfile(store, "Later signed in", "later@example.com");
+    const signedInCodexAccountKey = providerAccountKeyForProfile(store, signedIn.id, "codex");
     store.advanceProviderAccountProcessGeneration({
       profileId: signedIn.id,
       provider: "claude",
@@ -15887,14 +23540,11 @@ describe("StateStore", () => {
       profileId: signedIn.id,
       provider: "codex",
     });
-    const unprovedStarting = store.createSession({
+    const unprovedSession = upsertProvenTestSession(store, {
       fastEnabled: false,
       preset: "high",
       profileId: signedIn.id,
       provider: "codex",
-    });
-    const unprovedSession = store.bindSession({
-      sessionId: unprovedStarting.id, expectedRevision: unprovedStarting.revision,
       providerThreadId: "legacy-unproved-thread", state: "idle",
     });
     const unprovedQueue = store.enqueue(unprovedSession.id, "unproved queue authority");
@@ -15960,6 +23610,9 @@ describe("StateStore", () => {
       sessionId: switchedSession.id,
       state: "idle",
     });
+    store.bindSessionProviderAccountAuthority({ sessionId: switchedSession.id,
+      provider: "codex", runtimeScope: "managed",
+      accountKey: providerAccountKeyForProfile(store, signedIn.id, "codex") });
     const historicalEvent = store.appendSessionEvent({
       accountId: signedIn.id,
       body: { type: "warning", code: "SOURCE_PROVIDER", message: "immutable source event" },
@@ -16207,13 +23860,18 @@ describe("StateStore", () => {
         provider: migratedSourceAuthority.provider,
         provider_account_id: migratedSourceAuthority.providerAccountId,
       });
+      // Isolate the historical provider-proof trigger from modern account
+      // admission. This rollback-only corruption probe leaves no new queue,
+      // no fabricated historical attachment identity, and no weakened guard.
+      const queueProbeRollback = "ROLLBACK_LEGACY_QUEUE_AUTHORITY_PROBE";
+      const queueProbe = guardDatabase.transaction(() => {
       const guardQueueSequence = guardDatabase.query(
         `UPDATE queue_sequence_authority
          SET next_sequence=next_sequence+1
          WHERE singleton=1
          RETURNING next_sequence-1 AS enqueue_sequence`,
       ).get() as { enqueue_sequence: number };
-      guardDatabase.query(
+      withRemovedTestGuards(guardDatabase, ["session_account_authority_queue_guard"], () => guardDatabase.query(
         `INSERT INTO queue_entries(
            id,session_id,message,state,created_at,updated_at,enqueue_sequence
          ) VALUES (?,?,?,'pending',?,?,?)`,
@@ -16224,7 +23882,7 @@ describe("StateStore", () => {
         9_100,
         9_100,
         guardQueueSequence.enqueue_sequence,
-      );
+      ));
       guardDatabase.query(
         `INSERT INTO queue_effect_evidence(
            queue_id,evidence_json,evidence_digest,recorded_at
@@ -16292,6 +23950,10 @@ describe("StateStore", () => {
         "queue_runtime",
         9_100,
       );
+      throw new Error(queueProbeRollback);
+      });
+      expect(() => queueProbe()).toThrow(queueProbeRollback);
+      expect(guardDatabase.query("SELECT * FROM queue_entries WHERE id=?").all(guardQueueId)).toEqual([]);
 
       const insertEventAuthority = guardDatabase.query(
         `INSERT INTO session_event_provider_authorities(
@@ -16436,9 +24098,23 @@ describe("StateStore", () => {
       sessions: inspector.query("SELECT * FROM sessions ORDER BY id").all(),
     }).toEqual({
       ...legacyRows,
+      mutations: legacyRows.mutations.map((value) => {
+        const row = z.object({ id: z.string() }).passthrough().parse(value);
+        return row.id === unprovedMutation.id
+          ? { ...row, state: "ambiguous", updated_at: 9_000 }
+          : row;
+      }),
+      profiles: legacyRows.profiles.map((value) => {
+        const row = z.object({ id: z.string() }).passthrough().parse(value);
+        return { ...row, codex_account_key: row.id === signedIn.id ? signedInCodexAccountKey : null };
+      }),
       sessions: legacyRows.sessions.map((value) => {
         const row = z.object({ id: z.string(), revision: z.number().int().positive() }).passthrough().parse(value);
-        return row.id === unprovedSession.id
+        // Runtime observations prove their historical provider tuples, not
+        // the missing canonical40 account/scope binding for live control.
+        return [codexSession.id, claudeSession.id, conflictingSession.id,
+          revisionPrecedenceSession.id, invalidLatestSession.id,
+          switchedSession.id, unprovedSession.id].some((id) => id === row.id)
           ? { ...row, state: "recovery_required", revision: row.revision + 1, updated_at: 9_000 }
           : row;
       }),
@@ -16483,10 +24159,8 @@ describe("StateStore", () => {
     migrated.close();
     stores.splice(stores.indexOf(migrated), 1);
 
-    const interruptedMarker = new Database(paths.database, { create: false, strict: true });
-    dropAttachmentCustodySchema(interruptedMarker);
-    interruptedMarker.exec("DELETE FROM migrations WHERE version>=39; PRAGMA user_version=38");
-    interruptedMarker.close(false);
+    // A completed migration reopens idempotently at its actual schema. A
+    // restamped modern database is a mixed cohort, not an interrupted v38.
     const rerun = new StateStore(paths, { now: () => 12_000 });
     stores.push(rerun);
     const rerunInspector = new Database(paths.database, { readonly: true, strict: true });
@@ -16537,8 +24211,9 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }, { version: 36 }, { version: 37 }, { version: 38 }, { version: 39 }, { version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }, { version: 46 }, { version: 47 }, { version: 48 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all())
+        .toEqual(Array.from({ length: 49 }, (_, index) => ({ version: index + 1 })));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -16561,6 +24236,21 @@ describe("StateStore", () => {
         { name: "weekly_window_resets_at", type: "INTEGER", notnull: 0 },
         { name: "revision", type: "INTEGER", notnull: 1 },
       ]) expect(resetPolicyColumns).toContainEqual(expect.objectContaining(expected));
+      expect(inspector.query("PRAGMA table_info(session_adoption_policies)").all())
+        .toContainEqual(expect.objectContaining({ name: "provider", type: "TEXT", pk: 1 }));
+      const adoptionCandidateColumns = inspector
+        .query("PRAGMA table_info(session_adoption_candidates)").all();
+      expect(adoptionCandidateColumns)
+        .toContainEqual(expect.objectContaining({ name: "liveness", type: "TEXT", notnull: 1 }));
+      for (const name of ["source_pid", "source_pid_domain", "source_proc_start"]) {
+        expect(adoptionCandidateColumns)
+          .toContainEqual(expect.objectContaining({ name, notnull: 0 }));
+      }
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='session_adoption_candidates_claude_reprobe'",
+      ).get()).toEqual({ name: "session_adoption_candidates_claude_reprobe" });
+      expect(inspector.query("PRAGMA table_info(session_personal_runtime_bindings)").all())
+        .toContainEqual(expect.objectContaining({ name: "session_id", type: "TEXT", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(profiles)").all())
         .toContainEqual(expect.objectContaining({ name: "label_key", type: "TEXT" }));
       expect(inspector.query("PRAGMA table_info(projects)").all())
@@ -16620,11 +24310,15 @@ describe("StateStore", () => {
     }
   });
 
-  test("upgrades an exact released v38 schema without changing presets or notification choices", async () => {
+  test("upgrades an exact released v38 schema without changing presets or notifications while quarantining unproved adoption", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Released v38", "released-v38@example.com");
-    const session = store.createSession({
+    const created = store.createSession({
       profileId: profile.id, provider: "codex", preset: "high", fastEnabled: false,
+    });
+    const session = store.bindSession({
+      sessionId: created.id, expectedRevision: created.revision,
+      providerThreadId: "released-v38-thread", state: "idle",
     });
     const runtime = reviewedCodexProfile(profile);
     store.recordSessionRuntimeProfile({
@@ -16648,12 +24342,14 @@ describe("StateStore", () => {
       .toEqual({ version: 38 });
     expect(legacy.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='provider_accounts'").get())
       .toBeNull();
-    const rows = legacy.query("SELECT *,provider AS provider_v39 FROM sessions WHERE id=?").get(session.id);
+    const rows = z.record(z.string(), z.unknown()).parse(legacy.query(
+      "SELECT *,provider AS provider_v39 FROM sessions WHERE id=?",
+    ).get(session.id));
     const runtimeBytes = legacy.query("SELECT profile_json FROM session_runtime_profiles WHERE session_id=?")
       .get(session.id);
     legacy.close(false);
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:38:48");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:38:49");
 
     const upgraded = new StateStore(paths, { now: () => 40_000,
       resolveMachineTimeZone: () => { throw new Error("RELEASED_V38_ZONE_MUST_NOT_BE_REPLACED"); },
@@ -16664,8 +24360,14 @@ describe("StateStore", () => {
     expect(upgraded.requireSessionPresetContract(session.id)).toBe(currentPresetContract);
     expect(upgraded.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtime);
     const proof = new Database(paths.database, { readonly: true, strict: true });
-    expect(proof.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
-    expect(proof.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual(rows);
+    expect(proof.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+    // The released v38 row has immutable runtime evidence, but no adopted
+    // runtime/account-scope attestation. Migration preserves its bytes while
+    // adding only the explicit fail-closed session-state transition.
+    expect(proof.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual({
+      ...rows, state: "recovery_required", revision: session.revision + 1, updated_at: 40_000,
+    });
+    expect(proof.query("SELECT 1 FROM session_provider_account_authorities WHERE session_id=?").get(session.id)).toBeNull();
     expect(proof.query("SELECT profile_json FROM session_runtime_profiles WHERE session_id=?")
       .get(session.id)).toEqual(runtimeBytes);
     expect(proof.query("PRAGMA foreign_key_check").all()).toEqual([]);
@@ -16677,6 +24379,11 @@ describe("StateStore", () => {
     const profile = signInProfile(store, "Historical Sol", "historical-sol@example.com");
     const session = store.upsertProviderSession({
       providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
       providerThreadId: "thread-historical-sol",
       title: "Historical Sol",
       state: "idle",
@@ -16717,7 +24424,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:37:48");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:37:49");
     const migrated = new StateStore(paths, { now: () => 4_000 });
     stores.push(migrated);
     expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
@@ -16730,7 +24437,7 @@ describe("StateStore", () => {
       expect(inspector.query(
         "SELECT profile_json FROM session_runtime_profiles WHERE source_id='historical-sol-source'",
       ).get()).toEqual({ profile_json: before });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     } finally {
       inspector.close(false);
     }
@@ -16774,7 +24481,7 @@ describe("StateStore", () => {
       runtime: legacy.query("SELECT profile_json FROM session_runtime_profiles WHERE session_id=?").get(session.id),
       effect: legacy.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id),
     };
-    downgradeProviderAccountsToReleasedVersion(legacy, 39);
+    downgradeToExactProviderVersion39(legacy);
     expect(legacy.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
     legacy.close(false);
 
@@ -16795,7 +24502,7 @@ describe("StateStore", () => {
       expect(inspector.query("SELECT profile_json FROM session_runtime_profiles WHERE session_id=?").get(session.id)).toEqual(retained.runtime);
       expect(inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id)).toEqual(retained.effect);
       expect(inspector.query("SELECT provider,provider_v39 FROM sessions WHERE id=?").get(session.id)).toEqual({ provider: "codex", provider_v39: "devin" });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     } finally { inspector.close(false); }
     const readonly = new StateStore(paths, { readonly: true });
     stores.push(readonly);
@@ -16812,7 +24519,7 @@ describe("StateStore", () => {
   test("widens v38 provider authority without replacing existing session or rebind rows", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "V38 provider authority", "v38-provider@example.com");
-    const codex = store.createSession({
+    const codex = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
@@ -16873,7 +24580,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query(
         "SELECT id,provider,provider_v39 FROM sessions ORDER BY id",
       ).all()).toEqual([
@@ -16927,34 +24634,767 @@ describe("StateStore", () => {
 
     const partial = new Database(paths.database, { create: false, strict: true });
     try {
-      dropAttachmentCustodySchema(partial);
-      partial.exec("DROP TRIGGER work_session_devin_contract_guard");
+      downgradeToExactProviderVersion39(partial);
       partial.exec("PRAGMA ignore_check_constraints=ON");
-      partial.query(
-        "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
-      ).run(legacyPresetContract, session.id);
-      partial.exec(`
-        PRAGMA ignore_check_constraints=OFF;
-        DELETE FROM migrations WHERE version=39 OR version>=44;
-        PRAGMA user_version=38;
-      `);
+      withRemovedTestGuards(partial, ["work_session_devin_contract_guard"], () => {
+        partial.query(
+          "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
+        ).run(legacyPresetContract, session.id);
+      });
+      partial.exec("PRAGMA ignore_check_constraints=OFF");
     } finally {
       partial.close(false);
     }
 
-    expect(() => new StateStore(paths))
-      .toThrow("STATE_SCHEMA_V39_DEVIN_PRESET_CONTRACT_INVALID:sessions");
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_V39_DEVIN_PRESET_CONTRACT_INVALID:sessions",
+      "STATE_SCHEMA_MIGRATION_REQUIRED:39:49");
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
       expect(inspector.query(
         "SELECT provider_v39,preset_contract FROM sessions WHERE id=?",
       ).get(session.id)).toEqual({
         provider_v39: "devin",
         preset_contract: legacyPresetContract,
       });
-      expect(inspector.query("SELECT version FROM migrations WHERE version=39").get()).toBeNull();
+      expect(inspector.query("SELECT version FROM migrations WHERE version=39").get()).toEqual({ version: 39 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("creates a fresh database before newer SQLite revalidates Work authority triggers", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-newer-sqlite-")));
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    const customSqliteCandidate = process.arch === "arm64"
+      ? "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib"
+      : "/usr/local/opt/sqlite/lib/libsqlite3.dylib";
+    const customSqlite = process.platform === "darwin" && existsSync(customSqliteCandidate)
+      ? customSqliteCandidate
+      : "";
+    const program = String.raw`
+      import { Database } from "bun:sqlite";
+      import { join } from "node:path";
+      import { pathToFileURL } from "node:url";
+
+      const [repositoryRoot, home, customSqlite] = Bun.argv.slice(1);
+      if (customSqlite.length > 0 && !Database.setCustomSQLite(customSqlite)) {
+        throw new Error("CUSTOM_SQLITE_CONFIGURATION_FAILED");
+      }
+      const versionProbe = new Database(":memory:");
+      const sqliteVersion = versionProbe.query("SELECT sqlite_version() AS version").get().version;
+      versionProbe.close(false);
+
+      const pathsModule = await import(pathToFileURL(
+        join(repositoryRoot, "src", "storage", "paths.ts"),
+      ).href);
+      const storeModule = await import(pathToFileURL(
+        join(repositoryRoot, "src", "storage", "state-store.ts"),
+      ).href);
+      const paths = pathsModule.resolveStatePaths({
+        homeDirectory: home,
+        platform: process.platform === "linux" ? "linux" : "darwin",
+      });
+      await pathsModule.initializeStatePaths(paths);
+      const store = new storeModule.StateStore(paths, {
+        now: (() => { let value = 1_000; return () => value++; })(),
+        resolveMachineTimeZone: () => "UTC",
+      });
+      store.close();
+
+      const inspector = new Database(paths.database, { readonly: true, strict: true });
+      const userVersion = inspector.query("PRAGMA user_version").get().user_version;
+      const dependencyTables = inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
+          + "'provider_accounts','provider_runtime_account_revocations','session_account_authorities',"
+          + "'session_adoption_candidates','session_personal_runtime_bindings',"
+          + "'session_provider_account_authorities','session_provider_authorities') ORDER BY name",
+      ).all().map((row) => row.name);
+      const profileColumns = inspector.query(
+        "SELECT name FROM pragma_table_info('profiles') WHERE name='codex_account_key'",
+      ).all().map((row) => row.name);
+      const foreignKeyViolations = inspector.query("PRAGMA foreign_key_check").all().length;
+      inspector.close(false);
+      console.log(JSON.stringify({
+        dependencyTables,
+        foreignKeyViolations,
+        profileColumns,
+        sqliteVersion,
+        userVersion,
+      }));
+    `;
+    const child = Bun.spawn([
+      process.execPath,
+      "--eval",
+      program,
+      repositoryRoot,
+      home,
+      customSqlite,
+    ], {
+      cwd: repositoryRoot,
+      env: {},
+      stderr: "pipe",
+      stdin: "ignore",
+      stdout: "pipe",
+    });
+    const [exitCode, stderr, stdout] = await Promise.all([
+      child.exited,
+      new Response(child.stderr).text(),
+      new Response(child.stdout).text(),
+    ]);
+
+    expect(exitCode, stderr).toBe(0);
+    expect(JSON.parse(stdout)).toEqual({
+      dependencyTables: [
+        "provider_accounts",
+        "provider_runtime_account_revocations",
+        "session_account_authorities",
+        "session_adoption_candidates",
+        "session_personal_runtime_bindings",
+        "session_provider_account_authorities",
+        "session_provider_authorities",
+      ],
+      foreignKeyViolations: 0,
+      profileColumns: ["codex_account_key"],
+      sqliteVersion: expect.stringMatching(/^3\./u),
+      userVersion: 49,
+    });
+  });
+
+  test("migrates v34 through provider switch, notifications, contracts, and adoption v39", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Historical Sol", "historical-sol@example.com");
+    const session = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      profileId: profile.id,
+      provider: "codex",
+      providerThreadId: "thread-historical-sol",
+      title: "Historical Sol",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+    });
+    const runtimeProfile = effectiveRuntimeProfileSchema.parse({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request",
+      reviewMode: "auto_review",
+      permissionProfile: ":workspace",
+      computerUse: true,
+      pluginCapability: true,
+      enabledApps: [],
+    });
+    store.recordSessionRuntimeProfile({
+      sessionId: session.id,
+      sourceKind: "turn_start",
+      sourceId: "historical-sol-source",
+      profile: runtimeProfile,
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    try {
+      dropPostProviderSwitchSchema(legacy);
+      dropProviderSwitchProgressSchema(legacy);
+      legacy.exec("DELETE FROM migrations WHERE version>=35; PRAGMA user_version=34;");
+      expect(legacy.query(
+        `SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE name LIKE 'session_provider_switch_%'
+            OR name LIKE 'session_mutation_authority_rebinds%'
+            OR name='session_adoption_policies'`,
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      legacy.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:49");
+    const migrated = new StateStore(paths, { now: () => 4_000 });
+    stores.push(migrated);
+    expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
+    expect(migrated.requireSessionPresetRequirement(session.id)).toEqual({
+      preset: "high",
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
+        .toEqual([
+          { version: 35 },
+          { version: 36 },
+          { version: 37 },
+          { version: 38 },
+          { version: 39 },
+          { version: 40 },
+          { version: 41 }, { version: 42 }, { version: 43 },
+          { version: 44 }, { version: 45 }, { version: 46 },
+          { version: 47 }, { version: 48 }, { version: 49 },
+        ]);
+      expect(inspector.query(
+        `SELECT type,COUNT(*) AS count FROM sqlite_master
+         WHERE name LIKE 'session_provider_switch_%'
+            OR name LIKE 'session_mutation_authority_rebinds%'
+         GROUP BY type ORDER BY type`,
+      ).all()).toEqual([
+        { count: 7, type: "table" },
+        { count: 14, type: "trigger" },
+      ]);
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
+      ).get()).toEqual({ name: "session_adoption_policies" });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("migrates an upstream provider-switch v35 database to adoption v39", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const upstreamV35 = new Database(paths.database, { create: false, strict: true });
+    try {
+      dropPostProviderSwitchSchema(upstreamV35);
+      upstreamV35.exec("DELETE FROM migrations WHERE version>=36; PRAGMA user_version=35;");
+      expect(upstreamV35.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_provider_switch_targets'",
+      ).get()).toEqual({ name: "session_provider_switch_targets" });
+      expect(upstreamV35.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
+      ).get()).toBeNull();
+    } finally {
+      upstreamV35.close(false);
+    }
+
+    const migrated = new StateStore(paths, { now: () => 2_000 });
+    stores.push(migrated);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
+        .toEqual([
+          { version: 35 },
+          { version: 36 },
+          { version: 37 },
+          { version: 38 },
+          { version: 39 },
+          { version: 40 },
+          { version: 41 }, { version: 42 }, { version: 43 },
+          { version: 44 }, { version: 45 }, { version: 46 },
+          { version: 47 }, { version: 48 }, { version: 49 },
+        ]);
+      expect(inspector.query(
+        `SELECT name FROM sqlite_master WHERE type='table'
+         AND name IN ('session_provider_switch_targets','session_adoption_policies')
+         ORDER BY name`,
+      ).all()).toEqual([
+        { name: "session_adoption_policies" },
+        { name: "session_provider_switch_targets" },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("migrates the exact protected-main provider-v39 predecessor to adoption v40", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Provider v39 Devin");
+    const session = store.createSession({
+      profileId: profile.id,
+      provider: "devin",
+      preset: "astra",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const predecessor = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion39(predecessor);
+      expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(predecessor.query(
+        "SELECT name FROM pragma_table_info('profiles') WHERE name='codex_account_key'",
+      ).get()).toBeNull();
+      expect(predecessor.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
+      ).get()).toBeNull();
+      expect(predecessor.query(
+        "SELECT provider_v39,preset_contract FROM sessions WHERE id=?",
+      ).get(session.id)).toEqual({ provider_v39: "devin", preset_contract: 2 });
+    } finally {
+      predecessor.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:49");
+    const migrated = new StateStore(paths, { now: () => 2_000 });
+    stores.push(migrated);
+    expect(migrated.requireSession(session.id)).toMatchObject({
+      provider: "devin",
+      preset: "astra",
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query(
+        "SELECT version FROM migrations WHERE version>=39 ORDER BY version",
+      ).all()).toEqual([
+        { version: 39 }, { version: 40 }, { version: 41 },
+        { version: 42 }, { version: 43 }, { version: 44 },
+        { version: 45 }, { version: 46 }, { version: 47 },
+        { version: 48 }, { version: 49 },
+      ]);
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
+      ).get()).toEqual({ name: "session_adoption_policies" });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rejects a drifted provider-v39 predecessor before adding adoption authority", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const predecessor = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToExactProviderVersion39(predecessor);
+      predecessor.exec(`
+        DROP TRIGGER session_mutation_authority_rebinds_v39_immutable_delete;
+        CREATE TRIGGER session_mutation_authority_rebinds_v39_immutable_delete
+        BEFORE DELETE ON session_mutation_authority_rebinds_v39
+        WHEN OLD.recorded_at>=0
+        BEGIN SELECT RAISE(ABORT, 'session mutation authority rebind v39 is immutable'); END;
+      `);
+    } finally {
+      predecessor.close(false);
+    }
+
+    expect(() => new StateStore(paths, { now: () => 2_000 }))
+      .toThrow(
+        "STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39_immutable_delete",
+      );
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
+      ).get()).toBeNull();
+      expect(inspector.query(
+        `SELECT sql FROM sqlite_master
+         WHERE type='trigger'
+           AND name='session_mutation_authority_rebinds_v39_immutable_delete'`,
+      ).get()).toEqual(expect.objectContaining({
+        sql: expect.stringContaining("WHEN OLD.recorded_at>=0"),
+      }));
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("migrates the exact 42c4235 adoption-v35 surface and preserves candidates", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const historicalV35 = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToHistoricalAdoptionVersion35(historicalV35);
+      historicalV35.query(
+        `INSERT INTO session_adoption_candidates(
+           provider,provider_thread_id,project_id,title,provider_state,
+           active_turn_id,provider_updated_at,liveness,
+           source_pid,source_pid_domain,source_proc_start,claim_status,
+           candidate_fingerprint,fenced_fingerprint,revision,
+           first_discovered_at,last_observed_at,last_changed_at,last_attempt_at
+         ) VALUES ('claude',?,NULL,?,'terminal',NULL,10,'not_live',
+           46001,'darwin','historical-v35-process','pending',?,NULL,1,1000,1000,1000,NULL)`,
+      ).run(
+        "historical-v35-candidate",
+        "Historical v35 candidate",
+        "a".repeat(64),
+      );
+      expect(historicalV35.query(
+        "SELECT sql FROM sqlite_master WHERE name='session_adoption_candidates'",
+      ).get()).not.toBeNull();
+      expect(historicalV35.query(
+        "SELECT 1 FROM pragma_table_info('profiles') WHERE name='codex_account_key'",
+      ).get()).toBeNull();
+    } finally {
+      historicalV35.close(false);
+    }
+
+    const migrated = new StateStore(paths, { now: () => 2_000 });
+    stores.push(migrated);
+    expect(migrated.readSessionAdoptionCandidate(
+      "claude",
+      "historical-v35-candidate",
+    )).toMatchObject({
+      lastLiveObservedAt: null,
+      providerProjectRoot: null,
+      provider: "claude",
+      providerThreadId: "historical-v35-candidate",
+      sourceProcessIdentity: {
+        pid: 46_001,
+        pidDomain: "darwin",
+        procStart: "historical-v35-process",
+      },
+      status: "pending",
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query(
+        "SELECT 1 FROM pragma_table_info('session_adoption_candidates') WHERE name='last_live_observed_at'",
+      ).get()).toEqual({ 1: 1 });
+      expect(inspector.query(
+        "SELECT 1 FROM pragma_table_info('session_adoption_candidates') WHERE name='provider_project_root'",
+      ).get()).toEqual({ 1: 1 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rejects an extra adoption object beside the exact 42c4235 v35 surface without writes", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const historicalLookalike = new Database(paths.database, { create: false, strict: true });
+    try {
+      downgradeToHistoricalAdoptionVersion35(historicalLookalike);
+      historicalLookalike.exec(
+        "CREATE TABLE session_adoption_unrecognized_authority (id TEXT PRIMARY KEY) STRICT",
+      );
+    } finally {
+      historicalLookalike.close(false);
+    }
+
+    expect(() => new StateStore(paths, { now: () => 2_000 }))
+      .toThrow("STATE_SCHEMA_V39_LEGACY_ADOPTION_OBJECT_INVALID");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE name='session_adoption_unrecognized_authority'",
+      ).get()).toEqual({ name: "session_adoption_unrecognized_authority" });
+      expect(inspector.query(
+        "SELECT 1 FROM sqlite_master WHERE name='notification_hours'",
+      ).get()).toBeNull();
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rejects a malformed adoption-v35 lookalike before mutating it", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const featureV35 = new Database(paths.database, { create: false, strict: true });
+    try {
+      dropPostLegacyAdoptionVersion36Schema(featureV35);
+      dropProviderSwitchProgressSchema(featureV35);
+      featureV35.exec("DELETE FROM migrations WHERE version>=36; PRAGMA user_version=35;");
+      expect(featureV35.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
+      ).get()).toEqual({ name: "session_adoption_policies" });
+      expect(featureV35.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_provider_switch_targets'",
+      ).get()).toBeNull();
+    } finally {
+      featureV35.close(false);
+    }
+
+    expect(() => new StateStore(paths, { now: () => 2_000 }))
+      .toThrow(/STATE_SCHEMA_V39_LEGACY_ADOPTION_/u);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
+        .toEqual([{ version: 35 }]);
+      expect(inspector.query(
+        `SELECT name FROM sqlite_master WHERE type='table'
+         AND name IN ('session_provider_switch_targets','session_adoption_policies')
+         ORDER BY name`,
+      ).all()).toEqual([{ name: "session_adoption_policies" }]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rejects stale same-name v39 provider-revocation policy guards", async () => {
+    const value = await fixture();
+    const store = value.store;
+    const profile = signInProfile(
+      store,
+      "Stale v36 policy guards",
+      "stale-v36-policy-guards@example.com",
+    );
+    const begun = store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "personal",
+      currentAccountKey: null,
+      workStore: createRevocationWorkStore(store),
+    });
+    store.completeProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider: "codex",
+      runtimeScope: "personal",
+      expectedRevision: begun.revocation.revision,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const stale = new Database(paths.database, { create: false, strict: true });
+    try {
+      stale.exec(`
+        DROP TRIGGER session_adoption_policy_provider_revocation_guard_insert;
+        DROP TRIGGER session_adoption_policy_provider_revocation_guard_update;
+        CREATE TRIGGER session_adoption_policy_provider_revocation_guard_insert
+        BEFORE INSERT ON session_adoption_policies BEGIN SELECT 1; END;
+        CREATE TRIGGER session_adoption_policy_provider_revocation_guard_update
+        BEFORE UPDATE ON session_adoption_policies BEGIN SELECT 1; END;
+      `);
+    } finally {
+      stale.close(false);
+    }
+
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_adoption_policy_provider_revocation_guard_insert");
+  });
+
+  test("readonly open rejects a malformed same-name v39 authority trigger", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      damaged.exec(`
+        DROP TRIGGER session_adoption_candidate_revision_guard;
+        CREATE TRIGGER session_adoption_candidate_revision_guard
+        BEFORE UPDATE ON session_adoption_candidates BEGIN SELECT 1; END;
+      `);
+    } finally {
+      damaged.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_adoption_candidate_revision_guard");
+  });
+
+  test.each([
+    "last_live_observed_at",
+    "provider_project_root",
+  ] as const)("current v39 opens never repair a missing candidate retention column: %s", async (column) => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const malformed = new Database(paths.database, { create: false, strict: true });
+    try {
+      malformed.exec(`ALTER TABLE session_adoption_candidates DROP COLUMN ${column}`);
+    } finally {
+      malformed.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_adoption_candidates");
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_adoption_candidates");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query(
+        "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name=?",
+      ).get(column)).toBeNull();
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("current49 never recreates missing provider-v39 authority", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const malformed = new Database(paths.database, { create: false, strict: true });
+    try {
+      malformed.exec("DROP TABLE session_mutation_authority_rebinds_v39");
+    } finally {
+      malformed.close(false);
+    }
+
+    expectInertSchemaRefusal(paths,
+      "STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39",
+      "STATE_SCHEMA_COHORT_INVALID:combined49:session_mutation_provider_successor_v39_insert_guard");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE name='session_mutation_authority_rebinds_v39'",
+      ).get()).toBeNull();
+      expect(inspector.query(
+        `SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE name LIKE 'session_mutation_authority_rebinds_v39_%'`,
+      ).get()).toEqual({ count: 0 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("current v40 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const malformed = new Database(paths.database, { create: false, strict: true });
+    try {
+      malformed.exec(`
+        DROP TRIGGER session_mutation_authority_rebinds_v39_immutable_update;
+        CREATE TRIGGER session_mutation_authority_rebinds_v39_immutable_update
+        BEFORE UPDATE ON session_mutation_authority_rebinds_v39
+        WHEN NEW.recorded_at=OLD.recorded_at
+        BEGIN SELECT RAISE(ABORT, 'session mutation authority rebind v39 is immutable'); END;
+      `);
+    } finally {
+      malformed.close(false);
+    }
+
+    for (const readonly of [true, false]) {
+      expect(() => new StateStore(paths, readonly ? { readonly: true } : {}))
+        .toThrow(
+          "STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39_immutable_update",
+        );
+    }
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query(
+        `SELECT sql FROM sqlite_master
+         WHERE type='trigger'
+           AND name='session_mutation_authority_rebinds_v39_immutable_update'`,
+      ).get()).toEqual(expect.objectContaining({
+        sql: expect.stringContaining("WHEN NEW.recorded_at=OLD.recorded_at"),
+      }));
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("current49 never backfills a missing provider-v39 column", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const malformed = new Database(paths.database, { create: false, strict: true });
+    try {
+      const removedTriggers = dropProviderV39SessionColumn(malformed);
+      expect(removedTriggers.length).toBeGreaterThan(0);
+    } finally {
+      malformed.close(false);
+    }
+
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_V39_OBJECT_INVALID:sessions.provider_v39",
+      "STATE_SCHEMA_COHORT_INVALID:combined49:provider_interactions_authority_guard");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query(
+        "SELECT name FROM pragma_table_info('sessions') WHERE name='provider_v39'",
+      ).get()).toBeNull();
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='work_attempt_route_guard'",
+      ).get()).toBeNull();
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("writable open rejects malformed v39 identity uniqueness and revision guards", async () => {
+    const { store } = await fixture();
+    const first = store.createProfile("First repaired Claude identity");
+    const second = store.createProfile("Second repaired Claude identity");
+    const identity = {
+      pid: 52_101,
+      pidDomain: "darwin" as const,
+      procStart: "repaired-shared-Claude-process",
+    };
+    store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: store.requireProviderAccountAuthority(first.id, "claude"),
+      providerThreadId: "repaired-Claude-identity-first",
+      profileId: first.id,
+      profileGeneration: first.processGeneration,
+      runtimeScope: "personal",
+      identity,
+    });
+    const candidate = store.upsertSessionAdoptionCandidate({
+      provider: "claude",
+      providerThreadId: "repaired-Claude-revision-candidate",
+      title: "Repaired Claude revision candidate",
+      state: "idle",
+      providerUpdatedAt: 10,
+      liveness: "not_live",
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      damaged.exec(`
+        DROP INDEX session_claude_process_authorities_live_identity;
+        CREATE INDEX session_claude_process_authorities_live_identity
+          ON session_claude_process_authorities(pid_domain,pid,proc_start)
+          WHERE state!='released';
+        DROP TRIGGER session_adoption_candidate_revision_guard;
+        CREATE TRIGGER session_adoption_candidate_revision_guard
+        BEFORE UPDATE ON session_adoption_candidates BEGIN SELECT 1; END;
+      `);
+    } finally {
+      damaged.close(false);
+    }
+
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_SCHEMA_V39_OBJECT_INVALID:session_claude_process_authorities_live_identity");
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query(
+        "SELECT sql FROM sqlite_master WHERE name='session_adoption_candidate_revision_guard'",
+      ).get()).toEqual(expect.objectContaining({ sql: expect.stringContaining("SELECT 1") }));
+      expect(inspector.query("SELECT id FROM profiles WHERE id=?").get(second.id))
+        .toEqual({ id: second.id });
+      expect(inspector.query(
+        `SELECT revision,claim_status FROM session_adoption_candidates
+         WHERE provider=? AND provider_thread_id=?`,
+      ).get(candidate.provider, candidate.providerThreadId)).toEqual({
+        claim_status: "pending",
+        revision: candidate.revision,
+      });
     } finally {
       inspector.close(false);
     }
@@ -17008,11 +25448,9 @@ describe("StateStore", () => {
         .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
       expect(inspector.query("SELECT preset_contract FROM sessions WHERE id=?").get(session.id))
         .toEqual({ preset_contract: legacyPresetContract });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=38").get())
         .toEqual({ version: 38 });
-      expect(inspector.query("SELECT version FROM migrations WHERE version=39").get())
-        .toEqual({ version: 39 });
     } finally {
       inspector.close(false);
     }
@@ -17101,16 +25539,15 @@ describe("StateStore", () => {
       `INSERT INTO session_provider_switch_targets(attempt_id,provider_thread_id,recorded_at)
        VALUES (?,?,?)`,
     ).run(attempt.id, "retained-provider-thread", 7_350);
+    dropPostProviderSwitchSchema(mainV35);
     mainV35.exec(`
-      DROP TABLE attention_email_policy;
-      DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version IN (36,37,38,39,44,45,46,47);
+      DELETE FROM migrations WHERE version>=36;
       PRAGMA user_version=35;
     `);
     mainV35.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:48");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:49");
     const migrated = new StateStore(paths, {
       now: () => 8_000,
       resolveMachineTimeZone: () => "UTC",
@@ -17124,7 +25561,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query(
         "SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
       ).get(attempt.id)).toEqual({
@@ -17159,17 +25596,18 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropProviderAuthorityObjectsForLegacyFeatureFixture(legacy);
+    dropSessionAdoptionAndPresetContractSchema(legacy);
+    dropProviderSwitchVersion35Objects(legacy);
     legacy.exec(`
       DROP TABLE attention_email_policy;
-      DELETE FROM migrations WHERE version IN (36,37,38,39,44,45,46,47);
+      DELETE FROM migrations WHERE version>=36;
       PRAGMA user_version=35;
     `);
     expect(providerSwitchSchemaObjectCount(legacy)).toBe(0);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:48");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:49");
     const migrated = new StateStore(paths, {
       now: () => 9_000,
       resolveMachineTimeZone: () => {
@@ -17191,7 +25629,7 @@ describe("StateStore", () => {
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     } finally {
       inspector.close(false);
     }
@@ -17208,14 +25646,15 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new Database(paths.database, { create: false, strict: true });
+    dropSessionAdoptionAndPresetContractSchema(legacy);
     legacy.exec(`
-      DELETE FROM migrations WHERE version IN (37,38,39,44,45,46,47);
+      DELETE FROM migrations WHERE version>=37;
       PRAGMA user_version=36;
     `);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:48");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:49");
 
     expect(() => new StateStore(paths))
       .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
@@ -17251,8 +25690,9 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropProviderAuthorityObjectsForLegacyFeatureFixture(legacy);
-    legacy.exec("DELETE FROM migrations WHERE version IN (37,38,39,44,45,46,47); PRAGMA user_version=36;");
+    dropSessionAdoptionAndPresetContractSchema(legacy);
+    dropProviderSwitchVersion35Objects(legacy);
+    legacy.exec("DELETE FROM migrations WHERE version>=37; PRAGMA user_version=36;");
     const before = legacy.query(
       `SELECT h.start_minute,h.end_minute,h.time_zone,h.revision AS hours_revision,
               e.enabled,e.revision AS email_revision,e.created_at,e.updated_at
@@ -17262,7 +25702,7 @@ describe("StateStore", () => {
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:48");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:49");
     const migrated = new StateStore(paths, {
       now: () => 12_000,
       resolveMachineTimeZone: () => {
@@ -17290,7 +25730,7 @@ describe("StateStore", () => {
          FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
       ).get()).toEqual(before);
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     } finally {
       inspector.close(false);
     }
@@ -17307,10 +25747,11 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const lookalike = new Database(paths.database, { create: false, strict: true });
-    dropProviderAuthorityObjectsForLegacyFeatureFixture(lookalike);
+    dropSessionAdoptionAndPresetContractSchema(lookalike);
+    dropProviderSwitchVersion35Objects(lookalike);
     lookalike.exec(`
       CREATE INDEX attention_email_policy_untrusted ON attention_email_policy(enabled);
-      DELETE FROM migrations WHERE version IN (37,38,39,44,45,46,47);
+      DELETE FROM migrations WHERE version>=37;
       PRAGMA user_version=36;
     `);
     lookalike.close(false);
@@ -17419,17 +25860,16 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropProviderAuthorityObjectsForLegacyFeatureFixture(legacy);
+    dropPostProviderSwitchSchema(legacy);
+    dropProviderSwitchVersion35Objects(legacy);
     legacy.exec(`
-      DROP TABLE attention_email_policy;
-      DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version BETWEEN 35 AND 39 OR version>=44;
+      DELETE FROM migrations WHERE version>=35;
       PRAGMA user_version=34;
     `);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:48");
+      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:49");
     const unchanged = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
@@ -17487,7 +25927,7 @@ describe("StateStore", () => {
     const schemaInspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(21);
-      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
     } finally {
       schemaInspector.close(false);
     }
@@ -17499,11 +25939,10 @@ describe("StateStore", () => {
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropProviderAuthorityObjectsForLegacyFeatureFixture(legacy);
+    dropPostProviderSwitchSchema(legacy);
+    dropProviderSwitchVersion35Objects(legacy);
     legacy.exec(`
-      DROP TABLE attention_email_policy;
-      DROP TABLE notification_hours;
-      DELETE FROM migrations WHERE version BETWEEN 35 AND 39 OR version>=44;
+      DELETE FROM migrations WHERE version>=35;
       PRAGMA user_version=34;
     `);
     legacy.close(false);
@@ -17636,16 +26075,12 @@ describe("StateStore", () => {
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const authority = new Database(paths.database, { create: false, strict: true });
-    authority.exec(`
-      DROP TRIGGER notification_hours_update_guard;
-      DROP TRIGGER attention_email_policy_update_guard;
-      UPDATE notification_hours
-      SET revision=9007199254740991
-      WHERE singleton=1;
-      UPDATE attention_email_policy
-      SET revision=9007199254740991
-      WHERE singleton=1;
-    `);
+    withRemovedTestGuards(authority, ["notification_hours_update_guard", "attention_email_policy_update_guard"], () => {
+      authority.exec(`
+        UPDATE notification_hours SET revision=9007199254740991 WHERE singleton=1;
+        UPDATE attention_email_policy SET revision=9007199254740991 WHERE singleton=1;
+      `);
+    });
     authority.close(false);
 
     const reopened = new StateStore(paths, {
@@ -17758,86 +26193,64 @@ describe("StateStore", () => {
     })).toThrow("STATE_SCHEMA_V36_NOTIFICATION_HOURS_STRUCTURE_INVALID");
   });
 
-  test("heals a v30 work schema before rebuilding the legacy autorespond table", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
+  test("migrates authentic canonical30 Work and protocol autorespond history before reopening current49", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical30-work-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    await writeFile(paths.database, canonical30WorkDatabaseBytes(), { mode: 0o600 });
+    let inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      dropAttachmentCustodySchema(legacy);
-      legacy.exec(`
-        DROP TRIGGER work_attempt_route_guard;
-        DROP TRIGGER work_session_attempt_authority_guard;
-        DROP TRIGGER work_profile_attempt_authority_guard;
-        DROP TRIGGER work_signal_member_guard;
-        ALTER TABLE sessions DROP COLUMN provider;
-        DROP TABLE autorespond_evidence;
-        CREATE TABLE autorespond_evidence (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-          interaction_id TEXT NOT NULL CHECK(length(interaction_id) = 36),
-          kind TEXT NOT NULL CHECK(kind IN (
-            'command_approval','file_change_approval','permission_approval'
-          )),
-          class TEXT NOT NULL CHECK(length(class) BETWEEN 1 AND 256),
-          decision TEXT NOT NULL CHECK(length(decision) BETWEEN 1 AND 64),
-          mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace','manual')),
-          outcome TEXT NOT NULL CHECK(outcome IN ('accepted','refused')),
-          latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
-          subagent INTEGER NOT NULL CHECK(subagent IN (0,1)),
-          occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0)
-        ) STRICT;
-        CREATE INDEX autorespond_evidence_session
-          ON autorespond_evidence(session_id, occurred_at DESC, id DESC);
-        CREATE INDEX autorespond_evidence_recent
-          ON autorespond_evidence(occurred_at DESC, id DESC);
-      `);
-      // SQLite accepts trigger definitions that reference a missing column.
-      // The next schema rewrite must not be the first operation to discover it.
-      legacy.exec(WORK_SCHEMA_SQL);
-      legacy.exec("DELETE FROM migrations WHERE version>30; PRAGMA user_version=30;");
-      expect(legacy.query("PRAGMA user_version").get()).toEqual({ user_version: 30 });
-      expect(legacy.query("PRAGMA table_info(sessions)").all())
-        .not.toContainEqual(expect.objectContaining({ name: "provider" }));
-      expect(legacy.query("PRAGMA table_info(autorespond_evidence)").all())
-        .not.toContainEqual(expect.objectContaining({ name: "path" }));
-    } finally {
-      legacy.close(false);
-    }
-
-    const migrated = new StateStore(paths, { now: () => 2_000 });
-    stores.push(migrated);
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
-      expect(inspector.query("PRAGMA table_info(sessions)").all())
-        .toContainEqual(expect.objectContaining({ name: "provider", dflt_value: "'codex'" }));
-      expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
-        .toContainEqual(expect.objectContaining({ name: "path" }));
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 30 });
       expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 30 AND 48 ORDER BY version",
-      ).all()).toEqual([
-        { version: 30 },
-        { version: 31 },
-        { version: 32 },
-        { version: 33 },
-        { version: 34 },
-        { version: 35 },
-        { version: 36 },
-        { version: 37 },
-        { version: 38 },
-        { version: 39 },
-        { version: 40 },
-        { version: 41 },
-        { version: 42 },
-        { version: 43 },
-        { version: 44 },
-        { version: 45 },
-        { version: 46 },
-        { version: 47 }, { version: 48 },
-      ]);
+        "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name='works' OR name GLOB 'work_*' OR name GLOB 'works_*' ORDER BY name",
+      ).all()).toEqual([...canonical30WorkFixture.workObjects]);
+      expect(inspector.query("SELECT * FROM autorespond_evidence ORDER BY id").all())
+        .toEqual([...canonical30WorkFixture.evidence]);
+      expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(canonical30WorkFixture.sessionId))
+        .toEqual(canonical30WorkFixture.sessionRow);
+      expect(inspector.query("SELECT name FROM pragma_table_info('sessions') WHERE name='provider'").get()).toBeNull();
+      expect(inspector.query("SELECT name FROM pragma_table_info('autorespond_evidence') WHERE name='path'").get()).toBeNull();
+
+      inspector.close(false);
+      const migrated = new StateStore(paths, { now: () => 2_000 });
+      stores.push(migrated);
+      // Rebuilds change column positions. Reopen the inspector so Bun cannot
+      // reuse SELECT * result metadata prepared against the archived schema.
+      inspector = new Database(paths.database, { readonly: true, strict: true });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(inspector.query("SELECT name,dflt_value FROM pragma_table_info('sessions') WHERE name='provider'").get())
+        .toEqual({ name: "provider", dflt_value: "'codex'" });
+      expect(inspector.query("SELECT name FROM pragma_table_info('autorespond_evidence') WHERE name='path'").get())
+        .toEqual({ name: "path" });
+      const evidence = inspector.query("SELECT * FROM autorespond_evidence ORDER BY id").all();
+      expect(evidence).toEqual(canonical30WorkFixture.evidence.map((row) => ({
+        ...row, path: "protocol", rule: null, model: null,
+      })));
+      expect(inspector.query(
+        "SELECT id,session_id,interaction_id,kind,class,decision,mode,outcome,latency_ms,subagent,occurred_at FROM autorespond_evidence ORDER BY id",
+      ).all()).toEqual([...canonical30WorkFixture.evidence]);
+      expect(inspector.query("SELECT version,applied_at FROM migrations WHERE version<=30 ORDER BY version").all())
+        .toEqual([...canonical30WorkFixture.migrations]);
+      expect(inspector.query("SELECT version FROM migrations WHERE version>30 ORDER BY version").all())
+        .toEqual(Array.from({ length: 19 }, (_, index) => ({ version: index + 31 })));
+      const retained = migrated.requireSession(canonical30WorkFixture.sessionId);
+      expect(retained.providerThreadId).toBe(canonical30WorkFixture.sessionRow.provider_thread_id);
+      expect(retained.preset).toBe(canonical30WorkFixture.sessionRow.preset);
+      const schema = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all();
+      const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+      const session = inspector.query("SELECT * FROM sessions WHERE id=?").get(retained.id);
+      inspector.close(false);
+      migrated.close();
+      stores.splice(stores.indexOf(migrated), 1);
+      const reopened = new StateStore(paths, { now: () => 2_001 });
+      stores.push(reopened);
+      const readonly = new StateStore(paths, { readonly: true });
+      readonly.close();
+      inspector = new Database(paths.database, { readonly: true, strict: true });
+      expect(inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all()).toEqual(schema);
+      expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledger);
+      expect(inspector.query("SELECT * FROM autorespond_evidence ORDER BY id").all()).toEqual(evidence);
+      expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(retained.id)).toEqual(session);
     } finally {
       inspector.close(false);
     }
@@ -17859,7 +26272,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_V35_OBJECT_MISSING:session_provider_switch_targets_immutable_delete");
   });
 
-  test("writable open repairs a missing additive v35 object", async () => {
+  test("current49 refuses a missing provider-switch object without recreating evidence", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -17871,37 +26284,8 @@ describe("StateStore", () => {
       damaged.close(false);
     }
 
-    const repaired = new StateStore(paths, { now: () => 2_000 });
-    stores.push(repaired);
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query(
-        `SELECT name,type,tbl_name FROM sqlite_master
-         WHERE name='session_provider_switch_target_releases'
-            OR name LIKE 'session_provider_switch_target_releases_immutable_%'
-         ORDER BY type,name`,
-      ).all()).toEqual([
-        {
-          name: "session_provider_switch_target_releases",
-          tbl_name: "session_provider_switch_target_releases",
-          type: "table",
-        },
-        {
-          name: "session_provider_switch_target_releases_immutable_delete",
-          tbl_name: "session_provider_switch_target_releases",
-          type: "trigger",
-        },
-        {
-          name: "session_provider_switch_target_releases_immutable_update",
-          tbl_name: "session_provider_switch_target_releases",
-          type: "trigger",
-        },
-      ]);
-    } finally {
-      inspector.close(false);
-    }
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_V35_OBJECT_MISSING:session_provider_switch_target_releases");
   });
-
   test("rejects a same-name no-op v35 immutable trigger as invalid", async () => {
     const { store } = await fixture();
     const paths = store.paths;
@@ -17945,7 +26329,7 @@ describe("StateStore", () => {
   });
 
 
-  test("repairs a same-name nonunique v24 Unicode label index while readonly refuses it", async () => {
+  test("current49 refuses a nonunique Unicode label index without changing state", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.createProfile("Équipe");
@@ -17960,34 +26344,9 @@ describe("StateStore", () => {
     `);
     stale.close(false);
 
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V24_STRUCTURE_INVALID");
-    const unchanged = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(unchanged.query(
-        "SELECT sql FROM sqlite_master WHERE type='index' AND name='profiles_label_key_active'",
-      ).get()).toEqual({
-        sql: "CREATE INDEX profiles_label_key_active\n        ON profiles(label_key) WHERE state!='removed'",
-      });
-    } finally {
-      unchanged.close(false);
-    }
-
-    const repaired = new StateStore(paths, { now: () => 2_000 });
-    stores.push(repaired);
-    expect(() => repaired.createProfile("équipe")).toThrow();
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query(
-        `SELECT "unique" AS is_unique,partial
-         FROM pragma_index_list('profiles') WHERE name='profiles_label_key_active'`,
-      ).get()).toEqual({ is_unique: 1, partial: 1 });
-    } finally {
-      inspector.close(false);
-    }
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_V24_STRUCTURE_INVALID");
   });
-
-  test("repairs a stale same-name v24 guard while readonly leaves it untouched", async () => {
+  test("current49 refuses a stale label guard without rewriting authority", async () => {
     const { store } = await fixture();
     const paths = store.paths;
     store.close();
@@ -18002,40 +26361,8 @@ describe("StateStore", () => {
     `);
     stale.close(false);
 
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V24_STRUCTURE_INVALID");
-    const unchanged = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(unchanged.query(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='profiles_label_key_insert_guard'",
-      ).get()).toEqual({
-        sql: "CREATE TRIGGER profiles_label_key_insert_guard\n      BEFORE INSERT ON profiles\n      BEGIN SELECT 1; END",
-      });
-    } finally {
-      unchanged.close(false);
-    }
-
-    const repaired = new StateStore(paths, { now: () => 2_000 });
-    stores.push(repaired);
-    repaired.close();
-    stores.splice(stores.indexOf(repaired), 1);
-    const writer = new Database(paths.database, { create: false, strict: true });
-    try {
-      expect(() => writer.query(
-        `INSERT INTO profiles(
-           id,label,label_key,state,process_generation,created_at,updated_at
-         ) VALUES ('acct_00000000000000000000000000000025','Unsafe',NULL,'signed_out',0,1000,1000)`,
-      ).run()).toThrow("invalid profile label key");
-      expect(writer.query(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='profiles_label_key_insert_guard'",
-      ).get()).toEqual({
-        sql: "CREATE TRIGGER profiles_label_key_insert_guard\nBEFORE INSERT ON profiles\nWHEN NEW.label_key IS NULL\n  OR length(CAST(NEW.label_key AS BLOB)) NOT BETWEEN 1 AND 4096\nBEGIN SELECT RAISE(ABORT, 'invalid profile label key'); END",
-      });
-    } finally {
-      writer.close(false);
-    }
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_V24_STRUCTURE_INVALID");
   });
-
   test("fails closed when a v23 account state contains a Unicode label collision", async () => {
     const { store } = await fixture();
     const paths = store.paths;
@@ -18044,11 +26371,12 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new Database(paths.database, { create: false, strict: true });
+    dropSchemaAfterVersion34(legacy);
     legacy.exec(`
       DROP INDEX profiles_label_key_active;
       DROP TRIGGER profiles_label_key_insert_guard;
       DROP TRIGGER profiles_label_key_immutable;
-      DELETE FROM migrations WHERE version=24;
+      DELETE FROM migrations WHERE version>23;
       PRAGMA user_version=23;
     `);
     legacy.query(
@@ -18084,11 +26412,12 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new Database(paths.database, { create: false, strict: true });
+    dropSchemaAfterVersion34(legacy);
     legacy.exec(`
       DROP INDEX projects_label_key_unique;
       DROP TRIGGER projects_label_key_insert_guard;
       DROP TRIGGER projects_label_key_immutable;
-      DELETE FROM migrations WHERE version=24;
+      DELETE FROM migrations WHERE version>23;
       PRAGMA user_version=23;
     `);
     legacy.query(
@@ -18118,11 +26447,11 @@ describe("StateStore", () => {
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropAttachmentCustodySchema(legacy);
+    dropSchemaAfterVersion34(legacy);
     legacy.exec(`
       DROP TRIGGER IF EXISTS provider_interactions_response_fields_guard;
       DROP TRIGGER IF EXISTS provider_interactions_revision_guard;
-      DELETE FROM migrations WHERE version=19 OR version>=44;
+      DELETE FROM migrations WHERE version>18;
       PRAGMA user_version=18;
     `);
     legacy.close(false);
@@ -18131,7 +26460,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -18152,9 +26481,8 @@ describe("StateStore", () => {
   test("migrates legacy approval scope booleans into exact ordered decisions", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Legacy approvals", "legacy-approvals@example.com");
-    const starting = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({
-      sessionId: starting.id, expectedRevision: starting.revision,
+    const session = upsertProvenTestSession(store, {
+      profileId: profile.id, preset: "high", fastEnabled: false,
       providerThreadId: "thread-legacy-approvals", state: "idle",
     });
     const connectionId = "50000000-0000-4000-8000-000000000001";
@@ -18213,7 +26541,7 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropAttachmentCustodySchema(legacy);
+    dropSchemaAfterVersion34(legacy);
     legacy.exec("DROP TRIGGER IF EXISTS provider_interactions_authority_immutable");
     legacy.query("UPDATE provider_interactions SET display_json=? WHERE public_id=?").run(JSON.stringify({
       kind: "command_approval",
@@ -18230,22 +26558,26 @@ describe("StateStore", () => {
       grantRoot: null,
       allowsSessionApproval: false,
     }), files.publicId);
-    legacy.exec("DELETE FROM migrations WHERE version=18 OR version>=44; PRAGMA user_version=17");
+    legacy.exec("DELETE FROM migrations WHERE version>17; PRAGMA user_version=17");
     legacy.close(false);
 
     const migrated = new StateStore(paths, { now: () => 9_000 });
     stores.push(migrated);
-    expect(migrated.requireInteraction(command.publicId).display).toMatchObject({
-      kind: "command_approval",
-      availableDecisions: ["once", "session", "decline", "cancel"],
-    });
-    expect(migrated.requireInteraction(files.publicId).display).toMatchObject({
-      kind: "file_change_approval",
-      availableDecisions: ["once", "decline", "cancel"],
-    });
+    for (const interaction of [command, files]) {
+      expect(() => migrated.requireInteraction(interaction.publicId))
+        .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+    }
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      for (const interaction of [command, files]) {
+        const row = z.object({ display_json: z.string() }).strict().parse(inspector.query(
+          "SELECT display_json FROM provider_interactions WHERE public_id=?",
+        ).get(interaction.publicId));
+        expect(JSON.parse(row.display_json)).toEqual(interaction.display);
+        expect(inspector.query("SELECT * FROM interaction_provider_authorities WHERE public_id=?")
+          .all(interaction.publicId)).toEqual([]);
+      }
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -18265,6 +26597,11 @@ describe("StateStore", () => {
       request: { deviceCode: false },
       idempotencyKey,
     });
+    completeCodexAccountMutationAuthorityRetirement(
+      store,
+      profile.id,
+      profile.processGeneration,
+    );
     store.beginAccountMutationEffect({
       attemptId: attempt.id,
       profileId: profile.id,
@@ -18278,7 +26615,7 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropAttachmentCustodySchema(legacy);
+    dropSchemaAfterVersion34(legacy);
     legacy.exec(`
       DROP TRIGGER IF EXISTS provider_login_authority_identity_immutable;
       DROP TRIGGER IF EXISTS provider_login_authority_generation_guard;
@@ -18317,11 +26654,12 @@ describe("StateStore", () => {
   test("redacts and terminalizes secret-bearing MCP URL interactions when upgrading v10", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Legacy URL profile", "legacy-url@example.com");
-    const session = store.createSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       title: "Legacy URL session",
       preset: "high",
       fastEnabled: false,
+      providerThreadId: "legacy-thread",
     });
     const paths = store.paths;
     store.close();
@@ -18350,7 +26688,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -18372,11 +26710,12 @@ describe("StateStore", () => {
   test("redacts and physically scrubs permission values when upgrading v14", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Legacy permission profile", "legacy-permission@example.com");
-    const session = store.createSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       title: "Legacy permission session",
       preset: "high",
       fastEnabled: false,
+      providerThreadId: "legacy-permission-thread",
     });
     const paths = store.paths;
     store.close();
@@ -18403,7 +26742,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -18426,11 +26765,12 @@ describe("StateStore", () => {
       await initializeStatePaths(paths);
       const store = new StateStore(paths, { now: () => 5_000 });
       const profile = signInProfile(store, `Physical v${targetVersion}`, `physical-v${targetVersion}@example.com`);
-      const session = store.createSession({
+      const session = createProvenTestSession(store, {
         profileId: profile.id,
         title: `Physical v${targetVersion} session`,
         preset: "high",
         fastEnabled: false,
+        providerThreadId: `legacy-physical-thread-${targetVersion}`,
       });
       const queue = ["first", "deleted", "third", "fourth"].map((message) => store.enqueue(session.id, message));
       store.close();
@@ -18486,16 +26826,18 @@ describe("StateStore", () => {
         queue[2]!.id,
         queue[3]!.id,
       ]);
-      expect(migrated.listRecoverableQueue().map((entry) => entry.id)).toEqual([
-        queue[0]!.id,
-        queue[2]!.id,
-        queue[3]!.id,
-      ]);
+      expect(migrated.listQueue(session.id).map((entry) => entry.state))
+        .toEqual(["pending", "pending", "pending"]);
+      expect(migrated.listQueue(session.id).map((entry) => entry.message))
+        .toEqual(["first", "third", "fourth"]);
+      expect(migrated.hasUnsettledQueueAttachmentQuarantineForSession(session.id)).toBe(true);
+      expect(migrated.nextPendingQueue(session.id)).toBeNull();
+      expect(migrated.listRecoverableQueue()).toEqual(migrated.listQueue(session.id));
       migrated.close();
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -18522,11 +26864,12 @@ describe("StateStore", () => {
   test("keeps a busy-reader MCP scrub unavailable until WAL truncation can finish", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Pinned legacy URL", "pinned-legacy-url@example.com");
-    const session = store.createSession({
+    const session = createProvenTestSession(store, {
       profileId: profile.id,
       title: "Pinned legacy URL session",
       preset: "high",
       fastEnabled: false,
+      providerThreadId: "legacy-thread",
     });
     const paths = store.paths;
     store.close();
@@ -18601,7 +26944,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -18693,7 +27036,7 @@ describe("StateStore", () => {
     expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
         id: 7,
         path: "protocol",
@@ -18797,12 +27140,13 @@ describe("StateStore", () => {
     const preserved = store.requireSession("sess_00000000000000000000000000000000");
     expect(preserved).toMatchObject({
       title: "Preserved",
-      revision: 1,
+      revision: 2,
+      state: "recovery_required",
     });
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -18852,6 +27196,7 @@ describe("StateStore", () => {
         { version: 46, applied_at: 2000 },
         { version: 47, applied_at: 2000 },
         { version: 48, applied_at: 2000 },
+        { version: 49, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -18877,12 +27222,12 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropAttachmentCustodySchema(legacy);
+    dropSchemaAfterVersion34(legacy);
     legacy.exec(`
       DROP TRIGGER IF EXISTS queue_transition_guard;
       DROP TRIGGER IF EXISTS desktop_switch_transition_guard;
       DROP TABLE IF EXISTS desktop_switch_authority;
-      DELETE FROM migrations WHERE version=3 OR version>=44;
+      DELETE FROM migrations WHERE version>2;
       PRAGMA user_version=2;
     `);
     legacy.close(false);
@@ -18899,7 +27244,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -18919,9 +27264,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 49");
+    newer.exec("PRAGMA user_version = 50");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:49:48");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:50:49");
   });
 });

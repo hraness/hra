@@ -23,6 +23,8 @@ import {
   resolvePinnedCodexRuntime,
   validateMcpFormSubmission,
   type CodexFact,
+  type CodexAutomationAuthorityRequest,
+  type CodexAutomationAuthorityScan,
   type CodexPluginCatalog,
   type CodexPluginSummary,
   type ConversationAutomationToolCall,
@@ -60,6 +62,7 @@ import {
   type SessionStatus,
 } from "../domain/observation";
 import {
+  adoptableProviderSchema,
   currentPresetContract,
   isPresetSupportedByProvider,
   PresetProviderMismatchError,
@@ -67,7 +70,9 @@ import {
   providerSchema,
   presetsForProvider,
   presetTiers,
+  type AdoptableProvider,
   type Preset,
+  type PresetRequirement,
   type Provider,
 } from "../domain/presets";
 import {
@@ -83,6 +88,7 @@ import {
   type ProviderUsageComponent,
 } from "../domain/provider-usage";
 import {
+  projectPublicReviewedRuntimeProfile,
   reviewedRuntimeProfileSchema,
   type ReviewedRuntimeProfile,
 } from "../domain/runtime-profile";
@@ -179,7 +185,13 @@ import {
   type MutationEffectEvidence,
   type AccountRateLimitResetAttemptRecord,
   type AccountRateLimitResetPolicyRecord,
+  type ClaudeProcessAuthorityKey,
+  type ClaudeProcessAuthorityRecord,
+  type ClaudeProcessLaunchIntentRecord,
   type ProfileRecord,
+  type ProviderRuntimeAccountRevocationRecord,
+  type ProjectRecord,
+  type SessionAdoptionCandidateRecord,
   type SessionRecord,
   type SessionProviderAuthority,
   type SessionSwitchCas,
@@ -202,11 +214,15 @@ import { DaemonAuthoritySafetyError, type DaemonAuthorityFence } from "./daemon-
 import type { HraFactsMemoryLifecyclePort } from "./facts-memory-lifecycle";
 import { commandFailureBrand } from "./local-transport";
 import {
+  ClaudeProcessExitUnprovenError,
+  ClaudeSessionObservationError,
+  CodexClaimReleaseUnprovenError,
   CodexSessionObservationError,
   ProviderRuntimeUnavailableError,
   UnavailableClaudeRuntime,
   UnavailableDevinRuntime,
   type ClaudeRuntimePort,
+  type ClaudeProcessIdentity,
   type CloudControlPort,
   type CodexAccountProjection,
   type CodexLoginOutcome,
@@ -225,6 +241,14 @@ import {
   type ClaudeSessionFact,
   type ClaudeUsageObservation,
 } from "./claude-session-facts";
+import {
+  inferCodexLiveness,
+  PERSONAL_SESSION_DISCOVERY_MAX_RESULTS,
+  PERSONAL_SESSION_DISCOVERY_RECENCY_WINDOW_MS,
+  type ClaudeProcessLivenessProbe,
+  type DiscoveredPersonalSession,
+  type PersonalSessionDiscoveryPort,
+} from "./personal-session-discovery";
 import {
   SessionEventCursorCodec,
   SessionEventCursorError,
@@ -278,6 +302,20 @@ export class CommandFailure extends Error {
   ) {
     super(message);
     this.name = "CommandFailure";
+  }
+}
+
+class ProviderAccountAuthorityMismatchError extends CommandFailure {
+  constructor(
+    provider: AdoptableProvider,
+    profile: Pick<ProfileRecord, "id" | "label">,
+  ) {
+    super(
+      "RECOVERY_REQUIRED",
+      "The provider account changed. HRA refused stale controller authority and is releasing the affected sessions.",
+      { accountId: profile.id, provider },
+    );
+    this.name = "ProviderAccountAuthorityMismatchError";
   }
 }
 
@@ -377,6 +415,8 @@ const providerFailureCode = (error: unknown): string | null => providerFailure(e
 /** The provider's own bounded, credential-free message, or a neutral one. */
 const providerFailureMessage = (error: unknown): string =>
   providerFailure(error)?.message ?? "The provider refused the operation.";
+
+type ProviderFactSource = "managed" | "personal";
 
 const claudeCommandFailure = (error: ClaudeError): CommandFailure => {
   switch (error.code) {
@@ -798,6 +838,41 @@ const defaultPresetForProviderSwitch = (provider: Provider, current: Preset): Pr
   return fallback;
 };
 
+/** Projects private reviewed runtime evidence onto the ordinary public session surface. */
+const publicRuntimeProfile = (
+  profile: ReviewedRuntimeProfile | null | undefined,
+): ReturnType<typeof projectPublicReviewedRuntimeProfile> | null =>
+  profile === null || profile === undefined
+    ? null
+    : projectPublicReviewedRuntimeProfile(profile);
+
+const assertClaimedRuntimeProfile = (input: Readonly<{
+  authority: ProfileAuthority;
+  fast: boolean;
+  preset: Preset;
+  provider: AdoptableProvider;
+  requirement: PresetRequirement;
+  runtimeProfile: ReviewedRuntimeProfile;
+}>): ReviewedRuntimeProfile => {
+  const parsed = reviewedRuntimeProfileSchema.safeParse(input.runtimeProfile);
+  if (!parsed.success) {
+    throw new Error("SESSION_CLAIM_RUNTIME_PROFILE_MISMATCH");
+  }
+  const profile = parsed.data;
+  if (
+    profile.profileId !== input.authority.id
+    || profile.processGeneration !== input.authority.generation
+    || profile.preset !== input.preset
+    || profile.model !== input.requirement.model
+    || profile.reasoningEffort !== input.requirement.effort
+    || !isPresetSupportedByProvider(input.provider, profile.preset)
+    || ("fast" in profile ? profile.fast !== input.fast : input.fast)
+  ) {
+    throw new Error("SESSION_CLAIM_RUNTIME_PROFILE_MISMATCH");
+  }
+  return profile;
+};
+
 const loginReceiptSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("pending"),
@@ -885,6 +960,58 @@ const accountFingerprintForProfile = (
 ): string | null => profile.providerEmail === undefined
   ? null
   : digestText(profile.providerEmail.trim().toLowerCase());
+const normalizedProviderEmail = (value: string): string => value.trim().toLowerCase();
+type RuntimeAccountScope = "managed" | "personal";
+
+const boundedProviderIdentityScalar = (value: unknown): string | null => {
+  const parsed = z.string().min(1).max(1_024).safeParse(value);
+  if (!parsed.success) return null;
+  const normalized = parsed.data.trim();
+  if (normalized.length === 0 || /\p{Cc}/u.test(normalized)) return null;
+  return normalized;
+};
+
+/**
+ * Credential-free provider identity captured at custody admission. Codex's
+ * stable authority is its normalized account email. Claude exposes distinct
+ * account and organization UUIDs, so its authority deliberately does not
+ * inherit the selected Codex profile email.
+ */
+const providerAccountAuthorityKey = (
+  provider: AdoptableProvider,
+  account: CodexAccountProjection,
+): string | null => {
+  if (!account.signedIn) return null;
+  switch (provider) {
+    case "codex": {
+      const email = boundedProviderIdentityScalar(account.email);
+      return email === null ? null : `v1:codex:${digestText(email.toLowerCase())}`;
+    }
+    case "claude": {
+      const accountId = boundedProviderIdentityScalar(account.accountId);
+      const organizationId = boundedProviderIdentityScalar(account.organizationId);
+      if (accountId === null || organizationId === null) return null;
+      return `v1:claude:${digestText(`${accountId}\0${organizationId}`)}`;
+    }
+  }
+};
+
+const profileCodexAccountAuthorityKey = (
+  profile: Pick<ProfileRecord, "providerEmail">,
+): string | null => profile.providerEmail === undefined
+  ? null
+  : providerAccountAuthorityKey("codex", {
+      signedIn: true,
+      email: profile.providerEmail,
+    });
+const providerAccountAuthorityChanged = (
+  profile: Pick<ProfileRecord, "providerEmail">,
+  account: CodexAccountProjection,
+): boolean => {
+  if (!account.signedIn) return true;
+  if (profile.providerEmail === undefined || account.email === undefined) return true;
+  return normalizedProviderEmail(account.email) !== normalizedProviderEmail(profile.providerEmail);
+};
 const QUEUE_PRE_EFFECT_RETRY_DELAYS_MS = [25, 100, 250] as const;
 export const FACTS_MEMORY_SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
 
@@ -980,9 +1107,12 @@ export const BACKGROUND_DIAGNOSTIC_CODES = [
   "autorespond_failed",
   "claude_fact_untranslatable",
   "prose_autorespond_failed",
+  "profile_authority_revocation_failed",
+  "provider_account_authority_revocation_failed",
   "queue_dispatch_failed",
   "queue_pre_effect_retry_failed",
   "recovery_observation_failed",
+  "session_adoption_failed",
   "session_state_tracking_failed",
   "usage_refresh_failed",
   "usage_poll_account_failed",
@@ -995,6 +1125,7 @@ export const BACKGROUND_DIAGNOSTIC_CODES = [
   "provider_usage_admission_failed",
   "provider_usage_persistence_failed",
   "provider_usage_queue_overflow",
+  "provider_switch_target_release_failed",
   "provider_switch_target_abandon_failed",
   "usage_poll_tick_failed",
   "user_message_record_failed",
@@ -1036,7 +1167,7 @@ type PendingClaudeDisconnect = Readonly<{
   authority: ProfileAuthority;
   connectionId: string;
   providerThreadId: string;
-  reason: "eof" | "protocol_fault";
+  reason: "eof" | "process_exit" | "protocol_fault";
 }>;
 
 type ProviderUsageTurnBindingSettlement = Readonly<{
@@ -1057,16 +1188,25 @@ type ProviderUsagePersistenceJob = Readonly<{
 }>;
 
 type SessionSwitchDeferredFact =
-  | Readonly<{ provider: "codex" | "devin"; authority: ProfileAuthority; fact: CodexFact }>
-  | Readonly<{ provider: "claude"; authority: ProfileAuthority; fact: ClaudeSessionFact }>;
+  | Readonly<{ provider: "codex" | "devin"; authority: ProfileAuthority; fact: CodexFact; source: ProviderFactSource }>
+  | Readonly<{ provider: "claude"; authority: ProfileAuthority; fact: ClaudeSessionFact; source: ProviderFactSource }>;
 
 type SessionSwitchDeferredFactOwner = {
   readonly attemptId: SessionSwitchRecord["attemptId"];
   readonly authority: ProviderAccountAuthority;
   readonly providerThreadId: string;
-  readonly facts: SessionSwitchDeferredFact[];
+  readonly source: ProviderFactSource;
+  readonly facts: Array<SessionSwitchDeferredFact & Readonly<{ observedConnectionId: string | null }>>;
   overflowed: boolean;
 };
+
+// Minted only by the switch owner while its ranked account/session locks are
+// held. Ordinary provider callbacks never inherit inline drain authority.
+type SessionSwitchFactDrain = Readonly<{
+  sessionId: SessionRecord["id"];
+  owner: SessionSwitchDeferredFactOwner;
+  connectionId: string | null;
+}>;
 
 // Provider callbacks can change this field across an await or synchronous
 // storage callback, even after an earlier branch observed it as false.
@@ -1082,6 +1222,83 @@ const sameProviderUsageAuthority = (
   && left.bindingGeneration === right.bindingGeneration
   && left.processGeneration === right.processGeneration;
 
+const PERSONAL_SESSION_ADOPTION_SCAN_LIMIT = 50;
+/**
+ * A provider claim can include capability discovery, resume, observation, and
+ * deterministic release. Keep each poll to two provider-neutral attempts so a
+ * slow prefix cannot monopolize automation rotation or the other provider.
+ */
+const PERSONAL_SESSION_ADOPTION_CLAIM_ATTEMPT_LIMIT = 2;
+const PERSONAL_SESSION_ADOPTION_RECENCY_MS = PERSONAL_SESSION_DISCOVERY_RECENCY_WINDOW_MS;
+const PERSONAL_SESSION_ADOPTION_CLOCK_SKEW_MS = 5 * 60_000;
+const PERSONAL_CODEX_AUTOMATION_AUTHORITY_DEADLINE_MS = 5_000;
+const CLAUDE_PROCESS_LIVENESS_DEADLINE_MS = 3_000;
+const CLAUDE_RETAINED_CANDIDATE_PROBE_CONCURRENCY = 8;
+const PERSONAL_ACCOUNT_ATTESTATION_TTL_MS = 1_000;
+const SESSION_LIST_TRAVERSAL_LIMIT = 64;
+const SESSION_LIST_TRAVERSAL_IMPORT_RECEIPT_LIMIT = 10_000;
+
+const isEligiblePersonalCodexAutomationStatus = (
+  status: unknown,
+): status is "active" | "paused" => status === "active" || status === "paused";
+
+type PreparedPersonalAdmissionCandidate = Readonly<{
+  kind: "discovered" | "retained";
+  candidate: DiscoveredPersonalSession;
+  durableCandidate: SessionAdoptionCandidateRecord;
+  project: ProjectRecord | undefined;
+}>;
+
+type RetainedClaudeCandidateObservation = Omit<
+  PreparedPersonalAdmissionCandidate,
+  "kind"
+>;
+
+type PersonalAccountAttestation = Readonly<{
+  checkedAt: number;
+  accountKey: string;
+  generation: number;
+  authority: ProviderAccountAuthority;
+}>;
+
+type PersonalCodexScheduledAuthorityBatch = Readonly<{
+  providerThreadIds: readonly string[];
+  sourceDirectoryNamesByProviderThreadId: ReadonlyMap<string, readonly string[]>;
+}>;
+
+type PersonalCodexAdoptionClaimClass = "recent" | "scheduled";
+
+/**
+ * In-memory capability for provider deltas. Its durable components are
+ * revalidated synchronously before every commit, so an ordinary delta never
+ * performs a provider account read and can never outlive controller custody.
+ */
+type SessionFactAuthority = Readonly<{
+  sessionId: SessionRecord["id"];
+  profileId: ProfileRecord["id"];
+  profileGeneration: number;
+  providerAuthority: ProviderAccountAuthority;
+  provider: Provider;
+  runtimeScope: RuntimeAccountScope;
+  providerThreadId: string;
+  connectionId: string;
+  accountKey: string | null;
+  personalBindingRevision: number | null;
+  claudeProcess: Readonly<{
+    identity: ClaudeProcessIdentity;
+    revision: number;
+    profileGeneration: number;
+  }> | null;
+}>;
+
+type SessionListTraversalReplayState = {
+  readonly accountId: ProfileRecord["id"];
+  readonly providerAuthority: ProviderAccountAuthority;
+  readonly importedSessionIdsByProviderPage: Map<string, Set<SessionRecord["id"]>>;
+  readonly emittedSessionIds: Set<SessionRecord["id"]>;
+  importReceiptCount: number;
+};
+
 export class HraService {
   readonly #store: StateStore;
   readonly #paths: StatePaths;
@@ -1089,7 +1306,16 @@ export class HraService {
   readonly #codex: CodexRuntimePort;
   readonly #claude: ClaudeRuntimePort;
   readonly #devin: DevinRuntimePort;
+  readonly #personalCodex: CodexRuntimePort | undefined;
+  readonly #personalClaude: ClaudeRuntimePort | undefined;
+  readonly #personalCodexHome: string | undefined;
+  readonly #personalDiscovery: PersonalSessionDiscoveryPort | undefined;
+  readonly #readPersonalCodexAutomations: ((
+    request: CodexAutomationAuthorityRequest,
+  ) => Promise<CodexAutomationAuthorityScan>) | undefined;
+  readonly #claudeProcessLiveness: ClaudeProcessLivenessProbe | undefined;
   readonly #claudeFacts: ClaudeSessionFactTranslator;
+  readonly #personalClaudeFacts: ClaudeSessionFactTranslator | undefined;
   readonly #desktop: DesktopSwitchPort | undefined;
   readonly #cloud: CloudControlPort;
   readonly #daemonAuthority: Pick<DaemonAuthorityFence, "assertCurrent" | "close">;
@@ -1117,16 +1343,27 @@ export class HraService {
   readonly #scheduledAutorespondInteractions = new Set<string>();
   readonly #operations = new Set<Promise<void>>();
   readonly #projectionRecoveriesInFlight = new Set<string>();
+  /** Immediate in-memory admission fence for a durable personal-authority revocation. */
+  readonly #profileAuthorityRevocationsPending = new Map<string, number>();
+  readonly #profileAuthorityRevocationTasks = new Map<string, Promise<void>>();
+  /** Provider-home replacements fence only the sessions owned by that home. */
+  readonly #providerAccountRevocationTasks = new Map<string, Promise<void>>();
+  /** Short-lived fact-path cache; every controlling effect forces a fresh read. */
+  readonly #personalAccountAttestations = new Map<string, PersonalAccountAttestation>();
+  readonly #personalAccountChecks = new Map<string, Promise<string>>();
   readonly #sessionFactEpochs = new Map<string, number>();
   readonly #backgroundDiagnostics = new Map<BackgroundDiagnosticCode, BackgroundDiagnostic>();
   #lastBackgroundDiagnostic: BackgroundDiagnostic | null = null;
   readonly #sessionProviderConnections = new Map<string, string>();
   readonly #pendingClaudeDisconnects = new Map<string, PendingClaudeDisconnect>();
+  readonly #sessionFactAuthorities = new Map<string, SessionFactAuthority>();
   readonly #sessionObservationFailures = new Map<string, string>();
   readonly #sessionResubscriptionConnections = new Map<string, string>();
   readonly #sessionsAwaitingResubscription = new Set<string>();
   readonly #queuePreEffectRetryCounts = new Map<string, number>();
   readonly #queuePreEffectRetryScheduled = new Set<string>();
+  /** Same-daemon Codex claims whose exact controller release was not proven. */
+  readonly #unprovenCodexAdoptionClaims = new Set<string>();
   readonly #usageRefreshes = new Map<string, Promise<void>>();
   readonly #usageRefreshDirty = new Set<string>();
   readonly #providerUsagePersistenceQueue: ProviderUsagePersistenceJob[] = [];
@@ -1140,6 +1377,12 @@ export class HraService {
   >();
   #providerUsagePersistencePending = 0;
   #providerUsagePersistenceTask: Promise<void> | undefined;
+  readonly #sessionListTraversals = new Map<string, SessionListTraversalReplayState>();
+  #personalCodexAutomationCursor: string | null = null;
+  readonly #personalCodexAutomationRestartPage: number;
+  #personalCodexAutomationRestartPending = true;
+  /** Alternate the first bounded Codex claim slot when both sources stay busy. */
+  #personalCodexNextClaimClass: PersonalCodexAdoptionClaimClass = "recent";
   readonly #backgroundAbort = new AbortController();
   readonly #interactionDeadlineAbort = new AbortController();
   #interactionDeadlineTask: Promise<void> | undefined;
@@ -1161,6 +1404,15 @@ export class HraService {
     claude?: ClaudeRuntimePort;
     /** Omitted on a machine with no admitted `devin` binary. */
     devin?: DevinRuntimePort;
+    /** Dedicated runtimes for sessions claimed from the OS user's provider homes. */
+    personalCodex?: CodexRuntimePort;
+    personalClaude?: ClaudeRuntimePort;
+    personalCodexHome?: string;
+    personalDiscovery?: PersonalSessionDiscoveryPort;
+    readPersonalCodexAutomations?: (
+      request: CodexAutomationAuthorityRequest,
+    ) => Promise<CodexAutomationAuthorityScan>;
+    claudeProcessLiveness?: ClaudeProcessLivenessProbe;
     cloud: CloudControlPort;
     daemonAuthority: Pick<DaemonAuthorityFence, "assertCurrent" | "close">;
     desktop?: DesktopSwitchPort;
@@ -1183,6 +1435,12 @@ export class HraService {
     this.#codex = input.codex;
     this.#claude = input.claude ?? new UnavailableClaudeRuntime(CLAUDE_PIN);
     this.#devin = input.devin ?? new UnavailableDevinRuntime(DEVIN_PIN);
+    this.#personalCodex = input.personalCodex;
+    this.#personalClaude = input.personalClaude;
+    this.#personalCodexHome = input.personalCodexHome;
+    this.#personalDiscovery = input.personalDiscovery;
+    this.#readPersonalCodexAutomations = input.readPersonalCodexAutomations;
+    this.#claudeProcessLiveness = input.claudeProcessLiveness;
     this.#claudeFacts = new ClaudeSessionFactTranslator({
       authorityFor: (providerAuthority, providerThreadId, requestId) =>
         this.#claude.interactionAuthority(
@@ -1196,6 +1454,25 @@ export class HraService {
         ),
       now: () => this.#now(),
     });
+    this.#personalClaudeFacts = this.#personalClaude === undefined
+      ? undefined
+      : new ClaudeSessionFactTranslator({
+          authorityFor: (providerAuthority, providerThreadId, requestId) => {
+            const runtime = this.#personalClaude;
+            if (runtime === undefined) throw new ProviderRuntimeUnavailableError(
+              "The personal Claude runtime is unavailable.",
+            );
+            return runtime.interactionAuthority(
+              this.#personalAuthorityForProfile(
+                this.#store.requireProfileById(providerAuthority.profileId),
+                providerAuthority,
+              ),
+              providerThreadId,
+              requestId,
+            );
+          },
+          now: () => this.#now(),
+        });
     this.#cloud = input.cloud;
     this.#daemonAuthority = input.daemonAuthority;
     this.#eventCursors = input.eventCursors
@@ -1204,6 +1481,8 @@ export class HraService {
       (value) => this.#eventCursors.projectPublicProviderIdentifier(value),
     );
     this.#eventRedactor = new SessionEventStreamRedactor({
+      isCodexSession: (write) =>
+        this.#store.requireSession(write.sessionId).provider === "codex",
       projectPublicProviderIdentifier: (value) =>
         this.#eventCursors.projectPublicProviderIdentifier(value),
     });
@@ -1218,6 +1497,7 @@ export class HraService {
       .parse(input.daemonGeneration ?? 0);
     this.#daemonBootId = z.string().regex(/^boot_[a-f0-9]{32}$/u).optional()
       .parse(input.daemonBootId);
+    this.#personalCodexAutomationRestartPage = Math.max(0, this.#daemonGeneration - 1);
     this.#platform = input.platform ?? process.platform;
     const workCapabilities = input.workCapabilities
       ?? new WorkCapabilityCodec(WorkCapabilityCodec.generateKey());
@@ -1449,6 +1729,11 @@ export class HraService {
   ): ProfileAuthority {
     const providerAuthority = this.#sessionProviderAuthority(session);
     const profile = this.#store.requireProfileById(session.profileId);
+    const current = this.#store.requireSession(session.id);
+    this.#assertEstablishedSessionAccount(profile, current);
+    if (this.#sessionHasActivePersonalBinding(current)) {
+      return this.#personalAuthorityForProfile(profile, providerAuthority);
+    }
     return authorityFor(this.#paths, profile, providerAuthority);
   }
 
@@ -1501,7 +1786,10 @@ export class HraService {
     }> = {},
   ): void {
     const provider = authority.provider;
-    if (provider === "claude") this.#assertClaudeIsolationAccepted();
+    if (provider === "claude" && (
+      options.session === undefined
+      || !this.#sessionHasActivePersonalBinding(this.#store.requireSession(options.session.id))
+    )) this.#assertClaudeIsolationAccepted();
     const account = this.#store.requireProviderAccountForProfile(profile.id, provider);
     if (
       account.id !== authority.providerAccountId
@@ -1705,7 +1993,18 @@ export class HraService {
             }
           });
         }
-        case "account.login": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#login(profile.id, command.deviceCode, command.idempotencyKey, context.signal)); }
+        case "account.login": {
+          const profile = this.#store.requireProfile(command.account);
+          return await this.#serialize("session-adoption:codex", async () =>
+            await this.#serialize("session-adoption:claude", async () =>
+              await this.#serialize(`account:${profile.id}`, async () =>
+                await this.#login(
+                  profile.id,
+                  command.deviceCode,
+                  command.idempotencyKey,
+                  context.signal,
+                ))));
+        }
         case "account.claude-login.prepare": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#prepareClaudeLogin(profile.id, command.idempotencyKey, context.signal)); }
         case "account.claude-login.complete": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#completeClaudeLogin({ ...command, account: profile.id }, context.signal)); }
         case "account.claude-login.abandon": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#abandonClaudeLogin({ ...command, account: profile.id })); }
@@ -1713,7 +2012,13 @@ export class HraService {
         case "account.devin-login.complete": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#completeDevinLogin({ ...command, account: profile.id }, context.signal)); }
         case "account.devin-login.abandon": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#abandonDevinLogin({ ...command, account: profile.id })); }
         case "account.login-cancel": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#cancelLogin(profile.id, command.idempotencyKey, context.signal)); }
-        case "account.logout": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#logout(profile.id, command.idempotencyKey, context.signal)); }
+        case "account.logout": {
+          const profile = this.#store.requireProfile(command.account);
+          return await this.#serialize("session-adoption:codex", async () =>
+            await this.#serialize("session-adoption:claude", async () =>
+              await this.#serialize(`account:${profile.id}`, async () =>
+                await this.#logout(profile.id, command.idempotencyKey, context.signal))));
+        }
         case "account.usage": {
           if (command.account === undefined) return await this.#usage(undefined, command.refresh, context.signal);
           const profile = this.#store.requireProfile(command.account);
@@ -1746,6 +2051,7 @@ export class HraService {
         case "project.use": return { project: this.#store.setDefaultProject(this.#store.requireProject(command.project).id) };
         case "session.archive": {
           const session = this.#store.requireSession(command.session);
+          this.#assertSessionAccountAuthorityIfSignedIn(session);
           const archived = this.#store.setSessionArchived(session.id, command.archived);
           return {
             version: 1,
@@ -1754,6 +2060,15 @@ export class HraService {
             archivedAt: archived.archivedAt ?? null,
           };
         }
+        case "session.adoption.status": return this.#sessionAdoptionStatus(command.provider);
+        case "session.adoption.set": return await this.#serialize(
+          `session-adoption:${command.provider}`,
+          async () => await this.#setSessionAdoption(command, context.signal),
+        );
+        case "session.adoption.discover": return await this.discoverPersonalSessions(
+          command.provider,
+          context.signal,
+        );
         case "session.list": {
           if (command.account === undefined) {
             return await this.#listSessions(
@@ -1830,6 +2145,7 @@ export class HraService {
             return { version: 1, mode: command.mode, source: "default" };
           }
           const session = this.#store.requireSession(command.session);
+          this.#assertSessionAccountAuthorityIfSignedIn(session);
           this.#store.setSessionApprovalMode(session.id, command.mode);
           const effective = this.#store.readSessionApprovalMode(session.id);
           return { version: 1, session: session.id, mode: effective.mode, source: effective.source };
@@ -1898,7 +2214,7 @@ export class HraService {
         }
         case "session.start": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#startSession({ ...command, account: profile.id }, context.signal)); }
         case "session.send": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#send(session.id, command.message, command.idempotencyKey, context.signal, undefined, "human", command.attachments ?? [])); }
-        case "session.queue": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#queue(session.id, command.message, command.idempotencyKey, undefined, command.attachments ?? [])); }
+        case "session.queue": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#queue(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? [])); }
         case "session.steer": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#steer(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? [])); }
         case "session.stop": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#stop(session.id, command.idempotencyKey, context.signal)); }
         case "session.rename": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#rename(session.id, command.name, command.idempotencyKey, context.signal)); }
@@ -2078,43 +2394,77 @@ export class HraService {
         case "sync.now": return await this.#fencedEffect(async () => await this.#cloud.sync(context.signal));
         case "sync.projection-recover": {
           const selected = this.#store.requireSession(command.session);
-          return await this.#serializeSessionAuthority(selected, async () => {
-            this.#projectionRecoveriesInFlight.add(selected.id);
-            try {
-              await this.#daemonAuthority.assertCurrent();
-              const replay = await this.#cloud.readCompactProjectionRecoveryReceipt?.({
-                idempotencyKey: command.idempotencyKey,
-                sessionPublicId: selected.id,
-                signal: context.signal,
-              });
-              await this.#daemonAuthority.assertCurrent();
-              if (replay !== undefined) {
-                if (replay.status === "conflict") {
-                  throw new CommandFailure(
-                    "CONFLICT",
-                    "The projection recovery idempotency key belongs to another session.",
-                  );
-                }
-                if (replay.status === "found") return replay.result;
-              }
-              const session = this.#requireBoundSession(selected.id);
-              const profile = this.#store.requireProfile(session.profileId);
-              const providerAuthority = this.#sessionProviderAuthority(session);
-              return await this.#recoverCompactProjection({
-                acknowledgeGap: command.acknowledgeGap,
-                bindingGeneration: providerAuthority.bindingGeneration,
-                idempotencyKey: command.idempotencyKey,
-                processGeneration: providerAuthority.processGeneration,
-                profileId: profile.id,
-                provider: providerAuthority.provider,
-                providerAccountId: providerAuthority.providerAccountId,
-                providerThreadId: session.providerThreadId,
-                sessionId: session.id,
-              }, context.signal);
-            } finally {
-              this.#projectionRecoveriesInFlight.delete(selected.id);
+          const admission = await this.#serializeSessionAuthority(selected, async () => {
+            if (
+              this.#projectionRecoveriesInFlight.has(selected.id)
+              || this.#profileHasProjectionRecoveryInFlight(selected.profileId)
+            ) {
+              throw new CommandFailure(
+                "RECOVERY_REQUIRED",
+                "This session or account already has a compact-projection recovery in flight.",
+              );
             }
+            await this.#daemonAuthority.assertCurrent();
+            const replay = await this.#cloud.readCompactProjectionRecoveryReceipt?.({
+              idempotencyKey: command.idempotencyKey,
+              sessionPublicId: selected.id,
+              signal: context.signal,
+            });
+            await this.#daemonAuthority.assertCurrent();
+            if (replay !== undefined) {
+              if (replay.status === "conflict") {
+                throw new CommandFailure(
+                  "CONFLICT",
+                  "The projection recovery idempotency key belongs to another session.",
+                );
+              }
+              if (replay.status === "found") {
+                return { kind: "replay", result: replay.result } as const;
+              }
+            }
+            const session = this.#requireBoundSession(selected.id);
+            if (session.profileId !== selected.profileId) {
+              throw new CommandFailure(
+                "CONFLICT",
+                "The session account changed before projection recovery admission.",
+              );
+            }
+            const profile = this.#store.requireProfile(session.profileId);
+            const providerAuthority = this.#sessionProviderAuthority(session);
+            const expected = {
+              acknowledgeGap: command.acknowledgeGap,
+              bindingGeneration: providerAuthority.bindingGeneration,
+              idempotencyKey: command.idempotencyKey,
+              processGeneration: providerAuthority.processGeneration,
+              profileId: profile.id,
+              provider: providerAuthority.provider,
+              providerAccountId: providerAuthority.providerAccountId,
+              providerThreadId: session.providerThreadId,
+              sessionId: session.id,
+            } as const;
+            await this.#assertCompactProjectionRecoveryReady(expected);
+            if (this.#profileHasProjectionRecoveryInFlight(profile.id)) {
+              throw new CommandFailure(
+                "RECOVERY_REQUIRED",
+                "This account already has a compact-projection recovery in flight.",
+              );
+            }
+            // This in-memory fence closes the pre-journal admission window.
+            // Release the account/session tails before calling cloud: its
+            // provider-read callback reacquires both tails through the public
+            // exact-reader seam.
+            this.#projectionRecoveriesInFlight.add(session.id);
+            return { kind: "admitted", expected } as const;
           }, { allowDuringProjectionRecovery: true });
+          if (admission.kind === "replay") return admission.result;
+          try {
+            return await this.#recoverCompactProjection(
+              admission.expected,
+              context.signal,
+            );
+          } finally {
+            this.#projectionRecoveriesInFlight.delete(admission.expected.sessionId);
+          }
         }
       }
     } catch (error: unknown) {
@@ -2410,6 +2760,128 @@ export class HraService {
     }
   }
 
+  /**
+   * Supplies cloud reconciliation with an exact provider projection without
+   * letting that adapter select a runtime or provider home on its own.
+   */
+  async readSessionProjectionForCloud(
+    sessionId: SessionRecord["id"],
+    signal: AbortSignal,
+  ): Promise<CodexSessionProjection> {
+    const finish = this.#beginOperation();
+    try {
+      signal.throwIfAborted();
+      await this.#daemonAuthority.assertCurrent();
+      const selected = this.#store.requireSession(sessionId);
+      const captured = this.#sessionProviderAuthority(selected);
+      return await this.#serializeSessionAuthority(selected, async () => {
+        signal.throwIfAborted();
+        await this.#daemonAuthority.assertCurrent();
+        const session = this.#store.requireSession(selected.id);
+        if (session.profileId !== selected.profileId
+          || !sameProviderUsageAuthority(captured, this.#sessionProviderAuthority(session))) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The session account changed before cloud projection authority was acquired.",
+          );
+        }
+        const bound = this.#requireBoundSession(session.id);
+        const profile = this.#store.requireProfileById(bound.profileId);
+        this.#assertEstablishedSessionAccount(profile, bound);
+        const projection = await this.#readExactSessionProjection(
+          bound,
+          profile,
+          false,
+          signal,
+        );
+        signal.throwIfAborted();
+        await this.#daemonAuthority.assertCurrent();
+        const exactSession = this.#store.requireSession(bound.id);
+        const exactProfile = this.#store.requireProfileById(profile.id);
+        if (
+          exactSession.profileId !== bound.profileId
+          || !sameProviderUsageAuthority(captured, this.#sessionProviderAuthority(exactSession))
+          || exactSession.provider !== bound.provider
+          || exactSession.providerThreadId !== bound.providerThreadId
+          || exactSession.state === "recovery_required"
+          || exactSession.state === "terminal"
+          || (bound.provider === "codex" && exactProfile.processGeneration !== profile.processGeneration)
+          || !this.#profileAllowsEstablishedSession(exactProfile, exactSession)
+        ) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The session authority changed during the cloud projection read.",
+          );
+        }
+        return projection;
+      }, { allowDuringProjectionRecovery: true });
+    } finally {
+      finish();
+    }
+  }
+
+  /**
+   * Supplies cloud account reconciliation with only the bounded authentication
+   * bit. The cloud adapter never receives provider runtime custody or paths.
+   */
+  async readProviderAccountProjectionForCloud(input: Readonly<{
+    authority: ProviderAccountAuthority;
+    signal: AbortSignal;
+  }>): Promise<Readonly<{ signedIn: boolean | null }>> {
+    const captured = providerAccountAuthoritySchema.parse(input.authority);
+    const finish = this.#beginOperation();
+    try {
+      input.signal.throwIfAborted();
+      await this.#daemonAuthority.assertCurrent();
+      return await this.#serialize(`account:${captured.profileId}`, async () => {
+        const assertExactProfile = (): ProfileRecord => {
+          const exact = this.#store.requireProfileById(captured.profileId);
+          if (
+            !sameProviderUsageAuthority(captured, this.#providerAuthority(exact, captured.provider))
+            || (exact.state !== "signed_in" && exact.state !== "signed_out")
+            || (captured.provider === "codex" && this.#profileAuthorityRevocationIsPending(
+              exact.id,
+              exact.processGeneration,
+            ))
+          ) {
+            throw new CommandFailure(
+              "RECOVERY_REQUIRED",
+              "The provider account authority changed during cloud projection.",
+            );
+          }
+          return exact;
+        };
+        input.signal.throwIfAborted();
+        await this.#daemonAuthority.assertCurrent();
+        const before = assertExactProfile();
+        const authority = authorityFor(this.#paths, before, captured);
+        const account = await (async (): Promise<Readonly<{ signedIn: boolean | null }>> => {
+          switch (captured.provider) {
+            case "codex":
+              return await this.#fencedEffect(async () =>
+                await this.#codex.readAccount({ authority, signal: input.signal }));
+            case "claude": {
+              this.#assertClaudeIsolationAccepted();
+              const readiness = await this.#fencedEffect(async () =>
+                await this.#claude.readAccount({ authority, signal: input.signal }));
+              return { signedIn: readiness.readiness === "unverified"
+                ? null : readiness.readiness === "signed_in" };
+            }
+            case "devin":
+              return await this.#fencedEffect(async () =>
+                await this.#devin.readAccount({ authority, signal: input.signal }));
+          }
+        })();
+        input.signal.throwIfAborted();
+        await this.#daemonAuthority.assertCurrent();
+        assertExactProfile();
+        return { signedIn: account.signedIn };
+      });
+    } finally {
+      finish();
+    }
+  }
+
   async #executeRemoteAdmitted(
     command: RemoteSessionCommand,
     expectedAuthority: RemoteExpectedSessionAuthority,
@@ -2475,7 +2947,7 @@ export class HraService {
       this.#assertProviderReady(profile, providerAuthority, { session });
       switch (command.kind) {
         case "session.send": return await this.#send(session.id, command.message, command.idempotencyKey, context.signal, undefined, "human", command.attachments ?? []);
-        case "session.queue": return await this.#queue(session.id, command.message, command.idempotencyKey, undefined, command.attachments ?? []);
+        case "session.queue": return await this.#queue(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? []);
         case "session.steer": return await this.#steer(session.id, command.message, command.idempotencyKey, context.signal, undefined, command.attachments ?? []);
         case "session.stop": return await this.#stop(session.id, command.idempotencyKey, context.signal);
         case "session.rename": return await this.#rename(session.id, command.name, command.idempotencyKey, context.signal);
@@ -2499,7 +2971,8 @@ export class HraService {
           if (interaction.sessionId !== session.id) {
             throw new CommandFailure("CONFLICT", "The remote decision names an interaction of another session.");
           }
-          return await this.#resolveInteraction(command, { signal: context.signal });
+          return await this.#serialize(`interaction:${command.interaction}`, async () =>
+            await this.#resolveInteractionLocked(command, { signal: context.signal }));
         }
       }
       },
@@ -2524,6 +2997,7 @@ export class HraService {
   close(): Promise<void> {
     if (this.#closeTask !== undefined) return this.#closeTask;
     this.#state = "closing";
+    this.#sessionFactAuthorities.clear();
     this.#backgroundAbort.abort(new Error("HRA service is closing."));
     this.#interactionDeadlineAbort.abort(new Error("HRA service is closing."));
     this.#interactionDeadlineWake?.();
@@ -2547,6 +3021,14 @@ export class HraService {
   }
 
   async #recoverAdmitted(): Promise<void> {
+    // A launch intent can span an actual child launch before PID/start
+    // admission. Never delete or step past it: an unidentified live child is
+    // a harder boundary than a pending revocation and requires exact recovery.
+    if (this.#store.listClaudeProcessLaunchIntents().length > 0) {
+      throw new Error(
+        "Daemon recovery cannot run while a Claude process launch intent is unresolved.",
+      );
+    }
     await this.#cloud.supersedeTerminalCompactProjectionRecoveries();
     await this.#daemonAuthority.assertCurrent();
     await this.#recoverDedicatedSessionSwitches(this.#backgroundAbort.signal);
@@ -2559,8 +3041,15 @@ export class HraService {
     if (recoveredQueue.unresolved.length > 0) {
       throw new Error(`Daemon recovery cannot resolve ${String(recoveredQueue.unresolved.length)} dispatching queue authorities.`);
     }
+    await this.#recoverProfilePersonalAuthorityRevocations(
+      this.#interactionDeadlineAbort.signal,
+    );
+    await this.#recoverProviderRuntimeAccountRevocations(
+      this.#interactionDeadlineAbort.signal,
+    );
     await this.#reconcileTerminalFactsMemory();
     await this.#recoverPreparedWorkEffects(this.#interactionDeadlineAbort.signal);
+    await this.#recoverClaudeProcessAuthorities(this.#interactionDeadlineAbort.signal);
     await this.#daemonAuthority.assertCurrent();
     const pendingSessions = new Set<string>();
     for (const queued of this.#store.listRecoverableQueue()) {
@@ -2577,29 +3066,482 @@ export class HraService {
       }
     }
     let continueAfterId: string | null = null;
-    const activeSessions: SessionRecord[] = [];
+    const sessionsToReconnect: SessionRecord[] = [];
     for (;;) {
       const page = this.#store.listCloudSessionPage({
         afterId: continueAfterId,
         limit: 100,
       });
       for (const session of page.sessions) {
-        if (session.providerThreadId === undefined || session.state === "terminal") continue;
+        if (session.providerThreadId === undefined) continue;
+        const binding = this.#store.readSessionPersonalRuntimeBinding(session.id, true);
+        const bindingMatches = binding !== null
+          && binding.provider === session.provider
+          && binding.providerThreadId === session.providerThreadId;
+        if (bindingMatches && binding.state === "detaching") {
+          try {
+            switch (session.provider) {
+              case "codex": {
+                const runtime = this.#personalCodex;
+                if (runtime === undefined || runtime.releaseOwnedAuthority === undefined) {
+                  throw new ProviderRuntimeUnavailableError(
+                    "Personal-home Codex control cannot finish detach recovery.",
+                  );
+                }
+                const profile = this.#store.requireProfileById(session.profileId);
+                const authority = this.#personalAuthorityForProfile(profile, this.#capturedSessionProviderAuthority(session));
+                await runtime.releaseOwnedAuthority({
+                  authority,
+                  signal: new AbortController().signal,
+                });
+                break;
+              }
+              case "claude": {
+                const process = this.#store.readClaudeProcessAuthority({
+                  providerThreadId: session.providerThreadId,
+                  profileId: session.profileId,
+                  runtimeScope: "personal",
+                });
+                if (process?.state !== "released") {
+                  throw new ProviderRuntimeUnavailableError(
+                    "Claude detach recovery is waiting for exact process release.",
+                  );
+                }
+                break;
+              }
+              case "devin":
+                throw new ProviderRuntimeUnavailableError(
+                  "A Devin session cannot carry personal-home detach authority.",
+                );
+            }
+            this.#store.completePersonalSessionDetach({ sessionId: session.id });
+          } catch (error: unknown) {
+            this.recordBackgroundDiagnostic("session_adoption_failed", error);
+          }
+          continue;
+        }
+        if (session.state === "terminal" || session.state === "recovery_required") continue;
+        if (bindingMatches && binding.state === "detached") continue;
+        const usesPersonalRuntime = bindingMatches && binding.state === "active";
         this.#sessionsAwaitingResubscription.add(session.id);
         const profile = this.#store.requireProfile(session.profileId);
         if (
-          session.state === "active"
+          (session.state === "active" || session.provider === "claude" || usesPersonalRuntime)
           && this.#profileAllowsEstablishedSession(profile, session)
         ) {
-          activeSessions.push(session);
+          if (session.provider === "claude") {
+            const process = this.#store.readClaudeProcessAuthority({
+              providerThreadId: session.providerThreadId,
+              profileId: session.profileId,
+              runtimeScope: usesPersonalRuntime ? "personal" : "managed",
+            });
+            if (
+              process === null
+              || process.state !== "released"
+              || (process.sessionId !== null && process.sessionId !== session.id)
+            ) {
+              if (process === null) this.#quarantineSession(session.id);
+              continue;
+            }
+          }
+          sessionsToReconnect.push(session);
         }
       }
       if (page.isDone || page.continueAfterId === null) break;
       continueAfterId = page.continueAfterId;
     }
-    this.#scheduleRecoverySessionObservations(activeSessions);
+    this.#scheduleRecoverySessionObservations(sessionsToReconnect);
     this.#wakeInteractionDeadlinePump();
     this.#wakeSessionTaskPump();
+  }
+
+  async #recoverClaudeProcessAuthorities(signal: AbortSignal): Promise<void> {
+    for (const process of this.#store.listUnreleasedClaudeProcessAuthorities()) {
+      signal.throwIfAborted();
+      try {
+        await this.#releaseClaudeProcessAuthority(process, signal);
+      } catch (error: unknown) {
+        if (signal.aborted) throw signal.reason;
+        this.recordBackgroundDiagnostic("recovery_observation_failed", error);
+      }
+    }
+    // A crash may land after personal-session detach was durably staged but
+    // before its Claude child was released. The first recovery pass above now
+    // owns that exact release; finish the already-authorized detach in the same
+    // boot instead of requiring a second restart merely to observe `released`.
+    for (;;) {
+      const detaching = this.#store.listSessionPersonalRuntimeBindings({
+        provider: "claude",
+        state: "detaching",
+        limit: 500,
+      });
+      if (detaching.length === 0) break;
+      let progressed = false;
+      for (const binding of detaching) {
+        signal.throwIfAborted();
+        const session = this.#store.requireSession(binding.sessionId);
+        const process = this.#store.readClaudeProcessAuthority({
+          providerThreadId: binding.providerThreadId,
+          profileId: session.profileId,
+          runtimeScope: "personal",
+        });
+        if (process?.state !== "released") continue;
+        this.#store.completePersonalSessionDetach({ sessionId: binding.sessionId });
+        progressed = true;
+      }
+      if (!progressed) break;
+    }
+  }
+
+  async #recoverProfilePersonalAuthorityRevocations(signal: AbortSignal): Promise<void> {
+    for (const revocation of this.#store.listReleasingProfilePersonalAuthorityRevocations()) {
+      this.#profileAuthorityRevocationsPending.set(
+        revocation.profileId,
+        revocation.profileGeneration,
+      );
+    }
+    for (const revocation of this.#store.listReleasingProfilePersonalAuthorityRevocations()) {
+      signal.throwIfAborted();
+      try {
+        await this.#runProfilePersonalAuthorityRevocation(
+          revocation.profileId,
+          revocation.profileGeneration,
+          signal,
+        );
+        if (
+          this.#profileAuthorityRevocationsPending.get(revocation.profileId)
+          === revocation.profileGeneration
+        ) this.#profileAuthorityRevocationsPending.delete(revocation.profileId);
+      } catch (error: unknown) {
+        if (signal.aborted) throw signal.reason;
+        this.recordBackgroundDiagnostic("profile_authority_revocation_failed", error);
+      }
+    }
+  }
+
+  async #recoverProviderRuntimeAccountRevocations(signal: AbortSignal): Promise<void> {
+    for (const revocation of this.#store.listReleasingProviderRuntimeAccountRevocations()) {
+      signal.throwIfAborted();
+      this.#clearProfileFactAuthorities(
+        revocation.profileId,
+        revocation.provider,
+        revocation.runtimeScope,
+      );
+      await this.#serialize(`session-adoption:${revocation.provider}`, async () =>
+        await this.#serialize(`account:${revocation.profileId}`, async () =>
+          await this.#runProviderRuntimeAccountRevocation(
+            revocation,
+            signal,
+          )));
+    }
+  }
+
+  #scheduleClaudeProcessAuthorityRelease(key: ClaudeProcessAuthorityKey): void {
+    const task = Promise.resolve().then(async () => {
+      await this.#releaseClaudeProcessAuthority(
+        key,
+        this.#backgroundAbort.signal,
+      );
+    });
+    const tracked = task.catch((error: unknown) => {
+      if (this.#backgroundAbort.signal.aborted) return;
+      this.recordBackgroundDiagnostic("recovery_observation_failed", error);
+    });
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  #scheduleClaudeDisconnectRecovery(sessions: readonly SessionRecord[]): void {
+    if (this.#state !== "open" || sessions.length === 0) return;
+    const task = (async () => {
+      for (const disconnected of sessions) {
+        if (this.#state !== "open") return;
+        await this.#serializeSessionAuthority(
+          disconnected,
+          async () => {
+            let current: SessionRecord;
+            try {
+              current = this.#store.requireSession(disconnected.id);
+            } catch (error: unknown) {
+              if (error instanceof SelectionError && error.code === "NOT_FOUND") return;
+              throw error;
+            }
+            if (
+              current.profileId !== disconnected.profileId
+              || current.provider !== "claude"
+              || current.provider !== disconnected.provider
+              || current.providerThreadId === undefined
+              || current.providerThreadId !== disconnected.providerThreadId
+            ) return;
+
+            const binding = this.#store.readSessionPersonalRuntimeBinding(current.id, true);
+            const bindingMatches = binding !== null
+              && binding.provider === current.provider
+              && binding.providerThreadId === current.providerThreadId;
+            if (binding?.state === "active" && !bindingMatches) {
+              throw new ProviderRuntimeUnavailableError(
+                "The personal-home session binding no longer matches its durable session identity.",
+              );
+            }
+            const runtimeScope = bindingMatches ? "personal" : "managed";
+            const profile = this.#store.requireProfileById(current.profileId);
+            if (
+              current.state === "terminal"
+              || current.state === "recovery_required"
+              || !this.#profileAllowsEstablishedSession(profile, current)
+              || (bindingMatches && binding.state !== "active")
+            ) {
+              const process = this.#store.readClaudeProcessAuthority({
+                providerThreadId: current.providerThreadId,
+                profileId: current.profileId,
+                runtimeScope,
+              });
+              if (process !== null && process.state !== "released") {
+                await this.#releaseClaudeProcessAuthority(
+                  process,
+                  new AbortController().signal,
+                );
+              }
+              return;
+            }
+
+            // The disconnect callback can be delayed until a foreground
+            // recovery has already bound a replacement child. Re-observe the
+            // session under its authority tail so that healthy replacement is
+            // retained; the central Claude observation-recovery path releases
+            // only the exact currently persisted process when repair is needed.
+            await this.#ensureSessionObservedLocked(
+              current.id,
+              new AbortController().signal,
+            );
+          },
+          { allowDuringProjectionRecovery: true },
+        ).catch((error: unknown) => {
+          this.recordBackgroundDiagnostic("recovery_observation_failed", error);
+        });
+      }
+    })();
+    const tracked = task.catch((error: unknown) => {
+      if (this.#backgroundAbort.signal.aborted) return;
+      this.recordBackgroundDiagnostic("recovery_observation_failed", error);
+    });
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  #scheduleTerminalPersonalDetach(session: SessionRecord): void {
+    // The durable fence is already `detaching`, so it intentionally no longer
+    // satisfies the live-session account-authority predicate. Preserve the
+    // normal adoption/account/session lock order while releasing that fenced
+    // controller without trying to re-admit it as operational authority.
+    const task = this.#serialize(`session-adoption:${session.provider}`, async () =>
+      await this.#serializeProfileAuthorities([session.profileId], async () =>
+        await this.#serialize(`session:${session.id}`, async () => {
+          await this.#detachPersonalSession(session.id, this.#backgroundAbort.signal);
+        })));
+    const tracked = task.catch((error: unknown) => {
+      if (this.#backgroundAbort.signal.aborted) return;
+      this.recordBackgroundDiagnostic("session_adoption_failed", error);
+    });
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  #profileAuthorityRevocationIsPending(
+    profileId: ProfileRecord["id"],
+    processGeneration?: number,
+  ): boolean {
+    const pending = this.#profileAuthorityRevocationsPending.get(profileId);
+    return pending !== undefined
+      && (processGeneration === undefined || pending === processGeneration);
+  }
+
+  #providerRuntimeAccountRevocationIsPending(
+    profileId: ProfileRecord["id"],
+    profileGeneration: number,
+    provider: AdoptableProvider,
+    runtimeScope: RuntimeAccountScope,
+  ): boolean {
+    const revocation = this.#store.readProviderRuntimeAccountRevocation({
+      profileId,
+      provider,
+      runtimeScope,
+    });
+    return revocation?.state === "releasing"
+      && (provider === "claude" || revocation.profileGeneration === profileGeneration);
+  }
+
+  #profileHasControllingCodexAuthority(
+    profile: Pick<ProfileRecord, "id" | "processGeneration">,
+  ): boolean {
+    return this.#store.profileHasControllingCodexAuthority(profile.id);
+  }
+
+  #scheduleProfilePersonalAuthorityRevocation(
+    profile: Pick<ProfileRecord, "id" | "processGeneration">,
+  ): void {
+    this.#clearCodexAccountAttestations(profile.id);
+    // Persist and apply the complete authority fence before yielding to the
+    // asynchronous controller-release task. A daemon loss or a same-tick
+    // command after this callback must see recovery_required sessions, closed
+    // interactions, and retired work rather than a merely staged row.
+    const begun = this.#store.beginProfilePersonalAuthorityRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      workStore: this.#work,
+    });
+    this.#notifyAffectedWork(begun.affectedWorkIds);
+    for (const sessionId of begun.sessionIds) {
+      this.#sessionProviderConnections.delete(sessionId);
+      this.#clearSessionFactAuthority(sessionId);
+      this.#sessionObservationFailures.delete(sessionId);
+      this.#sessionResubscriptionConnections.delete(sessionId);
+      this.#sessionsAwaitingResubscription.delete(sessionId);
+      this.#eventWaiters.notify(sessionId);
+    }
+    for (const interaction of begun.interactions) {
+      if (interaction.sessionId !== null) this.#eventWaiters.notify(interaction.sessionId);
+    }
+    this.#profileAuthorityRevocationsPending.set(profile.id, profile.processGeneration);
+    if (this.#profileAuthorityRevocationTasks.has(profile.id)) return;
+    const task = Promise.resolve().then(async () => {
+      await this.#runProfilePersonalAuthorityRevocation(
+        profile.id,
+        profile.processGeneration,
+        this.#backgroundAbort.signal,
+      );
+      if (this.#profileAuthorityRevocationsPending.get(profile.id) === profile.processGeneration) {
+        this.#profileAuthorityRevocationsPending.delete(profile.id);
+      }
+    });
+    const tracked = task.catch((error: unknown) => {
+      if (this.#backgroundAbort.signal.aborted) return;
+      this.recordBackgroundDiagnostic("profile_authority_revocation_failed", error);
+    });
+    this.#profileAuthorityRevocationTasks.set(profile.id, tracked);
+    this.#background.add(tracked);
+    void tracked.then(() => {
+      if (this.#profileAuthorityRevocationTasks.get(profile.id) === tracked) {
+        this.#profileAuthorityRevocationTasks.delete(profile.id);
+      }
+      this.#background.delete(tracked);
+    });
+  }
+
+  async #runProfilePersonalAuthorityRevocation(
+    profileId: ProfileRecord["id"],
+    expectedGeneration: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    signal.throwIfAborted();
+    const revoke = async (): Promise<void> => {
+      const profile = this.#store.requireProfileById(profileId);
+      if (profile.processGeneration !== expectedGeneration) {
+        throw new Error("PROFILE_PERSONAL_AUTHORITY_REVOCATION_STALE");
+      }
+      const existing = this.#store.readProfilePersonalAuthorityRevocation(profileId);
+      if (existing?.state === "completed") {
+        if (existing.profileGeneration !== expectedGeneration || profile.state !== "signed_out") {
+          throw new Error("PROFILE_PERSONAL_AUTHORITY_REVOCATION_CONFLICT");
+        }
+        return;
+      }
+      const bindings = this.#store.listProfileControllingPersonalRuntimeBindings(profileId)
+        .filter((binding) => binding.provider === "codex");
+      const interactions = this.#store.listOpenInteractionsForProfile(
+        profileId,
+        expectedGeneration,
+      ).filter((interaction) => interaction.authority.provider === "codex");
+      const sessionIds = this.#nonterminalSessionIdsForProfile(profileId)
+        .filter((sessionId) => this.#store.requireSession(sessionId).provider === "codex");
+      const keys = [
+        ...new Set([
+          ...sessionIds.map((sessionId) => `session:${sessionId}`),
+          ...bindings.map((binding) => `session:${binding.sessionId}`),
+        ]),
+        ...interactions.map((interaction) => `interaction:${interaction.publicId}`),
+      ];
+      await this.#serializeKeys(keys, async () => {
+        signal.throwIfAborted();
+        const begun = this.#store.beginProfilePersonalAuthorityRevocation({
+          profileId,
+          expectedGeneration,
+          workStore: this.#work,
+        });
+        this.#notifyAffectedWork(begun.affectedWorkIds);
+        for (const sessionId of begun.sessionIds) {
+          this.#sessionProviderConnections.delete(sessionId);
+          this.#clearSessionFactAuthority(sessionId);
+          this.#sessionObservationFailures.delete(sessionId);
+          this.#sessionResubscriptionConnections.delete(sessionId);
+          this.#sessionsAwaitingResubscription.delete(sessionId);
+          this.#eventWaiters.notify(sessionId);
+        }
+        for (const interaction of begun.interactions) {
+          if (interaction.sessionId !== null) this.#eventWaiters.notify(interaction.sessionId);
+        }
+
+        const exactProfile = this.#store.requireProfileById(profileId, {
+          includeRemoved: true,
+        });
+        if (this.#codex.releaseOwnedAuthority !== undefined) {
+          await this.#codex.releaseOwnedAuthority({
+            authority: this.#profileAuthority(exactProfile, "codex"),
+            signal,
+          });
+        } else {
+          await this.#codex.close();
+        }
+        if (begun.bindings.some((binding) => binding.provider === "codex")) {
+          if (this.#personalCodex === undefined) {
+            throw new ProviderRuntimeUnavailableError(
+              "Personal-home Codex control is unavailable during authority release.",
+            );
+          }
+          if (this.#personalCodex.releaseOwnedAuthority !== undefined) {
+            await this.#personalCodex.releaseOwnedAuthority({
+              authority: this.#personalAuthorityForProfile(exactProfile, this.#providerAuthority(exactProfile, "codex")),
+              signal,
+            });
+          } else {
+            await this.#personalCodex.close();
+          }
+        }
+        for (const binding of begun.bindings) {
+          if (binding.provider !== "codex") throw new Error("CODEX_REVOCATION_SCOPE_MISMATCH");
+          signal.throwIfAborted();
+          const current = this.#store.readSessionPersonalRuntimeBinding(
+            binding.sessionId,
+            true,
+          );
+          if (current === null || current.state === "detached") continue;
+          this.#store.completePersonalSessionDetach({ sessionId: binding.sessionId });
+        }
+        this.#store.completeProfilePersonalAuthorityRevocation({
+          profileId,
+          expectedGeneration,
+        });
+      });
+    };
+    await this.#serialize("session-adoption:codex", async () =>
+      await this.#serialize(`account:${profileId}`, revoke));
+  }
+
+  #nonterminalSessionIdsForProfile(
+    profileId: ProfileRecord["id"],
+  ): readonly SessionRecord["id"][] {
+    const sessionIds: SessionRecord["id"][] = [];
+    let afterId: string | null = null;
+    for (;;) {
+      const page = this.#store.listCloudSessionPage({ afterId, limit: 100 });
+      for (const session of page.sessions) {
+        if (session.profileId === profileId && session.state !== "terminal") {
+          sessionIds.push(session.id);
+        }
+      }
+      if (page.isDone || page.continueAfterId === null) return sessionIds;
+      afterId = page.continueAfterId;
+    }
   }
 
   async #recoverPreparedWorkEffects(signal: AbortSignal): Promise<void> {
@@ -2780,7 +3722,7 @@ export class HraService {
     let failed = 0;
     for (const interaction of due) {
       if (this.#interactionDeadlineMaintenanceStopped()) break;
-      await this.#serialize(`interaction:${interaction.publicId}`, async () => {
+      await this.#serializeInteractionAuthority(interaction.publicId, async () => {
         const current = this.#store.requireInteraction(interaction.publicId);
         if (current.state !== "pending" || current.deadlineAt > this.#now()) return;
         await this.#expireInteractionAtDeadline(
@@ -2949,16 +3891,35 @@ export class HraService {
     current: InteractionRecord,
     signal: AbortSignal,
   ): Promise<void> {
+    const profile = this.#store.requireProfileById(current.authority.profileId);
+    if (!this.#interactionProfileAuthorityIsUsable(current)) {
+      const terminal = this.#store.expireInteraction({
+        id: current.publicId,
+        expectedRevision: current.revision,
+      });
+      this.#appendInteractionState(terminal);
+      return;
+    }
     const runtime = this.#runtimeForInteraction(current);
     let responseDigest: string;
     try {
       await this.#daemonAuthority.assertCurrent();
+      await this.#assertPersonalInteractionAccountAuthority(current, profile, signal);
       const validated = await runtime.validateInteractionTimeout({
         authority: this.#interactionAuthority(current),
         provider: current.authority,
         signal,
       });
+      await this.#assertPersonalInteractionAccountAuthority(current, profile, signal);
       responseDigest = validated.responseDigest;
+      if (!this.#interactionProfileAuthorityIsUsable(current)) {
+        const terminal = this.#store.expireInteraction({
+          id: current.publicId,
+          expectedRevision: current.revision,
+        });
+        this.#appendInteractionState(terminal);
+        return;
+      }
     } catch (error: unknown) {
       if (signal.aborted) return;
       const latest = this.#store.requireInteraction(current.publicId);
@@ -2993,16 +3954,24 @@ export class HraService {
     }
     try {
       await this.#daemonAuthority.assertCurrent();
+      await this.#assertPersonalInteractionAccountAuthority(prepared, profile, signal);
       await runtime.timeoutInteraction({
         authority: this.#interactionAuthority(prepared),
         provider: prepared.authority,
         signal,
       });
+      await this.#assertInteractionAccountAuthorityAfterProviderEffect(
+        prepared,
+        profile,
+        signal,
+      );
     } catch (error: unknown) {
       if (signal.aborted) return;
       const latest = this.#store.requireInteraction(prepared.publicId);
       if (latest.state !== "response_prepared" || latest.revision !== prepared.revision) return;
-      const terminal = providerFailureCode(error) === "INDETERMINATE_EFFECT"
+      const indeterminate = error instanceof IndeterminateLocalCommitError
+        || providerFailureCode(error) === "INDETERMINATE_EFFECT";
+      const terminal = indeterminate
         ? this.#store.markInteractionResolutionUnknown({
             id: latest.publicId,
             expectedRevision: latest.revision,
@@ -3054,7 +4023,7 @@ export class HraService {
           : null;
     for (const owners of this.#sessionSwitchDeferredFacts.values()) {
       for (const owner of owners) {
-        if (!sameProviderUsageAuthority(owner.authority, authority)) {
+        if (!sameProviderUsageAuthority(owner.authority, authority) || owner.source !== value.source) {
           continue;
         }
         // A Codex connection is account-wide and can serve many sessions.
@@ -3068,7 +4037,29 @@ export class HraService {
             "SESSION_SWITCH_DEFERRED_FACT_LIMIT_EXCEEDED",
           ));
         } else {
-          owner.facts.push(value);
+          // The producer may retain its callback object after returning. Freeze
+          // routing primitives, including nested interaction authority, before
+          // any drain await can observe later caller-side mutations.
+          const captured: SessionSwitchDeferredFact = value.provider === "claude"
+            ? { ...value, fact: { ...value.fact } }
+            : {
+                ...value,
+                fact: value.fact.type === "interactionRequested" || value.fact.type === "interactionResolved"
+                  ? { ...value.fact, provider: {
+                      ...value.fact.provider,
+                      requestId: { ...value.fact.provider.requestId },
+                    } }
+                  : { ...value.fact },
+              };
+          owner.facts.push({
+            ...captured,
+            authority: { ...value.authority },
+            observedConnectionId: value.provider === "claude"
+              ? value.fact.connectionId
+              : value.fact.type === "interactionRequested" || value.fact.type === "interactionResolved"
+                ? value.fact.provider.connectionId
+                : "connectionId" in value.fact ? value.fact.connectionId ?? null : null,
+          });
         }
         return true;
       }
@@ -3133,6 +4124,11 @@ export class HraService {
       attemptId: record.attemptId,
       authority,
       providerThreadId,
+      source: sameProviderUsageAuthority(record.sourceAuthority, authority)
+        && providerThreadId === record.sourceProviderThreadId
+        && this.#sessionHasActivePersonalBinding(this.#store.requireSession(sessionId))
+        ? "personal"
+        : "managed",
       facts: [],
       overflowed: false,
     };
@@ -3244,11 +4240,20 @@ export class HraService {
         return false;
       }
       try {
+        const drain: SessionSwitchFactDrain = {
+          sessionId,
+          owner,
+          connectionId: value.observedConnectionId,
+        };
+        this.#assertSessionSwitchFactDrain(drain, value.authority.id, sessionId);
         if (value.provider === "claude") {
-          await this.#observeClaudeFactAdmitted(value.authority, value.fact);
+          const translator = value.source === "personal" ? this.#personalClaudeFacts : this.#claudeFacts;
+          if (translator === undefined) throw new Error("CLAUDE_FACT_SOURCE_UNAVAILABLE");
+          await this.#observeClaudeFactAdmitted(value.authority, value.fact, value.source, translator, drain);
         } else {
-          await this.#observeProviderFactAdmitted(value.provider, value.authority, value.fact);
+          await this.#observeProviderFactAdmitted(value.authority, value.fact, value.provider, value.source, drain);
         }
+        this.#assertSessionSwitchFactDrain(drain, value.authority.id, sessionId);
       } catch (error: unknown) {
         if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
         this.recordBackgroundDiagnostic("provider_switch_fact_flush_failed", error);
@@ -3287,24 +4292,32 @@ export class HraService {
   }
 
   async observeCodexFact(authority: ProfileAuthority, fact: CodexFact): Promise<void> {
-    await this.#observeProviderFact("codex", authority, fact);
+    await this.#observeProviderFact(authority, fact, "codex", "managed");
+  }
+
+  async observePersonalCodexFact(
+    authority: ProfileAuthority,
+    fact: CodexFact,
+  ): Promise<void> {
+    await this.#observeProviderFact(authority, fact, "codex", "personal");
   }
 
   /** Applies one neutral fact emitted by the isolated Devin ACP runtime. */
   async observeDevinFact(authority: ProfileAuthority, fact: CodexFact): Promise<void> {
-    await this.#observeProviderFact("devin", authority, fact);
+    await this.#observeProviderFact(authority, fact, "devin", "managed");
   }
 
   async #observeProviderFact(
-    provider: "codex" | "devin",
     authority: ProfileAuthority,
     fact: CodexFact,
+    provider: "codex" | "devin",
+    source: ProviderFactSource,
   ): Promise<void> {
     const finish = this.#beginFactOperation();
     if (finish === null) return;
     try {
-      if (this.#deferSessionSwitchFact({ provider, authority, fact })) return;
-      await this.#observeProviderFactAdmitted(provider, authority, fact);
+      if (this.#deferSessionSwitchFact({ provider, authority, fact, source })) return;
+      await this.#observeProviderFactAdmitted(authority, fact, provider, source);
     } catch (error: unknown) {
       if (error instanceof InteractionPersistenceBoundaryError) this.#scheduleStop();
       if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
@@ -3322,11 +4335,26 @@ export class HraService {
    * therefore provider-agnostic by construction.
    */
   async observeClaudeFact(authority: ProfileAuthority, fact: ClaudeSessionFact): Promise<void> {
+    await this.#observeTranslatedClaudeFact(this.#claudeFacts, authority, fact, "managed");
+  }
+
+  /** Facts from the separately owned personal-home Claude controller. */
+  async observePersonalClaudeFact(authority: ProfileAuthority, fact: ClaudeSessionFact): Promise<void> {
+    if (this.#personalClaudeFacts === undefined) return;
+    await this.#observeTranslatedClaudeFact(this.#personalClaudeFacts, authority, fact, "personal");
+  }
+
+  async #observeTranslatedClaudeFact(
+    translator: ClaudeSessionFactTranslator,
+    authority: ProfileAuthority,
+    fact: ClaudeSessionFact,
+    source: ProviderFactSource,
+  ): Promise<void> {
     const finish = this.#beginFactOperation();
     if (finish === null) return;
     try {
-      if (this.#deferSessionSwitchFact({ provider: "claude", authority, fact })) return;
-      await this.#observeClaudeFactAdmitted(authority, fact);
+      if (this.#deferSessionSwitchFact({ provider: "claude", authority, fact, source })) return;
+      await this.#observeClaudeFactAdmitted(authority, fact, source, translator);
     } catch (error: unknown) {
       if (error instanceof InteractionPersistenceBoundaryError) this.#scheduleStop();
       if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
@@ -3339,8 +4367,20 @@ export class HraService {
   async #observeClaudeFactAdmitted(
     authority: ProfileAuthority,
     fact: ClaudeSessionFact,
+    source: ProviderFactSource,
+    translator: ClaudeSessionFactTranslator,
+    drain?: SessionSwitchFactDrain,
   ): Promise<void> {
     await this.#daemonAuthority.assertCurrent();
+    if (drain !== undefined) {
+      this.#assertSessionSwitchFactDrain(drain, authority.id);
+      if (drain.owner.authority.provider !== "claude" || drain.owner.source !== source
+        || fact.providerThreadId !== drain.owner.providerThreadId
+        || fact.connectionId !== drain.connectionId
+        || !sameProviderUsageAuthority(drain.owner.authority, this.#providerAccountAuthority(authority))) {
+        throw new Error("SESSION_SWITCH_FACT_DRAIN_AUTHORITY_MISMATCH");
+      }
+    }
     if (!this.#profileAuthorityIsCurrent(authority)) return;
     const session = this.#store.findSessionByProviderThread(
       authority.id,
@@ -3357,7 +4397,8 @@ export class HraService {
       }
       return;
     }
-    if (!this.#authorityMatchesSession(authority, session)) return;
+    if (!this.#authorityMatchesSession(authority, session)
+      || !this.#sessionUsesFactSource(session, "claude", source)) return;
     const currentConnectionId = this.#sessionProviderConnections.get(session.id);
     if (currentConnectionId !== undefined && currentConnectionId !== fact.connectionId) return;
     if (currentConnectionId === undefined) {
@@ -3375,7 +4416,7 @@ export class HraService {
     }
     let translated: ReturnType<ClaudeSessionFactTranslator["translate"]>;
     try {
-      translated = this.#claudeFacts.translate(
+      translated = translator.translate(
         this.#providerAccountAuthority(authority),
         fact,
       );
@@ -3386,7 +4427,7 @@ export class HraService {
       return;
     }
     const usageComponents: ProviderUsageComponent[] = [];
-    for (const observation of translated.usageObservations) {
+    for (const observation of source === "managed" ? translated.usageObservations : []) {
       try {
         usageComponents.push(this.#claudeUsageComponent(session.id, observation));
       } catch (error: unknown) {
@@ -3394,10 +4435,14 @@ export class HraService {
       }
     }
     for (const neutral of translated.timelineFacts) {
-      await this.#observeProviderFactAdmitted("claude", authority, neutral);
+      await this.#observeProviderFactAdmitted(authority, neutral, "claude", source, drain);
     }
     for (const component of usageComponents) {
-      this.#enqueueProviderUsagePersistence(component);
+      if (component.source === "claude_result") {
+        await this.#enqueueOrderedClaudeAccounting(component, drain);
+      } else {
+        this.#enqueueProviderUsagePersistence(component);
+      }
     }
   }
 
@@ -3443,25 +4488,76 @@ export class HraService {
   /**
    * Admission freezes the complete component synchronously. The timer starts
    * persistence only after the provider callback can return; the owned task
-   * remains in #background until every older admitted component was attempted.
+   * remains in #background until every published component was attempted.
    */
   #enqueueProviderUsagePersistence(observation: ProviderUsageComponent): void {
+    const job = this.#reserveProviderUsagePersistence(observation);
+    if (job !== null) this.#publishProviderUsagePersistence(job);
+  }
+
+  #reserveProviderUsagePersistence(
+    observation: ProviderUsageComponent,
+  ): ProviderUsagePersistenceJob | null {
     if (this.#providerUsagePersistencePending >= PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT) {
       this.#recordProviderUsageDiagnostic("provider_usage_queue_overflow");
-      return;
+      return null;
     }
     const owner = observation.turn === null
       ? undefined
       : this.#providerUsageTurnBindings.get(observation.turn.sessionId);
-    this.#providerUsagePersistenceQueue.push({
+    const job = {
       observation,
       turnBindingSettlement: owner !== undefined
         && sameProviderUsageAuthority(owner.authority, observation.authority)
         ? owner.settlement
         : null,
-    });
+    };
     this.#providerUsagePersistencePending += 1;
+    return job;
+  }
+
+  #publishProviderUsagePersistence(job: ProviderUsagePersistenceJob): void {
+    this.#providerUsagePersistenceQueue.push(job);
     this.#scheduleProviderUsagePersistence();
+  }
+
+  async #enqueueOrderedClaudeAccounting(
+    observation: Extract<ProviderUsageComponent, { source: "claude_result" }>,
+    drain: SessionSwitchFactDrain | undefined,
+  ): Promise<void> {
+    const job = this.#reserveProviderUsagePersistence(observation);
+    if (job === null) return;
+    let published = false;
+    const publish = (): void => {
+      this.#publishProviderUsagePersistence(job);
+      published = true;
+    };
+    // Native writes can await the reader while owning these same tails. Admit
+    // only a bounded immutable accounting job here, never wait in the reader.
+    // The ranked FIFO places publication after all earlier timeline facts;
+    // the informational SQLite write still runs outside locks on its timer.
+    const task = drain === undefined
+      ? this.#serializeProfileAuthorities([observation.authority.profileId], async () =>
+          await this.#serialize(`session:${observation.turn.sessionId}`, publish))
+      : (async () => {
+          await this.#daemonAuthority.assertCurrent();
+          this.#assertSessionSwitchFactDrain(
+            drain, observation.authority.profileId, observation.turn.sessionId,
+          );
+          publish();
+        })();
+    const tracked = task.catch((error: unknown) => {
+      // A lost daemon fence before publication is not permission for a stale
+      // writer. Own-provider changes alone do not reclassify admitted history.
+      this.#recordProviderUsageDiagnostic("provider_usage_persistence_failed", error);
+    }).finally(() => {
+      if (!published) this.#providerUsagePersistencePending -= 1;
+    });
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+    // The explicit drain owner already owns the ranked locks; join its local
+    // proof check before that owner retires, without acquiring another tail.
+    if (drain !== undefined) await tracked;
   }
 
   #beginProviderUsageTurnBinding(
@@ -3576,10 +4672,1150 @@ export class HraService {
     }
   }
 
+  #personalSessionRuntime(provider: AdoptableProvider): SessionRuntimePort<ReviewedRuntimeProfile> {
+    let runtime: CodexRuntimePort | ClaudeRuntimePort | undefined;
+    switch (provider) {
+      case "codex": runtime = this.#personalCodex; break;
+      case "claude": runtime = this.#personalClaude; break;
+    }
+    if (runtime !== undefined) return runtime;
+    throw new ProviderRuntimeUnavailableError(
+      `Personal-home ${provider} session control is unavailable on this daemon.`,
+    );
+  }
+
+  #personalAccountAttestationKey(
+    provider: AdoptableProvider,
+    profileId: ProfileRecord["id"],
+    runtimeScope: RuntimeAccountScope = "personal",
+  ): string {
+    return `${runtimeScope}:${provider}:${profileId}`;
+  }
+
+  #clearCodexAccountAttestations(profileId: ProfileRecord["id"]): void {
+    this.#personalAccountAttestations.delete(
+      this.#personalAccountAttestationKey("codex", profileId),
+    );
+    this.#personalAccountAttestations.delete(
+      this.#personalAccountAttestationKey("codex", profileId, "managed"),
+    );
+    this.#clearProfileFactAuthorities(profileId, "codex");
+  }
+
+  #scheduleProviderRuntimeAccountRevocation(
+    profile: Pick<ProfileRecord, "id" | "processGeneration">,
+    provider: AdoptableProvider,
+    runtimeScope: RuntimeAccountScope,
+    currentAccountKey: string | null,
+  ): void {
+    this.#beginProviderRuntimeAccountRevocationFence(
+      profile,
+      provider,
+      runtimeScope,
+      currentAccountKey,
+    );
+    const revocationKey = `${runtimeScope}:${provider}:${profile.id}`;
+    // Staging is deliberately above this in-memory dedupe. A second B -> C
+    // observation must durably advance the same job even while its B release
+    // worker is awaiting the provider.
+    if (this.#providerAccountRevocationTasks.has(revocationKey)) return;
+    const task = Promise.resolve().then(async () => {
+      await this.#serialize(`session-adoption:${provider}`, async () =>
+        await this.#serialize(`account:${profile.id}`, async () =>
+          await this.#runProviderRuntimeAccountRevocation({
+            profileId: profile.id,
+            profileGeneration: profile.processGeneration,
+            provider,
+            runtimeScope,
+          }, this.#backgroundAbort.signal)));
+    });
+    const tracked = task.catch((error: unknown) => {
+      if (this.#backgroundAbort.signal.aborted) return;
+      this.recordBackgroundDiagnostic(
+        "provider_account_authority_revocation_failed",
+        error,
+      );
+    });
+    this.#providerAccountRevocationTasks.set(revocationKey, tracked);
+    this.#background.add(tracked);
+    void tracked.then(() => {
+      if (this.#providerAccountRevocationTasks.get(revocationKey) === tracked) {
+        this.#providerAccountRevocationTasks.delete(revocationKey);
+      }
+      this.#background.delete(tracked);
+    });
+  }
+
+  #beginProviderRuntimeAccountRevocationFence(
+    profile: Pick<ProfileRecord, "id" | "processGeneration">,
+    provider: AdoptableProvider,
+    runtimeScope: RuntimeAccountScope,
+    currentAccountKey: string | null,
+  ): ReturnType<StateStore["beginProviderRuntimeAccountRevocation"]> {
+    const attestationKey = this.#personalAccountAttestationKey(
+      provider,
+      profile.id,
+      runtimeScope,
+    );
+    this.#personalAccountAttestations.delete(attestationKey);
+    this.#clearProfileFactAuthorities(profile.id, provider, runtimeScope);
+    const begun = this.#store.beginProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      expectedGeneration: profile.processGeneration,
+      provider,
+      runtimeScope,
+      currentAccountKey,
+      workStore: this.#work,
+    });
+    this.#notifyAffectedWork(begun.affectedWorkIds);
+    for (const interaction of begun.interactions) {
+      if (interaction.sessionId !== null) this.#eventWaiters.notify(interaction.sessionId);
+    }
+    for (const sessionId of begun.sessionIds) {
+      this.#sessionProviderConnections.delete(sessionId);
+      this.#clearSessionFactAuthority(sessionId);
+      this.#sessionObservationFailures.delete(sessionId);
+      this.#sessionResubscriptionConnections.delete(sessionId);
+      this.#sessionsAwaitingResubscription.delete(sessionId);
+      this.#eventWaiters.notify(sessionId);
+    }
+    return begun;
+  }
+
+  async #runProviderRuntimeAccountRevocation(
+    selector: Pick<
+      ProviderRuntimeAccountRevocationRecord,
+      "profileId" | "profileGeneration" | "provider" | "runtimeScope"
+    >,
+    signal: AbortSignal,
+    options: Readonly<{ allowEmptyPersonalCodexScope?: boolean }> = {},
+  ): Promise<void> {
+    for (;;) {
+      signal.throwIfAborted();
+      const current = this.#store.readProviderRuntimeAccountRevocation({
+        profileId: selector.profileId,
+        provider: selector.provider,
+        runtimeScope: selector.runtimeScope,
+      });
+      if (current === null || current.state === "completed") return;
+      if (current.profileGeneration !== selector.profileGeneration) {
+        throw new Error("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_STALE");
+      }
+      const exact = this.#store.requireProfileById(selector.profileId, {
+        includeRemoved: true,
+      });
+      if (exact.processGeneration !== selector.profileGeneration) {
+        throw new Error("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_STALE");
+      }
+      const restaged = this.#store.beginProviderRuntimeAccountRevocation({
+        profileId: current.profileId,
+        expectedGeneration: current.profileGeneration,
+        provider: current.provider,
+        runtimeScope: current.runtimeScope,
+        currentAccountKey: current.currentAccountKey,
+        workStore: this.#work,
+      });
+      this.#notifyAffectedWork(restaged.affectedWorkIds);
+      for (const interaction of restaged.interactions) {
+        if (interaction.sessionId !== null) this.#eventWaiters.notify(interaction.sessionId);
+      }
+      for (const sessionId of restaged.sessionIds) {
+        this.#sessionProviderConnections.delete(sessionId);
+        this.#clearSessionFactAuthority(sessionId);
+        this.#sessionObservationFailures.delete(sessionId);
+        this.#sessionResubscriptionConnections.delete(sessionId);
+        this.#sessionsAwaitingResubscription.delete(sessionId);
+        this.#eventWaiters.notify(sessionId);
+      }
+      const revision = restaged.revocation.revision;
+      if (current.provider === "codex") {
+        // The account callback durably stages the exact observed identity
+        // before it returns. The real Codex barrier also retires this exact
+        // generation before this worker can run, so any ordinary account read
+        // here would either fail AUTHORITY_STALE or incorrectly relaunch the
+        // authority we are releasing. Await only the nonlaunching close
+        // custody. A concurrent B -> C callback advances the durable revision
+        // synchronously and the completion read below covers that latest key.
+        const runtime = current.runtimeScope === "personal"
+          ? this.#personalCodex
+          : this.#codex;
+        const emptyPersonalScopeMayCloseWithoutRuntime =
+          options.allowEmptyPersonalCodexScope === true
+          && current.runtimeScope === "personal"
+          && restaged.bindings.length === 0;
+        if (!emptyPersonalScopeMayCloseWithoutRuntime) {
+          if (runtime?.releaseOwnedAuthority === undefined) {
+            throw new ProviderRuntimeUnavailableError(
+              `The ${current.runtimeScope} Codex runtime cannot safely release account authority.`,
+            );
+          }
+          await runtime.releaseOwnedAuthority({
+            authority: current.runtimeScope === "personal"
+              ? this.#personalAuthorityForProfile(exact, this.#providerAuthority(exact, "codex"))
+              : this.#profileAuthority(exact, "codex"),
+            signal,
+          });
+        }
+      } else {
+        // Include unbound claimed/releasing processes: the exact PID/start
+        // custody record, not a session lookup, is the release authority.
+        let afterProviderThreadId: string | null = null;
+        for (;;) {
+          const page = this.#store.listUnreleasedClaudeProcessAuthorityPage({
+            profileId: current.profileId,
+            runtimeScope: current.runtimeScope,
+            afterProviderThreadId,
+            limit: 100,
+          });
+          for (const process of page.authorities) {
+            signal.throwIfAborted();
+            await this.#releaseClaudeProcessAuthority(process, signal);
+          }
+          if (page.continueAfterProviderThreadId === null) break;
+          afterProviderThreadId = page.continueAfterProviderThreadId;
+        }
+      }
+      if (current.runtimeScope === "personal") {
+        let afterSessionId: string | null = null;
+        for (;;) {
+          const page = this.#store.listProfileDetachingPersonalRuntimeBindingPage({
+            profileId: current.profileId,
+            provider: current.provider,
+            afterSessionId,
+            limit: 500,
+          });
+          for (const binding of page.bindings) {
+            this.#clearSessionFactAuthority(binding.sessionId);
+            this.#store.completePersonalSessionDetach({
+              sessionId: binding.sessionId,
+              archive: false,
+            });
+          }
+          if (page.continueAfterSessionId === null) break;
+          afterSessionId = page.continueAfterSessionId;
+        }
+      }
+
+      if (current.provider === "codex") {
+        // A replacement observed while release was in flight was staged
+        // synchronously before its callback returned. Since release completed
+        // afterward, the same controller retirement covers that latest
+        // revision without trying to reopen a retired generation for a read.
+        const released = this.#store.readProviderRuntimeAccountRevocation({
+          profileId: current.profileId,
+          provider: current.provider,
+          runtimeScope: current.runtimeScope,
+        });
+        if (released === null || released.state === "completed") return;
+        if (released.profileGeneration !== current.profileGeneration) {
+          throw new Error("PROVIDER_ACCOUNT_AUTHORITY_REVOCATION_STALE");
+        }
+        this.#store.completeProviderRuntimeAccountRevocation({
+          profileId: released.profileId,
+          expectedGeneration: released.profileGeneration,
+          provider: released.provider,
+          runtimeScope: released.runtimeScope,
+          expectedRevision: released.revision,
+        });
+        return;
+      }
+
+      const observedAccountKey = await this.#readClaudeRuntimeAccountKeyForRevocation(
+        current,
+        exact,
+        signal,
+      );
+      const latest = this.#store.readProviderRuntimeAccountRevocation({
+        profileId: current.profileId,
+        provider: current.provider,
+        runtimeScope: current.runtimeScope,
+      });
+      if (latest === null || latest.state === "completed") return;
+      if (
+        latest.revision !== revision
+        || latest.currentAccountKey !== current.currentAccountKey
+      ) continue;
+      if (observedAccountKey !== current.currentAccountKey) {
+        const advanced = this.#store.beginProviderRuntimeAccountRevocation({
+          profileId: current.profileId,
+          expectedGeneration: current.profileGeneration,
+          provider: current.provider,
+          runtimeScope: current.runtimeScope,
+          currentAccountKey: observedAccountKey,
+          workStore: this.#work,
+        });
+        this.#notifyAffectedWork(advanced.affectedWorkIds);
+        continue;
+      }
+      this.#store.completeProviderRuntimeAccountRevocation({
+        profileId: current.profileId,
+        expectedGeneration: current.profileGeneration,
+        provider: current.provider,
+        runtimeScope: current.runtimeScope,
+        expectedRevision: revision,
+      });
+      return;
+    }
+  }
+
+  async #releaseCodexAuthorityForAccountMutationLocked(
+    profile: Pick<ProfileRecord, "id" | "processGeneration">,
+    signal: AbortSignal,
+    options: Readonly<{ deferManagedRelease?: boolean }> = {},
+  ): Promise<void> {
+    for (const runtimeScope of ["personal", "managed"] as const) {
+      const existing = this.#store.readProviderRuntimeAccountRevocation({
+        profileId: profile.id,
+        provider: "codex",
+        runtimeScope,
+      });
+      if (
+        existing?.state === "completed"
+        && existing.profileGeneration === profile.processGeneration
+        && existing.currentAccountKey === null
+      ) {
+        if (runtimeScope === "managed" && options.deferManagedRelease === true) {
+          throw new ProviderRuntimeUnavailableError(
+            "Managed Codex authority already ended in this profile generation. Restart HRA before reconciling or retrying account logout.",
+          );
+        }
+        continue;
+      }
+      if (runtimeScope === "managed" && options.deferManagedRelease === true) {
+        // Logout must durably fence every session before provider dispatch,
+        // while retaining the one exact managed client that owns account/logout.
+        // Unlike the ordinary scheduler, this intentionally creates no worker
+        // that could race and close that client before the effect begins.
+        this.#beginProviderRuntimeAccountRevocationFence(
+          profile,
+          "codex",
+          runtimeScope,
+          null,
+        );
+        continue;
+      }
+      // A null replacement key is an intentional complete-scope fence: login
+      // and logout retire every Codex session/controller, native or adopted,
+      // even when its stored key names the account being changed.
+      this.#scheduleProviderRuntimeAccountRevocation(
+        profile,
+        "codex",
+        runtimeScope,
+        null,
+      );
+      await this.#runProviderRuntimeAccountRevocation({
+        profileId: profile.id,
+        profileGeneration: profile.processGeneration,
+        provider: "codex",
+        runtimeScope,
+      }, signal, { allowEmptyPersonalCodexScope: true });
+      const completed = this.#store.readProviderRuntimeAccountRevocation({
+        profileId: profile.id,
+        provider: "codex",
+        runtimeScope,
+      });
+      if (
+        completed?.state !== "completed"
+        || completed.profileGeneration !== profile.processGeneration
+        || completed.currentAccountKey !== null
+      ) {
+        throw new ProviderRuntimeUnavailableError(
+          `${runtimeScope === "personal" ? "Personal-home" : "Managed"} Codex authority did not finish releasing before the account mutation.`,
+        );
+      }
+    }
+  }
+
+  async #completeManagedCodexLogoutAuthorityReleaseLocked(
+    profile: Pick<ProfileRecord, "id" | "processGeneration">,
+  ): Promise<void> {
+    // Once account/logout crossed its durable effect boundary, request
+    // cancellation no longer owns cleanup. Retire the exact client with an
+    // independent signal, while retaining daemon-fence checks around the
+    // nonlaunching release and its durable completion.
+    const releaseSignal = new AbortController().signal;
+    await this.#daemonAuthority.assertCurrent();
+    let releaseFailure: unknown;
+    try {
+      await this.#runProviderRuntimeAccountRevocation({
+        profileId: profile.id,
+        profileGeneration: profile.processGeneration,
+        provider: "codex",
+        runtimeScope: "managed",
+      }, releaseSignal);
+    } catch (error: unknown) {
+      releaseFailure = error;
+    }
+    await this.#daemonAuthority.assertCurrent();
+    if (releaseFailure !== undefined) {
+      throw releaseFailure instanceof Error
+        ? releaseFailure
+        : new Error("Managed Codex controller release failed.", { cause: releaseFailure });
+    }
+    const completed = this.#store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider: "codex",
+      runtimeScope: "managed",
+    });
+    if (
+      completed?.state !== "completed"
+      || completed.profileGeneration !== profile.processGeneration
+      || completed.currentAccountKey !== null
+    ) {
+      throw new ProviderRuntimeUnavailableError(
+        "Managed Codex authority did not finish releasing after account logout dispatch.",
+      );
+    }
+  }
+
+  async #readClaudeRuntimeAccountKeyForRevocation(
+    revocation: ProviderRuntimeAccountRevocationRecord,
+    profile: ProfileRecord,
+    signal: AbortSignal,
+  ): Promise<string | null> {
+    if (revocation.provider !== "claude") {
+      throw new Error("CODEX_REVOCATION_MUST_NOT_REREAD_RETIRED_AUTHORITY");
+    }
+    const providerAuthority = this.#providerAuthority(profile, "claude");
+    const authority = revocation.runtimeScope === "personal"
+      ? this.#personalAuthorityForProfile(profile, providerAuthority)
+      : authorityFor(this.#paths, profile, providerAuthority);
+    const runtime = revocation.runtimeScope === "personal"
+      ? this.#personalClaude
+      : this.#claude;
+    if (runtime?.readProviderAccountIdentity === undefined) {
+      throw new ProviderRuntimeUnavailableError(
+        `The ${revocation.runtimeScope} ${revocation.provider} runtime cannot reread account identity.`,
+      );
+    }
+    const readIdentity = runtime.readProviderAccountIdentity.bind(runtime);
+    const account = await this.#fencedEffect(async () =>
+      await readIdentity({ authority, signal }));
+    await this.#daemonAuthority.assertCurrent();
+    if (!this.#profileAuthorityIsCurrent(authority)) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "Claude account authority changed during identity verification.");
+    }
+    return providerAccountAuthorityKey("claude", account);
+  }
+
+  async #assertProviderRuntimeAccountAuthority(
+    profile: ProfileRecord,
+    provider: AdoptableProvider,
+    runtimeScope: RuntimeAccountScope,
+    signal: AbortSignal,
+    force: boolean,
+  ): Promise<string> {
+    const providerAuthority = this.#providerAuthority(profile, provider);
+    const authority = runtimeScope === "personal"
+      ? this.#personalAuthorityForProfile(profile, providerAuthority)
+      : authorityFor(this.#paths, profile, providerAuthority);
+    const assertCapturedAuthority = (): void => {
+      signal.throwIfAborted();
+      if (!this.#profileAuthorityIsCurrent(authority)
+        || this.#store.requireProfileById(profile.id).processGeneration !== profile.processGeneration) {
+        throw new CommandFailure("RECOVERY_REQUIRED", "Provider account authority changed during identity verification.");
+      }
+    };
+    assertCapturedAuthority();
+    if (provider === "codex") {
+      this.#assertSignedIn(profile);
+      this.#assertIdentifiableAccountAuthority(profile);
+    } else {
+      if (profile.state !== "signed_in" && profile.state !== "signed_out") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          `The HRA profile authority for ${profile.label} is unsettled. Resolve its Codex account transition before another Claude provider operation.`,
+        );
+      }
+      if (this.#profileAuthorityRevocationIsPending(profile.id, profile.processGeneration)) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          `Account authority for ${profile.label} is being revoked; wait for controller release before another provider operation.`,
+        );
+      }
+      if (runtimeScope === "managed") this.#assertClaudeIsolationAccepted();
+    }
+    if (this.#providerRuntimeAccountRevocationIsPending(
+      profile.id,
+      profile.processGeneration,
+      provider,
+      runtimeScope,
+    )) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The provider account authority is being released.",
+        { accountId: profile.id, provider },
+      );
+    }
+    const expectedCodexKey = profileCodexAccountAuthorityKey(profile);
+    const key = this.#personalAccountAttestationKey(provider, profile.id, runtimeScope);
+    const cached = this.#personalAccountAttestations.get(key);
+    const durableRevocation = this.#store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider,
+      runtimeScope,
+    });
+    const checkedAt = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(this.#now());
+    if (
+      !force
+      && cached?.generation === profile.processGeneration
+      && sameProviderUsageAuthority(cached.authority, providerAuthority)
+      && (provider !== "codex" || cached.accountKey === expectedCodexKey)
+      && durableRevocation?.profileGeneration !== profile.processGeneration
+      && checkedAt >= cached.checkedAt
+      && checkedAt - cached.checkedAt <= PERSONAL_ACCOUNT_ATTESTATION_TTL_MS
+    ) return cached.accountKey;
+
+    const existing = this.#personalAccountChecks.get(key);
+    if (existing !== undefined && !force) {
+      const accountKey = await existing;
+      assertCapturedAuthority();
+      const attested = this.#personalAccountAttestations.get(key);
+      if (attested === undefined || !sameProviderUsageAuthority(attested.authority, providerAuthority)) {
+        throw new CommandFailure("RECOVERY_REQUIRED", "The joined account check proved a different provider authority.");
+      }
+      return accountKey;
+    }
+    const check = (async (): Promise<string> => {
+      // A forced check is a post-effect fence. It must begin a provider read
+      // after every check that was already admitted when the caller crossed
+      // the effect boundary; joining an older read would collapse the account
+      // sandwich into a single pre-effect observation. Chaining onto the
+      // current per-account tail also makes concurrent forced checks each earn
+      // their own causally fresh observation.
+      if (existing !== undefined) {
+        try {
+          await existing;
+        } catch {
+          // The older caller owns its failure. This caller still needs a fresh
+          // observation so it can prove (or independently revoke) its effect.
+        }
+        signal.throwIfAborted();
+      }
+      assertCapturedAuthority();
+      const account = await this.#fencedEffect(async () => {
+        if (provider === "claude") {
+          const runtime = runtimeScope === "personal" ? this.#personalClaude : this.#claude;
+          return await runtime?.readProviderAccountIdentity?.({ authority, signal });
+        }
+        const runtime = runtimeScope === "personal" ? this.#personalCodex : this.#codex;
+        return await runtime?.readAccount({ authority, signal });
+      });
+      if (account === undefined) {
+        throw new ProviderRuntimeUnavailableError(
+          `${runtimeScope === "personal" ? "Personal-home" : "Managed"} ${provider} account identity is unavailable on this daemon.`,
+        );
+      }
+      signal.throwIfAborted();
+      await this.#daemonAuthority.assertCurrent();
+      assertCapturedAuthority();
+      const exact = this.#store.requireProfileById(profile.id);
+      if (exact.processGeneration !== profile.processGeneration) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The HRA account authority changed during provider identity verification.",
+        );
+      }
+      if (provider === "codex") {
+        this.#assertSignedIn(exact);
+        this.#assertIdentifiableAccountAuthority(exact);
+      } else {
+        if (exact.state !== "signed_in" && exact.state !== "signed_out") {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            `The HRA profile authority for ${exact.label} changed during Claude identity verification.`,
+          );
+        }
+        if (this.#profileAuthorityRevocationIsPending(exact.id, exact.processGeneration)) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            `Account authority for ${exact.label} is being revoked; wait for controller release before another provider operation.`,
+          );
+        }
+        if (runtimeScope === "managed") this.#assertClaudeIsolationAccepted();
+      }
+      const accountKey = providerAccountAuthorityKey(provider, account);
+      const exactExpectedCodexKey = profileCodexAccountAuthorityKey(exact);
+      const mismatchesSelectedCodexAccount = provider === "codex"
+        && (accountKey === null || accountKey !== exactExpectedCodexKey);
+      if (accountKey === null || mismatchesSelectedCodexAccount) {
+        this.#personalAccountAttestations.delete(key);
+        if (provider === "codex" && runtimeScope === "managed") {
+          this.#scheduleProfilePersonalAuthorityRevocation(exact);
+        } else {
+          this.#scheduleProviderRuntimeAccountRevocation(
+            exact,
+            provider,
+            runtimeScope,
+            accountKey,
+          );
+        }
+        throw new ProviderAccountAuthorityMismatchError(provider, exact);
+      }
+      const currentRevocation = this.#store.readProviderRuntimeAccountRevocation({
+        profileId: exact.id,
+        provider,
+        runtimeScope,
+      });
+      if (currentRevocation?.profileGeneration === exact.processGeneration) {
+        if (
+          currentRevocation.state !== "completed"
+          || currentRevocation.currentAccountKey !== accountKey
+        ) {
+          this.#scheduleProviderRuntimeAccountRevocation(
+            exact,
+            provider,
+            runtimeScope,
+            accountKey,
+          );
+          throw new ProviderAccountAuthorityMismatchError(provider, exact);
+        }
+        this.#store.clearCompletedProviderRuntimeAccountRevocation({
+          profileId: exact.id,
+          expectedGeneration: exact.processGeneration,
+          provider,
+          runtimeScope,
+          currentAccountKey: accountKey,
+        });
+      }
+      this.#personalAccountAttestations.set(key, {
+        checkedAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(this.#now()),
+        accountKey,
+        generation: exact.processGeneration,
+        authority: providerAuthority,
+      });
+      return accountKey;
+    })();
+    this.#personalAccountChecks.set(key, check);
+    try {
+      return await check;
+    } finally {
+      if (this.#personalAccountChecks.get(key) === check) {
+        this.#personalAccountChecks.delete(key);
+      }
+    }
+  }
+
+  async #assertManagedProviderRuntimeAuthority(
+    profile: ProfileRecord,
+    provider: Provider,
+    signal: AbortSignal,
+    force: boolean,
+  ): Promise<string | undefined> {
+    if (provider !== "devin") {
+      return await this.#assertProviderRuntimeAccountAuthority(
+        profile,
+        provider,
+        "managed",
+        signal,
+        force,
+      );
+    }
+
+    signal.throwIfAborted();
+    await this.#daemonAuthority.assertCurrent();
+    const before = this.#store.requireProfileById(profile.id);
+    if (
+      before.processGeneration !== profile.processGeneration
+      || this.#profileAuthorityRevocationIsPending(
+        before.id,
+        before.processGeneration,
+      )
+    ) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The managed Devin profile authority changed before provider verification.",
+      );
+    }
+    await this.#assertProviderSignedIn(before, "devin", signal);
+    signal.throwIfAborted();
+    await this.#daemonAuthority.assertCurrent();
+    const after = this.#store.requireProfileById(profile.id);
+    if (
+      after.processGeneration !== profile.processGeneration
+      || (after.state !== "signed_in" && after.state !== "signed_out")
+      || this.#profileAuthorityRevocationIsPending(
+        after.id,
+        after.processGeneration,
+      )
+    ) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The managed Devin profile authority changed during provider verification.",
+      );
+    }
+    return undefined;
+  }
+
+  async #assertPersonalProviderAccountAuthority(
+    profile: ProfileRecord,
+    provider: AdoptableProvider,
+    signal: AbortSignal,
+    force: boolean,
+  ): Promise<string> {
+    return await this.#assertProviderRuntimeAccountAuthority(
+      profile,
+      provider,
+      "personal",
+      signal,
+      force,
+    );
+  }
+
+  async #assertPersonalSessionAccountAuthority(
+    session: SessionRecord,
+    profile: ProfileRecord,
+    signal: AbortSignal,
+    force = true,
+  ): Promise<void> {
+    if (session.provider === "devin") {
+      signal.throwIfAborted();
+      await this.#daemonAuthority.assertCurrent();
+      if (this.#sessionHasActivePersonalBinding(session)) {
+        this.#quarantineSession(session.id);
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "A Devin session cannot use personal-home runtime authority.",
+          { sessionId: session.id },
+        );
+      }
+      const exact = this.#store.requireSession(session.id);
+      const exactProfile = this.#store.requireProfileById(profile.id);
+      if (
+        exact.profileId !== profile.id
+        || exact.provider !== "devin"
+        || exact.providerThreadId !== session.providerThreadId
+        || exactProfile.processGeneration !== profile.processGeneration
+        || this.#profileAuthorityRevocationIsPending(
+          exactProfile.id,
+          exactProfile.processGeneration,
+        )
+      ) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The session's managed Devin authority changed during verification.",
+          { sessionId: session.id },
+        );
+      }
+      this.#assertEstablishedSessionAccount(exactProfile, exact);
+      return;
+    }
+    const runtimeScope: RuntimeAccountScope = this.#sessionHasActivePersonalBinding(session)
+      ? "personal"
+      : "managed";
+    const recorded = this.#store.readSessionProviderAccountAuthority(session.id);
+    if (
+      recorded === null
+      || recorded.provider !== session.provider
+      || recorded.runtimeScope !== runtimeScope
+    ) {
+      this.#quarantineSession(session.id);
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session has no exact provider-account authority for its current runtime.",
+        { sessionId: session.id },
+      );
+    }
+    const currentAccountKey = await this.#assertProviderRuntimeAccountAuthority(
+      profile,
+      session.provider,
+      runtimeScope,
+      signal,
+      force,
+    );
+    if (recorded.accountKey !== currentAccountKey) {
+      if (session.provider === "codex" && runtimeScope === "managed") {
+        this.#scheduleProfilePersonalAuthorityRevocation(profile);
+      } else {
+        this.#scheduleProviderRuntimeAccountRevocation(
+          profile,
+          session.provider,
+          runtimeScope,
+          currentAccountKey,
+        );
+      }
+      throw new ProviderAccountAuthorityMismatchError(
+        session.provider,
+        profile,
+      );
+    }
+    const exact = this.#store.requireSession(session.id);
+    const exactRecorded = this.#store.readSessionProviderAccountAuthority(session.id);
+    if (
+      exact.profileId !== profile.id
+      || exact.provider !== session.provider
+      || exact.providerThreadId !== session.providerThreadId
+      || exactRecorded === null
+      || exactRecorded.provider !== recorded.provider
+      || exactRecorded.runtimeScope !== recorded.runtimeScope
+      || exactRecorded.accountKey !== recorded.accountKey
+      || (runtimeScope === "personal" && !this.#sessionHasActivePersonalBinding(exact))
+      || (runtimeScope === "managed" && this.#sessionHasActivePersonalBinding(exact))
+    ) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session's provider-account authority changed during verification.",
+        { sessionId: session.id },
+      );
+    }
+    const exactProfile = this.#store.requireProfileById(profile.id);
+    this.#assertEstablishedSessionAccount(exactProfile, exact);
+  }
+
+  async #assertSessionAccountAuthorityAfterProviderEffect(
+    session: SessionRecord,
+    profile: ProfileRecord,
+    signal: AbortSignal,
+  ): Promise<void> {
+    try {
+      await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+    } catch (cause: unknown) {
+      if (cause instanceof DaemonAuthoritySafetyError) throw cause;
+      throw new IndeterminateLocalCommitError(
+        "The provider may have applied the effect while its account authority changed.",
+        cause,
+      );
+    }
+  }
+
+  async #assertPersonalInteractionAccountAuthority(
+    interaction: Pick<InteractionRecord, "sessionId">,
+    profile: ProfileRecord,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (interaction.sessionId === null) return;
+    const session = this.#store.requireSession(interaction.sessionId);
+    await this.#assertPersonalSessionAccountAuthority(session, profile, signal);
+  }
+
+  async #assertInteractionAccountAuthorityAfterProviderEffect(
+    interaction: Pick<InteractionRecord, "sessionId">,
+    profile: ProfileRecord,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (interaction.sessionId === null) return;
+    try {
+      const session = this.#store.requireSession(interaction.sessionId);
+      await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+    } catch (cause: unknown) {
+      if (cause instanceof DaemonAuthoritySafetyError) throw cause;
+      throw new CodexError(
+        "INDETERMINATE_EFFECT",
+        "The provider may have applied the interaction response while its account authority changed.",
+        { cause },
+      );
+    }
+  }
+
+  #claudeRuntimeForScope(scope: ClaudeProcessAuthorityRecord["runtimeScope"]): ClaudeRuntimePort {
+    if (scope === "managed") return this.#claude;
+    if (this.#personalClaude !== undefined) return this.#personalClaude;
+    throw new ProviderRuntimeUnavailableError(
+      "Personal-home Claude process custody is unavailable on this daemon.",
+    );
+  }
+
+  #authorityForClaudeProcess(record: ClaudeProcessAuthorityRecord): ProfileAuthority | null {
+    if (record.providerAuthority === null) return null;
+    const profile = this.#store.requireProfileById(record.profileId, { includeRemoved: true });
+    return record.runtimeScope === "personal"
+      ? this.#personalAuthorityForProfile(profile, record.providerAuthority)
+      : authorityFor(this.#paths, profile, record.providerAuthority);
+  }
+
+  #sameClaudeProcessIdentity(
+    left: ClaudeProcessIdentity,
+    right: ClaudeProcessIdentity,
+  ): boolean {
+    return left.pid === right.pid
+      && left.pidDomain === right.pidDomain
+      && left.procStart === right.procStart;
+  }
+
+  async #recordClaimedClaudeProcess(input: {
+    authority: ProfileAuthority;
+    providerThreadId: string;
+    runtimeScope: ClaudeProcessAuthorityRecord["runtimeScope"];
+    sessionId?: SessionRecord["id"];
+    launchIntent: ClaudeProcessLaunchIntentRecord;
+    switchAttemptId?: MutationAttemptRecord["id"];
+    identity: ClaudeProcessIdentity;
+    signal: AbortSignal;
+  }): Promise<ClaudeProcessIdentity> {
+    input.signal.throwIfAborted();
+    await this.#daemonAuthority.assertCurrent();
+    this.#store.recordClaimedClaudeProcessAuthority({
+      providerThreadId: input.providerThreadId,
+      profileId: input.authority.id,
+      profileGeneration: input.launchIntent.profileGeneration,
+      providerAuthority: this.#providerAccountAuthority(input.authority),
+      runtimeScope: input.runtimeScope,
+      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+      identity: input.identity,
+      expectedLaunchIntentId: input.launchIntent.intentId,
+      expectedLaunchIntentRevision: input.launchIntent.revision,
+      ...(input.switchAttemptId === undefined ? {} : { switchAttemptId: input.switchAttemptId }),
+    });
+    return input.identity;
+  }
+
+  #cancelClaudeProcessLaunchIntent(intent: ClaudeProcessLaunchIntentRecord): void {
+    const current = this.#store.readClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      runtimeScope: intent.runtimeScope,
+    });
+    if (current === null) return;
+    if (current.intentId !== intent.intentId || current.revision !== intent.revision) {
+      throw new Error("SESSION_CLAUDE_PROCESS_LAUNCH_INTENT_CONFLICT");
+    }
+    this.#store.cancelClaudeProcessLaunchIntent({
+      providerThreadId: intent.providerThreadId,
+      profileId: intent.profileId,
+      profileGeneration: intent.profileGeneration,
+      runtimeScope: intent.runtimeScope,
+      intentId: intent.intentId,
+      expectedRevision: intent.revision,
+    });
+  }
+
+  async #probeClaudeProcessLiveness(
+    record: ClaudeProcessAuthorityRecord,
+    signal: AbortSignal,
+  ): Promise<"live" | "not_live" | "unknown"> {
+    return await this.#probeClaudeProcessIdentityLiveness(record.identity, signal);
+  }
+
+  async #probeClaudeProcessIdentityLiveness(
+    identity: ClaudeProcessIdentity,
+    signal: AbortSignal,
+    deadlineAt = this.#now() + CLAUDE_PROCESS_LIVENESS_DEADLINE_MS,
+  ): Promise<"live" | "not_live" | "unknown"> {
+    if (this.#claudeProcessLiveness === undefined) return "unknown";
+    signal.throwIfAborted();
+    return await this.#claudeProcessLiveness(identity, {
+      deadlineAt,
+      signal,
+    });
+  }
+
+  async #releaseClaudeProcessAuthority(
+    input: ClaudeProcessAuthorityKey,
+    signal: AbortSignal,
+  ): Promise<ClaudeProcessAuthorityRecord> {
+    // Callers often already hold the richer durable authority record. Narrow
+    // it before crossing the strict storage boundary so recovery cannot be
+    // defeated by structurally valid extra fields.
+    const key: ClaudeProcessAuthorityKey = {
+      providerThreadId: input.providerThreadId,
+      profileId: input.profileId,
+      runtimeScope: input.runtimeScope,
+    };
+    return await this.#serialize(
+      `claude-process:${key.runtimeScope}:${key.profileId}:${key.providerThreadId}`,
+      async () => await this.#releaseClaudeProcessAuthorityLocked(key, signal),
+    );
+  }
+
+  async #releaseClaudeProcessAuthorityLocked(
+    key: ClaudeProcessAuthorityKey,
+    signal: AbortSignal,
+  ): Promise<ClaudeProcessAuthorityRecord> {
+    let record = this.#store.readClaudeProcessAuthority(key);
+    if (record === null) {
+      throw new ProviderRuntimeUnavailableError(
+        "The Claude process has no durable exact-process custody record.",
+      );
+    }
+    if (record.state === "released") return record;
+    const runtime = this.#claudeRuntimeForScope(record.runtimeScope);
+    const authority = this.#authorityForClaudeProcess(record);
+    let runtimeOwnsExactProcess = false;
+    let liveIdentity: ClaudeProcessIdentity | undefined;
+    try {
+      if (authority !== null) {
+        liveIdentity = await this.#fencedEffect(async () =>
+          await runtime.readSessionProcessIdentity({
+            authority,
+            providerThreadId: key.providerThreadId,
+            signal,
+          }));
+      } else if (await this.#probeClaudeProcessLiveness(record, signal) !== "not_live") {
+        throw new ProviderRuntimeUnavailableError("Historical Claude custody requires proof that its exact prior process is gone.");
+      }
+    } catch (error: unknown) {
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
+      if (signal.aborted) throw signal.reason;
+      const liveness = await this.#probeClaudeProcessLiveness(record, signal);
+      if (liveness !== "not_live") throw error;
+    }
+    if (liveIdentity !== undefined) {
+      if (!this.#sameClaudeProcessIdentity(liveIdentity, record.identity)) {
+        throw new ProviderRuntimeUnavailableError(
+          "The live Claude controller does not match its durable process authority.",
+        );
+      }
+      runtimeOwnsExactProcess = true;
+    }
+
+    if (record.state !== "releasing") {
+      record = this.#store.beginClaudeProcessAuthorityRelease({
+        ...key,
+        expectedRevision: record.revision,
+        identity: record.identity,
+      });
+    }
+    if (runtimeOwnsExactProcess && authority !== null) {
+      await this.#fencedEffect(async () => await runtime.endSession({
+        authority,
+        providerThreadId: key.providerThreadId,
+        signal: new AbortController().signal,
+      }));
+    } else {
+      const liveness = await this.#probeClaudeProcessLiveness(record, signal);
+      if (liveness !== "not_live") {
+        throw new ProviderRuntimeUnavailableError(
+          "The exact prior Claude process is still live or cannot be proven gone.",
+        );
+      }
+    }
+    await this.#daemonAuthority.assertCurrent();
+    return this.#store.completeClaudeProcessAuthorityRelease({
+      ...key,
+      expectedRevision: record.revision,
+      identity: record.identity,
+    });
+  }
+
+  #sessionHasActivePersonalBinding(session: SessionRecord): boolean {
+    const binding = this.#store.readSessionPersonalRuntimeBinding(session.id, true);
+    if (binding === null) return false;
+    const matchesCurrentIdentity = binding.provider === session.provider
+      && binding.providerThreadId === session.providerThreadId;
+    if (binding.state === "active") {
+      if (!matchesCurrentIdentity) {
+        throw new ProviderRuntimeUnavailableError(
+          "The personal-home session binding no longer matches its durable session identity.",
+        );
+      }
+      return true;
+    }
+    if (matchesCurrentIdentity) {
+      throw new ProviderRuntimeUnavailableError(
+        "That session's exact provider controller is no longer available.",
+      );
+    }
+    // A provider switch may retain the mismatched detached row until the old
+    // identity is readopted. Runtime-profile history and provider_switched
+    // events preserve provenance; the session's current identity is managed.
+    return false;
+  }
+
+  #sessionHasMatchingActivePersonalBinding(
+    session: Pick<SessionRecord, "id" | "provider" | "providerThreadId">,
+  ): boolean {
+    const binding = this.#store.readSessionPersonalRuntimeBinding(session.id, true);
+    return binding !== null
+      && binding.state === "active"
+      && binding.provider === session.provider
+      && binding.providerThreadId === session.providerThreadId;
+  }
+
   #runtimeForSession(
     session: Pick<SessionRecord, "id" | "profileId" | "provider">,
   ): SessionRuntimePort<ReviewedRuntimeProfile> {
-    return this.#sessionRuntime(this.#sessionProviderAuthority(session).provider);
+    const provider = this.#sessionProviderAuthority(session).provider;
+    if (!this.#sessionHasActivePersonalBinding(this.#store.requireSession(session.id))) {
+      return this.#sessionRuntime(provider);
+    }
+    switch (provider) {
+      case "codex": return this.#personalSessionRuntime("codex");
+      case "claude": return this.#personalSessionRuntime("claude");
+      case "devin": throw new ProviderRuntimeUnavailableError(
+        "A Devin session cannot carry personal-home runtime authority.",
+      );
+    }
+  }
+
+  #authorityForSession(session: SessionRecord, profile?: ProfileRecord): ProfileAuthority {
+    if (profile !== undefined && profile.id !== session.profileId) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "Session profile authority is inconsistent.");
+    }
+    return this.#sessionAuthority(session);
+  }
+
+  #personalAuthorityForProfile(
+    profile: ProfileRecord,
+    providerAuthority: ProviderAccountAuthority,
+  ): ProfileAuthority {
+    if (this.#personalCodexHome === undefined) {
+      throw new ProviderRuntimeUnavailableError(
+        "Personal-home session authority is unavailable on this daemon.",
+      );
+    }
+    return {
+      ...authorityFor(this.#paths, profile, providerAuthority),
+      codexHome: this.#personalCodexHome,
+    };
+  }
+
+  #assertSessionAccountAuthority(
+    session: Pick<SessionRecord, "id" | "profileId">,
+    profile: Pick<ProfileRecord, "id" | "label">,
+  ): void {
+    if (
+      session.profileId === profile.id
+      && this.#store.sessionAccountAuthorityMatches(session.id, profile.id)
+    ) return;
+    throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      `Session ${session.id} is bound to a different or unprovable provider account identity. Sign in to the original account for ${profile.label} before using it.`,
+      { sessionId: session.id, accountId: profile.id },
+    );
+  }
+
+  #assertSessionAccountAuthorityIfSignedIn(
+    session: Pick<SessionRecord, "id" | "profileId" | "provider">,
+  ): void {
+    switch (session.provider) {
+      case "codex": {
+        const profile = this.#store.requireProfileById(session.profileId);
+        if (profile.state === "signed_in") this.#assertSessionAccountAuthority(session, profile);
+        return;
+      }
+      case "claude":
+      case "devin":
+        return;
+    }
+  }
+
+  #providerForInteraction(
+    record: Readonly<{
+      sessionId: SessionRecord["id"] | null;
+      authority: ProviderInteractionAuthority;
+    }>,
+  ): Provider {
+    const provider = this.#providerForInteractionAuthority(record.authority);
+    if (record.sessionId === null) return provider;
+    const session = this.#store.requireSession(record.sessionId);
+    if (session.provider !== provider) {
+      throw new ProviderRuntimeUnavailableError(
+        "The interaction provider no longer matches its durable session authority.",
+      );
+    }
+    return provider;
+  }
+
+  #assertProviderProfileState(profile: ProfileRecord, provider: Provider): void {
+    if (provider === "codex") {
+      this.#assertSignedIn(profile);
+      return;
+    }
+    if (profile.state === "signed_in" || profile.state === "signed_out") return;
+    throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      "The interaction belongs to an unsettled HRA profile authority.",
+    );
   }
 
   /**
@@ -3593,14 +5829,40 @@ export class HraService {
       authority: ProviderInteractionAuthority;
     }>,
   ): SessionRuntimePort<ReviewedRuntimeProfile> {
-    if (record.authority.provider === "claude") this.#assertClaudeIsolationAccepted();
-    return this.#sessionRuntime(record.authority.provider);
+    this.#interactionAuthority(record);
+    if (record.sessionId !== null) {
+      const session = this.#store.requireSession(record.sessionId);
+      if (session.provider === "claude" && !this.#sessionHasActivePersonalBinding(session)) {
+        this.#assertClaudeIsolationAccepted();
+      }
+      return this.#runtimeForSession(session);
+    }
+    const provider = record.authority.provider;
+    if (provider === "claude") this.#assertClaudeIsolationAccepted();
+    return this.#sessionRuntime(provider);
   }
 
   #providerForInteractionAuthority(
     authority: Pick<ProviderInteractionAuthority, "provider">,
   ): Provider {
     return authority.provider;
+  }
+
+  #interactionProfileAuthorityIsUsable(
+    record: Pick<InteractionRecord, "authority" | "sessionId">,
+  ): boolean {
+    try {
+      this.#interactionAuthority(record);
+      return this.#profileAuthorityIsUsable(
+        record.authority.profileId,
+        record.authority.processGeneration,
+        this.#providerForInteractionAuthority(record.authority),
+        record.sessionId ?? undefined,
+      );
+    } catch (error: unknown) {
+      if (error instanceof ProviderRuntimeUnavailableError || error instanceof CommandFailure) return false;
+      throw error;
+    }
   }
 
   /** Refuses a Codex-only capability on a session bound to another provider. */
@@ -3617,9 +5879,323 @@ export class HraService {
     );
   }
 
+  #sessionUsesFactSource(
+    session: SessionRecord,
+    provider: Provider,
+    source: ProviderFactSource,
+  ): boolean {
+    if (session.provider !== provider) return false;
+    if (provider === "codex"
+      && this.#profileAuthorityRevocationIsPending(session.profileId)) return false;
+    const binding = this.#store.readSessionPersonalRuntimeBinding(session.id, true);
+    const runtimeScope: RuntimeAccountScope = binding !== null
+      && binding.state === "active"
+      && binding.provider === provider
+      && binding.providerThreadId === session.providerThreadId
+      ? "personal"
+      : "managed";
+    const profile = this.#store.requireProfileById(session.profileId);
+    if (
+      provider !== "devin"
+      && this.#providerRuntimeAccountRevocationIsPending(
+        profile.id,
+        profile.processGeneration,
+        provider,
+        runtimeScope,
+      )
+    ) return false;
+    if (binding === null) return source === "managed";
+    const matchesCurrentIdentity = binding.provider === provider
+      && binding.providerThreadId === session.providerThreadId;
+    if (source === "managed") {
+      // Provider switching keeps a detached historical binding. It must not
+      // suppress facts from the session's new ordinary managed identity.
+      return binding.state === "detached" && !matchesCurrentIdentity;
+    }
+    return binding.state === "active" && matchesCurrentIdentity;
+  }
+
+  #clearSessionFactAuthority(sessionId: SessionRecord["id"]): void {
+    this.#sessionFactAuthorities.delete(sessionId);
+  }
+
+  #clearProfileFactAuthorities(
+    profileId: ProfileRecord["id"],
+    provider?: Provider,
+    runtimeScope?: RuntimeAccountScope,
+  ): void {
+    for (const [sessionId, capability] of this.#sessionFactAuthorities) {
+      if (
+        capability.profileId === profileId
+        && (provider === undefined || capability.provider === provider)
+        && (runtimeScope === undefined || capability.runtimeScope === runtimeScope)
+      ) this.#sessionFactAuthorities.delete(sessionId);
+    }
+  }
+
+  #mintSessionFactAuthority(
+    authority: ProfileAuthority,
+    session: SessionRecord,
+    connectionId: string,
+  ): void {
+    z.string().uuid().parse(connectionId);
+    if (session.providerThreadId === undefined) {
+      throw new Error("SESSION_FACT_AUTHORITY_THREAD_MISSING");
+    }
+    const profile = this.#store.requireProfileById(session.profileId);
+    if (
+      profile.id !== authority.id
+      || !this.#authorityMatchesSession(authority, session)
+      || !this.#profileAllowsEstablishedSession(profile, session)
+      || session.state === "terminal"
+      || session.state === "recovery_required"
+      || (
+        session.provider === "codex"
+        && !this.#store.sessionAccountAuthorityMatches(session.id, profile.id)
+      )
+    ) throw new Error("SESSION_FACT_AUTHORITY_PROFILE_STALE");
+    const runtimeScope: RuntimeAccountScope = this.#sessionHasActivePersonalBinding(session)
+      ? "personal"
+      : "managed";
+    let accountKey: string | null = null;
+    if (session.provider !== "devin") {
+      const recorded = this.#store.readSessionProviderAccountAuthority(session.id);
+      const attested = this.#personalAccountAttestations.get(
+        this.#personalAccountAttestationKey(session.provider, profile.id, runtimeScope),
+      );
+      if (
+        recorded === null
+        || recorded.provider !== session.provider
+        || recorded.runtimeScope !== runtimeScope
+        || attested?.generation !== profile.processGeneration
+        || !sameProviderUsageAuthority(attested.authority, this.#providerAccountAuthority(authority))
+        || attested.accountKey !== recorded.accountKey
+      ) throw new Error("SESSION_FACT_AUTHORITY_ACCOUNT_UNATTESTED");
+      accountKey = recorded.accountKey;
+    } else if (runtimeScope !== "managed") {
+      throw new Error("SESSION_FACT_AUTHORITY_DEVIN_SCOPE_STALE");
+    }
+    const binding = this.#store.readSessionPersonalRuntimeBinding(session.id, true);
+    const personalBindingRevision = runtimeScope === "personal"
+      && binding !== null
+      && binding.state === "active"
+      && binding.provider === session.provider
+      && binding.providerThreadId === session.providerThreadId
+      ? binding.revision
+      : null;
+    if (runtimeScope === "personal" && personalBindingRevision === null) {
+      throw new Error("SESSION_FACT_AUTHORITY_BINDING_STALE");
+    }
+    let claudeProcess: SessionFactAuthority["claudeProcess"] = null;
+    if (session.provider === "claude") {
+      const process = this.#store.readClaudeProcessAuthority({
+        providerThreadId: session.providerThreadId,
+        profileId: profile.id,
+        runtimeScope,
+      });
+      if (
+        process === null
+        || process.providerAuthority === null
+        || !sameProviderUsageAuthority(process.providerAuthority, this.#providerAccountAuthority(authority))
+        || process.sessionId !== session.id
+        || process.state !== "bound"
+      ) throw new Error("SESSION_FACT_AUTHORITY_CLAUDE_PROCESS_STALE");
+      claudeProcess = { identity: process.identity, revision: process.revision,
+        profileGeneration: process.profileGeneration };
+    }
+    this.#sessionFactAuthorities.set(session.id, {
+      sessionId: session.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration,
+      providerAuthority: this.#providerAccountAuthority(authority),
+      provider: session.provider,
+      runtimeScope,
+      providerThreadId: session.providerThreadId,
+      connectionId,
+      accountKey,
+      personalBindingRevision,
+      claudeProcess,
+    });
+  }
+
+  #sessionFactAuthorityIsCurrent(
+    sessionId: SessionRecord["id"],
+    authority: ProfileAuthority,
+    provider: Provider,
+    source: ProviderFactSource,
+    providerThreadId: string,
+    connectionId?: string,
+    options: Readonly<{ allowRecoveryRequired?: boolean }> = {},
+  ): boolean {
+    const capability = this.#sessionFactAuthorities.get(sessionId);
+    if (capability === undefined) return false;
+    try {
+      if (
+        capability.profileId !== authority.id
+        || !sameProviderUsageAuthority(capability.providerAuthority, this.#providerAccountAuthority(authority))
+        || !this.#profileAuthorityIsCurrent(authority)
+        || capability.provider !== provider
+        || capability.providerThreadId !== providerThreadId
+        || capability.runtimeScope !== (source === "personal" ? "personal" : "managed")
+        || (connectionId !== undefined && capability.connectionId !== connectionId)
+        || this.#sessionProviderConnections.get(sessionId) !== capability.connectionId
+        || (provider === "codex" && this.#profileAuthorityRevocationIsPending(
+          capability.profileId,
+          capability.profileGeneration,
+        ))
+        || (
+          capability.provider !== "devin"
+          && this.#providerRuntimeAccountRevocationIsPending(
+            capability.profileId,
+            this.#store.requireProfileById(capability.profileId).processGeneration,
+            capability.provider,
+            capability.runtimeScope,
+          )
+        )
+      ) throw new Error("SESSION_FACT_AUTHORITY_STALE");
+      const profile = this.#store.requireProfileById(capability.profileId);
+      const session = this.#store.requireSession(sessionId);
+      const recorded = capability.provider === "devin"
+        ? null
+        : this.#store.readSessionProviderAccountAuthority(sessionId);
+      if (
+        (provider === "codex" && profile.processGeneration !== capability.profileGeneration)
+        || !this.#authorityMatchesSession(authority, session)
+        || !this.#profileAllowsEstablishedSession(profile, session)
+        || session.profileId !== capability.profileId
+        || session.provider !== capability.provider
+        || session.providerThreadId !== capability.providerThreadId
+        || session.state === "terminal"
+        || (session.state === "recovery_required" && options.allowRecoveryRequired !== true)
+        || (
+          session.provider === "codex"
+          && !this.#store.sessionAccountAuthorityMatches(session.id, profile.id)
+        )
+        || (
+          capability.provider === "devin"
+            ? capability.runtimeScope !== "managed" || capability.accountKey !== null
+            : recorded === null
+              || recorded.provider !== capability.provider
+              || recorded.runtimeScope !== capability.runtimeScope
+              || recorded.accountKey !== capability.accountKey
+        )
+      ) throw new Error("SESSION_FACT_AUTHORITY_STALE");
+      const binding = this.#store.readSessionPersonalRuntimeBinding(sessionId, true);
+      if (capability.runtimeScope === "personal") {
+        if (
+          binding === null
+          || binding.state !== "active"
+          || binding.revision !== capability.personalBindingRevision
+          || binding.provider !== capability.provider
+          || binding.providerThreadId !== capability.providerThreadId
+        ) throw new Error("SESSION_FACT_AUTHORITY_BINDING_STALE");
+      } else if (
+        binding !== null
+        && binding.state !== "detached"
+        && binding.provider === capability.provider
+        && binding.providerThreadId === capability.providerThreadId
+      ) throw new Error("SESSION_FACT_AUTHORITY_BINDING_STALE");
+      if (capability.provider === "claude") {
+        const process = this.#store.readClaudeProcessAuthority({
+          providerThreadId: capability.providerThreadId,
+          profileId: capability.profileId,
+          runtimeScope: capability.runtimeScope,
+        });
+        if (
+          process === null
+          || process.providerAuthority === null
+          || !sameProviderUsageAuthority(process.providerAuthority, capability.providerAuthority)
+          || process.sessionId !== capability.sessionId
+          || process.state !== "bound"
+          || capability.claudeProcess === null
+          || process.profileGeneration !== capability.claudeProcess.profileGeneration
+          || process.revision !== capability.claudeProcess.revision
+          || !this.#sameClaudeProcessIdentity(process.identity, capability.claudeProcess.identity)
+        ) throw new Error("SESSION_FACT_AUTHORITY_CLAUDE_PROCESS_STALE");
+      } else if (capability.claudeProcess !== null) {
+        throw new Error("SESSION_FACT_AUTHORITY_PROVIDER_STALE");
+      }
+      return true;
+    } catch {
+      this.#clearSessionFactAuthority(sessionId);
+      return false;
+    }
+  }
+
+  /**
+   * An unknown Codex connection is never allowed to commit its triggering
+   * delta. Once existing mutation tails drain, an exact provider observation
+   * may mint a capability for later deltas. Claude has no connection-only
+   * fallback: its exact process identity must already be claimed and observed.
+   */
+  async #warmUnknownCodexFactAuthority(
+    session: SessionRecord,
+    provider: Provider,
+  ): Promise<void> {
+    if (provider !== "codex") return;
+    try {
+      await this.#ensureSessionObservedLocked(
+        session.id,
+        this.#backgroundAbort.signal,
+      );
+    } catch (error: unknown) {
+      if (error instanceof StateSecurityScrubRequiredError) throw error;
+      this.recordBackgroundDiagnostic("session_state_tracking_failed", error);
+    }
+  }
+
+  async #ensureSessionFactAuthority(
+    session: SessionRecord,
+    authority: ProfileAuthority,
+    provider: Provider,
+    source: ProviderFactSource,
+    providerThreadId: string,
+    connectionId?: string,
+  ): Promise<boolean> {
+    const hadCapability = this.#sessionFactAuthorities.has(session.id);
+    if (this.#sessionFactAuthorityIsCurrent(
+      session.id,
+      authority,
+      provider,
+      source,
+      providerThreadId,
+      connectionId,
+    )) return true;
+    if (hadCapability || provider !== "codex") return false;
+    await this.#warmUnknownCodexFactAuthority(session, provider);
+    return this.#sessionFactAuthorityIsCurrent(
+      session.id,
+      authority,
+      provider,
+      source,
+      providerThreadId,
+      connectionId,
+    );
+  }
+
+  #findSessionForProviderFact(
+    profileId: ProfileRecord["id"],
+    providerThreadId: string,
+    provider: Provider,
+    source: ProviderFactSource,
+  ): SessionRecord | null {
+    const session = this.#store.findSessionByProviderThread(profileId, providerThreadId);
+    if (session === null || !this.#sessionUsesFactSource(session, provider, source)) {
+      return null;
+    }
+    const profile = this.#store.requireProfileById(profileId);
+    if (!this.#profileAllowsEstablishedSession(profile, session)) return null;
+    if (
+      session.provider === "codex"
+      && !this.#store.sessionAccountAuthorityMatches(session.id, profileId)
+    ) return null;
+    return session;
+  }
+
   async handleConversationAutomationToolCall(
     authority: ProfileAuthority,
     call: ConversationAutomationToolCall,
+    source: ProviderFactSource = "managed",
   ): Promise<DynamicToolPublicResult> {
     const finish = this.#beginOperation();
     try {
@@ -3638,8 +6214,14 @@ export class HraService {
         !this.#profileAuthorityIsCurrent(authority)
         || authority.provider !== "codex"
         || profile.state !== "signed_in"
+        || this.#profileAuthorityRevocationIsPending(profile.id, authority.generation)
       ) throw new Error("CONVERSATION_AUTOMATION_AUTHORITY_STALE");
-      const session = this.#store.findSessionByProviderThread(authority.id, call.threadId);
+      const session = this.#findSessionForProviderFact(
+        authority.id,
+        call.threadId,
+        "codex",
+        source,
+      );
       if (
         session === null
         || session.state === "terminal"
@@ -3652,11 +6234,13 @@ export class HraService {
       const idempotencyKey = conversationAutomationIdempotencyKey(authority, call);
       const result = await this.#serializeSessionAuthority(
         session,
-        () => {
+        async () => {
           const currentProfile = this.#store.requireProfileById(authority.id);
-          const currentSession = this.#store.findSessionByProviderThread(
+          const currentSession = this.#findSessionForProviderFact(
             authority.id,
             call.threadId,
+            "codex",
+            source,
           );
           if (
             !this.#profileAuthorityIsCurrent(authority)
@@ -3668,6 +6252,12 @@ export class HraService {
             || !this.#authorityMatchesSession(authority, currentSession)
             || !this.#store.isConversationAutomationEnabled(currentSession.id, call.threadId)
           ) throw new Error("CONVERSATION_AUTOMATION_AUTHORITY_STALE");
+          await this.#assertPersonalSessionAccountAuthority(
+            currentSession,
+            currentProfile,
+            this.#backgroundAbort.signal,
+            true,
+          );
           switch (call.operation.mode) {
             case "list":
               return this.#sessionTasks.listIdempotent(
@@ -3733,6 +6323,7 @@ export class HraService {
   notifyConversationAutomationToolResponseWritten(
     authority: ProfileAuthority,
     call: ConversationAutomationToolCall,
+    source: ProviderFactSource = "managed",
   ): void {
     if (
       this.#state !== "open"
@@ -3744,10 +6335,16 @@ export class HraService {
     ) return;
     try {
       const profile = this.#store.requireProfileById(authority.id);
-      const session = this.#store.findSessionByProviderThread(authority.id, call.threadId);
+      const session = this.#findSessionForProviderFact(
+        authority.id,
+        call.threadId,
+        "codex",
+        source,
+      );
       if (
         this.#profileAuthorityIsCurrent(authority)
         && profile.state === "signed_in"
+        && !this.#profileAuthorityRevocationIsPending(profile.id, authority.generation)
         && session !== null
         && session.state !== "terminal"
       ) this.#wakeSessionTaskPump();
@@ -3776,9 +6373,13 @@ export class HraService {
         || authority.provider !== "codex"
         || this.#profileHasProjectionRecoveryInFlight(profile.id)
       ) return;
+      this.#assertObservedCodexAccountAuthority(profile, account);
       const recoveryUnsettled = await this.#cloud
         .isCompactProjectionRecoveryUnsettledForProfile(profile.id);
       await this.#daemonAuthority.assertCurrent();
+      const afterRecoveryRead = this.#store.requireProfileById(profile.id);
+      if (afterRecoveryRead.processGeneration !== authority.generation) return;
+      this.#assertObservedCodexAccountAuthority(afterRecoveryRead, account);
       if (recoveryUnsettled || this.#profileHasProjectionRecoveryInFlight(profile.id)) return;
       const apply = async (): Promise<void> => {
         let current: ProfileRecord;
@@ -3788,15 +6389,31 @@ export class HraService {
           if (error instanceof SelectionError && error.code === "NOT_FOUND") return;
           throw error;
         }
-        if (
-          !this.#profileAuthorityIsCurrent(authority)
-          || this.#profileHasProjectionRecoveryInFlight(profile.id)
-        ) return;
+        if (!this.#profileAuthorityIsCurrent(authority)) return;
+        this.#assertObservedCodexAccountAuthority(current, account);
+        if (this.#profileHasProjectionRecoveryInFlight(profile.id)) return;
         const blocked = await this.#cloud
           .isCompactProjectionRecoveryUnsettledForProfile(profile.id);
         await this.#daemonAuthority.assertCurrent();
+        current = this.#store.requireProfileById(profile.id);
+        if (current.processGeneration !== authority.generation) return;
+        this.#assertObservedCodexAccountAuthority(current, account);
         if (blocked || this.#profileHasProjectionRecoveryInFlight(profile.id)) return;
+        const accountAuthorityChanged = providerAccountAuthorityChanged(current, account);
+        if (this.#profileAuthorityRevocationIsPending(
+          current.id,
+          current.processGeneration,
+        )) {
+          if (accountAuthorityChanged) this.#scheduleProfilePersonalAuthorityRevocation(current);
+          return;
+        }
         if (!account.signedIn && current.state === "login_pending") return;
+        // Established-identity mismatches were rejected synchronously before
+        // any recovery wait or mutation-tail deferral above.
+        // Provider state discovered outside HRA is evidence, not permission to
+        // bind a replacement identity to dormant sessions and work. Only the
+        // explicit login mutation may move a signed-out profile into signed-in.
+        if (current.state === "signed_out") return;
         const stateChange = this.#store.setProfileStateWithWorkRetirement(
           current.id,
           current.processGeneration,
@@ -3839,12 +6456,144 @@ export class HraService {
     }
   }
 
+  #accountMutationExplainsObservedCodexTransition(
+    profile: Pick<ProfileRecord, "id" | "processGeneration" | "state">,
+    account: CodexAccountProjection,
+  ): boolean {
+    const attempt = this.#accountRecoveryMutation(this.#providerAuthority(profile, "codex"));
+    if (attempt === null) return false;
+    if (attempt.kind === "account.logout") return !account.signedIn;
+    if (attempt.kind === "account.login") return true;
+    // Either observation can reconcile an uncertain cancellation, but neither
+    // proves that cancelLogin itself ran or grants a second dispatch.
+    return attempt.kind === "account.login-cancel";
+  }
+
+  #accountRecoveryMutation(authority: ProviderAccountAuthority): MutationAttemptRecord | null {
+    try {
+      return this.#store.readAccountRecoveryMutation(authority);
+    } catch {
+      throw new CommandFailure("RECOVERY_REQUIRED", "No single exact account recovery authority is available.");
+    }
+  }
+
+  /**
+   * Reject an unsolicited replacement before an account fact can hide behind
+   * projection recovery or the account mutation tail. Login and logout facts
+   * backed by their exact durable mutation are expected transitions, not an
+   * authority replacement.
+   */
+  #assertObservedCodexAccountAuthority(
+    profile: ProfileRecord,
+    account: CodexAccountProjection,
+  ): void {
+    if (profile.state !== "signed_in" && profile.state !== "recovery_required") return;
+    if (!providerAccountAuthorityChanged(profile, account)) return;
+    if (this.#accountMutationExplainsObservedCodexTransition(profile, account)) return;
+    this.#scheduleProfilePersonalAuthorityRevocation(profile);
+    throw new ProviderAccountAuthorityMismatchError("codex", profile);
+  }
+
+  /**
+   * A personal-home account fact is evidence only for the dedicated personal
+   * controller. It must never rewrite the selected isolated HRA login. A
+   * mismatch instead enters the existing durable controller-revocation path
+   * before any later personal fact or effect can be admitted.
+   */
+  async observePersonalCodexAccount(
+    authority: ProfileAuthority,
+    account: CodexAccountProjection,
+  ): Promise<void> {
+    const finish = this.#beginFactOperation();
+    if (finish === null) return;
+    try {
+      await this.#daemonAuthority.assertCurrent();
+      let profile: ProfileRecord;
+      try {
+        profile = this.#store.requireProfileById(authority.id);
+      } catch {
+        return;
+      }
+      if (
+        !this.#profileAuthorityIsCurrent(authority)
+        || authority.provider !== "codex"
+        || (profile.state !== "signed_in" && profile.state !== "recovery_required")
+      ) return;
+      const key = this.#personalAccountAttestationKey("codex", profile.id);
+      const accountKey = providerAccountAuthorityKey("codex", account);
+      if (accountKey === null || accountKey !== profileCodexAccountAuthorityKey(profile)) {
+        this.#personalAccountAttestations.delete(key);
+        const releasing = this.#store.readProviderRuntimeAccountRevocation({
+          profileId: profile.id,
+          provider: "codex",
+          runtimeScope: "personal",
+        });
+        if (
+          releasing?.state === "releasing"
+          && releasing.profileGeneration === profile.processGeneration
+        ) {
+          if (releasing.currentAccountKey !== accountKey) {
+            this.#scheduleProviderRuntimeAccountRevocation(
+              profile,
+              "codex",
+              "personal",
+              accountKey,
+            );
+          }
+          // The controller is already fenced, but every replacement callback
+          // still fails closed. A B -> C observation advances the durable job
+          // before throwing, so the in-flight close can complete its newest
+          // revision without reopening this retired generation.
+          throw new ProviderAccountAuthorityMismatchError("codex", profile);
+        }
+        this.#scheduleProviderRuntimeAccountRevocation(
+          profile,
+          "codex",
+          "personal",
+          accountKey,
+        );
+        throw new ProviderAccountAuthorityMismatchError("codex", profile);
+      }
+      this.#personalAccountAttestations.set(key, {
+        checkedAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(this.#now()),
+        accountKey,
+        generation: profile.processGeneration,
+        authority: this.#providerAccountAuthority(authority),
+      });
+    } catch (error: unknown) {
+      if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+      throw error;
+    } finally {
+      finish();
+    }
+  }
+
   async #observeProviderFactAdmitted(
-    provider: Provider,
     authority: ProfileAuthority,
     fact: CodexFact,
+    provider: Provider,
+    source: ProviderFactSource,
+    drain?: SessionSwitchFactDrain,
   ): Promise<void> {
     await this.#daemonAuthority.assertCurrent();
+    if (drain !== undefined) {
+      this.#assertSessionSwitchFactDrain(drain, authority.id);
+      const connectionId = fact.type === "interactionRequested" || fact.type === "interactionResolved"
+        ? fact.provider.connectionId
+        : "connectionId" in fact ? fact.connectionId ?? null : null;
+      const providerThreadId = fact.type === "interactionRequested" || fact.type === "interactionResolved"
+        ? fact.provider.threadId
+        : "threadId" in fact && typeof fact.threadId === "string" ? fact.threadId : null;
+      const scopedClaudeConnectionFact = provider === "claude"
+        && (fact.type === "providerDisconnected" || fact.type === "protocolNotice");
+      if (drain.owner.source !== source || drain.owner.authority.provider !== provider
+        || !sameProviderUsageAuthority(drain.owner.authority, this.#providerAccountAuthority(authority))
+        || connectionId !== drain.connectionId
+        || (providerThreadId === null ? !scopedClaudeConnectionFact
+          : providerThreadId !== drain.owner.providerThreadId)) {
+        throw new Error("SESSION_SWITCH_FACT_DRAIN_AUTHORITY_MISMATCH");
+      }
+    }
     if (provider !== authority.provider) return;
     let profile: ProfileRecord;
     try {
@@ -3853,7 +6602,24 @@ export class HraService {
       return;
     }
     if (!this.#profileAuthorityIsCurrent(authority)) return;
+    if (
+      provider === "codex"
+      && fact.type !== "providerDisconnected"
+      && this.#profileAuthorityRevocationIsPending(profile.id, profile.processGeneration)
+    ) return;
     if (fact.type === "providerDisconnected") {
+      if (source === "personal") {
+        const disconnected = this.#handleProviderDisconnected(
+          authority,
+          fact.connectionId,
+          fact.reason,
+          provider,
+          source,
+          drain,
+        );
+        if (provider === "claude") this.#scheduleClaudeDisconnectRecovery(disconnected);
+        return;
+      }
       await this.#applyOrderedAccountFact(profile.id, () => {
         try {
           this.#store.requireProfileById(authority.id);
@@ -3862,8 +6628,18 @@ export class HraService {
           throw error;
         }
         if (!this.#admittedProviderProcessAuthorityIsCurrent(authority)) return;
-        this.#handleProviderDisconnected(authority, fact.connectionId, fact.reason);
-        if (authority.provider === "codex") {
+        const current = this.#store.requireProfileById(authority.id);
+        const disconnected = this.#handleProviderDisconnected(
+          authority, fact.connectionId, fact.reason, provider, source, drain,
+        );
+        if (provider === "claude") this.#scheduleClaudeDisconnectRecovery(disconnected);
+        if (provider === "codex") {
+          // A shared Codex generation may not move while a personal controller
+          // still owns it. Independent Claude account counters never rebind.
+          if (this.#profileHasControllingCodexAuthority(current)) {
+            this.#wakeSessionTaskPump();
+            return;
+          }
           const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
             authority.id,
             authority.generation,
@@ -3873,17 +6649,18 @@ export class HraService {
           this.#notifyAffectedWork(retirement.affectedWorkIds);
         }
         this.#wakeSessionTaskPump();
-      });
+      }, drain);
       return;
     }
     if (fact.type === "providerConnected") return;
     if (fact.type === "notificationIgnored") return;
     if (fact.type === "rateLimitsUpdated") {
-      if (provider === "codex") this.#scheduleUsageRefresh(authority);
+      if (source === "personal" || provider !== "codex") return;
+      this.#scheduleUsageRefresh(authority);
       return;
     }
     if (fact.type === "loginCompleted") {
-      if (provider !== "codex") return;
+      if (source === "personal" || provider !== "codex") return;
       if (fact.success || fact.loginId === null) return;
       const loginId = fact.loginId;
       const settleFailedLogin = (): void => {
@@ -3911,9 +6688,13 @@ export class HraService {
           provider: { signedIn: false },
         });
       };
-      await this.#applyOrderedAccountFact(profile.id, settleFailedLogin);
+      await this.#applyOrderedAccountFact(profile.id, settleFailedLogin, drain);
       return;
     }
+    // Codex facts retain the selected Codex-account prerequisite. Claude facts
+    // are instead fenced by their exact provider account and process authority,
+    // so a profile whose independent Codex login is signed out remains usable.
+    if (provider === "codex" && profile.state !== "signed_in") return;
     if (fact.type === "interactionRequested") {
       if (
         fact.provider.profileId !== authority.id
@@ -3934,40 +6715,82 @@ export class HraService {
       ) throw new Error("MCP_FORM_DISPLAY_CONTRACT_MISSING");
       const session = fact.provider.threadId === null
         ? null
-        : this.#store.findSessionByProviderThread(authority.id, fact.provider.threadId);
-      if (fact.provider.threadId !== null && session === null) {
-        // A thread-scoped interaction must never be downgraded to a global
-        // interaction merely because a dedicated switch temporarily owns the
-        // source or target binding.
-        throw new Error("INTERACTION_SESSION_BINDING_UNAVAILABLE");
-      }
-      if (session !== null && !this.#authorityMatchesSession(authority, session)) {
-        throw new Error("INTERACTION_SESSION_PROVIDER_AUTHORITY_MISMATCH");
-      }
-      if (session !== null) this.#ensureSessionProviderConnection(authority, session, fact.connectionId);
-      const admitted = this.#store.admitInteraction({
-        publicId: randomUUID(),
-        sessionId: session?.id ?? null,
-        authority: fact.provider,
-        kind: fact.kind,
-        blocking: fact.blocking,
-        display: sanitizeInteractionDisplay(fact.display),
-        ...(fact.timeoutMs === undefined ? {} : { timeoutMs: fact.timeoutMs }),
-        ...(fact.requestedAt === undefined ? {} : { requestedAt: fact.requestedAt }),
-        ...(fact.deadlineAt === undefined ? {} : { deadlineAt: fact.deadlineAt }),
-      });
-      if (!admitted.replayed && admitted.record.sessionId !== null) {
-        this.#appendSessionEvent(authority, admitted.record.sessionId, fact.connectionId, {
-          type: "interaction_requested",
-          interactionId: admitted.record.publicId,
-          interactionKind: admitted.record.kind,
-          revision: admitted.record.revision,
-          blocking: admitted.record.blocking,
-          summary: admitted.record.display.summary,
+        : this.#findSessionForProviderFact(
+            authority.id,
+            fact.provider.threadId,
+            provider,
+            source,
+          );
+      if (session === null || fact.provider.threadId === null) return;
+      const providerThreadId = fact.provider.threadId;
+      const admit = async (): Promise<void> => {
+        const currentProfile = this.#store.requireProfileById(authority.id);
+        if (
+          !this.#profileAuthorityIsCurrent(authority)
+          || (provider === "codex" && currentProfile.state !== "signed_in")
+          || (provider === "codex" && this.#profileAuthorityRevocationIsPending(
+            currentProfile.id,
+            currentProfile.processGeneration,
+          ))
+        ) return;
+        const exact = fact.provider.threadId === null
+          ? null
+          : this.#findSessionForProviderFact(
+              authority.id,
+              fact.provider.threadId,
+              provider,
+              source,
+            );
+        if (exact === null || !this.#authorityMatchesSession(authority, exact)) return;
+        if (!await this.#ensureSessionFactAuthority(
+          exact,
+          authority,
+          provider,
+          source,
+          providerThreadId,
+          fact.connectionId,
+        )) return;
+        if (!this.#sessionFactAuthorityIsCurrent(
+          exact.id,
+          authority,
+          provider,
+          source,
+          providerThreadId,
+          fact.connectionId,
+        )) return;
+        const admitted = this.#store.admitInteraction({
+          publicId: randomUUID(),
+          sessionId: exact.id,
+          authority: fact.provider,
+          kind: fact.kind,
+          blocking: fact.blocking,
+          display: sanitizeInteractionDisplay(fact.display),
+          ...(fact.timeoutMs === undefined ? {} : { timeoutMs: fact.timeoutMs }),
+          ...(fact.requestedAt === undefined ? {} : { requestedAt: fact.requestedAt }),
+          ...(fact.deadlineAt === undefined ? {} : { deadlineAt: fact.deadlineAt }),
         });
-        this.#scheduleAutorespond(admitted.record);
-      }
-      this.#wakeInteractionDeadlinePump();
+        if (!admitted.replayed && admitted.record.sessionId !== null) {
+          if (!this.#sessionFactAuthorityIsCurrent(
+            exact.id,
+            authority,
+            provider,
+            source,
+            providerThreadId,
+            fact.connectionId,
+          )) return;
+          this.#appendSessionEvent(authority, admitted.record.sessionId, fact.connectionId, {
+            type: "interaction_requested",
+            interactionId: admitted.record.publicId,
+            interactionKind: admitted.record.kind,
+            revision: admitted.record.revision,
+            blocking: admitted.record.blocking,
+            summary: admitted.record.display.summary,
+          });
+          this.#scheduleAutorespond(admitted.record);
+        }
+        this.#wakeInteractionDeadlinePump();
+      };
+      await this.#applyOrderedSessionFact(session, admit, drain);
       return;
     }
     if (fact.type === "interactionResolved") {
@@ -3978,121 +6801,273 @@ export class HraService {
         observed.sessionId !== null
         && this.#store.requireSession(observed.sessionId).provider !== provider
       ) return;
-      await this.#serialize(`interaction:${observed.publicId}`, async () => {
-        const current = this.#store.findInteractionByAuthority(fact.provider);
+      const settle = async (): Promise<void> => {
+        const currentProfile = this.#store.requireProfileById(authority.id);
         if (
-          current === null
-          || current.state === "resolved"
-          || current.state === "declined"
-          || current.state === "canceled"
-          || current.state === "expired"
-          || current.state === "resolution_unknown"
+          !this.#profileAuthorityIsCurrent(authority)
+          || (provider === "codex" && currentProfile.state !== "signed_in")
+          || (provider === "codex" && this.#profileAuthorityRevocationIsPending(
+            currentProfile.id,
+            currentProfile.processGeneration,
+          ))
         ) return;
-        try {
-          const settled = this.#store.settleInteraction({
-            id: current.publicId,
-            expectedRevision: current.revision,
-            state: current.intendedTerminalState ?? "resolved",
-            authority: fact.provider,
-            ...(current.responseDigest === null ? {} : { responseDigest: current.responseDigest }),
-          });
-          this.#appendInteractionState(settled);
-        } catch (error: unknown) {
-          throw this.#interactionPersistenceBoundaryError({
-            cause: error,
-            effect: "possibly_sent",
-            focalInteraction: current,
-            ...(current.responseDigest === null
-              ? {}
-              : { responseDigest: current.responseDigest }),
-          });
+        if (drain !== undefined) {
+          this.#assertSessionSwitchFactDrain(drain, authority.id);
+          if (this.#mutationTails.has(`interaction:${observed.publicId}`)) {
+            throw new Error("SESSION_SWITCH_FACT_DRAIN_INTERACTION_BUSY");
+          }
         }
-      });
+        await this.#serialize(`interaction:${observed.publicId}`, async () => {
+          if (drain !== undefined) this.#assertSessionSwitchFactDrain(drain, authority.id);
+          const current = this.#store.findInteractionByAuthority(fact.provider);
+          if (
+            current === null
+            || current.state === "resolved"
+            || current.state === "declined"
+            || current.state === "canceled"
+            || current.state === "expired"
+            || current.state === "resolution_unknown"
+          ) return;
+          if (current.sessionId === null || fact.provider.threadId === null) return;
+          if (!this.#sessionFactAuthorityIsCurrent(
+            current.sessionId,
+            authority,
+            provider,
+            source,
+            fact.provider.threadId,
+            fact.provider.connectionId,
+          )) return;
+          try {
+            const settled = this.#store.settleInteraction({
+              id: current.publicId,
+              expectedRevision: current.revision,
+              state: current.intendedTerminalState ?? "resolved",
+              authority: fact.provider,
+              ...(current.responseDigest === null ? {} : { responseDigest: current.responseDigest }),
+            });
+            this.#appendInteractionState(settled);
+          } catch (error: unknown) {
+            throw this.#interactionPersistenceBoundaryError({
+              cause: error,
+              effect: "possibly_sent",
+              focalInteraction: current,
+              ...(current.responseDigest === null
+                ? {}
+                : { responseDigest: current.responseDigest }),
+            });
+          }
+        });
+      };
+      const ordered = async (): Promise<void> => {
+        if (observed.sessionId === null) {
+          await this.#applyOrderedAccountFact(authority.id, settle, drain);
+          return;
+        }
+        const session = this.#store.requireSession(observed.sessionId);
+        if (!this.#sessionUsesFactSource(session, provider, source)) return;
+        await this.#applyOrderedSessionFact(session, async () => {
+          const exact = this.#store.requireSession(session.id);
+          if (!this.#sessionUsesFactSource(exact, provider, source)) return;
+          if (fact.provider.threadId === null) return;
+          if (!await this.#ensureSessionFactAuthority(
+            exact,
+            authority,
+            provider,
+            source,
+            fact.provider.threadId,
+            fact.provider.connectionId,
+          )) return;
+          await settle();
+        }, drain);
+      };
+      if (this.#mutationTails.has(`interaction:${observed.publicId}`)) {
+        if (drain !== undefined) throw new Error("SESSION_SWITCH_FACT_DRAIN_INTERACTION_BUSY");
+        const tracked = ordered().catch((error: unknown) => {
+          if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+          else this.recordBackgroundDiagnostic("session_state_tracking_failed", error);
+        });
+        this.#background.add(tracked);
+        void tracked.then(() => this.#background.delete(tracked));
+      } else {
+        await ordered();
+      }
       return;
     }
     if (fact.type === "protocolNotice") {
       if (fact.connectionId === undefined) return;
-      for (const [sessionId, connectionId] of this.#sessionProviderConnections) {
+      const observations: Promise<void>[] = [];
+      for (const [sessionId, connectionId] of [...this.#sessionProviderConnections]) {
+        if (drain !== undefined && sessionId !== drain.sessionId) continue;
         if (connectionId !== fact.connectionId) continue;
         const session = this.#store.requireSession(sessionId);
-        if (!this.#authorityMatchesSession(authority, session)) continue;
-        if (this.#store.sessionSwitchAdmissionBlocked({
-          sessionId: session.id,
-          providerThreadId: session.providerThreadId ?? null,
-          providerAuthority: this.#providerAccountAuthority(authority),
-        }).blocked) continue;
-        this.#appendSessionEvent(authority, session.id, connectionId, {
-          type: "protocol_incompatible",
-          method: fact.method,
-          payloadDigest: digestText(fact.method),
-        });
+        if (
+          !this.#authorityMatchesSession(authority, session)
+          || !this.#sessionUsesFactSource(session, provider, source)
+        ) continue;
+        observations.push(this.#applyOrderedSessionFact(session, async () => {
+          const exact = this.#store.requireSession(session.id);
+          if (
+            !this.#authorityMatchesSession(authority, exact)
+            || !this.#sessionUsesFactSource(exact, provider, source)
+          ) return;
+          if (exact.providerThreadId === undefined || this.#store.sessionSwitchAdmissionBlocked({
+            sessionId: exact.id,
+            providerThreadId: exact.providerThreadId,
+            providerAuthority: this.#providerAccountAuthority(authority),
+          }).blocked) return;
+          if (!await this.#ensureSessionFactAuthority(
+            exact,
+            authority,
+            provider,
+            source,
+            exact.providerThreadId,
+            connectionId,
+          )) return;
+          if (!this.#sessionFactAuthorityIsCurrent(
+            exact.id,
+            authority,
+            provider,
+            source,
+            exact.providerThreadId,
+            connectionId,
+          )) return;
+          this.#appendSessionEvent(authority, exact.id, connectionId, {
+            type: "protocol_incompatible",
+            method: fact.method,
+            payloadDigest: digestText(fact.method),
+          });
+        }, drain));
       }
+      await Promise.all(observations);
       return;
     }
     if (!("threadId" in fact) || typeof fact.threadId !== "string") return;
-    const session = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
+    const observedSession = this.#findSessionForProviderFact(
+      authority.id,
+      fact.threadId,
+      provider,
+      source,
+    );
     if (
-      session === null
-      || session.provider !== provider
-      || (session.state === "terminal" && fact.type !== "threadDeleted")
-      || (session.state === "recovery_required" && fact.type !== "threadDeleted")
+      observedSession === null
+      || (observedSession.state === "terminal" && fact.type !== "threadDeleted")
+      || (observedSession.state === "recovery_required" && fact.type !== "threadDeleted")
     ) return;
-    if (!this.#authorityMatchesSession(authority, session)) return;
-    this.#ensureSessionProviderConnection(authority, session, fact.connectionId);
+    if (!this.#authorityMatchesSession(authority, observedSession)) return;
+    // Provider deletion is the terminal authority that supersedes an
+    // in-flight compact-projection recovery. It must not queue behind that
+    // recovery's session tail, or both sides wait for the other to settle.
     if (fact.type === "threadDeleted") {
-      await this.#applyProviderThreadDeletion(authority, fact, session);
+      if (fact.connectionId === undefined) return;
+      if (!this.#sessionFactAuthorityIsCurrent(
+        observedSession.id,
+        authority,
+        provider,
+        source,
+        fact.threadId,
+        fact.connectionId,
+        { allowRecoveryRequired: true },
+      )) return;
+      await this.#applyProviderThreadDeletion(
+        authority,
+        fact,
+        observedSession,
+        provider,
+        source,
+      );
       return;
     }
-    const event = this.#eventBodyForCodexFact(fact, session);
-    if (event !== null) {
-      this.#appendSessionEvent(authority, session.id, fact.connectionId ?? null, event);
-    }
-    const recoveryUnsettled = await this.#cloud
-      .isCompactProjectionRecoveryUnsettled(session.id);
-    await this.#daemonAuthority.assertCurrent();
-    if (recoveryUnsettled || this.#projectionRecoveriesInFlight.has(session.id)) return;
-    let dispatchQueue = false;
-    if (this.#mutationTails.has(`session:${session.id}`)) {
-      const priorRevision = this.#store.requireSession(session.id).revision;
-      dispatchQueue = this.#applyCodexFact(authority, fact, session);
-      const committed = this.#store.requireSession(session.id);
+    await this.#applyOrderedSessionFact(observedSession, async () => {
+      const currentProfile = this.#store.requireProfileById(authority.id);
+      if (
+        !this.#profileAuthorityIsCurrent(authority)
+        || (provider === "codex" && currentProfile.state !== "signed_in")
+        || (provider === "codex" && this.#profileAuthorityRevocationIsPending(
+          currentProfile.id,
+          currentProfile.processGeneration,
+        ))
+      ) return;
+      const session = this.#findSessionForProviderFact(
+        authority.id,
+        fact.threadId,
+        provider,
+        source,
+      );
+      if (
+        session === null
+        || session.state === "terminal"
+        || session.state === "recovery_required"
+      ) return;
+      if (!await this.#ensureSessionFactAuthority(
+        session,
+        authority,
+        provider,
+        source,
+        fact.threadId,
+        fact.connectionId,
+      )) return;
+      const event = this.#eventBodyForCodexFact(fact, session);
+      if (event !== null) {
+        if (!this.#sessionFactAuthorityIsCurrent(
+          session.id,
+          authority,
+          provider,
+          source,
+          fact.threadId,
+          fact.connectionId,
+        )) return;
+        this.#appendSessionEvent(authority, session.id, fact.connectionId ?? null, event);
+      }
+      const recoveryUnsettled = await this.#cloud
+        .isCompactProjectionRecoveryUnsettled(session.id);
+      await this.#daemonAuthority.assertCurrent();
+      const exact = this.#findSessionForProviderFact(
+        authority.id,
+        fact.threadId,
+        provider,
+        source,
+      );
+      if (
+        exact === null
+        || recoveryUnsettled
+        || this.#projectionRecoveriesInFlight.has(session.id)
+      ) return;
+      if (!this.#sessionFactAuthorityIsCurrent(
+        exact.id,
+        authority,
+        provider,
+        source,
+        fact.threadId,
+        fact.connectionId,
+      )) return;
+      const priorRevision = exact.revision;
+      const dispatchQueue = this.#applyCodexFact(authority, fact, exact);
+      const committed = this.#store.requireSession(exact.id);
       if (committed.revision !== priorRevision) {
         await this.#reconcileCommittedSessionFactsMemory(committed);
       }
-    } else {
-      try {
-        dispatchQueue = await this.#serializeSessionAuthority(session, async () => {
-          const priorRevision = this.#store.requireSession(session.id).revision;
-          const shouldDispatch = this.#applyCodexFact(authority, fact, session);
-          const committed = this.#store.requireSession(session.id);
-          if (committed.revision !== priorRevision) {
-            await this.#reconcileCommittedSessionFactsMemory(committed);
-          }
-          return shouldDispatch;
-        });
-      } catch (error: unknown) {
-        if (error instanceof CommandFailure && error.code === "RECOVERY_REQUIRED") return;
-        throw error;
-      }
-    }
-    if (dispatchQueue) {
-      const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, authority));
-      const tracked = task.then(
-        () => undefined,
-        (error: unknown) => this.recordBackgroundDiagnostic("queue_dispatch_failed", error),
-      );
-      this.#background.add(tracked);
-      void tracked.then(() => this.#background.delete(tracked));
-    }
+      if (dispatchQueue) this.#scheduleIdleQueue(committed);
+    }, drain);
   }
 
   async #applyProviderThreadDeletion(
     authority: ProfileAuthority,
     fact: Extract<CodexFact, { type: "threadDeleted" }>,
     expected: SessionRecord,
+    provider: Provider,
+    source: ProviderFactSource,
   ): Promise<void> {
     const current = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
     if (current === null || current.id !== expected.id) return;
+    if (!this.#sessionFactAuthorityIsCurrent(
+      current.id,
+      authority,
+      provider,
+      source,
+      fact.threadId,
+      fact.connectionId,
+      { allowRecoveryRequired: true },
+    )) return;
     this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
       sessionId: current.id,
       accountId: authority.id,
@@ -4101,6 +7076,15 @@ export class HraService {
       providerConnectionId: fact.connectionId ?? null,
     }));
     this.#bumpSessionFactEpoch(current.id);
+    if (!this.#sessionFactAuthorityIsCurrent(
+      current.id,
+      authority,
+      provider,
+      source,
+      fact.threadId,
+      fact.connectionId,
+      { allowRecoveryRequired: true },
+    )) return;
     const terminal = this.#store.terminalizeSessionFromProviderDeletion({
       accountId: authority.id,
       providerConnectionId: fact.connectionId ?? null,
@@ -4111,8 +7095,32 @@ export class HraService {
     });
     if (terminal.event !== undefined) this.#eventWaiters.notify(current.id);
     for (const interaction of terminal.interactions) this.#appendInteractionState(interaction);
-    await this.#cleanupTerminalFactsMemory(this.#store.requireSession(current.id));
+    const terminalSession = this.#store.requireSession(current.id);
+    const personalBinding = this.#store.readSessionPersonalRuntimeBinding(current.id, true);
+    if (
+      personalBinding !== null
+      && personalBinding.state !== "detached"
+      && personalBinding.provider === terminalSession.provider
+      && personalBinding.providerThreadId === terminalSession.providerThreadId
+    ) {
+      if (personalBinding.state === "active") {
+        this.#clearSessionFactAuthority(terminalSession.id);
+        this.#store.beginPersonalSessionDetach({ sessionId: terminalSession.id });
+      }
+      this.#scheduleTerminalPersonalDetach(terminalSession);
+    } else if (
+      terminalSession.provider === "claude"
+      && terminalSession.providerThreadId !== undefined
+    ) {
+      this.#scheduleClaudeProcessAuthorityRelease({
+        providerThreadId: terminalSession.providerThreadId,
+        profileId: terminalSession.profileId,
+        runtimeScope: "managed",
+      });
+    }
+    await this.#cleanupTerminalFactsMemory(terminalSession);
     this.#sessionProviderConnections.delete(current.id);
+    this.#clearSessionFactAuthority(current.id);
     this.#sessionObservationFailures.delete(current.id);
     this.#sessionResubscriptionConnections.delete(current.id);
     this.#sessionsAwaitingResubscription.delete(current.id);
@@ -4623,7 +7631,15 @@ export class HraService {
     if (connectionId === undefined) return;
     z.string().uuid().parse(connectionId);
     const previous = this.#sessionProviderConnections.get(session.id);
-    if (previous === connectionId) return;
+    if (previous === connectionId) {
+      try {
+        this.#mintSessionFactAuthority(authority, session, connectionId);
+      } catch (error: unknown) {
+        this.#clearSessionFactAuthority(session.id);
+        throw error;
+      }
+      return;
+    }
     if (previous !== undefined) {
       const position = this.#store.eventStreamPosition(session.id);
       this.#appendSessionEvent(authority, session.id, previous, {
@@ -4634,6 +7650,13 @@ export class HraService {
       });
     }
     this.#sessionProviderConnections.set(session.id, connectionId);
+    try {
+      this.#mintSessionFactAuthority(authority, session, connectionId);
+    } catch (error: unknown) {
+      this.#sessionProviderConnections.delete(session.id);
+      this.#clearSessionFactAuthority(session.id);
+      throw error;
+    }
     const resubscribed = previous !== undefined
       || this.#sessionsAwaitingResubscription.has(session.id)
       || this.#lastSessionEventIsProviderGap(session.id);
@@ -4667,6 +7690,7 @@ export class HraService {
       authority.providerAccountId,
       authority.bindingGeneration,
       authority.generation,
+      authority.codexHome,
       providerThreadId,
     ]);
   }
@@ -4695,12 +7719,7 @@ export class HraService {
 
   #drainPendingClaudeDisconnect(session: SessionRecord): void {
     if (session.provider !== "claude" || session.providerThreadId === undefined) return;
-    const providerAuthority = this.#capturedSessionProviderAuthority(session);
-    const authority = authorityFor(
-      this.#paths,
-      this.#store.requireProfileById(providerAuthority.profileId),
-      providerAuthority,
-    );
+    const authority = this.#sessionAuthority(session);
     const pending = this.#takePendingClaudeDisconnect(authority, session.providerThreadId);
     if (pending === undefined) return;
     if (
@@ -4714,7 +7733,11 @@ export class HraService {
     if (currentConnectionId === undefined) {
       this.#ensureSessionProviderConnection(authority, session, pending.connectionId);
     }
-    this.#handleProviderDisconnected(authority, pending.connectionId, pending.reason);
+    const source: ProviderFactSource = this.#sessionHasActivePersonalBinding(session)
+      ? "personal" : "managed";
+    this.#scheduleClaudeDisconnectRecovery(this.#handleProviderDisconnected(
+      authority, pending.connectionId, pending.reason, "claude", source,
+    ));
   }
 
   #takePendingClaudeDisconnect(
@@ -4742,7 +7765,17 @@ export class HraService {
     authority: ProfileAuthority,
     connectionId: string,
     reason: "eof" | "process_exit" | "closed" | "protocol_fault",
-  ): void {
+    provider: Provider,
+    source: ProviderFactSource,
+    drain?: SessionSwitchFactDrain,
+  ): readonly SessionRecord[] {
+    if (drain !== undefined) {
+      this.#assertSessionSwitchFactDrain(drain, authority.id);
+      if (provider !== "claude" || drain.connectionId !== connectionId) {
+        throw new Error("SESSION_SWITCH_FACT_DRAIN_ACCOUNT_SCOPE_MISMATCH");
+      }
+    }
+    const disconnected: SessionRecord[] = [];
     const providerAuthority = this.#providerAccountAuthority(authority);
     const terminal = this.#store.expireGenerationInteractions({
       profileId: authority.id,
@@ -4750,6 +7783,7 @@ export class HraService {
       connectionId,
       providerAuthority,
       excludeSessionSwitchBlocked: true,
+      ...(drain === undefined ? {} : { sessionId: drain.sessionId }),
     });
     for (const interaction of terminal) this.#appendInteractionState(interaction);
     // Codex shares one connection across its account runtime, while each
@@ -4757,10 +7791,12 @@ export class HraService {
     // connection map is the exact loss boundary: account/daemon retirement is
     // handled separately by #retireClosedRuntimeAuthorities.
     const affectedSessions = [...this.#sessionProviderConnections]
-      .filter(([, activeConnectionId]) => activeConnectionId === connectionId)
+      .filter(([sessionId, activeConnectionId]) => activeConnectionId === connectionId
+        && (drain === undefined || sessionId === drain.sessionId))
       .flatMap(([sessionId]) => {
         const session = this.#store.requireSession(sessionId);
-        return this.#authorityMatchesSession(authority, session) ? [session] : [];
+        return this.#authorityMatchesSession(authority, session)
+          && this.#sessionUsesFactSource(session, provider, source) ? [session] : [];
       });
     for (const session of affectedSessions) {
       const sessionConnectionId = connectionId;
@@ -4774,6 +7810,7 @@ export class HraService {
         // generation, while the journal/recovery path owns this session's
         // exact disposition.
         this.#sessionProviderConnections.delete(session.id);
+        this.#clearSessionFactAuthority(session.id);
         this.#sessionObservationFailures.delete(session.id);
         this.#sessionResubscriptionConnections.delete(session.id);
         this.#sessionsAwaitingResubscription.delete(session.id);
@@ -4792,28 +7829,13 @@ export class HraService {
         throughSequence: position.observedThroughSequence + 1,
       });
       this.#sessionProviderConnections.delete(session.id);
+      this.#clearSessionFactAuthority(session.id);
       this.#sessionObservationFailures.delete(session.id);
       this.#sessionResubscriptionConnections.delete(session.id);
-      if (authority.provider === "claude") {
-        const terminalized = this.#store.terminalizeSessionFromProviderDeletion({
-          accountId: authority.id,
-          providerConnectionId: sessionConnectionId,
-          providerGeneration: authority.generation,
-          providerAuthority,
-          source: "provider_transport_lost",
-          sessionId: session.id,
-        });
-        for (const interaction of terminalized.interactions) {
-          this.#appendInteractionState(interaction);
-        }
-        if (session.providerThreadId !== undefined) {
-          this.#claudeFacts.forgetSession(providerAuthority, session.providerThreadId);
-        }
-        this.#sessionsAwaitingResubscription.delete(session.id);
-      } else {
-        this.#sessionsAwaitingResubscription.add(session.id);
-      }
+      this.#sessionsAwaitingResubscription.add(session.id);
+      disconnected.push(session);
     }
+    return disconnected;
   }
 
   #prepareCodexProviderRetirements(
@@ -4868,10 +7890,15 @@ export class HraService {
     retiredSessionIds: readonly SessionRecord["id"][],
   ): void {
     for (const retirement of retirements) {
-      if (this.#sessionProviderConnections.get(retirement.sessionId) !== retirement.connectionId) {
+      const currentConnection = this.#sessionProviderConnections.get(retirement.sessionId);
+      if (
+        currentConnection !== undefined
+        && currentConnection !== retirement.connectionId
+      ) {
         throw new Error("ACCOUNT_PROVIDER_RETIREMENT_CONNECTION_CHANGED");
       }
       this.#sessionProviderConnections.delete(retirement.sessionId);
+      this.#clearSessionFactAuthority(retirement.sessionId);
       this.#sessionObservationFailures.delete(retirement.sessionId);
       this.#sessionResubscriptionConnections.delete(retirement.sessionId);
       this.#sessionsAwaitingResubscription.add(retirement.sessionId);
@@ -5143,13 +8170,40 @@ export class HraService {
     let devinClose = async () => await this.#devin.close();
     let devinCaptures: readonly DevinJoinedCloseCapture[] = [];
     let joinedDevinWriters: readonly DevinRuntimeCloseWitness[] = [];
-    const failedProviders = new Set<Provider>();
+    const claudeCloseCaptures = new Map<string, ClaudeProcessAuthorityRecord>();
+    const failedRuntimeScopes = new Set<string>();
     try {
       if (this.#interactionDeadlineTask !== undefined) {
         await this.#interactionDeadlineTask.catch(() => undefined);
       }
       if (this.#sessionTaskPumpTask !== undefined) {
         await this.#sessionTaskPumpTask.catch(() => undefined);
+      }
+      // Admission authority is already closed. This bounded read captures
+      // cleanup custody only: it cannot launch, resume, or rebind anything.
+      // Rows outside this snapshot need independent exit proof after close.
+      try {
+      for (const process of this.#store.listUnreleasedClaudeProcessAuthorities()) {
+        try {
+          const authority = this.#authorityForClaudeProcess(process);
+          if (authority === null) continue;
+          const identity = await this.#claudeRuntimeForScope(process.runtimeScope)
+            .readSessionProcessIdentity({ authority, providerThreadId: process.providerThreadId,
+              signal: new AbortController().signal });
+          if (this.#sameClaudeProcessIdentity(identity, process.identity)) {
+            claudeCloseCaptures.set(JSON.stringify([
+              process.runtimeScope, process.profileId, process.providerThreadId,
+            ]), process);
+          }
+        } catch {
+          // Failed inspection never prevents all-runtime close and grants no
+          // release evidence. The post-close PID/start probe must decide.
+        }
+      }
+      } catch (error: unknown) {
+        // Even corrupt durable custody cannot skip cleanup of the manager's
+        // owned children. The post-close read remains fail-closed.
+        this.recordBackgroundDiagnostic("recovery_observation_failed", error);
       }
       const custody = this.#devin.closeCustody;
       if (custody !== undefined && this.#daemonBootId !== undefined && this.#daemonGeneration > 0) {
@@ -5174,22 +8228,45 @@ export class HraService {
           captureError = error;
         }
       }
-      const runtimes: readonly Readonly<{
-        close: () => Promise<void>;
-        provider: Provider;
-      }>[] = [
-        { close: async () => await this.#codex.close(), provider: "codex" },
-        { close: async () => await this.#claude.close(), provider: "claude" },
-        { close: devinClose, provider: "devin" },
-      ];
+      const runtimes = new Map<
+        SessionRuntimePort<ReviewedRuntimeProfile>,
+        Array<Readonly<{ provider: Provider; runtimeScope: RuntimeAccountScope }>>
+      >();
+      const registerRuntime = (
+        runtime: SessionRuntimePort<ReviewedRuntimeProfile>,
+        provider: Provider,
+        runtimeScope: RuntimeAccountScope,
+      ): void => {
+        const authorities = runtimes.get(runtime) ?? [];
+        authorities.push({ provider, runtimeScope });
+        runtimes.set(runtime, authorities);
+      };
+      registerRuntime(this.#codex, "codex", "managed");
+      registerRuntime(this.#claude, "claude", "managed");
+      registerRuntime(this.#devin, "devin", "managed");
+      if (this.#personalCodex !== undefined) {
+        registerRuntime(this.#personalCodex, "codex", "personal");
+      }
+      if (this.#personalClaude !== undefined) {
+        registerRuntime(this.#personalClaude, "claude", "personal");
+      }
+      const runtimeEntries = [...runtimes.entries()];
       const closed = await Promise.allSettled(
-        runtimes.map(async (runtime) => await runtime.close()),
+        runtimeEntries.map(async ([runtime]) => runtime === this.#devin
+          ? await devinClose()
+          : await runtime.close()),
       );
       for (const [index, outcome] of closed.entries()) {
         if (outcome.status === "rejected") {
           runtimeError ??= outcome.reason;
-          const runtime = runtimes[index];
-          if (runtime !== undefined) failedProviders.add(runtime.provider);
+          const entry = runtimeEntries[index];
+          if (entry !== undefined) {
+            for (const authority of entry[1]) {
+              failedRuntimeScopes.add(
+                `${authority.provider}:${authority.runtimeScope}`,
+              );
+            }
+          }
         }
       }
     } catch (error: unknown) {
@@ -5200,8 +8277,22 @@ export class HraService {
     if (runtimeError !== undefined) {
       const quarantineErrors: unknown[] = [];
       for (const profile of this.#store.listProfiles()) {
-        for (const provider of failedProviders) {
-          for (const session of this.#store.listNonterminalProviderSessions(profile.id, provider)) {
+        for (const provider of ["codex", "claude", "devin"] as const) {
+          for (const session of this.#store.listNonterminalProviderSessions(
+            profile.id,
+            provider,
+          )) {
+            const recorded = provider === "devin"
+              ? null
+              : this.#store.readSessionProviderAccountAuthority(session.id);
+            const runtimeScope: RuntimeAccountScope = provider === "devin"
+              ? "managed"
+              : recorded !== null && recorded.provider === session.provider
+                ? recorded.runtimeScope
+                : this.#sessionHasMatchingActivePersonalBinding(session)
+                  ? "personal"
+                  : "managed";
+            if (!failedRuntimeScopes.has(`${provider}:${runtimeScope}`)) continue;
             try {
               this.#quarantineSession(session.id);
             } catch (error: unknown) {
@@ -5227,6 +8318,7 @@ export class HraService {
     }
     let retirementError: unknown;
     try {
+      await this.#settleClosedClaudeProcessAuthorities(claudeCloseCaptures);
       this.#retireClosedRuntimeAuthorities(devinCaptures, joinedDevinWriters);
     } catch (error: unknown) {
       retirementError = error;
@@ -5241,7 +8333,53 @@ export class HraService {
     if (retirementError !== undefined) {
       throw retirementError instanceof Error
         ? retirementError
-        : new Error("The provider runtime authority retirement failed with a non-Error failure.");
+        : new Error("Provider runtime authority retirement failed with a non-Error failure.");
+    }
+  }
+
+  async #settleClosedClaudeProcessAuthorities(
+    joined: ReadonlyMap<string, ClaudeProcessAuthorityRecord>,
+  ): Promise<void> {
+    for (;;) {
+      const live = this.#store.listUnreleasedClaudeProcessAuthorities();
+      if (live.length === 0) break;
+      for (const process of live) {
+        const captured = joined.get(JSON.stringify([
+          process.runtimeScope, process.profileId, process.providerThreadId,
+        ]));
+        const exactJoined = captured !== undefined && captured.providerAuthority !== null
+          && process.providerAuthority !== null && captured.revision === process.revision
+          && captured.profileGeneration === process.profileGeneration
+          && captured.sessionId === process.sessionId
+          && sameProviderUsageAuthority(captured.providerAuthority, process.providerAuthority)
+          && this.#sameClaudeProcessIdentity(captured.identity, process.identity);
+        if (!exactJoined && await this.#probeClaudeProcessLiveness(
+          process, new AbortController().signal,
+        ) !== "not_live") {
+          throw new ProviderRuntimeUnavailableError(
+            "The exact historical Claude process was not joined and is not proven gone.",
+          );
+        }
+        const releasing = process.state === "releasing" ? process
+          : this.#store.beginClaudeProcessAuthorityRelease({
+              providerThreadId: process.providerThreadId, profileId: process.profileId,
+              runtimeScope: process.runtimeScope, expectedRevision: process.revision,
+              identity: process.identity,
+            });
+        this.#store.completeClaudeProcessAuthorityRelease({
+          providerThreadId: releasing.providerThreadId, profileId: releasing.profileId,
+          runtimeScope: releasing.runtimeScope, expectedRevision: releasing.revision,
+          identity: releasing.identity,
+        });
+      }
+    }
+    if (this.#store.listClaudeProcessLaunchIntents(1).length > 0) {
+      // A crash between spawn and identity admission can leave a process this
+      // manager never owned. Closing its current children cannot prove that
+      // historical launch did not occur, so preserve its recovery fence.
+      throw new ProviderRuntimeUnavailableError(
+        "An unresolved Claude launch still requires exact process recovery.",
+      );
     }
   }
 
@@ -5327,8 +8465,8 @@ export class HraService {
         const connectionId = this.#sessionProviderConnections.get(session.id) ?? null;
         try {
           // An open or reconciliation-required dedicated switch owns this
-          // session's source/target projection. Shutdown still retires the
-          // account process fence below, but must not author generic
+          // session's source/target projection. Shutdown closes admission,
+          // but must not author generic
           // disconnect, gap, or Claude terminalization rows across that WAL.
           if (this.#store.sessionSwitchAdmissionBlocked({
             sessionId: session.id,
@@ -5359,44 +8497,37 @@ export class HraService {
               throughSequence: position.observedThroughSequence + 1,
             });
           }
-          if (account.provider === "claude") {
-            const closed = this.#store.terminalizeSessionFromProviderDeletion({
-              accountId: account.profileId,
-              providerConnectionId: connectionId,
-              providerGeneration: account.processGeneration,
-              providerAuthority,
-              source: "provider_transport_lost",
-              sessionId: session.id,
-            });
-            for (const interaction of closed.interactions) {
-              this.#appendInteractionState(interaction);
-            }
-            if (session.providerThreadId !== undefined) {
-              this.#claudeFacts.forgetSession(providerAuthority, session.providerThreadId);
-            }
+          if (account.provider === "claude" && session.providerThreadId !== undefined) {
+            this.#claudeFacts.forgetSession(providerAuthority, session.providerThreadId);
+            this.#personalClaudeFacts?.forgetSession(providerAuthority, session.providerThreadId);
           }
         } catch (error: unknown) {
           projectionErrors.push(error);
         } finally {
           this.#sessionProviderConnections.delete(session.id);
+          this.#clearSessionFactAuthority(session.id);
           this.#sessionObservationFailures.delete(session.id);
           this.#sessionResubscriptionConnections.delete(session.id);
           this.#sessionsAwaitingResubscription.delete(session.id);
         }
       }
       try {
+        // The released Claude proof belongs to exactly this incarnation.
+        // Boot consumes it once for N→N+1; advancing here and again at boot
+        // would invent a second incarnation without a joined process proof.
+        if (account.provider === "claude") continue;
         if (account.provider !== "codex" && this.#store
           .listUnsettledMutations({ authorityId: account.profileId })
           .some((attempt) => attempt.kind === `account.${account.provider}-login`)) continue;
         if (account.provider === "codex") {
-          const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
+          const retirement = this.#store.advanceProfileGenerationForDaemonShutdown(
             account.profileId,
             account.processGeneration,
             this.#work,
             { preserveSessionMutationAuthorities: true },
           );
           this.#notifyAffectedWork(retirement.affectedWorkIds);
-        } else if (account.provider === "devin" && devinCaptures.some(
+        } else if (devinCaptures.some(
           (capture) => capture.providerAuthority.providerAccountId === account.id,
         )) {
           const capture = devinCaptures.find(
@@ -5430,6 +8561,7 @@ export class HraService {
     }
     this.#sessionProviderConnections.clear();
     this.#pendingClaudeDisconnects.clear();
+    this.#sessionFactAuthorities.clear();
     this.#sessionObservationFailures.clear();
     this.#sessionResubscriptionConnections.clear();
     this.#sessionsAwaitingResubscription.clear();
@@ -6336,9 +9468,8 @@ export class HraService {
       );
     }
     this.#assertClaudeIsolationAccepted();
-    const providerBlocker = this.#store.providerAuthorityAdvanceBlocker(
+    const providerBlocker = this.#store.managedClaudeLoginAuthorityBlocker(
       profile.id,
-      "claude",
     );
     if (providerBlocker !== null) {
       throw new CommandFailure(
@@ -6347,9 +9478,8 @@ export class HraService {
         { provider: "claude", reason: providerBlocker, retryable: true },
       );
     }
-    const releasableSessions = this.#store.listNonterminalProviderSessions(
+    const releasableSessions = this.#store.listNonterminalManagedClaudeSessions(
       profile.id,
-      "claude",
     );
     if (releasableSessions.some((session) =>
       session.state !== "idle"
@@ -6384,9 +9514,8 @@ export class HraService {
       for (const candidate of releasableSessions) {
         await this.#serialize(`session:${candidate.id}`, async () => {
           const current = this.#store.requireSession(candidate.id);
-          const blocker = this.#store.providerAuthorityAdvanceBlocker(
+          const blocker = this.#store.managedClaudeLoginAuthorityBlocker(
             profile.id,
-            "claude",
           );
           if (
             blocker !== null
@@ -6395,7 +9524,7 @@ export class HraService {
             || current.state !== "idle"
             || current.activeTurnId !== undefined
             || current.providerThreadId === undefined
-            || !this.#store.canReleaseIdleClaudeSessionForAccountLogin({
+            || !this.#store.canReleaseIdleManagedClaudeSessionForAccountLogin({
               profileId: profile.id,
               profileGeneration: providerAuthority.processGeneration,
               sessionId: current.id,
@@ -6410,12 +9539,35 @@ export class HraService {
             );
           }
           const providerConnectionId = this.#sessionProviderConnections.get(current.id) ?? null;
-          await this.#endProviderSession(
-            { ...current, providerThreadId: current.providerThreadId },
-            profile,
-            signal,
-            "Claude account login",
-          );
+          // Login is specifically entered because the managed Claude account
+          // no longer authenticates. A normal session end requires that stale
+          // account key to remain current, which would make safe sign-in
+          // impossible. The durable PID/start record is the narrower release
+          // authority here: release that exact process without targeting a
+          // replacement account, then retire the local session below.
+          await this.#releaseClaudeProcessAuthority({
+            providerThreadId: current.providerThreadId,
+            profileId: current.profileId,
+            runtimeScope: "managed",
+          }, signal);
+          await this.#daemonAuthority.assertCurrent();
+          this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
+            accountId: profile.id,
+            providerConnectionId,
+            providerGeneration: providerAuthority.processGeneration,
+            providerAuthority,
+            sessionId: current.id,
+          }));
+          this.#appendSessionEvent(authorityFor(this.#paths, profile, providerAuthority), current.id, providerConnectionId, {
+            type: "connection",
+            state: "disconnected",
+            reason: "Claude account login",
+          });
+          this.#sessionProviderConnections.delete(current.id);
+          this.#clearSessionFactAuthority(current.id);
+          this.#sessionObservationFailures.delete(current.id);
+          this.#sessionResubscriptionConnections.delete(current.id);
+          this.#sessionsAwaitingResubscription.delete(current.id);
           const terminal = this.#store.terminalizeIdleClaudeSessionForAccountLogin({
             accountId: profile.id,
             providerAuthority,
@@ -6587,16 +9739,94 @@ export class HraService {
 
   async #showAccount(selector: string, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(selector);
+    const revocation = this.#store.readProfilePersonalAuthorityRevocation(profile.id);
+    if (
+      this.#profileAuthorityRevocationIsPending(profile.id, profile.processGeneration)
+      || (revocation?.state === "releasing"
+        && revocation.profileGeneration === profile.processGeneration)
+    ) {
+      return {
+        account: this.#publicProfile(profile),
+        recovery: {
+          required: true,
+          cleared: false,
+          diagnostic: "Provider account authority changed; HRA is releasing every session controller before completing sign-out.",
+        },
+      };
+    }
+    const managedCodexRevocation = this.#store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider: "codex",
+      runtimeScope: "managed",
+    });
+    const managedCodexGenerationEnded =
+      managedCodexRevocation?.state === "completed"
+      && managedCodexRevocation.profileGeneration === profile.processGeneration
+      && managedCodexRevocation.currentAccountKey === null;
+    if (managedCodexGenerationEnded) {
+      if (profile.state === "signed_out") {
+        return { account: this.#publicProfile(profile) };
+      }
+      return {
+        account: this.#publicProfile(profile),
+        recovery: {
+          required: true,
+          cleared: false,
+          restartRequired: true,
+          diagnostic: "This Codex generation was exactly retired after account mutation dispatch. Restart HRA so a fresh generation can reread provider state without reopening the retired controller.",
+        },
+      };
+    }
     if (profile.state === "signed_out" && profile.processGeneration === 0) {
       return { account: this.#publicProfile(profile) };
     }
+    const providerAuthority = this.#providerAuthority(profile, "codex");
+    const assertReadAuthority = (): ProfileRecord => {
+      const latest = this.#store.requireProfileById(profile.id);
+      const latestRevocation = this.#store.readProfilePersonalAuthorityRevocation(profile.id);
+      const latestManaged = this.#store.readProviderRuntimeAccountRevocation({
+        profileId: profile.id, provider: "codex", runtimeScope: "managed",
+      });
+      if (latest.state !== profile.state
+        || !sameProviderUsageAuthority(providerAuthority, this.#providerAuthority(latest, "codex"))
+        || this.#profileAuthorityRevocationIsPending(profile.id, profile.processGeneration)
+        || JSON.stringify(latestRevocation) !== JSON.stringify(revocation)
+        || JSON.stringify(latestManaged) !== JSON.stringify(managedCodexRevocation)) {
+        throw new CommandFailure("CONFLICT", "Account authority changed while its provider identity was read.");
+      }
+      return latest;
+    };
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettledForProfile(profile.id);
     await this.#daemonAuthority.assertCurrent();
-    const account = await this.#fencedEffect(async () => await this.#codex.readAccount({ authority: this.#profileAuthority(profile, "codex"), signal }));
+    const account = await this.#fencedEffect(async () => {
+      assertReadAuthority();
+      return await this.#codex.readAccount({ authority: authorityFor(this.#paths, profile, providerAuthority), signal });
+    });
+    const observedProfile = assertReadAuthority();
+    // Do not let missing/ambiguous original proof look like an unsolicited
+    // account replacement, or disappear into the status-only fallback.
+    this.#accountRecoveryMutation(providerAuthority);
+    const accountAuthorityChanged = providerAccountAuthorityChanged(observedProfile, account);
+    if (
+      accountAuthorityChanged
+      && (observedProfile.state === "signed_in" || observedProfile.state === "recovery_required")
+      && !this.#accountMutationExplainsObservedCodexTransition(observedProfile, account)
+    ) {
+      this.#scheduleProfilePersonalAuthorityRevocation(observedProfile);
+      return {
+        account: this.#publicProfile(observedProfile),
+        providerProjection: account,
+        recovery: {
+          required: true,
+          cleared: false,
+          diagnostic: "Provider account authority changed. HRA is releasing every controller owned by the prior account before accepting another identity.",
+        },
+      };
+    }
     if (projectionRecoveryUnsettled) {
       return {
-        account: this.#publicProfile(profile),
+        account: this.#publicProfile(observedProfile),
         providerProjection: account,
         recovery: {
           cleared: false,
@@ -6605,23 +9835,30 @@ export class HraService {
         },
       };
     }
+    if (profile.state === "signed_out") {
+      return {
+        account: this.#publicProfile(profile),
+        providerProjection: account,
+        ...(account.signedIn
+          ? {
+              login: {
+                status: "external_identity_unbound",
+                next: `hra account login ${profile.id}`,
+              },
+            }
+          : {}),
+      };
+    }
     if (profile.state === "recovery_required" || profile.state === "login_pending") {
-      this.#resolveUnsettledLoginCancellations(profile, account);
+      this.#resolveUnsettledLoginCancellations(profile, account, providerAuthority);
     }
     if (profile.state === "recovery_required") {
-      const unsettled = this.#store.listUnsettledMutations({ authorityId: profile.id })
-        .filter((attempt) => attempt.format === "legacy")
-        .filter((attempt) => {
-          if (attempt.kind !== "account.login" && attempt.kind !== "account.logout") return false;
-          const providerAuthority = this.#primaryMutationProviderAuthority(attempt);
-          return providerAuthority !== null
-            && providerAuthority.profileId === profile.id
-            && providerAuthority.provider === "codex";
-        });
-      if (unsettled.length === 0) {
+      const attempt = this.#accountRecoveryMutation(providerAuthority);
+      if (attempt === null) {
         const reconciled = this.#store.reconcileProfileRecoveryFromAccountRead({
           profileId: profile.id,
           expectedGeneration: profile.processGeneration,
+          expectedProviderAuthority: providerAuthority,
           provider: account,
         });
         return {
@@ -6634,11 +9871,7 @@ export class HraService {
           },
         };
       }
-      if (unsettled.length !== 1) {
-        return { account: this.#publicProfile(profile), providerProjection: account, recovery: { required: true, cleared: false, diagnostic: "No single exact account recovery authority is available." } };
-      }
-      const attempt = unsettled[0];
-      if (attempt?.evidence === undefined || (attempt.originalState ?? attempt.state) === "reconciled") {
+      if (attempt.evidence === undefined || (attempt.originalState ?? attempt.state) === "reconciled") {
         throw new CommandFailure("RECOVERY_REQUIRED", "The account recovery evidence is incomplete.");
       }
       const originalState = attempt.originalState ?? attempt.state;
@@ -6653,6 +9886,7 @@ export class HraService {
         attemptId: attempt.id,
         expectedOriginalState: originalState,
         expectedEvidenceDigest: attempt.evidence.digest,
+        expectedProviderAuthority: providerAuthority,
         resolution: applied ? "proven_applied" : "provider_state_reconciled",
         resolutionEvidence: { source: "account/read", signedIn: account.signedIn },
         ...(attempt.kind === "account.login"
@@ -6702,20 +9936,19 @@ export class HraService {
    * exact account read settles it: a signed-in read proves the login finished,
    * and a signed-out read leaves the pending login for a fresh cancellation.
    */
-  #resolveUnsettledLoginCancellations(profile: ProfileRecord, account: CodexAccountProjection): void {
-    for (const attempt of this.#store.listUnsettledMutations({ authorityId: profile.id })) {
-      if (attempt.format !== "legacy" || attempt.kind !== "account.login-cancel") continue;
-      const providerAuthority = this.#primaryMutationProviderAuthority(attempt);
-      if (
-        providerAuthority === null
-        || providerAuthority.profileId !== profile.id
-        || providerAuthority.provider !== "codex"
-      ) continue;
+  #resolveUnsettledLoginCancellations(profile: ProfileRecord, account: CodexAccountProjection,
+    expectedProviderAuthority: ProviderAccountAuthority): void {
+    if (profile.id !== expectedProviderAuthority.profileId) throw new CommandFailure("CONFLICT", "Account authority changed during recovery.");
+    const attempt = this.#accountRecoveryMutation(expectedProviderAuthority);
+    if (attempt?.kind === "account.login-cancel") {
       const originalState = attempt.originalState ?? attempt.state;
-      if (originalState !== "effect_started" && originalState !== "ambiguous") continue;
+      if (originalState !== "effect_started" && originalState !== "ambiguous") {
+        throw new CommandFailure("RECOVERY_REQUIRED", "The account recovery state is not resolvable.");
+      }
       this.#store.resolveLoginCancelMutation({
         attemptId: attempt.id,
         expectedOriginalState: originalState,
+        expectedProviderAuthority,
         provider: { signedIn: account.signedIn },
       });
     }
@@ -6770,10 +10003,14 @@ export class HraService {
         request: { deviceCode },
         idempotencyKey: key,
         providerAuthorities,
-        beginEffect: (attemptId) => {
+        beginEffect: async (attemptId) => {
           try {
             const retirements = this.#prepareCodexProviderRetirements(
               sourceProviderAuthority,
+            );
+            await this.#releaseCodexAuthorityForAccountMutationLocked(
+              current,
+              signal,
             );
             const begun = this.#store.beginAccountMutationEffect({
               attemptId,
@@ -6921,7 +10158,7 @@ export class HraService {
       );
     }
     const unsettledCancellations = this.#store.listUnsettledMutations({ authorityId: profile.id })
-      .filter((attempt) => attempt.kind === "account.login-cancel" && attempt.authorityGeneration === profile.processGeneration);
+      .filter((attempt) => attempt.kind === "account.login-cancel");
     if (unsettledCancellations.length > 0) {
       throw new CommandFailure(
         "RECOVERY_REQUIRED",
@@ -7032,24 +10269,109 @@ export class HraService {
       request: {},
       idempotencyKey: key,
       providerAuthorities,
-      beginEffect: (attemptId) => {
-        const begun = this.#store.beginAccountMutationEffect({
-          attemptId,
-          profileId: profile.id,
-          profileGeneration: providerAuthority.processGeneration,
-          providerAuthority,
-          evidence: { kind: "account.logout", baselineSignedIn: profile.state !== "signed_out" },
-          workStore: this.#work,
-        });
-        this.#notifyAffectedWork(begun.affectedWorkIds);
+      beginEffect: async (attemptId) => {
+        try {
+          const retirements = this.#prepareCodexProviderRetirements(providerAuthority);
+          await this.#releaseCodexAuthorityForAccountMutationLocked(
+            profile,
+            signal,
+            { deferManagedRelease: profile.state !== "signed_out" },
+          );
+          const begun = this.#store.beginAccountMutationEffect({
+            attemptId,
+            profileId: profile.id,
+            profileGeneration: providerAuthority.processGeneration,
+            providerAuthority,
+            evidence: { kind: "account.logout", baselineSignedIn: profile.state !== "signed_out" },
+            providerRetirements: retirements,
+            workStore: this.#work,
+          });
+          this.#notifyAffectedWork(begun.affectedWorkIds);
+          this.#applyCodexProviderRetirements(
+            retirements,
+            begun.retiredSessionIds,
+          );
+        } catch (error: unknown) {
+          let admissionFailure = error;
+          const managed = this.#store.readProviderRuntimeAccountRevocation({
+            profileId: profile.id,
+            provider: "codex",
+            runtimeScope: "managed",
+          });
+          if (
+            managed?.state === "releasing"
+            && managed.profileGeneration === profile.processGeneration
+            && managed.currentAccountKey === null
+          ) {
+            try {
+              // No provider effect was dispatched, but the exact client was
+              // deliberately retained for it. Prove that custody released
+              // before returning the begin failure; the same generation may
+              // not be reopened afterward.
+              await this.#completeManagedCodexLogoutAuthorityReleaseLocked(profile);
+            } catch (cleanupError: unknown) {
+              admissionFailure = cleanupError instanceof DaemonAuthoritySafetyError
+                ? cleanupError
+                : new AggregateError(
+                    [error, cleanupError],
+                    "Codex logout admission failed and retained controller release was not proven.",
+                  );
+            }
+          }
+          // The generation is now durably fenced even when exact release
+          // completed. Do not let another operation in this service attempt
+          // to reopen it; the normal daemon close path advances authority for
+          // a fresh-process reconciliation.
+          this.#state = "closing";
+          this.#interactionDeadlineAbort.abort(
+            new Error("Codex logout admission did not commit exactly."),
+          );
+          this.#interactionDeadlineWake?.();
+          this.#interactionDeadlineWake = undefined;
+          this.#daemonAuthority.close();
+          this.#scheduleStop();
+          throw admissionFailure;
+        }
       },
       effect: async () => {
-        if (profile.state !== "signed_out") await this.#fencedEffect(async () => await this.#codex.logout({ authority: authorityFor(this.#paths, profile, providerAuthority), signal }));
+        if (profile.state === "signed_out") return { loggedOut: true as const };
+        let logoutFailure: unknown;
+        try {
+          await this.#fencedEffect(async () => await this.#codex.logout({
+            authority: authorityFor(this.#paths, profile, providerAuthority),
+            signal,
+          }));
+        } catch (error: unknown) {
+          if (error instanceof DaemonAuthoritySafetyError) throw error;
+          logoutFailure = error;
+        }
+        let releaseFailure: unknown;
+        try {
+          // The provider call has crossed its durable effect_started boundary.
+          // Only now may the exact client be retired; completion is required
+          // before any local account settlement can make progress again.
+          await this.#completeManagedCodexLogoutAuthorityReleaseLocked(
+            profile,
+          );
+        } catch (error: unknown) {
+          if (error instanceof DaemonAuthoritySafetyError) throw error;
+          releaseFailure = error;
+        }
+        if (logoutFailure !== undefined || releaseFailure !== undefined) {
+          const causes = [logoutFailure, releaseFailure]
+            .filter((cause) => cause !== undefined);
+          throw new IndeterminateLocalCommitError(
+            "Codex logout was dispatched, but its exact account and controller settlement is not fully proven.",
+            causes.length === 1
+              ? causes[0]
+              : new AggregateError(causes, "Codex logout and controller release did not settle together."),
+          );
+        }
         return { loggedOut: true as const };
       },
       receipt: (value) => logoutReceiptSchema.parse(value),
       restore: (value) => logoutReceiptSchema.parse(value),
-      onAmbiguous: () => this.#quarantineProfile(profile),
+      onAmbiguous: () => this.#quarantineCodexAccountMutation(profile),
     });
     const current = this.#store.requireProfile(profile.id);
     const stateChange = current.state === "signed_out"
@@ -7059,6 +10381,10 @@ export class HraService {
           state: "signed_out",
         });
     if (stateChange !== null) this.#notifyAffectedWork(stateChange.affectedWorkIds);
+    if (stateChange !== null && !stateChange.changed) {
+      this.#quarantineCodexAccountMutation(profile);
+      throw new CommandFailure("RECOVERY_REQUIRED", "Codex logged out, but its local account state could not be committed. Run `hra account show` to reconcile it.");
+    }
     return { account: this.#publicProfile(this.#store.requireProfile(profile.id)), idempotencyKey: key };
   }
 
@@ -7540,9 +10866,10 @@ export class HraService {
       ? null
       : account.email;
     if (account.signedIn && verifiedEmail === null) {
+      this.#scheduleProfilePersonalAuthorityRevocation(input.profile);
       throw new CommandFailure(
-        "UNAVAILABLE",
-        "Codex is signed in but did not expose an account email, so HRA skipped the usage refresh and automatic reset.",
+        "RECOVERY_REQUIRED",
+        "Codex is signed in but did not expose a stable account identity. HRA is revoking the unprovable authority before any session or usage operation can continue.",
       );
     }
     const actualFingerprint = verifiedEmail === null
@@ -7555,46 +10882,21 @@ export class HraService {
       || (persistedFingerprint !== null
         && actualFingerprint !== persistedFingerprint);
     if (identityChanged) {
-      const stateChange = this.#store.setProfileStateWithWorkRetirement(
-        input.profile.id,
-        input.profile.processGeneration,
-        account.signedIn ? "signed_in" : "signed_out",
-        this.#work,
-        {
-          ...(verifiedEmail === null ? {} : { email: verifiedEmail }),
-          ...(account.plan === undefined ? {} : { plan: account.plan }),
-        },
-      );
-      this.#notifyAffectedWork(stateChange.affectedWorkIds);
-      if (!stateChange.changed) {
-        throw new CommandFailure(
-          "CONFLICT",
-          "Account generation changed while reconciling usage identity.",
-        );
-      }
+      this.#scheduleProfilePersonalAuthorityRevocation(input.profile);
       throw new CommandFailure(
-        "CONFLICT",
-        "The signed-in Codex account changed during usage refresh. HRA reconciled the account and discarded the unverified usage result; run the usage refresh again.",
+        "RECOVERY_REQUIRED",
+        "The provider account identity changed. HRA is releasing every controller and retiring the prior generation before accepting another identity.",
       );
     }
     if (verifiedEmail === null) {
       throw new Error("ACCOUNT_USAGE_IDENTITY_PROOF_INVALID");
     }
     if (input.profile.providerEmail === undefined) {
-      const stateChange = this.#store.setProfileStateWithWorkRetirement(
-        input.profile.id,
-        input.profile.processGeneration,
-        "signed_in",
-        this.#work,
-        {
-          email: verifiedEmail,
-          ...(account.plan === undefined ? {} : { plan: account.plan }),
-        },
+      this.#scheduleProfilePersonalAuthorityRevocation(input.profile);
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The local account had no prior stable identity. HRA fenced this observation; establish the identity through an explicit account login.",
       );
-      this.#notifyAffectedWork(stateChange.affectedWorkIds);
-      if (!stateChange.changed) {
-        throw new Error("ACCOUNT_USAGE_IDENTITY_COMMIT_CONFLICT");
-      }
     }
     return actualFingerprint;
   }
@@ -7740,7 +11042,7 @@ export class HraService {
     return await this.#fencedEffect(async () => await desktop.recoverSwitch({ signal }));
   }
 
-  async #recoverCompactProjection(
+  async #assertCompactProjectionRecoveryReady(
     expected: Readonly<{
       acknowledgeGap: true;
       bindingGeneration: number;
@@ -7752,8 +11054,7 @@ export class HraService {
       providerThreadId: string;
       sessionId: SessionRecord["id"];
     }>,
-    signal: AbortSignal,
-  ): Promise<unknown> {
+  ): Promise<void> {
     await this.#daemonAuthority.assertCurrent();
     const session = this.#requireBoundSession(expected.sessionId);
     const profile = this.#store.requireProfileById(expected.profileId);
@@ -7779,10 +11080,27 @@ export class HraService {
     if (unsettledMutations.length > 0 || unsettledQueueEffects.length > 0 || unsettledQueueEntries.length > 0) {
       throw new CommandFailure("RECOVERY_REQUIRED", "Projection recovery rejects a session with unsettled mutation or queue authority.");
     }
+  }
+
+  async #recoverCompactProjection(
+    expected: Readonly<{
+      acknowledgeGap: true;
+      bindingGeneration: number;
+      idempotencyKey: string;
+      processGeneration: number;
+      profileId: ProfileRecord["id"];
+      provider: Provider;
+      providerAccountId: ProviderAccountId;
+      providerThreadId: string;
+      sessionId: SessionRecord["id"];
+    }>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    await this.#assertCompactProjectionRecoveryReady(expected);
     return await this.#fencedEffect(async () => await this.#cloud.recoverCompactProjection({
       acknowledgeGap: expected.acknowledgeGap,
       idempotencyKey: expected.idempotencyKey,
-      sessionPublicId: session.id,
+      sessionPublicId: expected.sessionId,
       signal,
     }));
   }
@@ -7903,6 +11221,280 @@ export class HraService {
     }
   }
 
+  async #resumeClaudeSessionAfterExactProcessRelease(
+    session: SessionRecord,
+    profile: ProfileRecord,
+    authority: ProfileAuthority,
+    signal: AbortSignal,
+  ): Promise<CodexSessionObservation> {
+    if (
+      session.provider !== "claude"
+      || session.providerThreadId === undefined
+    ) {
+      throw new ClaudeSessionObservationError();
+    }
+    const runtimeScope = this.#sessionHasActivePersonalBinding(session) ? "personal" : "managed";
+    const priorProcess = this.#store.readClaudeProcessAuthority({
+      providerThreadId: session.providerThreadId,
+      profileId: session.profileId,
+      runtimeScope,
+    });
+    if (
+      priorProcess === null
+      || priorProcess.state !== "released"
+      || (priorProcess.sessionId !== null && priorProcess.sessionId !== session.id)
+    ) throw new ClaudeSessionObservationError();
+    if (session.projectId === undefined) {
+      throw new ProviderRuntimeUnavailableError(
+        "A durable project is required to resume this Claude session.",
+      );
+    }
+    const runtime = runtimeScope === "personal"
+      ? this.#personalClaude
+      : this.#claude;
+    if (runtime === undefined) {
+      throw new ProviderRuntimeUnavailableError(
+        "Claude session control cannot resume this fenced session.",
+      );
+    }
+    const project = this.#store.requireProject(session.projectId);
+    const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
+    const presetSelection = this.#store.requireSessionPresetRequirement(session.id);
+    if (presetSelection.preset !== session.preset) {
+      throw new ClaudeSessionObservationError();
+    }
+    const providerThreadId = session.providerThreadId;
+    const providerAccountAuthority = this.#store.readSessionProviderAccountAuthority(
+      session.id,
+    );
+    if (
+      providerAccountAuthority === null
+      || providerAccountAuthority.provider !== "claude"
+      || providerAccountAuthority.runtimeScope !== runtimeScope
+    ) throw new ClaudeSessionObservationError();
+    await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+    const exactProviderAccountAuthority = this.#store.readSessionProviderAccountAuthority(
+      session.id,
+    );
+    if (
+      exactProviderAccountAuthority === null
+      || exactProviderAccountAuthority.provider !== providerAccountAuthority.provider
+      || exactProviderAccountAuthority.runtimeScope !== providerAccountAuthority.runtimeScope
+      || exactProviderAccountAuthority.accountKey !== providerAccountAuthority.accountKey
+    ) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The Claude session account authority changed before its exact-process resume.",
+      );
+    }
+    const launchIntent = this.#store.stageClaudeProcessLaunchIntent({
+      providerThreadId,
+      profileId: session.profileId,
+      profileGeneration: profile.processGeneration,
+      providerAuthority: this.#providerAccountAuthority(authority),
+      runtimeScope,
+      providerAccountKey: providerAccountAuthority.accountKey,
+      sessionId: session.id,
+    });
+    let claimedIdentity: ClaudeProcessIdentity | undefined;
+    let projection: Awaited<ReturnType<ClaudeRuntimePort["claimSession"]>> | undefined;
+    let claimFailure: Readonly<{ error: unknown }> | undefined;
+    try {
+      projection = await this.#fencedEffect(async () => {
+        const value = await runtime.claimSession({
+          authority,
+          admitProcessIdentity: async (identity) => {
+            claimedIdentity = await this.#recordClaimedClaudeProcess({
+              authority,
+              providerThreadId,
+              runtimeScope,
+              sessionId: session.id,
+              launchIntent,
+              identity,
+              signal,
+            });
+          },
+          providerThreadId,
+          projectRoot,
+          title: session.title,
+          preset: session.preset,
+          requirement: presetSelection.requirement,
+          fast: session.fastEnabled,
+          sourceLiveness: "not_live",
+          signal,
+        });
+        return value;
+      });
+    } catch (error: unknown) {
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
+      claimFailure = { error };
+    }
+    let postClaimAccountFailure: Readonly<{ error: unknown }> | undefined;
+    try {
+      await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+    } catch (error: unknown) {
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
+      postClaimAccountFailure = { error };
+    }
+    if (postClaimAccountFailure !== undefined) {
+      if (claimedIdentity !== undefined) {
+        try {
+          await this.#releaseClaudeProcessAuthority(
+            { providerThreadId, profileId: session.profileId, runtimeScope },
+            new AbortController().signal,
+          );
+        } catch (releaseError: unknown) {
+          if (releaseError instanceof DaemonAuthoritySafetyError) throw releaseError;
+          throw new IndeterminateLocalCommitError(
+            "The Claude account changed during exact-process resume and its admitted process could not be released.",
+            new AggregateError([postClaimAccountFailure.error, releaseError]),
+          );
+        }
+      }
+      throw new IndeterminateLocalCommitError(
+        "The Claude account changed while its exact-process resume was in flight.",
+        claimFailure === undefined
+          ? postClaimAccountFailure.error
+          : new AggregateError([claimFailure.error, postClaimAccountFailure.error]),
+      );
+    }
+    if (claimedIdentity === undefined) {
+      if (claimFailure?.error instanceof ClaudeProcessExitUnprovenError) {
+        throw claimFailure.error;
+      }
+      if (claimFailure !== undefined) {
+        try {
+          this.#cancelClaudeProcessLaunchIntent(launchIntent);
+        } catch (cancelError: unknown) {
+          if (cancelError instanceof DaemonAuthoritySafetyError) throw cancelError;
+          this.#quarantineSession(session.id);
+          throw new IndeterminateLocalCommitError(
+            "Claude rejected exact-process resume, but its launch intent could not be retired.",
+            new AggregateError([claimFailure.error, cancelError]),
+          );
+        }
+        throw claimFailure.error;
+      }
+      throw new ClaudeProcessExitUnprovenError({
+        cause: new Error("CLAUDE_PROCESS_IDENTITY_NOT_ADMITTED"),
+      });
+    }
+    if (claimFailure !== undefined) {
+      try {
+        await this.#releaseClaudeProcessAuthority(
+          { providerThreadId, profileId: session.profileId, runtimeScope },
+          new AbortController().signal,
+        );
+        this.#cancelClaudeProcessLaunchIntent(launchIntent);
+      } catch (releaseError: unknown) {
+        if (releaseError instanceof DaemonAuthoritySafetyError) throw releaseError;
+        throw new ClaudeProcessExitUnprovenError({
+          cause: new AggregateError([claimFailure.error, releaseError]),
+        });
+      }
+      throw claimFailure.error;
+    }
+    if (projection === undefined) throw new Error("CLAUDE_RESUME_PROJECTION_MISSING");
+    try {
+      const resumedRuntimeProfile = assertClaimedRuntimeProfile({
+        authority,
+        fast: session.fastEnabled,
+        preset: session.preset,
+        provider: "claude",
+        requirement: presetSelection.requirement,
+        runtimeProfile: projection.effectiveRuntimeProfile,
+      });
+      if (
+        projection.providerThreadId !== session.providerThreadId
+        || projection.projectRoot !== projectRoot
+      ) {
+        throw new Error("CLAUDE_FENCED_RESUME_IDENTITY_MISMATCH");
+      }
+      this.#store.bindClaimedClaudeProcessAuthority({
+        providerThreadId,
+        profileId: session.profileId,
+        sessionId: session.id,
+        runtimeScope,
+        identity: claimedIdentity,
+      });
+      this.#store.recordSessionRuntimeProfile({
+        sessionId: session.id,
+        sourceKind: "session_start",
+        sourceId: `resume_${createHash("sha256")
+          .update(
+            `${session.id}\0${String(profile.processGeneration)}`
+            + `\0${String(projection.effectiveRuntimeProfile.observedAt)}`,
+          )
+          .digest("hex")}`,
+        profile: resumedRuntimeProfile,
+        providerAuthority: this.#providerAccountAuthority(authority),
+      });
+      const observation = await this.#fencedEffect(async () => await runtime.observeSession({
+        authority,
+        providerThreadId,
+        signal,
+      }));
+      return observation;
+    } catch (error: unknown) {
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
+      try {
+        await this.#releaseClaudeProcessAuthority(
+          { providerThreadId, profileId: session.profileId, runtimeScope },
+          new AbortController().signal,
+        );
+        this.#cancelClaudeProcessLaunchIntent(launchIntent);
+      } catch (releaseError: unknown) {
+        if (releaseError instanceof DaemonAuthoritySafetyError) throw releaseError;
+        throw new ClaudeProcessExitUnprovenError({
+          cause: new AggregateError([error, releaseError]),
+        });
+      }
+      throw error;
+    }
+  }
+
+  async #releaseAndResumeClaudeSessionAfterObservationFailure(
+    session: SessionRecord,
+    authority: ProfileAuthority,
+    signal: AbortSignal,
+  ): Promise<CodexSessionObservation> {
+    if (session.provider !== "claude" || session.providerThreadId === undefined) {
+      throw new ClaudeSessionObservationError();
+    }
+    const runtimeScope = this.#sessionHasActivePersonalBinding(session)
+      ? "personal"
+      : "managed";
+    // Observation can fail after a newly started child was durably bound but
+    // before a connection id reached the in-memory routing map. Release by
+    // exact persisted PID/start authority, independent of caller cancellation,
+    // before attempting the ordinary exact-session resume path.
+    await this.#releaseClaudeProcessAuthority(
+      {
+        providerThreadId: session.providerThreadId,
+        profileId: session.profileId,
+        runtimeScope,
+      },
+      new AbortController().signal,
+    );
+    signal.throwIfAborted();
+    await this.#daemonAuthority.assertCurrent();
+    const current = this.#currentObservationSession(
+      authority,
+      session.id,
+      session.providerThreadId,
+    );
+    if (current === null || current.provider !== "claude") {
+      throw new ClaudeSessionObservationError();
+    }
+    const profile = this.#store.requireProfileById(current.profileId);
+    return await this.#resumeClaudeSessionAfterExactProcessRelease(
+      current,
+      profile,
+      authority,
+      signal,
+    );
+  }
+
   async #ensureSessionObservedLocked(
     selector: string,
     signal: AbortSignal,
@@ -7970,7 +11562,11 @@ export class HraService {
     }
     const providerAuthority = this.#sessionProviderAuthority(session);
     await this.#ensureFactsMemory(session);
-    if (session.provider === "claude" && this.#platform !== "linux") {
+    if (
+      session.provider === "claude"
+      && this.#platform !== "linux"
+      && !this.#sessionHasMatchingActivePersonalBinding(session)
+    ) {
       return this.#claudePlatformUnavailableObservation(profile);
     }
     try {
@@ -7988,6 +11584,7 @@ export class HraService {
         state: "unavailable",
       };
     }
+    await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
     if (this.#lastSessionEventIsProviderGap(session.id)) {
       this.#sessionsAwaitingResubscription.add(session.id);
     }
@@ -8005,37 +11602,61 @@ export class HraService {
         signal,
       }));
     } catch (error: unknown) {
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
       if (signal.aborted) throw signal.reason;
-      const exact = this.#currentObservationSession(
-        authority,
-        session.id,
-        providerThreadId,
-      );
-      if (exact === null) {
-        return {
-          basis: "provider_read",
-          code: "resume_unavailable",
-          coverage: "unavailable",
-          freshness: "fresh",
-          observedAt: this.#now(),
-          profileGeneration: this.#currentProviderGeneration(authority),
-          source: "codex_app_server",
-          state: "unavailable",
-        };
-      }
-      if (
-        error instanceof CodexSessionObservationError
-        && error.reason === "thread_mismatch"
-      ) {
-        return this.#quarantineObservationMismatch(authority, exact);
-      }
-      if (session.provider === "claude") {
-        this.#recordSessionObservationFailure(
-          authority,
-          exact,
-          "resume_unavailable",
-          false,
+      if (error instanceof ClaudeSessionObservationError) {
+        try {
+          observation = await this.#releaseAndResumeClaudeSessionAfterObservationFailure(
+            session,
+            authority,
+            signal,
+          );
+        } catch (resumeError: unknown) {
+          if (resumeError instanceof DaemonAuthoritySafetyError) throw resumeError;
+          await this.#assertSessionAccountAuthorityAfterProviderEffect(
+            session,
+            profile,
+            signal,
+          );
+          if (!(resumeError instanceof ClaudeProcessExitUnprovenError)) throw resumeError;
+          this.#quarantineSession(session.id);
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "Claude session recovery launched a controller whose exit could not be proved. HRA retained its exact launch authority and quarantined the session.",
+            { sessionId: session.id },
+          );
+        }
+      } else {
+        await this.#assertSessionAccountAuthorityAfterProviderEffect(
+          session,
+          profile,
+          signal,
         );
+        const exact = this.#currentObservationSession(
+          authority,
+          session.id,
+          providerThreadId,
+        );
+        if (exact === null) {
+          return {
+            basis: "provider_read",
+            code: "resume_unavailable",
+            coverage: "unavailable",
+            freshness: "fresh",
+            observedAt: this.#now(),
+            profileGeneration: this.#currentProviderGeneration(authority),
+            source: "codex_app_server",
+            state: "unavailable",
+          };
+        }
+        if (
+          error instanceof CodexSessionObservationError
+          && error.reason === "thread_mismatch"
+        ) {
+          return this.#quarantineObservationMismatch(authority, exact);
+        }
+        if (!(error instanceof CodexSessionObservationError)) throw error;
+        this.#recordSessionObservationFailure(authority, exact, "resume_unavailable", false);
         return {
           basis: "provider_read",
           code: "resume_unavailable",
@@ -8047,18 +11668,6 @@ export class HraService {
           state: "unavailable",
         };
       }
-      if (!(error instanceof CodexSessionObservationError)) throw error;
-      this.#recordSessionObservationFailure(authority, exact, "resume_unavailable", false);
-      return {
-        basis: "provider_read",
-        code: "resume_unavailable",
-        coverage: "unavailable",
-        freshness: "fresh",
-        observedAt: this.#now(),
-        profileGeneration: providerAuthority.processGeneration,
-        source: "codex_app_server",
-        state: "unavailable",
-      };
     }
     await this.#daemonAuthority.assertCurrent();
     session = this.#store.requireSession(session.id);
@@ -8083,6 +11692,12 @@ export class HraService {
         state: "unavailable",
       };
     }
+    await this.#assertPersonalSessionAccountAuthority(
+      session,
+      this.#store.requireProfileById(session.profileId),
+      signal,
+      true,
+    );
     z.string().uuid().parse(observation.connectionId);
     this.#sessionObservationFailures.delete(session.id);
     this.#ensureSessionProviderConnection(authority, session, observation.connectionId);
@@ -8100,7 +11715,10 @@ export class HraService {
         activeTurnId: projection.status === "active"
           ? projection.activeTurnId ?? null
           : null,
-        title: projection.title,
+        // Claude's runtime projection deliberately keeps only a compact
+        // display title. The durable HRA title may be longer, so observing a
+        // resumed Claude process must not truncate it.
+        ...(session.provider === "claude" ? {} : { title: projection.title }),
       });
       if (
         reconciled.state !== beforeState
@@ -8733,7 +12351,7 @@ export class HraService {
         return;
       }
       if (effect.mode === "queue") {
-        await this.#queue(session.id, message, effect.nestedMutationKey, beforeEffect);
+        await this.#queue(session.id, message, effect.nestedMutationKey, signal, beforeEffect);
         return;
       }
       await this.#steer(session.id, message, effect.nestedMutationKey, signal, beforeEffect);
@@ -9126,17 +12744,31 @@ export class HraService {
           "This interaction has no complete approval authority available for protected inspection.",
         );
       }
+      const profile = this.#store.requireProfileById(current.authority.profileId);
+      const provider = this.#providerForInteraction(current);
+      this.#assertProviderProfileState(profile, provider);
       let authority: Awaited<ReturnType<CodexRuntimePort["inspectInteractionAuthority"]>>;
       try {
         await this.#daemonAuthority.assertCurrent();
+        await this.#assertPersonalInteractionAccountAuthority(current, profile, signal);
         authority = await this.#runtimeForInteraction(current).inspectInteractionAuthority({
           authority: this.#interactionAuthority(current),
           provider: current.authority,
           kind: current.kind,
           signal,
         });
+        await this.#assertPersonalInteractionAccountAuthority(current, profile, signal);
         await this.#daemonAuthority.assertCurrent();
+        const exactProfile = this.#store.requireProfileById(profile.id);
+        this.#assertProviderProfileState(exactProfile, provider);
+        if (!this.#interactionProfileAuthorityIsUsable(current)) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The interaction belongs to a stale account authority.",
+          );
+        }
       } catch (error: unknown) {
+        if (error instanceof CommandFailure) throw error;
         if (providerFailureCode(error) === "UNSUPPORTED_CAPABILITY") {
           throw new CommandFailure("INVALID_INPUT", providerFailureMessage(error));
         }
@@ -9151,8 +12783,7 @@ export class HraService {
         || observed.state !== "pending"
         || observed.kind !== current.kind
         || observed.sessionId !== current.sessionId
-        || observed.authority.profileId !== current.authority.profileId
-        || observed.authority.processGeneration !== current.authority.processGeneration
+        || !sameProviderUsageAuthority(observed.authority, current.authority)
         || observed.authority.connectionId !== current.authority.connectionId
         || observed.authority.requestDigest !== current.authority.requestDigest
         || observed.authority.requestId.type !== current.authority.requestId.type
@@ -9195,8 +12826,16 @@ export class HraService {
     command: Extract<LocalCommand, { kind: "interaction.resolve" }>,
     context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void },
   ): Promise<unknown> {
+    return await this.#serializeInteractionAuthority(command.interaction, async () =>
+      await this.#resolveInteractionLocked(command, context));
+  }
+
+  async #resolveInteractionLocked(
+    command: Extract<LocalCommand, { kind: "interaction.resolve" }>,
+    context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void },
+  ): Promise<unknown> {
     const signal = context.signal;
-    return await this.#serialize(`interaction:${command.interaction}`, async () => {
+    return await (async () => {
       const current = this.#store.requireInteraction(command.interaction);
       if (current.revision !== command.expectedRevision || current.state !== "pending") {
         throw new CommandFailure(
@@ -9209,10 +12848,20 @@ export class HraService {
         await this.#rejectManualResolutionAtDeadline(current);
       }
       this.#assertResolutionMatches(current, command.resolution);
+      const profile = this.#store.requireProfileById(current.authority.profileId);
+      const provider = this.#providerForInteraction(current);
+      this.#assertProviderProfileState(profile, provider);
+      if (!this.#profileAuthorityIsCurrent(this.#interactionAuthority(current))) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The interaction belongs to a stale account authority.",
+        );
+      }
       const runtime = this.#runtimeForInteraction(current);
       let responseDigest: string;
       try {
         await this.#daemonAuthority.assertCurrent();
+        await this.#assertPersonalInteractionAccountAuthority(current, profile, signal);
         const validated = await runtime.validateInteractionResolution({
           authority: this.#interactionAuthority(current),
           provider: current.authority,
@@ -9220,8 +12869,18 @@ export class HraService {
           resolution: command.resolution,
           signal,
         });
+        await this.#assertPersonalInteractionAccountAuthority(current, profile, signal);
         responseDigest = validated.responseDigest;
+        const exactProfile = this.#store.requireProfileById(profile.id);
+        this.#assertProviderProfileState(exactProfile, provider);
+        if (!this.#interactionProfileAuthorityIsUsable(current)) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The interaction belongs to a stale account authority.",
+          );
+        }
       } catch (error: unknown) {
+        if (error instanceof CommandFailure) throw error;
         if (this.#now() >= current.deadlineAt) {
           await this.#rejectManualResolutionAtDeadline(current);
         }
@@ -9254,6 +12913,7 @@ export class HraService {
       if (this.#now() >= current.deadlineAt) {
         await this.#rejectManualResolutionAtDeadline(current);
       }
+      await this.#assertPersonalInteractionAccountAuthority(current, profile, signal);
       let prepared: InteractionRecord;
       try {
         prepared = this.#store.prepareInteractionResponse({
@@ -9275,9 +12935,18 @@ export class HraService {
       }
       try {
         await this.#daemonAuthority.assertCurrent();
+        const exactProfile = this.#store.requireProfileById(profile.id);
+        this.#assertProviderProfileState(exactProfile, provider);
+        if (!this.#interactionProfileAuthorityIsUsable(prepared)) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The interaction belongs to a stale account authority.",
+          );
+        }
         if (this.#now() >= prepared.deadlineAt) {
           await this.#rejectPreparedManualResolutionAtDeadline(prepared);
         }
+        await this.#assertPersonalInteractionAccountAuthority(prepared, exactProfile, signal);
         await runtime.resolveInteraction({
           authority: this.#interactionAuthority(prepared),
           provider: prepared.authority,
@@ -9286,23 +12955,35 @@ export class HraService {
           deadlineAt: prepared.deadlineAt,
           signal,
         });
+        await this.#assertInteractionAccountAuthorityAfterProviderEffect(
+          prepared,
+          exactProfile,
+          signal,
+        );
       } catch (error: unknown) {
         if (error instanceof CommandFailure) throw error;
         if (providerFailureCode(error) === "DEADLINE_EXPIRED") {
           await this.#rejectPreparedManualResolutionAtDeadline(prepared);
         }
-        const terminal = providerFailureCode(error) === "INDETERMINATE_EFFECT"
-          ? this.#store.markInteractionResolutionUnknown({
-              id: prepared.publicId,
-              expectedRevision: prepared.revision,
-              responseDigest,
-            })
+        const indeterminate = error instanceof IndeterminateLocalCommitError
+          || providerFailureCode(error) === "INDETERMINATE_EFFECT";
+        const latest = this.#store.requireInteraction(prepared.publicId);
+        const terminal = indeterminate
+          ? latest.state === "response_prepared"
+              && latest.revision === prepared.revision
+              && latest.responseDigest === responseDigest
+            ? this.#store.markInteractionResolutionUnknown({
+                id: prepared.publicId,
+                expectedRevision: prepared.revision,
+                responseDigest,
+              })
+            : latest
           : this.#store.expireInteraction({
               id: prepared.publicId,
               expectedRevision: prepared.revision,
             });
-        this.#appendInteractionState(terminal);
-        if (providerFailureCode(error) === "INDETERMINATE_EFFECT") {
+        if (terminal !== latest) this.#appendInteractionState(terminal);
+        if (indeterminate) {
           throw new CommandFailure(
             "RECOVERY_REQUIRED",
             "The interaction response may have reached Codex; its resolution is unknown.",
@@ -9335,7 +13016,7 @@ export class HraService {
         });
       }
       return { interaction: this.#publicInteraction(written), responseWritten: true };
-    });
+    })();
   }
 
   async #rejectManualResolutionAtDeadline(current: InteractionRecord): Promise<never> {
@@ -9360,16 +13041,31 @@ export class HraService {
       || prepared.intendedTerminalState === null
       || prepared.intendedTerminalState === "expired"
     ) throw new Error("INTERACTION_MANUAL_RESPONSE_NOT_PREPARED");
+    if (!this.#interactionProfileAuthorityIsUsable(prepared)) {
+      const terminal = this.#store.expireInteraction({
+        id: prepared.publicId,
+        expectedRevision: prepared.revision,
+      });
+      this.#appendInteractionState(terminal);
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The interaction authority was revoked before its timeout response could be dispatched.",
+        { interaction: this.#publicInteraction(terminal) },
+      );
+    }
+    const profile = this.#store.requireProfileById(prepared.authority.profileId);
     const runtime = this.#runtimeForInteraction(prepared);
     const signal = this.#interactionDeadlineAbort.signal;
     let timeoutResponseDigest: string;
     try {
       await this.#daemonAuthority.assertCurrent();
+      await this.#assertPersonalInteractionAccountAuthority(prepared, profile, signal);
       const validated = await runtime.validateInteractionTimeout({
         authority: this.#interactionAuthority(prepared),
         provider: prepared.authority,
         signal,
       });
+      await this.#assertPersonalInteractionAccountAuthority(prepared, profile, signal);
       timeoutResponseDigest = validated.responseDigest;
     } catch (error: unknown) {
       const latest = this.#store.requireInteraction(prepared.publicId);
@@ -9410,17 +13106,29 @@ export class HraService {
     }
     try {
       await this.#daemonAuthority.assertCurrent();
+      await this.#assertPersonalInteractionAccountAuthority(
+        timeoutPrepared,
+        profile,
+        signal,
+      );
       await runtime.timeoutInteraction({
         authority: this.#interactionAuthority(timeoutPrepared),
         provider: timeoutPrepared.authority,
         signal,
       });
+      await this.#assertInteractionAccountAuthorityAfterProviderEffect(
+        timeoutPrepared,
+        profile,
+        signal,
+      );
     } catch (error: unknown) {
       const latest = this.#store.requireInteraction(timeoutPrepared.publicId);
+      const indeterminate = error instanceof IndeterminateLocalCommitError
+        || providerFailureCode(error) === "INDETERMINATE_EFFECT";
       const terminal = latest.state === "response_prepared"
         && latest.revision === timeoutPrepared.revision
         && latest.responseDigest === timeoutResponseDigest
-        ? providerFailureCode(error) === "INDETERMINATE_EFFECT"
+        ? indeterminate
           ? this.#store.markInteractionResolutionUnknown({
               id: latest.publicId,
               expectedRevision: latest.revision,
@@ -9433,10 +13141,10 @@ export class HraService {
         : latest;
       if (terminal !== latest) this.#appendInteractionState(terminal);
       throw new CommandFailure(
-        providerFailureCode(error) === "INDETERMINATE_EFFECT"
+        indeterminate
           ? "RECOVERY_REQUIRED"
           : "CONFLICT",
-        providerFailureCode(error) === "INDETERMINATE_EFFECT"
+        indeterminate
           ? "The provider timeout response may have reached Codex; its resolution is unknown."
           : "The expired interaction could not be closed on its exact provider connection.",
         { interaction: this.#publicInteraction(terminal) },
@@ -9475,6 +13183,1531 @@ export class HraService {
     );
   }
 
+  #personalCodexRestartRequired(
+    profile: Pick<ProfileRecord, "id" | "processGeneration">,
+  ): boolean {
+    const revocation = this.#store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider: "codex",
+      runtimeScope: "personal",
+    });
+    return revocation?.state === "completed"
+      && revocation.profileGeneration === profile.processGeneration;
+  }
+
+  #sessionAdoptionStatus(provider?: AdoptableProvider): unknown {
+    const providers: readonly AdoptableProvider[] = provider === undefined
+      ? ["codex", "claude"]
+      : [provider];
+    return {
+      version: 1,
+      providers: providers.map((candidateProvider) => {
+        const policy = this.#store.readSessionAdoptionPolicy(candidateProvider);
+        const counts = this.#store.readSessionAdoptionCounts(candidateProvider);
+        return {
+          provider: candidateProvider,
+          enabled: policy?.enabled ?? false,
+          accountId: policy?.profileId ?? null,
+          ...(candidateProvider === "codex"
+            && this.#store.listProfiles().some((profile) =>
+              this.#personalCodexRestartRequired(profile))
+            ? { restartRequired: true }
+            : {}),
+          ...counts,
+        };
+      }),
+    };
+  }
+
+  async #setSessionAdoption(
+    command: Extract<LocalCommand, { kind: "session.adoption.set" }>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    if (!command.enabled) {
+      if (command.provider === "codex") {
+        await this.#recoverInterruptedCodexAdoptionClaimsBeforePolicyChange(signal);
+      }
+      this.#store.setSessionAdoptionPolicy({ provider: command.provider, profileId: null });
+      return this.#sessionAdoptionStatus(command.provider);
+    }
+    if (command.account === undefined) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        "Enabling personal-home session adoption requires an HRA account.",
+      );
+    }
+    const profile = this.#store.requireProfile(command.account);
+    const currentPolicy = this.#store.readSessionAdoptionPolicy(command.provider);
+    if (
+      command.provider === "codex"
+      && currentPolicy !== null
+      && currentPolicy.profileId !== null
+      && currentPolicy.profileId !== profile.id
+    ) {
+      await this.#recoverInterruptedCodexAdoptionClaimsBeforePolicyChange(signal);
+    }
+    if (command.provider === "codex" && this.#personalCodexRestartRequired(profile)) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The personal-home Codex controller was released after an account change. Restart the HRA daemon before enabling adoption again.",
+        { accountId: profile.id, provider: "codex", restartRequired: true },
+      );
+    }
+    if (command.provider === "codex") {
+      this.#assertSignedIn(profile);
+      this.#assertIdentifiableAccountAuthority(profile);
+    }
+    const scopedRevocation = this.#store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id,
+      provider: command.provider,
+      runtimeScope: "personal",
+    });
+    if (scopedRevocation?.profileGeneration === profile.processGeneration) {
+      // Enabling discovery is an authority-bearing admission. Reconcile a
+      // completed exact-key fence with a fresh provider read first; releasing,
+      // null-key, or changed-key scopes remain fail-closed.
+      await this.#assertPersonalProviderAccountAuthority(
+        profile,
+        command.provider,
+        signal,
+        true,
+      );
+    }
+    this.#store.setSessionAdoptionPolicy({
+      provider: command.provider,
+      profileId: profile.id,
+    });
+    try {
+      // The command dispatcher already owns this provider's adoption tail.
+      const discovery = await this.#discoverPersonalProviderWithAccountLock(
+        command.provider,
+        signal,
+      );
+      return { ...this.#sessionAdoptionStatus(command.provider) as object, discovery };
+    } catch (error: unknown) {
+      if (signal.aborted) throw signal.reason;
+      this.recordBackgroundDiagnostic("session_adoption_failed", error);
+      return {
+        ...this.#sessionAdoptionStatus(command.provider) as object,
+        discovery: { provider: command.provider, state: "unavailable" },
+      };
+    }
+  }
+
+  /**
+   * A policy mutation cannot discard an interrupted claim. After a real daemon
+   * restart, settle old Codex custody from the old policy's exact account lock
+   * before asking storage to disable or transfer the policy.
+   */
+  async #recoverInterruptedCodexAdoptionClaimsBeforePolicyChange(
+    signal: AbortSignal,
+  ): Promise<void> {
+    const policy = this.#store.readSessionAdoptionPolicy("codex");
+    if (
+      policy === null
+      || !policy.enabled
+      || policy.profileId === null
+      || this.#store.listSessionAdoptionCandidates({
+        provider: "codex",
+        status: "claiming",
+        limit: 1,
+      }).length === 0
+    ) return;
+    const policyProfileId = policy.profileId;
+    try {
+      await this.#serialize(`account:${policyProfileId}`, async () => {
+        const exactPolicy = this.#store.readSessionAdoptionPolicy("codex");
+        if (
+          exactPolicy === null
+          || !exactPolicy.enabled
+          || exactPolicy.profileId !== policyProfileId
+        ) return;
+        const profile = this.#store.requireProfileById(policyProfileId);
+        this.#assertSignedIn(profile);
+        this.#assertIdentifiableAccountAuthority(profile);
+        const accountKey = await this.#assertPersonalProviderAccountAuthority(
+          profile,
+          "codex",
+          signal,
+          true,
+        );
+        if (this.#personalCodexHome === undefined) {
+          throw new ProviderRuntimeUnavailableError(
+            "Personal-home Codex session control is unavailable on this daemon.",
+          );
+        }
+        const authority = {
+          ...this.#profileAuthority(profile, "codex"),
+          codexHome: this.#personalCodexHome,
+        };
+        await this.#recoverInterruptedCodexAdoptionClaimsLocked(
+          profile,
+          authority,
+          accountKey,
+          signal,
+        );
+      });
+    } catch (error: unknown) {
+      if (signal.aborted) throw signal.reason;
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
+      // The storage policy seam still refuses the mutation while any claim is
+      // unsettled; retain the most specific provider failure diagnostically.
+      this.recordBackgroundDiagnostic("session_adoption_failed", error);
+    }
+  }
+
+  /** One bounded scan, also used by the daemon's single-owner poller. */
+  async discoverPersonalSessions(
+    provider: AdoptableProvider | undefined,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const finish = this.#beginOperation();
+    try {
+      await this.#daemonAuthority.assertCurrent();
+      const selectedProvider = provider === undefined
+        ? undefined
+        : adoptableProviderSchema.parse(provider);
+      const providers: readonly AdoptableProvider[] = selectedProvider === undefined
+        ? ["codex", "claude"]
+        : [selectedProvider];
+      const settled = await Promise.all(providers.map(async (candidateProvider) =>
+        await this.#serialize(
+          `session-adoption:${candidateProvider}`,
+          async () => await this.#discoverPersonalProviderWithAccountLock(
+            candidateProvider,
+            signal,
+          ),
+        )));
+      await this.#daemonAuthority.assertCurrent();
+      return { version: 1, providers: settled };
+    } finally {
+      finish();
+    }
+  }
+
+  async #projectForPersonalCandidate(
+    candidate: DiscoveredPersonalSession,
+  ): Promise<ProjectRecord | undefined> {
+    if (candidate.projectRoot === undefined) return undefined;
+    let root: string | null;
+    try {
+      root = await resolveUsableCanonicalProjectDirectory(candidate.projectRoot);
+    } catch {
+      return undefined;
+    }
+    if (root === null) return undefined;
+    return this.#store.listProjects().find((project) => project.rootPath === root);
+  }
+
+  #personalCandidateIsRecent(candidate: DiscoveredPersonalSession): boolean {
+    if (candidate.updatedAt === undefined) return candidate.liveness === "live";
+    const now = this.#now();
+    if (candidate.updatedAt > now + PERSONAL_SESSION_ADOPTION_CLOCK_SKEW_MS) return false;
+    if (now - candidate.updatedAt <= PERSONAL_SESSION_ADOPTION_RECENCY_MS) return true;
+    return candidate.provider === "codex" && candidate.scheduledTaskTarget === true;
+  }
+
+  #personalCandidateNeedsScheduledAgeWaiver(
+    candidate: DiscoveredPersonalSession,
+  ): boolean {
+    if (
+      candidate.provider !== "codex"
+      || candidate.scheduledTaskTarget !== true
+      || candidate.updatedAt === undefined
+    ) return false;
+    const now = this.#now();
+    return candidate.updatedAt <= now + PERSONAL_SESSION_ADOPTION_CLOCK_SKEW_MS
+      && now - candidate.updatedAt > PERSONAL_SESSION_ADOPTION_RECENCY_MS;
+  }
+
+  #personalCodexCandidateCompletesRecentLiveObservation(
+    candidate: DiscoveredPersonalSession,
+  ): boolean {
+    if (
+      candidate.provider !== "codex"
+      || candidate.admissionEligible !== false
+      || candidate.liveness !== "not_live"
+    ) return false;
+    const durable = this.#store.readSessionAdoptionCandidate(
+      "codex",
+      candidate.providerThreadId,
+    );
+    if (
+      durable === null
+      || (durable.status !== "pending" && durable.status !== "claiming")
+      || durable.lastLiveObservedAt === null
+    ) return false;
+    const now = this.#now();
+    return durable.lastLiveObservedAt <= now + PERSONAL_SESSION_ADOPTION_CLOCK_SKEW_MS
+      && now - durable.lastLiveObservedAt <= PERSONAL_SESSION_ADOPTION_RECENCY_MS;
+  }
+
+  #personalCodexClaimClass(
+    candidate: DiscoveredPersonalSession,
+  ): PersonalCodexAdoptionClaimClass {
+    return this.#personalCandidateNeedsScheduledAgeWaiver(candidate)
+      ? "scheduled"
+      : "recent";
+  }
+
+  /**
+   * Interleave independently recent and schedule-waived candidates. Durable
+   * attempt order prevents a repeatedly failing id from owning its page, while
+   * the alternating first class removes a fixed bias when only one slot is
+   * usable on a particular poll.
+   */
+  #orderPersonalCodexAdmissionCandidates(
+    candidates: readonly PreparedPersonalAdmissionCandidate[],
+  ): readonly PreparedPersonalAdmissionCandidate[] {
+    const compare = (
+      left: PreparedPersonalAdmissionCandidate,
+      right: PreparedPersonalAdmissionCandidate,
+    ): number => {
+      const leftAttempt = left.durableCandidate.lastAttemptAt;
+      const rightAttempt = right.durableCandidate.lastAttemptAt;
+      if (leftAttempt === null && rightAttempt !== null) return -1;
+      if (leftAttempt !== null && rightAttempt === null) return 1;
+      if (leftAttempt !== null && rightAttempt !== null && leftAttempt !== rightAttempt) {
+        return leftAttempt - rightAttempt;
+      }
+      const leftUpdated = left.candidate.updatedAt ?? Number.MAX_SAFE_INTEGER;
+      const rightUpdated = right.candidate.updatedAt ?? Number.MAX_SAFE_INTEGER;
+      if (leftUpdated !== rightUpdated) return leftUpdated - rightUpdated;
+      return left.candidate.providerThreadId.localeCompare(right.candidate.providerThreadId);
+    };
+    const byClass: Record<
+      PersonalCodexAdoptionClaimClass,
+      PreparedPersonalAdmissionCandidate[]
+    > = { recent: [], scheduled: [] };
+    for (const candidate of candidates) {
+      byClass[this.#personalCodexClaimClass(candidate.candidate)].push(candidate);
+    }
+    byClass.recent.sort(compare);
+    byClass.scheduled.sort(compare);
+    const firstClass = this.#personalCodexNextClaimClass;
+    const secondClass: PersonalCodexAdoptionClaimClass = firstClass === "recent"
+      ? "scheduled"
+      : "recent";
+    if (byClass.recent.length > 0 && byClass.scheduled.length > 0) {
+      this.#personalCodexNextClaimClass = secondClass;
+    }
+    const ordered: PreparedPersonalAdmissionCandidate[] = [];
+    for (let index = 0; index < Math.max(
+      byClass[firstClass].length,
+      byClass[secondClass].length,
+    ); index += 1) {
+      const first = byClass[firstClass][index];
+      if (first !== undefined) ordered.push(first);
+      const second = byClass[secondClass][index];
+      if (second !== undefined) ordered.push(second);
+    }
+    return ordered;
+  }
+
+  #orderPersonalAdmissionCandidates(
+    provider: AdoptableProvider,
+    candidates: readonly PreparedPersonalAdmissionCandidate[],
+  ): readonly PreparedPersonalAdmissionCandidate[] {
+    if (provider === "codex") {
+      return this.#orderPersonalCodexAdmissionCandidates(candidates);
+    }
+    return [...candidates].sort((left, right) => {
+      const leftAttempt = left.durableCandidate.lastAttemptAt;
+      const rightAttempt = right.durableCandidate.lastAttemptAt;
+      if (leftAttempt === null && rightAttempt !== null) return -1;
+      if (leftAttempt !== null && rightAttempt === null) return 1;
+      if (leftAttempt !== null && rightAttempt !== null && leftAttempt !== rightAttempt) {
+        return leftAttempt - rightAttempt;
+      }
+      const leftUpdated = left.candidate.updatedAt ?? Number.MAX_SAFE_INTEGER;
+      const rightUpdated = right.candidate.updatedAt ?? Number.MAX_SAFE_INTEGER;
+      if (leftUpdated !== rightUpdated) return leftUpdated - rightUpdated;
+      return left.candidate.providerThreadId.localeCompare(
+        right.candidate.providerThreadId,
+      );
+    });
+  }
+
+  async #personalCodexScheduledAuthorityForDiscovery(
+    signal: AbortSignal,
+  ): Promise<
+    PersonalCodexScheduledAuthorityBatch
+  > {
+    const empty: PersonalCodexScheduledAuthorityBatch = {
+      providerThreadIds: [],
+      sourceDirectoryNamesByProviderThreadId: new Map(),
+    };
+    const reader = this.#readPersonalCodexAutomations;
+    if (reader === undefined) return empty;
+    try {
+      const deadlineAt = this.#now() + PERSONAL_CODEX_AUTOMATION_AUTHORITY_DEADLINE_MS;
+      const readPage = async (
+        after: string | null,
+        restartPage: number,
+      ): Promise<CodexAutomationAuthorityScan> => {
+        const scan = await this.#fencedEffect(async () => await reader({
+          kind: "page",
+          after,
+          deadlineAt,
+          limit: PERSONAL_SESSION_ADOPTION_SCAN_LIMIT,
+          restartPage,
+          signal,
+        }));
+        signal.throwIfAborted();
+        await this.#daemonAuthority.assertCurrent();
+        if (
+          (!scan.complete && scan.nextCursor === null)
+          || scan.entries.length > PERSONAL_SESSION_ADOPTION_SCAN_LIMIT
+          || scan.entries.length + scan.diagnostics.length
+            > PERSONAL_SESSION_ADOPTION_SCAN_LIMIT
+        ) {
+          throw new Error("Personal Codex automation authority page was unavailable.");
+        }
+        return scan;
+      };
+      const requestedCursor = this.#personalCodexAutomationCursor;
+      const restartPage = this.#personalCodexAutomationRestartPending
+        ? this.#personalCodexAutomationRestartPage
+        : 0;
+      // A generation-derived seek is a best-effort fairness hint, not
+      // authority. Consume it before the I/O so a large or slow directory
+      // cannot make every later poll repeat the same deadline-bound seek and
+      // starve the ordinary page-zero cursor traversal forever.
+      this.#personalCodexAutomationRestartPending = false;
+      let scan = await readPage(
+        requestedCursor,
+        restartPage,
+      );
+      // An expired or cross-process cursor first rebuilds a live directory
+      // handle without returning authority. Consume that proof immediately so
+      // a polling interval longer than the cursor TTL cannot starve rotation.
+      if (
+        requestedCursor !== null
+        && !scan.complete
+        && scan.entries.length === 0
+        && scan.diagnostics.length === 0
+        && scan.nextCursor !== null
+      ) {
+        const rebuiltCursor = scan.nextCursor;
+        // Retain the rebuilt live cursor even if its immediate proof read
+        // exhausts the shared deadline or fails transiently. A later poll must
+        // continue from the rebuilt handle rather than reconstructing the same
+        // expired cursor forever.
+        this.#personalCodexAutomationCursor = rebuiltCursor;
+        scan = await readPage(rebuiltCursor, 0);
+      }
+      const sourceNames = new Map<string, string[]>();
+      for (const entry of scan.entries) {
+        const automation = entry.automation;
+        if (
+          automation.kind !== "heartbeat"
+          || automation.targetThreadId === null
+          || !isEligiblePersonalCodexAutomationStatus(automation.status)
+        ) continue;
+        const existing = sourceNames.get(automation.targetThreadId) ?? [];
+        if (!existing.includes(entry.sourceDirectoryName)) {
+          existing.push(entry.sourceDirectoryName);
+        }
+        sourceNames.set(automation.targetThreadId, existing);
+      }
+      this.#personalCodexAutomationCursor = scan.nextCursor;
+      return {
+        providerThreadIds: [...sourceNames.keys()].sort(),
+        sourceDirectoryNamesByProviderThreadId: new Map(
+          [...sourceNames.entries()].map(([providerThreadId, names]) => [
+            providerThreadId,
+            [...names].sort(),
+          ]),
+        ),
+      };
+    } catch (error: unknown) {
+      if (signal.aborted) throw signal.reason;
+      this.recordBackgroundDiagnostic("session_adoption_failed", error);
+      return empty;
+    }
+  }
+
+  async #assertPersonalCodexScheduledTargetStillPresent(
+    providerThreadId: string,
+    sourceDirectoryNames: readonly string[],
+    signal: AbortSignal,
+  ): Promise<void> {
+    const reader = this.#readPersonalCodexAutomations;
+    if (reader === undefined || sourceDirectoryNames.length === 0) {
+      throw new Error("SESSION_ADOPTION_SCHEDULED_TARGET_CHANGED");
+    }
+    const requestedSources = new Set(sourceDirectoryNames);
+    const scan = await this.#fencedEffect(async () => await reader({
+      kind: "sources",
+      sourceDirectoryNames,
+      deadlineAt: this.#now() + PERSONAL_CODEX_AUTOMATION_AUTHORITY_DEADLINE_MS,
+      signal,
+    }));
+    signal.throwIfAborted();
+    await this.#daemonAuthority.assertCurrent();
+    if (
+      !scan.complete
+      || scan.nextCursor !== null
+      || scan.entries.length > requestedSources.size
+      || scan.entries.some((entry) => !requestedSources.has(entry.sourceDirectoryName))
+      || !scan.entries.some((entry) =>
+        entry.automation.kind === "heartbeat"
+        && entry.automation.targetThreadId === providerThreadId
+        && isEligiblePersonalCodexAutomationStatus(entry.automation.status))
+    ) {
+      throw new Error("SESSION_ADOPTION_SCHEDULED_TARGET_CHANGED");
+    }
+  }
+
+  /**
+   * Reconcile claim custody left by an earlier daemon generation. A metadata
+   * read is deliberately used here: it proves current quiescence without
+   * resuming or subscribing to a thread whose prior release was unproven.
+   */
+  async #recoverInterruptedCodexAdoptionClaimsLocked(
+    profile: ProfileRecord,
+    authority: ProfileAuthority,
+    expectedAccountKey: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const personalCodex = this.#personalCodex;
+    const readSessionMetadata = personalCodex?.readSessionMetadata?.bind(personalCodex);
+    if (readSessionMetadata === undefined) {
+      throw new ProviderRuntimeUnavailableError(
+        "Personal-home Codex control cannot read exact thread metadata for recovery.",
+      );
+    }
+    for (;;) {
+      const batch = this.#store.listSessionAdoptionCandidates({
+        provider: "codex",
+        status: "claiming",
+        limit: PERSONAL_SESSION_ADOPTION_SCAN_LIMIT,
+      });
+      if (batch.length === 0) return;
+      const candidates = batch.filter((candidate) =>
+        !this.#unprovenCodexAdoptionClaims.has(candidate.providerThreadId));
+      if (candidates.length === 0) return;
+      const observations = await Promise.all(candidates.map(async (candidate) => {
+        try {
+          const projection = await this.#fencedEffect(async () =>
+            await readSessionMetadata(
+              authority,
+              candidate.providerThreadId,
+              signal,
+            ));
+          return { candidate, projection } as const;
+        } catch (error: unknown) {
+          return { candidate, error } as const;
+        }
+      }));
+      signal.throwIfAborted();
+      await this.#daemonAuthority.assertCurrent();
+      const exactProfile = this.#store.requireProfileById(profile.id);
+      this.#assertSignedIn(exactProfile);
+      this.#assertIdentifiableAccountAuthority(exactProfile);
+      if (exactProfile.processGeneration !== profile.processGeneration) {
+        throw new Error("SESSION_ADOPTION_PROFILE_AUTHORITY_CHANGED");
+      }
+      const exactAccountKey = await this.#assertPersonalProviderAccountAuthority(
+        exactProfile,
+        "codex",
+        signal,
+        true,
+      );
+      if (exactAccountKey !== expectedAccountKey) {
+        throw new ProviderAccountAuthorityMismatchError(
+          "codex",
+          exactProfile,
+        );
+      }
+      signal.throwIfAborted();
+      await this.#daemonAuthority.assertCurrent();
+      let recovered = 0;
+      for (const observation of observations) {
+        if ("error" in observation) {
+          this.recordBackgroundDiagnostic("session_adoption_failed", observation.error);
+          continue;
+        }
+        try {
+          if (observation.projection.providerThreadId !== observation.candidate.providerThreadId) {
+            throw new Error("SESSION_ADOPTION_RECOVERY_THREAD_MISMATCH");
+          }
+          const liveness = inferCodexLiveness({
+            status: observation.projection.status,
+            ...(observation.projection.activeTurnId === undefined
+              ? {}
+              : { activeTurnId: observation.projection.activeTurnId }),
+            ...(observation.projection.providerUpdatedAt === undefined
+              ? {}
+              : { updatedAt: observation.projection.providerUpdatedAt }),
+            now: this.#now(),
+          });
+          const observed = this.#store
+            .updateCodexSessionAdoptionCandidateLivenessAfterExactRead({
+              providerThreadId: observation.candidate.providerThreadId,
+              expectedRevision: observation.candidate.revision,
+              liveness,
+              ...(liveness === "live" && (
+                observation.projection.status === "active"
+                || observation.projection.activeTurnId !== undefined
+              ) ? { trustedLiveObservation: true } : {}),
+            });
+          if (liveness !== "not_live") continue;
+          this.#store.recoverSessionAdoptionClaimAfterObservation({
+            provider: "codex",
+            providerThreadId: observed.providerThreadId,
+            profileId: exactProfile.id,
+            expectedRevision: observed.revision,
+          });
+          recovered += 1;
+        } catch (error: unknown) {
+          this.recordBackgroundDiagnostic("session_adoption_failed", error);
+        }
+      }
+      // A live, unreadable, conflicted, or same-daemon claim still blocks the
+      // policy mutation. Stop here rather than repeatedly probing the same row.
+      if (recovered !== batch.length) return;
+    }
+  }
+
+  async #reprobeRetainedClaudeCandidates(
+    currentProviderThreadIds: ReadonlySet<string>,
+    signal: AbortSignal,
+  ): Promise<readonly RetainedClaudeCandidateObservation[]> {
+    if (this.#claudeProcessLiveness === undefined) return [];
+    const retained = this.#store
+      .listRetainedClaudeSessionAdoptionCandidatesWithSourceIdentity({
+        // Exclusion is applied by storage before ORDER BY/LIMIT. A full current
+        // registry snapshot therefore cannot starve recently HRA-observed
+        // live identities that have since disappeared from the registry.
+        excludeProviderThreadIds: [...currentProviderThreadIds],
+        liveObservedAfter: Math.max(0, this.#now() - PERSONAL_SESSION_ADOPTION_RECENCY_MS),
+        limit: PERSONAL_SESSION_ADOPTION_SCAN_LIMIT,
+      });
+    if (retained.length === 0) return [];
+
+    const projects = new Map(
+      this.#store.listProjects().map((project) => [project.id, project] as const),
+    );
+    const deadlineAt = this.#now() + CLAUDE_PROCESS_LIVENESS_DEADLINE_MS;
+    const observed: RetainedClaudeCandidateObservation[] = [];
+    for (
+      let offset = 0;
+      offset < retained.length;
+      offset += CLAUDE_RETAINED_CANDIDATE_PROBE_CONCURRENCY
+    ) {
+      signal.throwIfAborted();
+      const batch = retained.slice(
+        offset,
+        offset + CLAUDE_RETAINED_CANDIDATE_PROBE_CONCURRENCY,
+      );
+      const settled = await Promise.all(batch.map(async (candidate) => {
+        const sourceProcessIdentity = candidate.sourceProcessIdentity;
+        if (sourceProcessIdentity === null) return null;
+        try {
+          const liveness = await this.#fencedEffect(async () =>
+            await this.#probeClaudeProcessIdentityLiveness(
+              sourceProcessIdentity,
+              signal,
+              deadlineAt,
+            ));
+          signal.throwIfAborted();
+          await this.#daemonAuthority.assertCurrent();
+          const durableCandidate = this.#store
+            .updateClaudeSessionAdoptionCandidateLivenessAfterExactProbe({
+              providerThreadId: candidate.providerThreadId,
+              expectedRevision: candidate.revision,
+              expectedSourceProcessIdentity: sourceProcessIdentity,
+              liveness,
+            });
+          const syntheticCandidate: DiscoveredPersonalSession = {
+            provider: "claude",
+            providerThreadId: durableCandidate.providerThreadId,
+            title: durableCandidate.title,
+            ...(durableCandidate.providerProjectRoot === null
+              ? {}
+              : { projectRoot: durableCandidate.providerProjectRoot }),
+            ...(durableCandidate.providerUpdatedAt === null
+              ? {}
+              : { updatedAt: durableCandidate.providerUpdatedAt }),
+            liveness: durableCandidate.liveness,
+            sourceProcessIdentity: durableCandidate.sourceProcessIdentity,
+          };
+          return {
+            candidate: syntheticCandidate,
+            durableCandidate,
+            project: durableCandidate.projectId === null
+              ? undefined
+              : projects.get(durableCandidate.projectId),
+          } satisfies RetainedClaudeCandidateObservation;
+        } catch (error: unknown) {
+          if (signal.aborted) return { aborted: signal.reason as unknown } as const;
+          this.recordBackgroundDiagnostic("session_adoption_failed", error);
+          return null;
+        }
+      }));
+      for (const result of settled) {
+        if (result === null) continue;
+        if ("aborted" in result) throw result.aborted;
+        observed.push(result);
+      }
+    }
+    return observed;
+  }
+
+  async #discoverPersonalProviderWithAccountLock(
+    provider: AdoptableProvider,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    // Every caller owns session-adoption:<provider>. Preserve the global lock
+    // order used by logout/revocation, then hold the selected account tail for
+    // the entire provider claim and durable commit. A managed disconnect may
+    // advance the account generation before this lock or observe the committed
+    // personal binding afterward, but cannot invalidate authority mid-claim.
+    const policy = this.#store.readSessionAdoptionPolicy(provider);
+    if (policy === null || !policy.enabled || policy.profileId === null) {
+      return await this.#discoverPersonalProviderLocked(provider, signal);
+    }
+    return await this.#serialize(
+      `account:${policy.profileId}`,
+      async () => await this.#discoverPersonalProviderLocked(provider, signal),
+    );
+  }
+
+  async #discoverPersonalProviderLocked(
+    provider: AdoptableProvider,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const policy = this.#store.readSessionAdoptionPolicy(provider);
+    if (policy === null || !policy.enabled || policy.profileId === null) {
+      return { provider, state: "disabled", discovered: 0, adopted: 0, pending: 0 };
+    }
+    if (this.#personalDiscovery === undefined || this.#personalCodexHome === undefined) {
+      throw new ProviderRuntimeUnavailableError(
+        `Personal-home ${provider} discovery is unavailable on this daemon.`,
+      );
+    }
+    let profile = this.#store.requireProfileById(policy.profileId);
+    if (provider === "codex") {
+      this.#assertSignedIn(profile);
+      this.#assertIdentifiableAccountAuthority(profile);
+    } else {
+      if (profile.state !== "signed_in" && profile.state !== "signed_out") {
+        throw new CommandFailure("RECOVERY_REQUIRED", "The personal Claude profile authority is unsettled.");
+      }
+      const unsettled = this.#unsettledClaudeLogin(profile);
+      if (unsettled !== undefined) {
+        throw new CommandFailure("RECOVERY_REQUIRED", "A foreground Claude login still owns this account.", this.#claudeLoginRecovery(unsettled));
+      }
+    }
+    let providerAuthority = this.#providerAuthority(profile, provider);
+    // Discovery's identity read and later claim share this positive provider
+    // incarnation. Personal Claude authority never comes from probing the
+    // managed home or advancing Codex's compatibility counter.
+    signal.throwIfAborted();
+    await this.#daemonAuthority.assertCurrent();
+    if (providerAuthority.processGeneration === 0) {
+      providerAuthority = this.#store.advanceProviderAccountProcessGeneration({
+        profileId: profile.id, provider, expectedProcessGeneration: 0,
+      });
+      profile = this.#store.requireProfileById(profile.id);
+    }
+    const authority = this.#personalAuthorityForProfile(profile, providerAuthority);
+    const discoveryProviderAccountKey = await this.#assertPersonalProviderAccountAuthority(
+      profile,
+      provider,
+      signal,
+      true,
+    );
+    if (provider === "codex") {
+      await this.#recoverInterruptedCodexAdoptionClaimsLocked(
+        profile,
+        authority,
+        discoveryProviderAccountKey,
+        signal,
+      );
+    }
+    const codexScheduledAuthority = provider === "codex"
+      ? await this.#personalCodexScheduledAuthorityForDiscovery(signal)
+      : undefined;
+    const codexScheduledThreadIds = codexScheduledAuthority?.providerThreadIds;
+    const observed = await this.#fencedEffect(async () => {
+      return await this.#personalDiscovery?.discover({
+        provider,
+        ...(codexScheduledThreadIds === undefined
+          ? {}
+          : { codexScheduledThreadIds }),
+        // Observation is independently bounded from provider claims. Reading
+        // all four Codex pages and the complete bounded Claude registry keeps
+        // live prefixes from hiding a later quiescent candidate.
+        limit: PERSONAL_SESSION_DISCOVERY_MAX_RESULTS,
+        deadlineMs: 5_000,
+        signal,
+      }) ?? [];
+    });
+
+    // Persist the complete bounded observation before any controller claim.
+    // A slow or rejected first claim therefore cannot prevent later live rows
+    // from becoming durable candidates for eventual quiescent takeover.
+    const registeredProjectsByRoot = new Map(
+      this.#store.listProjects().map((project) => [project.rootPath, project] as const),
+    );
+    const preparedObserved: PreparedPersonalAdmissionCandidate[] = [];
+    let persisted = 0;
+    let retainedObservationPending = 0;
+    for (const candidate of observed) {
+      signal.throwIfAborted();
+      if (candidate.provider !== provider) continue;
+      const admissionEligible = (
+        candidate.admissionEligible !== false
+        && this.#personalCandidateIsRecent(candidate)
+      ) || this.#personalCodexCandidateCompletesRecentLiveObservation(candidate);
+      const retentionEligible = candidate.trustedLiveObservation === true
+        && candidate.liveness === "live"
+        && (provider === "codex" || candidate.sourceProcessIdentity != null);
+      if (!admissionEligible && !retentionEligible) continue;
+      // Registered project roots are canonical, so an exact provider string can
+      // be mapped without filesystem I/O. Noncanonical/symlink roots are not
+      // inferred for live-only retention here: only a later admission attempt,
+      // inside the two-candidate preflight budget, may canonicalize them.
+      const project = candidate.projectRoot === undefined
+        ? undefined
+        : registeredProjectsByRoot.get(candidate.projectRoot);
+      const durableCandidate = this.#store.upsertSessionAdoptionCandidate({
+        provider,
+        providerThreadId: candidate.providerThreadId,
+        ...(project === undefined ? {} : { projectId: project.id }),
+        ...(candidate.projectRoot === undefined
+          ? {}
+          : { providerProjectRoot: candidate.projectRoot }),
+        title: candidate.title,
+        state: candidate.liveness === "live" ? "active" : "idle",
+        ...(candidate.updatedAt === undefined
+          ? {}
+          : { providerUpdatedAt: candidate.updatedAt }),
+        liveness: candidate.liveness,
+        ...(candidate.trustedLiveObservation === true
+          ? { trustedLiveObservation: true }
+          : {}),
+        ...(provider === "claude"
+          ? { sourceProcessIdentity: candidate.sourceProcessIdentity ?? null }
+          : {}),
+      });
+      persisted += 1;
+      if (admissionEligible) {
+        preparedObserved.push({
+          kind: "discovered",
+          candidate,
+          durableCandidate,
+          project,
+        });
+      } else if (
+        durableCandidate.status === "pending"
+        || durableCandidate.status === "claiming"
+      ) {
+        retainedObservationPending += 1;
+      }
+    }
+    signal.throwIfAborted();
+    await this.#daemonAuthority.assertCurrent();
+    const retainedClaude = provider === "claude"
+      ? await this.#reprobeRetainedClaudeCandidates(
+          new Set(observed
+            .filter((candidate) => candidate.provider === "claude")
+            .map((candidate) => candidate.providerThreadId)),
+          signal,
+        )
+      : [];
+    const admissionCandidates = this.#orderPersonalAdmissionCandidates(provider, [
+      ...preparedObserved,
+      ...retainedClaude.map((candidate) => ({ kind: "retained" as const, ...candidate })),
+    ]);
+    let adopted = 0;
+    let pending = retainedObservationPending;
+    let failed = 0;
+    let preflightAttempts = 0;
+    for (const admissionCandidate of admissionCandidates) {
+      const candidate = admissionCandidate.candidate;
+      let project = admissionCandidate.project;
+      let durableCandidate = admissionCandidate.durableCandidate;
+      const codexClaimKey = provider === "codex"
+        ? candidate.providerThreadId
+        : null;
+      signal.throwIfAborted();
+      if (
+        codexClaimKey !== null
+        && this.#unprovenCodexAdoptionClaims.has(codexClaimKey)
+      ) {
+        if (durableCandidate.status === "pending" || durableCandidate.status === "claiming") {
+          pending += 1;
+        }
+        continue;
+      }
+      if (durableCandidate.status === "claiming" && candidate.liveness === "not_live") {
+        try {
+          durableCandidate = this.#store.recoverSessionAdoptionClaimAfterObservation({
+            provider,
+            providerThreadId: candidate.providerThreadId,
+            profileId: profile.id,
+            expectedRevision: durableCandidate.revision,
+          });
+        } catch (error: unknown) {
+          // A claiming row already contributes to the aggregate pending count.
+          // Keep it fenced until a later observation or exact Claude process
+          // release makes crash recovery provable.
+          this.recordBackgroundDiagnostic("session_adoption_failed", error);
+        }
+      }
+      if (durableCandidate.status !== "pending") {
+        if (durableCandidate.status === "claiming") {
+          pending += 1;
+        }
+        continue;
+      }
+      if (
+        (provider === "claude" && candidate.liveness !== "not_live")
+        || (provider === "codex" && candidate.liveness !== "not_live")
+      ) {
+        pending += 1;
+        continue;
+      }
+      if (this.#store.findSessionPersonalRuntimeBinding(
+        provider,
+        candidate.providerThreadId,
+      )?.state === "detaching") {
+        pending += 1;
+        continue;
+      }
+      if (
+        preflightAttempts >= PERSONAL_SESSION_ADOPTION_CLAIM_ATTEMPT_LIMIT
+      ) {
+        pending += 1;
+        continue;
+      }
+      const claimState = { claimed: false, dispatched: false };
+      let committedSession: SessionRecord | undefined;
+      let claudeProcessIdentity: ClaudeProcessIdentity | undefined;
+      let claudeLaunchIntent: ClaudeProcessLaunchIntentRecord | undefined;
+      try {
+        // Record and consume the bounded attempt before any candidate-specific
+        // async filesystem or schedule check. A rejected preflight has no
+        // provider effect, so the row stays pending while its durable attempt
+        // timestamp moves it behind untouched candidates on the next poll.
+        durableCandidate = this.#store.recordSessionAdoptionCandidatePreflightAttempt({
+          provider,
+          providerThreadId: candidate.providerThreadId,
+          expectedRevision: durableCandidate.revision,
+        });
+        preflightAttempts += 1;
+        if (project === undefined) {
+          project = await this.#projectForPersonalCandidate(candidate);
+        }
+        if (project === undefined) {
+          throw new Error("SESSION_ADOPTION_PROJECT_UNAVAILABLE");
+        }
+        const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
+        signal.throwIfAborted();
+        await this.#daemonAuthority.assertCurrent();
+        // Persist the bounded canonical result before any provider effect. It is
+        // then available to an exact-process Claude reprobe if the registry row
+        // disappears after this observation.
+        durableCandidate = this.#store.upsertSessionAdoptionCandidate({
+          provider,
+          providerThreadId: candidate.providerThreadId,
+          projectId: project.id,
+          ...(candidate.projectRoot === undefined
+            ? {}
+            : { providerProjectRoot: candidate.projectRoot }),
+          title: candidate.title,
+          state: candidate.liveness === "live" ? "active" : "idle",
+          ...(candidate.updatedAt === undefined
+            ? {}
+            : { providerUpdatedAt: candidate.updatedAt }),
+          liveness: candidate.liveness,
+          ...(candidate.sourceProcessIdentity === undefined
+            ? {}
+            : { sourceProcessIdentity: candidate.sourceProcessIdentity }),
+        });
+        const adoptionPreset = this.#store.readDefaultPreset(provider);
+        const adoptionFast = false;
+        const adoptionRequirement = presetRequirementForContract(
+          adoptionPreset,
+          currentPresetContract,
+        );
+        const needsScheduledAgeWaiver = this.#personalCandidateNeedsScheduledAgeWaiver(
+          candidate,
+        );
+        const scheduledSourceDirectoryNames = needsScheduledAgeWaiver
+          ? codexScheduledAuthority?.sourceDirectoryNamesByProviderThreadId.get(
+              candidate.providerThreadId,
+            ) ?? []
+          : [];
+        if (needsScheduledAgeWaiver) {
+          await this.#assertPersonalCodexScheduledTargetStillPresent(
+            candidate.providerThreadId,
+            scheduledSourceDirectoryNames,
+            signal,
+          );
+          signal.throwIfAborted();
+          await this.#daemonAuthority.assertCurrent();
+        }
+        durableCandidate = this.#store.fenceSessionAdoptionCandidateForClaim({
+          provider,
+          providerThreadId: candidate.providerThreadId,
+          expectedRevision: durableCandidate.revision,
+        });
+        let projection: CodexSessionProjection;
+        let connectionId: string;
+        let effectiveRuntimeProfile: ReviewedRuntimeProfile;
+        if (provider === "codex") {
+          const personalCodex = this.#personalCodex;
+          if (personalCodex === undefined) {
+            throw new ProviderRuntimeUnavailableError(
+              "Personal-home Codex control is unavailable on this daemon.",
+            );
+          }
+          if (personalCodex.claimSession === undefined) {
+            throw new ProviderRuntimeUnavailableError(
+              "Personal-home Codex control cannot claim an existing thread.",
+            );
+          }
+          const claimSession = personalCodex.claimSession.bind(personalCodex);
+          const observation = await this.#fencedEffect(async () => {
+            claimState.dispatched = true;
+            const value = await claimSession({
+              authority,
+              providerThreadId: candidate.providerThreadId,
+              projectRoot,
+              preset: adoptionPreset,
+              requirement: adoptionRequirement,
+              fast: adoptionFast,
+              signal,
+            });
+            claimState.claimed = true;
+            return value;
+          });
+          if (inferCodexLiveness({
+            status: observation.projection.status,
+            ...(observation.projection.activeTurnId === undefined
+              ? {}
+              : { activeTurnId: observation.projection.activeTurnId }),
+            ...(observation.projection.providerUpdatedAt === undefined
+              ? {}
+              : { updatedAt: observation.projection.providerUpdatedAt }),
+            now: this.#now(),
+          }) !== "not_live") {
+            throw new Error("SESSION_ADOPTION_CLAIM_LIVENESS_CHANGED");
+          }
+          projection = observation.projection;
+          connectionId = observation.connectionId;
+          effectiveRuntimeProfile = observation.effectiveRuntimeProfile;
+        } else {
+          const personalClaude = this.#personalClaude;
+          if (personalClaude === undefined) {
+            throw new ProviderRuntimeUnavailableError(
+              "Personal-home Claude control is unavailable on this daemon.",
+            );
+          }
+          claudeLaunchIntent = this.#store.stageClaudeProcessLaunchIntent({
+            providerThreadId: candidate.providerThreadId,
+            profileId: profile.id,
+            profileGeneration: profile.processGeneration,
+            providerAuthority,
+            runtimeScope: "personal",
+            providerAccountKey: discoveryProviderAccountKey,
+          });
+          const launchIntent = claudeLaunchIntent;
+          const resumed = await this.#fencedEffect(async () => {
+            const value = await personalClaude.claimSession({
+              authority,
+              admitProcessIdentity: async (identity) => {
+                claudeProcessIdentity = await this.#recordClaimedClaudeProcess({
+                  authority,
+                  providerThreadId: candidate.providerThreadId,
+                  runtimeScope: "personal",
+                  launchIntent,
+                  identity,
+                  signal,
+                });
+              },
+              providerThreadId: candidate.providerThreadId,
+              projectRoot,
+              title: candidate.title,
+              preset: adoptionPreset,
+              requirement: adoptionRequirement,
+              fast: adoptionFast,
+              sourceLiveness: "not_live",
+              signal,
+            });
+            claimState.claimed = true;
+            return value;
+          });
+          if (claudeProcessIdentity === undefined) {
+            throw new Error("CLAUDE_PROCESS_IDENTITY_NOT_ADMITTED");
+          }
+          projection = resumed;
+          effectiveRuntimeProfile = resumed.effectiveRuntimeProfile;
+          const observation = await this.#fencedEffect(async () =>
+            await personalClaude.observeSession({
+              authority,
+              providerThreadId: candidate.providerThreadId,
+              signal,
+            }));
+          connectionId = observation.connectionId;
+        }
+        effectiveRuntimeProfile = assertClaimedRuntimeProfile({
+          authority,
+          fast: adoptionFast,
+          preset: adoptionPreset,
+          provider,
+          requirement: adoptionRequirement,
+          runtimeProfile: effectiveRuntimeProfile,
+        });
+        if (
+          projection.providerThreadId !== candidate.providerThreadId
+          || projection.status !== "idle"
+          || projection.activeTurnId !== undefined
+        ) {
+          throw new Error("SESSION_ADOPTION_CLAIM_NOT_QUIESCENT");
+        }
+        const projectionProject = projection.projectRoot === undefined
+          ? project
+          : await this.#projectForPersonalCandidate({
+              ...candidate,
+              projectRoot: projection.projectRoot,
+            });
+        if (projectionProject?.id !== project.id) {
+          throw new Error("SESSION_ADOPTION_PROJECT_CHANGED_DURING_CLAIM");
+        }
+        signal.throwIfAborted();
+        await this.#daemonAuthority.assertCurrent();
+        const exactProfile = this.#store.requireProfileById(profile.id);
+        if (provider === "codex") {
+          this.#assertSignedIn(exactProfile);
+          this.#assertIdentifiableAccountAuthority(exactProfile);
+        } else if (
+          exactProfile.state !== "signed_in"
+          && exactProfile.state !== "signed_out"
+        ) {
+          throw new Error("SESSION_ADOPTION_PROFILE_AUTHORITY_CHANGED");
+        }
+        if (exactProfile.processGeneration !== profile.processGeneration
+          || !this.#profileAuthorityIsCurrent(authority)) {
+          throw new Error("SESSION_ADOPTION_PROFILE_AUTHORITY_CHANGED");
+        }
+        // Identity is sandwiched around discovery and controller claim. The
+        // selected account, personal provider home, and durable session
+        // authority must still name one normalized provider identity at the
+        // exact claim-to-commit boundary.
+        const providerAccountKey = await this.#assertPersonalProviderAccountAuthority(
+          exactProfile,
+          provider,
+          signal,
+          true,
+        );
+        if (providerAccountKey !== discoveryProviderAccountKey) {
+          this.#scheduleProviderRuntimeAccountRevocation(
+            exactProfile,
+            provider,
+            "personal",
+            providerAccountKey,
+          );
+          throw new ProviderAccountAuthorityMismatchError(
+            provider,
+            exactProfile,
+          );
+        }
+        if (needsScheduledAgeWaiver) {
+          await this.#assertPersonalCodexScheduledTargetStillPresent(
+            candidate.providerThreadId,
+            scheduledSourceDirectoryNames,
+            signal,
+          );
+          signal.throwIfAborted();
+          await this.#daemonAuthority.assertCurrent();
+        }
+        const claimedProviderProjectRoot = projection.projectRoot ?? candidate.projectRoot;
+        durableCandidate = this.#store.upsertSessionAdoptionCandidate({
+          provider,
+          providerThreadId: projection.providerThreadId,
+          projectId: project.id,
+          ...(claimedProviderProjectRoot === undefined
+            ? {}
+            : { providerProjectRoot: claimedProviderProjectRoot }),
+          // The Claude adapter bounds its in-memory display title. Preserve
+          // the complete title discovered from the personal registry as the
+          // durable session title across claim and later resume.
+          title: provider === "claude" ? durableCandidate.title : projection.title,
+          state: projection.status,
+          ...(projection.providerUpdatedAt === undefined
+            ? {}
+            : { providerUpdatedAt: projection.providerUpdatedAt }),
+          liveness: provider === "claude" ? "not_live" : candidate.liveness,
+        });
+        const result = this.#store.adoptSessionCandidate({
+          providerAuthority,
+          provider,
+          providerThreadId: projection.providerThreadId,
+          expectedCandidateRevision: durableCandidate.revision,
+          profileId: profile.id,
+          profileGeneration: exactProfile.processGeneration,
+          projectId: project.id,
+          preset: adoptionPreset,
+          requirement: adoptionRequirement,
+          fastEnabled: adoptionFast,
+          runtimeProfile: effectiveRuntimeProfile,
+          providerAccountKey,
+          ...(claudeProcessIdentity === undefined ? {} : { claudeProcessIdentity }),
+        });
+        committedSession = result.session;
+        if (codexClaimKey !== null) {
+          this.#unprovenCodexAdoptionClaims.delete(codexClaimKey);
+        }
+        adopted += 1;
+        this.#ensureSessionProviderConnection(authority, result.session, connectionId);
+        if (provider === "claude") {
+          const personalClaude = this.#personalClaude;
+          if (personalClaude === undefined) {
+            throw new ProviderRuntimeUnavailableError(
+              "Personal-home Claude control disappeared after adoption commit.",
+            );
+          }
+          try {
+            // Re-prove the controller after the durable commit and provisional
+            // connection map are both visible. A child that disconnected in
+            // the claim-to-commit gap must not leave a bound dead-process row.
+            const confirmation = await this.#fencedEffect(async () =>
+              await personalClaude.observeSession({
+                authority,
+                providerThreadId: candidate.providerThreadId,
+                signal,
+              }));
+            if (
+              confirmation.projection.providerThreadId !== candidate.providerThreadId
+              || confirmation.projection.status !== "idle"
+              || confirmation.projection.activeTurnId !== undefined
+            ) {
+              throw new ClaudeSessionObservationError();
+            }
+            this.#ensureSessionProviderConnection(
+              authority,
+              result.session,
+              confirmation.connectionId,
+            );
+          } catch (error: unknown) {
+            await this.#releaseClaudeProcessAuthority(
+              {
+                providerThreadId: candidate.providerThreadId,
+                profileId: profile.id,
+                runtimeScope: "personal",
+              },
+              new AbortController().signal,
+            );
+            this.recordBackgroundDiagnostic("recovery_observation_failed", error);
+            this.#scheduleRecoverySessionObservations([result.session]);
+          }
+        }
+        await this.#reconcileCommittedSessionFactsMemory(result.session);
+      } catch (error: unknown) {
+        if (
+          codexClaimKey !== null
+          && error instanceof CodexClaimReleaseUnprovenError
+        ) {
+          this.#unprovenCodexAdoptionClaims.add(codexClaimKey);
+        }
+        // Codex's claim seam guarantees that every ordinary rejection has
+        // either acquired no subscription or synchronously released/retired
+        // the exact controller. Only the closed unproven-release error keeps
+        // durable `claiming` custody for restart recovery. Do not target-end a
+        // deterministic failed claim a second time: the provider identity may
+        // already have been retired along with its connection.
+        let releaseProven = provider === "codex"
+          && committedSession === undefined
+          && claimState.dispatched
+          && !claimState.claimed
+          && !(error instanceof CodexClaimReleaseUnprovenError);
+        if (
+          committedSession === undefined
+          && !(error instanceof ClaudeProcessExitUnprovenError)
+          && (claimState.claimed || claudeLaunchIntent !== undefined)
+        ) {
+          const release = provider === "claude"
+            ? claudeProcessIdentity !== undefined
+              ? this.#releaseClaudeProcessAuthority(
+                  {
+                    providerThreadId: candidate.providerThreadId,
+                    profileId: profile.id,
+                    runtimeScope: "personal",
+                  },
+                  new AbortController().signal,
+                )
+              : claimState.claimed
+                ? this.#personalSessionRuntime(provider).endSession({
+                    authority,
+                    providerThreadId: candidate.providerThreadId,
+                    signal: new AbortController().signal,
+                  })
+                : Promise.resolve()
+            : this.#personalSessionRuntime(provider).endSession({
+                authority,
+                providerThreadId: candidate.providerThreadId,
+                signal: new AbortController().signal,
+              });
+          try {
+            await release;
+            if (claudeLaunchIntent !== undefined) {
+              this.#cancelClaudeProcessLaunchIntent(claudeLaunchIntent);
+            }
+            releaseProven = true;
+          } catch (releaseError: unknown) {
+            this.recordBackgroundDiagnostic("session_adoption_failed", releaseError);
+          }
+        }
+        if (releaseProven) {
+          if (codexClaimKey !== null) {
+            this.#unprovenCodexAdoptionClaims.delete(codexClaimKey);
+          }
+          try {
+            if (error instanceof ProviderAccountAuthorityMismatchError) {
+              this.#store.fenceSessionAdoptionCandidateAfterClaimRelease({
+                provider,
+                providerThreadId: candidate.providerThreadId,
+                profileId: profile.id,
+              });
+            } else {
+              this.#store.requeueSessionAdoptionCandidateAfterClaimRelease({
+                provider,
+                providerThreadId: candidate.providerThreadId,
+                profileId: profile.id,
+              });
+            }
+          } catch (requeueError: unknown) {
+            this.recordBackgroundDiagnostic("session_adoption_failed", requeueError);
+          }
+        }
+        if (signal.aborted) throw signal.reason;
+        if (committedSession === undefined) failed += 1;
+        if (committedSession !== undefined) {
+          this.#scheduleRecoverySessionObservations([committedSession]);
+        }
+        this.recordBackgroundDiagnostic("session_adoption_failed", error);
+      }
+    }
+    return {
+      provider,
+      state: "ready",
+      discovered: persisted,
+      adopted,
+      pending,
+      failed,
+    };
+  }
+
+  async #detachPersonalSession(
+    sessionId: SessionRecord["id"],
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    signal.throwIfAborted();
+    const session = this.#store.requireSession(sessionId);
+    if (session.providerThreadId === undefined) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The session has no proven provider binding.");
+    }
+    const providerThreadId = session.providerThreadId;
+    const binding = this.#store.readSessionPersonalRuntimeBinding(session.id, true);
+    if (binding === null || binding.state === "detached") {
+      throw new CommandFailure("CONFLICT", "That session is not controlled from a personal provider home.");
+    }
+    if (
+      binding.provider !== session.provider
+      || binding.providerThreadId !== providerThreadId
+    ) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "The personal-home binding no longer matches this session's provider identity.",
+      );
+    }
+    if (
+      binding.state === "active"
+      && (session.state === "active" || session.activeTurnId !== undefined)
+    ) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "Stop the active turn before detaching this session.",
+      );
+    }
+    const profile = this.#store.requireProfileById(session.profileId);
+    const authority = this.#personalAuthorityForProfile(profile, this.#capturedSessionProviderAuthority(session));
+    if (binding.state === "active") {
+      if (session.state !== "terminal" && session.state !== "recovery_required") {
+        const projection = await this.#readExactSessionProjection(
+          { ...session, providerThreadId },
+          profile,
+          false,
+          signal,
+        );
+        signal.throwIfAborted();
+        await this.#daemonAuthority.assertCurrent();
+        if (projection.status !== "idle" || projection.activeTurnId !== undefined) {
+          throw new CommandFailure(
+            "CONFLICT",
+            "The provider still reports an active turn. Stop it before detaching this session.",
+          );
+        }
+      }
+      try {
+        this.#clearSessionFactAuthority(session.id);
+        this.#store.beginPersonalSessionDetach({ sessionId: session.id });
+      } catch (error: unknown) {
+        const code = error instanceof Error ? error.message : "";
+        if (code.includes("SESSION_ADOPTION_DETACH_ACTIVE_TURN")) {
+          throw new CommandFailure(
+            "CONFLICT",
+            "Stop the active turn before detaching this session.",
+          );
+        }
+        if (code.includes("SESSION_ADOPTION_DETACH_PENDING_INTERACTION")) {
+          throw new CommandFailure(
+            "CONFLICT",
+            "Resolve or wait for the pending provider interaction before detaching this session.",
+          );
+        }
+        if (code.includes("SESSION_ADOPTION_DETACH_UNSETTLED_QUEUE")) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "Wait for queued work to settle before detaching this session.",
+          );
+        }
+        if (code.includes("SESSION_ADOPTION_DETACH_UNSETTLED_MUTATION")) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "Resolve the session's unsettled provider mutation before detaching it.",
+          );
+        }
+        if (code.includes("SESSION_ADOPTION_DETACH_ACTIVE_TASK")) {
+          throw new CommandFailure(
+            "CONFLICT",
+            "Pause or delete active scheduled tasks before detaching this session.",
+          );
+        }
+        throw error;
+      }
+    }
+    try {
+      if (binding.provider === "claude") {
+        await this.#releaseClaudeProcessAuthority(
+          {
+            providerThreadId,
+            profileId: session.profileId,
+            runtimeScope: "personal",
+          },
+          new AbortController().signal,
+        );
+      } else {
+        await this.#fencedEffect(async () =>
+          await this.#personalSessionRuntime(binding.provider).endSession({
+            authority,
+            providerThreadId,
+            signal: new AbortController().signal,
+          }));
+      }
+    } catch (error: unknown) {
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
+      this.recordBackgroundDiagnostic("session_adoption_failed", error);
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session is fenced from new work, but provider controller release did not finish. HRA will retry it during recovery.",
+      );
+    }
+    await this.#daemonAuthority.assertCurrent();
+    let detached: ReturnType<StateStore["completePersonalSessionDetach"]>;
+    try {
+      detached = this.#store.completePersonalSessionDetach({ sessionId: session.id });
+    } catch (error: unknown) {
+      this.recordBackgroundDiagnostic("session_adoption_failed", error);
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The provider controller was released, but durable session cleanup did not finish. HRA will retry it during recovery.",
+      );
+    }
+    this.#sessionProviderConnections.delete(session.id);
+    this.#clearSessionFactAuthority(session.id);
+    this.#sessionObservationFailures.delete(session.id);
+    this.#sessionResubscriptionConnections.delete(session.id);
+    this.#sessionsAwaitingResubscription.delete(session.id);
+    return {
+      version: 1,
+      session: detached.session.id,
+      detached: true,
+      archived: detached.session.archivedAt !== undefined,
+    };
+  }
+
+  #beginSessionListTraversal(profile: ProfileRecord): Readonly<{
+    id: string;
+    state: SessionListTraversalReplayState;
+  }> {
+    while (this.#sessionListTraversals.size >= SESSION_LIST_TRAVERSAL_LIMIT) {
+      const oldest = this.#sessionListTraversals.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.#sessionListTraversals.delete(oldest);
+    }
+    const id = randomUUID();
+    const state: SessionListTraversalReplayState = {
+      accountId: profile.id,
+      providerAuthority: this.#providerAuthority(profile, "codex"),
+      importedSessionIdsByProviderPage: new Map(),
+      emittedSessionIds: new Set(),
+      importReceiptCount: 0,
+    };
+    this.#sessionListTraversals.set(id, state);
+    return { id, state };
+  }
+
+  #requireSessionListTraversal(
+    traversalId: string,
+    profile: ProfileRecord,
+  ): SessionListTraversalReplayState {
+    const state = this.#sessionListTraversals.get(traversalId);
+    if (
+      state === undefined
+      || state.accountId !== profile.id
+      || !sameProviderUsageAuthority(state.providerAuthority, this.#providerAuthority(profile, "codex"))
+    ) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        "This session-list cursor's bounded replay state expired. Restart the account listing without a cursor.",
+      );
+    }
+    // Map insertion order is the traversal LRU. A bounded eviction is explicit
+    // on reuse rather than silently changing which provider rows a cursor emits.
+    this.#sessionListTraversals.delete(traversalId);
+    this.#sessionListTraversals.set(traversalId, state);
+    return state;
+  }
+
+  #rememberSessionListProviderImport(
+    traversalId: string,
+    state: SessionListTraversalReplayState,
+    providerPage: string,
+    sessionId: SessionRecord["id"],
+  ): void {
+    let receipt = state.importedSessionIdsByProviderPage.get(providerPage);
+    if (receipt?.has(sessionId) === true) return;
+    if (state.importReceiptCount >= SESSION_LIST_TRAVERSAL_IMPORT_RECEIPT_LIMIT) {
+      this.#sessionListTraversals.delete(traversalId);
+      throw new CommandFailure(
+        "UNAVAILABLE",
+        "This session-list traversal exceeded its bounded replay evidence. Restart the account listing without a cursor; imported sessions remain safely local.",
+      );
+    }
+    if (receipt === undefined) {
+      receipt = new Set();
+      state.importedSessionIdsByProviderPage.set(providerPage, receipt);
+    }
+    receipt.add(sessionId);
+    state.importReceiptCount += 1;
+  }
+
   async #listSessions(
     account: string | undefined,
     limit: number,
@@ -9501,6 +14734,7 @@ export class HraService {
         accountId: profile.id,
         accountGeneration: profile.processGeneration,
         limit,
+        includeArchived,
       } as const;
       const decodedCursor = cursor === undefined
         ? undefined
@@ -9530,6 +14764,7 @@ export class HraService {
         listing: signedOutSessionListMetadataSchema.parse({
           accountSelector: profile.id,
           accountState: "signed_out",
+          provider: "codex",
           scope: "local_only",
           freshness: "stale",
           localCompleteness: nextCursor === null ? "complete" : "partial",
@@ -9544,112 +14779,169 @@ export class HraService {
       accountId: profile.id,
       providerGeneration: profile.processGeneration,
       limit,
+      includeArchived,
     } as const;
-    let decodedComposite: ReturnType<SessionEventCursorCodec["decodeCompositeSessionList"]> | undefined;
-    let decodedLegacy: ReturnType<SessionEventCursorCodec["decodeSessionList"]> | undefined;
+    let decodedCursor: ReturnType<SessionEventCursorCodec["decodeSessionList"]> | undefined;
+    let decodedLocalCursor: ReturnType<SessionEventCursorCodec["decodeAccountSessionLocal"]> | undefined;
     if (cursor !== undefined) {
       try {
-        decodedComposite = this.#eventCursors.decodeCompositeSessionList(cursor, cursorFilter);
+        decodedCursor = this.#eventCursors.decodeSessionList(cursor, cursorFilter);
       } catch (error: unknown) {
-        if (!(error instanceof SessionEventCursorError) || error.reason !== "type_mismatch") throw error;
-        decodedLegacy = this.#eventCursors.decodeSessionList(cursor, cursorFilter);
+        if (!(error instanceof SessionEventCursorError) || error.reason !== "type_mismatch") {
+          throw error;
+        }
+        decodedLocalCursor = this.#eventCursors.decodeAccountSessionLocal(cursor, cursorFilter);
       }
     }
+    const decodedTraversalId = decodedCursor?.traversalId ?? decodedLocalCursor?.traversalId;
+    if (cursor !== undefined && decodedTraversalId === undefined) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        "This session-list cursor predates bounded replay authority. Restart the account listing without a cursor.",
+      );
+    }
+    const traversal = cursor === undefined
+      ? this.#beginSessionListTraversal(profile)
+      : {
+          id: decodedTraversalId as string,
+          state: this.#requireSessionListTraversal(decodedTraversalId as string, profile),
+        };
     if (await this.#cloud.isCompactProjectionRecoveryUnsettledForProfile(profile.id)) {
       await this.#daemonAuthority.assertCurrent();
-      if (decodedComposite !== undefined || decodedLegacy !== undefined) {
+      if (
+        decodedCursor !== undefined
+        || (decodedLocalCursor !== undefined && decodedLocalCursor.afterCreatedAt === null)
+      ) {
         throw new CommandFailure(
           "RECOVERY_REQUIRED",
           "Provider session-list continuation is paused while compact-projection recovery preserves exact local authority.",
         );
       }
+      const localPage = this.#store.listLocalSessionPage({
+        profileId: profile.id,
+        after: decodedLocalCursor === undefined
+          ? null
+          : {
+              createdAt: decodedLocalCursor.afterCreatedAt as number,
+              sessionId: decodedLocalCursor.afterSessionId as SessionRecord["id"],
+            },
+        includeArchived,
+        limit,
+        requireCurrentAccountAuthority: true,
+      });
+      for (const session of localPage.sessions) {
+        traversal.state.emittedSessionIds.add(session.id);
+      }
+      const nextCursor = localPage.nextPosition === null
+        ? null
+        : this.#eventCursors.encodeAccountSessionLocal({
+            ...cursorFilter,
+            traversalId: traversal.id,
+            afterCreatedAt: localPage.nextPosition.createdAt,
+            afterSessionId: localPage.nextPosition.sessionId,
+          });
+      if (nextCursor === null) this.#sessionListTraversals.delete(traversal.id);
       return {
         accountId: profile.id,
-        sessions: this.#store.listSessions(limit, profile.id, includeArchived),
-        nextCursor: null,
+        sessions: localPage.sessions,
+        nextCursor,
         recovery: {
-          diagnostic: "Provider reconciliation is paused while compact-projection recovery preserves exact local authority.",
+          diagnostic: nextCursor === null
+            ? "Every currently authorized local session was listed, but provider reconciliation remains paused while compact-projection recovery preserves exact local authority."
+            : "More currently authorized local sessions remain; provider reconciliation is paused while compact-projection recovery preserves exact local authority.",
           required: true,
         },
       };
     }
     const providerAuthority = this.#providerAuthority(profile, "codex");
     const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
-
-    const sessions: SessionRecord[] = [];
-    const shouldPageLocalSessions = decodedLegacy === undefined
-      && (decodedComposite === undefined || decodedComposite.continuation.phase === "local");
-    if (shouldPageLocalSessions) {
+    const shouldReadLocalPage = decodedCursor === undefined
+      && (
+        cursor === undefined
+        || (
+          decodedLocalCursor !== undefined
+          && decodedLocalCursor.afterCreatedAt !== null
+        )
+      );
+    if (shouldReadLocalPage) {
+      const localAfter = decodedLocalCursor === undefined
+        || decodedLocalCursor.afterCreatedAt === null
+        || decodedLocalCursor.afterSessionId === null
+        ? null
+        : {
+            createdAt: decodedLocalCursor.afterCreatedAt,
+            sessionId: decodedLocalCursor.afterSessionId,
+          };
       const localPage = this.#store.listLocalSessionPage({
         profileId: profile.id,
-        after: decodedComposite?.continuation.phase === "local"
-          ? {
-              createdAt: decodedComposite.continuation.afterCreatedAt,
-              sessionId: decodedComposite.continuation.afterSessionId,
-            }
-          : null,
-        excludedProvider: this.#codex.provider,
+        after: localAfter,
         includeArchived,
         limit,
+        requireCurrentAccountAuthority: true,
       });
-      sessions.push(...localPage.sessions);
-      if (localPage.nextPosition !== null) {
+      if (localPage.sessions.length > 0) {
+        for (const session of localPage.sessions) {
+          traversal.state.emittedSessionIds.add(session.id);
+        }
         return {
           accountId: profile.id,
-          sessions,
-          nextCursor: this.#eventCursors.encodeCompositeSessionList({
-            ...cursorFilter,
-            continuation: {
-              phase: "local",
-              afterCreatedAt: localPage.nextPosition.createdAt,
-              afterSessionId: localPage.nextPosition.sessionId,
-            },
-          }),
-        };
-      }
-      if (sessions.length === limit) {
-        return {
-          accountId: profile.id,
-          sessions,
-          nextCursor: this.#eventCursors.encodeCompositeSessionList({
-            ...cursorFilter,
-            continuation: { phase: "provider_start" },
-          }),
+          sessions: localPage.sessions,
+          // null/null is a signed transition into provider discovery. Even an
+          // exact-boundary local page must not let the next request repeat the
+          // local phase or expose a source-specific ordering arm.
+          nextCursor: this.#eventCursors.encodeAccountSessionLocal({
+              ...cursorFilter,
+              traversalId: traversal.id,
+              afterCreatedAt: localPage.nextPosition?.createdAt ?? null,
+              afterSessionId: localPage.nextPosition?.sessionId ?? null,
+            }),
         };
       }
     }
-
-    const providerCursor = decodedLegacy?.providerCursor
-      ?? (decodedComposite?.continuation.phase === "provider"
-        ? decodedComposite.continuation.state.providerCursor
-        : undefined);
-    const providerLimit = limit - sessions.length;
-    const remote = await this.#fencedEffect(async () => await this.#codex.listSessions({
+    this.#assertIdentifiableAccountAuthority(profile);
+    const expectedAccountFingerprint = accountFingerprintForProfile(profile);
+    await this.#proveUsageAccountIdentity({
+      profile,
       authority: runtimeAuthority,
-      limit: providerLimit,
-      ...(providerCursor === undefined ? {} : { cursor: providerCursor }),
+      expectedFingerprint: expectedAccountFingerprint,
       signal,
-    }));
-    if (remote.sessions.length > providerLimit) {
+    });
+    const providerAccountKey = profileCodexAccountAuthorityKey(profile);
+    if (providerAccountKey === null) {
       throw new CommandFailure(
-        "UNAVAILABLE",
-        "Codex returned more session-list rows than the requested page can safely retain.",
+        "RECOVERY_REQUIRED",
+        "The selected account has no stable Codex provider identity.",
       );
     }
+    const remote = await this.#fencedEffect(async () => await this.#codex.listSessions({
+      authority: runtimeAuthority,
+      limit,
+      ...(decodedCursor === undefined ? {} : { cursor: decodedCursor.providerCursor }),
+      signal,
+    }));
+    // The list response carries no account identity. Re-prove the same account
+    // after the read and before importing any row, so an account swap during
+    // the provider call cannot bind another identity's thread to this profile.
+    await this.#proveUsageAccountIdentity({
+      profile,
+      authority: runtimeAuthority,
+      expectedFingerprint: expectedAccountFingerprint,
+      signal,
+    });
+    const providerPageReplayKey = decodedCursor === undefined
+      ? "provider:first"
+      : `provider:cursor:${decodedCursor.providerCursor}`;
+    let providerPageImportReceipt = traversal.state.importedSessionIdsByProviderPage
+      .get(providerPageReplayKey);
     let nextCursor: string | null = null;
     if (remote.nextCursor !== null) {
       try {
-        nextCursor = decodedLegacy === undefined
-          ? this.#eventCursors.advanceCompositeSessionList({
-              ...cursorFilter,
-              providerCursor: remote.nextCursor,
-              ...(decodedComposite === undefined ? {} : { prior: decodedComposite }),
-            })
-          : this.#eventCursors.advanceSessionList({
-              ...cursorFilter,
-              providerCursor: remote.nextCursor,
-              prior: decodedLegacy,
-            });
+        nextCursor = this.#eventCursors.advanceSessionList({
+          ...cursorFilter,
+          traversalId: traversal.id,
+          providerCursor: remote.nextCursor,
+          ...(decodedCursor === undefined ? {} : { prior: decodedCursor }),
+        });
       } catch (error: unknown) {
         if (error instanceof SessionEventCursorError) {
           throw new CommandFailure(
@@ -9661,25 +14953,91 @@ export class HraService {
       }
     }
     const projects = this.#store.listProjects();
-    for (const projection of remote.sessions) {
+    const sessions: SessionRecord[] = [];
+    const remoteSessionIds = new Set<string>();
+    for (const projection of remote.sessions.slice(0, limit)) {
+      const personalBinding = this.#store.findSessionPersonalRuntimeBinding(
+        "codex",
+        projection.providerThreadId,
+      );
+      if (personalBinding !== null) {
+        const personalSession = this.#store.requireSession(personalBinding.sessionId);
+        if (personalBinding.state !== "detached") {
+          // A managed-home listing may expose a thread currently controlled
+          // through the personal home. Treat that as an identity collision,
+          // never as authority to mutate or emit the personally controlled row
+          // from the wrong provider source. Its ordinary row was already part
+          // of the source-neutral local phase.
+          continue;
+        }
+        // A detached row with the same account/thread identity remains an
+        // explicit personal-home detach fence. A managed-home import must not
+        // silently cross that authority boundary or confuse home ownership.
+        if (personalSession.profileId === profile.id) continue;
+      }
+      const localCollision = this.#store.findSessionByProviderThread(
+        profile.id,
+        projection.providerThreadId,
+      );
+      if (localCollision !== null && localCollision.provider !== "codex") {
+        // Provider-thread ids are opaque within each provider home. A Codex
+        // projection must never mutate a local Claude row merely because the
+        // two providers selected the same string.
+        continue;
+      }
+      if (
+        localCollision !== null
+        && !this.#store.sessionAccountAuthorityMatches(localCollision.id, profile.id)
+      ) {
+        // A provider identity replacement can reuse an opaque thread id. The
+        // old identity's row remains recoverable if that identity returns, but
+        // the replacement identity cannot mutate or inherit it.
+        continue;
+      }
+      const alreadyEmittedInTraversal = localCollision !== null
+        && traversal.state.emittedSessionIds.has(localCollision.id);
+      const emittedOnThisProviderPage = localCollision !== null
+        && providerPageImportReceipt?.has(localCollision.id) === true;
       const projectId = projection.projectRoot === undefined ? undefined : projects.find((project) => project.rootPath === projection.projectRoot)?.id;
       const session = this.#store.upsertProviderSession({
         providerAuthority,
+        profileId: profile.id,
+        provider: "codex",
         providerThreadId: projection.providerThreadId,
         ...(projectId === undefined ? {} : { projectId }),
         title: projection.title,
+        preset: this.#store.readDefaultPreset("codex"),
+        fastEnabled: false,
         state: projection.status,
         ...(projection.activeTurnId === undefined ? {} : { activeTurnId: projection.activeTurnId }),
         ...(projection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: projection.providerUpdatedAt }),
+        providerAccountKey,
+        conversationAutomationEnabled: true,
       });
-      if (includeArchived || session.archivedAt === undefined) sessions.push(session);
+      if (!alreadyEmittedInTraversal) {
+        this.#rememberSessionListProviderImport(
+          traversal.id,
+          traversal.state,
+          providerPageReplayKey,
+          session.id,
+        );
+        providerPageImportReceipt = traversal.state.importedSessionIdsByProviderPage
+          .get(providerPageReplayKey);
+        traversal.state.emittedSessionIds.add(session.id);
+      }
+      if (remoteSessionIds.has(session.id)) continue;
+      remoteSessionIds.add(session.id);
       await this.#reconcileCommittedSessionFactsMemory(session);
+      if (!alreadyEmittedInTraversal || emittedOnThisProviderPage) sessions.push(session);
     }
+    const visibleRemoteSessions = includeArchived
+      ? sessions
+      : sessions.filter((session) => session.archivedAt === undefined);
     return {
       accountId: profile.id,
       // Archive is a listing filter over locally known sessions: the
       // provider has no archive concept, so its page is filtered here.
-      sessions,
+      sessions: visibleRemoteSessions,
       nextCursor,
     };
   }
@@ -9708,28 +15066,33 @@ export class HraService {
   async #showSession(selector: string, detail: boolean, signal: AbortSignal): Promise<unknown> {
     const session = this.#store.requireSession(selector);
     if (session.state === "terminal") {
-      const providerObservation = await this.#ensureSessionObservedLocked(
-        session.id,
-        signal,
-      );
+      const providerObservation = await this.#ensureSessionObservedLocked(session.id, signal);
       return {
         session: this.#store.requireSession(session.id),
-        effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null,
+        effectiveRuntimeProfile: publicRuntimeProfile(this.#store.latestSessionRuntimeProfile(session.id)?.profile),
         providerObservation,
-        ...(session.provider === "claude"
-          ? {
-              next: "Start a new Claude session; the pinned Claude transport cannot resume or replay this terminal thread after daemon loss.",
-            }
-          : {}),
       };
     }
-    if (session.providerThreadId === undefined) return { session, effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null };
-    const providerThreadId = session.providerThreadId;
-    const profile = this.#store.requireProfile(session.profileId);
-    if (session.provider === "claude" && this.#platform !== "linux") {
+    if (session.providerThreadId === undefined) {
       return {
         session,
-        effectiveRuntimeProfile: this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null,
+        effectiveRuntimeProfile: publicRuntimeProfile(
+          this.#store.latestSessionRuntimeProfile(session.id)?.profile,
+        ),
+      };
+    }
+    const providerThreadId = session.providerThreadId;
+    const profile = this.#store.requireProfile(session.profileId);
+    if (
+      session.provider === "claude"
+      && this.#platform !== "linux"
+      && !this.#sessionHasMatchingActivePersonalBinding(session)
+    ) {
+      return {
+        session,
+        effectiveRuntimeProfile: publicRuntimeProfile(
+          this.#store.latestSessionRuntimeProfile(session.id)?.profile,
+        ),
         providerObservation: this.#claudePlatformUnavailableObservation(profile),
       };
     }
@@ -9742,7 +15105,12 @@ export class HraService {
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettled(session.id);
     await this.#daemonAuthority.assertCurrent();
-    const observed = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: this.#sessionAuthority(session), providerThreadId, detail, signal }));
+    const observed = await this.#readExactSessionProjection(
+      { ...session, providerThreadId },
+      profile,
+      detail,
+      signal,
+    );
     const projection = this.#withAttachmentManifests(session.id, observed);
     if (projectionRecoveryUnsettled || this.#projectionRecoveriesInFlight.has(session.id)) {
       const runtimeProfile = this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null;
@@ -9750,7 +15118,7 @@ export class HraService {
       return {
         session: coherentSession,
         ...(projection.providerThreadId === providerThreadId ? { projection } : {}),
-        effectiveRuntimeProfile: runtimeProfile,
+        effectiveRuntimeProfile: publicRuntimeProfile(runtimeProfile),
         recovery: {
           cleared: false,
           diagnostic: projection.providerThreadId === providerThreadId
@@ -9767,12 +15135,13 @@ export class HraService {
     const coherentSession = this.#store.requireSession(session.id);
     const runtimeProfile = this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null;
     return coherentSession.state === "recovery_required"
-      ? { session: coherentSession, projection, effectiveRuntimeProfile: runtimeProfile, recovery: { required: true, cleared: false } }
-      : { session: coherentSession, projection, effectiveRuntimeProfile: runtimeProfile };
+      ? { session: coherentSession, projection, effectiveRuntimeProfile: publicRuntimeProfile(runtimeProfile), recovery: { required: true, cleared: false } }
+      : { session: coherentSession, projection, effectiveRuntimeProfile: publicRuntimeProfile(runtimeProfile) };
   }
 
   async #startSession(command: Extract<LocalCommand, { kind: "session.start" }>, signal: AbortSignal): Promise<unknown> {
     let profile = this.#store.requireProfile(command.account);
+    await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
     const provider = command.provider ?? "codex";
     // Reject an incoherent provider/preset pair before consulting or starting
     // that provider's runtime. Validation is a local admission decision and
@@ -9819,6 +15188,10 @@ export class HraService {
     let startedProjection:
       | (CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile })
       | undefined;
+    let claudeProcessIdentity: ClaudeProcessIdentity | undefined;
+    let claudeLaunchIntent: ClaudeProcessLaunchIntentRecord | undefined;
+    let providerAccountKey: string | undefined;
+    const reservedClaudeProviderThreadId = provider === "claude" ? randomUUID() : undefined;
     let outcome: z.infer<typeof sessionStartReceiptSchema>;
     try {
       outcome = await this.#effect<z.infer<typeof sessionStartReceiptSchema>>({
@@ -9834,6 +15207,12 @@ export class HraService {
       }],
       beginEffect: async (attemptId) => {
         clientMessageId = attemptId;
+        providerAccountKey = await this.#assertManagedProviderRuntimeAuthority(
+          profile,
+          provider,
+          signal,
+          true,
+        );
         review = await this.#fencedRuntimeReview(runtime, async () => {
           const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
           return await runtime.reviewSessionStart({
@@ -9845,6 +15224,21 @@ export class HraService {
             signal,
           });
         });
+        const reviewedAccountKey = await this.#assertManagedProviderRuntimeAuthority(
+          this.#store.requireProfileById(profile.id),
+          provider,
+          signal,
+          true,
+        );
+        if (reviewedAccountKey !== providerAccountKey) {
+          if (provider === "devin") {
+            throw new CommandFailure(
+              "RECOVERY_REQUIRED",
+              "The managed Devin authority changed during runtime review.",
+            );
+          }
+          throw new ProviderAccountAuthorityMismatchError(provider, profile);
+        }
         const local = this.#store.beginSessionStartEffect({
           attemptId,
           profileId: profile.id,
@@ -9856,6 +15250,7 @@ export class HraService {
           providerAuthentication,
           preset: command.preset,
           fastEnabled: command.fast,
+          ...(providerAccountKey === undefined ? {} : { providerAccountKey }),
           evidence: {
             kind: "session.start",
             projectId: project.id,
@@ -9866,26 +15261,152 @@ export class HraService {
           },
         });
         localSessionId = local.id;
+        if (provider === "claude") {
+          if (reservedClaudeProviderThreadId === undefined) {
+            throw new Error("CLAUDE_PROVIDER_THREAD_ID_NOT_RESERVED");
+          }
+          if (providerAccountKey === undefined) {
+            throw new Error("CLAUDE_PROVIDER_ACCOUNT_AUTHORITY_MISSING");
+          }
+          claudeLaunchIntent = this.#store.stageClaudeProcessLaunchIntent({
+            providerThreadId: reservedClaudeProviderThreadId,
+            profileId: profile.id,
+            profileGeneration: profile.processGeneration,
+            providerAuthority,
+            runtimeScope: "managed",
+            providerAccountKey,
+            sessionId: local.id,
+          });
+        }
       },
       effect: async () => {
         if (localSessionId === undefined || clientMessageId === undefined || review === undefined) throw new Error("Session start effect lost its durable placeholder or runtime-review binding.");
         const runtimeReview = review;
         const local = this.#store.requireSession(localSessionId);
+        const launchProviderThreadId = provider === "claude"
+          ? reservedClaudeProviderThreadId
+          : undefined;
+        if (provider === "claude" && launchProviderThreadId === undefined) {
+          throw new Error("CLAUDE_PROVIDER_THREAD_ID_NOT_RESERVED");
+        }
         try {
-          startedProjection = await this.#fencedEffect(async () => {
+          await this.#fencedEffect(async () => {
             const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
-            return await runtime.startSession({
+            const value = await runtime.startSession({
               authority: authorityFor(this.#paths, profile, providerAuthority),
+              ...(launchProviderThreadId === undefined
+                ? {}
+                : {
+                    providerThreadId: launchProviderThreadId,
+                    admitProcessIdentity: async (identity: ClaudeProcessIdentity) => {
+                      if (claudeLaunchIntent === undefined) {
+                        throw new Error("CLAUDE_PROCESS_LAUNCH_INTENT_MISSING");
+                      }
+                      claudeProcessIdentity = await this.#recordClaimedClaudeProcess({
+                        authority: authorityFor(this.#paths, profile, providerAuthority),
+                        providerThreadId: launchProviderThreadId,
+                        runtimeScope: "managed",
+                        sessionId: local.id,
+                        launchIntent: claudeLaunchIntent,
+                        identity,
+                        signal,
+                      });
+                    },
+                  }),
               projectRoot,
               review: runtimeReview,
               signal,
             });
+            startedProjection = value;
+            return value;
           });
+          if (startedProjection === undefined) {
+            throw new Error("Session start returned no exact provider projection.");
+          }
+          if (provider === "claude") {
+            if (
+              reservedClaudeProviderThreadId === undefined
+              || startedProjection.providerThreadId !== reservedClaudeProviderThreadId
+              || claudeProcessIdentity === undefined
+            ) throw new Error("CLAUDE_PROCESS_IDENTITY_NOT_ADMITTED");
+          }
+          await this.#assertSessionAccountAuthorityAfterProviderEffect(
+            local,
+            this.#store.requireProfileById(profile.id),
+            signal,
+          );
         } catch (error: unknown) {
           await this.#daemonAuthority.assertCurrent();
-          if (error instanceof IndeterminateCodexEffectError) {
+          if (
+            error instanceof IndeterminateCodexEffectError
+            || error instanceof IndeterminateLocalCommitError
+          ) {
             this.#quarantineSession(local.id);
             throw error;
+          }
+          if (provider === "claude" && error instanceof ClaudeProcessExitUnprovenError) {
+            this.#quarantineSession(local.id);
+            throw new IndeterminateLocalCommitError(
+              "Claude session admission failed without proof that its controller exited.",
+              error,
+            );
+          }
+          if (startedProjection !== undefined) {
+            try {
+              if (provider === "claude" && claudeProcessIdentity !== undefined) {
+                await this.#releaseClaudeProcessAuthority(
+                  {
+                    providerThreadId: startedProjection.providerThreadId,
+                    profileId: profile.id,
+                    runtimeScope: "managed",
+                  },
+                  new AbortController().signal,
+                );
+              } else {
+                await runtime.endSession({
+                  authority: authorityFor(this.#paths, profile, providerAuthority),
+                  providerThreadId: startedProjection.providerThreadId,
+                  signal: new AbortController().signal,
+                });
+              }
+            } catch (releaseError: unknown) {
+              this.#quarantineSession(local.id);
+              throw new IndeterminateLocalCommitError(
+                "The provider created a session, but HRA could not prove its controller was released after admission failed.",
+                releaseError,
+              );
+            }
+          } else if (provider === "claude" && claudeProcessIdentity !== undefined) {
+            if (launchProviderThreadId === undefined) {
+              throw new Error("CLAUDE_PROVIDER_THREAD_ID_NOT_RESERVED");
+            }
+            try {
+              await this.#releaseClaudeProcessAuthority(
+                {
+                  providerThreadId: launchProviderThreadId,
+                  profileId: profile.id,
+                  runtimeScope: "managed",
+                },
+                new AbortController().signal,
+              );
+            } catch (releaseError: unknown) {
+              this.#quarantineSession(local.id);
+              throw new IndeterminateLocalCommitError(
+                "Claude admission failed after exact process custody, but controller release was not proven.",
+                releaseError,
+              );
+            }
+          }
+          if (claudeLaunchIntent !== undefined) {
+            try {
+              this.#cancelClaudeProcessLaunchIntent(claudeLaunchIntent);
+            } catch (cancelError: unknown) {
+              this.#quarantineSession(local.id);
+              throw new IndeterminateLocalCommitError(
+                "Claude rejected session creation, but its launch intent could not be retired.",
+                cancelError,
+              );
+            }
           }
           if (!this.#store.deleteUnboundStartingSession(local.id, local.revision)) {
             this.#quarantineSession(local.id);
@@ -9897,9 +15418,14 @@ export class HraService {
       },
       receipt: (value) => sessionStartReceiptSchema.parse(value),
       restore: (value) => sessionStartReceiptSchema.parse(value),
-      commit: (attemptId, _value, receipt) => {
+      commit: async (attemptId, _value, receipt) => {
         if (localSessionId === undefined || startedProjection === undefined) throw new Error("Session start commit lost its exact provider projection.");
         const local = this.#store.requireSession(localSessionId);
+        await this.#assertSessionAccountAuthorityAfterProviderEffect(
+          local,
+          this.#store.requireProfileById(profile.id),
+          signal,
+        );
         this.#store.completeSessionStartEffect({
           attemptId,
           sessionId: local.id,
@@ -9910,6 +15436,7 @@ export class HraService {
           ...(startedProjection.activeTurnId === undefined ? {} : { activeTurnId: startedProjection.activeTurnId }),
           ...(startedProjection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: startedProjection.providerUpdatedAt }),
           runtimeProfile: startedProjection.effectiveRuntimeProfile,
+          ...(claudeProcessIdentity === undefined ? {} : { claudeProcessIdentity }),
           receipt,
         });
       },
@@ -9959,9 +15486,10 @@ export class HraService {
     await this.#ensureSessionObservedLocked(outcome.sessionId, signal);
     return {
       session: this.#store.requireSession(outcome.sessionId),
-      effectiveRuntimeProfile: outcome.effectiveRuntimeProfile
-        ?? this.#store.latestSessionRuntimeProfile(outcome.sessionId)?.profile
-        ?? null,
+      effectiveRuntimeProfile: publicRuntimeProfile(
+        outcome.effectiveRuntimeProfile
+          ?? this.#store.latestSessionRuntimeProfile(outcome.sessionId)?.profile,
+      ),
       idempotencyKey: key,
     };
   }
@@ -10113,6 +15641,99 @@ export class HraService {
       .toUpperCase()
       .replace(/[^A-Z0-9_]/gu, "_")
       .slice(0, 80);
+  }
+
+  #requireSessionSwitchAdoption(record: SessionSwitchRecord): NonNullable<ReturnType<StateStore["readSessionSwitchAdoption"]>> {
+    const capsule = this.#store.readSessionSwitchAdoption(record.attemptId);
+    if (capsule === null) throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      "This historical switch has no exact runtime-home custody and cannot issue new provider effects.",
+      { idempotencyKey: record.idempotencyKey },
+    );
+    return capsule;
+  }
+
+  async #assertSessionSwitchAccount(
+    record: SessionSwitchRecord,
+    side: "source" | "target",
+    signal: AbortSignal,
+    seedAuthority?: ProviderAccountAuthority,
+  ): Promise<void> {
+    const capsule = this.#requireSessionSwitchAdoption(record);
+    const original = side === "source" ? record.sourceAuthority : record.targetAuthority;
+    const captured = seedAuthority ?? original;
+    if (seedAuthority !== undefined && (side !== "target" || record.phase !== "rebound"
+      || captured.provider !== original.provider || captured.profileId !== original.profileId
+      || captured.providerAccountId !== original.providerAccountId
+      || captured.bindingGeneration !== original.bindingGeneration
+      || captured.processGeneration < original.processGeneration
+      || !sameProviderUsageAuthority(captured, this.#capturedSessionProviderAuthority(this.#store.requireSession(record.sessionId))))) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The handoff seed has no exact captured successor authority.");
+    }
+    const scope = side === "source" ? capsule.sourceRuntimeScope : "managed";
+    const generation = side === "source" ? capsule.sourceProfileGeneration : capsule.targetProfileGeneration;
+    const expectedKey = side === "source" ? capsule.sourceAccountKey : capsule.targetAccountKey;
+    const assertExact = (): ProfileRecord => {
+      const profile = this.#store.requireProfileById(captured.profileId);
+      if ((captured.provider === "codex" && seedAuthority === undefined && profile.processGeneration !== generation)
+        || !sameProviderUsageAuthority(captured, this.#providerAuthority(profile, captured.provider))) {
+        throw new CommandFailure("RECOVERY_REQUIRED", "The switch's captured provider authority changed.");
+      }
+      if (side === "source" && scope === "personal") {
+        const binding = this.#store.readSessionPersonalRuntimeBinding(record.sessionId, true);
+        if (binding === null || binding.state !== "active"
+          || binding.revision !== capsule.sourcePersonalBindingRevision
+          || binding.provider !== captured.provider
+          || binding.providerThreadId !== record.sourceProviderThreadId) {
+          throw new CommandFailure("RECOVERY_REQUIRED", "The switch's captured personal binding changed.");
+        }
+      }
+      return profile;
+    };
+    const profile = assertExact();
+    if (captured.provider === "devin") throw new CommandFailure("UNAVAILABLE", "This provider cannot acquire new switch custody.");
+    const observed = await this.#assertProviderRuntimeAccountAuthority(
+      profile, captured.provider, scope, signal, true,
+    );
+    assertExact();
+    if (observed !== expectedKey) throw new ProviderAccountAuthorityMismatchError(captured.provider, profile);
+  }
+
+  #sessionSwitchSourceAuthority(record: SessionSwitchRecord): ProfileAuthority {
+    const capsule = this.#requireSessionSwitchAdoption(record);
+    const profile = this.#store.requireProfileById(record.sourceAuthority.profileId);
+    return capsule.sourceRuntimeScope === "personal"
+      ? this.#personalAuthorityForProfile(profile, record.sourceAuthority)
+      : authorityFor(this.#paths, profile, record.sourceAuthority);
+  }
+
+  async #assertSessionSwitchTargetProcess(
+    record: SessionSwitchRecord, signal: AbortSignal, authority = record.targetAuthority,
+  ): Promise<void> {
+    if (authority.provider !== "claude") return;
+    const threadId = record.targetStart?.providerThreadId;
+    if (threadId === undefined) throw new Error("SESSION_SWITCH_TARGET_START_RECEIPT_MISSING");
+    const key = { profileId: record.targetAuthority.profileId, providerThreadId: threadId,
+      runtimeScope: "managed" as const };
+    const process = this.#store.readClaudeProcessAuthority(key);
+    if (process === null || process.providerAuthority === null
+      || process.sessionId !== record.sessionId
+      || (process.state !== "claimed" && process.state !== "bound")
+      || !sameProviderUsageAuthority(process.providerAuthority, authority)) {
+      throw new ProviderRuntimeUnavailableError("The switch target has no exact Claude process custody.");
+    }
+    const profile = this.#store.requireProfileById(record.targetAuthority.profileId);
+    const identity = await this.#fencedEffect(async () => await this.#claude.readSessionProcessIdentity({
+      authority: authorityFor(this.#paths, profile, authority),
+      providerThreadId: threadId, signal,
+    }));
+    const after = this.#store.readClaudeProcessAuthority(key);
+    if (!this.#sameClaudeProcessIdentity(identity, process.identity)
+      || after === null || after.revision !== process.revision
+      || after.providerAuthority === null
+      || !sameProviderUsageAuthority(after.providerAuthority, authority)) {
+      throw new ProviderRuntimeUnavailableError("The switch target process changed during verification.");
+    }
   }
 
   #sessionSwitchEffectIsIndeterminate(
@@ -10349,6 +15970,7 @@ export class HraService {
       || record.phase === "cancelled"
       || record.phase === "abandoned"
     ) return this.#sessionSwitchReplay(record, record.rawRequest);
+    this.#requireSessionSwitchAdoption(record);
     if (
       record.phase === "seed_dispatching"
       && record.sourceRelease !== null
@@ -10423,6 +16045,8 @@ export class HraService {
       try {
         targetProfile = this.#store.requireProfileById(record.targetAuthority.profileId);
         this.#assertProviderReady(targetProfile, record.targetAuthority);
+        await this.#assertSessionSwitchAccount(record, "source", signal);
+        await this.#assertSessionSwitchAccount(record, "target", signal);
         const session = this.#store.requireSession(record.sessionId);
         const project = session.projectId === undefined
           ? undefined
@@ -10485,8 +16109,8 @@ export class HraService {
   ): Promise<unknown> {
     const session = this.#requireBoundSession(selectedSession.id);
     this.#work.assertSessionCanChangeRoute(session.id);
-    if (session.provider === "claude") this.#assertClaudeIsolationAccepted();
     const currentProfile = this.#store.requireProfileById(session.profileId);
+    await this.#assertPersonalSessionAccountAuthority(session, currentProfile, signal, true);
     const source = this.#store.requireSessionProviderAuthority(session.id);
     const sourceAuthority = this.#sessionProviderAccountAuthority(source);
     if (remoteExpected !== undefined) {
@@ -10550,6 +16174,10 @@ export class HraService {
       : await this.#requireUsableProjectRoot(project.rootPath);
     const runtime = this.#sessionRuntime(command.provider);
     const targetProfileAuthority = authorityFor(this.#paths, targetProfile, targetAuthority);
+    const targetAccountKey = await this.#assertManagedProviderRuntimeAuthority(
+      targetProfile, command.provider, signal, true,
+    );
+    if (targetAccountKey === undefined) throw new CommandFailure("UNAVAILABLE", "The target provider has no exact account identity.");
     const review = await this.#fencedRuntimeReview(runtime, async () => await runtime.reviewSessionStart({
       authority: targetProfileAuthority,
       ...(projectRoot === undefined ? {} : { projectRoot }),
@@ -10560,6 +16188,12 @@ export class HraService {
     }));
 
     try {
+    await this.#assertPersonalSessionAccountAuthority(session, currentProfile, signal, true);
+    const afterReviewKey = await this.#assertManagedProviderRuntimeAuthority(targetProfile, command.provider, signal, true);
+    if (afterReviewKey !== targetAccountKey
+      || !sameProviderUsageAuthority(targetAuthority, this.#providerAuthority(targetProfile, command.provider))) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The target account changed during switch review.");
+    }
     const frozen = this.#store.readSessionSnapshotWithEventPosition(session.id);
     const frozenSource = this.#store.requireSessionProviderAuthority(session.id);
     if (
@@ -10590,6 +16224,7 @@ export class HraService {
       sessionId: session.id,
       sourceAuthority,
       targetAuthority,
+      targetAccountKey,
       expectedSessionRevision: session.revision,
       expectedAuthorityRevision: source.authorityRevision,
       sourcePreset: session.preset,
@@ -10656,6 +16291,7 @@ export class HraService {
     existingSourceDeferral?: SessionSwitchDeferredFactOwner,
   ): Promise<unknown> {
     let record = initial;
+    const adoption = this.#requireSessionSwitchAdoption(record);
     const cas = sessionSwitchCas(record);
     let sourceDeferral = existingSourceDeferral;
     if (record.phase === "prepared") {
@@ -10679,6 +16315,8 @@ export class HraService {
       const targetRuntime = this.#sessionRuntime(record.targetAuthority.provider);
       const targetProfileAuthority = authorityFor(this.#paths, targetProfile, record.targetAuthority);
       try {
+        await this.#assertSessionSwitchAccount(record, "source", signal);
+        await this.#assertSessionSwitchAccount(record, "target", signal);
         this.#work.assertSessionCanChangeRoute(record.sessionId);
         record = this.#store.beginSessionSwitchTargetStart(cas);
       } catch (error: unknown) {
@@ -10686,7 +16324,24 @@ export class HraService {
         throw error;
       }
       let started: CodexSessionProjection & { effectiveRuntimeProfile: ReviewedRuntimeProfile };
+      const reservedClaudeThread = record.targetAuthority.provider === "claude" ? randomUUID() : undefined;
+      let claudeLaunch: ClaudeProcessLaunchIntentRecord | undefined;
+      let claimedIdentity: ClaudeProcessIdentity | undefined;
+      const targetEffect = { invoked: false };
+      let targetReturned = false;
       try {
+        if (reservedClaudeThread !== undefined) {
+          claudeLaunch = this.#store.stageClaudeProcessLaunchIntent({
+            providerThreadId: reservedClaudeThread,
+            profileId: targetProfile.id,
+            profileGeneration: this.#store.requireProfileById(targetProfile.id).processGeneration,
+            providerAuthority: record.targetAuthority,
+            providerAccountKey: adoption.targetAccountKey,
+            runtimeScope: "managed",
+            sessionId: record.sessionId,
+            switchAttemptId: record.attemptId,
+          });
+        }
         started = await this.#fencedEffect(async () => {
           // #fencedEffect first awaits daemon authority. Recheck source-fact
           // custody inside the closure so a callback delivered by that await
@@ -10694,17 +16349,38 @@ export class HraService {
           if (this.#sessionSwitchFactDeferralObserved(record.sessionId, targetStartSourceDeferral)) {
             throw new SessionSwitchSourceFactBeforeTargetEffect();
           }
+          targetEffect.invoked = true;
           return await targetRuntime.startSession({
             authority: targetProfileAuthority,
+            ...(reservedClaudeThread === undefined ? {} : {
+              providerThreadId: reservedClaudeThread,
+              admitProcessIdentity: async (identity: ClaudeProcessIdentity) => {
+                if (claudeLaunch === undefined) throw new Error("CLAUDE_PROCESS_LAUNCH_INTENT_MISSING");
+                claimedIdentity = await this.#recordClaimedClaudeProcess({
+                  authority: targetProfileAuthority, providerThreadId: reservedClaudeThread,
+                  runtimeScope: "managed", sessionId: record.sessionId,
+                  launchIntent: claudeLaunch, switchAttemptId: record.attemptId,
+                  identity, signal,
+                });
+              },
+            }),
             ...(projectRoot === undefined ? {} : { projectRoot }),
             review: targetReview,
             signal,
           });
         });
+        targetReturned = true;
+        if (reservedClaudeThread !== undefined && (started.providerThreadId !== reservedClaudeThread
+          || claimedIdentity === undefined)) throw new Error("CLAUDE_PROCESS_IDENTITY_NOT_ADMITTED");
+        await this.#assertSessionSwitchAccount(record, "target", signal);
+        await this.#assertSessionSwitchAccount(record, "source", signal);
       } catch (error: unknown) {
         if (error instanceof DaemonAuthoritySafetyError) {
           this.#discardSessionSwitchFactDeferral(record.sessionId, sourceDeferral);
           throw error;
+        }
+        if (!targetEffect.invoked && claudeLaunch !== undefined) {
+          this.#cancelClaudeProcessLaunchIntent(claudeLaunch);
         }
         if (error instanceof SessionSwitchSourceFactBeforeTargetEffect) {
           try {
@@ -10739,7 +16415,8 @@ export class HraService {
           );
         }
         const diagnosticCode = this.#sessionSwitchDiagnostic("TARGET_START", error);
-        if (this.#sessionSwitchEffectIsIndeterminate(error, "target_start")) {
+        if (targetReturned || (targetEffect.invoked && claudeLaunch !== undefined)
+          || this.#sessionSwitchEffectIsIndeterminate(error, "target_start")) {
           this.#markSessionSwitchReconciliationRequiredAndDiscard(
             record.sessionId,
             {
@@ -11042,12 +16719,7 @@ export class HraService {
     }
     if (record.phase === "source_releasing") {
       const sourceSession = this.#store.requireSession(record.sessionId);
-      const sourceProfile = this.#store.requireProfileById(record.sourceAuthority.profileId);
-      const sourceProfileAuthority = authorityFor(
-        this.#paths,
-        sourceProfile,
-        record.sourceAuthority,
-      );
+      const sourceProfileAuthority = this.#sessionSwitchSourceAuthority(record);
       sourceDeferral ??= this.#beginSessionSwitchFactDeferral(
         record.sessionId,
         record,
@@ -11056,13 +16728,25 @@ export class HraService {
       );
       const activeSourceDeferral = sourceDeferral;
       try {
-        await this.#fencedEffect(async () => await this.#sessionRuntime(
-          record.sourceAuthority.provider,
-        ).endSession({
-          authority: sourceProfileAuthority,
-          providerThreadId: record.sourceProviderThreadId,
-          signal,
-        }));
+        await this.#assertSessionSwitchAccount(record, "source", signal);
+        await this.#assertSessionSwitchAccount(record, "target", signal);
+        if (record.sourceAuthority.provider === "claude") {
+          await this.#releaseClaudeProcessAuthority({
+            profileId: record.sourceAuthority.profileId,
+            providerThreadId: record.sourceProviderThreadId,
+            runtimeScope: adoption.sourceRuntimeScope,
+          }, signal);
+        } else {
+          const sourceRuntime = adoption.sourceRuntimeScope === "personal"
+            ? this.#personalSessionRuntime("codex") : this.#sessionRuntime(record.sourceAuthority.provider);
+          await this.#fencedEffect(async () => await sourceRuntime.endSession({
+            authority: sourceProfileAuthority,
+            providerThreadId: record.sourceProviderThreadId,
+            signal,
+          }));
+        }
+        await this.#assertSessionSwitchAccount(record, "source", signal);
+        await this.#assertSessionSwitchAccount(record, "target", signal);
       } catch (error: unknown) {
         if (error instanceof DaemonAuthoritySafetyError) {
           this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
@@ -11222,6 +16906,9 @@ export class HraService {
         );
       }
       try {
+        await this.#assertSessionSwitchAccount(record, "source", signal);
+        await this.#assertSessionSwitchAccount(record, "target", signal);
+        await this.#assertSessionSwitchTargetProcess(record, signal);
         record = this.#store.rebindSessionSwitch(cas);
       } catch (error: unknown) {
         if (error instanceof StateSecurityScrubRequiredError) {
@@ -11255,8 +16942,7 @@ export class HraService {
       this.#discardSessionSwitchFactDeferral(record.sessionId, activeSourceDeferral);
     } else if (record.phase === "source_released") {
       const sourceSession = this.#store.requireSession(record.sessionId);
-      const sourceProfile = this.#store.requireProfileById(record.sourceAuthority.profileId);
-      const sourceAuthority = authorityFor(this.#paths, sourceProfile, record.sourceAuthority);
+      const sourceAuthority = this.#sessionSwitchSourceAuthority(record);
       const cleanupDeferral = this.#beginSessionSwitchFactDeferral(
         record.sessionId,
         record,
@@ -11311,6 +16997,9 @@ export class HraService {
         );
       }
       try {
+        await this.#assertSessionSwitchAccount(record, "source", signal);
+        await this.#assertSessionSwitchAccount(record, "target", signal);
+        await this.#assertSessionSwitchTargetProcess(record, signal);
         record = this.#store.rebindSessionSwitch(cas);
       } catch (error: unknown) {
         this.#discardSessionSwitchFactDeferral(record.sessionId, cleanupDeferral);
@@ -11419,6 +17108,7 @@ export class HraService {
     signal: AbortSignal,
     deferral: SessionSwitchDeferredFactOwner,
   ): Promise<unknown> {
+    this.#requireSessionSwitchAdoption(rebound);
     if (this.#sessionSwitchFactDeferralObserved(rebound.sessionId, deferral)) {
       this.#store.markSessionSwitchReconciliationRequired({
         ...sessionSwitchCas(rebound),
@@ -11489,6 +17179,8 @@ export class HraService {
         { idempotencyKey: rebound.idempotencyKey },
       );
     }
+    await this.#assertSessionSwitchAccount(rebound, "target", signal, providerAuthority);
+    await this.#assertSessionSwitchTargetProcess(rebound, signal, providerAuthority);
     let dispatching = this.#store.beginSessionSwitchSeedDispatch({
       ...cas,
       seedAuthority: providerAuthority,
@@ -11590,6 +17282,8 @@ export class HraService {
         );
       }
       try {
+        await this.#assertSessionSwitchAccount(rebound, "target", signal, providerAuthority);
+        await this.#assertSessionSwitchTargetProcess(rebound, signal, providerAuthority);
         started = await this.#fencedEffect(async () => {
           // #fencedEffect awaits the daemon fence before invoking this
           // closure. Re-prove callback custody on the provider-call side of
@@ -11607,8 +17301,10 @@ export class HraService {
             signal,
           });
         });
+        await this.#assertSessionSwitchAccount(rebound, "target", signal, providerAuthority);
       } catch (error: unknown) {
-        settleSeedFailure(error);
+        settleSeedFailure(started === undefined || error instanceof DaemonAuthoritySafetyError ? error
+          : new IndeterminateLocalCommitError("The target account changed after the handoff seed may have applied.", error));
       }
     }
     } finally {
@@ -11724,7 +17420,8 @@ export class HraService {
   ): Promise<void> {
     const captured = this.#capturedSessionProviderAuthority(session);
     this.#assertProviderReady(profile, captured, { session });
-    const authority = authorityFor(this.#paths, profile, captured);
+    const authority = this.#sessionAuthority(session);
+    await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
     const connectionId = this.#sessionProviderConnections.get(session.id) ?? null;
     this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
       accountId: profile.id,
@@ -11736,9 +17433,18 @@ export class HraService {
     this.#appendSessionEvent(authority, session.id, connectionId, {
       type: "connection", state: "disconnected", reason,
     });
-    await this.#fencedEffect(async () => await this.#runtimeForSession(session).endSession({
-      authority, providerThreadId: session.providerThreadId, signal,
-    }));
+    if (session.provider === "claude") {
+      await this.#releaseClaudeProcessAuthority({
+        providerThreadId: session.providerThreadId,
+        profileId: session.profileId,
+        runtimeScope: this.#sessionHasActivePersonalBinding(session) ? "personal" : "managed",
+      }, signal);
+    } else {
+      await this.#fencedEffect(async () => await this.#runtimeForSession(session).endSession({
+        authority, providerThreadId: session.providerThreadId, signal,
+      }));
+    }
+    await this.#assertSessionAccountAuthorityAfterProviderEffect(session, profile, signal);
     this.#clearReleasedProviderSession(session, authority);
   }
 
@@ -11759,6 +17465,7 @@ export class HraService {
       sessionId: session.id,
     });
     this.#sessionProviderConnections.delete(session.id);
+    this.#clearSessionFactAuthority(session.id);
     this.#sessionObservationFailures.delete(session.id);
     this.#sessionResubscriptionConnections.delete(session.id);
     this.#sessionsAwaitingResubscription.delete(session.id);
@@ -11892,7 +17599,7 @@ export class HraService {
       const restored = this.#restoreMutationReplay({ kind: "session.send", idempotencyKey: key,
         restore: (value) => turnStartReceiptSchema.parse(value) }, prior);
       if (restored.replayed) return { session: selected, turnId: restored.value.turnId,
-        effectiveRuntimeProfile: restored.value.effectiveRuntimeProfile ?? null,
+        effectiveRuntimeProfile: publicRuntimeProfile(restored.value.effectiveRuntimeProfile),
         ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }), idempotencyKey: key };
     }
     const session = this.#requireBoundSession(selected.id);
@@ -11906,7 +17613,8 @@ export class HraService {
       throw new CommandFailure("CONFLICT", "The session preset authority changed before dispatch.");
     }
     this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
-    const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
+    const runtimeAuthority = this.#sessionAuthority(session);
+    const runtime = this.#runtimeForSession(session);
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     if (project !== undefined) await this.#requireUsableProjectRoot(project.rootPath);
     this.#requireLiveProviderObservation(
@@ -11929,11 +17637,12 @@ export class HraService {
       if (baseline === undefined || review === undefined) throw new Error("Session send lost its exact pre-effect provider baseline or runtime review.");
       const runtimeReview = review;
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
+      const projectRoot = project === undefined
+        ? undefined
+        : await this.#requireUsableProjectRoot(project.rootPath);
+      await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
       turnBindingOwner = this.#beginProviderUsageTurnBinding(session.id, providerAuthority);
       startedResult = await this.#fencedEffect(async () => {
-        const projectRoot = project === undefined
-          ? undefined
-          : await this.#requireUsableProjectRoot(project.rootPath);
         return await this.#runtimeForSession(session).startTurn({
           authority: runtimeAuthority,
           providerThreadId: session.providerThreadId,
@@ -11946,11 +17655,17 @@ export class HraService {
         });
       });
       turnBindingTurnId = startedResult.turnId;
+      await this.#assertSessionAccountAuthorityAfterProviderEffect(
+        session,
+        profile,
+        signal,
+      );
       return { ...startedResult, sourceId: attemptId };
     }, beginEffect: async (attemptId, custody) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
-      review = await this.#fencedRuntimeReview(this.#sessionRuntime(session.provider), async () => {
+      await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+      review = await this.#fencedRuntimeReview(this.#runtimeForSession(session), async () => {
         const projectRoot = project === undefined
           ? undefined
           : await this.#requireUsableProjectRoot(project.rootPath);
@@ -12010,7 +17725,7 @@ export class HraService {
       turnBindingBound = true;
     }, onAmbiguous: () => this.#quarantineSession(session.id) });
       } finally {
-        if (review !== undefined) this.#sessionRuntime(session.provider).discardRuntimeReview(review);
+        if (review !== undefined) runtime.discardRuntimeReview(review);
         if (turnBindingOwner !== undefined) {
           this.#settleProviderUsageTurnBinding(
             session.id,
@@ -12030,7 +17745,7 @@ export class HraService {
     return {
       session: reconciled,
       turnId: result.turnId,
-      effectiveRuntimeProfile: result.effectiveRuntimeProfile ?? null,
+      effectiveRuntimeProfile: publicRuntimeProfile(result.effectiveRuntimeProfile),
       ...(attachments.values.length === 0
         ? {}
         : { attachments: attachments.values.map(attachmentReferenceOf) }),
@@ -12097,7 +17812,7 @@ export class HraService {
     return await this.#withAttachmentIngress(sessionInput, async (attachments, reservation) => {
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
-    const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
+    const runtimeAuthority = this.#sessionAuthority(session);
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
@@ -12109,7 +17824,9 @@ export class HraService {
       onReplay: () => { execution.replayed = true; }, effect: async (attemptId) => {
       if (activeTurnId === undefined) throw new CommandFailure("CONFLICT", "The session has no active turn to steer.");
       const turnId = activeTurnId;
+      await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
       await this.#fencedEffect(async () => await this.#runtimeForSession(session).steer({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, activeTurnId: turnId, message, ...(attachments.values.length === 0 ? {} : { attachments: attachments.values }), clientMessageId: attemptId, signal }));
+      await this.#assertSessionAccountAuthorityAfterProviderEffect(session, profile, signal);
       return { steered: true as const, activeTurnId: turnId };
     }, beginEffect: async (attemptId, custody) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
@@ -12154,6 +17871,7 @@ export class HraService {
     selector: string,
     message: string,
     idempotencyKey: string | undefined,
+    signal: AbortSignal,
     beforeEffect?: () => void,
     attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
@@ -12183,6 +17901,7 @@ export class HraService {
     const sessionInput = { kind: "session.queue" as const, sessionId: session.id, idempotencyKey: key,
       message, attachments: attachmentReferences, providerAuthority, ...this.#attachmentDaemon() };
     return await this.#withAttachmentIngress(sessionInput, async (attachments, reservation) => {
+    await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
     // Work authorization and durable enqueue are one synchronous fence boundary.
     beforeEffect?.();
     const admitted = this.#store.enqueueIdempotentWithResult({ sessionId: session.id, profileGeneration: providerAuthority.processGeneration,
@@ -12215,7 +17934,9 @@ export class HraService {
 
   #scheduleQueueDispatch(session: SessionRecord): void {
     if (this.#state !== "open") return;
-    const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, this.#sessionAuthority(session)));
+    const profile = this.#store.requireProfile(session.profileId);
+    if (!this.#profileAllowsEstablishedSession(profile, session)) return;
+    const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, this.#authorityForSession(session, profile)));
     const tracked = task.then(
       () => undefined,
       (error: unknown) => this.recordBackgroundDiagnostic("queue_dispatch_failed", error),
@@ -12310,7 +18031,7 @@ export class HraService {
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
     const providerAuthority = this.#sessionProviderAuthority(session);
-    const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
+    const runtimeAuthority = this.#sessionAuthority(session);
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
@@ -12320,7 +18041,9 @@ export class HraService {
     const result = await this.#effect({ kind: "session.stop", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: {}, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_stop" }], effect: async () => {
       if (activeTurnId === null) return { stopped: false as const, activeTurnId: null };
       const turnId = activeTurnId;
+      await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
       await this.#fencedEffect(async () => await this.#runtimeForSession(session).interrupt({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, activeTurnId: turnId, signal }));
+      await this.#assertSessionAccountAuthorityAfterProviderEffect(session, profile, signal);
       return { stopped: true as const, activeTurnId: turnId };
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
@@ -12355,10 +18078,11 @@ export class HraService {
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
     const providerAuthority = this.#sessionProviderAuthority(session);
-    const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
+    const runtimeAuthority = this.#sessionAuthority(session);
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
-    await this.#effect({ kind: "session.rename", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { name }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_rename" }], effect: async () => { await this.#fencedEffect(async () => await this.#codex.rename({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, name, signal })); return { renamed: true as const }; }, beginEffect: async (attemptId) => {
+    const codex = this.#runtimeForSession(session) as CodexRuntimePort;
+    await this.#effect({ kind: "session.rename", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { name }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_rename" }], effect: async () => { await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true); await this.#fencedEffect(async () => await codex.rename({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, name, signal })); await this.#assertSessionAccountAuthorityAfterProviderEffect(session, profile, signal); return { renamed: true as const }; }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       this.#store.beginSessionMutationEffect({
         attemptId,
@@ -12471,7 +18195,26 @@ export class HraService {
       if (action === "abandon" && current.state === "recovery_required") {
         await this.#cleanupFactsMemory(current, "abandon");
       }
-      return await this.#resolveSessionRecovery(current.id, action, signal);
+      const result = await this.#resolveSessionRecovery(current.id, action, signal);
+      if (action === "abandon") {
+        const terminal = this.#store.requireSession(current.id);
+        const binding = this.#store.readSessionPersonalRuntimeBinding(terminal.id, true);
+        if (binding !== null && binding.state !== "detached"
+          && binding.provider === terminal.provider && binding.providerThreadId === terminal.providerThreadId) {
+          if (binding.state === "active") {
+            this.#clearSessionFactAuthority(terminal.id);
+            this.#store.beginPersonalSessionDetach({ sessionId: terminal.id });
+          }
+          this.#scheduleTerminalPersonalDetach(terminal);
+        } else if (terminal.provider === "claude" && terminal.providerThreadId !== undefined) {
+          this.#scheduleClaudeProcessAuthorityRelease({
+            providerThreadId: terminal.providerThreadId,
+            profileId: terminal.profileId,
+            runtimeScope: "managed",
+          });
+        }
+      }
+      return result;
     });
   }
 
@@ -12560,7 +18303,7 @@ export class HraService {
         resolution: "provider_state_reconciled",
         provider: {
           providerThreadId: projection.providerThreadId,
-          title: projection.title,
+          title: session.provider === "claude" ? session.title : projection.title,
           status: projection.status,
           ...(projection.activeTurnId === undefined ? {} : { activeTurnId: projection.activeTurnId }),
           ...(projection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: projection.providerUpdatedAt }),
@@ -12680,7 +18423,7 @@ export class HraService {
     const projection = await this.#readExactSessionProjection({ ...session, providerThreadId: session.providerThreadId }, profile, false, signal);
     const provider = {
       providerThreadId: projection.providerThreadId,
-      title: projection.title,
+      title: session.provider === "claude" ? session.title : projection.title,
       status: projection.status,
       ...(projection.activeTurnId === undefined ? {} : { activeTurnId: projection.activeTurnId }),
       ...(projection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: projection.providerUpdatedAt }),
@@ -12757,19 +18500,356 @@ export class HraService {
     };
     const sourceProfile = this.#store.requireProfileById(evidence.sourceProfileId);
     const targetProfile = this.#store.requireProfileById(evidence.targetProfileId);
+    let current = this.#store.requireSession(session.id);
+    let progress = this.#store.readSessionProviderSwitchProgress(attempt.id);
+    // Older unsettled receipts may lack this proof. They can only be settled
+    // locally; they must never authorize recovery or a target provider call.
+    const legacyTargetAccountAuthorityMissing =
+      evidence.targetProvider !== "devin"
+      && evidence.targetProviderAccountKey === undefined
+      && progress.targetProviderAccountKey === undefined;
+    const targetAccountAuthorityValid =
+      progress.targetProviderAccountKey === evidence.targetProviderAccountKey
+      && (evidence.targetProvider === "devin"
+        ? progress.targetProviderAccountKey === undefined
+        : progress.targetProviderAccountKey !== undefined);
+    if (
+      !targetAccountAuthorityValid
+      && !(action === "abandon" && legacyTargetAccountAuthorityMissing)
+    ) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The provider-switch target account authority no longer matches its immutable evidence.",
+      );
+    }
+    const sourceBound = (): boolean =>
+      current.profileId === evidence.sourceProfileId
+      && current.provider === evidence.sourceProvider
+      && current.providerThreadId === evidence.sourceProviderThreadId;
+    const targetBound = (): boolean =>
+      progress.targetProviderThreadId !== undefined
+      && current.profileId === evidence.targetProfileId
+      && current.provider === evidence.targetProvider
+      && current.providerThreadId === progress.targetProviderThreadId;
+    if (!sourceBound() && !targetBound()) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session binding matches neither immutable side of the provider switch.",
+      );
+    }
+    if (targetBound() && !progress.sourceReleased) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The target is locally bound without a durable source-release receipt.",
+      );
+    }
+    const currentProviderAccountAuthority =
+      this.#store.readSessionProviderAccountAuthority(session.id);
+    const sourceBinding = this.#store.readSessionPersonalRuntimeBinding(
+      session.id,
+      true,
+    );
+    let sourceRuntimeScope: RuntimeAccountScope | undefined;
+    let sourceExpectedAccountKey: string | undefined;
+    const targetExpectedAccountKey = evidence.targetProviderAccountKey;
+    if (sourceBound()) {
+      if (evidence.sourceProvider === "devin") {
+        if (currentProviderAccountAuthority !== null) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The keyless Devin source unexpectedly has provider-account authority.",
+          );
+        }
+        sourceRuntimeScope = "managed";
+      } else if (
+        currentProviderAccountAuthority === null
+        || currentProviderAccountAuthority.provider !== evidence.sourceProvider
+      ) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider switch lost its immutable source account authority.",
+        );
+      } else {
+        sourceRuntimeScope = currentProviderAccountAuthority.runtimeScope;
+        sourceExpectedAccountKey = currentProviderAccountAuthority.accountKey;
+      }
+    } else if (!(action === "abandon" && legacyTargetAccountAuthorityMissing)) {
+      if (evidence.targetProvider === "devin") {
+        if (targetExpectedAccountKey !== undefined || currentProviderAccountAuthority !== null) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The keyless Devin target unexpectedly has provider-account authority.",
+          );
+        }
+      } else if (
+        targetExpectedAccountKey === undefined
+        || (
+          currentProviderAccountAuthority === null
+          || currentProviderAccountAuthority.provider !== evidence.targetProvider
+          || currentProviderAccountAuthority.runtimeScope !== "managed"
+          || currentProviderAccountAuthority.accountKey !== targetExpectedAccountKey
+        )
+      ) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider switch lost its immutable target account authority.",
+        );
+      }
+    }
+    if (sourceRuntimeScope === "personal") {
+      if (
+        sourceBinding === null
+        || sourceBinding.state !== "active"
+        || sourceBinding.provider !== evidence.sourceProvider
+        || sourceBinding.providerThreadId !== evidence.sourceProviderThreadId
+      ) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider switch lost its exact personal-home source binding.",
+        );
+      }
+    } else if (sourceBound() && (
+      sourceBinding !== null
+      && sourceBinding.state !== "detached"
+    )) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The provider switch source runtime scope conflicts with its personal-home binding.",
+      );
+    } else if (
+      targetBound()
+      && sourceBinding !== null
+      && sourceBinding.state !== "detached"
+    ) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The provider switch target still has controlling personal-home authority.",
+      );
+    }
+    let recoveredTargetProviderAccountKey: string | undefined;
+    let recoveredTargetAccountAuthorityProven = false;
+    const requireSourceRuntimeAccountAuthority = (): Readonly<{
+      accountKey?: string;
+      runtimeScope: RuntimeAccountScope;
+    }> => {
+      if (sourceRuntimeScope !== undefined && evidence.sourceProvider === "devin") {
+        if (sourceRuntimeScope !== "managed" || sourceExpectedAccountKey !== undefined) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The keyless Devin source has invalid runtime-account authority.",
+          );
+        }
+        return { runtimeScope: sourceRuntimeScope };
+      }
+      if (sourceRuntimeScope !== undefined && sourceExpectedAccountKey !== undefined) {
+        return {
+          accountKey: sourceExpectedAccountKey,
+          runtimeScope: sourceRuntimeScope,
+        };
+      }
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The provider switch no longer owns the exact source runtime authority.",
+      );
+    };
+    const assertRuntimeAccountStable = async (
+      profile: ProfileRecord,
+      provider: Provider,
+      runtimeScope: RuntimeAccountScope,
+      expectedAccountKey: string | undefined,
+      missingDiagnostic: string,
+    ): Promise<string | undefined> => {
+      const exactProfile = this.#store.requireProfileById(profile.id);
+      let observedAccountKey: string | undefined;
+      if (runtimeScope === "managed") {
+        observedAccountKey = await this.#assertManagedProviderRuntimeAuthority(
+          exactProfile,
+          provider,
+          signal,
+          true,
+        );
+      } else {
+        if (provider === "devin") {
+          throw new CommandFailure("RECOVERY_REQUIRED", missingDiagnostic);
+        }
+        observedAccountKey = await this.#assertProviderRuntimeAccountAuthority(
+          exactProfile,
+          provider,
+          runtimeScope,
+          signal,
+          true,
+        );
+      }
+      if (provider === "devin") {
+        if (expectedAccountKey !== undefined || observedAccountKey !== undefined) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The keyless Devin runtime unexpectedly produced account-key authority.",
+          );
+        }
+        return undefined;
+      }
+      if (expectedAccountKey === undefined) {
+        throw new CommandFailure("RECOVERY_REQUIRED", missingDiagnostic);
+      }
+      if (observedAccountKey === expectedAccountKey) return observedAccountKey;
+      if (provider === "codex" && runtimeScope === "managed") {
+        this.#scheduleProfilePersonalAuthorityRevocation(exactProfile);
+      } else {
+        this.#scheduleProviderRuntimeAccountRevocation(
+          exactProfile,
+          provider,
+          runtimeScope,
+          observedAccountKey ?? null,
+        );
+      }
+      throw new ProviderAccountAuthorityMismatchError(
+        provider,
+        exactProfile,
+      );
+    };
     const readDetached = async (
+      side: "source" | "target",
       profile: ProfileRecord,
       provider: Provider,
       providerThreadId: string,
       detail: boolean,
     ): Promise<CodexSessionProjection> => {
-      const projection = await this.#fencedEffect(async () =>
-        await this.#sessionRuntime(provider).readSession({
-          authority: requireCurrent(profile, provider),
-          providerThreadId,
-          detail,
-          signal,
-        }));
+      const isSource = side === "source";
+      const sideMatches = isSource
+        ? profile.id === evidence.sourceProfileId
+          && provider === evidence.sourceProvider
+          && providerThreadId === evidence.sourceProviderThreadId
+        : profile.id === evidence.targetProfileId
+          && provider === evidence.targetProvider
+          && progress.targetProviderThreadId === providerThreadId;
+      if (!sideMatches) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider-switch detached-read side does not match its immutable evidence.",
+        );
+      }
+      if (
+        !isSource
+        && evidence.targetProfileId === evidence.sourceProfileId
+        && evidence.targetProvider === evidence.sourceProvider
+        && providerThreadId === evidence.sourceProviderThreadId
+      ) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider-switch target aliases its source thread and cannot be inspected.",
+        );
+      }
+      const sourceAuthority = isSource
+        ? requireSourceRuntimeAccountAuthority()
+        : undefined;
+      const runtimeScope: RuntimeAccountScope = isSource
+        ? sourceAuthority?.runtimeScope ?? "managed"
+        : "managed";
+      const expectedAccountKey = isSource
+        ? sourceAuthority?.accountKey
+        : targetExpectedAccountKey;
+      const assertAccountStable = async (): Promise<string | undefined> => {
+        return await assertRuntimeAccountStable(
+          profile,
+          provider,
+          runtimeScope,
+          expectedAccountKey,
+          isSource
+            ? "The provider switch no longer owns the exact source account authority."
+            : "This provider-switch receipt predates durable target account authority and cannot inspect its target.",
+        );
+      };
+      const beforeAccountKey = await assertAccountStable();
+      let runtime: SessionRuntimePort<ReviewedRuntimeProfile>;
+      if (runtimeScope === "personal") {
+        if (provider === "devin") {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "A Devin provider-switch side cannot use personal-home runtime authority.",
+          );
+        }
+        runtime = this.#personalSessionRuntime(provider);
+      } else {
+        runtime = this.#sessionRuntime(provider);
+      }
+      const capturedAuthority = requireCurrent(profile, provider);
+      const authority = runtimeScope === "personal"
+        ? this.#personalAuthorityForProfile(profile, this.#providerAccountAuthority(capturedAuthority))
+        : capturedAuthority;
+      let projection: CodexSessionProjection | undefined;
+      let readFailure: Readonly<{ error: unknown }> | undefined;
+      try {
+        if (provider === "claude") {
+          const process = this.#store.readClaudeProcessAuthority({
+            providerThreadId,
+            profileId: profile.id,
+            runtimeScope,
+          });
+          if (
+            process === null
+            || process.providerAuthority === null
+            || !sameProviderUsageAuthority(process.providerAuthority, this.#providerAccountAuthority(authority))
+            || process.sessionId !== session.id
+            || (process.state !== "claimed" && process.state !== "bound")
+          ) {
+            throw new CommandFailure(
+              "RECOVERY_REQUIRED",
+              "The provider switch no longer owns exact Claude process custody for this detached read.",
+            );
+          }
+          const liveIdentity = await this.#fencedEffect(async () =>
+            await (runtime as ClaudeRuntimePort).readSessionProcessIdentity({
+              authority,
+              providerThreadId,
+              signal,
+            }));
+          if (!this.#sameClaudeProcessIdentity(liveIdentity, process.identity)) {
+            throw new CommandFailure(
+              "RECOVERY_REQUIRED",
+              "The live Claude controller no longer matches the provider switch's durable process custody.",
+            );
+          }
+        }
+        projection = await this.#fencedEffect(async () =>
+          await runtime.readSession({
+            authority,
+            providerThreadId,
+            detail,
+            signal,
+          }));
+      } catch (error: unknown) {
+        if (error instanceof DaemonAuthoritySafetyError) throw error;
+        readFailure = { error };
+      }
+      let afterAccountKey: string | undefined;
+      try {
+        afterAccountKey = await assertAccountStable();
+      } catch (error: unknown) {
+        if (error instanceof DaemonAuthoritySafetyError) throw error;
+        throw new IndeterminateLocalCommitError(
+          "A detached provider-switch read crossed an account-authority change.",
+          error,
+        );
+      }
+      if (readFailure !== undefined) throw readFailure.error;
+      if (projection === undefined) throw new Error("PROVIDER_SWITCH_DETACHED_READ_MISSING");
+      if (afterAccountKey !== beforeAccountKey) {
+        if (provider === "devin") {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The managed Devin authority changed during detached provider-switch inspection.",
+          );
+        }
+        throw new ProviderAccountAuthorityMismatchError(
+          provider,
+          this.#store.requireProfileById(profile.id),
+        );
+      }
+      if (!isSource) {
+        recoveredTargetProviderAccountKey = afterAccountKey;
+        recoveredTargetAccountAuthorityProven = true;
+      }
       if (projection.providerThreadId !== providerThreadId) {
         throw new CommandFailure(
           "RECOVERY_REQUIRED",
@@ -12778,16 +18858,102 @@ export class HraService {
       }
       return projection;
     };
+    const recoveredTargetProviderAccountKeyInput = (): Readonly<{
+      providerAccountKey?: string;
+    }> => {
+      if (!recoveredTargetAccountAuthorityProven) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider switch has no fresh target account-authority proof.",
+        );
+      }
+      if (evidence.targetProvider === "devin") {
+        if (recoveredTargetProviderAccountKey !== undefined) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The keyless Devin target unexpectedly has recovered account-key authority.",
+          );
+        }
+        return {};
+      }
+      if (recoveredTargetProviderAccountKey === undefined) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider switch has no fresh target account-authority proof.",
+        );
+      }
+      return { providerAccountKey: recoveredTargetProviderAccountKey };
+    };
     const endDetachedTarget = async (providerThreadId: string): Promise<void> => {
-      await this.#fencedEffect(async () => await this.#sessionRuntime(evidence.targetProvider).endSession({
-        authority: requireCurrent(targetProfile, evidence.targetProvider),
-        providerThreadId,
-        signal,
-      }));
+      if (providerThreadId !== progress.targetProviderThreadId) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider-switch cleanup target does not match its durable target receipt.",
+        );
+      }
+      if (
+        evidence.targetProfileId === evidence.sourceProfileId
+        && evidence.targetProvider === evidence.sourceProvider
+        && providerThreadId === evidence.sourceProviderThreadId
+      ) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The provider-switch target aliases its source thread and cannot be ended.",
+        );
+      }
+      const providerAccountKey = await assertRuntimeAccountStable(
+        targetProfile,
+        evidence.targetProvider,
+        "managed",
+        targetExpectedAccountKey,
+        "This provider-switch receipt predates durable target account authority and cannot end its target.",
+      );
+      let effectFailure: Readonly<{ error: unknown }> | undefined;
+      try {
+        switch (evidence.targetProvider) {
+          case "claude":
+            await this.#releaseClaudeProcessAuthority({
+              providerThreadId,
+              profileId: targetProfile.id,
+              runtimeScope: "managed",
+            }, signal);
+            break;
+          case "codex":
+          case "devin":
+            await this.#fencedEffect(async () => await this.#sessionRuntime(
+              evidence.targetProvider,
+            ).endSession({
+              authority: requireCurrent(targetProfile, evidence.targetProvider),
+              providerThreadId,
+              signal,
+            }));
+            break;
+        }
+      } catch (error: unknown) {
+        if (error instanceof DaemonAuthoritySafetyError) throw error;
+        effectFailure = { error };
+      }
+      try {
+        await assertRuntimeAccountStable(
+          targetProfile,
+          evidence.targetProvider,
+          "managed",
+          targetExpectedAccountKey,
+          "This provider-switch receipt predates durable target account authority and cannot end its target.",
+        );
+      } catch (error: unknown) {
+        if (error instanceof DaemonAuthoritySafetyError) throw error;
+        throw new IndeterminateLocalCommitError(
+          "The provider-switch target account changed while its exact cleanup was in flight.",
+          error,
+        );
+      }
+      if (effectFailure !== undefined) throw effectFailure.error;
       this.#store.recordSessionProviderSwitchTargetReleased({
         attemptId: attempt.id,
         sessionId: session.id,
         providerThreadId,
+        ...(providerAccountKey === undefined ? {} : { providerAccountKey }),
       });
     };
     const providerState = (projection: CodexSessionProjection) => ({
@@ -12823,23 +18989,6 @@ export class HraService {
       };
     };
 
-    let current = this.#store.requireSession(session.id);
-    let progress = this.#store.readSessionProviderSwitchProgress(attempt.id);
-    const sourceBound = (): boolean =>
-      current.profileId === evidence.sourceProfileId
-      && current.provider === evidence.sourceProvider
-      && current.providerThreadId === evidence.sourceProviderThreadId;
-    const targetBound = (): boolean =>
-      progress.targetProviderThreadId !== undefined
-      && current.profileId === evidence.targetProfileId
-      && current.provider === evidence.targetProvider
-      && current.providerThreadId === progress.targetProviderThreadId;
-    if (!sourceBound() && !targetBound()) {
-      throw new CommandFailure(
-        "RECOVERY_REQUIRED",
-        "The session binding matches neither immutable side of the provider switch.",
-      );
-    }
     const crossedDaemonRestart = evidence.daemonGeneration === undefined
       || evidence.daemonGeneration !== this.#daemonGeneration;
     const sourceClaudeStateUnavailable = crossedDaemonRestart
@@ -12863,9 +19012,13 @@ export class HraService {
       let sourceStateUnknown = !sourceReleased;
       let sourceObserved = false;
       let observedSourceProviderUpdatedAt: number | null | undefined;
-      if (!sourceReleased && evidence.sourceProvider === "codex") {
+      if (
+        !sourceReleased
+        && (evidence.sourceProvider === "codex" || evidence.sourceProvider === "devin")
+      ) {
         try {
           const sourceProjection = await readDetached(
+            "source",
             sourceProfile,
             evidence.sourceProvider,
             evidence.sourceProviderThreadId,
@@ -12883,6 +19036,7 @@ export class HraService {
         progress.targetProviderThreadId !== undefined
         && !targetReleased
         && !targetClaudeStateUnavailable
+        && !legacyTargetAccountAuthorityMissing
       ) {
         try {
           await endDetachedTarget(progress.targetProviderThreadId);
@@ -12952,7 +19106,11 @@ export class HraService {
       let targetReleased = progress.targetReleased;
       const sourceReleased = progress.sourceReleased;
       const targetAddressable = progress.targetProviderThreadId !== undefined;
-      if (progress.targetProviderThreadId !== undefined && !targetReleased) {
+      if (
+        progress.targetProviderThreadId !== undefined
+        && !targetReleased
+        && !legacyTargetAccountAuthorityMissing
+      ) {
         try {
           await endDetachedTarget(progress.targetProviderThreadId);
           targetReleased = true;
@@ -12964,6 +19122,7 @@ export class HraService {
       if (sourceBound() && !sourceReleased && targetReleased) {
         try {
           const sourceProjection = await readDetached(
+            "source",
             sourceProfile,
             evidence.sourceProvider,
             evidence.sourceProviderThreadId,
@@ -13040,6 +19199,7 @@ export class HraService {
         throw new CommandFailure("RECOVERY_REQUIRED", "A released target no longer has the expected source binding.");
       }
       const sourceProjection = await readDetached(
+        "source",
         sourceProfile,
         evidence.sourceProvider,
         evidence.sourceProviderThreadId,
@@ -13064,6 +19224,7 @@ export class HraService {
     if (progress.seed === undefined) {
       await endDetachedTarget(targetThreadId);
       const sourceProjection = await readDetached(
+        "source",
         sourceProfile,
         evidence.sourceProvider,
         evidence.sourceProviderThreadId,
@@ -13087,6 +19248,7 @@ export class HraService {
     }
     if (progress.seedTurnId === undefined) {
       targetProjection = await readDetached(
+        "target",
         targetProfile,
         evidence.targetProvider,
         targetThreadId,
@@ -13145,6 +19307,7 @@ export class HraService {
         }
         await endDetachedTarget(targetThreadId);
         const sourceProjection = await readDetached(
+          "source",
           sourceProfile,
           evidence.sourceProvider,
           evidence.sourceProviderThreadId,
@@ -13169,6 +19332,15 @@ export class HraService {
     if (progress.seedTurnId === undefined || progress.seedTurnStatus === undefined) {
       throw new CommandFailure("RECOVERY_REQUIRED", "The target seed result is still not durably proven.");
     }
+    if (targetProjection === undefined) {
+      targetProjection = await readDetached(
+        "target",
+        targetProfile,
+        evidence.targetProvider,
+        targetThreadId,
+        false,
+      );
+    }
     if (!progress.sourceReleased) {
       if (!sourceBound()) {
         throw new CommandFailure("RECOVERY_REQUIRED", "The source release is unproven and the source is no longer bound.");
@@ -13192,12 +19364,20 @@ export class HraService {
         });
       } catch {
         current = this.#store.requireSession(session.id);
+        targetProjection = await readDetached(
+          "target",
+          targetProfile,
+          evidence.targetProvider,
+          targetThreadId,
+          false,
+        );
         this.#store.bindSessionProviderSwitchRecoveryTarget({
           attemptId: attempt.id,
           sessionId: session.id,
           expectedSessionRevision: current.revision,
-          title: targetProjection?.title ?? current.title,
-          ...(targetProjection?.providerUpdatedAt === undefined
+          ...recoveredTargetProviderAccountKeyInput(),
+          title: targetProjection.title,
+          ...(targetProjection.providerUpdatedAt === undefined
             ? {}
             : { providerUpdatedAt: targetProjection.providerUpdatedAt }),
           recordSourceReleased: true,
@@ -13210,12 +19390,20 @@ export class HraService {
       throw new CommandFailure("RECOVERY_REQUIRED", "The provider-switch release receipts changed before target adoption.");
     }
     if (sourceBound()) {
+      targetProjection = await readDetached(
+        "target",
+        targetProfile,
+        evidence.targetProvider,
+        targetThreadId,
+        false,
+      );
       this.#store.bindSessionProviderSwitchRecoveryTarget({
         attemptId: attempt.id,
         sessionId: session.id,
         expectedSessionRevision: current.revision,
-        title: targetProjection?.title ?? current.title,
-        ...(targetProjection?.providerUpdatedAt === undefined
+        ...recoveredTargetProviderAccountKeyInput(),
+        title: targetProjection.title,
+        ...(targetProjection.providerUpdatedAt === undefined
           ? {}
           : { providerUpdatedAt: targetProjection.providerUpdatedAt }),
       });
@@ -13225,6 +19413,7 @@ export class HraService {
       throw new CommandFailure("RECOVERY_REQUIRED", "The seeded target could not be bound to the recovering session.");
     }
     targetProjection = await readDetached(
+      "target",
       targetProfile,
       evidence.targetProvider,
       targetThreadId,
@@ -13330,7 +19519,7 @@ export class HraService {
     const projection = await this.#readExactSessionProjection({ ...session, providerThreadId: session.providerThreadId }, profile, false, signal);
     const provider = {
       providerThreadId: projection.providerThreadId,
-      title: projection.title,
+      title: session.provider === "claude" ? session.title : projection.title,
       status: projection.status,
       ...(projection.activeTurnId === undefined ? {} : { activeTurnId: projection.activeTurnId }),
       ...(projection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: projection.providerUpdatedAt }),
@@ -13369,9 +19558,19 @@ export class HraService {
   }
 
   async #readExactSessionProjection(session: BoundSessionRecord, profile: ProfileRecord, detail: boolean, signal: AbortSignal): Promise<CodexSessionProjection> {
-    if (session.provider === "claude") this.#assertClaudeIsolationAccepted();
     if (profile.id !== session.profileId) throw new Error("Session profile authority mismatch.");
-    const projection = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: this.#sessionAuthority(session), providerThreadId: session.providerThreadId, detail, signal }));
+    if (
+      session.provider === "claude"
+      && !this.#sessionHasMatchingActivePersonalBinding(session)
+    ) this.#assertClaudeIsolationAccepted();
+    await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+    const projection = await this.#fencedEffect(async () => await this.#runtimeForSession(session).readSession({ authority: this.#authorityForSession(session, profile), providerThreadId: session.providerThreadId, detail, signal }));
+    await this.#assertPersonalSessionAccountAuthority(
+      this.#store.requireSession(session.id),
+      this.#store.requireProfileById(profile.id),
+      signal,
+      true,
+    );
     if (projection.providerThreadId !== session.providerThreadId) {
       throw new CommandFailure("RECOVERY_REQUIRED", "Codex returned a projection for a different provider thread.");
     }
@@ -13394,7 +19593,16 @@ export class HraService {
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
-    return await this.#fencedEffect(async () => await this.#codex.inspectTurn({ authority: this.#sessionAuthority(session), providerThreadId: session.providerThreadId, turnId, signal }));
+    const codex = this.#runtimeForSession(session) as CodexRuntimePort;
+    await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+    const inspected = await this.#fencedEffect(async () => await codex.inspectTurn({ authority: this.#authorityForSession(session, profile), providerThreadId: session.providerThreadId, turnId, signal }));
+    await this.#assertPersonalSessionAccountAuthority(
+      this.#store.requireSession(session.id),
+      this.#store.requireProfileById(profile.id),
+      signal,
+      true,
+    );
+    return inspected;
   }
 
   #requireBoundSession(selector: string): BoundSessionRecord {
@@ -13402,10 +19610,24 @@ export class HraService {
     if (session.providerThreadId === undefined) throw new CommandFailure("RECOVERY_REQUIRED", "The session has no proven provider binding.");
     if (session.state === "recovery_required") throw new CommandFailure("RECOVERY_REQUIRED", "The session requires recovery before another mutation.");
     if (session.state === "terminal") throw new CommandFailure("CONFLICT", "The session is terminal and cannot accept another mutation.");
+    // This is also the fail-closed admission gate for commands that only write
+    // local queue state before they need a provider runtime.
+    const profile = this.#store.requireProfileById(session.profileId);
+    this.#assertEstablishedSessionAccount(profile, session);
+    this.#sessionHasActivePersonalBinding(session);
     return { ...session, providerThreadId: session.providerThreadId };
   }
 
   #assertSignedIn(profile: ProfileRecord): void {
+    if (this.#profileAuthorityRevocationIsPending(
+      profile.id,
+      profile.processGeneration,
+    )) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        `Account authority for ${profile.label} is being revoked; wait for controller release before another provider operation.`,
+      );
+    }
     if (profile.state === "recovery_required") {
       throw new CommandFailure("RECOVERY_REQUIRED", `Run \`hra account show ${profile.id}\` to reconcile this account before another provider operation.`);
     }
@@ -13425,24 +19647,206 @@ export class HraService {
     }
   }
 
+  #assertIdentifiableAccountAuthority(
+    profile: Pick<ProfileRecord, "id" | "label" | "providerEmail">,
+  ): void {
+    if (profile.providerEmail !== undefined) return;
+    throw new CommandFailure(
+      "UNAVAILABLE",
+      `The provider did not expose a stable account identity for ${profile.label}. HRA will not create or adopt sessions under an unprovable API-key or Bedrock credential.`,
+      { accountId: profile.id },
+    );
+  }
+
+  #profileAuthorityIsUsable(
+    profileId: ProfileRecord["id"],
+    generation: number,
+    provider: Provider = "codex",
+    sessionId?: SessionRecord["id"],
+  ): boolean {
+    try {
+      const profile = this.#store.requireProfileById(profileId);
+      const session = sessionId === undefined
+        ? { provider }
+        : this.#store.requireSession(sessionId);
+      return this.#providerAuthority(profile, provider).processGeneration === generation
+        && this.#profileAllowsEstablishedSession(profile, session)
+        && (provider !== "codex"
+          || !this.#profileAuthorityRevocationIsPending(profileId, profile.processGeneration));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * A profile's durable state is Codex account state. Claude authentication is
+   * owned by Claude Code inside the same provider-neutral profile directory,
+   * so admitting a new Claude effect must ask that provider without mutating
+   * the Codex state machine.
+   */
+  async #assertProviderSignedIn(
+    profile: ProfileRecord,
+    provider: Provider,
+    signal: AbortSignal,
+  ): Promise<Readonly<{
+    profileId: ProfileRecord["id"];
+    processGeneration: number;
+    provider: Provider;
+    signedIn: true;
+  }>> {
+    switch (provider) {
+      case "codex": {
+        this.#assertSignedIn(profile);
+        this.#assertIdentifiableAccountAuthority(profile);
+        return {
+          profileId: profile.id,
+          processGeneration: profile.processGeneration,
+          provider,
+          signedIn: true,
+        };
+      }
+      case "claude": {
+        if (profile.state !== "signed_in" && profile.state !== "signed_out") {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "Resolve this profile's unsettled Codex account transition before starting a Claude provider effect.",
+          );
+        }
+        const unsettledLogin = this.#unsettledClaudeLogin(profile);
+        if (unsettledLogin !== undefined) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "A foreground Claude login still owns this account. Join or explicitly resolve that exact login before starting another Claude provider effect.",
+            this.#claudeLoginRecovery(unsettledLogin),
+          );
+        }
+        this.#assertClaudeIsolationAccepted();
+        const account = await this.#readClaudeAccount(profile, signal);
+        if (account.readiness === "signed_in") {
+          return {
+            profileId: profile.id,
+            processGeneration: profile.processGeneration,
+            provider,
+            signedIn: true,
+          };
+        }
+        const nextCommand = `hra account login ${profile.id} --provider claude`;
+        throw new CommandFailure(
+          "INTERACTION_REQUIRED",
+          `Sign in with \`${nextCommand}\` before using this account's Claude runtime.`,
+          {
+            accountSelector: profile.id,
+            accountState: "signed_out",
+            nextCommand,
+            provider,
+          },
+        );
+      }
+      case "devin": {
+        if (profile.state !== "signed_in" && profile.state !== "signed_out") {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "Resolve this profile's unsettled Codex account transition before starting a Devin provider effect.",
+          );
+        }
+        const unsettledLogin = this.#unsettledDevinLogin(profile);
+        if (unsettledLogin !== undefined) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "A foreground Devin login still owns this account. Join or explicitly resolve that exact login before starting another Devin provider effect.",
+            this.#devinLoginRecovery(unsettledLogin),
+          );
+        }
+        const account = await this.#readDevinAccount(profile, signal);
+        if (account.signedIn) {
+          return {
+            profileId: profile.id,
+            processGeneration: profile.processGeneration,
+            provider,
+            signedIn: true,
+          };
+        }
+        const nextCommand = `hra account login ${profile.id} --provider devin`;
+        throw new CommandFailure(
+          "INTERACTION_REQUIRED",
+          `Sign in with \`${nextCommand}\` before using this account's Devin runtime.`,
+          {
+            accountSelector: profile.id,
+            accountState: "signed_out",
+            nextCommand,
+            provider,
+          },
+        );
+      }
+    }
+  }
 
   /** Provider-touch admission for an established session. */
   #profileAllowsEstablishedSession(
     profile: ProfileRecord,
-    session: Pick<SessionRecord, "provider">,
+    session: Pick<SessionRecord, "provider"> & Partial<
+      Pick<SessionRecord, "id" | "providerThreadId">
+    >,
   ): boolean {
     switch (session.provider) {
       case "codex": return profile.state === "signed_in";
-      case "claude": return this.#platform === "linux";
-      case "devin": return true;
+      case "claude": {
+        if (profile.state !== "signed_in" && profile.state !== "signed_out") return false;
+        if (this.#platform === "linux") return true;
+        if (session.id === undefined || session.providerThreadId === undefined) return false;
+        return this.#sessionHasMatchingActivePersonalBinding({
+          id: session.id,
+          provider: session.provider,
+          providerThreadId: session.providerThreadId,
+        });
+      }
+      case "devin": return profile.state === "signed_in" || profile.state === "signed_out";
     }
   }
 
+  /** Established sessions retain both their HRA profile and runtime-home authority. */
+  #assertEstablishedSessionAccount(
+    profile: ProfileRecord,
+    session: Pick<SessionRecord, "id" | "profileId" | "provider" | "providerThreadId">,
+  ): void {
+    switch (session.provider) {
+      case "codex": {
+        this.#assertSignedIn(profile);
+        this.#assertSessionAccountAuthority(session, profile);
+        return;
+      }
+      case "claude": {
+        if (profile.state !== "signed_in" && profile.state !== "signed_out") {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The Claude session's profile or runtime-home authority is unsettled.",
+          );
+        }
+        if (!this.#sessionHasMatchingActivePersonalBinding(session)) {
+          this.#assertClaudeIsolationAccepted();
+        }
+        return;
+      }
+      case "devin": {
+        if (!this.#profileAllowsEstablishedSession(profile, session)) {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The Devin session's profile authority is unsettled.",
+          );
+        }
+        return;
+      }
+    }
+  }
 
   #quarantineProfile(profile: Pick<ProfileRecord, "id" | "processGeneration" | "providerEmail" | "providerPlan">): ProfileRecord {
+    this.#clearProfileFactAuthorities(profile.id, "codex");
     const current = this.#store.requireProfile(profile.id);
     if (current.processGeneration !== profile.processGeneration) {
       throw new Error("Account generation changed before recovery quarantine.");
+    }
+    if (this.#profileHasControllingCodexAuthority(current)) {
+      this.#scheduleProfilePersonalAuthorityRevocation(current);
     }
     const stateChange = current.state === "recovery_required"
       ? null
@@ -13458,7 +19862,39 @@ export class HraService {
     return this.#store.requireProfile(profile.id);
   }
 
+  #quarantineCodexAccountMutation(
+    profile: Pick<ProfileRecord, "id" | "processGeneration" | "providerEmail" | "providerPlan">,
+  ): ProfileRecord {
+    // The exact Codex scopes were already fenced by the account mutation.
+    // Keep independent Claude controllers intact: recovery_required makes
+    // their effects temporarily unavailable without confusing a Codex
+    // credential outcome with permission to terminate Claude custody.
+    this.#clearProfileFactAuthorities(profile.id, "codex");
+    const current = this.#store.requireProfile(profile.id);
+    if (current.processGeneration !== profile.processGeneration) {
+      throw new Error("Account generation changed before Codex recovery quarantine.");
+    }
+    if (current.state !== "recovery_required") {
+      const stateChange = this.#store.setProfileStateWithWorkRetirement(
+        profile.id,
+        profile.processGeneration,
+        "recovery_required",
+        this.#work,
+        {
+          ...(current.providerEmail === undefined ? {} : { email: current.providerEmail }),
+          ...(current.providerPlan === undefined ? {} : { plan: current.providerPlan }),
+        },
+      );
+      this.#notifyAffectedWork(stateChange.affectedWorkIds);
+      if (!stateChange.changed) {
+        throw new Error("Codex account could not be quarantined after an indeterminate mutation.");
+      }
+    }
+    return this.#store.requireProfile(profile.id);
+  }
+
   #quarantineSession(sessionId: SessionRecord["id"]): SessionRecord {
+    this.#clearSessionFactAuthority(sessionId);
     const session = this.#store.quarantineSession(sessionId);
     if (session.state !== "recovery_required" && session.state !== "terminal") {
       throw new Error("Session quarantine did not reach a non-dispatchable state.");
@@ -13572,6 +20008,7 @@ export class HraService {
     ) throw new CommandFailure("RECOVERY_REQUIRED", "Queued dispatch provider-account authority changed.");
     const queued = this.#store.nextPendingQueue(session.id);
     if (queued === null) return;
+    const runtime = this.#runtimeForSession(session);
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     if (project === undefined) return;
     let evidence: ReturnType<StateStore["beginQueueEffect"]> | undefined;
@@ -13583,18 +20020,25 @@ export class HraService {
       const attachmentReferences = this.#store.queueAttachmentManifest(queued.id);
       const signal = new AbortController().signal;
       const profile = this.#store.requireProfile(session.profileId);
+      if (!this.#profileAuthorityIsUsable(
+        profile.id,
+        authority.generation,
+        session.provider,
+        session.id,
+      )) return;
       await this.#requireUsableProjectRoot(project.rootPath);
       this.#requireLiveProviderObservation(
         await this.#ensureSessionObservedLocked(session.id, signal),
       );
       const baseline = await this.#readExactSessionProjection(boundSession, profile, false, signal);
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) return;
-      review = await this.#fencedRuntimeReview(this.#sessionRuntime(session.provider), async () => {
-        const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
+      await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+      review = await this.#fencedRuntimeReview(this.#runtimeForSession(session), async () => {
+        const reviewedProjectRoot = await this.#requireUsableProjectRoot(project.rootPath);
         return await this.#runtimeForSession(session).reviewTurnStart({
           authority,
           providerThreadId: boundSession.providerThreadId,
-          projectRoot,
+          projectRoot: reviewedProjectRoot,
           preset: session.preset,
           requirement: presetSelection.requirement,
           fast: session.fastEnabled,
@@ -13627,6 +20071,7 @@ export class HraService {
       this.#queuePreEffectRetryCounts.delete(queued.id);
       const dispatchRevision = this.#store.requireSession(session.id).revision;
       const dispatchFactEpoch = this.#snapshotSessionFactEpoch(session.id);
+      await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
       const turnBindingOwner = this.#beginProviderUsageTurnBinding(
         session.id,
         providerAuthority,
@@ -13651,6 +20096,7 @@ export class HraService {
         });
         turnBindingTurnId = result.turnId;
         providerApplied = true;
+        await this.#assertSessionAccountAuthorityAfterProviderEffect(boundSession, profile, signal);
         this.#store.completeQueueEffect({
           queueId: queued.id,
           expectedEvidenceDigest: evidence.digest,
@@ -13706,7 +20152,7 @@ export class HraService {
       const observed = this.#store.requireSession(session.id);
       if (observed.state === "idle") this.#scheduleQueueDispatch(observed);
     } finally {
-      if (review !== undefined) this.#sessionRuntime(session.provider).discardRuntimeReview(review);
+      if (review !== undefined) runtime.discardRuntimeReview(review);
     }
   }
 
@@ -13729,12 +20175,14 @@ export class HraService {
         if (
           !this.#profileAuthorityIsCurrent(authority)
           || profile.state !== "signed_in"
+          || this.#profileAuthorityRevocationIsPending(profile.id, authority.generation)
         ) return;
         await this.#serialize(`account:${profile.id}`, async () => {
           const current = this.#store.requireProfileById(profile.id);
           if (
             !this.#profileAuthorityIsCurrent(authority)
             || current.state !== "signed_in"
+            || this.#profileAuthorityRevocationIsPending(current.id, authority.generation)
           ) return;
           await this.#usage(
             current.id,
@@ -13845,6 +20293,19 @@ export class HraService {
     }
   }
 
+  async #serializeKeys<T>(
+    keys: readonly string[],
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    const unique = [...new Set(keys)];
+    const descend = async (index: number): Promise<T> => {
+      const key = unique[index];
+      if (key === undefined) return await operation();
+      return await this.#serialize(key, async () => await descend(index + 1));
+    };
+    return await descend(0);
+  }
+
   async #serializeProfileAuthorities<T>(
     profileIds: readonly ProfileRecord["id"][],
     operation: () => Promise<T> | T,
@@ -13893,7 +20354,15 @@ export class HraService {
   async #applyOrderedAccountFact(
     profileId: ProfileRecord["id"],
     operation: () => Promise<void> | void,
+    drain?: SessionSwitchFactDrain,
   ): Promise<void> {
+    if (drain !== undefined) {
+      await this.#daemonAuthority.assertCurrent();
+      this.#assertSessionSwitchFactDrain(drain, profileId);
+      await operation();
+      this.#assertSessionSwitchFactDrain(drain, profileId);
+      return;
+    }
     const accountKey = `account:${profileId}`;
     if (!this.#mutationTails.has(accountKey)) {
       await this.#serialize(accountKey, operation);
@@ -13912,6 +20381,66 @@ export class HraService {
     );
     this.#background.add(tracked);
     void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  async #applyOrderedSessionFact(
+    session: Pick<SessionRecord, "id" | "profileId">,
+    operation: () => Promise<void> | void,
+    drain?: SessionSwitchFactDrain,
+  ): Promise<void> {
+    if (drain !== undefined) {
+      await this.#daemonAuthority.assertCurrent();
+      this.#assertSessionSwitchFactDrain(drain, session.profileId, session.id);
+      await operation();
+      this.#assertSessionSwitchFactDrain(drain, session.profileId, session.id);
+      return;
+    }
+    const accountKey = `account:${session.profileId}`;
+    const sessionKey = `session:${session.id}`;
+    const ordered = async (): Promise<void> => {
+      await this.#serializeSessionAuthority(
+        session,
+        operation,
+        { allowDuringProjectionRecovery: true },
+      );
+    };
+    if (!this.#mutationTails.has(accountKey) && !this.#mutationTails.has(sessionKey)) {
+      await ordered();
+      return;
+    }
+    // Provider callbacks can be awaited from inside the provider effect that
+    // owns these tails. Queue the entire source revalidation and fact commit,
+    // then return the callback so the effect can release its authority.
+    const task = ordered();
+    const tracked = task.then(
+      () => undefined,
+      (error: unknown) => {
+        if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+        else this.recordBackgroundDiagnostic("session_state_tracking_failed", error);
+      },
+    );
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  #assertSessionSwitchFactDrain(
+    drain: SessionSwitchFactDrain,
+    profileId: ProfileRecord["id"],
+    sessionId = drain.sessionId,
+  ): void {
+    const session = this.#store.requireSession(sessionId);
+    if (drain.sessionId !== sessionId || drain.owner.authority.profileId !== profileId
+      || session.profileId !== profileId || session.providerThreadId !== drain.owner.providerThreadId
+      || drain.owner.overflowed
+      || this.#sessionSwitchDeferredFacts.get(sessionId)?.has(drain.owner) !== true
+      || !this.#mutationTails.has(`account:${profileId}`)
+      || !this.#mutationTails.has(`session:${sessionId}`)
+      || !sameProviderUsageAuthority(drain.owner.authority, this.#capturedSessionProviderAuthority(session))
+      || !this.#sessionUsesFactSource(session, drain.owner.authority.provider, drain.owner.source)) {
+      throw new Error("SESSION_SWITCH_FACT_DRAIN_AUTHORITY_MISMATCH");
+    }
+    // Inline drain retains the non-lock guard of normal ordered admission.
+    this.#assertSessionAccountAuthorityIfSignedIn(session);
   }
 
   #sessionRecoveryProfileIds(session: Pick<SessionRecord, "id" | "profileId">): readonly ProfileRecord["id"][] {
@@ -13945,15 +20474,38 @@ export class HraService {
     operation: () => Promise<T> | T,
     options: Readonly<{ allowDuringProjectionRecovery?: boolean }> = {},
   ): Promise<T> {
-    return await this.#serializeProfileAuthorities(profileIds, async () =>
+    const authorityProfileIds = [...new Set(profileIds)];
+    const profileRecoveryIsInFlight = (): boolean =>
+      authorityProfileIds.some((profileId) =>
+        this.#profileHasProjectionRecoveryInFlight(profileId));
+    return await this.#serializeProfileAuthorities(authorityProfileIds, async () =>
       this.#serialize(`session:${session.id}`, async () => {
+        this.#assertSessionAccountAuthorityIfSignedIn(this.#store.requireSession(session.id));
         if (options.allowDuringProjectionRecovery !== true) {
-          const unsettled = await this.#cloud.isCompactProjectionRecoveryUnsettled(session.id);
-          await this.#daemonAuthority.assertCurrent();
-          if (unsettled) {
+          if (
+            this.#projectionRecoveriesInFlight.has(session.id)
+            || profileRecoveryIsInFlight()
+          ) {
             throw new CommandFailure(
               "RECOVERY_REQUIRED",
-              "This session has an unsettled compact-projection recovery. Retry that exact recovery before changing local or provider state.",
+              "This session or account has a compact-projection recovery in flight.",
+            );
+          }
+          const [sessionRecoveryIsUnsettled, ...profileRecoveryStates] = await Promise.all([
+            this.#cloud.isCompactProjectionRecoveryUnsettled(session.id),
+            ...authorityProfileIds.map(async (profileId) =>
+              await this.#cloud.isCompactProjectionRecoveryUnsettledForProfile(profileId)),
+          ]);
+          await this.#daemonAuthority.assertCurrent();
+          if (
+            sessionRecoveryIsUnsettled
+            || profileRecoveryStates.some(Boolean)
+            || this.#projectionRecoveriesInFlight.has(session.id)
+            || profileRecoveryIsInFlight()
+          ) {
+            throw new CommandFailure(
+              "RECOVERY_REQUIRED",
+              "This session or account has an unsettled compact-projection recovery. Retry that exact recovery before changing local or provider state.",
             );
           }
         }
@@ -13961,10 +20513,41 @@ export class HraService {
       }));
   }
 
+  async #serializeInteractionAuthority<T>(
+    interactionId: InteractionRecord["publicId"],
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    const selected = this.#store.requireInteraction(interactionId);
+    if (selected.sessionId === null) {
+      return await this.#serialize(`account:${selected.authority.profileId}`, async () =>
+        this.#serialize(`interaction:${selected.publicId}`, async () => {
+          await this.#assertNoCompactProjectionRecoveryForProfile(
+            selected.authority.profileId,
+          );
+          return await operation();
+        }));
+    }
+    const session = this.#store.requireSession(selected.sessionId);
+    if (session.profileId !== selected.authority.profileId) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The interaction no longer belongs to its recorded account authority.",
+      );
+    }
+    return await this.#serializeSessionAuthority(session, async () =>
+      this.#serialize(`interaction:${selected.publicId}`, operation));
+  }
+
   async #assertNoCompactProjectionRecoveryForProfile(profileId: ProfileRecord["id"]): Promise<void> {
+    if (this.#profileHasProjectionRecoveryInFlight(profileId)) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "This account has a compact-projection recovery in flight.",
+      );
+    }
     const unsettled = await this.#cloud.isCompactProjectionRecoveryUnsettledForProfile(profileId);
     await this.#daemonAuthority.assertCurrent();
-    if (unsettled) {
+    if (unsettled || this.#profileHasProjectionRecoveryInFlight(profileId)) {
       throw new CommandFailure(
         "RECOVERY_REQUIRED",
         "This account owns an unsettled compact-projection recovery. Retry that exact recovery before changing provider or account authority.",

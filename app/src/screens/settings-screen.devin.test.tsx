@@ -74,6 +74,10 @@ await mock.module("../data/registry", () => ({
       proseAutorespondConfigured: false,
       revision: 1,
       scheduledTasks: [],
+      sessionAdoption: {
+        claude: { adopted: 0, enabled: false, fenced: 0, pending: 0 },
+        codex: { adopted: 0, enabled: false, fenced: 0, pending: 0 },
+      },
       showThinkingDefault: false,
       updatedAt: 1_760_000_000_000,
     } satisfies MachineView],
@@ -100,5 +104,9 @@ describe("Devin account settings", () => {
     expect(markup).toContain("--manual-token-flow");
     expect(markup).not.toContain("Link here");
     expect(markup).not.toContain("Check status");
+    expect(markup).toContain("Codex personal sessions");
+    expect(markup).toContain("Claude Code personal sessions");
+    expect(markup).not.toContain("Devin personal sessions");
+    expect(markup).not.toContain("session adoption enable &lt;account&gt; --provider devin");
   });
 });

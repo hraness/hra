@@ -105,6 +105,7 @@ const machine: MachineView = {
   proseAutorespondConfigured: false,
   revision: 8,
   scheduledTasks: [],
+  sessionAdoption: null,
   showThinkingDefault: false,
   updatedAt: 1_760_000_000_000,
 };

@@ -11,6 +11,7 @@ import {
 import { canonicalProviderUsageJson } from "../domain/provider-usage";
 import { AUTOMATIC_USAGE_MOVE_LINEAGE_LIMIT, settledAutomaticPointerMoveSchema, type SettledAutomaticPointerMove } from "../domain/usage-policy";
 import { attemptIdSchema } from "../domain/values";
+import { normalizeSchemaSql } from "./schema-cohort";
 
 export const AUTOMATIC_POINTER_MOVE_KIND = "usage.pointer.move";
 export const AUTOMATIC_POINTER_MOVE_AUTHORITY = "provider:codex";
@@ -126,7 +127,6 @@ export const AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS = [
     sql: `CREATE INDEX IF NOT EXISTS automatic_pointer_move_mutation_head ON mutation_attempts(authority_generation DESC) WHERE kind='usage.pointer.move';` },
   ...guards.map((guard) => ({ ...guard, type: "trigger" as const })),
 ] as const;
-const normalizeSql = (value: string): string => value.replace(/\bIF NOT EXISTS\b/giu, "").replace(/\s+/gu, " ").trim().replace(/;$/u, "");
 export function applyAutomaticPointerMoveSchema(database: Database): void {
   for (const object of AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS) database.exec(object.sql);
 }
@@ -134,7 +134,7 @@ export function assertAutomaticPointerMoveSchema(database: Database): void {
   for (const object of AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS) {
     const row = database.query("SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?").get(object.name) as
       { type: string; tbl_name: string; sql: string } | null;
-    if (row === null || row.type !== object.type || row.tbl_name !== object.table || normalizeSql(row.sql) !== normalizeSql(object.sql)) fail();
+    if (row === null || row.type !== object.type || row.tbl_name !== object.table || normalizeSchemaSql(row.sql) !== normalizeSchemaSql(object.sql)) fail();
   }
 }
 export type AutomaticPointerMoveHistory = Readonly<{

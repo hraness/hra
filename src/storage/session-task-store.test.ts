@@ -6,6 +6,7 @@ import {
   createProjectId,
   createQueueId,
   createSessionId,
+  type ProfileId,
   type SessionId,
 } from "../domain/values";
 import {
@@ -22,6 +23,8 @@ import {
 } from "./session-task-store";
 
 const databases: Database[] = [];
+const codexAccountKey = `v1:codex:${"a".repeat(64)}`;
+const claudeAccountKey = `v1:claude:${"b".repeat(64)}`;
 
 afterEach(() => {
   for (const database of databases.splice(0)) database.close(false);
@@ -36,7 +39,9 @@ INSERT INTO daemon_state(singleton,generation) VALUES (1,7);
 CREATE TABLE profiles (
   id TEXT PRIMARY KEY,
   state TEXT NOT NULL,
-  process_generation INTEGER NOT NULL
+  process_generation INTEGER NOT NULL,
+  provider_email TEXT,
+  codex_account_key TEXT DEFAULT '${codexAccountKey}'
 ) STRICT;
 CREATE TABLE projects (
   id TEXT PRIMARY KEY,
@@ -47,6 +52,104 @@ CREATE TABLE sessions (
   profile_id TEXT NOT NULL REFERENCES profiles(id),
   project_id TEXT REFERENCES projects(id),
   provider_thread_id TEXT,
+  provider TEXT NOT NULL DEFAULT 'codex',
+  provider_v39 TEXT NOT NULL DEFAULT 'codex',
+  state TEXT NOT NULL
+) STRICT;
+CREATE TABLE provider_accounts(
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL,
+  process_generation INTEGER NOT NULL,
+  readiness TEXT NOT NULL,
+  UNIQUE(profile_id,provider)
+) STRICT;
+CREATE TABLE session_provider_authorities(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL,
+  process_generation INTEGER NOT NULL,
+  authority_revision INTEGER NOT NULL,
+  routing_provenance TEXT NOT NULL DEFAULT 'explicit'
+) STRICT;
+CREATE TRIGGER fixture_session_authority_insert AFTER INSERT ON sessions BEGIN
+  INSERT OR IGNORE INTO provider_accounts
+    SELECT NEW.profile_id,NEW.profile_id,'codex',1,p.process_generation,'signed_in'
+    FROM profiles p WHERE p.id=NEW.profile_id;
+  INSERT OR IGNORE INTO provider_accounts
+    SELECT 'pact_'||substr(p.id,6),p.id,'claude',1,1,'signed_in'
+    FROM profiles p WHERE p.id=NEW.profile_id;
+  INSERT OR IGNORE INTO provider_accounts
+    SELECT 'dact_'||substr(p.id,6),p.id,'devin',1,1,'signed_in'
+    FROM profiles p WHERE p.id=NEW.profile_id;
+  INSERT INTO session_provider_authorities
+    SELECT NEW.id,a.id,a.profile_id,a.provider,a.binding_generation,a.process_generation,1,'explicit'
+    FROM provider_accounts a WHERE a.profile_id=NEW.profile_id AND a.provider=NEW.provider_v39;
+END;
+CREATE TRIGGER fixture_session_authority_update AFTER UPDATE OF provider_v39 ON sessions
+WHEN NEW.provider_v39!=OLD.provider_v39 BEGIN
+  UPDATE session_provider_authorities SET
+    provider_account_id=(SELECT id FROM provider_accounts WHERE profile_id=NEW.profile_id AND provider=NEW.provider_v39),
+    provider=NEW.provider_v39,
+    binding_generation=(SELECT binding_generation FROM provider_accounts WHERE profile_id=NEW.profile_id AND provider=NEW.provider_v39),
+    process_generation=(SELECT process_generation FROM provider_accounts WHERE profile_id=NEW.profile_id AND provider=NEW.provider_v39),
+    authority_revision=authority_revision+1
+  WHERE session_id=NEW.id;
+END;
+CREATE TRIGGER fixture_codex_process_mirror AFTER UPDATE OF process_generation ON profiles BEGIN
+  UPDATE provider_accounts SET process_generation=NEW.process_generation WHERE profile_id=NEW.id AND provider='codex';
+  UPDATE session_provider_authorities SET process_generation=NEW.process_generation,authority_revision=authority_revision+1
+    WHERE profile_id=NEW.id AND provider='codex';
+END;
+CREATE TABLE session_account_authorities (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  account_key TEXT,
+  recorded_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE provider_runtime_account_revocations (
+  profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  profile_generation INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  runtime_scope TEXT NOT NULL,
+  current_account_key TEXT,
+  state TEXT NOT NULL,
+  PRIMARY KEY(profile_id,provider,runtime_scope)
+) STRICT;
+CREATE TABLE session_provider_account_authorities (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  runtime_scope TEXT NOT NULL,
+  account_key TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+) STRICT;
+CREATE TRIGGER session_account_authority_insert
+AFTER INSERT ON sessions
+BEGIN
+  INSERT INTO session_account_authorities(session_id,profile_id,account_key,recorded_at)
+  SELECT NEW.id,NEW.profile_id,
+    CASE WHEN p.provider_email IS NULL THEN NULL ELSE lower(trim(p.provider_email)) END,
+    0
+  FROM profiles p WHERE p.id=NEW.profile_id;
+END;
+CREATE TRIGGER session_provider_account_authority_insert
+AFTER INSERT ON sessions
+WHEN NEW.provider_v39='codex'
+BEGIN
+  INSERT INTO session_provider_account_authorities(
+    session_id,provider,runtime_scope,account_key,recorded_at
+  )
+  SELECT NEW.id,NEW.provider_v39,'managed',p.codex_account_key,0
+  FROM profiles p
+  WHERE p.id=NEW.profile_id AND p.codex_account_key IS NOT NULL;
+END;
+CREATE TABLE session_personal_runtime_bindings (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  provider_thread_id TEXT NOT NULL,
   state TEXT NOT NULL
 ) STRICT;
 CREATE TABLE queue_sequence_authority (
@@ -126,6 +229,7 @@ const idempotencyKey = (): string =>
   `123e4567-e89b-42d3-a456-${(++uuidSequence).toString(16).padStart(12, "0")}`;
 
 type Fixture = Readonly<{
+  accountId: ProfileId;
   database: Database;
   now: { value: number };
   otherSessionId: SessionId;
@@ -150,7 +254,8 @@ function fixture(input: Readonly<{
   const sessionId = createSessionId();
   const otherSessionId = createSessionId();
   database.query(
-    "INSERT INTO profiles(id,state,process_generation) VALUES (?,'signed_in',1)",
+    `INSERT INTO profiles(id,state,process_generation,provider_email)
+     VALUES (?,'signed_in',1,'scheduler@example.com')`,
   ).run(accountId);
   database.query("INSERT INTO projects(id,root_path) VALUES (?,?)").run(projectId, "/project");
   for (const id of [sessionId, otherSessionId]) {
@@ -181,7 +286,7 @@ function fixture(input: Readonly<{
     ...(input.enqueue === false ? {} : { enqueue }),
   };
   const store = new SessionTaskStore(database, options);
-  return { database, now, otherSessionId, sessionId, store, enqueueCalls };
+  return { accountId, database, now, otherSessionId, sessionId, store, enqueueCalls };
 }
 
 const createTask = (
@@ -200,6 +305,31 @@ const createTask = (
   status: input.status ?? "active",
   idempotencyKey: input.idempotencyKey ?? idempotencyKey(),
 });
+
+const adoptPersonalClaudeSession = (
+  value: Fixture,
+  bindingState: "active" | "detaching" | "detached" = "active",
+): void => {
+  value.database.query(
+    "UPDATE profiles SET state='signed_out',provider_email=NULL,codex_account_key=NULL WHERE id=?",
+  ).run(value.accountId);
+  value.database.query("UPDATE sessions SET provider='claude',provider_v39='claude' WHERE id=?")
+    .run(value.sessionId);
+  value.database.query(
+    "DELETE FROM session_provider_account_authorities WHERE session_id=?",
+  ).run(value.sessionId);
+  value.database.query(
+    `INSERT INTO session_provider_account_authorities(
+       session_id,provider,runtime_scope,account_key,recorded_at
+     ) VALUES (?,'claude','personal',?,0)`,
+  ).run(value.sessionId, claudeAccountKey);
+  value.database.query(
+    `INSERT INTO session_personal_runtime_bindings(
+       session_id,provider,provider_thread_id,state
+     ) SELECT id,provider,provider_thread_id,?
+       FROM sessions WHERE id=?`,
+  ).run(bindingState, value.sessionId);
+};
 
 const expectStoreCode = (
   callback: () => unknown,
@@ -223,6 +353,19 @@ describe("SessionTaskStore schema authority", () => {
     database.exec(schema);
     return database;
   };
+
+  test("session task schema audit preserves IF NOT EXISTS inside a digest GLOB", () => {
+    const original = "*[^0-9a-f]*";
+    const altered = "*[IF NOT EXISTS^0-9a-f]*";
+    const database = databaseWithSchema(SESSION_TASK_SCHEMA_SQL.replace(original, altered));
+    expect(database.query("SELECT ?1 NOT GLOB ?2 AS valid, ?1 NOT GLOB ?3 AS weakened")
+      .get("g".repeat(64), original, altered)).toEqual({ valid: 0, weakened: 1 });
+    const before = database.query("SELECT type,name,sql FROM sqlite_master ORDER BY name").all();
+    const changes = database.query("SELECT total_changes() AS count").get();
+    expect(() => assertSessionTaskSchema(database)).toThrow("STATE_SESSION_TASK_SCHEMA_INVALID");
+    expect(database.query("SELECT type,name,sql FROM sqlite_master ORDER BY name").all()).toEqual(before);
+    expect(database.query("SELECT total_changes() AS count").get()).toEqual(changes);
+  });
 
   test("rejects wrong object types, non-STRICT tables, foreign-key drift, and invariant drift", () => {
     const wrongType = databaseWithSchema(SESSION_TASK_SCHEMA_SQL);
@@ -833,6 +976,182 @@ describe("SessionTaskStore due materialization", () => {
       .toEqual({ count: 0 });
   });
 
+
+  test("materializes a managed Devin task once while its durable profile is signed out", async () => {
+    const value = fixture();
+    value.database.query(
+      "UPDATE profiles SET state='signed_out',provider_email=NULL,codex_account_key=NULL WHERE id=?",
+    ).run(value.accountId);
+    value.database.query(
+      "UPDATE sessions SET provider='codex',provider_v39='devin' WHERE id=?",
+    ).run(value.sessionId);
+    value.database.query(
+      "DELETE FROM session_provider_account_authorities WHERE session_id=?",
+    ).run(value.sessionId);
+    const created = createTask(value, {
+      name: "Managed Devin follow-up",
+      prompt: "Continue the native Devin conversation.",
+    });
+    const dueAt = created.nextDueAt ?? 0;
+
+    expect(value.store.nextDueAt()).toBe(dueAt);
+    expect(await value.store.materializeDue({ now: dueAt })).toMatchObject([{
+      task: { id: created.id, sessionId: value.sessionId },
+      occurrence: { taskId: created.id, sessionId: value.sessionId },
+      queue: {
+        message: "Continue the native Devin conversation.",
+        sessionId: value.sessionId,
+        state: "pending",
+      },
+    }]);
+    expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(value.store.listOccurrences(value.sessionId, created.id)).toHaveLength(1);
+  });
+
+  test("materializes an adopted personal Claude task while its profile is signed out", async () => {
+    const value = fixture();
+    adoptPersonalClaudeSession(value);
+    const created = createTask(value, {
+      name: "Personal Claude follow-up",
+      prompt: "Continue the adopted Claude conversation.",
+    });
+    const dueAt = created.nextDueAt ?? 0;
+
+    expect(value.store.nextDueAt()).toBe(dueAt);
+    expect(await value.store.materializeDue({ now: dueAt })).toMatchObject([{
+      task: { id: created.id, sessionId: value.sessionId },
+      occurrence: { taskId: created.id, sessionId: value.sessionId },
+      queue: {
+        message: "Continue the adopted Claude conversation.",
+        sessionId: value.sessionId,
+        state: "pending",
+      },
+    }]);
+    expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(value.database.query(
+      `SELECT q.state,s.provider,pa.runtime_scope,b.state AS binding_state
+       FROM queue_entries q
+       JOIN sessions s ON s.id=q.session_id
+       JOIN session_provider_account_authorities pa ON pa.session_id=s.id
+       JOIN session_personal_runtime_bindings b ON b.session_id=s.id
+       WHERE q.session_id=?`,
+    ).all(value.sessionId)).toEqual([{
+      state: "pending",
+      provider: "claude",
+      runtime_scope: "personal",
+      binding_state: "active",
+    }]);
+  });
+
+  test("withholds detached, releasing, or mismatched personal Claude task authority", async () => {
+    for (const authorityLoss of ["detached", "releasing", "mismatched"] as const) {
+      const value = fixture();
+      adoptPersonalClaudeSession(value);
+      const created = createTask(value, {
+        name: `Personal Claude ${authorityLoss}`,
+      });
+      const dueAt = created.nextDueAt ?? 0;
+      if (authorityLoss === "detached") {
+        value.database.query(
+          "UPDATE session_personal_runtime_bindings SET state='detached' WHERE session_id=?",
+        ).run(value.sessionId);
+      } else {
+        value.database.query(
+          `INSERT INTO provider_runtime_account_revocations(
+             profile_id,profile_generation,provider,runtime_scope,current_account_key,state
+           ) VALUES (?,1,'claude','personal',?,?)`,
+        ).run(
+          value.accountId,
+          authorityLoss === "mismatched"
+            ? `v1:claude:${"c".repeat(64)}`
+            : claudeAccountKey,
+          authorityLoss === "mismatched" ? "completed" : "releasing",
+        );
+      }
+
+      expect(value.store.nextDueAt()).toBeNull();
+      expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+      expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+      expect(value.database.query(
+        "SELECT COUNT(*) AS count FROM queue_entries WHERE session_id=?",
+      ).get(value.sessionId)).toEqual({ count: 0 });
+    }
+  });
+
+  test("withholds revoked Claude tasks when its own generation differs from the Codex shadow", async () => {
+    for (const state of ["releasing", "completed"] as const) {
+      const value = fixture();
+      value.database.query("UPDATE provider_accounts SET process_generation=2 WHERE profile_id=? AND provider='claude'")
+        .run(value.accountId);
+      adoptPersonalClaudeSession(value);
+      const created = createTask(value);
+      const dueAt = created.nextDueAt ?? 0;
+      expect(value.store.nextDueAt()).toBe(dueAt);
+      value.database.query(`INSERT INTO provider_runtime_account_revocations(
+        profile_id,profile_generation,provider,runtime_scope,current_account_key,state
+      ) VALUES (?,1,'claude','personal',?,?)`).run(value.accountId,
+        state === "releasing" ? claudeAccountKey : `v1:claude:${"c".repeat(64)}`, state);
+      expect(value.store.nextDueAt()).toBeNull();
+      expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+      expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+      expect(value.database.query("SELECT COUNT(*) AS count FROM queue_entries WHERE session_id=?")
+        .get(value.sessionId)).toEqual({ count: 0 });
+    }
+  });
+
+  test("rechecks personal Claude binding authority after project validation", async () => {
+    const fixtureReference: { value?: Fixture } = {};
+    const current = fixture({
+      resolveProjectDirectory: async (root) => {
+        const value = fixtureReference.value;
+        if (value === undefined) throw new Error("Missing task fixture.");
+        value.database.query(
+          "UPDATE session_personal_runtime_bindings SET state='detached' WHERE session_id=?",
+        ).run(value.sessionId);
+        return root;
+      },
+    });
+    fixtureReference.value = current;
+    adoptPersonalClaudeSession(current);
+    const created = createTask(current);
+    const dueAt = created.nextDueAt ?? 0;
+    expect(current.store.nextDueAt()).toBe(dueAt);
+
+    expect(await current.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(current.store.listOccurrences(current.sessionId, created.id)).toEqual([]);
+    expect(current.database.query(
+      "SELECT COUNT(*) AS count FROM queue_entries WHERE session_id=?",
+    ).get(current.sessionId)).toEqual({ count: 0 });
+  });
+
+  test("does not advertise or retry a native task under stale account identity", async () => {
+    const value = fixture();
+    const created = createTask(value);
+    const dueAt = created.nextDueAt ?? 0;
+    expect(value.store.nextDueAt()).toBe(dueAt);
+
+    value.database.query(
+      "UPDATE profiles SET provider_email='replacement@example.com' WHERE id=?",
+    ).run(value.accountId);
+    expect(value.store.nextDueAt()).toBeNull();
+    expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(await value.store.materializeDue({ now: dueAt })).toEqual([]);
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM session_task_occurrences",
+    ).get()).toEqual({ count: 0 });
+    expect(value.database.query("SELECT COUNT(*) AS count FROM queue_entries").get())
+      .toEqual({ count: 0 });
+
+    value.database.query(
+      "UPDATE profiles SET provider_email='scheduler@example.com' WHERE id=?",
+    ).run(value.accountId);
+    expect(await value.store.materializeDue({ now: dueAt })).toMatchObject([{
+      task: { id: created.id, sessionId: value.sessionId },
+      occurrence: { taskId: created.id, sessionId: value.sessionId },
+      queue: { sessionId: value.sessionId },
+    }]);
+  });
+
   test("returns after one atomic handoff before resolving the next candidate", async () => {
     let rejectSecond = true;
     const resolvedRoots: string[] = [];
@@ -895,7 +1214,8 @@ describe("SessionTaskStore due materialization", () => {
     const invalidProjectId = createProjectId();
     const validProjectId = createProjectId();
     value.database.query(
-      "INSERT INTO profiles(id,state,process_generation) VALUES (?,'signed_in',1)",
+      `INSERT INTO profiles(id,state,process_generation,provider_email)
+       VALUES (?,'signed_in',1,'other-scheduler@example.com')`,
     ).run(accountId);
     value.database.query("INSERT INTO projects(id,root_path) VALUES (?,?)")
       .run(invalidProjectId, "/invalid");

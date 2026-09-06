@@ -6,6 +6,7 @@ import { attachmentReferenceListSchema, attachmentReferenceSchema } from "../dom
 import { isAttachmentImageMediaType, type AttachmentReference } from "../domain/attachments";
 import { providerAccountAuthoritySchema } from "../domain/provider-accounts";
 import { attemptIdSchema, queueIdSchema, sessionIdSchema, unixMillisecondsSchema, utf8Bytes } from "../domain/values";
+import { normalizeSchemaSql } from "./schema-cohort";
 
 export const QUEUE_ATTACHMENT_FORMAT = "atomic_attachments_v1";
 export const QUEUE_ATTACHMENT_PENDING_SOURCE_CAP = 200;
@@ -159,7 +160,6 @@ export const QUEUE_ATTACHMENT_SCHEMA_OBJECTS = [
     sql: "CREATE INDEX IF NOT EXISTS queue_attachment_quarantine_session ON queue_attachment_quarantines(session_id,queue_id,ordinal);" },
   ...guards.map((guard) => ({ ...guard, type: "trigger" as const })),
 ];
-const normalizeSql = (value: string): string => value.replace(/\bIF NOT EXISTS\b/giu, "").replace(/\s+/gu, " ").trim().replace(/;$/u, "");
 export function applyQueueAttachmentSchema(database: Database): void {
   if (database.query("SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='enqueue_identity_format'").get() === null) {
     database.exec(`ALTER TABLE queue_entries ADD COLUMN enqueue_identity_format TEXT CHECK(enqueue_identity_format IS NULL OR enqueue_identity_format='${QUEUE_ATTACHMENT_FORMAT}')`);
@@ -178,12 +178,18 @@ export function assertQueueAttachmentSchema(database: Database): void {
   const identityColumn = database.query("SELECT type,\"notnull\" AS required,dflt_value FROM pragma_table_info('queue_entries') WHERE name='enqueue_identity_attempt_id'").get() as { type: string; required: number; dflt_value: string | null } | null;
   if (identityColumn?.type !== "TEXT" || identityColumn.required !== 0 || identityColumn.dflt_value !== null) return corrupt();
   const parent = database.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='queue_entries'").get() as { sql: string } | null;
-  if (parent === null || /\/\*|--/u.test(parent.sql) || !normalizeSql(parent.sql).replace(/\s+/gu, "").includes(
-    `enqueue_identity_formatTEXTCHECK(enqueue_identity_formatISNULLORenqueue_identity_format='${QUEUE_ATTACHMENT_FORMAT}')`)) return corrupt();
-  if (!normalizeSql(parent.sql).replace(/\s+/gu, "").includes(`enqueue_identity_attempt_idTEXTREFERENCESqueue_attachment_identities(attempt_id)DEFERRABLEINITIALLYDEFERREDCHECK((enqueue_identity_formatISNULLANDenqueue_identity_attempt_idISNULL)OR(enqueue_identity_formatIS'${QUEUE_ATTACHMENT_FORMAT}'ANDenqueue_identity_attempt_idISNOTNULL))`)) return corrupt();
+  if (parent === null || /\/\*|--/u.test(parent.sql)) return corrupt();
+  const parentSql = normalizeSchemaSql(parent.sql);
+  // These owned columns are the complete appended tail in the admitted schema.
+  // A future queue-column migration must extend this exact audit, not match
+  // declaration text that could occur within an unrelated quoted identifier.
+  const suffix = normalizeSchemaSql(`, enqueue_identity_format TEXT CHECK(enqueue_identity_format IS NULL OR enqueue_identity_format='${QUEUE_ATTACHMENT_FORMAT}'),
+    enqueue_identity_attempt_id TEXT REFERENCES queue_attachment_identities(attempt_id) DEFERRABLE INITIALLY DEFERRED
+    CHECK((enqueue_identity_format IS NULL AND enqueue_identity_attempt_id IS NULL) OR (enqueue_identity_format IS '${QUEUE_ATTACHMENT_FORMAT}' AND enqueue_identity_attempt_id IS NOT NULL))) STRICT`);
+  if (!parentSql.endsWith(suffix)) return corrupt();
   for (const object of QUEUE_ATTACHMENT_SCHEMA_OBJECTS) {
     const row = database.query("SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?").get(object.name) as { type: string; tbl_name: string; sql: string } | null;
-    if (row === null || row.type !== object.type || row.tbl_name !== object.table || normalizeSql(row.sql) !== normalizeSql(object.sql)) return corrupt();
+    if (row === null || row.type !== object.type || row.tbl_name !== object.table || normalizeSchemaSql(row.sql) !== normalizeSchemaSql(object.sql)) return corrupt();
   }
 }
 export function readQueueAttachmentIdentity(database: Database, queueIdInput: string): QueueAttachmentIdentity | null {

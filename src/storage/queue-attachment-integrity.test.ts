@@ -1,14 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, realpath } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
-import { ATTACHMENT_CUSTODY_COLUMNS } from "./attachment-custody-schema";
+import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
-import { QUEUE_ATTACHMENT_SCHEMA_OBJECTS } from "./queue-attachment-identity";
 import { StateStore, type StoredMessageAttachment } from "./state-store";
 
 const stores: StateStore[] = [];
@@ -30,9 +28,11 @@ async function fixture() {
   const daemonGeneration = store.nextDaemonGeneration(bootId);
   const profile = store.nextProfileGeneration(store.createProfile("Queue integrity").id);
   store.setProfileState(profile.id, profile.processGeneration, "signed_in", { email: "queue@example.com", plan: "Plus" });
-  const created = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-  const session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision, providerThreadId: "queue-integrity", state: "idle" });
   const authority = store.requireProviderAccountAuthority(profile.id, "codex");
+  const imported = store.upsertProviderSession({ profileId: profile.id, provider: "codex",
+    providerAuthority: authority, providerAccountKey: `v1:codex:${createHash("sha256").update("queue@example.com").digest("hex")}`,
+    preset: "high", fastEnabled: false, title: "Queue integrity", providerThreadId: "queue-integrity", state: "idle" });
+  const session = store.updateSessionMetadata({ sessionId: imported.id, expectedRevision: imported.revision, preset: "high" });
   const database = new Database(paths.database, { strict: true });
   databases.push(database);
   database.exec("PRAGMA foreign_keys=ON");
@@ -55,40 +55,35 @@ async function fixture() {
   };
   return { store, database, clock, paths, session, authority, profile, input, enqueue, close, reopen, dropGuard };
 }
-function removeAttachmentCustodyMigration(database: Database) {
-  database.exec("PRAGMA foreign_keys=OFF");
-  for (const type of ["trigger", "index"] as const) {
-    for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
-      if (object.type === type) database.exec(`DROP ${type.toUpperCase()} ${object.name}`);
-    }
-  }
-  for (const definition of [...ATTACHMENT_CUSTODY_COLUMNS].reverse()) {
-    database.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${definition.slice(0, definition.indexOf(" "))}`);
-  }
-  for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
-    if (object.type === "table") database.exec(`DROP TABLE ${object.name}`);
-  }
-  database.exec("DELETE FROM migrations WHERE version=48");
-  expect(database.query("SELECT name FROM pragma_table_info('mutation_attempts') WHERE name LIKE 'attachment_%'").all()).toEqual([]);
-}
-function downgrade(database: Database) {
-  removeAttachmentCustodyMigration(database);
-  for (const object of QUEUE_ATTACHMENT_SCHEMA_OBJECTS.filter((entry) => entry.type === "trigger")) database.exec(`DROP TRIGGER ${object.name}`);
-  database.exec("ALTER TABLE queue_entries DROP COLUMN enqueue_identity_attempt_id");
-  database.exec("ALTER TABLE queue_entries DROP COLUMN enqueue_identity_format");
-  for (const type of ["index", "table"] as const) for (const object of [...QUEUE_ATTACHMENT_SCHEMA_OBJECTS].reverse()) {
-    if (object.type === type) database.exec(`DROP ${type.toUpperCase()} ${object.name}`);
-  }
-  database.exec("DELETE FROM migrations WHERE version=47; PRAGMA user_version=46; PRAGMA foreign_keys=ON");
+async function legacyFixture(state: "pending" | "cancelled") {
+  const entry = canonical40QueuesFixture.queues.find((queue) => queue.state === state);
+  if (entry === undefined) throw new Error("Missing archived queue fixture.");
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical40-queue-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  await writeFile(paths.database, canonical40QueuesDatabaseBytes());
+  await chmod(paths.database, 0o600);
+  const store = new StateStore(paths, { now: () => 1_900_000_001_000 });
+  stores.push(store);
+  const database = new Database(paths.database, { strict: true });
+  databases.push(database);
+  const session = store.requireSession(entry.sessionId);
+  const queued = store.requireQueue(entry.queueId);
+  const input = { sessionId: session.id, message: entry.originalMessage, idempotencyKey: entry.idempotencyKey, attachments: [] };
+  return { store, database, session, queued, input };
 }
 describe("queue attachment durable integrity", () => {
   test("legacy pending identity is quarantined without losing its body across boot and explicit abandonment", async () => {
-    const f = await fixture();
-    const queued = f.store.enqueueIdempotent({ ...f.input, attachments: [] });
-    f.close(); downgrade(f.database);
-    const reopened = f.reopen();
+    const f = await legacyFixture("pending");
+    const { store: reopened, queued } = f;
     expect(reopened.hasUnsettledQueueAttachmentQuarantineForSession(f.session.id)).toBe(true);
-    expect(reopened.nextPendingQueue(f.session.id)?.id).toBe(queued.id);
+    expect(reopened.listQueue(f.session.id)).toEqual([queued]);
+    // Canonical40 has no immutable queue provider tuple. Keep its FIFO head
+    // visible, but never return that head from the dispatch-facing selector.
+    expect(reopened.nextPendingQueue(f.session.id)).toBeNull();
+    expect(f.database.query("SELECT queue_id FROM queue_provider_authorities WHERE queue_id=?").get(queued.id)).toBeNull();
+    expect(f.database.query("SELECT scope_id FROM legacy_provider_authority_quarantines WHERE scope_kind='queue' AND scope_id=?").get(queued.id))
+      .toEqual({ scope_id: queued.id });
     expect(() => reopened.queueAttachmentManifest(queued.id)).toThrow("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
     reopened.nextDaemonGeneration(`boot_${"b".repeat(32)}`);
     expect(reopened.requireQueue(queued.id)).toMatchObject({ state: "pending", message: f.input.message });
@@ -99,17 +94,16 @@ describe("queue attachment durable integrity", () => {
     expect(reopened.abandonQueueAttachmentQuarantinedSession({ sessionId: current.id, expectedRevision: current.revision }).state).toBe("terminal");
     expect(reopened.requireQueue(queued.id)).toMatchObject({ state: "cancelled", message: "[queue message removed after settlement]" });
     expect(reopened.hasUnsettledQueueAttachmentQuarantineForSession(f.session.id)).toBe(false);
-    expect(f.database.query("SELECT ordinal,kind FROM queue_attachment_quarantines ORDER BY ordinal").all()).toEqual([
+    expect(f.database.query("SELECT ordinal,kind FROM queue_attachment_quarantines WHERE queue_id=? ORDER BY ordinal").all(queued.id)).toEqual([
       { ordinal: 1, kind: "quarantined" }, { ordinal: 2, kind: "abandoned" },
     ]);
   });
   test("legacy terminal receipt remains text-replayable without inventing an empty seal", async () => {
-    const f = await fixture(); const queued = f.store.enqueueIdempotent({ ...f.input, attachments: [] });
-    f.store.transitionQueue(queued.id, "pending", "cancelled"); f.close(); downgrade(f.database);
-    const reopened = f.reopen();
+    const f = await legacyFixture("cancelled");
+    const { store: reopened, queued } = f;
     expect(reopened.readQueueEnqueueReplay({ ...f.input, attachments: [] })).toEqual({ queued: reopened.requireQueue(queued.id), verification: "legacy_unverified" });
     expect(f.database.query("SELECT * FROM queue_attachment_identities").all()).toEqual([]);
-    expect(f.database.query("SELECT * FROM queue_attachment_quarantines").all()).toEqual([]);
+    expect(f.database.query("SELECT * FROM queue_attachment_quarantines WHERE queue_id=?").all(queued.id)).toEqual([]);
   });
   test.each(["queue_attachment_identities", "queue_attachment_identity_anchors"] as const)("missing %s fails hot original-key and both reopen modes", async (table) => {
     const f = await fixture(); const queued = f.enqueue();
@@ -157,15 +151,17 @@ describe("queue attachment durable integrity", () => {
       request: { title: "wrong owner" }, idempotencyKey: f.input.idempotencyKey })).toThrow();
     f.close(); expect(() => f.reopen()).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
   });
-  test("an anchor-only partial47 schema is not mistaken for a legacy namespace", async () => {
+  test("an anchor-only queue schema is not mistaken for a legacy namespace before current-cohort repair", async () => {
     const f = await fixture(); f.enqueue();
-    removeAttachmentCustodyMigration(f.database);
-    // Deliberately retain the partial47 marker, anchor, guards and stamp.
-    // Only migration48 is removed before simulating the older version header.
-    f.database.exec("PRAGMA foreign_keys=OFF; DROP TABLE queue_attachment_identities; PRAGMA user_version=46");
+    // Keep the genuine current cohort and every surviving marker/anchor. An
+    // absent owned table is corruption, not permission to repair a legacy DB.
+    f.database.exec("PRAGMA foreign_keys=OFF; DROP TABLE queue_attachment_identities");
+    const before = f.database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all();
     expect(() => f.store.prepareMutation({ kind: "session.rename", authorityId: f.session.id, authorityGeneration: f.authority.processGeneration,
       request: {}, idempotencyKey: f.input.idempotencyKey })).toThrow();
     f.close(); expect(() => f.reopen()).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
+    expect(f.database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all()).toEqual(before);
+    expect(f.database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
   });
   test("a retained format marker prevents public manifest repair after both seals disappear", async () => {
     const f = await fixture(); const queue = f.enqueue();

@@ -1,13 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, utimes } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createAttemptId } from "../domain/values";
-import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
-import { ATTACHMENT_CUSTODY_COLUMNS } from "./attachment-custody-schema";
+import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
 import { AttachmentBlobStore, type AttachmentCleanupPort } from "./attachment-store";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP, StateStore, type StoredMessageAttachment } from "./state-store";
@@ -24,12 +22,16 @@ afterEach(async () => {
 
 type CleanupHook = (...args: Parameters<AttachmentCleanupPort["unlinkCleanupCandidateSync"]>) => void;
 
-async function fixture(hook?: CleanupHook) {
+async function fixture(hook?: CleanupHook, legacyKind?: "session.send" | "session.steer") {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-attachment-reservations-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
-  const clock = { now: 1_800_000_000_000 };
+  if (legacyKind !== undefined) {
+    await writeFile(paths.database, canonical40QueuesDatabaseBytes());
+    await chmod(paths.database, 0o600);
+  }
+  const clock = { now: legacyKind === undefined ? 1_800_000_000_000 : 1_900_000_001_000 };
   const blobs = AttachmentBlobStore.forStatePaths(paths);
   const cleanupCalls: Parameters<AttachmentCleanupPort["unlinkCleanupCandidateSync"]>[] = [];
   // Fixed at construction: a candidate never supplies executable cleanup code.
@@ -42,17 +44,31 @@ async function fixture(hook?: CleanupHook) {
   };
   const store = new StateStore(paths, { now: () => clock.now, attachmentCleanupPort });
   stores.push(store);
-  const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
-  const daemonGeneration = store.nextDaemonGeneration(bootId);
+  const bootId = legacyKind === undefined ? `boot_${randomUUID().replaceAll("-", "")}` : canonical40QueuesFixture.bootId;
+  const daemonGeneration = legacyKind === undefined ? store.nextDaemonGeneration(bootId) : canonical40QueuesFixture.daemonGeneration;
   const daemon = { daemonGeneration, bootId };
-  const profile = store.nextProfileGeneration(store.createProfile("Attachment reservations").id);
-  expect(store.setProfileState(profile.id, profile.processGeneration, "signed_in", {
+  const historical = legacyKind === undefined ? undefined : canonical40QueuesFixture.sessionInputs.find((entry) => entry.kind === legacyKind);
+  if (legacyKind !== undefined && historical === undefined) throw new Error("Missing archived input fixture.");
+  const profile = historical === undefined ? store.nextProfileGeneration(store.createProfile("Attachment reservations").id)
+    : store.requireProfileById(canonical40QueuesFixture.profileId);
+  if (historical === undefined) expect(store.setProfileState(profile.id, profile.processGeneration, "signed_in", {
     email: "attachments@example.com", plan: "Plus",
   })).toBe(true);
-  const created = store.createSession({ profileId: profile.id, provider: "codex", preset: "high", fastEnabled: false });
-  const session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
-    providerThreadId: "attachment-reservation-thread", state: "idle" });
   const authority = store.requireProviderAccountAuthority(profile.id, "codex");
+  const session = (() => {
+    if (historical !== undefined) return store.requireSession(historical.sessionId);
+    const imported = store.upsertProviderSession({ profileId: profile.id, provider: "codex",
+      providerAuthority: authority, providerAccountKey: `v1:codex:${createHash("sha256").update("attachments@example.com").digest("hex")}`,
+      title: "Attachment reservations", preset: "high", fastEnabled: false, providerThreadId: "attachment-reservation-thread", state: "idle" });
+    return store.updateSessionMetadata({ sessionId: imported.id, expectedRevision: imported.revision, preset: "high" });
+  })();
+  if (historical !== undefined) {
+    // The archive carries both kinds. Canonically cancel the unrelated one so
+    // this test's terminal cleanup oracle depends only on its own old request.
+    for (const entry of canonical40QueuesFixture.sessionInputs) if (entry.kind !== historical.kind) {
+      expect(store.transitionMutation(entry.attemptId, "prepared", "cancelled")).toBe(true);
+    }
+  }
   const other = new StateStore(paths, { now: () => clock.now });
   stores.push(other);
   const database = new Database(paths.database, { strict: true });
@@ -101,7 +117,7 @@ async function fixture(hook?: CleanupHook) {
       messageDigest: createHash("sha256").update("The exact human request.").digest("hex") },
   });
   return { paths, store, other, database, clock, blobs, daemon, session, authority, cleanupCalls, attachmentCleanupPort,
-    put, input, reserve, release, cleanup, prepare, beginInput };
+    put, input, reserve, release, cleanup, prepare, beginInput, historical };
 }
 
 describe("attachment reservations across storage and filesystem custody", () => {
@@ -424,52 +440,18 @@ describe("attachment reservations across storage and filesystem custody", () => 
   });
 
   test.each(["session.send", "session.steer"] as const)("historical unproved %s preparation blocks cleanup and cannot gain empty proof from closed replay", async (kind) => {
-    const value = await fixture();
+    const value = await fixture(undefined, kind);
+    const historical = value.historical;
+    if (historical === undefined) throw new Error("Expected an archived prepared request.");
     const blob = await value.put();
-    const key = randomUUID();
+    const key = historical.idempotencyKey;
     const description = { kind, authorityId: value.session.id,
       authorityGeneration: value.authority.processGeneration, request: { message: "The exact human request." },
-      idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: value.authority, provenance: "session_effect" }],
+      idempotencyKey: randomUUID(), providerAuthorities: [{ role: "primary", authority: value.authority, provenance: "session_effect" }],
     } as const;
     expect(() => value.store.prepareMutation(description)).toThrow("ATTACHMENT_CUSTODY_UNPROVED");
-    value.database.close(false);
-    databases.splice(databases.indexOf(value.database), 1);
-    for (const store of [value.store, value.other]) {
-      store.close();
-      stores.splice(stores.indexOf(store), 1);
-    }
-    const attemptId = createAttemptId();
-    const legacy = new Database(value.paths.database, { create: false, strict: true });
-    try {
-      legacy.exec("PRAGMA foreign_keys=OFF");
-      for (const type of ["trigger", "index"] as const) {
-        for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
-          if (object.type === type) legacy.exec(`DROP ${type.toUpperCase()} ${object.name}`);
-        }
-      }
-      for (const column of [...ATTACHMENT_CUSTODY_COLUMNS].reverse()) {
-        const name = column.split(" ")[0];
-        if (name === undefined) throw new Error("Expected exact custody column");
-        legacy.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${name}`);
-      }
-      for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
-        if (object.type === "table") legacy.exec(`DROP TABLE ${object.name}`);
-      }
-      legacy.exec("DELETE FROM migrations WHERE version=48; PRAGMA user_version=47; PRAGMA foreign_keys=ON");
-      const requestDigest = createHash("sha256").update(JSON.stringify({ kind, authorityId: value.session.id,
-        authorityGeneration: value.authority.processGeneration, request: description.request })).digest("hex");
-      legacy.query(`INSERT INTO mutation_attempts(
-        id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at
-      ) VALUES (?,?,?,?,?,?,'prepared',?,?)`).run(attemptId, key, kind, value.session.id,
-        value.authority.processGeneration, requestDigest, value.clock.now, value.clock.now);
-      legacy.query(`INSERT INTO mutation_provider_authorities(
-        attempt_id,role,provider_account_id,profile_id,provider,binding_generation,process_generation,provenance,recorded_at
-      ) VALUES (?,'primary',?,?,?,?,?,'session_effect',?)`).run(attemptId,
-        value.authority.providerAccountId, value.authority.profileId, value.authority.provider,
-        value.authority.bindingGeneration, value.authority.processGeneration, value.clock.now);
-    } finally { legacy.close(false); }
-    const store = new StateStore(value.paths, { now: () => value.clock.now, attachmentCleanupPort: value.attachmentCleanupPort });
-    stores.push(store);
+    const store = value.store;
+    const attemptId = historical.attemptId;
     const cleanup = () => store.cleanupAttachmentCandidate({ candidate: blob.candidate, ...value.daemon });
     const original = store.readMutation(key);
     expect(original).toMatchObject({ id: attemptId, state: "prepared" });

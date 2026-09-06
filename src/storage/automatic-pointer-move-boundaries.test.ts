@@ -71,6 +71,13 @@ async function fixture() {
   const project = await store.createProject("Pointer boundary project", projectRoot, true);
   const unbound = store.createSession({ profileId: source.id, projectId: project.id, provider: "codex", preset: "high", fastEnabled: false });
   const session = store.bindSession({ sessionId: unbound.id, expectedRevision: unbound.revision, providerThreadId: "pointer-boundary-thread", state: "idle" });
+  if (source.providerEmail === undefined) throw new Error("Missing source account identity.");
+  store.bindSessionProviderAccountAuthority({
+    sessionId: session.id,
+    provider: "codex",
+    runtimeScope: "managed",
+    accountKey: `v1:codex:${createHash("sha256").update(source.providerEmail.trim().toLowerCase()).digest("hex")}`,
+  });
   const database = new Database(paths.database, { strict: true });
   databases.push(database);
   database.exec("PRAGMA foreign_keys=ON");

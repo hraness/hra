@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
-import { randomKeyBytes } from "./crypto";
+import { decryptBytes, randomKeyBytes } from "./crypto";
 import {
+  cloudPayloadAad,
   decryptDeviceCommand,
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
@@ -24,6 +25,7 @@ import {
   parseDeviceRegistryPayload,
   parseRemoteCommandPayload,
   parseSessionMetadataPayload,
+  type DeviceRegistryPayload,
 } from "./payloads";
 import {
   USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS,
@@ -423,14 +425,6 @@ function registryFixture() {
         nextRunAt: 1_700_000_060_000,
         sessionPublicId: "sess_00000000000000000000000000000001",
       },
-      {
-        cadence: "FREQ=WEEKLY;BYDAY=MO",
-        id: "upload-usage",
-        kind: "codex_automation",
-        label: "Upload usage",
-        nextRunAt: null,
-        sessionPublicId: null,
-      },
     ],
     showThinkingDefault: false,
     version: 1,
@@ -458,6 +452,61 @@ describe("device registry payloads", () => {
       ...authority,
       kind: "session_metadata",
     }));
+  });
+
+  test("removes legacy Codex Desktop automation metadata before encrypting the public registry", async () => {
+    const privateAutomation = {
+      cadence: "FREQ=WEEKLY;BYDAY=MO",
+      id: "desktop-private-automation-id",
+      kind: "codex_automation",
+      label: "Desktop private automation label",
+      nextRunAt: null,
+      sessionPublicId: "sess_private_target_correlation",
+    } as const;
+    const legacyRegistry = {
+      ...registry,
+      scheduledTasks: [...registry.scheduledTasks, privateAutomation],
+    };
+    const parsed = parseDeviceRegistryPayload(legacyRegistry);
+    expect(parsed?.scheduledTasks).toEqual(registry.scheduledTasks);
+
+    const key = randomKeyBytes();
+    const envelope = await encryptDeviceRegistry(
+      legacyRegistry as unknown as DeviceRegistryPayload,
+      key,
+      authority,
+    );
+    const plaintext = new TextDecoder().decode(await decryptBytes(
+      envelope,
+      key,
+      cloudPayloadAad(authority),
+    ));
+    expect(JSON.parse(plaintext)).toEqual(parsed);
+    for (const privateValue of [
+      privateAutomation.id,
+      privateAutomation.label,
+      privateAutomation.cadence,
+      privateAutomation.sessionPublicId,
+    ]) {
+      expect(plaintext).not.toContain(privateValue);
+    }
+  });
+
+  test("accepts additive exact personal-session adoption aggregates without candidate detail", async () => {
+    const withAdoption = {
+      ...registry,
+      sessionAdoption: {
+        claude: { adopted: 1, enabled: false, fenced: 2, pending: 3 },
+        codex: { adopted: 4, enabled: true, fenced: 5, pending: 6 },
+      },
+    } as const;
+    const parsed = parseDeviceRegistryPayload(withAdoption);
+    expect(parsed).toEqual(withAdoption);
+    expect(JSON.stringify(parsed)).not.toContain("providerThreadId");
+
+    const key = randomKeyBytes();
+    const envelope = await encryptDeviceRegistry(withAdoption, key, authority);
+    expect(await decryptDeviceRegistry(envelope, key, authority)).toEqual(withAdoption);
   });
 
   test("parses and encrypts a registry carrying a Devin account and Astra default", async () => {
@@ -494,11 +543,11 @@ describe("device registry payloads", () => {
     })).toBeNull();
     expect(parseDeviceRegistryPayload({
       ...registry,
-      scheduledTasks: [{ ...registry.scheduledTasks[1], label: absolutePath }],
+      scheduledTasks: [{ ...registry.scheduledTasks[0], label: absolutePath }],
     })).toBeNull();
     expect(parseDeviceRegistryPayload({
       ...registry,
-      scheduledTasks: [{ ...registry.scheduledTasks[1], cadence: absolutePath }],
+      scheduledTasks: [{ ...registry.scheduledTasks[0], cadence: absolutePath }],
     })).toBeNull();
     await expectPromiseToReject(encryptDeviceRegistry(
       { ...registry, machineLabel: absolutePath },
@@ -538,6 +587,43 @@ describe("device registry payloads", () => {
       ...registry,
       projects: Array.from({ length: 201 }, () => registry.projects[0]),
     })).toBeNull();
+    const adoption = {
+      claude: { adopted: 1, enabled: false, fenced: 2, pending: 3 },
+      codex: { adopted: 4, enabled: true, fenced: 5, pending: 6 },
+    } as const;
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      sessionAdoption: { ...adoption, codex: { ...adoption.codex, pending: -1 } },
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      sessionAdoption: { ...adoption, claude: { ...adoption.claude, enabled: "yes" } },
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      sessionAdoption: { ...adoption, codex: { ...adoption.codex, title: "private" } },
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      sessionAdoption: { codex: adoption.codex },
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      sessionAdoption: {
+        ...adoption,
+        devin: { adopted: 7, enabled: true, fenced: 8, pending: 9 },
+      },
+    })).toBeNull();
+    for (const privateExtra of [
+      { candidateIds: ["candidate_private"] },
+      { providerHome: "/private/provider/home" },
+      { providerThreadId: "provider_thread_private" },
+      { sourceProcessIdentity: { pid: 42 } },
+      { authorityHash: "authority_hash_private" },
+    ]) {
+      expect(parseDeviceRegistryPayload({ ...registry, ...privateExtra, sessionAdoption: adoption }))
+        .toBeNull();
+    }
   });
 
   test("takes one accessor-free snapshot before validating a registry", () => {

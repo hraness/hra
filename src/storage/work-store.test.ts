@@ -54,6 +54,10 @@ import {
 const databases: Database[] = [];
 const stateStores: StateStore[] = [];
 const capability = `hrac1_${"A".repeat(43)}`;
+const codexAccountKey = (email: string): string =>
+  `v1:codex:${createHash("sha256").update(email.trim().toLowerCase()).digest("hex")}`;
+const claudeAccountKey = (identity: string): string =>
+  `v1:claude:${createHash("sha256").update(identity).digest("hex")}`;
 
 let uuidV7Sequence = 0;
 
@@ -101,7 +105,9 @@ const parentSchema = `
 CREATE TABLE profiles(
   id TEXT PRIMARY KEY,
   state TEXT NOT NULL,
-  process_generation INTEGER NOT NULL
+  process_generation INTEGER NOT NULL,
+  provider_email TEXT,
+  codex_account_key TEXT
 ) STRICT;
 CREATE TABLE projects(
   id TEXT PRIMARY KEY
@@ -112,6 +118,7 @@ CREATE TABLE sessions(
   project_id TEXT NOT NULL REFERENCES projects(id),
   provider TEXT NOT NULL DEFAULT 'codex',
   provider_v39 TEXT NOT NULL DEFAULT 'codex',
+  provider_thread_id TEXT,
   preset TEXT NOT NULL,
   preset_contract INTEGER NOT NULL DEFAULT 2 CHECK(preset_contract IN (1,2)),
   fast_enabled INTEGER NOT NULL,
@@ -133,7 +140,8 @@ CREATE TABLE session_provider_authorities(
   provider TEXT NOT NULL,
   binding_generation INTEGER NOT NULL,
   process_generation INTEGER NOT NULL,
-  authority_revision INTEGER NOT NULL
+  authority_revision INTEGER NOT NULL,
+  routing_provenance TEXT NOT NULL DEFAULT 'explicit'
 ) STRICT;
 CREATE TRIGGER fixture_session_authority_insert AFTER INSERT ON sessions BEGIN
   INSERT OR IGNORE INTO provider_accounts
@@ -146,7 +154,7 @@ CREATE TRIGGER fixture_session_authority_insert AFTER INSERT ON sessions BEGIN
     SELECT 'dact_'||substr(p.id,6),p.id,'devin',1,1,'signed_in'
     FROM profiles p WHERE p.id=NEW.profile_id;
   INSERT INTO session_provider_authorities
-    SELECT NEW.id,a.id,a.profile_id,a.provider,a.binding_generation,a.process_generation,1
+    SELECT NEW.id,a.id,a.profile_id,a.provider,a.binding_generation,a.process_generation,1,'explicit'
     FROM provider_accounts a WHERE a.profile_id=NEW.profile_id AND a.provider=NEW.provider_v39;
 END;
 CREATE TRIGGER fixture_session_authority_update AFTER UPDATE OF provider_v39 ON sessions
@@ -163,6 +171,53 @@ CREATE TRIGGER fixture_codex_process_mirror AFTER UPDATE OF process_generation O
   UPDATE provider_accounts SET process_generation=NEW.process_generation WHERE profile_id=NEW.id AND provider='codex';
   UPDATE session_provider_authorities SET process_generation=NEW.process_generation,authority_revision=authority_revision+1
     WHERE profile_id=NEW.id AND provider='codex';
+END;
+CREATE TABLE session_account_authorities(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  account_key TEXT,
+  recorded_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE provider_runtime_account_revocations(
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  profile_generation INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  runtime_scope TEXT NOT NULL,
+  current_account_key TEXT,
+  state TEXT NOT NULL,
+  PRIMARY KEY(profile_id,provider,runtime_scope)
+) STRICT;
+CREATE TABLE session_provider_account_authorities(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  runtime_scope TEXT NOT NULL,
+  account_key TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE session_personal_runtime_bindings(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  provider_thread_id TEXT NOT NULL,
+  state TEXT NOT NULL
+) STRICT;
+CREATE TRIGGER session_account_authority_insert
+AFTER INSERT ON sessions
+BEGIN
+  INSERT INTO session_account_authorities(session_id,profile_id,account_key,recorded_at)
+  SELECT NEW.id,NEW.profile_id,
+    CASE WHEN p.provider_email IS NULL THEN NULL ELSE lower(trim(p.provider_email)) END,
+    0
+  FROM profiles p WHERE p.id=NEW.profile_id;
+END;
+CREATE TRIGGER session_provider_account_authority_insert
+AFTER INSERT ON sessions
+WHEN NEW.provider_v39='codex'
+BEGIN
+  INSERT INTO session_provider_account_authorities(
+    session_id,provider,runtime_scope,account_key,recorded_at
+  )
+  SELECT NEW.id,'codex','managed',p.codex_account_key,0
+  FROM profiles p WHERE p.id=NEW.profile_id AND p.codex_account_key IS NOT NULL;
 END;
 CREATE TABLE session_events(
   session_id TEXT NOT NULL,
@@ -242,8 +297,9 @@ function fixture(): Fixture {
   const actorSessionId = createSessionId();
   const reviewerSessionId = createSessionId();
   database.query(
-    "INSERT INTO profiles(id,state,process_generation) VALUES (?,'signed_in',1)",
-  ).run(accountId);
+    `INSERT INTO profiles(id,state,process_generation,provider_email,codex_account_key)
+     VALUES (?,'signed_in',1,'worker@example.com',?)`,
+  ).run(accountId, codexAccountKey("worker@example.com"));
   database.query("INSERT INTO projects(id) VALUES (?)").run(projectId);
   for (const sessionId of [actorSessionId, reviewerSessionId]) {
     database.query(
@@ -305,12 +361,19 @@ async function originalSendOwnerFixture(): Promise<Fixture & Readonly<{
       preset: "high",
       fastEnabled: false,
     });
-    return stateStore.bindSession({
+    const bound = stateStore.bindSession({
       sessionId: created.id,
       expectedRevision: created.revision,
       providerThreadId: thread,
       state: "idle",
-    }).id;
+    });
+    stateStore.bindSessionProviderAccountAuthority({
+      sessionId: bound.id,
+      provider: "codex",
+      runtimeScope: "managed",
+      accountKey: `v1:codex:${createHash("sha256").update("work-owner@example.com").digest("hex")}`,
+    });
+    return bound.id;
   };
   const actorSessionId = bindSession("work-owner-actor");
   const reviewerSessionId = bindSession("work-owner-reviewer");
@@ -387,6 +450,90 @@ function claimOriginalSendOwner(
       runtimeProfile,
     },
   });
+}
+
+function bindPersonalProviderAuthority(
+  value: Fixture,
+  sessionId: SessionId,
+  provider: "claude" | "codex",
+  providerThreadId: string,
+  accountKey: string,
+): void {
+  value.database.query(
+    "DELETE FROM session_personal_runtime_bindings WHERE session_id=?",
+  ).run(sessionId);
+  value.database.query(
+    "DELETE FROM session_provider_account_authorities WHERE session_id=?",
+  ).run(sessionId);
+  value.database.query(
+    "UPDATE sessions SET provider=?,provider_v39=?,provider_thread_id=? WHERE id=?",
+  ).run(provider, provider, providerThreadId, sessionId);
+  value.database.query(
+    `INSERT INTO session_provider_account_authorities(
+       session_id,provider,runtime_scope,account_key,recorded_at
+     ) VALUES (?,?, 'personal',?,0)`,
+  ).run(sessionId, provider, accountKey);
+  value.database.query(
+    `INSERT INTO session_personal_runtime_bindings(
+       session_id,provider,provider_thread_id,state
+     ) VALUES (?,?,?,'active')`,
+  ).run(sessionId, provider, providerThreadId);
+}
+
+function addSignedOutPersonalClaudeSession(
+  value: Fixture,
+  label: string,
+): Readonly<{
+  accountKey: string;
+  profileId: ProfileId;
+  sessionId: SessionId;
+}> {
+  const profileId = createProfileId();
+  const sessionId = createSessionId();
+  const providerThreadId = `personal-claude-${label}`;
+  const accountKey = claudeAccountKey(label);
+  value.database.query(
+    `INSERT INTO profiles(id,state,process_generation,provider_email,codex_account_key)
+     VALUES (?,'signed_out',1,NULL,NULL)`,
+  ).run(profileId);
+  value.database.query(
+    `INSERT INTO sessions(
+       id,profile_id,project_id,provider,provider_v39,provider_thread_id,preset,fast_enabled,state
+     ) VALUES (?,?,?,'claude','claude',?,'high',0,'active')`,
+  ).run(sessionId, profileId, value.projectId, providerThreadId);
+  bindPersonalProviderAuthority(
+    value,
+    sessionId,
+    "claude",
+    providerThreadId,
+    accountKey,
+  );
+  return { accountKey, profileId, sessionId };
+}
+
+function addSignedOutManagedDevinSession(
+  value: Fixture,
+  label: string,
+): Readonly<{
+  profileId: ProfileId;
+  sessionId: SessionId;
+}> {
+  const profileId = createProfileId();
+  const sessionId = createSessionId();
+  value.database.query(
+    `INSERT INTO profiles(id,state,process_generation,provider_email,codex_account_key)
+     VALUES (?,'signed_out',1,NULL,NULL)`,
+  ).run(profileId);
+  value.database.query(
+    `INSERT INTO sessions(
+       id,profile_id,project_id,provider,provider_v39,provider_thread_id,preset,
+       preset_contract,fast_enabled,state
+     ) VALUES (?,?,?,'codex','devin',?,'ultra',2,0,'active')`,
+  ).run(sessionId, profileId, value.projectId, `devin-${label}`);
+  value.database.query(
+    "DELETE FROM session_account_authorities WHERE session_id=?",
+  ).run(sessionId);
+  return { profileId, sessionId };
 }
 
 function fillWorkEventCapacity(
@@ -715,6 +862,13 @@ function prepareSignal(value: Fixture, provider: "codex" | "claude" | "devin" = 
   if (provider !== "codex") {
     value.database.query("UPDATE sessions SET provider_v39=?,preset='ultra' WHERE id=?")
       .run(provider, value.reviewerSessionId);
+    if (provider === "claude") {
+      value.database.query("DELETE FROM session_provider_account_authorities WHERE session_id=?")
+        .run(value.reviewerSessionId);
+      value.database.query(`INSERT INTO session_provider_account_authorities(
+        session_id,provider,runtime_scope,account_key,recorded_at
+      ) VALUES (?,'claude','managed',?,0)`).run(value.reviewerSessionId, `v1:claude:${"c".repeat(64)}`);
+    }
   }
   const created = createWork(value);
   join(value, created.work.id, created.work.revision, value.reviewerSessionId);
@@ -730,6 +884,26 @@ function prepareSignal(value: Fixture, provider: "codex" | "claude" | "devin" = 
 }
 
 describe("WorkStore schema and atomic plans", () => {
+  test("fences Claude Work signals under scoped revocation despite a different Codex shadow", () => {
+    for (const state of ["releasing", "completed"] as const) {
+      const value = fixture();
+      value.database.query("UPDATE provider_accounts SET process_generation=2 WHERE profile_id=? AND provider='claude'")
+        .run(value.accountId);
+      const { key, workId } = prepareSignal(value, "claude");
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+      value.database.query(`INSERT INTO provider_runtime_account_revocations(
+        profile_id,profile_generation,provider,runtime_scope,current_account_key,state
+      ) VALUES (?,1,'claude','managed',?,?)`).run(value.accountId,
+        `v1:claude:${(state === "releasing" ? "c" : "d").repeat(64)}`, state);
+      expect(value.store.authorizePreparedEffect(key)).toMatchObject({ executable: false });
+      expect(() => value.store.apply({
+        kind: "signal.send", idempotencyKey: randomUUID(), workId,
+        senderSessionId: value.actorSessionId, senderCapability: capability,
+        targetSessionId: value.reviewerSessionId, mode: "queue", body: "Must not reach revoked Claude.",
+      })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    }
+  });
+
   test("work signal authority survives a sibling process restart but rejects its own provider generation", () => {
     for (const changedProvider of ["codex", "devin"] as const) {
       const value = fixture();
@@ -821,6 +995,38 @@ describe("WorkStore schema and atomic plans", () => {
     expect(() => assertWorkSignalProviderAuthorities(value.database)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_INVALID");
     expect(value.database.query("SELECT sql FROM sqlite_master WHERE name='work_signal_provider_authority_no_update'").get())
       .toEqual({ sql: expect.stringContaining("SELECT 1") });
+  });
+
+  test("work signal schema audit preserves IF NOT EXISTS inside a digest GLOB", () => {
+    const value = fixture();
+    const original = "*[^a-f0-9]*";
+    const altered = "*[IF NOT EXISTS^a-f0-9]*";
+    value.database.exec("DROP TABLE work_signal_provider_authorities");
+    value.database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL.replace(original, altered));
+    expect(value.database.query("SELECT ?1 NOT GLOB ?2 AS valid, ?1 NOT GLOB ?3 AS weakened")
+      .get("g".repeat(64), original, altered)).toEqual({ valid: 0, weakened: 1 });
+    const before = value.database.query("SELECT sql FROM sqlite_master WHERE name='work_signal_provider_authorities'").get();
+    const changes = value.database.query("SELECT total_changes() AS count").get();
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_INVALID");
+    expect(value.database.query("SELECT sql FROM sqlite_master WHERE name='work_signal_provider_authorities'").get()).toEqual(before);
+    expect(value.database.query("SELECT total_changes() AS count").get()).toEqual(changes);
+  });
+
+  test("work authority schema audit preserves phrase bytes inside frozen comments", () => {
+    const value = fixture();
+    const original = value.database.query<{ sql: string }, []>(
+      "SELECT sql FROM sqlite_master WHERE name='work_attempt_route_guard'",
+    ).get();
+    if (original === null) throw new Error("Expected the current route guard.");
+    const altered = original.sql.replace("the exact Luna/max tuple.", "the exact IF NOT EXISTS Luna/max tuple.");
+    expect(altered).not.toBe(original.sql);
+    value.database.exec("DROP TRIGGER work_attempt_route_guard");
+    value.database.exec(altered);
+    const changes = value.database.query("SELECT total_changes() AS count").get();
+    expect(() => assertWorkSchema(value.database)).toThrow("WORK_SCHEMA_STALE_TRIGGER:work_attempt_route_guard");
+    expect(() => assertReadonlyWorkSchema(value.database)).toThrow("WORK_SCHEMA_STALE_TRIGGER:work_attempt_route_guard");
+    expect(value.database.query("SELECT sql FROM sqlite_master WHERE name='work_attempt_route_guard'").get()).toEqual({ sql: altered });
+    expect(value.database.query("SELECT total_changes() AS count").get()).toEqual(changes);
   });
 
   test("legacy work signals retain their instruction bytes and quarantine without inferring current authority", () => {
@@ -975,6 +1181,84 @@ describe("WorkStore schema and atomic plans", () => {
     );
   });
 
+  test("rejects stale or unidentified session account authority for create, join, and claim", () => {
+    const value = fixture();
+    const original = createWork(value);
+    value.database.query(
+      `UPDATE profiles
+       SET provider_email='replacement@example.com',codex_account_key=?
+       WHERE id=?`,
+    ).run(codexAccountKey("replacement@example.com"), value.accountId);
+
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(value.database.query("SELECT COUNT(*) AS count FROM works").get()).toEqual({ count: 1 });
+
+    const freshCoordinatorSessionId = createSessionId();
+    value.database.query(
+      `INSERT INTO sessions(id,profile_id,project_id,preset,fast_enabled,state)
+       VALUES (?,?,?,'high',0,'active')`,
+    ).run(freshCoordinatorSessionId, value.accountId, value.projectId);
+    const freshKey = randomUUID();
+    const fresh = value.store.apply({
+      kind: "work.create",
+      idempotencyKey: freshKey,
+      clientRef: `plan-${freshKey}`,
+      coordinatorSessionId: freshCoordinatorSessionId,
+      objective: "Use only the replacement account authority.",
+      routes: [{
+        accountId: value.accountId,
+        projectId: value.projectId,
+        preset: "high",
+        fast: false,
+      }],
+      tasks: [taskSpec(value, "replacement")],
+    });
+    if (fresh.kind !== "work.create") throw new Error("unexpected result");
+    expect(() => value.store.apply({
+      kind: "work.join",
+      idempotencyKey: randomUUID(),
+      workId: fresh.work.id,
+      coordinatorSessionId: freshCoordinatorSessionId,
+      coordinatorCapability: capability,
+      actorSessionId: value.reviewerSessionId,
+    })).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_members WHERE work_id=?",
+    ).get(fresh.work.id)).toEqual({ count: 1 });
+    value.database.query(
+      "UPDATE sessions SET state='recovery_required' WHERE id=?",
+    ).run(freshCoordinatorSessionId);
+    expect(() => value.store.apply({
+      kind: "task.addBatch",
+      idempotencyKey: randomUUID(),
+      workId: fresh.work.id,
+      expectedWorkRevision: fresh.work.revision,
+      coordinatorSessionId: freshCoordinatorSessionId,
+      coordinatorCapability: capability,
+      tasks: [taskSpec(value, "recovery-fenced")],
+    })).toThrow(new WorkStoreError("ATTEMPT_NOT_OWNER"));
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_tasks WHERE work_id=?",
+    ).get(fresh.work.id)).toEqual({ count: 1 });
+
+    expect(() => claim(value, {
+      workId: original.work.id,
+      taskId: original.tasks[0]!.id,
+      revision: original.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_attempts WHERE work_id=?",
+    ).get(original.work.id)).toEqual({ count: 0 });
+
+    const unidentified = fixture();
+    unidentified.database.query(
+      "UPDATE profiles SET provider_email=NULL WHERE id=?",
+    ).run(unidentified.accountId);
+    expect(() => createWork(unidentified)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(unidentified.database.query("SELECT COUNT(*) AS count FROM works").get())
+      .toEqual({ count: 0 });
+  });
+
   test("rejects current work guards against a pre-provider session schema", () => {
     const database = new Database(":memory:", { strict: true });
     databases.push(database);
@@ -1107,51 +1391,49 @@ describe("WorkStore schema and atomic plans", () => {
 });
 
 describe("WorkStore original send ownership", () => {
-  test("original send ownership: rejects coherent unclaimed, direct, and terminal owners without changing either journal", async () => {
-    for (const stage of ["input_required", "effect_started", "accepted", "ambiguous", "abandoned", "cancelled"] as const) {
-      const value = await originalSendOwnerFixture();
-      const prepared = prepareOwnerGuardDispatch(value);
-      const owner = prepareOriginalSendOwner(value, prepared.effect.nestedMutationKey, workPreparedEffectMessage(prepared.effect));
-      if (stage === "cancelled") {
-        value.stateStore.cancelOwnedSessionSend({ attemptId: owner.owner.attemptId, ownerDigest: owner.ownerDigest });
-      } else if (stage !== "input_required") {
-        const claim = claimOriginalSendOwner(value, owner);
-        if (claim.claim === null || claim.claimDigest === null) throw new Error("owned direct claim missing");
-        const settlement = {
-          attemptId: owner.owner.attemptId,
-          ownerDigest: owner.ownerDigest,
-          claimDigest: claim.claimDigest,
-        };
-        if (stage === "accepted") {
-          value.stateStore.settleOwnedDirectSend({
-            ...settlement,
-            outcome: { kind: "accepted", receipt: {
-              sourceId: owner.owner.attemptId,
-              turnId: "original-owned-turn",
-              status: "completed",
-              effectiveRuntimeProfile: claim.claim.evidence.runtimeProfile,
-            } },
-          });
-        } else if (stage === "ambiguous" || stage === "abandoned") {
-          value.stateStore.settleOwnedDirectSend({ ...settlement, outcome: { kind: "ambiguous", reason: "provider_outcome_unknown" } });
-          if (stage === "abandoned") {
-            value.stateStore.settleOwnedDirectSend({ ...settlement, outcome: { kind: "abandoned", acknowledgeOutcomeUnknown: true } });
-          }
+  test.each(["input_required", "effect_started", "accepted", "ambiguous", "abandoned", "cancelled"] as const)("original send ownership: rejects coherent %s owner without changing either journal", async (stage) => {
+    const value = await originalSendOwnerFixture();
+    const prepared = prepareOwnerGuardDispatch(value);
+    const owner = prepareOriginalSendOwner(value, prepared.effect.nestedMutationKey, workPreparedEffectMessage(prepared.effect));
+    if (stage === "cancelled") {
+      value.stateStore.cancelOwnedSessionSend({ attemptId: owner.owner.attemptId, ownerDigest: owner.ownerDigest });
+    } else if (stage !== "input_required") {
+      const claim = claimOriginalSendOwner(value, owner);
+      if (claim.claim === null || claim.claimDigest === null) throw new Error("owned direct claim missing");
+      const settlement = {
+        attemptId: owner.owner.attemptId,
+        ownerDigest: owner.ownerDigest,
+        claimDigest: claim.claimDigest,
+      };
+      if (stage === "accepted") {
+        value.stateStore.settleOwnedDirectSend({
+          ...settlement,
+          outcome: { kind: "accepted", receipt: {
+            sourceId: owner.owner.attemptId,
+            turnId: "original-owned-turn",
+            status: "completed",
+            effectiveRuntimeProfile: claim.claim.evidence.runtimeProfile,
+          } },
+        });
+      } else if (stage === "ambiguous" || stage === "abandoned") {
+        value.stateStore.settleOwnedDirectSend({ ...settlement, outcome: { kind: "ambiguous", reason: "provider_outcome_unknown" } });
+        if (stage === "abandoned") {
+          value.stateStore.settleOwnedDirectSend({ ...settlement, outcome: { kind: "abandoned", acknowledgeOutcomeUnknown: true } });
         }
       }
-      const before = value.stateStore.readOwnedSessionSend(prepared.effect.nestedMutationKey);
-      expect(before?.state).toBe(stage);
-      const workBefore = value.store.snapshot(prepared.created.work.id);
-      const rejected = new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
-      expect(() => value.store.authorizePreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
-      expect(() => value.store.reprojectPreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
-      expect(() => value.store.settlePreparedEffectNoEffect(prepared.operation.idempotencyKey, "not_dispatched")).toThrow(rejected);
-      expect(() => value.store.apply(prepared.operation)).toThrow(rejected);
-      expect(value.stateStore.readOwnedSessionSend(prepared.effect.nestedMutationKey)).toEqual(before);
-      expect(value.store.snapshot(prepared.created.work.id)).toEqual(workBefore);
-      expect(value.store.effectStatus(prepared.operation.idempotencyKey)?.state).toBe("prepared");
-      expect(value.database.query("SELECT COUNT(*) AS count FROM work_nested_effect_settlements").get()).toEqual({ count: 0 });
     }
+    const before = value.stateStore.readOwnedSessionSend(prepared.effect.nestedMutationKey);
+    expect(before?.state).toBe(stage);
+    const workBefore = value.store.snapshot(prepared.created.work.id);
+    const rejected = new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+    expect(() => value.store.authorizePreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+    expect(() => value.store.reprojectPreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+    expect(() => value.store.settlePreparedEffectNoEffect(prepared.operation.idempotencyKey, "not_dispatched")).toThrow(rejected);
+    expect(() => value.store.apply(prepared.operation)).toThrow(rejected);
+    expect(value.stateStore.readOwnedSessionSend(prepared.effect.nestedMutationKey)).toEqual(before);
+    expect(value.store.snapshot(prepared.created.work.id)).toEqual(workBefore);
+    expect(value.store.effectStatus(prepared.operation.idempotencyKey)?.state).toBe("prepared");
+    expect(value.database.query("SELECT COUNT(*) AS count FROM work_nested_effect_settlements").get()).toEqual({ count: 0 });
   });
 
   test("original send ownership: keeps the independent top-level Work intent namespace usable", async () => {
@@ -1312,6 +1594,17 @@ describe("WorkStore original send ownership", () => {
 });
 
 describe("WorkStore claims, fences, and prepared effects", () => {
+  test("requires signed-in HRA account authority for established Claude work", () => {
+    const value = fixture();
+    value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
+      .run(value.accountId);
+    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
+      .run(value.accountId);
+
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    expect(value.database.query("SELECT COUNT(*) AS count FROM works").get()).toEqual({ count: 0 });
+  });
+
   test("refuses a claim when the session and immutable work preset contracts differ", () => {
     const value = fixture();
     const created = createWork(value);
@@ -1382,11 +1675,29 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     });
   });
 
-  test("refuses Claude task execution while keeping session-owned signals provider-neutral", () => {
+  test("gives signed-out adopted Claude coordinator, member, signal, and ack authority", () => {
     const value = fixture();
-    value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
-      .run(value.accountId);
-    value.database.query("UPDATE sessions SET provider_v39='claude',preset='ultra' WHERE profile_id=?")
+    const accountKey = claudeAccountKey("personal-work-signals");
+    bindPersonalProviderAuthority(
+      value,
+      value.actorSessionId,
+      "claude",
+      "personal-claude-work-actor",
+      accountKey,
+    );
+    bindPersonalProviderAuthority(
+      value,
+      value.reviewerSessionId,
+      "claude",
+      "personal-claude-work-reviewer",
+      accountKey,
+    );
+    value.database.query(
+      `UPDATE profiles
+       SET state='signed_out',provider_email=NULL,codex_account_key=NULL
+       WHERE id=?`,
+    ).run(value.accountId);
+    value.database.query("UPDATE sessions SET preset='ultra' WHERE profile_id=?")
       .run(value.accountId);
 
     const created = createWork(value, [taskSpec(value, "claude-tier-collision", {
@@ -1409,11 +1720,275 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       senderCapability: capability,
       targetSessionId: value.reviewerSessionId,
       mode: "queue",
-      body: "Claude remains reachable independently of Codex authentication.",
+      body: "Claude remains reachable through the provider-neutral signal lane.",
     });
     if (signal.kind !== "signal.send") throw new Error("unexpected result");
-    expect(signal.signal.accountGeneration).toBe(0);
+    expect(signal.signal.accountGeneration).toBe(1);
     expect(value.store.authorizePreparedEffect(signalKey)).toMatchObject({ executable: true });
+    const delivered = value.store.finalizeSignal(signalKey, {
+      kind: "failed",
+      code: "queue_closed",
+    });
+    const acknowledged = value.store.apply({
+      kind: "signal.ack",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      signalId: signal.signal.id,
+      expectedSignalRevision: delivered.revision,
+      actorSessionId: value.reviewerSessionId,
+      actorCapability: capability,
+    });
+    if (acknowledged.kind !== "signal.ack") throw new Error("unexpected result");
+    expect(acknowledged.signal.acknowledgedAt).not.toBeNull();
+
+    const detachedKey = randomUUID();
+    const beforeDetach = value.store.apply({
+      kind: "signal.send",
+      idempotencyKey: detachedKey,
+      workId: created.work.id,
+      senderSessionId: value.actorSessionId,
+      senderCapability: capability,
+      targetSessionId: value.reviewerSessionId,
+      mode: "queue",
+      body: "This delivery is fenced if the adopted target detaches.",
+    });
+    if (beforeDetach.kind !== "signal.send") throw new Error("unexpected result");
+    value.database.query(
+      "UPDATE session_personal_runtime_bindings SET state='detaching' WHERE session_id=?",
+    ).run(value.reviewerSessionId);
+    expect(value.store.authorizePreparedEffect(detachedKey)).toMatchObject({
+      disposition: "settled",
+      executable: false,
+      status: { state: "failed" },
+    });
+    expect(() => value.store.apply({
+      kind: "signal.send",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      senderSessionId: value.actorSessionId,
+      senderCapability: capability,
+      targetSessionId: value.reviewerSessionId,
+      mode: "queue",
+      body: "A detached target is no longer a valid delivery authority.",
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    value.database.query(
+      "UPDATE session_personal_runtime_bindings SET state='active' WHERE session_id=?",
+    ).run(value.reviewerSessionId);
+
+    value.database.query(
+      `INSERT INTO provider_runtime_account_revocations(
+         profile_id,profile_generation,provider,runtime_scope,current_account_key,state
+       ) VALUES (?,1,'claude','personal',?,'releasing')`,
+    ).run(value.accountId, accountKey);
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
+    value.database.query(
+      `UPDATE provider_runtime_account_revocations
+       SET state='completed',current_account_key=?
+       WHERE profile_id=? AND provider='claude' AND runtime_scope='personal'`,
+    ).run(claudeAccountKey("replacement-work-signals"), value.accountId);
+    expect(() => join(
+      value,
+      created.work.id,
+      created.work.revision,
+      value.reviewerSessionId,
+    )).toThrow(new WorkStoreError("ATTEMPT_NOT_OWNER"));
+    value.database.query(
+      `UPDATE provider_runtime_account_revocations
+       SET current_account_key=?
+       WHERE profile_id=? AND provider='claude' AND runtime_scope='personal'`,
+    ).run(accountKey, value.accountId);
+    expect(() => createWork(value)).not.toThrow();
+  });
+
+  test("gives keyless signed-out managed Devin control-plane authority but no Work execution", () => {
+    const value = fixture();
+    const coordinator = addSignedOutManagedDevinSession(value, "coordinator");
+    const member = addSignedOutManagedDevinSession(value, "member");
+    expect(value.database.query(
+      `SELECT COUNT(*) AS count FROM session_account_authorities
+       WHERE session_id IN (?,?)`,
+    ).get(coordinator.sessionId, member.sessionId)).toEqual({ count: 0 });
+    expect(value.database.query(
+      `SELECT COUNT(*) AS count FROM session_provider_account_authorities
+       WHERE session_id IN (?,?)`,
+    ).get(coordinator.sessionId, member.sessionId)).toEqual({ count: 0 });
+
+    const createKey = randomUUID();
+    const created = value.store.apply({
+      kind: "work.create",
+      idempotencyKey: createKey,
+      clientRef: `devin-control-${createKey}`,
+      coordinatorSessionId: coordinator.sessionId,
+      objective: "Coordinate without granting the Devin session execution authority.",
+      routes: [{
+        accountId: coordinator.profileId,
+        projectId: value.projectId,
+        preset: "ultra",
+        fast: false,
+      }],
+      tasks: [taskSpec({
+        accountId: coordinator.profileId,
+        projectId: value.projectId,
+      }, "devin-control", { preset: "ultra" })],
+    });
+    if (created.kind !== "work.create") throw new Error("unexpected result");
+    expect(value.database.query(
+      "SELECT preset_contract FROM works WHERE id=?",
+    ).get(created.work.id)).toEqual({ preset_contract: 2 });
+    const joined = value.store.apply({
+      kind: "work.join",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      coordinatorSessionId: coordinator.sessionId,
+      coordinatorCapability: capability,
+      actorSessionId: member.sessionId,
+    });
+    if (joined.kind !== "work.join") throw new Error("unexpected result");
+    expect(() => claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+      actorSessionId: coordinator.sessionId,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(value.store.apply({
+      kind: "task.claimNext",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      actorSessionId: member.sessionId,
+      actorCapability: capability,
+      route: { accountId: coordinator.profileId, projectId: value.projectId },
+      leaseMs: 5_000,
+    })).toMatchObject({ kind: "task.claimNext", task: null, attempt: null });
+    expect(value.database.query(
+      "SELECT COUNT(*) AS count FROM work_attempts WHERE work_id=?",
+    ).get(created.work.id)).toEqual({ count: 0 });
+
+    const signalKey = randomUUID();
+    const signal = value.store.apply({
+      kind: "signal.send",
+      idempotencyKey: signalKey,
+      workId: created.work.id,
+      senderSessionId: coordinator.sessionId,
+      senderCapability: capability,
+      targetSessionId: member.sessionId,
+      mode: "queue",
+      body: "Review the plan without claiming an execution attempt.",
+    });
+    if (signal.kind !== "signal.send") throw new Error("unexpected result");
+    expect(value.store.authorizePreparedEffect(signalKey)).toMatchObject({ executable: true });
+    const delivered = value.store.finalizeSignal(signalKey, {
+      kind: "failed",
+      code: "queue_closed",
+    });
+    const acknowledged = value.store.apply({
+      kind: "signal.ack",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      signalId: signal.signal.id,
+      expectedSignalRevision: delivered.revision,
+      actorSessionId: member.sessionId,
+      actorCapability: capability,
+    });
+    if (acknowledged.kind !== "signal.ack") throw new Error("unexpected result");
+    expect(acknowledged.signal.acknowledgedAt).not.toBeNull();
+  });
+
+  test("refuses dispatch after a claimed Codex worker is observed as Devin", () => {
+    const value = fixture();
+    const created = createWork(value);
+    const claimed = claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+    value.database.exec("DROP TRIGGER work_session_attempt_authority_guard");
+    value.database.query(
+      "UPDATE sessions SET provider_v39='devin',preset_contract=2 WHERE id=?",
+    ).run(value.actorSessionId);
+    value.database.exec(WORK_SCHEMA_SQL);
+
+    expect(() => value.store.apply({
+      kind: "attempt.dispatch",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      attemptId: claimed.attempt.id,
+      expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence,
+      actorSessionId: value.actorSessionId,
+      attemptCapability: capability,
+      targetSessionId: value.actorSessionId,
+      mode: "send",
+    })).toThrow(new WorkStoreError("REVISION_CONFLICT"));
+    expect(value.database.query(
+      "SELECT state,target_session_id FROM work_attempts WHERE id=?",
+    ).get(claimed.attempt.id)).toEqual({ state: "released", target_session_id: null });
+  });
+
+  test("allows adopted Codex claims and rejects detached or revoked personal authority", () => {
+    const valid = fixture();
+    const validAccountKey = codexAccountKey("worker@example.com");
+    bindPersonalProviderAuthority(
+      valid,
+      valid.actorSessionId,
+      "codex",
+      "personal-codex-valid-worker",
+      validAccountKey,
+    );
+    const validWork = createWork(valid);
+    expect(claim(valid, {
+      workId: validWork.work.id,
+      taskId: validWork.tasks[0]!.id,
+      revision: validWork.tasks[0]!.revision,
+    }).attempt.fence).toBe(1);
+
+    const detached = fixture();
+    bindPersonalProviderAuthority(
+      detached,
+      detached.actorSessionId,
+      "codex",
+      "personal-codex-detached-worker",
+      validAccountKey,
+    );
+    const detachedWork = createWork(detached);
+    detached.database.query(
+      "UPDATE session_personal_runtime_bindings SET state='detached' WHERE session_id=?",
+    ).run(detached.actorSessionId);
+    expect(() => claim(detached, {
+      workId: detachedWork.work.id,
+      taskId: detachedWork.tasks[0]!.id,
+      revision: detachedWork.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+
+    const revoked = fixture();
+    bindPersonalProviderAuthority(
+      revoked,
+      revoked.actorSessionId,
+      "codex",
+      "personal-codex-revoked-worker",
+      validAccountKey,
+    );
+    const revokedWork = createWork(revoked);
+    revoked.database.query(
+      `INSERT INTO provider_runtime_account_revocations(
+         profile_id,profile_generation,provider,runtime_scope,current_account_key,state
+       ) VALUES (?,1,'codex','personal',?,'releasing')`,
+    ).run(revoked.accountId, validAccountKey);
+    expect(() => claim(revoked, {
+      workId: revokedWork.work.id,
+      taskId: revokedWork.tasks[0]!.id,
+      revision: revokedWork.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+
+    revoked.database.query(
+      `UPDATE provider_runtime_account_revocations
+       SET state='completed',current_account_key=?
+       WHERE profile_id=? AND provider='codex' AND runtime_scope='personal'`,
+    ).run(codexAccountKey("replacement@example.com"), revoked.accountId);
+    expect(() => claim(revoked, {
+      workId: revokedWork.work.id,
+      taskId: revokedWork.tasks[0]!.id,
+      revision: revokedWork.tasks[0]!.revision,
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
   });
 
   test("fences provider identity and rechecks it before Codex task dispatch", () => {
@@ -1449,6 +2024,89 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       disposition: "settled",
       executable: false,
       status: { state: "failed" },
+    });
+  });
+
+  test("retains a late accepted receipt without reviving swept provider authority", () => {
+    const value = fixture();
+    const created = createWork(value);
+    const claimed = claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+    const dispatchKey = randomUUID();
+    value.store.apply({
+      kind: "attempt.dispatch",
+      idempotencyKey: dispatchKey,
+      workId: created.work.id,
+      attemptId: claimed.attempt.id,
+      expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence,
+      actorSessionId: value.actorSessionId,
+      attemptCapability: capability,
+      targetSessionId: value.actorSessionId,
+      mode: "send",
+    });
+    expect(value.store.authorizePreparedEffect(dispatchKey).executable).toBe(true);
+
+    value.database.query("UPDATE sessions SET state='terminal' WHERE id=?")
+      .run(value.actorSessionId);
+    expect(value.store.snapshot(created.work.id).tasks[0]).toMatchObject({
+      status: "blocked",
+    });
+    expect(value.database.query(
+      "SELECT state FROM work_attempts WHERE id=?",
+    ).get(claimed.attempt.id)).toEqual({ state: "recovery_required" });
+    expect(value.store.events(created.work.id, 0, 50).events.at(-1)?.body).toEqual({
+      type: "attempt.recovery_required",
+      attemptId: claimed.attempt.id,
+      fence: claimed.attempt.fence,
+      reason: "custodian_restart",
+    });
+
+    const receipt = turnStartedReceipt();
+    const recovered = value.store.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt,
+    });
+    expect(recovered).toMatchObject({
+      status: "unknown",
+      dispatchReceipt: receipt,
+    });
+    const afterFinalization = value.store.events(created.work.id, 0, 50);
+    expect(afterFinalization.events.at(-1)?.body).toEqual({
+      type: "attempt.dispatch_finalized",
+      attemptId: claimed.attempt.id,
+      outcome: "accepted",
+    });
+
+    const restarted = new WorkStore(value.database, {
+      daemonGeneration: 8,
+      now: () => value.now.value,
+      encodeCursor,
+      issueCapability,
+      verifyCapability,
+      projectProviderIdentifier,
+    });
+    expect(restarted.authorizePreparedEffect(dispatchKey)).toMatchObject({
+      executable: false,
+      disposition: "settled",
+      status: { state: "accepted" },
+    });
+    expect(restarted.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt,
+    })).toEqual(recovered);
+    expect(restarted.snapshot(created.work.id).tasks[0]).toMatchObject({
+      status: "blocked",
+    });
+    expect(restarted.events(created.work.id, 0, 50)).toEqual(afterFinalization);
+    expect(value.database.query(
+      "SELECT state,revision FROM work_attempts WHERE id=?",
+    ).get(claimed.attempt.id)).toEqual({
+      state: "recovery_required",
+      revision: recovered.revision,
     });
   });
 
@@ -1500,12 +2158,12 @@ describe("WorkStore claims, fences, and prepared effects", () => {
       1,
       "b".repeat(64),
     );
+
     const claimTask = (): unknown => claim(value, {
       workId: created.work.id,
       taskId: created.tasks[0]!.id,
       revision: created.tasks[0]!.revision,
     });
-
     const next = value.store.apply({
       kind: "task.claimNext",
       idempotencyKey: randomUUID(),
@@ -1532,16 +2190,11 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     expect(claimTask()).toMatchObject({ kind: "task.claim" });
   });
 
-  test("still refuses Codex work authority while the Codex profile is signed out", () => {
+  test("refuses Codex work admission while the HRA profile is signed out", () => {
     const value = fixture();
     value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
       .run(value.accountId);
-    const created = createWork(value);
-    expect(() => claim(value, {
-      workId: created.work.id,
-      taskId: created.tasks[0]!.id,
-      revision: created.tasks[0]!.revision,
-    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    expect(() => createWork(value)).toThrow(new WorkStoreError("MEMBER_NOT_FOUND"));
   });
 
   test("CAS claims a ready task once and increments its committed fence", () => {
@@ -2167,6 +2820,94 @@ describe("WorkStore claims, fences, and prepared effects", () => {
 });
 
 describe("WorkStore submissions, reviews, and signals", () => {
+  test("allows a signed-out adopted Claude member to review a Codex submission", () => {
+    const value = fixture();
+    const reviewer = addSignedOutPersonalClaudeSession(value, "reviewer");
+    const created = createWork(value, [taskSpec(value, "adopted-claude-review", {
+      requiredReviews: 1,
+    })]);
+    join(
+      value,
+      created.work.id,
+      created.work.revision,
+      reviewer.sessionId,
+    );
+    const claimed = claim(value, {
+      workId: created.work.id,
+      taskId: created.tasks[0]!.id,
+      revision: created.tasks[0]!.revision,
+    });
+    const dispatchKey = randomUUID();
+    value.store.apply({
+      kind: "attempt.dispatch",
+      idempotencyKey: dispatchKey,
+      workId: created.work.id,
+      attemptId: claimed.attempt.id,
+      expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence,
+      actorSessionId: value.actorSessionId,
+      attemptCapability: capability,
+      targetSessionId: value.actorSessionId,
+      mode: "send",
+    });
+    expect(value.store.authorizePreparedEffect(dispatchKey).executable).toBe(true);
+    const running = value.store.finalizeDispatch(dispatchKey, {
+      kind: "accepted",
+      receipt: turnStartedReceipt(),
+    });
+    const reported = value.store.apply({
+      kind: "attempt.report",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      attemptId: running.id,
+      expectedAttemptRevision: running.revision,
+      fence: running.fence,
+      actorSessionId: value.actorSessionId,
+      attemptCapability: capability,
+      report: {
+        kind: "submit",
+        summary: "Ready for the adopted Claude reviewer.",
+        result: { kind: "text", text: "complete" },
+        evidence: [],
+      },
+    });
+    if (reported.kind !== "attempt.report" || reported.submission === null) {
+      throw new Error("submission missing");
+    }
+    const submission = reported.submission;
+
+    value.database.query(
+      "UPDATE session_personal_runtime_bindings SET state='detaching' WHERE session_id=?",
+    ).run(reviewer.sessionId);
+    expect(() => value.store.apply({
+      kind: "submission.review",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      submissionId: submission.id,
+      expectedSubmissionRevision: submission.revision,
+      expectedContentDigest: submission.contentDigest,
+      reviewerSessionId: reviewer.sessionId,
+      reviewerCapability: capability,
+      review: { decision: "accept", summary: "Authority must be current.", evidence: [] },
+    })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    value.database.query(
+      "UPDATE session_personal_runtime_bindings SET state='active' WHERE session_id=?",
+    ).run(reviewer.sessionId);
+    const reviewed = value.store.apply({
+      kind: "submission.review",
+      idempotencyKey: randomUUID(),
+      workId: created.work.id,
+      submissionId: submission.id,
+      expectedSubmissionRevision: submission.revision,
+      expectedContentDigest: submission.contentDigest,
+      reviewerSessionId: reviewer.sessionId,
+      reviewerCapability: capability,
+      review: { decision: "accept", summary: "Independent review passed.", evidence: [] },
+    });
+    if (reviewed.kind !== "submission.review") throw new Error("unexpected result");
+    expect(reviewed.submission.status).toBe("accepted");
+  });
+
   test("preserves revisions and requires an independent reviewer before completion", () => {
     const value = fixture();
     const created = createWork(value, [taskSpec(value, "reviewed", { requiredReviews: 1 })]);
@@ -3812,6 +4553,75 @@ describe("WorkStore submissions, reviews, and signals", () => {
 });
 
 describe("WorkStore cancellation and recovery", () => {
+  test("session retirement uses the captured provider process and never the sibling mirror", () => {
+    const value = fixture();
+    value.database.query("UPDATE sessions SET provider_v39='claude' WHERE id=?")
+      .run(value.reviewerSessionId);
+    value.database.query("UPDATE provider_accounts SET process_generation=3 WHERE profile_id=? AND provider='claude'")
+      .run(value.accountId);
+    value.database.query("UPDATE session_provider_authorities SET process_generation=3 WHERE session_id=?")
+      .run(value.reviewerSessionId);
+    expect(value.store.prepareSessionAuthorityChange([value.reviewerSessionId], 3)).toEqual([]);
+    expect(() => value.store.prepareSessionAuthorityChange([value.reviewerSessionId], 1))
+      .toThrow("REVISION_CONFLICT");
+    value.database.query("UPDATE provider_accounts SET process_generation=4 WHERE profile_id=? AND provider='claude'")
+      .run(value.accountId);
+    expect(value.store.prepareSessionAuthorityChange([value.reviewerSessionId], 3)).toEqual([]);
+    value.database.query("DELETE FROM session_provider_authorities WHERE session_id=?")
+      .run(value.reviewerSessionId);
+    expect(() => value.store.prepareSessionAuthorityChange([value.reviewerSessionId], 3))
+      .toThrow("REVISION_CONFLICT");
+  });
+
+  test("retires only attempts owned by the exact bounded session set", () => {
+    const value = fixture();
+    const created = createWork(value, [
+      taskSpec(value, "actor-task"),
+      taskSpec(value, "reviewer-task"),
+    ]);
+    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+    const actorTask = created.tasks.find((task) => task.clientRef === "actor-task")!;
+    const reviewerTask = created.tasks.find((task) => task.clientRef === "reviewer-task")!;
+    const actorClaim = claim(value, {
+      workId: created.work.id,
+      taskId: actorTask.id,
+      revision: actorTask.revision,
+    });
+    const reviewerClaim = claim(value, {
+      workId: created.work.id,
+      taskId: reviewerTask.id,
+      revision: reviewerTask.revision,
+      actorSessionId: value.reviewerSessionId,
+    });
+
+    expect(() => value.store.prepareSessionAuthorityChange(
+      [value.reviewerSessionId],
+      2,
+    )).toThrow(new WorkStoreError("REVISION_CONFLICT"));
+    expect(value.store.task(actorTask.id).activeAttempt?.status).toBe("claimed");
+    expect(value.store.task(reviewerTask.id).activeAttempt?.status).toBe("claimed");
+    expect(() => value.store.prepareSessionAuthorityChange(
+      Array.from({ length: 501 }, () => value.reviewerSessionId),
+      1,
+    )).toThrow(new WorkStoreError("WORK_CAPACITY_EXCEEDED"));
+    expect(value.store.task(reviewerTask.id).activeAttempt?.status).toBe("claimed");
+
+    expect(value.store.prepareSessionAuthorityChange(
+      [value.reviewerSessionId, value.reviewerSessionId],
+      1,
+    )).toEqual([created.work.id]);
+    expect(value.store.task(actorTask.id).activeAttempt).toMatchObject({
+      id: actorClaim.attempt.id,
+      status: "claimed",
+    });
+    expect(value.store.task(reviewerTask.id).activeAttempt).toBeNull();
+    expect(value.store.task(reviewerTask.id).task.status).toBe("ready");
+    expect(value.database.query(
+      "SELECT state FROM work_attempts WHERE id=?",
+    ).get(reviewerClaim.attempt.id)).toEqual({ state: "released" });
+    expect(value.store.prepareSessionAuthorityChange([], 1)).toEqual([]);
+  });
+
   test("reconciles no-effect only from a determinate failed nested mutation", () => {
     const prepareRecovery = (nestedState: "ambiguous" | "failed") => {
       const value = fixture();

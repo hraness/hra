@@ -38,6 +38,7 @@ import {
 import type { QueueState } from "../domain/transitions";
 import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
 import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
+import { normalizeSchemaSql } from "./schema-cohort";
 
 const maximumSafeInteger = 9_007_199_254_740_991;
 const SESSION_TASK_RECEIPT_RESULT_MAX_BYTES = MESSAGE_MAX_BYTES * 6 + 16_384;
@@ -292,9 +293,6 @@ const foreignKeyRowSchema = z.object({
   match: z.string(),
 }).strict();
 
-const normalizedSchemaSql = (value: string): string =>
-  value.replaceAll(/\s+/gu, " ").trim();
-
 const sessionTaskSchemaSignature = (database: Database): string => {
   const objects = database.query(
     `SELECT name,type,sql FROM sqlite_schema
@@ -302,7 +300,7 @@ const sessionTaskSchemaSignature = (database: Database): string => {
      ORDER BY name`,
   ).all(...requiredSchemaObjects).map((row) => {
     const parsed = schemaObjectRowSchema.parse(row);
-    return { ...parsed, sql: normalizedSchemaSql(parsed.sql) };
+    return { ...parsed, sql: normalizeSchemaSql(parsed.sql) };
   });
   const tables = database.query("PRAGMA table_list").all().map((row) =>
     z.object({
@@ -376,6 +374,11 @@ export const assertSessionTaskSchema = (database: Database): void => {
   ).all();
 };
 
+// Canonical adoption40 and private task48 shipped byte-identical task DDL.
+// Its existing exact signature includes tables, indexes, triggers and FKs.
+export const assertCanonicalAdoption40SessionTaskSchema = assertSessionTaskSchema;
+export const assertPrivateTask48SessionTaskSchema = assertSessionTaskSchema;
+
 const taskRowSchema = z.object({
   id: sessionTaskIdSchema,
   session_id: sessionIdSchema,
@@ -416,12 +419,72 @@ const receiptRowSchema = z.object({
 type ReceiptOperation = z.infer<typeof receiptRowSchema>["operation"];
 type ReceiptRow = z.infer<typeof receiptRowSchema>;
 
+// Keep the preliminary wake-up query, bounded candidate scan, and transactional
+// recheck on one provider-scoped authority definition. Provider additions must
+// extend the explicit final branch; an unknown provider never inherits Codex.
+const currentSessionTaskAuthorityJoins = `
+JOIN profiles a ON a.id=s.profile_id
+JOIN session_provider_authorities captured
+  ON captured.session_id=s.id AND captured.profile_id=s.profile_id AND captured.provider=s.provider_v39
+JOIN provider_accounts exact_account
+  ON exact_account.id=captured.provider_account_id AND exact_account.profile_id=captured.profile_id
+    AND exact_account.provider=captured.provider AND exact_account.binding_generation=captured.binding_generation
+    AND exact_account.process_generation=captured.process_generation
+LEFT JOIN session_provider_account_authorities pa
+  ON pa.session_id=s.id AND pa.provider=s.provider_v39`;
+
+const currentSessionTaskAuthorityPredicate = `
+AND a.state!='removed'
+AND (exact_account.readiness='signed_in' OR (
+  captured.provider IN ('claude','devin') AND exact_account.readiness='unverified'
+  AND captured.routing_provenance='explicit'
+))
+AND NOT EXISTS(
+  SELECT 1 FROM provider_runtime_account_revocations r
+  WHERE r.profile_id=s.profile_id
+    AND (r.provider='claude' OR r.profile_generation=captured.process_generation)
+    AND r.provider=s.provider_v39
+    AND r.runtime_scope=pa.runtime_scope
+    AND (r.state='releasing' OR r.current_account_key IS NULL
+      OR r.current_account_key!=pa.account_key)
+)
+AND (
+  (pa.runtime_scope='personal' AND EXISTS(
+    SELECT 1 FROM session_personal_runtime_bindings b
+    WHERE b.session_id=s.id
+      AND b.provider=s.provider_v39
+      AND b.provider_thread_id=s.provider_thread_id
+      AND b.state='active'
+  ))
+  OR (pa.runtime_scope='managed' AND NOT EXISTS(
+    SELECT 1 FROM session_personal_runtime_bindings b
+    WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+  ))
+  OR (s.provider_v39='devin' AND NOT EXISTS(
+    SELECT 1 FROM session_personal_runtime_bindings b
+    WHERE b.session_id=s.id AND b.state IN ('active','detaching')
+  ))
+)
+AND (
+  (s.provider_v39='claude' AND a.state!='removed')
+  OR (s.provider_v39='codex' AND a.state='signed_in'
+    AND a.provider_email IS NOT NULL
+    AND a.codex_account_key=pa.account_key
+    AND EXISTS(
+      SELECT 1 FROM session_account_authorities legacy
+      WHERE legacy.session_id=s.id
+        AND legacy.profile_id=s.profile_id
+        AND legacy.account_key IS NOT NULL
+        AND legacy.account_key=lower(trim(a.provider_email))
+    ))
+  OR (s.provider_v39='devin' AND a.state!='removed')
+)`;
+
 const dueCandidateRowSchema = taskRowSchema.extend({
   project_root: z.string().min(1),
 });
 
 const eligibleDueTaskRowSchema = dueCandidateRowSchema.extend({
-  profile_state: z.literal("signed_in"),
   session_state: z.enum(["starting", "active", "idle"]),
   provider_thread_id: z.string().min(1),
 });
@@ -1170,13 +1233,13 @@ export class SessionTaskStore {
       `SELECT MIN(t.next_due_at) AS next_due_at
        FROM session_tasks t
        JOIN sessions s ON s.id=t.session_id
-       JOIN profiles a ON a.id=s.profile_id
+       ${currentSessionTaskAuthorityJoins}
        JOIN projects p ON p.id=s.project_id
        WHERE t.deleted_at IS NULL
          AND t.status='active'
          AND s.provider_thread_id IS NOT NULL
          AND s.state NOT IN ('terminal','recovery_required')
-         AND a.state='signed_in'
+         ${currentSessionTaskAuthorityPredicate}
          AND NOT EXISTS(
            SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
            WHERE switch.session_id=t.session_id
@@ -1231,14 +1294,14 @@ export class SessionTaskStore {
          t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,p.root_path AS project_root
        FROM session_tasks t
        JOIN sessions s ON s.id=t.session_id
-       JOIN profiles a ON a.id=s.profile_id
+       ${currentSessionTaskAuthorityJoins}
        JOIN projects p ON p.id=s.project_id
        WHERE t.deleted_at IS NULL
          AND t.status='active'
          AND t.next_due_at<=?
          AND s.provider_thread_id IS NOT NULL
          AND s.state NOT IN ('terminal','recovery_required')
-         AND a.state='signed_in'
+         ${currentSessionTaskAuthorityPredicate}
          AND NOT EXISTS(
            SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
            WHERE switch.session_id=t.session_id
@@ -1303,11 +1366,11 @@ export class SessionTaskStore {
           `SELECT
              t.id,t.session_id,t.name,t.prompt,t.schedule_kind,t.interval_minutes,t.status,
              t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,
-             p.root_path AS project_root,a.state AS profile_state,s.state AS session_state,
+             p.root_path AS project_root,s.state AS session_state,
              s.provider_thread_id
            FROM session_tasks t
            JOIN sessions s ON s.id=t.session_id
-           JOIN profiles a ON a.id=s.profile_id
+           ${currentSessionTaskAuthorityJoins}
            JOIN projects p ON p.id=s.project_id
            WHERE t.id=?
              AND t.session_id=?
@@ -1316,7 +1379,7 @@ export class SessionTaskStore {
              AND t.next_due_at<=?
              AND s.provider_thread_id IS NOT NULL
              AND s.state NOT IN ('terminal','recovery_required')
-             AND a.state='signed_in'
+             ${currentSessionTaskAuthorityPredicate}
              AND NOT EXISTS(
                SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
                WHERE switch.session_id=t.session_id

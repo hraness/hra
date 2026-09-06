@@ -4,6 +4,10 @@ import { z } from "zod";
 export const providerSchema = z.enum(["codex", "claude", "devin"]);
 export type Provider = z.infer<typeof providerSchema>;
 
+/** Providers whose existing personal-home sessions HRA can adopt. */
+export const adoptableProviderSchema = z.enum(["codex", "claude"]);
+export type AdoptableProvider = z.infer<typeof adoptableProviderSchema>;
+
 export const DEFAULT_PROVIDER = "codex" satisfies Provider;
 
 export const presetSchema = z.enum(["low", "high", "ultra", "fable-max", "astra"]);

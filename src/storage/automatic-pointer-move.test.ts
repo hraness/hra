@@ -1,19 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { canonical40QueuesDatabaseBytes } from "../../scripts/fixtures/canonical40-queues";
 import { automaticPointerMoveCapsuleDigest, type AutomaticPointerMoveRequest } from "../domain/automatic-pointer-move";
 import { codexProviderAccountAuthoritySchema } from "../domain/provider-accounts";
 import { createStoredAccountUsageSnapshot } from "../domain/usage-metrics";
 import { type ProfileId } from "../domain/values";
-import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
-import { ATTACHMENT_CUSTODY_COLUMNS } from "./attachment-custody-schema";
 import { AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS } from "./automatic-pointer-move";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
-import { QUEUE_ATTACHMENT_SCHEMA_OBJECTS } from "./queue-attachment-identity";
 import { StateStore } from "./state-store";
 
 const stores = new Set<StateStore>();
@@ -24,17 +22,30 @@ afterEach(async () => {
   for (const home of homes.splice(0)) await rm(home, { recursive: true, force: true });
 });
 
-async function fixture() {
+async function fixture(canonical40 = false) {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-pointer-move-")));
   homes.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
+  if (canonical40) {
+    await writeFile(paths.database, canonical40QueuesDatabaseBytes());
+    await chmod(paths.database, 0o600);
+  }
+  const historicalSnapshot = () => {
+    const db = new Database(paths.database, { strict: true });
+    try {
+      return { profiles: db.query("SELECT * FROM profiles ORDER BY id").all(),
+        migrations: db.query("SELECT * FROM migrations WHERE version<=40 ORDER BY version").all() };
+    } finally { db.close(false); }
+  };
+  const historicalBefore = canonical40 ? historicalSnapshot() : null;
   let time = 1_800_000_000_000;
   const open = (readonly = false) => {
     const store = new StateStore(paths, { readonly, now: () => time, resolveMachineTimeZone: () => "UTC" });
     stores.add(store); return store;
   };
   const store = open();
+  const historicalAfter = canonical40 ? historicalSnapshot() : null;
   const bootId = `boot_${"a".repeat(32)}`;
   const daemonGeneration = store.nextDaemonGeneration(bootId);
   const profile = (label: string) => {
@@ -44,6 +55,8 @@ async function fixture() {
   };
   const source = profile("source");
   const target = profile("target");
+  if (canonical40) store.activateProviderAccount({ provider: "codex", providerAccountId: source.id,
+    expectedPointerRevision: store.readProviderAccountState("codex").pointerRevision });
   const writeQuota = (profileId: ProfileId, usedPercent: number, credits = 0, observedAt = time) => {
     const authority = store.requireProviderAccountAuthority(profileId, "codex");
     const sourceSequence = (store.latestUsage(profileId)?.sourceRevision ?? 0) + 1;
@@ -76,7 +89,8 @@ async function fixture() {
       expectedOrderRevision: pointer.orderRevision, expectedPointerRevision: pointer.pointerRevision };
   };
   const inspect = () => new Database(paths.database, { strict: true });
-  return { store, paths, source, target, open, inspect, request, writeQuota, profile, advanceTime: (ms: number) => { time += ms; } };
+  return { store, paths, source, target, open, inspect, request, writeQuota, profile, historicalBefore, historicalAfter,
+    advanceTime: (ms: number) => { time += ms; } };
 }
 
 describe("automatic pointer-only storage", () => {
@@ -188,6 +202,15 @@ describe("automatic pointer-only storage", () => {
     const value = await fixture(); const request = value.request();
     const profile = value[endpoint];
     const authority = value.store.requireProviderAccountAuthority(profile.id, "codex");
+    const workStore = value.store.createWorkStore(request.daemonGeneration, () => "unused-revocation-cursor", {
+      issue: () => `hrac1_${"A".repeat(43)}`, verify: () => true,
+    });
+    for (const runtimeScope of ["personal", "managed"] as const) {
+      const begun = value.store.beginProviderRuntimeAccountRevocation({ profileId: profile.id,
+        expectedGeneration: authority.processGeneration, provider: "codex", runtimeScope, currentAccountKey: null, workStore });
+      value.store.completeProviderRuntimeAccountRevocation({ profileId: profile.id,
+        expectedGeneration: authority.processGeneration, provider: "codex", runtimeScope, expectedRevision: begun.revocation.revision });
+    }
     const attempt = value.store.prepareMutation({ kind: "account.logout", authorityId: profile.id, authorityGeneration: authority.processGeneration,
       request: {}, providerAuthorities: [{ role: "primary", authority, provenance: "account_logout" }] });
     value.store.beginAccountMutationEffect({ attemptId: attempt.id, profileId: profile.id, profileGeneration: authority.processGeneration,
@@ -236,47 +259,24 @@ describe("automatic pointer-only storage", () => {
     expect(value.store.readAutomaticPointerMove(request.idempotencyKey)).toBeNull();
   });
 
-  test("upgrades actual v45 additively and refuses a missing current-format guard before repair", async () => {
-    const value = await fixture(); const db = value.inspect();
+  test("upgrades authentic canonical40 additively and refuses a missing current-format guard before repair", async () => {
+    const value = await fixture(true); const db = value.inspect();
     try {
-      db.exec("PRAGMA foreign_keys=OFF");
-      for (const type of ["trigger", "index"] as const) {
-        for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
-          if (object.type === type) db.exec(`DROP ${type.toUpperCase()} ${object.name}`);
-        }
-      }
-      for (const definition of [...ATTACHMENT_CUSTODY_COLUMNS].reverse()) {
-        db.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${definition.slice(0, definition.indexOf(" "))}`);
-      }
-      for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
-        if (object.type === "table") db.exec(`DROP TABLE ${object.name}`);
-      }
-      for (const object of QUEUE_ATTACHMENT_SCHEMA_OBJECTS) {
-        if (object.type === "trigger") db.exec(`DROP TRIGGER ${object.name}`);
-      }
-      db.exec("ALTER TABLE queue_entries DROP COLUMN enqueue_identity_attempt_id");
-      db.exec("ALTER TABLE queue_entries DROP COLUMN enqueue_identity_format");
-      for (const type of ["index", "table"] as const) {
-        for (const object of [...QUEUE_ATTACHMENT_SCHEMA_OBJECTS].reverse()) {
-          if (object.type === type) db.exec(`DROP ${type.toUpperCase()} ${object.name}`);
-        }
-      }
-      for (const type of ["trigger", "index", "table"] as const) {
-        for (const object of [...AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS].reverse()) {
-          if (object.type === type) db.exec(`DROP ${type.toUpperCase()} ${object.name}`);
-        }
-      }
-      db.exec("DELETE FROM migrations WHERE version IN (46,47,48); PRAGMA user_version=45; PRAGMA foreign_keys=ON");
-      expect(db.query("SELECT version FROM migrations WHERE version>45").all()).toEqual([]);
-      expect(db.query("SELECT name FROM pragma_table_info('queue_entries') WHERE name IN ('enqueue_identity_format','enqueue_identity_attempt_id')").all()).toEqual([]);
-      expect(db.query("SELECT name FROM pragma_table_info('mutation_attempts') WHERE name LIKE 'attachment_%'").all()).toEqual([]);
-      const upgraded = value.open();
-      expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
-      expect(db.query("SELECT version FROM migrations WHERE version>45 ORDER BY version").all()).toEqual([{ version: 46 }, { version: 47 }, { version: 48 }]);
-      expect(upgraded.requireProfile(value.source.id)).toEqual(value.store.requireProfile(value.source.id));
-      upgraded.settleAutomaticPointerMove(value.request());
+      expect(value.historicalBefore).not.toBeNull();
+      expect(value.historicalAfter).toEqual(value.historicalBefore);
+      expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
+      expect(db.query("SELECT version FROM migrations WHERE version>40 ORDER BY version").all())
+        .toEqual(Array.from({ length: 9 }, (_, index) => ({ version: index + 41 })));
+      value.store.settleAutomaticPointerMove(value.request());
       db.exec("DROP TRIGGER automatic_pointer_move_anchor_insert_guard");
+      const snapshot = () => ({ schema: db.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+        migrations: db.query("SELECT * FROM migrations ORDER BY version").all(), profiles: db.query("SELECT * FROM profiles ORDER BY id").all(),
+        moves: db.query("SELECT * FROM automatic_pointer_moves ORDER BY attempt_id").all(),
+        anchors: db.query("SELECT * FROM automatic_pointer_move_anchors ORDER BY attempt_id").all(),
+        mutations: db.query("SELECT * FROM mutation_attempts ORDER BY id").all() });
+      const before = snapshot();
       for (const readonly of [false, true]) expect(() => value.open(readonly)).toThrow("AUTOMATIC_POINTER_MOVE_CORRUPT");
+      expect(snapshot()).toEqual(before);
       expect(db.query("SELECT 1 FROM sqlite_master WHERE name='automatic_pointer_move_anchor_insert_guard'").get()).toBeNull();
     } finally { db.close(false); }
   });

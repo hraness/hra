@@ -5,7 +5,7 @@ import { isatty } from "node:tty";
 
 import { callLocalDaemon } from "../src/daemon/local-transport";
 import { waitForDaemonReady, type DaemonIdentity } from "../src/daemon/daemon-startup";
-import { main as cliMain, runDaemon } from "../src/cli";
+import { initialize, main as cliMain, runDaemon } from "../src/cli";
 import type { Output } from "../src/cli/render";
 import type { CommandResponse } from "../src/domain/contracts";
 import {
@@ -195,22 +195,41 @@ const responseRequiresRestart = (response: CommandResponse): boolean =>
 type GenerationStopReason = "parent_closed" | "restart" | "stop" | "suspend";
 
 type DaemonGeneration = {
+  controller: AbortController;
   expectedStop: GenerationStopReason | null;
   identity?: DaemonIdentity;
   promise: Promise<number>;
 };
 
+type DaemonSupervisorDependencies = Readonly<{
+  runDaemon?: typeof runDaemon;
+  waitForDaemonReady?: typeof waitForDaemonReady;
+}>;
+
+type WorkerDependencies = DaemonSupervisorDependencies & Readonly<{
+  initializeWorkerInstallation?: (
+    descriptor: AcceptanceInstallationDescriptor,
+  ) => Promise<void>;
+}>;
+
 class DaemonSupervisor {
   readonly #descriptor: AcceptanceInstallationDescriptor;
   readonly #installation: ReturnType<typeof createAcceptanceInstallation>;
   readonly #failure = deferred<never>();
+  readonly #runDaemon: typeof runDaemon;
+  readonly #waitForDaemonReady: typeof waitForDaemonReady;
   #failureError: Error | undefined;
   #generation: DaemonGeneration | undefined;
   #suspended = false;
 
-  constructor(descriptor: AcceptanceInstallationDescriptor) {
+  constructor(
+    descriptor: AcceptanceInstallationDescriptor,
+    dependencies: DaemonSupervisorDependencies = {},
+  ) {
     this.#descriptor = descriptor;
     this.#installation = createAcceptanceInstallation(descriptor);
+    this.#runDaemon = dependencies.runDaemon ?? runDaemon;
+    this.#waitForDaemonReady = dependencies.waitForDaemonReady ?? waitForDaemonReady;
     void this.#failure.promise.catch(() => undefined);
   }
 
@@ -222,9 +241,11 @@ class DaemonSupervisor {
     if (this.#generation !== undefined || this.#suspended) {
       throw new WorkerFailure("daemon_failed");
     }
+    const controller = new AbortController();
     const generation: DaemonGeneration = {
+      controller,
       expectedStop: null,
-      promise: runDaemon(this.#installation),
+      promise: this.#runDaemon(this.#installation, { stopSignal: controller.signal }),
     };
     this.#generation = generation;
     void generation.promise.then(
@@ -237,7 +258,7 @@ class DaemonSupervisor {
     );
     try {
       generation.identity = await Promise.race([
-        waitForDaemonReady({
+        this.#waitForDaemonReady({
           deadlineMs: 30_000,
           paths: this.#installation.paths,
           queryStatus: async () => await callLocalDaemon({
@@ -251,9 +272,9 @@ class DaemonSupervisor {
       ]);
     } catch (error: unknown) {
       generation.expectedStop ??= "stop";
-      signalDaemon();
+      generation.controller.abort(new Error("Live-acceptance daemon readiness failed."));
       await beforeDeadline(generation.promise, 30_000).catch(() => undefined);
-      throw error;
+      throw error instanceof WorkerFailure ? error : new WorkerFailure("daemon_failed");
     }
     if (process.env.HOME !== this.#descriptor.expectedHomeDirectory) {
       throw new WorkerFailure("home_changed");
@@ -328,8 +349,16 @@ class DaemonSupervisor {
     if (generation === undefined) return;
     if (generation.expectedStop === null) {
       generation.expectedStop = "parent_closed";
-      signalDaemon();
+      generation.controller.abort(new Error("The live-acceptance parent closed."));
     }
+  }
+
+  async stopAfterFailure(): Promise<void> {
+    const generation = this.#generation;
+    if (generation === undefined) return;
+    generation.expectedStop ??= "stop";
+    generation.controller.abort(new Error("The live-acceptance worker failed."));
+    await beforeDeadline(generation.promise, 30_000).catch(() => undefined);
   }
 
   async #stopGeneration(
@@ -352,7 +381,7 @@ class DaemonSupervisor {
       });
       if (!response.ok) throw new WorkerFailure("daemon_failed");
     } else {
-      signalDaemon();
+      generation.controller.abort(new Error("The live-acceptance daemon was asked to stop."));
     }
     await this.#awaitStoppedGeneration(generation);
   }
@@ -406,6 +435,35 @@ class CapturedCliOutput implements Output {
       throw new WorkerFailure("status_unavailable");
     }
     return next;
+  }
+}
+
+const discardedCliOutput: Output = {
+  writeStderr: () => undefined,
+  writeStdout: () => undefined,
+};
+
+async function initializeWorkerInstallation(
+  descriptor: AcceptanceInstallationDescriptor,
+): Promise<void> {
+  // Codex resolves its account-level credential-store policy from the app-server
+  // startup directory. Bind that base config to the same isolated project used by
+  // every config/read preflight, without changing HOME or carrying the path in argv.
+  process.chdir(descriptor.documentsDirectory);
+  if (process.cwd() !== descriptor.documentsDirectory) {
+    throw new WorkerFailure("layout_invalid");
+  }
+  const installation = createAcceptanceInstallation(descriptor);
+  try {
+    const exitCode = await initialize(true, false, discardedCliOutput, {
+      documentsDirectory: descriptor.documentsDirectory,
+      paths: installation.paths,
+    });
+    if (exitCode !== 0) throw new WorkerFailure("initialization_failed");
+  } catch {
+    // The worker protocol reports a bounded stage, never a potentially
+    // path-bearing SQLite or filesystem diagnostic.
+    throw new WorkerFailure("initialization_failed");
   }
 }
 
@@ -576,41 +634,27 @@ async function consumeControl(
   }
 }
 
-const signalDaemon = (): void => {
-  try {
-    process.kill(process.pid, "SIGTERM");
-  } catch {
-    // The daemon may already have completed its bounded shutdown.
-  }
-};
-
-async function workerMain(): Promise<number> {
+async function workerMain(
+  dependencies: WorkerDependencies = {},
+): Promise<number> {
   let status: StatusWriter | undefined;
   let input: WorkerInput | undefined;
   let descriptor: AcceptanceInstallationDescriptor | undefined;
+  let supervisor: DaemonSupervisor | undefined;
   try {
     status = new StatusWriter();
     input = new WorkerInput();
-    descriptor = await assertAcceptanceDescriptorLayout(await readDescriptor(input));
+    try {
+      descriptor = await assertAcceptanceDescriptorLayout(await readDescriptor(input));
+    } catch (error: unknown) {
+      if (error instanceof WorkerFailure) throw error;
+      throw new WorkerFailure("descriptor_invalid");
+    }
     if (process.env.HOME !== descriptor.expectedHomeDirectory) {
       throw new WorkerFailure("home_changed");
     }
-    // Codex resolves its account-level credential-store policy from the app-server
-    // startup directory. Bind that base config to the same isolated project used by
-    // every config/read preflight, without changing HOME or carrying the path in argv.
-    process.chdir(descriptor.documentsDirectory);
-    if (process.cwd() !== descriptor.documentsDirectory) {
-      throw new WorkerFailure("layout_invalid");
-    }
-    const installation = createAcceptanceInstallation(descriptor);
-    const initializationOutput = new CapturedCliOutput();
-    const initializationExitCode = await cliMain(
-      ["init", "--yes"],
-      initializationOutput,
-      { installation, interactive: false },
-    );
-    if (initializationExitCode !== 0) throw new WorkerFailure("daemon_failed");
-    const supervisor = new DaemonSupervisor(descriptor);
+    await (dependencies.initializeWorkerInstallation ?? initializeWorkerInstallation)(descriptor);
+    supervisor = new DaemonSupervisor(descriptor, dependencies);
     await supervisor.start();
     if (process.env.HOME !== descriptor.expectedHomeDirectory) {
       throw new WorkerFailure("home_changed");
@@ -636,7 +680,7 @@ async function workerMain(): Promise<number> {
     await status.close();
     return 0;
   } catch (error: unknown) {
-    signalDaemon();
+    await supervisor?.stopAfterFailure().catch(() => undefined);
     const code = error instanceof WorkerFailure
       ? error.code
       : error instanceof Error && error.message === "home_changed"
@@ -655,6 +699,41 @@ async function workerMain(): Promise<number> {
   } finally {
     input?.destroy();
   }
+}
+
+type LiveAcceptanceWorkerSupervisorTestInput =
+  | Readonly<{
+      descriptor: AcceptanceInstallationDescriptor;
+      kind: "start";
+      runDaemon: typeof runDaemon;
+      waitForDaemonReady: typeof waitForDaemonReady;
+    }>
+  | Readonly<{
+      initializeWorkerInstallation?: typeof initializeWorkerInstallation;
+      kind: "worker_main";
+      runDaemon: typeof runDaemon;
+      waitForDaemonReady: typeof waitForDaemonReady;
+    }>;
+
+export function runLiveAcceptanceWorkerSupervisorForTest(
+  input: Extract<LiveAcceptanceWorkerSupervisorTestInput, { kind: "start" }>,
+): Promise<void>;
+export function runLiveAcceptanceWorkerSupervisorForTest(
+  input: Extract<LiveAcceptanceWorkerSupervisorTestInput, { kind: "worker_main" }>,
+): Promise<number>;
+export async function runLiveAcceptanceWorkerSupervisorForTest(
+  input: LiveAcceptanceWorkerSupervisorTestInput,
+): Promise<number | void> {
+  const dependencies = {
+    ...(input.kind === "worker_main" && input.initializeWorkerInstallation !== undefined
+      ? { initializeWorkerInstallation: input.initializeWorkerInstallation }
+      : {}),
+    runDaemon: input.runDaemon,
+    waitForDaemonReady: input.waitForDaemonReady,
+  };
+  if (input.kind === "worker_main") return await workerMain(dependencies);
+  const supervisor = new DaemonSupervisor(input.descriptor, dependencies);
+  await supervisor.start();
 }
 
 if (import.meta.main) process.exitCode = await workerMain();

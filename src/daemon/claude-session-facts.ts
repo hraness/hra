@@ -238,6 +238,13 @@ export class ClaudeSessionFactTranslator {
       // of that, so nothing is projected.
       case "sessionBootstrapped":
         return null;
+      case "providerDisconnected":
+        this.forgetSession(authority, threadId);
+        return {
+          connectionId,
+          reason: fact.reason,
+          type: "providerDisconnected",
+        };
       case "turnStarted":
         return {
           connectionId,
@@ -365,8 +372,6 @@ export class ClaudeSessionFactTranslator {
           turnId: fact.turnId ?? "",
           type: "providerError",
         };
-      case "providerDisconnected":
-        return { connectionId, reason: fact.reason, type: "providerDisconnected" };
       case "protocolNotice":
         return { connectionId, method: fact.event, type: "protocolNotice" };
       // The turn summary's exact runtime and result text reach the projection
