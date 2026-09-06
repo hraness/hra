@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -28,6 +28,9 @@ import {
   createAcceptanceInstallation,
   type AcceptanceInstallationDescriptor,
 } from "./live-acceptance-installation";
+import type {
+  LiveAcceptanceMemoryFaultStatus,
+} from "./live-acceptance-memory-fault";
 import {
   assertCurrentLiveAcceptancePackageVersion,
   assertAcceptanceDescriptorLayout,
@@ -97,6 +100,13 @@ const releaseDeployEvidence: DeployEvidence = deployEvidenceSchema.parse(withSel
     teamId: HRA_CONVEX_TEAM_ID,
   }),
 }));
+const releaseCandidate = {
+  cloudTargetDigest: createHash("sha256")
+    .update(DEFAULT_CLOUD_DEPLOYMENT_URL, "utf8")
+    .digest("hex"),
+  packageVersion: HRA_VERSION,
+  sourceRevision: releaseSourceCommit,
+} as const;
 
 async function privateTestBase(): Promise<string> {
   const root = await mkdtemp(join(await realpath(tmpdir()), "hra-live-acceptance-test-"));
@@ -290,6 +300,14 @@ class FakeWorker implements LiveAcceptanceWorker {
     return response({ accepted: true });
   }
 
+  armCanonicalMemoryResponseDrop(): Promise<LiveAcceptanceMemoryFaultStatus> {
+    return Promise.reject(new Error("unexpected memory fault control"));
+  }
+
+  canonicalMemoryResponseDropStatus(): Promise<LiveAcceptanceMemoryFaultStatus> {
+    return Promise.reject(new Error("unexpected memory fault control"));
+  }
+
   async preserve(): Promise<void> {
     this.preserved = true;
     this.stopped = true;
@@ -309,6 +327,10 @@ class FakeWorker implements LiveAcceptanceWorker {
 
   lifetime(): Promise<void> {
     return Promise.resolve();
+  }
+
+  finalizeCanonicalMemoryResponseDrop(): Promise<LiveAcceptanceMemoryFaultStatus> {
+    return Promise.reject(new Error("unexpected memory fault control"));
   }
 
   resume(): Promise<void> {
@@ -416,6 +438,45 @@ describe("source-only live acceptance isolation", () => {
     expect(liveAcceptanceWorkerControlSchema.safeParse(control).success).toBeTrue();
   });
 
+  test("admits only coherent bounded memory-fault control frames", () => {
+    const input = {
+      candidateHead: {
+        headDigest: "a".repeat(64),
+        operationSha256: "b".repeat(64),
+        sequence: 2,
+      },
+      hostedSpaceId: `memory_${"A".repeat(32)}`,
+      remote: {
+        genesisToken: "c".repeat(64),
+        head: {
+          headDigest: "d".repeat(64),
+          operationSha256: "e".repeat(64),
+          sequence: 1,
+        },
+        headToken: "f".repeat(64),
+        keyVersion: 1,
+        revision: 1,
+      },
+    };
+    const control = {
+      input,
+      requestId: randomUUID(),
+      type: "memory_fault_arm" as const,
+      version: 1 as const,
+    };
+    expect(liveAcceptanceWorkerControlSchema.safeParse(control).success).toBeTrue();
+    expect(liveAcceptanceWorkerControlSchema.safeParse({
+      ...control,
+      input: { ...input, unboundedTransportHook: true },
+    }).success).toBeFalse();
+    expect(liveAcceptanceWorkerStatusSchema.safeParse({
+      requestId: control.requestId,
+      status: { currentGeneration: 1, phase: "finalized" },
+      type: "memory_fault_result",
+      version: 1,
+    }).success).toBeFalse();
+  });
+
   test("pins exact runtime authority before and after acceptance", async () => {
     const reads: string[] = [];
     const boundary = await openLiveRuntimeAttestationBoundary(
@@ -442,16 +503,25 @@ describe("source-only live acceptance isolation", () => {
     );
     const open = main.indexOf("openLiveRuntimeAttestationBoundary(");
     const start = main.indexOf("startLiveAcceptanceRun({");
-    const firstClose = main.indexOf("runtimeBoundary?.close()", start);
+    const firstCurrentParse = main.indexOf("parseCurrentLiveAcceptanceEvidence(", start);
+    const firstClose = main.indexOf("runtimeBoundary.close()", firstCurrentParse);
     const firstPersist = main.indexOf("persistLiveAcceptanceEvidence(", firstClose);
-    const secondClose = main.indexOf("runtimeBoundary?.close()", firstClose + 1);
+    const secondCurrentParse = main.indexOf(
+      "parseCurrentLiveAcceptanceEvidence(",
+      firstCurrentParse + 1,
+    );
+    const secondClose = main.indexOf("runtimeBoundary.close()", secondCurrentParse);
     const secondPersist = main.indexOf("persistLiveAcceptanceEvidence(", secondClose);
     expect(packageVersionGuard).toBeGreaterThan(-1);
     expect(packageVersionGuard).toBeLessThan(open);
     expect(open).toBeGreaterThan(-1);
     expect(open).toBeLessThan(start);
+    expect(firstCurrentParse).toBeGreaterThan(start);
+    expect(firstCurrentParse).toBeLessThan(firstClose);
     expect(firstClose).toBeGreaterThan(start);
     expect(firstClose).toBeLessThan(firstPersist);
+    expect(secondCurrentParse).toBeGreaterThan(firstPersist);
+    expect(secondCurrentParse).toBeLessThan(secondClose);
     expect(secondClose).toBeGreaterThan(firstPersist);
     expect(secondClose).toBeLessThan(secondPersist);
     expect(source).toContain("runtimeRevision: runtimeAttestation.runtimeRevision");
@@ -523,6 +593,14 @@ describe("source-only live acceptance isolation", () => {
       deployEvidencePath: "/private/operator/candidate-deploy.json",
       scenarioArguments: ["--scenario-stdin"],
     });
+    expect(parseLiveAcceptanceEvidenceOutput([
+      "--scenario-stdin",
+      "--deploy-evidence",
+      "/private/operator/candidate-deploy.json",
+    ])).toEqual({
+      deployEvidencePath: "/private/operator/candidate-deploy.json",
+      scenarioArguments: ["--scenario-stdin"],
+    });
     expect(() => parseLiveAcceptanceEvidenceOutput([
       "--scenario-stdin",
       "--evidence-fd",
@@ -546,6 +624,45 @@ describe("source-only live acceptance isolation", () => {
       "--deploy-evidence",
       "/private/operator/candidate-deploy.json",
     ])).toThrow();
+  });
+
+  test("requires deploy evidence before reading an agent scenario or starting recovery", async () => {
+    const liveAcceptanceModule = new URL("./live-acceptance.ts", import.meta.url).href;
+    const harness = [
+      `import { liveAcceptanceMain } from ${JSON.stringify(liveAcceptanceModule)};`,
+      "let recoveries = 0;",
+      "let sourceReads = 0;",
+      "const exitCode = await liveAcceptanceMain(['--scenario-stdin'], {",
+      "  recoverProcessJournal: async () => { recoveries += 1; },",
+      "  sourceAttestation: async () => {",
+      "    sourceReads += 1;",
+      `    return ${JSON.stringify(releaseCandidate)};`,
+      "  },",
+      "});",
+      "process.stdout.write(JSON.stringify({ exitCode, recoveries, sourceReads }));",
+    ].join("\n");
+    const child = Bun.spawn([process.execPath, "--no-env-file", "-e", harness], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const completion = await Promise.race([
+      child.exited.then((exitCode) => ({ exitCode, timedOut: false as const })),
+      Bun.sleep(2_000).then(() => ({ exitCode: null, timedOut: true as const })),
+    ]);
+    if (completion.timedOut) {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+    expect(completion).toEqual({ exitCode: 0, timedOut: false });
+    expect(await new Response(child.stdout).text()).toBe(JSON.stringify({
+      exitCode: 2,
+      recoveries: 0,
+      sourceReads: 0,
+    }));
+    expect(await new Response(child.stderr).text()).toBe(
+      "hra live acceptance: --deploy-evidence is required for the current memory gate\n",
+    );
   });
 
   test("creates two canonical private installations without changing HOME", async () => {
@@ -618,6 +735,34 @@ describe("source-only live acceptance isolation", () => {
     }
   });
 
+  test("binds the exact release candidate into both active worker descriptors", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({
+        candidate: releaseCandidate,
+        cloudDeploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+        temporaryBaseDirectory: base,
+      });
+      runRoot = layout.runRoot.path;
+      expect(layout.descriptors.a.candidate).toEqual(releaseCandidate);
+      expect(layout.descriptors.b.candidate).toEqual(releaseCandidate);
+      expect(acceptanceInstallationDescriptorSchema.safeParse({
+        ...layout.descriptors.a,
+        candidate: { ...releaseCandidate, targetBearerToken: "forbidden" },
+      }).success).toBeFalse();
+      expect(acceptanceInstallationDescriptorSchema.safeParse({
+        ...layout.descriptors.a,
+        candidate: { ...releaseCandidate, cloudTargetDigest: "0".repeat(63) },
+      }).success).toBeFalse();
+    } finally {
+      if (runRoot !== undefined) {
+        await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      }
+      await removeOwnedTestBase(base);
+    }
+  });
+
   test("initializes in the scrubbed environment before running an abort-aware daemon", async () => {
     const base = await privateTestBase();
     let child: ReturnType<typeof spawn> | undefined;
@@ -639,6 +784,7 @@ describe("source-only live acceptance isolation", () => {
         "  runDaemon: async (_installation, options) => {",
         "    const signal = options.stopSignal;",
         '    if (signal === undefined) throw new Error("missing generation stop signal");',
+        '    if (options.liveAcceptanceCanonicalMemoryTransportDecorator === undefined) throw new Error("missing memory fault decorator");',
         "    await new Promise((resolve) => {",
         "      if (signal.aborted) resolve();",
         '      else signal.addEventListener("abort", resolve, { once: true });',
@@ -1217,8 +1363,16 @@ describe("source-only live acceptance isolation", () => {
         ok: false,
       });
 
+      expect(await run.device("b").canonicalMemoryResponseDropStatus()).toEqual({
+        currentGeneration: 1,
+        phase: "unavailable",
+      });
       await run.device("b").suspend();
       await run.device("b").resume();
+      expect(await run.device("b").canonicalMemoryResponseDropStatus()).toEqual({
+        currentGeneration: 2,
+        phase: "unavailable",
+      });
       expect((await run.device("b").execute(["project", "list", "--json"])).exitCode)
         .toBe(0);
 

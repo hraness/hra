@@ -28,6 +28,8 @@ import {
 } from "../src/public-provider-identifier";
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { safeLiveAcceptanceCommandDigest } from "../src/codex/protocol";
+import { parseCli } from "../src/cli/parser";
+import { PROJECT_MEMORY_EMPTY_HEAD } from "../src/domain/project-memory";
 import {
   LIVE_ACCEPTANCE_CONTROL_FD,
   liveAcceptanceRecoveryReceiptSchema,
@@ -36,8 +38,23 @@ import {
   type LiveAcceptanceDeviceName,
 } from "./live-acceptance";
 import {
+  liveAcceptanceMemoryFaultArmSchema,
+  liveAcceptanceMemoryFaultFinalizeSchema,
+  liveAcceptanceMemoryFaultStatusSchema,
+  type LiveAcceptanceMemoryFaultArm,
+  type LiveAcceptanceMemoryFaultFinalize,
+  type LiveAcceptanceMemoryFaultStatus,
+} from "./live-acceptance-memory-fault";
+import type {
+  LiveAcceptanceMemoryReadback,
+  LiveMemoryErasureObservation,
+  LiveMemoryQuotaObservation,
+} from "./live-acceptance-memory-readback";
+import {
   liveAcceptanceScenarioConfigurationSchema,
+  liveAcceptanceEvidenceSchema,
   liveAcceptanceScenarioTesting,
+  parseCurrentLiveAcceptanceEvidence,
   runLiveAcceptanceScenario,
   type LiveAcceptanceOperatorRequest,
   type LiveAcceptanceScenarioOperator,
@@ -45,10 +62,12 @@ import {
 
 const accountA = `acct_${"1".repeat(32)}`;
 const accountB = `acct_${"2".repeat(32)}`;
+const accountBDevice = `acct_${"9".repeat(32)}`;
 const projectA = `proj_${"3".repeat(32)}`;
 const projectB = `proj_${"4".repeat(32)}`;
 const sessionA = `sess_${"5".repeat(32)}`;
 const sessionB = `sess_${"6".repeat(32)}`;
+const memorySessionB = `sess_${"9".repeat(32)}`;
 const deviceAId = `device_${"7".repeat(32)}`;
 const deviceBId = `device_${"8".repeat(32)}`;
 const commandId = "018bcfe5-6800-7000-8000-000000000001";
@@ -66,6 +85,29 @@ const attestation = {
   sourceRevision: "b".repeat(40),
 } as const;
 
+const digest = (character: string): string => character.repeat(64);
+const hostedSpaceId = `memory_${"m".repeat(32)}`;
+const candidateHead = {
+  headDigest: digest("c"),
+  operationSha256: digest("1"),
+  sequence: 1,
+} as const;
+const laterHead = {
+  headDigest: digest("d"),
+  operationSha256: digest("2"),
+  sequence: 2,
+} as const;
+const winnerHead = {
+  headDigest: digest("e"),
+  operationSha256: digest("3"),
+  sequence: 3,
+} as const;
+const loserHead = {
+  headDigest: digest("f"),
+  operationSha256: digest("4"),
+  sequence: 3,
+} as const;
+
 const success = (command: string, data: unknown): LiveAcceptanceCliResult => ({
   exitCode: 0,
   stderr: "",
@@ -73,7 +115,7 @@ const success = (command: string, data: unknown): LiveAcceptanceCliResult => ({
 });
 
 const failure = (
-  code: "INVALID_INPUT" | "UNAVAILABLE" = "UNAVAILABLE",
+  code: "INTERNAL" | "INVALID_INPUT" | "UNAVAILABLE" = "UNAVAILABLE",
   exitCode = code === "INVALID_INPUT" ? 2 : 5,
 ): LiveAcceptanceCliResult => ({
   exitCode,
@@ -83,6 +125,45 @@ const failure = (
     ok: false,
     version: 1,
   })}\n`,
+});
+
+type FakeMemoryHead = typeof PROJECT_MEMORY_EMPTY_HEAD
+  | typeof candidateHead
+  | typeof laterHead
+  | typeof winnerHead
+  | typeof loserHead;
+
+const publicHead = (head: FakeMemoryHead) => ({
+  digest: head.headDigest,
+  operationSha256: head.operationSha256,
+  sequence: head.sequence,
+});
+
+const remoteObservation = (head: FakeMemoryHead) => ({
+  genesisToken: digest("a"),
+  head,
+  headProofDigest: digest(head.sequence === 0 ? "b" : String(head.sequence)),
+  headToken: digest(head.sequence === 0 ? "0" : String(head.sequence)),
+  keyVersion: 1,
+  revision: 1,
+});
+
+const fakeAttachment = (
+  device: LiveAcceptanceDeviceName,
+  generation: number,
+  head: FakeMemoryHead,
+  state: "attached" | "conflict" | "detached" | "error",
+) => ({
+  accountBindingDigest: digest("5"),
+  canonicalBindingDigest: digest("6"),
+  createdAt: 1,
+  generation,
+  projectId: device === "a" ? projectA : projectB,
+  remote: remoteObservation(head),
+  remoteSpaceId: hostedSpaceId,
+  revision: generation,
+  state,
+  updatedAt: generation,
 });
 
 const interaction = (kind: "permission_approval" | "user_input"): PublicInteraction => ({
@@ -405,8 +486,32 @@ class FakeWorld {
   cleanupClockAdvanceMs = 0;
   cleanupObservedAt: number | undefined;
   wrongInteractionTurn = false;
-  sessionStarts = 0;
+  readonly timeline: string[] = [];
+  sessionStartsA = 0;
   accountAdds = 0;
+  memoryAttachmentGenerationA = 0;
+  memoryAttachmentGenerationB = 0;
+  memoryAttachmentStateA: "attached" | "conflict" | "detached" | "error" | null = null;
+  memoryAttachmentStateB: "attached" | "conflict" | "detached" | "error" | null = null;
+  memoryFaultPhase: LiveAcceptanceMemoryFaultStatus["phase"] = "idle";
+  memoryLocalHeadA: FakeMemoryHead = PROJECT_MEMORY_EMPTY_HEAD;
+  memoryLocalHeadB: FakeMemoryHead = PROJECT_MEMORY_EMPTY_HEAD;
+  memoryRemoteHead: FakeMemoryHead = PROJECT_MEMORY_EMPTY_HEAD;
+  memorySameGenerationRefusalCount = 0;
+  readonly memoryPages = new Map<string, Readonly<{
+    body: string;
+    device: LiveAcceptanceDeviceName;
+    recordSha256: string;
+  }>>();
+  wrongMemorySecondaryIdentity = false;
+  wrongMemoryPeerCandidateHead = false;
+  wrongMemoryHistoricalProof = false;
+  staleMemoryAttachmentRefresh = false;
+  wrongMemoryConflictDiagnostic = false;
+  omitMemoryLoserPage = false;
+  omitMemoryCanonicalRow = false;
+  wrongMemoryQuota = false;
+  wrongMemoryErasure = false;
 }
 
 class FakeDevice implements LiveAcceptanceDevice {
@@ -426,8 +531,22 @@ class FakeDevice implements LiveAcceptanceDevice {
     options: Readonly<{ protectedDocument?: unknown }> = {},
   ): Promise<LiveAcceptanceCliResult> {
     const argv = [...argvInput];
+    const expectedParserRejection = argv[0] === "plugin"
+      && ["auth", "disable", "enable", "install"].includes(argv[1] ?? "");
+    if (expectedParserRejection) {
+      let rejected = false;
+      try {
+        parseCli(argv, this.projectDirectory);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) throw new Error("Expected the production CLI parser to reject the probe.");
+    } else {
+      parseCli(argv, this.projectDirectory);
+    }
     (this.calls as string[][]).push(argv);
     const command = `${argv[0]}.${argv[1]}`;
+    this.#world.timeline.push(`${this.device}:${command}`);
     if (command === "project.add") {
       return success(command, { project: { id: this.device === "a" ? projectA : projectB } });
     }
@@ -479,7 +598,14 @@ class FakeDevice implements LiveAcceptanceDevice {
     if (command === "account.add") {
       this.#world.accountAdds += 1;
       return success(command, {
-        account: { id: this.#world.accountAdds === 1 ? accountA : accountB, state: "signed_out" },
+        account: {
+          id: this.device === "b"
+            ? accountBDevice
+            : this.#world.accountAdds === 1
+              ? accountA
+              : accountB,
+          state: "signed_out",
+        },
       });
     }
     if (command === "account.login") {
@@ -488,7 +614,11 @@ class FakeDevice implements LiveAcceptanceDevice {
       if (handoffIndex < 0 || handoffPath === undefined) {
         throw new Error("Account login did not request protected output.");
       }
-      const accountLabel = argv[2] === accountA ? "Acceptance Primary" : "Acceptance Secondary";
+      const accountLabel = argv[2] === accountA
+        ? "Acceptance Primary"
+        : argv[2] === accountBDevice
+          ? "Acceptance Secondary Memory"
+          : "Acceptance Secondary";
       liveAcceptanceScenarioTesting.writeOwnedProtectedJsonDocument(handoffPath, {
         accountId: argv[2],
         accountLabel,
@@ -517,7 +647,11 @@ class FakeDevice implements LiveAcceptanceDevice {
       return success(command, {
         account: {
           id: argv[2],
-          providerEmail: primary ? "primary@example.test" : "secondary@example.test",
+          providerEmail: primary
+            ? "primary@example.test"
+            : this.device === "b" && this.#world.wrongMemorySecondaryIdentity
+              ? "different-secondary@example.test"
+              : "secondary@example.test",
           providerPlan: this.#world.providerPlan,
           state: this.#world.accountLoginPending ? "login_pending" : "signed_in",
         },
@@ -566,9 +700,12 @@ class FakeDevice implements LiveAcceptanceDevice {
       });
     }
     if (command === "session.start") {
-      this.#world.sessionStarts += 1;
+      if (this.device === "b") {
+        return success(command, { session: { id: memorySessionB } });
+      }
+      this.#world.sessionStartsA += 1;
       return success(command, {
-        session: { id: this.#world.sessionStarts === 1 ? sessionA : sessionB },
+        session: { id: this.#world.sessionStartsA === 1 ? sessionA : sessionB },
       });
     }
     if (command === "session.send") {
@@ -721,6 +858,325 @@ class FakeDevice implements LiveAcceptanceDevice {
       argv[0] === "plugin"
       && ["auth", "disable", "enable", "install"].includes(argv[1] ?? "")
     ) return failure("INVALID_INPUT", 2);
+    if (command === "memory.hosted") {
+      const action = argv[2];
+      if (action === "create") {
+        this.#world.memoryAttachmentGenerationA = 1;
+        this.#world.memoryAttachmentStateA = "attached";
+        this.#world.memoryLocalHeadA = PROJECT_MEMORY_EMPTY_HEAD;
+        this.#world.memoryRemoteHead = PROJECT_MEMORY_EMPTY_HEAD;
+        return success("memory.hosted.create", {
+          attachment: fakeAttachment("a", 1, PROJECT_MEMORY_EMPTY_HEAD, "attached"),
+          canonicalSpaceId: `space_${"s".repeat(32)}`,
+          hostedSpaceId,
+          projectId: projectA,
+          replay: false,
+        });
+      }
+      if (action === "attach") {
+        if (this.device === "b" && this.#world.memoryAttachmentGenerationB === 0) {
+          this.#world.memoryAttachmentGenerationB = 1;
+          this.#world.memoryAttachmentStateB = "attached";
+          return success("memory.hosted.attach", {
+            attachment: fakeAttachment("b", 1, this.#world.memoryRemoteHead, "attached"),
+            projectId: projectB,
+          });
+        }
+        if (
+          this.device === "a"
+          && this.#world.memoryAttachmentStateA === "detached"
+          && this.#world.memoryFaultPhase === "armed"
+        ) {
+          this.#world.memoryAttachmentGenerationA += 1;
+          this.#world.memoryAttachmentStateA = "attached";
+          this.#world.memoryRemoteHead = candidateHead;
+          this.#world.memoryFaultPhase = "dropped_blocking";
+          this.#world.timeline.push("memory:drop-applied-response-lost");
+          return failure("INTERNAL", 1);
+        }
+        if (
+          this.device === "a"
+          && this.#world.memoryAttachmentStateA === "detached"
+          && this.#world.memoryFaultPhase === "finalized"
+        ) {
+          this.#world.memoryAttachmentGenerationA += 1;
+          this.#world.memoryAttachmentStateA = "attached";
+          this.#world.memoryRemoteHead = winnerHead;
+          this.#world.timeline.push("memory:winner-published");
+          return success("memory.hosted.attach", {
+            attachment: fakeAttachment(
+              "a",
+              this.#world.memoryAttachmentGenerationA,
+              winnerHead,
+              "attached",
+            ),
+            projectId: projectA,
+          });
+        }
+        if (
+          this.device === "b"
+          && this.#world.memoryAttachmentStateB === "detached"
+          && this.#world.memoryRemoteHead === winnerHead
+        ) {
+          this.#world.memoryAttachmentGenerationB += 1;
+          this.#world.memoryAttachmentStateB = "conflict";
+          this.#world.timeline.push("memory:loser-conflict");
+          return failure("INTERNAL", 1);
+        }
+        const generation = this.device === "a"
+          ? this.#world.memoryAttachmentGenerationA
+          : this.#world.memoryAttachmentGenerationB;
+        const state = this.device === "a"
+          ? this.#world.memoryAttachmentStateA
+          : this.#world.memoryAttachmentStateB;
+        if (state !== "attached") throw new Error("Unexpected fake memory attachment state.");
+        const observedGeneration = this.#world.staleMemoryAttachmentRefresh
+          && this.device === "a"
+          && this.#world.memoryFaultPhase === "finalized"
+          ? generation - 1
+          : generation;
+        return success("memory.hosted.attach", {
+          attachment: fakeAttachment(
+            this.device,
+            observedGeneration,
+            this.#world.memoryRemoteHead,
+            "attached",
+          ),
+          projectId: this.device === "a" ? projectA : projectB,
+        });
+      }
+      if (action === "detach") {
+        const expectedGeneration = Number(argv[argv.indexOf("--generation") + 1]);
+        const currentGeneration = this.device === "a"
+          ? this.#world.memoryAttachmentGenerationA
+          : this.#world.memoryAttachmentGenerationB;
+        if (expectedGeneration !== currentGeneration) {
+          throw new Error("Scenario used a stale fake memory attachment generation.");
+        }
+        if (this.device === "a") {
+          this.#world.memoryAttachmentGenerationA += 1;
+          this.#world.memoryAttachmentStateA = "detached";
+        } else {
+          this.#world.memoryAttachmentGenerationB += 1;
+          this.#world.memoryAttachmentStateB = "detached";
+        }
+        const generation = currentGeneration + 1;
+        return success("memory.hosted.detach", {
+          attachment: fakeAttachment(
+            this.device,
+            generation,
+            this.#world.memoryRemoteHead,
+            "detached",
+          ),
+          projectId: this.device === "a" ? projectA : projectB,
+        });
+      }
+      if (action === "sync") {
+        if (
+          this.device === "a"
+          && this.#world.memoryFaultPhase === "dropped_blocking"
+        ) {
+          this.#world.memorySameGenerationRefusalCount += 1;
+          return failure("INTERNAL", 1);
+        }
+        const localHead = this.device === "a"
+          ? this.#world.memoryLocalHeadA
+          : this.#world.memoryLocalHeadB;
+        if (localHead.sequence > this.#world.memoryRemoteHead.sequence) {
+          this.#world.memoryRemoteHead = localHead;
+        } else if (localHead.sequence < this.#world.memoryRemoteHead.sequence) {
+          if (this.device === "a") this.#world.memoryLocalHeadA = this.#world.memoryRemoteHead;
+          else this.#world.memoryLocalHeadB = this.#world.wrongMemoryPeerCandidateHead
+            && this.#world.memoryRemoteHead === candidateHead
+            ? PROJECT_MEMORY_EMPTY_HEAD
+            : this.#world.memoryRemoteHead;
+        }
+        const convergedHead = this.device === "a"
+          ? this.#world.memoryLocalHeadA
+          : this.#world.memoryLocalHeadB;
+        if (this.device === "b" && convergedHead === candidateHead) {
+          this.#world.timeline.push("memory:peer-candidate-pulled");
+        }
+        return success("memory.hosted.sync", {
+          attached: true,
+          complete: true,
+          localHead: convergedHead,
+          operations: 1,
+          projectId: this.device === "a" ? projectA : projectB,
+          remoteHead: this.#world.memoryRemoteHead,
+          state: "converged",
+        });
+      }
+      throw new Error(`Unexpected fake hosted memory action: ${String(action)}`);
+    }
+    if (command === "memory.remember") {
+      const key = argv[3]!;
+      const body = argv[argv.indexOf("--") + 1]!;
+      const label = key.includes("response-drop-candidate")
+        ? "candidate"
+        : key.includes("post-drop-terminal")
+          ? "later"
+          : key.includes("divergence-winner")
+            ? "winner"
+            : "loser";
+      const recordSha256 = digest(label === "candidate"
+        ? "7"
+        : label === "later"
+          ? "8"
+          : label === "winner"
+            ? "9"
+            : "a");
+      this.#world.memoryPages.set(key, { body, device: this.device, recordSha256 });
+      if (label === "later") this.#world.timeline.push("memory:peer-later-remembered");
+      const workingSequence = [...this.#world.memoryPages.values()]
+        .filter((page) => page.device === this.device).length;
+      const workingOperation = digest(this.device === "a" ? "b" : "c");
+      return success("memory.remember", {
+        idempotencyRetainedUntil: "2030-01-01T00:00:00.000Z",
+        ok: true,
+        page: { key, operationSha256: workingOperation, recordSha256 },
+        receiptSha256: digest("d"),
+        replay: false,
+        sessionId: argv[2],
+        submission: { id: `submission-${label}`, kind: "remember", state: "applied" },
+        version: 1,
+        workingHead: {
+          digest: digest(this.device === "a" ? "e" : "f"),
+          operationSha256: workingOperation,
+          sequence: workingSequence,
+        },
+      });
+    }
+    if (command === "memory.share") {
+      const key = argv[3]!;
+      const page = this.#world.memoryPages.get(key);
+      if (page === undefined) throw new Error("Fake memory page was not remembered.");
+      const head = key.includes("response-drop-candidate")
+        ? candidateHead
+        : key.includes("post-drop-terminal")
+          ? laterHead
+          : key.includes("divergence-winner")
+            ? winnerHead
+            : loserHead;
+      if (this.device === "a") this.#world.memoryLocalHeadA = head;
+      else this.#world.memoryLocalHeadB = head;
+      return success("memory.share", {
+        canonicalHead: publicHead(head),
+        idempotencyRetainedUntil: "2030-01-01T00:00:00.000Z",
+        ok: true,
+        receiptSha256: digest("e"),
+        replay: false,
+        sessionId: argv[2],
+        share: {
+          key,
+          nominationSha256: digest("f"),
+          operationSha256: head.operationSha256,
+          recordSha256: page.recordSha256,
+          status: "adopted",
+        },
+        submission: { id: `share-${head.sequence}-${this.device}`, kind: "share", state: "applied" },
+        version: 1,
+      });
+    }
+    if (command === "memory.status") {
+      const localHead = this.device === "a"
+        ? this.#world.memoryLocalHeadA
+        : this.#world.memoryLocalHeadB;
+      const conflict = this.device === "b" && this.#world.memoryAttachmentStateB === "conflict";
+      return success("memory.status", {
+        canonical: {
+          authorityDigest: digest("1"),
+          bindingDigest: digest("6"),
+          diagnosticCode: conflict
+            ? this.#world.wrongMemoryConflictDiagnostic
+              ? "REMOTE_MEMORY_HISTORY_CONFLICT"
+              : "REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT"
+            : null,
+          expectedHead: publicHead(localHead),
+          frozen: conflict,
+          identityContract: 2,
+          initialized: true,
+          lastExchangeAt: 1,
+          lastExchangeHead: publicHead(conflict ? laterHead : localHead),
+          physicalState: "initialized",
+          revision: 1,
+          syncState: conflict ? "conflict" : "settled",
+        },
+        ok: true,
+        projectId: this.device === "a" ? projectA : projectB,
+        sessionId: argv[2],
+        unsettledSubmission: null,
+        version: 1,
+        working: {},
+      });
+    }
+    if (command === "memory.get") {
+      const key = argv[3]!;
+      const page = this.#world.memoryPages.get(key);
+      const workingOnly = argv.includes("--working-only");
+      const omitted = workingOnly
+        && key.includes("divergence-loser")
+        && this.#world.omitMemoryLoserPage;
+      const rows = omitted || page === undefined
+        ? []
+        : !workingOnly && page.device === this.device
+          ? (this.#world.omitMemoryCanonicalRow
+              && (key.includes("response-drop-candidate")
+                || key.includes("divergence-winner"))
+              ? (["working"] as const)
+              : (["working", "canonical"] as const)).map((lane, row) => ({
+              bodyChunk: page.body,
+              chunkCount: 1,
+              chunkIndex: 0,
+              key,
+              lane,
+              recordSha256: page.recordSha256,
+              row,
+            }))
+          : [{
+              bodyChunk: page.body,
+              chunkCount: 1,
+              chunkIndex: 0,
+              key,
+              lane: workingOnly ? "working" : "canonical",
+              recordSha256: page.recordSha256,
+              row: 0,
+            }];
+      const localHead = this.device === "a"
+        ? this.#world.memoryLocalHeadA
+        : this.#world.memoryLocalHeadB;
+      return success("memory.query", {
+        canonical: {
+          diagnosticCode: workingOnly && this.#world.memoryAttachmentStateB === "conflict"
+            ? "REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT"
+            : null,
+          frozen: workingOnly && this.#world.memoryAttachmentStateB === "conflict",
+          included: !workingOnly,
+          syncState: this.#world.memoryAttachmentStateB === "conflict" && this.device === "b"
+            ? "conflict"
+            : "settled",
+        },
+        canonicalHead: workingOnly ? null : publicHead(localHead),
+        conflicts: {},
+        continuation: null,
+        mode: "get",
+        ok: true,
+        page: {
+          completeness: "complete",
+          endExclusive: rows.length,
+          hasMore: false,
+          pageSize: 2,
+          returnedRows: rows.length,
+          start: 0,
+          totalRows: rows.length,
+        },
+        queryId: "memq_fake",
+        rows,
+        scope: workingOnly ? "working" : "composite",
+        version: 1,
+        workingHead: publicHead(PROJECT_MEMORY_EMPTY_HEAD),
+      });
+    }
     if (command === "remote.show") {
       if (this.device === "b" && (!this.#world.approved || this.#world.deviceBRevoked)) {
         return failure();
@@ -810,12 +1266,193 @@ class FakeDevice implements LiveAcceptanceDevice {
     throw new Error(`Unexpected fake CLI command: ${command}`);
   }
 
+  async armCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultArm,
+  ): Promise<LiveAcceptanceMemoryFaultStatus> {
+    if (this.device !== "a" || this.#world.memoryFaultPhase !== "idle") {
+      throw new Error("Fake memory fault was armed outside its idle device-A phase.");
+    }
+    const parsed = liveAcceptanceMemoryFaultArmSchema.parse(input);
+    expect(parsed).toEqual({
+      candidateHead,
+      hostedSpaceId,
+      remote: {
+        genesisToken: digest("a"),
+        head: PROJECT_MEMORY_EMPTY_HEAD,
+        headToken: digest("0"),
+        keyVersion: 1,
+        revision: 1,
+      },
+    });
+    this.#world.memoryFaultPhase = "armed";
+    this.#world.timeline.push("memory:fault-armed");
+    return this.#faultStatus();
+  }
+
+  async canonicalMemoryResponseDropStatus(): Promise<LiveAcceptanceMemoryFaultStatus> {
+    if (this.device !== "a") throw new Error("Only fake device A owns the memory fault.");
+    return this.#faultStatus();
+  }
+
+  async finalizeCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultFinalize,
+  ): Promise<LiveAcceptanceMemoryFaultStatus> {
+    if (this.device !== "a" || this.#world.memoryFaultPhase !== "historical_proved") {
+      throw new Error("Fake memory fault finalized before historical recovery.");
+    }
+    const parsed = liveAcceptanceMemoryFaultFinalizeSchema.parse(input);
+    expect(parsed).toEqual({
+      candidateBindingDigest: digest("9"),
+      laterTerminalSequence: laterHead.sequence,
+    });
+    this.#world.memoryFaultPhase = "finalized";
+    this.#world.timeline.push("memory:fault-finalized");
+    return this.#faultStatus();
+  }
+
   async resume(): Promise<void> {
+    if (this.device === "a") {
+      if (this.#world.memoryFaultPhase !== "suspended") {
+        throw new Error("Fake device A resumed outside the suspended fault phase.");
+      }
+      this.#world.memoryFaultPhase = "waiting_historical";
+      this.#world.timeline.push("memory:recovery-generation-started");
+      // The real daemon's background recovery owns this pull after readiness.
+      this.#world.memoryLocalHeadA = this.#world.memoryRemoteHead;
+      this.#world.memoryFaultPhase = "historical_proved";
+      this.#world.timeline.push("memory:historical-pull-proved");
+      return;
+    }
     this.#world.deviceBOnline = true;
   }
 
   async suspend(): Promise<void> {
+    if (this.device === "a") {
+      if (this.#world.memoryFaultPhase !== "dropped_blocking") {
+        throw new Error("Fake device A suspended outside the blocking fault phase.");
+      }
+      this.#world.memoryFaultPhase = "suspended";
+      this.#world.timeline.push("memory:fault-generation-suspended");
+      return;
+    }
     this.#world.deviceBOnline = false;
+  }
+
+  #faultStatus(): LiveAcceptanceMemoryFaultStatus {
+    const phase = this.#world.memoryFaultPhase;
+    const hasDropProof = [
+      "dropped_blocking",
+      "finalized",
+      "historical_proved",
+      "proving_historical",
+      "suspended",
+      "waiting_historical",
+    ].includes(phase);
+    const hasHistoricalProof = phase === "historical_proved" || phase === "finalized";
+    return liveAcceptanceMemoryFaultStatusSchema.parse({
+      currentGeneration: phase === "suspended" ? null : phase === "idle" ? 1 : phase === "armed"
+        || phase === "dropped_blocking" ? 1 : 2,
+      ...(hasHistoricalProof
+        ? {
+            historical: {
+              afterSequence: candidateHead.sequence - 1,
+              firstOperationSha256: this.#world.wrongMemoryHistoricalProof
+                ? digest("0")
+                : digest("8"),
+              generation: 2,
+              terminalSequence: laterHead.sequence,
+            },
+          }
+        : {}),
+      phase,
+      ...(hasDropProof
+        ? {
+            proof: {
+              candidateBindingDigest: digest("9"),
+              candidateHead,
+              droppedGeneration: 1,
+              hostedSpaceIdSha256: createHash("sha256")
+                .update(hostedSpaceId, "utf8")
+                .digest("hex"),
+              pushDispatchCount: 1,
+              sameGenerationRefusalCount: this.#world.memorySameGenerationRefusalCount,
+              sequence: candidateHead.sequence,
+              structuredRequestSha256: digest("7"),
+              wireOperationSha256: digest("8"),
+            },
+          }
+        : {}),
+    });
+  }
+}
+
+class FakeMemoryReadback implements LiveAcceptanceMemoryReadback {
+  #state: "new" | "bound" | "populated" | "closed" = "new";
+
+  constructor(readonly world: FakeWorld) {}
+
+  async bindDevices(
+    devicePublicIds: readonly [string, string],
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (
+      signal.aborted
+      || this.#state !== "new"
+      || JSON.stringify(devicePublicIds) !== JSON.stringify([deviceAId, deviceBId])
+    ) throw new Error("Fake memory readback device binding failed.");
+    this.#state = "bound";
+    this.world.timeline.push("memory:readback-bound");
+  }
+
+  async observePopulated(
+    expectedOperations: number,
+    signal: AbortSignal,
+  ): Promise<LiveMemoryQuotaObservation> {
+    if (
+      signal.aborted
+      || this.#state !== "bound"
+      || expectedOperations !== 3
+      || this.world.memoryRemoteHead !== winnerHead
+      || this.world.memoryAttachmentStateB !== "conflict"
+      || this.world.cleanupComplete
+    ) throw new Error("Fake populated memory readback ran outside its exact state.");
+    this.#state = "populated";
+    this.world.timeline.push("memory:quota-observed");
+    return {
+      logicalBytes: 4_096,
+      operationRecords: this.world.wrongMemoryQuota ? 2 : 3,
+      quotaMatches: true,
+      records: this.world.wrongMemoryQuota ? 3 : 4,
+      spaceRecords: 1,
+    };
+  }
+
+  async observeErased(signal: AbortSignal): Promise<LiveMemoryErasureObservation> {
+    if (signal.aborted || this.#state !== "populated" || !this.world.cleanupComplete) {
+      throw new Error("Fake erased memory readback ran before cleanup.");
+    }
+    this.#state = "closed";
+    this.world.timeline.push("memory:erasure-observed");
+    if (this.world.wrongMemoryErasure) {
+      return {
+        logicalBytes: 0,
+        operationRecords: 1,
+        quotaCategory: "absent",
+        records: 0,
+        spaceRecords: 0,
+      } as unknown as LiveMemoryErasureObservation;
+    }
+    return {
+      logicalBytes: 0,
+      operationRecords: 0,
+      quotaCategory: "absent",
+      records: 0,
+      spaceRecords: 0,
+    };
+  }
+
+  close(): void {
+    this.#state = "closed";
   }
 }
 
@@ -889,6 +1526,7 @@ const startFakeScenario = (
   world: FakeWorld,
   operator: LiveAcceptanceScenarioOperator,
   options: Readonly<{
+    memoryReadback?: LiveAcceptanceMemoryReadback | null;
     remoteCommandDeadlineMs?: number;
     signal?: AbortSignal;
     sleep?: (milliseconds: number) => Promise<void>;
@@ -901,6 +1539,9 @@ const startFakeScenario = (
     a: new FakeDevice("a", world),
     b: new FakeDevice("b", world),
   } as const;
+  const memoryReadback = options.memoryReadback === null
+    ? undefined
+    : options.memoryReadback ?? new FakeMemoryReadback(world);
   let clock = 1_000;
   let commandProofSequence = 0;
   const promise = runLiveAcceptanceScenario({
@@ -912,12 +1553,15 @@ const startFakeScenario = (
       clock += world.cleanupClockAdvanceMs;
       world.cleanupObservedAt = clock;
       world.cleanupComplete = true;
+      world.timeline.push("memory:run-cleanup");
     },
     device: (name) => devices[name],
     runId: "50000000-0000-4000-8000-000000000001",
   }, operator, attestation, {
     accountLoginDeadlineMs: 1_000,
     autonomousUsageProofDeadlineMs: 5,
+    memoryFaultDeadlineMs: 5,
+    ...(memoryReadback === undefined ? {} : { memoryReadback }),
     now: () => clock,
     pollIntervalMs: 1,
     presenceObservationMarginMs: 0,
@@ -1062,7 +1706,7 @@ describe("live acceptance release scenario", () => {
 
     expect(world.cleanupComplete).toBe(true);
     expect(world.boundPeer).toBe(deviceBId);
-    expect(operator.deviceLogins).toBe(2);
+    expect(operator.deviceLogins).toBe(3);
     expect(operator.requests.map((request) => request.kind)).toEqual([
       "device_a_auth_invite",
       "device_a_auth_code",
@@ -1083,6 +1727,48 @@ describe("live acceptance release scenario", () => {
       cloudTargetDigest: "a".repeat(64),
       devicePublicIds: [deviceAId, deviceBId],
       packageVersion: HRA_VERSION,
+      memory: {
+        divergence: {
+          commonHead: laterHead,
+          diagnosticCode: "REMOTE_MEMORY_EQUAL_SEQUENCE_CONFLICT",
+          divergentSequence: 3,
+          loserHead,
+          loserPagePreserved: true,
+          loserStickyConflict: true,
+          sameSequenceDistinctHeads: true,
+          winnerHead,
+          winnerPreserved: true,
+        },
+        historicalReconciliation: {
+          candidateBindingDigest: digest("9"),
+          candidateHead,
+          candidateHeadObservedByPeer: true,
+          droppedGeneration: 1,
+          exactHistoricalOperation: true,
+          historical: {
+            afterSequence: 0,
+            firstOperationSha256: digest("8"),
+            generation: 2,
+            terminalSequence: 2,
+          },
+          noRepeatPush: true,
+          publicRecoverySettled: true,
+          pushDispatchCount: 1,
+          recoveredHead: laterHead,
+          sameGenerationRefusalCount: 1,
+          sequence: 1,
+          structuredRequestSha256: digest("7"),
+          wireOperationSha256: digest("8"),
+        },
+        quota: {
+          logicalBytes: 4_096,
+          operationRecords: 3,
+          quotaMatches: true,
+          records: 4,
+          spaceRecords: 1,
+        },
+        secondaryProviderIdentityMatched: true,
+      },
       pluginLifecycleEffectsRejected: ["auth", "disable", "enable", "install"],
       pluginInstallRejected: true,
       presence: ["online", "offline", "online"],
@@ -1091,8 +1777,31 @@ describe("live acceptance release scenario", () => {
       sessionIds: [sessionA, sessionB],
       sourceRevision: "b".repeat(40),
       status: "passed",
-      version: 1,
+      version: 2,
     });
+    expect(evidence.memory.erasure).toEqual({
+      logicalBytes: 0,
+      operationRecords: 0,
+      quotaCategory: "absent",
+      records: 0,
+      spaceRecords: 0,
+    });
+    const candidatePull = world.timeline.indexOf("memory:peer-candidate-pulled");
+    const laterRemember = world.timeline.indexOf("memory:peer-later-remembered");
+    const historicalPull = world.timeline.indexOf("memory:historical-pull-proved");
+    const winnerPublished = world.timeline.indexOf("memory:winner-published");
+    const loserConflict = world.timeline.indexOf("memory:loser-conflict");
+    const quotaObserved = world.timeline.indexOf("memory:quota-observed");
+    const cleanup = world.timeline.indexOf("memory:run-cleanup");
+    const erasureObserved = world.timeline.indexOf("memory:erasure-observed");
+    expect(candidatePull).toBeGreaterThanOrEqual(0);
+    expect(laterRemember).toBeGreaterThan(candidatePull);
+    expect(historicalPull).toBeGreaterThan(laterRemember);
+    expect(winnerPublished).toBeGreaterThan(historicalPull);
+    expect(loserConflict).toBeGreaterThan(winnerPublished);
+    expect(quotaObserved).toBeGreaterThan(loserConflict);
+    expect(cleanup).toBeGreaterThan(quotaObserved);
+    expect(erasureObserved).toBeGreaterThan(cleanup);
     expect(evidence.completedAt - evidence.startedAt).toBeGreaterThan(70_000);
     const serialized = JSON.stringify(evidence);
     expect(serialized).not.toContain("primary@example.test");
@@ -1116,6 +1825,100 @@ describe("live acceptance release scenario", () => {
       expect(devices.a.calls.some((argv) => argv[0] === "plugin" && argv[1] === action))
         .toBe(true);
     }
+  });
+
+  test("keeps legacy V1 parse-only and rejects incoherent current memory evidence", async () => {
+    const evidence = await startFakeScenario(new FakeWorld(), new FakeOperator()).promise;
+    const legacy: Record<string, unknown> = { ...evidence, version: 1 };
+    delete legacy.memory;
+    expect(liveAcceptanceEvidenceSchema.parse(legacy)).toEqual(legacy);
+    expect(() => parseCurrentLiveAcceptanceEvidence(legacy))
+      .toThrow("live_evidence_version_obsolete");
+
+    expect(() => parseCurrentLiveAcceptanceEvidence({
+      ...evidence,
+      memory: {
+        ...evidence.memory,
+        historicalReconciliation: {
+          ...evidence.memory.historicalReconciliation,
+          recoveredHead: candidateHead,
+        },
+      },
+    })).toThrow("Canonical-memory release evidence is incoherent.");
+    expect(() => parseCurrentLiveAcceptanceEvidence({
+      ...evidence,
+      memory: {
+        ...evidence.memory,
+        historicalReconciliation: {
+          ...evidence.memory.historicalReconciliation,
+          sameGenerationRefusalCount: 0,
+        },
+      },
+    })).toThrow();
+  });
+
+  test("requires the memory readback before any scenario effect", async () => {
+    const world = new FakeWorld();
+    const operator = new FakeOperator();
+    const started = startFakeScenario(world, operator, { memoryReadback: null });
+    await expect(started.promise).rejects.toThrow("memory_readback_required");
+    expect(started.devices.a.calls).toHaveLength(0);
+    expect(started.devices.b.calls).toHaveLength(0);
+    expect(operator.requests).toHaveLength(0);
+    expect(world.boundPeer).toBeUndefined();
+  });
+
+  test("requires the exact secondary provider and candidate pull before peer advance", async () => {
+    const wrongIdentity = new FakeWorld();
+    wrongIdentity.wrongMemorySecondaryIdentity = true;
+    await expect(startFakeScenario(wrongIdentity, new FakeOperator()).promise)
+      .rejects.toThrow("memory_secondary_provider_identity_changed");
+
+    const wrongPeerHead = new FakeWorld();
+    wrongPeerHead.wrongMemoryPeerCandidateHead = true;
+    await expect(startFakeScenario(wrongPeerHead, new FakeOperator()).promise)
+      .rejects.toThrow("memory_hosted_sync_not_converged");
+    expect(wrongPeerHead.timeline).not.toContain("memory:peer-later-remembered");
+  });
+
+  test("requires exact later-generation historical recovery and refreshed attachment generation", async () => {
+    const wrongHistorical = new FakeWorld();
+    wrongHistorical.wrongMemoryHistoricalProof = true;
+    await expect(startFakeScenario(wrongHistorical, new FakeOperator()).promise).rejects.toThrow();
+    expect(wrongHistorical.timeline).not.toContain("memory:fault-finalized");
+
+    const staleGeneration = new FakeWorld();
+    staleGeneration.staleMemoryAttachmentRefresh = true;
+    await expect(startFakeScenario(staleGeneration, new FakeOperator()).promise)
+      .rejects.toThrow("Scenario used a stale fake memory attachment generation.");
+    expect(staleGeneration.timeline).not.toContain("memory:winner-published");
+  });
+
+  test("requires exact sticky divergence, retained loser content, quota, and erasure", async () => {
+    const missingCanonical = new FakeWorld();
+    missingCanonical.omitMemoryCanonicalRow = true;
+    await expect(startFakeScenario(missingCanonical, new FakeOperator()).promise)
+      .rejects.toThrow("memory_page_not_proven");
+
+    const wrongDiagnostic = new FakeWorld();
+    wrongDiagnostic.wrongMemoryConflictDiagnostic = true;
+    await expect(startFakeScenario(wrongDiagnostic, new FakeOperator()).promise)
+      .rejects.toThrow("memory_divergence_conflict_not_sticky");
+
+    const missingLoser = new FakeWorld();
+    missingLoser.omitMemoryLoserPage = true;
+    await expect(startFakeScenario(missingLoser, new FakeOperator()).promise).rejects.toThrow();
+
+    const wrongQuota = new FakeWorld();
+    wrongQuota.wrongMemoryQuota = true;
+    await expect(startFakeScenario(wrongQuota, new FakeOperator()).promise)
+      .rejects.toThrow("Canonical-memory release evidence is incoherent.");
+    expect(wrongQuota.cleanupComplete).toBe(true);
+
+    const wrongErasure = new FakeWorld();
+    wrongErasure.wrongMemoryErasure = true;
+    await expect(startFakeScenario(wrongErasure, new FakeOperator()).promise).rejects.toThrow();
+    expect(wrongErasure.cleanupComplete).toBe(true);
   });
 
   test("rejects prompt-only markers and empty usage", async () => {

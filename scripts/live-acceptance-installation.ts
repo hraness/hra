@@ -29,7 +29,19 @@ const normalizedAbsolutePathSchema = z.string()
   .max(4_096)
   .refine((value) => isAbsolute(value) && resolve(value) === value);
 
+export const liveAcceptanceCandidateSchema = z.object({
+  cloudTargetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+  packageVersion: z.string()
+    .min(5)
+    .max(128)
+    .regex(/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u),
+  sourceRevision: z.string().regex(/^[a-f0-9]{40}$/u),
+}).strict();
+
+export type LiveAcceptanceCandidate = z.infer<typeof liveAcceptanceCandidateSchema>;
+
 export const acceptanceInstallationDescriptorSchema = z.object({
+  candidate: liveAcceptanceCandidateSchema.optional(),
   cloudDeploymentUrl: z.string().min(1).max(2_048).refine((value) => {
     try {
       return canonicalCloudDeploymentUrl(value) === value;

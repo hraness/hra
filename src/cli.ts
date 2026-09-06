@@ -91,6 +91,7 @@ import {
   type CloudSecretCustodyPort,
   type CanonicalMemoryCloudAuthoritySource,
 } from "./cloud/index";
+import type { CanonicalMemoryTransport } from "./cloud/canonical-memory-transport";
 import {
   allowlistedEnvironment,
   readCodexAutomationAuthority,
@@ -3263,12 +3264,18 @@ type DaemonStopLatch = {
 };
 
 export type RunDaemonOptions = Readonly<{
+  liveAcceptanceCanonicalMemoryTransportDecorator?: (
+    transport: CanonicalMemoryTransport,
+  ) => CanonicalMemoryTransport;
   stopSignal?: AbortSignal;
 }>;
 
 async function runDaemonLifecycle(
   installation: HraInstallation,
   stopLatch: DaemonStopLatch,
+  liveAcceptanceCanonicalMemoryTransportDecorator?: (
+    transport: CanonicalMemoryTransport,
+  ) => CanonicalMemoryTransport,
 ): Promise<number> {
   assertInstallationHome(installation);
   const paths = installation.paths;
@@ -3752,7 +3759,24 @@ async function runDaemonLifecycle(
         cloudAdapter = candidateAdapter;
         cloud = candidateCloud;
         cloudLifecycle = candidateLifecycle;
-        canonicalMemoryAuthoritySource = localCloudControl;
+        canonicalMemoryAuthoritySource = liveAcceptanceCanonicalMemoryTransportDecorator === undefined
+          ? localCloudControl
+          : {
+              snapshotCanonicalMemoryAuthority: async (signal) => {
+                const authority = await localCloudControl.snapshotCanonicalMemoryAuthority(signal);
+                try {
+                  return Object.freeze({
+                    ...authority,
+                    transport: liveAcceptanceCanonicalMemoryTransportDecorator(
+                      authority.transport,
+                    ),
+                  });
+                } catch (error: unknown) {
+                  authority.dispose();
+                  throw error;
+                }
+              },
+            };
         candidateAdapter = undefined;
         candidateBridge = undefined;
       } catch (error: unknown) {
@@ -4106,6 +4130,14 @@ export async function runDaemon(
   installation: HraInstallation = createProductionInstallation(),
   options: RunDaemonOptions = {},
 ): Promise<number> {
+  if (
+    options.liveAcceptanceCanonicalMemoryTransportDecorator !== undefined
+    && installation.kind !== "live_acceptance"
+  ) {
+    throw new Error(
+      "The canonical-memory transport decorator is restricted to live acceptance.",
+    );
+  }
   const stopLatch: DaemonStopLatch = { deliver: undefined, requested: false };
   const requestLatchedStop = () => {
     if (stopLatch.requested) return;
@@ -4118,7 +4150,11 @@ export async function runDaemon(
   // event. Check after registration so no stop can be lost around this edge.
   if (stopSignal?.aborted === true) requestLatchedStop();
   try {
-    return await runDaemonLifecycle(installation, stopLatch);
+    return await runDaemonLifecycle(
+      installation,
+      stopLatch,
+      options.liveAcceptanceCanonicalMemoryTransportDecorator,
+    );
   } finally {
     stopLatch.deliver = undefined;
     stopSignal?.removeEventListener("abort", requestLatchedStop);

@@ -6102,6 +6102,18 @@ describe("CLI entry point", () => {
     }
   });
 
+  test("rejects the canonical-memory fault decorator outside live acceptance before effects", async () => {
+    const installation = createProductionInstallation();
+    let decorated = false;
+    await expect(runDaemon(installation, {
+      liveAcceptanceCanonicalMemoryTransportDecorator: (transport) => {
+        decorated = true;
+        return transport;
+      },
+    })).rejects.toThrow("restricted to live acceptance");
+    expect(decorated).toBeFalse();
+  });
+
   test("delivers an abort during early daemon boot before transport exists", async () => {
     const { installation: baseInstallation, runRoot } = await upgradeFixture("daemon-stop-during-early-boot");
     try {

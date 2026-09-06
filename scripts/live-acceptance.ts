@@ -28,7 +28,20 @@ import { z } from "zod";
 import {
   acceptanceInstallationDescriptorSchema,
   type AcceptanceInstallationDescriptor,
+  type LiveAcceptanceCandidate,
 } from "./live-acceptance-installation";
+import {
+  liveAcceptanceMemoryFaultArmSchema,
+  liveAcceptanceMemoryFaultFinalizeSchema,
+  liveAcceptanceMemoryFaultStatusSchema,
+  type LiveAcceptanceMemoryFaultArm,
+  type LiveAcceptanceMemoryFaultFinalize,
+  type LiveAcceptanceMemoryFaultStatus,
+} from "./live-acceptance-memory-fault";
+import {
+  createLiveAcceptanceMemoryReadback,
+  type LiveAcceptanceMemoryReadback,
+} from "./live-acceptance-memory-readback";
 import {
   commandResponseSchema,
   localCommandSchema,
@@ -60,6 +73,7 @@ import {
   type DeployEvidence,
   type RuntimeReleaseAttestation,
 } from "./release-evidence";
+import type { LiveAcceptanceEvidenceV2 } from "./live-acceptance-scenario";
 
 export const LIVE_ACCEPTANCE_CONTROL_FD = 0;
 export const LIVE_ACCEPTANCE_STATUS_FD = 1;
@@ -102,6 +116,23 @@ export const liveAcceptanceWorkerControlSchema = z.discriminatedUnion("type", [
     command: localCommandSchema,
     requestId: requestIdSchema,
     type: z.literal("command"),
+    version: z.literal(1),
+  }).strict(),
+  z.object({
+    input: liveAcceptanceMemoryFaultArmSchema,
+    requestId: requestIdSchema,
+    type: z.literal("memory_fault_arm"),
+    version: z.literal(1),
+  }).strict(),
+  z.object({
+    input: liveAcceptanceMemoryFaultFinalizeSchema,
+    requestId: requestIdSchema,
+    type: z.literal("memory_fault_finalize"),
+    version: z.literal(1),
+  }).strict(),
+  z.object({
+    requestId: requestIdSchema,
+    type: z.literal("memory_fault_status"),
     version: z.literal(1),
   }).strict(),
   z.object({
@@ -167,6 +198,12 @@ export const liveAcceptanceWorkerStatusSchema = z.discriminatedUnion("type", [
     requestId: requestIdSchema,
     response: commandResponseSchema,
     type: z.literal("command_result"),
+    version: z.literal(1),
+  }).strict(),
+  z.object({
+    requestId: requestIdSchema,
+    status: liveAcceptanceMemoryFaultStatusSchema,
+    type: z.literal("memory_fault_result"),
     version: z.literal(1),
   }).strict(),
   z.object({
@@ -335,6 +372,10 @@ export interface LiveAcceptanceWorker {
   readonly pid: number;
   readonly projectDirectory: string;
   command(command: LocalCommand): Promise<CommandResponse>;
+  armCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultArm,
+  ): Promise<LiveAcceptanceMemoryFaultStatus>;
+  canonicalMemoryResponseDropStatus(): Promise<LiveAcceptanceMemoryFaultStatus>;
   execute(
     argv: readonly string[],
     options?: Readonly<{ protectedDocument?: unknown }>,
@@ -343,12 +384,19 @@ export interface LiveAcceptanceWorker {
   lifetime(): Promise<void>;
   preserve(): Promise<void>;
   ready(): Promise<void>;
+  finalizeCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultFinalize,
+  ): Promise<LiveAcceptanceMemoryFaultStatus>;
   resume(): Promise<void>;
   stop(): Promise<void>;
   suspend(): Promise<void>;
 }
 
 export type LiveAcceptanceDevice = Readonly<{
+  armCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultArm,
+  ): Promise<LiveAcceptanceMemoryFaultStatus>;
+  canonicalMemoryResponseDropStatus(): Promise<LiveAcceptanceMemoryFaultStatus>;
   device: LiveAcceptanceDeviceName;
   projectDirectory: string;
   execute(
@@ -356,6 +404,9 @@ export type LiveAcceptanceDevice = Readonly<{
     options?: Readonly<{ protectedDocument?: unknown }>,
   ): Promise<LiveAcceptanceCliResult>;
   resume(): Promise<void>;
+  finalizeCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultFinalize,
+  ): Promise<LiveAcceptanceMemoryFaultStatus>;
   suspend(): Promise<void>;
 }>;
 
@@ -364,6 +415,7 @@ export type LiveAcceptanceWorkerFactory = (
 ) => Promise<LiveAcceptanceWorker>;
 
 type StartOptions = Readonly<{
+  candidate?: LiveAcceptanceCandidate;
   cloudDeploymentUrl?: string;
   shutdownVerifier?: (
     worker: LiveAcceptanceWorker,
@@ -776,7 +828,7 @@ class AtomicRecoveryReceipt {
 }
 
 export async function createLiveAcceptanceLayout(
-  options: Pick<StartOptions, "cloudDeploymentUrl" | "temporaryBaseDirectory"> = {},
+  options: Pick<StartOptions, "candidate" | "cloudDeploymentUrl" | "temporaryBaseDirectory"> = {},
 ): Promise<LiveAcceptanceLayout> {
   const expectedHomeDirectory = process.env.HOME;
   if (
@@ -826,6 +878,7 @@ export async function createLiveAcceptanceLayout(
       rootDirectory: string,
       documentsDirectory: string,
     ): AcceptanceInstallationDescriptor => acceptanceInstallationDescriptorSchema.parse({
+      ...(options.candidate === undefined ? {} : { candidate: options.candidate }),
       ...(options.cloudDeploymentUrl === undefined
         ? {}
         : { cloudDeploymentUrl: options.cloudDeploymentUrl }),
@@ -967,6 +1020,10 @@ type WorkerPending =
   | Readonly<{
       kind: "command";
       result: ReturnType<typeof deferred<CommandResponse>>;
+    }>
+  | Readonly<{
+      kind: "memory_fault";
+      result: ReturnType<typeof deferred<LiveAcceptanceMemoryFaultStatus>>;
     }>;
 
 class ProcessWorker implements LiveAcceptanceWorker {
@@ -1139,6 +1196,22 @@ class ProcessWorker implements LiveAcceptanceWorker {
     }
   }
 
+  async armCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultArm,
+  ): Promise<LiveAcceptanceMemoryFaultStatus> {
+    return await this.#memoryFaultControl({ input, type: "memory_fault_arm" });
+  }
+
+  async canonicalMemoryResponseDropStatus(): Promise<LiveAcceptanceMemoryFaultStatus> {
+    return await this.#memoryFaultControl({ type: "memory_fault_status" });
+  }
+
+  async finalizeCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultFinalize,
+  ): Promise<LiveAcceptanceMemoryFaultStatus> {
+    return await this.#memoryFaultControl({ input, type: "memory_fault_finalize" });
+  }
+
   async suspend(): Promise<void> {
     await this.#workerAction("suspend");
   }
@@ -1199,6 +1272,30 @@ class ProcessWorker implements LiveAcceptanceWorker {
       this.#pending.delete(requestId);
     }
     this.#assertHealthy();
+  }
+
+  async #memoryFaultControl(input:
+    | Readonly<{ input: LiveAcceptanceMemoryFaultArm; type: "memory_fault_arm" }>
+    | Readonly<{ input: LiveAcceptanceMemoryFaultFinalize; type: "memory_fault_finalize" }>
+    | Readonly<{ type: "memory_fault_status" }>
+  ): Promise<LiveAcceptanceMemoryFaultStatus> {
+    await this.ready();
+    this.#assertControlAvailable();
+    const requestId = randomUUID();
+    const result = deferred<LiveAcceptanceMemoryFaultStatus>();
+    const control = liveAcceptanceWorkerControlSchema.parse({
+      ...input,
+      requestId,
+      version: 1,
+    });
+    const frame = `${JSON.stringify(control)}\n`;
+    this.#pending.set(requestId, { kind: "memory_fault", result });
+    try {
+      await this.#writeControl(frame, requestId);
+      return await boundedDeadline(result.promise, workerCommandDeadlineMs, "worker_failed");
+    } finally {
+      this.#pending.delete(requestId);
+    }
   }
 
   async #writeControl(frame: string, requestId?: string): Promise<void> {
@@ -1281,6 +1378,15 @@ class ProcessWorker implements LiveAcceptanceWorker {
       if (pending?.kind !== "cli") throw new LiveAcceptanceError("worker_protocol_invalid");
       this.#pending.delete(frame.requestId);
       pending.result.resolve(frame.result);
+      return;
+    }
+    if (frame.type === "memory_fault_result") {
+      const pending = this.#pending.get(frame.requestId);
+      if (pending?.kind !== "memory_fault") {
+        throw new LiveAcceptanceError("worker_protocol_invalid");
+      }
+      this.#pending.delete(frame.requestId);
+      pending.result.resolve(frame.status);
       return;
     }
     if (frame.type === "ack") {
@@ -2058,8 +2164,14 @@ export class LiveAcceptanceRun {
   device(device: LiveAcceptanceDeviceName): LiveAcceptanceDevice {
     const worker = this.#workers[device];
     return {
+      armCanonicalMemoryResponseDrop: async (input) =>
+        await worker.armCanonicalMemoryResponseDrop(input),
+      canonicalMemoryResponseDropStatus: async () =>
+        await worker.canonicalMemoryResponseDropStatus(),
       device,
       execute: async (argv, options) => await worker.execute(argv, options),
+      finalizeCanonicalMemoryResponseDrop: async (input) =>
+        await worker.finalizeCanonicalMemoryResponseDrop(input),
       projectDirectory: worker.projectDirectory,
       resume: async () => await worker.resume(),
       suspend: async () => await worker.suspend(),
@@ -2559,7 +2671,7 @@ export const parseLiveAcceptanceEvidenceOutput = (
     }
     if (argument !== undefined) scenarioArguments.push(argument);
   }
-  if ((evidenceOutput === undefined) !== (deployEvidencePath === undefined)) {
+  if (evidenceOutput !== undefined && deployEvidencePath === undefined) {
     throw new LiveAcceptanceError("input_invalid");
   }
   return {
@@ -2570,29 +2682,18 @@ export const parseLiveAcceptanceEvidenceOutput = (
 };
 
 const persistLiveAcceptanceEvidence = (
-  evidence: Readonly<{
-    cloudTargetDigest: string;
-    completedAt: number;
-    packageVersion: string;
-    runId: string;
-    sourceRevision: string;
-    startedAt: number;
-    status: "passed";
-    version: 1;
-  }>,
-  deployEvidence: DeployEvidence | undefined,
+  evidence: LiveAcceptanceEvidenceV2,
+  deployEvidence: DeployEvidence,
   output: LiveAcceptanceEvidenceOutput | undefined,
-  runtimeAttestation: RuntimeReleaseAttestation | undefined,
+  runtimeAttestation: RuntimeReleaseAttestation,
 ): LiveAcceptanceEvidenceDocument | undefined => {
-  if (output === undefined) return undefined;
   assertCurrentLiveAcceptancePackageVersion(evidence.packageVersion);
   if (
-    deployEvidence === undefined
-    || runtimeAttestation === undefined
-    || evidence.sourceRevision !== deployEvidence.sourceCommit
+    evidence.sourceRevision !== deployEvidence.sourceCommit
     || evidence.startedAt <= deployEvidence.after.deployedAtMs
     || canonicalDigest(runtimeAttestation) !== canonicalDigest(deployEvidence.after)
   ) throw new LiveAcceptanceError("input_invalid");
+  if (output === undefined) return undefined;
   const document = liveAcceptanceEvidenceDocumentSchema.parse(withSelfDigest({
     completedAt: evidence.completedAt,
     deployEvidenceDigest: deployEvidence.selfDigest,
@@ -2729,7 +2830,13 @@ export const liveAcceptanceMain = async (
     process.stderr.write("hra live acceptance: scenario and evidence descriptors must differ\n");
     return 2;
   }
+  const deployEvidencePath = parsedOutput.deployEvidencePath;
+  if (deployEvidencePath === undefined) {
+    process.stderr.write("hra live acceptance: --deploy-evidence is required for the current memory gate\n");
+    return 2;
+  }
   let run: LiveAcceptanceRun | undefined;
+  let memoryReadback: LiveAcceptanceMemoryReadback | undefined;
   let scenarioOperator: Readonly<{
     close?: () => void;
     flush?: () => Promise<void>;
@@ -2775,24 +2882,27 @@ export const liveAcceptanceMain = async (
       configuration.cloudDeploymentUrl,
     );
     assertCurrentLiveAcceptancePackageVersion(attestation.packageVersion);
-    const deployEvidence = parsedOutput.deployEvidencePath === undefined
-      ? undefined
-      : parseDeployEvidenceFile(parsedOutput.deployEvidencePath);
+    const deployEvidence = parseDeployEvidenceFile(deployEvidencePath);
     if (
-      deployEvidence !== undefined
-      && (
-        deployEvidence.sourceCommit !== attestation.sourceRevision
-        || deployEvidence.target.deploymentUrl !== configuration.cloudDeploymentUrl
-      )
+      deployEvidence.sourceCommit !== attestation.sourceRevision
+      || deployEvidence.target.deploymentUrl !== configuration.cloudDeploymentUrl
     ) throw new LiveAcceptanceError("input_invalid");
-    const runtimeBoundary = deployEvidence === undefined
-      ? undefined
-      : await openLiveRuntimeAttestationBoundary(
-          deployEvidence,
-          options.readRuntimeAttestation ?? readLiveRuntimeAttestation,
-        );
+    const runtimeReader = options.readRuntimeAttestation ?? readLiveRuntimeAttestation;
+    const runtimeBoundary = await openLiveRuntimeAttestationBoundary(deployEvidence, runtimeReader);
+    const expectedRuntimeDigest = canonicalDigest(deployEvidence.after);
+    memoryReadback = createLiveAcceptanceMemoryReadback({
+      candidate: attestation,
+      target: deployEvidence.target,
+      verifyRuntime: async () => {
+        const observed = await runtimeReader(deployEvidence.target.deploymentUrl);
+        if (canonicalDigest(observed) !== expectedRuntimeDigest) {
+          throw new LiveAcceptanceError("input_invalid");
+        }
+      },
+    });
     if (scenarioAbort.signal.aborted) throw new LiveAcceptanceError("operator_interrupted");
     run = await startLiveAcceptanceRun({
+      candidate: attestation,
       cloudDeploymentUrl: configuration.cloudDeploymentUrl,
     });
     const activeRun = run;
@@ -2800,7 +2910,7 @@ export const liveAcceptanceMain = async (
       activeRun,
       operator,
       attestation,
-      { signal: scenarioAbort.signal },
+      { memoryReadback, signal: scenarioAbort.signal },
     );
     void scenario.catch(() => undefined);
     const outcome = await Promise.race([
@@ -2822,15 +2932,18 @@ export const liveAcceptanceMain = async (
       ).catch(() => ({ type: "failed" as const }));
       if (preservation === "cleanup_complete" && settlement.type === "complete") {
         await scenarioOperator.flush?.();
-        const runtimeAttestation = await runtimeBoundary?.close();
-        persistLiveAcceptanceEvidence(
+        const currentEvidence = scenarioModule.parseCurrentLiveAcceptanceEvidence(
           settlement.evidence,
+        );
+        const runtimeAttestation = await runtimeBoundary.close();
+        persistLiveAcceptanceEvidence(
+          currentEvidence,
           deployEvidence,
           parsedOutput.evidenceOutput,
           runtimeAttestation,
         );
         await writeStandardOutputFrame({
-          evidence: settlement.evidence,
+          evidence: currentEvidence,
           ok: true,
           status: "passed",
           version: 1,
@@ -2860,15 +2973,16 @@ export const liveAcceptanceMain = async (
       return 75;
     }
     await scenarioOperator.flush?.();
-    const runtimeAttestation = await runtimeBoundary?.close();
+    const currentEvidence = scenarioModule.parseCurrentLiveAcceptanceEvidence(outcome.evidence);
+    const runtimeAttestation = await runtimeBoundary.close();
     persistLiveAcceptanceEvidence(
-      outcome.evidence,
+      currentEvidence,
       deployEvidence,
       parsedOutput.evidenceOutput,
       runtimeAttestation,
     );
     await writeStandardOutputFrame({
-      evidence: outcome.evidence,
+      evidence: currentEvidence,
       ok: true,
       status: "passed",
       version: 1,
@@ -2948,6 +3062,7 @@ export const liveAcceptanceMain = async (
     }
     return operatorInterrupted ? 75 : 1;
   } finally {
+    memoryReadback?.close();
     scenarioOperator?.close?.();
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);

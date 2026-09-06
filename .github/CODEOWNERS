@@ -25,6 +25,13 @@
 /scripts/release-package-policy.ts @0thernet
 /scripts/verify-npm-provenance.ts @0thernet
 /scripts/verify-npm-provenance-crypto.mjs @0thernet
+/scripts/live-acceptance.ts @0thernet
+/scripts/live-acceptance-worker.ts @0thernet
+/scripts/live-acceptance-installation.ts @0thernet
+/scripts/live-acceptance-scenario.ts @0thernet
+/scripts/live-acceptance-memory-fault.ts @0thernet
+/scripts/live-acceptance-memory-readback.ts @0thernet
+/scripts/live-acceptance-memory-readback-child.ts @0thernet
 /src/install-normalizer.ts @0thernet
 /src/install-preflight-runtime.ts @0thernet
 /src/install-preflight.ts @0thernet

@@ -13,6 +13,12 @@ import {
   type AcceptanceInstallationDescriptor,
 } from "./live-acceptance-installation";
 import {
+  LiveAcceptanceMemoryFaultController,
+  type LiveAcceptanceMemoryFaultArm,
+  type LiveAcceptanceMemoryFaultFinalize,
+  type LiveAcceptanceMemoryFaultStatus,
+} from "./live-acceptance-memory-fault";
+import {
   assertAcceptanceDescriptorLayout,
   LIVE_ACCEPTANCE_CONTROL_FD,
   LIVE_ACCEPTANCE_CONTROL_MAXIMUM_BYTES,
@@ -197,6 +203,8 @@ type GenerationStopReason = "parent_closed" | "restart" | "stop" | "suspend";
 type DaemonGeneration = {
   controller: AbortController;
   expectedStop: GenerationStopReason | null;
+  faultEnded: boolean;
+  faultGeneration: number;
   identity?: DaemonIdentity;
   promise: Promise<number>;
 };
@@ -215,6 +223,7 @@ type WorkerDependencies = DaemonSupervisorDependencies & Readonly<{
 class DaemonSupervisor {
   readonly #descriptor: AcceptanceInstallationDescriptor;
   readonly #installation: ReturnType<typeof createAcceptanceInstallation>;
+  readonly #memoryFault: LiveAcceptanceMemoryFaultController;
   readonly #failure = deferred<never>();
   readonly #runDaemon: typeof runDaemon;
   readonly #waitForDaemonReady: typeof waitForDaemonReady;
@@ -228,13 +237,21 @@ class DaemonSupervisor {
   ) {
     this.#descriptor = descriptor;
     this.#installation = createAcceptanceInstallation(descriptor);
+    this.#memoryFault = new LiveAcceptanceMemoryFaultController({
+      ...(descriptor.candidate === undefined ? {} : { candidate: descriptor.candidate }),
+      ...(descriptor.cloudDeploymentUrl === undefined
+        ? {}
+        : { cloudDeploymentUrl: descriptor.cloudDeploymentUrl }),
+      device: descriptor.device,
+      runId: descriptor.runId,
+    });
     this.#runDaemon = dependencies.runDaemon ?? runDaemon;
     this.#waitForDaemonReady = dependencies.waitForDaemonReady ?? waitForDaemonReady;
     void this.#failure.promise.catch(() => undefined);
   }
 
   get failure(): Promise<never> {
-    return this.#failure.promise;
+    return Promise.race([this.#failure.promise, this.#memoryFault.failure]);
   }
 
   async start(): Promise<void> {
@@ -242,19 +259,30 @@ class DaemonSupervisor {
       throw new WorkerFailure("daemon_failed");
     }
     const controller = new AbortController();
+    const faultGeneration = this.#memoryFault.beginGeneration();
     const generation: DaemonGeneration = {
       controller,
       expectedStop: null,
-      promise: this.#runDaemon(this.#installation, { stopSignal: controller.signal }),
+      faultEnded: false,
+      faultGeneration,
+      promise: this.#runDaemon(this.#installation, {
+        liveAcceptanceCanonicalMemoryTransportDecorator: (transport) =>
+          this.#memoryFault.decorate(faultGeneration, transport),
+        stopSignal: controller.signal,
+      }),
     };
     this.#generation = generation;
     void generation.promise.then(
       (exitCode) => {
         if (exitCode !== 0 || generation.expectedStop === null) {
+          this.#endFaultGeneration(generation, exitCode);
           this.#fail(new WorkerFailure("daemon_failed"));
         }
       },
-      () => this.#fail(new WorkerFailure("daemon_failed")),
+      () => {
+        this.#endFaultGeneration(generation, 1);
+        this.#fail(new WorkerFailure("daemon_failed"));
+      },
     );
     try {
       generation.identity = await Promise.race([
@@ -273,7 +301,10 @@ class DaemonSupervisor {
     } catch (error: unknown) {
       generation.expectedStop ??= "stop";
       generation.controller.abort(new Error("Live-acceptance daemon readiness failed."));
-      await beforeDeadline(generation.promise, 30_000).catch(() => undefined);
+      await beforeDeadline(generation.promise, 30_000).then(
+        (exitCode) => this.#endFaultGeneration(generation, exitCode),
+        () => this.#endFaultGeneration(generation, 1),
+      ).catch(() => undefined);
       throw error instanceof WorkerFailure ? error : new WorkerFailure("daemon_failed");
     }
     if (process.env.HOME !== this.#descriptor.expectedHomeDirectory) {
@@ -304,12 +335,29 @@ class DaemonSupervisor {
     return response;
   }
 
+  armCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultArm,
+  ): LiveAcceptanceMemoryFaultStatus {
+    this.#assertRunning();
+    return this.#memoryFault.arm(input);
+  }
+
+  canonicalMemoryResponseDropStatus(): LiveAcceptanceMemoryFaultStatus {
+    this.#assertRunning();
+    return this.#memoryFault.status();
+  }
+
+  finalizeCanonicalMemoryResponseDrop(
+    input: LiveAcceptanceMemoryFaultFinalize,
+  ): LiveAcceptanceMemoryFaultStatus {
+    this.#assertRunning();
+    return this.#memoryFault.finalize(input);
+  }
+
   async restartAfterResponse(): Promise<void> {
     const generation = this.#generation;
     if (generation === undefined || generation.expectedStop !== "restart") return;
-    await beforeDeadline(generation.promise, 30_000);
-    if (this.#generation !== generation) throw new WorkerFailure("daemon_failed");
-    this.#generation = undefined;
+    await this.#awaitStoppedGeneration(generation);
     await this.start();
   }
 
@@ -358,7 +406,14 @@ class DaemonSupervisor {
     if (generation === undefined) return;
     generation.expectedStop ??= "stop";
     generation.controller.abort(new Error("The live-acceptance worker failed."));
-    await beforeDeadline(generation.promise, 30_000).catch(() => undefined);
+    await beforeDeadline(generation.promise, 30_000).then(
+      (exitCode) => this.#endFaultGeneration(generation, exitCode),
+      () => this.#endFaultGeneration(generation, 1),
+    ).catch(() => undefined);
+  }
+
+  closeMemoryFault(): void {
+    this.#memoryFault.close();
   }
 
   async #stopGeneration(
@@ -391,7 +446,22 @@ class DaemonSupervisor {
     if (exitCode !== 0 || this.#generation !== generation) {
       throw new WorkerFailure("daemon_failed");
     }
+    this.#endFaultGeneration(generation, exitCode);
     this.#generation = undefined;
+  }
+
+  #endFaultGeneration(generation: DaemonGeneration, exitCode: number): void {
+    if (generation.faultEnded) return;
+    generation.faultEnded = true;
+    try {
+      this.#memoryFault.endGeneration({
+        exitCode,
+        generation: generation.faultGeneration,
+        reason: generation.expectedStop ?? "stop",
+      });
+    } catch (error: unknown) {
+      this.#fail(error instanceof Error ? error : new WorkerFailure("daemon_failed"));
+    }
   }
 
   #assertRunning(): void {
@@ -535,6 +605,33 @@ async function handleControl(
       action: "resume",
       requestId: control.requestId,
       type: "ack",
+      version: 1,
+    });
+    return null;
+  }
+  if (control.type === "memory_fault_arm") {
+    await status.write({
+      requestId: control.requestId,
+      status: supervisor.armCanonicalMemoryResponseDrop(control.input),
+      type: "memory_fault_result",
+      version: 1,
+    });
+    return null;
+  }
+  if (control.type === "memory_fault_finalize") {
+    await status.write({
+      requestId: control.requestId,
+      status: supervisor.finalizeCanonicalMemoryResponseDrop(control.input),
+      type: "memory_fault_result",
+      version: 1,
+    });
+    return null;
+  }
+  if (control.type === "memory_fault_status") {
+    await status.write({
+      requestId: control.requestId,
+      status: supervisor.canonicalMemoryResponseDropStatus(),
+      type: "memory_fault_result",
       version: 1,
     });
     return null;
@@ -697,6 +794,7 @@ async function workerMain(
     await status?.close().catch(() => undefined);
     return 1;
   } finally {
+    supervisor?.closeMemoryFault();
     input?.destroy();
   }
 }

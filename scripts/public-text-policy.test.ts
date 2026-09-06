@@ -168,6 +168,34 @@ describe("public text policy", () => {
     }
   });
 
+  test("scans the reviewed released-state SQL fixture without admitting arbitrary SQL files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-sql-"));
+    const fixture = join(root, "scripts/fixtures/released-state/v0.5.0/control-plane.sql");
+    try {
+      await mkdir(dirname(fixture), { recursive: true });
+      await writeFile(fixture, "CREATE TABLE fixture (id TEXT);\n", "utf8");
+      await expect(assertPublicTree(root)).resolves.toBeUndefined();
+      const secret = ["github", "pat"].join("_") + "_" + "abcdefghijklmnopqrstuvwxyz123456";
+      await writeFile(fixture, `INSERT INTO fixture VALUES ('${secret}');\n`, "utf8");
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "SECRET_SHAPE" });
+      const privatePackage = `@${["private", "scope"].join("-")}/example`;
+      await writeFile(fixture, `-- ${privatePackage}\n`, "utf8");
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "PRIVATE_SCOPE" });
+      const privatePath = ["", "Users", "example", "state"].join("/");
+      await writeFile(fixture, `-- ${privatePath}\n`, "utf8");
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "ABSOLUTE_USER_PATH" });
+      await unlink(fixture);
+      for (const path of ["unreviewed.sql", "scripts/fixtures/released-state/v0.5.0/unreviewed.sql"]) {
+        const unreviewed = join(root, path);
+        await writeFile(unreviewed, "CREATE TABLE fixture (id TEXT);\n", "utf8");
+        await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+        await unlink(unreviewed);
+      }
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("admits only bounded, structurally valid editorial WebP files", async () => {
     const root = await mkdtemp(join(tmpdir(), "hra-public-policy-webp-"));
     const editorialDirectory = join(root, "site", "images", "editorial");

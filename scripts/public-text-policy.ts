@@ -125,6 +125,9 @@ const excludedDirectories = new Set([".git", "dist", "node_modules"]);
  */
 const publicCopyFile = /^(?:[A-Z_]+\.md|package\.json|site\/.+|docs\/.+\.md|\.github\/ISSUE_TEMPLATE\/.+)$/u;
 const textFile = /(?:^|\/)(?:CODEOWNERS|LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|toml|ts|tsx|txt|xml|yaml|yml|zig)$/u;
+// This synthetic logical dump is a reviewed migration input, not a general
+// database-file exception. It still passes every public sensitive-text check.
+const releasedStateSql = "scripts/fixtures/released-state/v0.5.0/control-plane.sql";
 const editorialWebp = /^site\/images\/editorial\/[a-z0-9]+(?:-[a-z0-9]+)*(?:-384|-768)?\.webp$/u;
 const webpChunkTypes = new Set(["VP8 ", "VP8L", "VP8X"]);
 
@@ -157,7 +160,7 @@ export async function assertPublicTree(root: string): Promise<void> {
         await assertAuthoritySupervisorArtifactPublicFile(root, label);
       } else if (entry.isFile() && editorialWebp.test(label)) {
         await assertEditorialWebp(child, label);
-      } else if (entry.isFile() && textFile.test(child)) {
+      } else if (entry.isFile() && (textFile.test(child) || label === releasedStateSql)) {
         const value = await readFile(child, "utf8");
         if (entry.name === "bun.lock") assertPublicSensitiveText(value, label);
         else assertPublicText(value, label);
