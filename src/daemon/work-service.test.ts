@@ -298,6 +298,8 @@ class CurrentDaemonAuthority {
 
 type Fixture = Readonly<{
   createService: () => HraService;
+  daemonGeneration: number;
+  daemonBootId: string;
   eventCursors: SessionEventCursorCodec;
   paths: ReturnType<typeof resolveStatePaths>;
   projectRoot: string;
@@ -325,9 +327,8 @@ async function fixture(): Promise<Fixture> {
   await initializeStatePaths(paths);
   let observedAt = 10_000;
   const store = new StateStore(paths, { now: () => observedAt++ });
-  const daemonGeneration = store.nextDaemonGeneration(
-    `boot_${crypto.randomUUID().replaceAll("-", "")}`,
-  );
+  const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   const runtime = new WorkRuntime();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
   const workCapabilities = new WorkCapabilityCodec(WorkCapabilityCodec.generateKey());
@@ -340,6 +341,7 @@ async function fixture(): Promise<Fixture> {
       eventCursors,
       workCapabilities,
       daemonGeneration,
+      daemonBootId,
       now: () => observedAt++,
       requestStop: () => undefined,
     });
@@ -375,6 +377,8 @@ async function fixture(): Promise<Fixture> {
   );
   const value = {
     createService,
+    daemonGeneration,
+    daemonBootId,
     eventCursors,
     paths,
     projectRoot,
@@ -565,24 +569,22 @@ function prepareNestedSend(
     effect.targetSessionId,
   );
   return {
-    attempt: value.store.prepareMutation({
+    attempt: value.store.prepareSessionInputMutation({
       kind: "session.send",
-      authorityId: effect.targetSessionId,
-      authorityGeneration: effect.accountGeneration,
-      request: { message },
+      sessionId: effect.targetSessionId,
+      message,
+      attachments: [],
       idempotencyKey: effect.nestedMutationKey,
-      providerAuthorities: [{
-        role: "primary",
-        authority: {
-          provider: sessionAuthority.provider,
-          providerAccountId: sessionAuthority.providerAccountId,
-          profileId: sessionAuthority.profileId,
-          bindingGeneration: sessionAuthority.bindingGeneration,
-          processGeneration: sessionAuthority.processGeneration,
-        },
-        provenance: "session_send",
-      }],
-    }),
+      providerAuthority: {
+        provider: sessionAuthority.provider,
+        providerAccountId: sessionAuthority.providerAccountId,
+        profileId: sessionAuthority.profileId,
+        bindingGeneration: sessionAuthority.bindingGeneration,
+        processGeneration: effect.accountGeneration,
+      },
+      daemonGeneration: value.daemonGeneration,
+      bootId: value.daemonBootId,
+    }).attempt,
     message,
   };
 }
@@ -616,6 +618,9 @@ function beginNestedSend(
     sessionId: actor.sessionId,
     profileGeneration: effect.accountGeneration,
     providerAuthority,
+    attachments: [],
+    daemonGeneration: value.daemonGeneration,
+    bootId: value.daemonBootId,
     evidence: {
       kind: "session.send",
       providerThreadId: session.providerThreadId,

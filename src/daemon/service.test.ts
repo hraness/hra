@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -60,6 +60,8 @@ import {
   type GatewayKeyPort,
 } from "../storage/gateway-key-custody";
 import { StateStore } from "../storage/state-store";
+import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "../storage/attachment-custody";
+import { ATTACHMENT_CUSTODY_COLUMNS } from "../storage/attachment-custody-schema";
 import {
   DeterministicProseResponder,
   PROSE_APPROVAL_REPLY,
@@ -786,7 +788,7 @@ async function fixture(
     proseResponder?: ProseResponder;
   }> = {},
   platform: NodeJS.Platform = "linux",
-): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
+): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; daemonGeneration: number; daemonBootId: string; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
   serviceRoots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
@@ -795,13 +797,17 @@ async function fixture(
   await initializeStatePaths(paths);
   const store = new StateStore(paths, { now });
   stores.push(store);
+  // Exercise the same explicit persisted boot fence used by the real daemon;
+  // generation zero is not attachment reservation or deletion authority.
+  const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   // The daemon defaults to answering approvals itself; these tests exercise
   // the manual paths and opt in to autorespond explicitly where needed.
   store.setDefaultApprovalMode("manual");
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.claude === undefined ? {} : { claude: autorespond.claude }), ...(autorespond.devin === undefined ? {} : { devin: autorespond.devin }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, platform, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, daemonGeneration, daemonBootId, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), ...(autorespond.claude === undefined ? {} : { claude: autorespond.claude }), ...(autorespond.devin === undefined ? {} : { devin: autorespond.devin }), ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }), ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }), now, platform, requestStop }), store, codex, cloud, daemonAuthority, daemonGeneration, daemonBootId, documents, eventCursors, paths };
 }
 
 async function claudeAccountFixture(
@@ -2724,7 +2730,7 @@ describe("HraService", () => {
       },
       provenance: "account_claude_login",
     }]);
-    expect(value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(1);
+    expect(value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(value.daemonGeneration + 1);
     expect(value.store.requireProviderAccountAuthority(added.account.id, "claude").processGeneration)
       .toBe(launchedAuthority.processGeneration);
     expect(value.store.requireProviderAccountAuthority(added.account.id, "codex"))
@@ -2857,7 +2863,7 @@ describe("HraService", () => {
     }, { signal }) as { login: { attemptId: `attempt_${string}`; providerGeneration: number } };
     expect(prepared.login.providerGeneration).toBe(launchedAuthority.processGeneration);
     const captured = value.store.readMutationProviderAuthorities(prepared.login.attemptId);
-    expect(value.store.nextDaemonGeneration(`boot_${"d".repeat(32)}`)).toBe(1);
+    expect(value.store.nextDaemonGeneration(`boot_${"d".repeat(32)}`)).toBe(value.daemonGeneration + 1);
     expect(value.store.recoverEffectStartedMutations()).toEqual({
       recovered: [prepared.login.attemptId],
       unresolved: [],
@@ -4377,6 +4383,330 @@ describe("HraService", () => {
     expect(JSON.stringify(shown)).not.toContain(Buffer.from(png).toString("base64"));
   });
 
+  test.each(["accounted", "unaccounted"] as const)("attachment cleanup rechecks a competing writer's reference after the %s snapshot", async (mode) => {
+    const value = await fixture();
+    const { service, store, paths, documents } = value;
+    const { sessionId } = await createIdleSession(value, "Attachment cleanup race");
+    await writeFile(join(documents, "retained.txt"), "retain these exact bytes");
+    await writeFile(join(documents, "sent.txt"), "trigger bounded maintenance");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const references = await ingestAttachments(blobs, ["retained.txt", "sent.txt"], documents);
+    const retained = references[0];
+    const sent = references[1];
+    if (retained === undefined || sent === undefined) throw new Error("Missing attachment race fixture.");
+    const stored = { ...retained, canonicalMediaType: "text/plain" as const };
+    await utimes(blobs.pathFor(retained.digest, "text/plain"), new Date(1_000), new Date(1_000));
+    if (mode === "accounted") {
+      store.recordMessageAttachments({ sessionId, sourceId: "old-display-source", attachments: [stored] });
+      const inspector = new Database(paths.database, { strict: true });
+      inspector.query("DELETE FROM message_attachments WHERE session_id=? AND source_id=?")
+        .run(sessionId, "old-display-source");
+      inspector.close(false);
+    }
+    expect(store.attachmentCustody(retained.digest)?.referenceCount).toBe(mode === "accounted" ? 0 : undefined);
+    const other = new StateStore(paths);
+    const listUnreferenced = store.listUnreferencedAttachments.bind(store);
+    // Restore the exact prototype method below; invoke it only with the
+    // actual blob-store receiver through apply.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const listCandidates = AttachmentBlobStore.prototype.listCleanupCandidates;
+    let injected = false;
+    store.listUnreferencedAttachments = (...input) => {
+      const candidates = listUnreferenced(...input);
+      if (mode === "accounted" && !injected && candidates.some((candidate) => candidate.digest === retained.digest)) {
+        injected = true;
+        other.recordMessageAttachments({ sessionId, sourceId: "competing-retained-source", attachments: [stored] });
+      }
+      return candidates;
+    };
+    AttachmentBlobStore.prototype.listCleanupCandidates = async function (...input) {
+      const snapshot = await listCandidates.apply(this, input);
+      if (mode === "unaccounted" && !injected
+        && snapshot.candidates.some((candidate) => candidate.kind === "blob" && candidate.digest === retained.digest)) {
+        injected = true;
+        other.recordMessageAttachments({ sessionId, sourceId: "competing-retained-source", attachments: [stored] });
+      }
+      return snapshot;
+    };
+    try {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Use the second file.",
+        attachments: [sent], idempotencyKey: crypto.randomUUID() }, { signal });
+      expect(injected).toBe(true);
+      expect(store.attachmentCustody(retained.digest)?.referenceCount).toBe(1);
+      expect(store.messageAttachmentManifest(sessionId, "competing-retained-source")).toEqual([retained]);
+      expect(await blobs.read(retained.digest, "text/plain"))
+        .toEqual(new TextEncoder().encode("retain these exact bytes"));
+    } finally {
+      store.listUnreferencedAttachments = listUnreferenced;
+      AttachmentBlobStore.prototype.listCleanupCandidates = listCandidates;
+      other.close();
+    }
+  });
+
+  test.each(["session.send", "session.steer", "session.queue"] as const)("attachment ingress protects %s before its first blob read", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths, documents, daemonGeneration, daemonBootId } = value;
+    const { sessionId } = await createIdleSession(value, "Reserved attachment read");
+    if (kind !== "session.send") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    }
+    await writeFile(join(documents, "reserved-read.txt"), "protect bytes before reading them");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const references = await ingestAttachments(blobs, ["reserved-read.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing reserved read fixture.");
+    await utimes(blobs.pathFor(reference.digest, "text/plain"), new Date(1_000), new Date(1_000));
+    const other = new StateStore(paths);
+    // Preserve the prototype method for exact restoration; the hook invokes
+    // it only through apply(this, input), retaining the actual blob store.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const read = AttachmentBlobStore.prototype.read;
+    let cleanup: ReturnType<StateStore["cleanupAttachmentCandidate"]> | undefined;
+    AttachmentBlobStore.prototype.read = async function (...input) {
+      if (input[0] === reference.digest && cleanup === undefined) {
+        cleanup = other.cleanupAttachmentCandidate({ daemonGeneration, bootId: daemonBootId,
+          candidate: { kind: "blob", digest: reference.digest, canonicalMediaType: "text/plain" } });
+      }
+      return await read.apply(this, input);
+    };
+    try {
+      const result = await service.execute({ kind, session: sessionId, message: "Read the protected original input.",
+        attachments: [...references] }, { signal }) as { idempotencyKey: string };
+      expect(cleanup).toEqual({ kind: "retained", reason: "reserved" });
+      expect(store.readMutation(result.idempotencyKey)?.state).toBe("applied");
+      expect(await blobs.read(reference.digest, "text/plain"))
+        .toEqual(new TextEncoder().encode("protect bytes before reading them"));
+    } finally {
+      AttachmentBlobStore.prototype.read = read;
+      other.close();
+    }
+  });
+
+  test.each(["session.send", "session.steer", "session.queue"] as const)("attachment ingress releases only its %s invocation after a missing-byte refusal", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths } = value;
+    const { sessionId } = await createIdleSession(value, "Missing attachment reservation");
+    if (kind !== "session.send") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    }
+    const reserve = store.reserveAttachmentIngress.bind(store);
+    const release = store.releaseAttachmentIngress.bind(store);
+    const reservations: ReturnType<StateStore["reserveAttachmentIngress"]>[] = [];
+    const releases: ReturnType<StateStore["releaseAttachmentIngress"]>[] = [];
+    store.reserveAttachmentIngress = (input) => {
+      const result = reserve(input);
+      reservations.push(result);
+      return result;
+    };
+    store.releaseAttachmentIngress = (input) => {
+      const result = release(input);
+      releases.push(result);
+      return result;
+    };
+    const key = crypto.randomUUID();
+    try {
+      await expect(service.execute({ kind, session: sessionId, message: "Do not dispatch missing bytes.", idempotencyKey: key,
+        attachments: [{ digest: "c".repeat(64), name: "missing.txt", mediaType: "text/plain", byteLength: 7 }] }, { signal }))
+        .rejects.toMatchObject({ code: "INVALID_INPUT" });
+      expect(reservations.map((reservation) => reservation.kind)).toEqual(["reserved"]);
+      expect(releases).toEqual([{ released: true, reason: "released" }]);
+      expect(store.readMutation(key)).toBeNull();
+      const inspector = new Database(paths.database, { readonly: true, strict: true });
+      try {
+        expect(inspector.query("SELECT COUNT(*) AS count FROM attachment_custody_slots").get()).toEqual({ count: 0 });
+      } finally {
+        inspector.close(false);
+      }
+    } finally {
+      store.reserveAttachmentIngress = reserve;
+      store.releaseAttachmentIngress = release;
+    }
+  });
+
+  test.each(["session.send", "session.steer"] as const)("completed %s attachment replay needs no live slot, blob or provider preflight", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths, documents, codex, daemonGeneration, daemonBootId } = value;
+    const { sessionId } = await createIdleSession(value, "Historical attachment receipt");
+    if (kind === "session.steer") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    }
+    await writeFile(join(documents, "receipt.txt"), "the original accepted attachment");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const references = await ingestAttachments(blobs, ["receipt.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing accepted attachment fixture.");
+    const command = { kind, session: sessionId, message: "Keep this receipt replayable.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const first = await service.execute(command, { signal }) as { turnId: string };
+    const session = store.requireSession(sessionId);
+    const providerAuthority = store.requireProviderAccountAuthority(session.profileId, session.provider);
+    const holds: Array<{ reservationId: string; reservationDigest: string }> = [];
+    try {
+      for (let index = 0; index < 64; index++) {
+        const hold = store.reserveAttachmentIngress({ kind, sessionId, message: "Occupy one independent slot.",
+          idempotencyKey: crypto.randomUUID(), attachments: references, providerAuthority, daemonGeneration, bootId: daemonBootId });
+        if (hold.kind !== "reserved") throw new Error("Expected an attached live slot.");
+        holds.push({ reservationId: hold.reservationId, reservationDigest: hold.reservationDigest });
+      }
+      const calls = [...codex.calls];
+      const events = store.listSessionEvents({ sessionId, afterSequence: 0 }).events;
+      const receipt = { turnId: first.turnId, attachments: references, idempotencyKey: command.idempotencyKey };
+      await expect(service.execute(command, { signal })).resolves.toMatchObject(receipt);
+      await blobs.remove(reference.digest, "text/plain");
+      store.setSessionTurnState({ sessionId, expectedRevision: session.revision, state: "recovery_required" });
+      await expect(service.execute(command, { signal })).resolves.toMatchObject(receipt);
+      expect(codex.calls).toEqual(calls);
+      expect(store.listSessionEvents({ sessionId, afterSequence: 0 }).events).toEqual(events);
+    } finally {
+      for (const hold of holds) store.releaseAttachmentIngress({ ...hold, daemonGeneration, bootId: daemonBootId });
+    }
+  });
+
+  test.each(["session.send", "session.steer"] as const)("raced completed %s attachment replay has no post-receipt side effects", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths, documents, codex } = value;
+    const { sessionId } = await createIdleSession(value, "Raced attachment receipt");
+    if (kind === "session.steer") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    } else codex.turnStatus = "completed";
+    await service.settled();
+    await writeFile(join(documents, "raced-receipt.txt"), "one attached native effect");
+    const references = await ingestAttachments(AttachmentBlobStore.forStatePaths(paths), ["raced-receipt.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing raced attachment fixture.");
+    const command = { kind, session: sessionId, message: "Accept this exact original input once.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const other = new StateStore(paths);
+    // A separate service has separate ranked locks, but the same persisted
+    // boot and exact runtime authority. It can complete while this caller is
+    // suspended in its first attachment read without a same-lock deadlock.
+    const winner = new HraService({ store: other, paths, codex, cloud: value.cloud,
+      daemonAuthority: value.daemonAuthority, daemonGeneration: value.daemonGeneration,
+      daemonBootId: value.daemonBootId, eventCursors: value.eventCursors, platform: "linux", requestStop: () => undefined });
+    const readReplay = store.readSessionInputReplay.bind(store);
+    const listUnreferenced = store.listUnreferencedAttachments.bind(store);
+    const nextPendingQueue = store.nextPendingQueue.bind(store);
+    const resetCounter = store.resetAutorespondCounter.bind(store);
+    // The original method is invoked only with its actual blob-store receiver.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const readBlob = AttachmentBlobStore.prototype.read;
+    const observed = { nullPreflight: false, injected: false, sweepReads: 0, queueReads: 0, counterResets: 0 };
+    let accepted: { turnId: string } | undefined;
+    const original = { receipt: null as ReturnType<StateStore["readMutation"]> };
+    let nativeCalls: Array<"send" | "steer"> = [];
+    let userMessages: Array<ReturnType<StateStore["listSessionEvents"]>["events"][number]> = [];
+    store.readSessionInputReplay = (input) => {
+      const result = readReplay(input);
+      if (input.idempotencyKey === command.idempotencyKey && result === null) observed.nullPreflight = true;
+      return result;
+    };
+    store.listUnreferencedAttachments = (...input) => { observed.sweepReads += 1; return listUnreferenced(...input); };
+    store.nextPendingQueue = (...input) => { observed.queueReads += 1; return nextPendingQueue(...input); };
+    store.resetAutorespondCounter = (...input) => { observed.counterResets += 1; return resetCounter(...input); };
+    AttachmentBlobStore.prototype.read = async function (...input) {
+      if (input[0] === reference.digest && !observed.injected) {
+        observed.injected = true;
+        expect(observed.nullPreflight).toBe(true);
+        expect(other.readMutation(command.idempotencyKey)).toBeNull();
+        accepted = await winner.execute(command, { signal }) as { turnId: string };
+        await winner.settled();
+        original.receipt = other.readMutation(command.idempotencyKey);
+        expect(original.receipt?.state).toBe("applied");
+        other.bumpAutorespondCounter(sessionId);
+        nativeCalls = codex.calls.filter((call) => call === "send" || call === "steer");
+        userMessages = other.listSessionEvents({ sessionId, afterSequence: 0 }).events
+          .filter((event) => event.body.type === "user_message");
+        expect(userMessages.filter((event) => event.body.type === "user_message" && event.body.text === command.message)).toHaveLength(1);
+      }
+      return await readBlob.apply(this, input);
+    };
+    try {
+      const result = await service.execute(command, { signal });
+      await service.settled();
+      expect(observed.injected).toBe(true);
+      expect(accepted).toBeDefined();
+      expect(result).toMatchObject({ turnId: accepted?.turnId, attachments: references, idempotencyKey: command.idempotencyKey });
+      if (original.receipt === null) throw new Error("Missing competing terminal receipt.");
+      expect(store.readMutation(command.idempotencyKey)).toEqual(original.receipt);
+      expect({
+        nativeCalls: codex.calls.filter((call) => call === "send" || call === "steer"),
+        userMessages: store.listSessionEvents({ sessionId, afterSequence: 0 }).events.filter((event) => event.body.type === "user_message"),
+        sweepReads: observed.sweepReads, queueReads: observed.queueReads, counterResets: observed.counterResets,
+        consecutive: store.readAutorespondBudgets(sessionId).consecutive,
+      }).toEqual({ nativeCalls, userMessages, sweepReads: 0, queueReads: 0, counterResets: 0, consecutive: 1 });
+    } finally {
+      AttachmentBlobStore.prototype.read = readBlob;
+      store.readSessionInputReplay = readReplay;
+      store.listUnreferencedAttachments = listUnreferenced;
+      store.nextPendingQueue = nextPendingQueue;
+      store.resetAutorespondCounter = resetCounter;
+      await winner.close();
+      other.close();
+    }
+  });
+
+  test("attachment release diagnostics do not replace the original missing-byte refusal", async () => {
+    const value = await fixture();
+    const { service, store } = value;
+    const { sessionId } = await createIdleSession(value, "Attachment release diagnostics");
+    const release = store.releaseAttachmentIngress.bind(store);
+    store.releaseAttachmentIngress = (input) => {
+      release(input);
+      throw new Error("private attachment release detail");
+    };
+    try {
+      await expect(service.execute({ kind: "session.send", session: sessionId, message: "Keep the original refusal.",
+        attachments: [{ digest: "d".repeat(64), name: "missing.txt", mediaType: "text/plain", byteLength: 7 }] }, { signal }))
+        .rejects.toMatchObject({ code: "INVALID_INPUT" });
+      expect(service.backgroundDiagnostics().last).toMatchObject({
+        code: "attachment_ingress_release_failed", cause: "error", count: 1,
+      });
+      expect(JSON.stringify(service.backgroundDiagnostics())).not.toContain("private attachment release detail");
+    } finally {
+      store.releaseAttachmentIngress = release;
+    }
+  });
+
+  test.each(["session.send", "session.steer"] as const)("attachment admission rolls back %s begin and preserves exact prepared retry", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths, documents, codex } = value;
+    const { sessionId } = await createIdleSession(value, "Atomic attachment begin");
+    if (kind === "session.steer") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    }
+    await writeFile(join(documents, "atomic-input.txt"), "read exactly once at provider dispatch");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const references = await ingestAttachments(blobs, ["atomic-input.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing atomic attachment fixture.");
+    const command = { kind, session: sessionId, message: "Preserve this original input.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const providerCall = kind === "session.send" ? "send" : "steer";
+    const calls = codex.calls.filter((call) => call === providerCall).length;
+    const inspector = new Database(paths.database, { strict: true });
+    try {
+      inspector.exec("CREATE TRIGGER fail_session_input_manifest BEFORE INSERT ON message_attachments BEGIN SELECT RAISE(ABORT,'injected_session_input_manifest_failure'); END");
+      await expect(service.execute(command, { signal })).rejects.toThrow("injected_session_input_manifest_failure");
+      const prepared = store.readMutation(command.idempotencyKey);
+      expect(prepared?.state).toBe("prepared");
+      expect(prepared?.evidence).toBeUndefined();
+      expect(store.messageAttachmentManifest(sessionId, prepared?.id ?? "missing")).toEqual([]);
+      expect(codex.calls.filter((call) => call === providerCall)).toHaveLength(calls);
+      expect(await blobs.read(reference.digest, "text/plain"))
+        .toEqual(new TextEncoder().encode("read exactly once at provider dispatch"));
+      inspector.exec("DROP TRIGGER fail_session_input_manifest");
+      await service.execute(command, { signal });
+      const accepted = store.readMutation(command.idempotencyKey);
+      expect(accepted?.id).toBe(prepared?.id);
+      expect(accepted?.state).toBe("applied");
+      expect(store.messageAttachmentManifest(sessionId, accepted?.id ?? "missing")).toEqual(references);
+      expect(codex.calls.filter((call) => call === providerCall)).toHaveLength(calls + 1);
+    } finally {
+      inspector.exec("DROP TRIGGER IF EXISTS fail_session_input_manifest");
+      inspector.close(false);
+    }
+  });
+
   test("refuses a message whose attachment is not in local custody", async () => {
     const value = await fixture();
     const { service, documents } = value;
@@ -4492,8 +4822,14 @@ describe("HraService", () => {
       const result = readReplay(input);
       if (!injected && result === null && input.idempotencyKey === command.idempotencyKey) {
         injected = true;
+        const reservation = other.reserveAttachmentIngress({ kind: "session.queue", sessionId,
+          idempotencyKey: command.idempotencyKey, message: command.message, attachments: references,
+          providerAuthority: authority, daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId });
+        if (reservation.kind !== "reserved") throw new Error("Missing competing queue reservation.");
         other.enqueueIdempotent({ sessionId, message: command.message, idempotencyKey: command.idempotencyKey,
           profileGeneration: authority.processGeneration, providerAuthority: authority,
+          attachmentReservation: { reservationId: reservation.reservationId, reservationDigest: reservation.reservationDigest,
+            daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId },
           attachments: references.map((reference) => ({ ...reference, canonicalMediaType: "text/plain" as const })) });
       }
       return result;
@@ -5634,6 +5970,17 @@ describe("HraService", () => {
     const legacy = new Database(value.paths.database, { create: false, strict: true });
     try {
       legacy.exec("PRAGMA foreign_keys=OFF");
+      for (const type of ["trigger", "index"] as const) {
+        for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
+          if (object.type === type) legacy.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
+        }
+      }
+      for (const column of [...ATTACHMENT_CUSTODY_COLUMNS].reverse()) {
+        legacy.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${column.slice(0, column.indexOf(" "))}`);
+      }
+      for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
+        if (object.type === "table") legacy.exec(`DROP TABLE IF EXISTS ${object.name}`);
+      }
       legacy.exec(`
         DROP TRIGGER IF EXISTS session_mutation_provider_successor_insert_guard;
         DROP TRIGGER IF EXISTS session_mutation_provider_successor_v39_insert_guard;
@@ -5713,10 +6060,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 47 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual(Array.from({ length: 23 }, (_, index) => ({ version: index + 25 })));
+      ).all()).toEqual(Array.from({ length: 24 }, (_, index) => ({ version: index + 25 })));
     } finally {
       inspector.close(false);
     }
@@ -13979,17 +14326,15 @@ describe("HraService", () => {
       seeded.profile.id,
     );
     const stalePreparedKey = "52000000-0000-4000-8000-000000000099";
-    const stalePrepared = value.store.prepareMutation({
+    const { attempt: stalePrepared } = value.store.prepareSessionInputMutation({
       kind: "session.send",
-      authorityId: sessionId,
-      authorityGeneration: originalSessionAuthority.processGeneration,
-      request: { message: "must remain fenced after restart" },
+      sessionId,
+      providerAuthority: originalProviderAuthority,
+      message: "must remain fenced after restart",
+      attachments: [],
       idempotencyKey: stalePreparedKey,
-      providerAuthorities: [{
-        role: "primary",
-        authority: originalProviderAuthority,
-        provenance: "session_send",
-      }],
+      daemonGeneration: value.daemonGeneration,
+      bootId: value.daemonBootId,
     });
     expect(stalePrepared).toMatchObject({ state: "prepared", replay: false });
     const staleQueue = value.store.enqueue(
@@ -14009,7 +14354,7 @@ describe("HraService", () => {
     const daemonGeneration = restartedStore.nextDaemonGeneration(
       `boot_${"f".repeat(32)}`,
     );
-    expect(daemonGeneration).toBe(1);
+    expect(daemonGeneration).toBe(value.daemonGeneration + 1);
     expect(restartedStore.requireProfileById(seeded.profile.id).processGeneration)
       .toBe(originalGeneration + 1);
     const reboundSessionAuthority = restartedStore.requireSessionProviderAuthority(sessionId);

@@ -5,6 +5,8 @@ import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
+import { ATTACHMENT_CUSTODY_COLUMNS } from "./attachment-custody-schema";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { QUEUE_ATTACHMENT_SCHEMA_OBJECTS } from "./queue-attachment-identity";
 import { StateStore, type StoredMessageAttachment } from "./state-store";
@@ -24,7 +26,8 @@ async function fixture() {
   const clock = { now: 10_000 };
   const store = new StateStore(paths, { now: () => clock.now++ });
   stores.push(store);
-  store.nextDaemonGeneration(`boot_${"a".repeat(32)}`);
+  const bootId = `boot_${"a".repeat(32)}`;
+  const daemonGeneration = store.nextDaemonGeneration(bootId);
   const profile = store.nextProfileGeneration(store.createProfile("Queue integrity").id);
   store.setProfileState(profile.id, profile.processGeneration, "signed_in", { email: "queue@example.com", plan: "Plus" });
   const created = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
@@ -35,6 +38,14 @@ async function fixture() {
   database.exec("PRAGMA foreign_keys=ON");
   const input = { sessionId: session.id, message: "original private body", profileGeneration: authority.processGeneration,
     providerAuthority: authority, idempotencyKey: randomUUID(), attachments: [attachment] };
+  const enqueue = (request: typeof input = input) => {
+    const reservation = store.reserveAttachmentIngress({ kind: "session.queue", sessionId: request.sessionId,
+      idempotencyKey: request.idempotencyKey, message: request.message, providerAuthority: request.providerAuthority,
+      daemonGeneration, bootId, attachments: request.attachments.map(({ digest, name, mediaType, byteLength }) => ({ digest, name, mediaType, byteLength })) });
+    return store.enqueueIdempotent({ ...request, ...(reservation.kind === "reserved" ? { attachmentReservation: {
+      reservationId: reservation.reservationId, reservationDigest: reservation.reservationDigest, daemonGeneration, bootId,
+    } } : {}) });
+  };
   const close = () => { store.close(); stores.splice(stores.indexOf(store), 1); };
   const reopen = (readonly = false) => { const opened = new StateStore(paths, { readonly, now: () => clock.now++ }); stores.push(opened); return opened; };
   const dropGuard = (name: string) => {
@@ -42,10 +53,26 @@ async function fixture() {
     database.exec(`DROP TRIGGER ${name}`);
     return () => database.exec(row.sql);
   };
-  return { store, database, clock, paths, session, authority, profile, input, close, reopen, dropGuard };
+  return { store, database, clock, paths, session, authority, profile, input, enqueue, close, reopen, dropGuard };
+}
+function removeAttachmentCustodyMigration(database: Database) {
+  database.exec("PRAGMA foreign_keys=OFF");
+  for (const type of ["trigger", "index"] as const) {
+    for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
+      if (object.type === type) database.exec(`DROP ${type.toUpperCase()} ${object.name}`);
+    }
+  }
+  for (const definition of [...ATTACHMENT_CUSTODY_COLUMNS].reverse()) {
+    database.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${definition.slice(0, definition.indexOf(" "))}`);
+  }
+  for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
+    if (object.type === "table") database.exec(`DROP TABLE ${object.name}`);
+  }
+  database.exec("DELETE FROM migrations WHERE version=48");
+  expect(database.query("SELECT name FROM pragma_table_info('mutation_attempts') WHERE name LIKE 'attachment_%'").all()).toEqual([]);
 }
 function downgrade(database: Database) {
-  database.exec("PRAGMA foreign_keys=OFF");
+  removeAttachmentCustodyMigration(database);
   for (const object of QUEUE_ATTACHMENT_SCHEMA_OBJECTS.filter((entry) => entry.type === "trigger")) database.exec(`DROP TRIGGER ${object.name}`);
   database.exec("ALTER TABLE queue_entries DROP COLUMN enqueue_identity_attempt_id");
   database.exec("ALTER TABLE queue_entries DROP COLUMN enqueue_identity_format");
@@ -85,7 +112,7 @@ describe("queue attachment durable integrity", () => {
     expect(f.database.query("SELECT * FROM queue_attachment_quarantines").all()).toEqual([]);
   });
   test.each(["queue_attachment_identities", "queue_attachment_identity_anchors"] as const)("missing %s fails hot original-key and both reopen modes", async (table) => {
-    const f = await fixture(); const queued = f.store.enqueueIdempotent(f.input);
+    const f = await fixture(); const queued = f.enqueue();
     const restore = f.dropGuard(`${table}_immutable_delete`);
     f.database.exec("PRAGMA foreign_keys=OFF"); f.database.query(`DELETE FROM ${table} WHERE queue_id=?`).run(queued.id); restore();
     expect(() => f.store.readQueueEnqueueReplay(f.input)).toThrow();
@@ -94,14 +121,14 @@ describe("queue attachment durable integrity", () => {
     f.close(); expect(() => f.reopen()).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT"); expect(() => f.reopen(true)).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
   });
   test("malformed SQL-legal reference is a typed quarantine error and fails reopen", async () => {
-    const f = await fixture(); const queued = f.store.enqueueIdempotent(f.input);
+    const f = await fixture(); const queued = f.enqueue();
     const restore = f.dropGuard("message_attachments_immutable_update");
     f.database.query("UPDATE message_attachments SET name='../x' WHERE source_id=?").run(queued.id); restore();
     expect(() => f.store.queueAttachmentManifest(queued.id)).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
     f.close(); expect(() => f.reopen()).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
   });
   test("missing protected manifest is detected before schema repair", async () => {
-    const f = await fixture(); const queued = f.store.enqueueIdempotent(f.input);
+    const f = await fixture(); const queued = f.enqueue();
     const restore = f.dropGuard("queue_attachment_manifest_delete_guard");
     f.database.query("DELETE FROM message_attachments WHERE source_id=?").run(queued.id); restore();
     f.close(); expect(() => f.reopen()).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
@@ -116,7 +143,7 @@ describe("queue attachment durable integrity", () => {
     expect(f.database.query("SELECT * FROM message_attachments").all()).toEqual([]);
   });
   test.each(["relocated", "missing"] as const)("reserves original key after its queue mutation is %s", async (mode) => {
-    const f = await fixture(); f.store.enqueueIdempotent(f.input);
+    const f = await fixture(); f.enqueue();
     const replacement = randomUUID();
     const restore = f.dropGuard(mode === "relocated" ? "queue_attachment_mutation_update_guard" : "queue_attachment_mutation_delete_guard");
     f.database.exec("PRAGMA foreign_keys=OFF");
@@ -131,14 +158,17 @@ describe("queue attachment durable integrity", () => {
     f.close(); expect(() => f.reopen()).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
   });
   test("an anchor-only partial47 schema is not mistaken for a legacy namespace", async () => {
-    const f = await fixture(); f.store.enqueueIdempotent(f.input);
+    const f = await fixture(); f.enqueue();
+    removeAttachmentCustodyMigration(f.database);
+    // Deliberately retain the partial47 marker, anchor, guards and stamp.
+    // Only migration48 is removed before simulating the older version header.
     f.database.exec("PRAGMA foreign_keys=OFF; DROP TABLE queue_attachment_identities; PRAGMA user_version=46");
     expect(() => f.store.prepareMutation({ kind: "session.rename", authorityId: f.session.id, authorityGeneration: f.authority.processGeneration,
       request: {}, idempotencyKey: f.input.idempotencyKey })).toThrow();
     f.close(); expect(() => f.reopen()).toThrow("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
   });
   test("a retained format marker prevents public manifest repair after both seals disappear", async () => {
-    const f = await fixture(); const queue = f.store.enqueueIdempotent(f.input);
+    const f = await fixture(); const queue = f.enqueue();
     const restoreIdentity = f.dropGuard("queue_attachment_identities_immutable_delete");
     const restoreAnchor = f.dropGuard("queue_attachment_identity_anchors_immutable_delete");
     f.database.exec("PRAGMA foreign_keys=OFF");
@@ -157,13 +187,13 @@ describe("queue attachment durable integrity", () => {
   test("identity and anchor failure roll back the entire queue transaction", async () => {
     const f = await fixture();
     f.database.exec("CREATE TRIGGER test_anchor_failure BEFORE INSERT ON queue_attachment_identity_anchors BEGIN SELECT RAISE(ABORT,'anchor injection'); END");
-    expect(() => f.store.enqueueIdempotent(f.input)).toThrow("anchor injection");
+    expect(() => f.enqueue()).toThrow("anchor injection");
     expect(f.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
     expect(f.database.query("SELECT * FROM mutation_attempts").all()).toEqual([]);
     expect(f.database.query("SELECT * FROM attachments").all()).toEqual([]);
   });
   test("transport loss retains quarantined pending input without disposing independent recovery", async () => {
-    const f = await fixture(); const queued = f.store.enqueueIdempotent(f.input);
+    const f = await fixture(); const queued = f.enqueue();
     const restore = f.dropGuard("queue_attachment_manifest_delete_guard");
     f.database.query("DELETE FROM message_attachments WHERE source_id=?").run(queued.id); restore();
     f.store.quarantineQueueAttachmentIdentity({ queueId: queued.id, sessionId: f.session.id });
@@ -174,7 +204,7 @@ describe("queue attachment durable integrity", () => {
     expect(f.store.hasUnsettledQueueAttachmentQuarantineForSession(f.session.id)).toBe(true);
   });
   test("pending abandonment refuses a separate unresolved mutation without settling or scrubbing it", async () => {
-    const f = await fixture(); const queued = f.store.enqueueIdempotent(f.input);
+    const f = await fixture(); const queued = f.enqueue();
     const attempt = f.store.prepareMutation({ kind: "session.rename", authorityId: f.session.id, authorityGeneration: f.authority.processGeneration,
       request: { title: "possibly changed" }, providerAuthorities: [{ role: "primary", authority: f.authority, provenance: "session_rename" }] });
     f.store.transitionMutation(attempt.id, "prepared", "effect_started");
@@ -189,7 +219,7 @@ describe("queue attachment durable integrity", () => {
     expect(f.database.query("SELECT * FROM mutation_resolutions WHERE attempt_id=?").get(attempt.id)).toBeNull();
   });
   test.each(["dispatching", "ambiguous"] as const)("retains %s attachments beyond the display cap", async (state) => {
-    const f = await fixture(); const queued = f.store.enqueueIdempotent(f.input);
+    const f = await fixture(); const queued = f.enqueue();
     const evidence = f.store.beginQueueEffect({ queueId: queued.id, sessionId: f.session.id, profileGeneration: f.authority.processGeneration, providerAuthority: f.authority,
       evidence: { kind: "queue.dispatch", queueId: queued.id, sessionId: f.session.id, providerThreadId: "queue-integrity", profileGeneration: f.authority.processGeneration,
         baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null }, clientMessageId: queued.id,

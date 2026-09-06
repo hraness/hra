@@ -1191,12 +1191,22 @@ describe("WorkStore original send ownership", () => {
           value.database.exec("DROP TRIGGER session_send_owner_anchors_immutable_delete");
           value.database.query("DELETE FROM session_send_owner_anchors WHERE attempt_id=?").run(owner.owner.attemptId);
         } else if (corruption === "orphan") {
-          value.database.exec("DROP TRIGGER session_send_mutation_delete_guard");
-          value.database.query("DELETE FROM mutation_attempts WHERE id=?").run(owner.owner.attemptId);
+          const attachmentGuard = value.database.query("SELECT sql FROM sqlite_master WHERE name='attachment_parent_delete_guard'").get() as { sql: string };
+          value.database.exec("DROP TRIGGER session_send_mutation_delete_guard; DROP TRIGGER attachment_parent_delete_guard");
+          try {
+            value.database.query("DELETE FROM mutation_attempts WHERE id=?").run(owner.owner.attemptId);
+          } finally {
+            value.database.exec(attachmentGuard.sql);
+          }
         } else {
-          value.database.exec("DROP TRIGGER session_send_mutation_guard");
-          value.database.query("UPDATE mutation_attempts SET idempotency_key=? WHERE id=?")
-            .run(randomUUID(), owner.owner.attemptId);
+          const attachmentGuard = value.database.query("SELECT sql FROM sqlite_master WHERE name='attachment_parent_immutable'").get() as { sql: string };
+          value.database.exec("DROP TRIGGER session_send_mutation_guard; DROP TRIGGER attachment_parent_immutable");
+          try {
+            value.database.query("UPDATE mutation_attempts SET idempotency_key=? WHERE id=?")
+              .run(randomUUID(), owner.owner.attemptId);
+          } finally {
+            value.database.exec(attachmentGuard.sql);
+          }
         }
         applySessionSendOwnerSchema(value.database);
       } finally {

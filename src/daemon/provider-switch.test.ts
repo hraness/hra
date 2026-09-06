@@ -492,6 +492,7 @@ type Fixture = Readonly<{
   documents: string;
   factsMemory: SwitchFactsMemory;
   daemonGeneration: number;
+  daemonBootId: string;
   paths: ReturnType<typeof resolveStatePaths>;
   service: HraService;
   store: StateStore;
@@ -499,7 +500,6 @@ type Fixture = Readonly<{
 
 async function fixture(
   nowOrAuthority: (() => number) | Pick<DaemonAuthorityFence, "assertCurrent" | "close"> = Date.now,
-  daemonGeneration = 0,
 ): Promise<Fixture> {
   const now = typeof nowOrAuthority === "function" ? nowOrAuthority : Date.now;
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-switch-")));
@@ -510,6 +510,8 @@ async function fixture(
   await initializeStatePaths(paths);
   const store = new StateStore(paths);
   stores.push(store);
+  const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   store.setDefaultApprovalMode("manual");
   const codex = new SwitchFakeCodex();
   const claude = new SwitchFakeClaude();
@@ -525,13 +527,14 @@ async function fixture(
     factsMemory,
     now,
     daemonGeneration,
+    daemonBootId,
     paths,
     platform: "linux",
     requestStop: () => undefined,
     store,
   });
   services.push(service);
-  return { claude, codex, daemonAuthority, daemonGeneration, documents, factsMemory, paths, service, store };
+  return { claude, codex, daemonAuthority, daemonGeneration, daemonBootId, documents, factsMemory, paths, service, store };
 }
 
 function liveAuthorityFor(
@@ -577,9 +580,8 @@ async function reopenFixture(value: Fixture): Promise<Fixture> {
 
   const store = new StateStore(value.paths);
   stores.push(store);
-  const daemonGeneration = store.nextDaemonGeneration(
-    `boot_${crypto.randomUUID().replaceAll("-", "")}`,
-  );
+  const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   const codex = new SwitchFakeCodex();
   const claude = new SwitchFakeClaude();
   const daemonAuthority = new SwitchDaemonAuthority();
@@ -591,6 +593,7 @@ async function reopenFixture(value: Fixture): Promise<Fixture> {
     daemonAuthority,
     factsMemory,
     daemonGeneration,
+    daemonBootId,
     paths: value.paths,
     platform: "linux",
     requestStop: () => undefined,
@@ -603,6 +606,7 @@ async function reopenFixture(value: Fixture): Promise<Fixture> {
     codex,
     daemonAuthority,
     daemonGeneration,
+    daemonBootId,
     factsMemory,
     documents: value.documents,
     paths: value.paths,
@@ -4413,23 +4417,24 @@ describe("provider portability", () => {
     // Admit the pending queue before arranging the independently unsettled
     // send; sealed queue admission cannot bypass an existing mutation fence.
     const dispatching = value.store.enqueue(idle.session.id, "uncertain Claude queue");
-    const sendAttempt = value.store.prepareMutation({
+    const { attempt: sendAttempt } = value.store.prepareSessionInputMutation({
       kind: "session.send",
-      authorityId: idle.session.id,
-      authorityGeneration: idleAuthority.processGeneration,
-      request: { message: "uncertain Claude send" },
+      sessionId: idle.session.id,
+      providerAuthority: idleProviderAuthority,
+      message: "uncertain Claude send",
+      attachments: [],
       idempotencyKey: sendKey,
-      providerAuthorities: [{
-        role: "primary",
-        authority: idleProviderAuthority,
-        provenance: "session_send",
-      }],
+      daemonGeneration: value.daemonGeneration,
+      bootId: value.daemonBootId,
     });
     value.store.beginSessionMutationEffect({
       attemptId: sendAttempt.id,
       sessionId: idle.session.id,
       profileGeneration: idleAuthority.processGeneration,
       providerAuthority: idleProviderAuthority,
+      attachments: [],
+      daemonGeneration: value.daemonGeneration,
+      bootId: value.daemonBootId,
       evidence: {
         kind: "session.send",
         providerThreadId: idleSession.providerThreadId as string,

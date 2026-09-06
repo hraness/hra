@@ -78,6 +78,8 @@ import { createAcceptanceInstallation } from "../scripts/live-acceptance-install
 import { initializeStatePaths, resolveStatePaths } from "./storage/paths";
 import { FileSecretBackend, GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
+import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./storage/attachment-custody";
+import { ATTACHMENT_CUSTODY_COLUMNS } from "./storage/attachment-custody-schema";
 
 const capture = () => {
   let stdout = "";
@@ -128,12 +130,25 @@ class CliClaudeLoginSignalSource implements ClaudeLoginSignalSource {
 const downgradeStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {
+    database.exec("PRAGMA foreign_keys=OFF");
+    for (const type of ["trigger", "index"] as const) {
+      for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
+        if (object.type === type) database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
+      }
+    }
+    for (const column of [...ATTACHMENT_CUSTODY_COLUMNS].reverse()) {
+      database.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${column.slice(0, column.indexOf(" "))}`);
+    }
+    for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
+      if (object.type === "table") database.exec(`DROP TABLE IF EXISTS ${object.name}`);
+    }
     database.exec(`
       DROP TABLE session_mutation_authority_rebinds_v39;
       DROP TABLE attention_email_policy;
       DROP TABLE notification_hours;
       DELETE FROM migrations WHERE version>=36;
       PRAGMA user_version=35;
+      PRAGMA foreign_keys=ON;
     `);
   } finally {
     database.close(false);
@@ -143,7 +158,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 // An install written by a newer HRA build than this one. No migration exists for
 // it, so every entry point must refuse instead of guessing.
 // Keep this expectation independent of the implementation's schema constant.
-const expectedStateSchemaVersion = 47;
+const expectedStateSchemaVersion = 48;
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {

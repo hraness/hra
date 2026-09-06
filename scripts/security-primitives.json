@@ -72,7 +72,7 @@
     "validateOwnedFile": 6
   },
   "src/daemon/service.ts": {
-    "assertCurrent": 62
+    "assertCurrent": 67
   },
   "src/daemon/session-event-cursor.ts": {
     "timingSafeEqual": 1
@@ -150,7 +150,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 93,
+    "immediateTransaction": 133,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 2

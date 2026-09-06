@@ -8,6 +8,7 @@ import { sessionSendRequestFingerprintSchema } from "../domain/session-send-requ
 import { attemptIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
 import { assertNoAutomaticPointerMoveOwnership, AutomaticPointerMoveStoreError } from "./automatic-pointer-move";
 import { assertQueueAttachmentMutationIntegrity, QueueAttachmentIdentityError } from "./queue-attachment-identity";
+import { ATTACHMENT_CUSTODY_COLUMNS, assertAttachmentCustodyNamespace, AttachmentCustodyNamespaceError, type InitialAttachmentInput } from "./attachment-custody-schema";
 
 export const SESSION_SEND_REQUEST_FORMAT = "original_send_v1";
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
@@ -245,8 +246,11 @@ export function assertSessionSendOwnerSchema(database: Database): void {
     { type: string; required: number; dflt_value: string | null } | null;
   if (column?.type !== "TEXT" || column.required !== 0 || column.dflt_value !== null) throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
   const parent = database.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='mutation_attempts'").get() as { sql: string } | null;
+  const suffix = `,request_formatTEXTCHECK(request_formatISNULLORrequest_format='${SESSION_SEND_REQUEST_FORMAT}')`;
+  const custodySuffix = ATTACHMENT_CUSTODY_COLUMNS.map((column) => column.replace(/\s+/gu, "")).join(",");
+  const compact = parent === null ? "" : normalizeSql(parent.sql).replace(/\s+/gu, "");
   if (parent === null || /\/\*|--/u.test(parent.sql)
-    || !normalizeSql(parent.sql).replace(/\s+/gu, "").endsWith(`,request_formatTEXTCHECK(request_formatISNULLORrequest_format='${SESSION_SEND_REQUEST_FORMAT}'))STRICT`)) {
+    || (!compact.endsWith(`${suffix})STRICT`) && !compact.endsWith(`${suffix},${custodySuffix})STRICT`))) {
     throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
   }
   for (const object of SESSION_SEND_OWNER_SCHEMA_OBJECTS) {
@@ -271,6 +275,11 @@ const canonical = <T>(schema: z.ZodType<T>, json: unknown): T => {
   return value;
 };
 export function classifySessionSendOwnership(database: Database, lookup: SessionSendOwnershipLookup): SessionSendOwnership {
+  try { assertAttachmentCustodyNamespace(database, lookup); }
+  catch (error: unknown) {
+    if (!(error instanceof AttachmentCustodyNamespaceError)) throw error;
+    throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
+  }
   try { assertQueueAttachmentMutationIntegrity(database, lookup); }
   catch (error: unknown) {
     if (!(error instanceof QueueAttachmentIdentityError)) throw error;
@@ -410,12 +419,16 @@ export function requireSessionSendOwner(database: Database, lookup: SessionSendO
   if (record.kind !== "owned") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
   return record;
 }
-export function insertSessionSendOwner(database: Database, input: SessionSendOwner): SessionSendOwnerHistory {
+export function insertSessionSendOwner(database: Database, input: SessionSendOwner, attachmentInput?: InitialAttachmentInput): SessionSendOwnerHistory {
   const owner = sessionSendOwnerSchema.parse(input);
   const ownerDigest = sessionSendDigest("owner", owner);
-  database.query(`INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at,request_format)
+  if (attachmentInput === undefined) database.query(`INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at,request_format)
     VALUES(?,?,'session.send',?,?,?,'prepared',?,?,?)`).run(owner.attemptId, owner.idempotencyKey, owner.sessionId,
     owner.sourceAuthority.processGeneration, owner.fingerprint.requestDigest, owner.createdAt, owner.createdAt, SESSION_SEND_REQUEST_FORMAT);
+  else database.query(`INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at,request_format,
+    attachment_input_format,attachment_custody_id,attachment_input_digest) VALUES(?,?,'session.send',?,?,?,'prepared',?,?,?,?,?,?)`).run(owner.attemptId,
+    owner.idempotencyKey, owner.sessionId, owner.sourceAuthority.processGeneration, owner.fingerprint.requestDigest, owner.createdAt, owner.createdAt,
+    SESSION_SEND_REQUEST_FORMAT, attachmentInput.format, attachmentInput.custodyId, attachmentInput.digest);
   database.query("INSERT INTO session_send_owners(attempt_id,original_key,session_id,owner_json,owner_digest) VALUES(?,?,?,?,?)")
     .run(owner.attemptId, owner.idempotencyKey, owner.sessionId, JSON.stringify(owner), ownerDigest);
   database.query(`INSERT INTO mutation_provider_authorities(attempt_id,role,provider_account_id,profile_id,provider,binding_generation,process_generation,provenance,recorded_at)
@@ -423,6 +436,10 @@ export function insertSessionSendOwner(database: Database, input: SessionSendOwn
     owner.sourceAuthority.profileId, owner.sourceAuthority.provider, owner.sourceAuthority.bindingGeneration, owner.sourceAuthority.processGeneration, owner.createdAt);
   database.query("INSERT INTO session_send_owner_anchors(attempt_id,original_key,kind,digest) VALUES(?,?,'owner',?)")
     .run(owner.attemptId, owner.idempotencyKey, ownerDigest);
+  // The enclosing v48 admission transaction still has to insert its deferred
+  // input anchor/bind the retained set. Its caller performs the canonical read
+  // only after both immutable authorities exist; no dispatch is granted here.
+  if (attachmentInput !== undefined) return { kind: "owned", owner, ownerDigest, claim: null, claimDigest: null, outcomes: [], state: "input_required" };
   return requireSessionSendOwner(database, { attemptId: owner.attemptId });
 }
 export function insertSessionSendExecutionClaim(database: Database, history: SessionSendOwnerHistory, input: SessionSendExecutionClaim): SessionSendOwnerHistory {

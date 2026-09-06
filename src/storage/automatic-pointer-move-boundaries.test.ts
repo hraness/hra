@@ -11,7 +11,7 @@ import { createCloudUuidV7 } from "../domain/uuid-v7";
 import { createAttemptId, type ProfileId } from "../domain/values";
 import { applyAutomaticPointerMoveSchema, AutomaticPointerMoveStoreError } from "./automatic-pointer-move";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
-import { applySessionSendOwnerSchema, SessionSendOwnershipError } from "./session-send-owner";
+import { SessionSendOwnershipError } from "./session-send-owner";
 import { StateStore } from "./state-store";
 import { WorkStoreError } from "./work-store";
 
@@ -92,7 +92,7 @@ async function fixture() {
       expectedOrderRevision: pointer.orderRevision, expectedPointerRevision: pointer.pointerRevision };
   };
   const send = (idempotencyKey: string = randomUUID()) => ({ kind: "session.send" as const, idempotencyKey, session: session.id, message: "One direct human request.", attachments: [] });
-  return { store, database, work, clock, source, next, last, project, session, record, request, send };
+  return { store, database, work, clock, source, next, last, project, session, record, request, send, daemonGeneration, bootId };
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
@@ -122,6 +122,13 @@ function genericSend(value: Fixture, key: string) {
   return { kind: "session.send", idempotencyKey: key, authorityId: value.session.id,
     authorityGeneration: value.source.processGeneration, request: { message: "Generic boundary request." },
     providerAuthorities: [{ role: "primary" as const, authority: value.store.requireProviderAccountAuthority(value.source.id, "codex"), provenance: "session_send" }] };
+}
+
+function prepareInput(value: Fixture, key = randomUUID()) {
+  return value.store.prepareSessionInputMutation({ kind: "session.send", idempotencyKey: key,
+    sessionId: value.session.id, message: "Generic boundary request.", attachments: [],
+    providerAuthority: value.store.requireProviderAccountAuthority(value.source.id, "codex"),
+    daemonGeneration: value.daemonGeneration, bootId: value.bootId });
 }
 
 function corruptPointer(value: Fixture, attemptId: string, corruption: "anchor_only" | "relocated_key"): void {
@@ -157,7 +164,7 @@ describe("automatic pointer move cross-consumer boundaries", () => {
       expectedAutomaticPolicyRevision: 1, change: { kind: "set_default", enabled: false } })).toThrow(rejected);
     expect(value.store.readAutomaticPointerMove(request.idempotencyKey)?.move).toEqual(move.move);
     expect(value.store.prepareOwnedSessionSend(value.send()).state).toBe("input_required");
-    expect(value.store.prepareMutation(genericSend(value, randomUUID())).state).toBe("prepared");
+    expect(prepareInput(value).attempt.state).toBe("prepared");
   });
 
   test("refuses pointer admission over an existing original send key without touching either owner", async () => {
@@ -177,14 +184,20 @@ describe("automatic pointer move cross-consumer boundaries", () => {
     const send = value.send();
     const owner = value.store.prepareOwnedSessionSend(send);
     const anchors = value.database.query("SELECT * FROM session_send_owner_anchors WHERE attempt_id=?").all(owner.owner.attemptId);
+    const guards = ["session_send_mutation_delete_guard", "attachment_parent_delete_guard"].map((name) => {
+      const row = value.database.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(name) as { sql: string } | null;
+      if (row === null) throw new Error(`Missing deletion guard: ${name}`);
+      return { name, sql: row.sql };
+    });
     value.database.exec("PRAGMA foreign_keys=OFF");
     try {
-      value.database.exec("DROP TRIGGER session_send_mutation_delete_guard");
+      for (const guard of guards) value.database.exec(`DROP TRIGGER ${guard.name}`);
       value.database.query("DELETE FROM mutation_attempts WHERE id=?").run(owner.owner.attemptId);
-      applySessionSendOwnerSchema(value.database);
     } finally {
+      for (const guard of guards) value.database.exec(guard.sql);
       value.database.exec("PRAGMA foreign_keys=ON");
     }
+    expect(value.database.query("SELECT 1 FROM mutation_attempts WHERE id=?").get(owner.owner.attemptId)).toBeNull();
     expect(() => value.store.settleAutomaticPointerMove(value.request(send.idempotencyKey))).toThrow("SESSION_SEND_OWNER_CORRUPT");
     expect(value.database.query("SELECT * FROM session_send_owner_anchors WHERE attempt_id=?").all(owner.owner.attemptId)).toEqual(anchors);
     expect(value.database.query("SELECT 1 FROM automatic_pointer_moves WHERE original_key=?").get(send.idempotencyKey)).toBeNull();
@@ -239,13 +252,20 @@ describe("automatic pointer move cross-consumer boundaries", () => {
       expect(() => value.store.prepareOwnedSessionSend(value.send(request.idempotencyKey))).toThrow("SESSION_SEND_OWNER_CORRUPT");
       expect(() => value.store.prepareMutation(genericSend(value, request.idempotencyKey))).toThrow("SESSION_SEND_OWNER_CORRUPT");
       expect(() => value.work.authorizePreparedEffect(prepared.operation.idempotencyKey)).toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+      // A new generic send is intentionally closed in v48. Use an otherwise
+      // admitted operation so these raw probes specifically reach the pointer
+      // namespace guard rather than the input-custody admission guard.
+      const insertRaw = (attemptId: string, key: string) => value.database.query(`INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at)
+        VALUES(?,?,'session.rename',?,? ,?,'prepared',?,?)`).run(attemptId, key, value.session.id, value.source.processGeneration, "a".repeat(64), value.clock.now, value.clock.now);
+      const mutationsBefore = value.database.query("SELECT * FROM mutation_attempts ORDER BY id").all();
       for (const [attemptId, key] of [[createAttemptId(), request.idempotencyKey], [moved.attemptId, randomUUID()]]) {
-        expect(() => value.database.query(`INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at)
-          VALUES(?,?,'session.send',?,? ,?,'prepared',?,?)`).run(attemptId!, key!, value.session.id, value.source.processGeneration, "a".repeat(64), value.clock.now, value.clock.now)).toThrow("AUTOMATIC_POINTER_MOVE_CORRUPT");
+        expect(() => insertRaw(attemptId!, key!)).toThrow("AUTOMATIC_POINTER_MOVE_CORRUPT");
+        expect(value.database.query("SELECT * FROM mutation_attempts ORDER BY id").all()).toEqual(mutationsBefore);
       }
       expect(value.database.query("SELECT * FROM automatic_pointer_move_anchors WHERE attempt_id=?").get(moved.attemptId)).toEqual(anchor);
       expect(value.store.prepareOwnedSessionSend(value.send()).state).toBe("input_required");
-      expect(value.store.prepareMutation(genericSend(value, randomUUID())).state).toBe("prepared");
+      expect(prepareInput(value).attempt.state).toBe("prepared");
+      expect(insertRaw(createAttemptId(), randomUUID()).changes).toBe(1);
     });
   }
 

@@ -166,6 +166,15 @@ import {
 import { TRANSCRIPT_SEED_MAX_CHARACTERS } from "../domain/transcript";
 import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../domain/session-tasks";
 import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
+import { AttachmentBlobStore, ATTACHMENT_BLOB_SWEEP_GRACE_MS, parseAttachmentCleanupCandidate,
+  type AttachmentCleanupCandidate, type AttachmentCleanupPort } from "./attachment-store";
+import { AttachmentCustodyError, applyAttachmentCustodySchema, auditAttachmentCustody, assertAttachmentCustodySchema, assertAttachmentDaemon,
+  assertLiveAttachmentClosure, attachmentInputProof, attachmentMutationProtectedSql, attachmentReferencesDigest,
+  bindAttachmentParent, hasUnknownAttachmentCustody, hasAttachmentCustodyArtifacts, initialEmptyAttachmentInput, insertEmptyAttachmentInput,
+  parseAttachmentInput, readAttachmentParent, readAttachmentSet, reconcileAttachmentTerminals, reconcileLiveAttachmentTerminals, releaseAttachmentSet,
+  requireAttachmentReservation, reserveAttachmentSet, retireAttachmentIngress, settleAttachmentParent, transferAttachmentQueue,
+  type AttachmentDaemon, type AttachmentIngressInput, type AttachmentReservation } from "./attachment-custody";
+import type { InitialAttachmentInput } from "./attachment-custody-schema";
 import {
   QUEUE_ATTACHMENT_FORMAT, QUEUE_ATTACHMENT_PENDING_SOURCE_CAP, QueueAttachmentIdentityError,
   applyQueueAttachmentSchema, auditQueueAttachmentIdentities, insertQueueAttachmentIdentity,
@@ -1449,7 +1458,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 47;
+const currentSchemaVersion = 48;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -9967,6 +9976,7 @@ const migrateWritableDatabase = (
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
   if (initialVersion === currentSchemaVersion) {
+    auditAttachmentCustody(database);
     auditQueueAttachmentIdentities(database);
     auditAutomaticPointerMoves(database);
     auditSessionSendOwners(database);
@@ -9990,6 +10000,7 @@ const migrateWritableDatabase = (
     // A stamped provider-account schema owns these immutable execution
     // fences. Do not recreate missing current-format custody as a migration.
     if (initialVersion >= 40) assertWorkSignalProviderAuthorities(database);
+    if (initialVersion >= 48) auditAttachmentCustody(database);
     if (initialVersion >= 44) auditDevinJoinedCloses(database);
     if (initialVersion >= 47) auditQueueAttachmentIdentities(database);
     if (initialVersion >= 46) auditAutomaticPointerMoves(database);
@@ -10563,6 +10574,19 @@ const migrateWritableDatabase = (
       database.query("INSERT INTO migrations(version,applied_at) VALUES(47,?)").run(now());
       database.exec("PRAGMA user_version=47");
       version = 47;
+    }
+    if (version < 48) {
+      // Partial v48 artifacts are not a legacy empty database. Never recreate
+      // missing custody evidence from a retained marker or child table.
+      if (hasAttachmentCustodyArtifacts(database)) {
+        throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_CORRUPT");
+      }
+      applyAttachmentCustodySchema(database);
+      reconcileAttachmentTerminals(database, now());
+      auditAttachmentCustody(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES(48,?)").run(now());
+      database.exec("PRAGMA user_version=48");
+      version = 48;
     }
 
     // Reapplying additive objects and idempotent authority backfills makes a
@@ -13153,12 +13177,14 @@ export class StateStore {
   readonly #now: () => number;
   readonly #readonly: boolean;
   readonly #securityScrubCheckpoint: SecurityScrubCheckpointPolicy;
+  readonly #attachmentCleanupPort: AttachmentCleanupPort;
   #publicProviderIdentifierProjector: PublicProviderIdentifierProjector;
   readonly paths: StatePaths;
 
   constructor(paths: StatePaths, options: {
     readonly?: boolean;
     now?: () => number;
+    attachmentCleanupPort?: AttachmentCleanupPort;
     beforeDatabaseOpen?: (input: Readonly<{ flags: number; path: string }>) => void;
     publicProviderIdentifierProjector?: PublicProviderIdentifierProjector;
     resolveMachineTimeZone?: MachineTimeZoneResolver;
@@ -13169,6 +13195,7 @@ export class StateStore {
     this.paths = paths;
     this.#now = options.now ?? Date.now;
     this.#readonly = options.readonly === true;
+    this.#attachmentCleanupPort = options.attachmentCleanupPort ?? AttachmentBlobStore.forStatePaths(paths);
     this.#securityScrubCheckpoint = options.securityScrubCheckpoint === undefined
       ? defaultSecurityScrubCheckpointPolicy
       : securityScrubCheckpointPolicySchema.parse(options.securityScrubCheckpoint);
@@ -13219,6 +13246,7 @@ export class StateStore {
       if (this.#readonly) auditDevinJoinedCloses(this.#database);
       if (this.#readonly) auditAutomaticPointerMoves(this.#database);
       if (this.#readonly) auditQueueAttachmentIdentities(this.#database);
+      if (this.#readonly) auditAttachmentCustody(this.#database);
       if (this.#readonly) auditSessionSendOwners(this.#database);
       assertCompositeNotificationPolicy(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
@@ -18243,6 +18271,7 @@ export class StateStore {
       }
       const applied = this.#database.query("UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=? WHERE id=? AND state='effect_started'").run(JSON.stringify(input.receipt), now, attemptId);
       if (applied.changes !== 1) throw new Error("SESSION_TURN_RECEIPT_CAS_CONFLICT");
+      settleAttachmentParent(this.#database, attemptId, now);
     });
     transaction.immediate();
   }
@@ -18804,12 +18833,134 @@ export class StateStore {
    * never started and a turn never starts with a manifest that was not
    * recorded.
    */
+  reserveAttachmentIngress(input: AttachmentIngressInput): ({ kind: "empty" } | ({ kind: "reserved" } & AttachmentReservation)) {
+    const parsed = parseAttachmentInput(input);
+    return this.#database.transaction(() => {
+      assertAttachmentDaemon(this.#database, parsed);
+      this.assertProviderAccountAuthorityCurrent(parsed.providerAuthority);
+      if (!sameProviderAccountAuthority(parsed.providerAuthority, this.requireSessionProviderAuthority(sessionIdSchema.parse(parsed.sessionId)))) {
+        throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_AUTHORITY_CHANGED");
+      }
+      if (parsed.attachments.length === 0) return { kind: "empty" as const };
+      return { kind: "reserved" as const, ...reserveAttachmentSet(this.#database, parsed, this.#now()) };
+    }).immediate();
+  }
+
+  releaseAttachmentIngress(input: AttachmentReservation & AttachmentDaemon): { released: boolean; reason: "released" | "already_released" | "mutation_owned" } {
+    return this.#database.transaction(() => releaseAttachmentSet(this.#database, input, input, this.#now())).immediate();
+  }
+
+  /** Candidate lists are hints. This is the only synchronous unlink boundary:
+   * the SQLite writer remains held through the fixed port and accounting CAS. */
+  cleanupAttachmentCandidate(input: AttachmentDaemon & { candidate: AttachmentCleanupCandidate }):
+    { kind: "deleted" | "absent" } | { kind: "retained"; reason: "unknown_input" | "reserved" | "referenced" | "accounting_conflict" | "young" | "unsafe_file" } {
+    const candidate = parseAttachmentCleanupCandidate(input.candidate);
+    return this.#database.transaction(() => {
+      assertAttachmentDaemon(this.#database, input);
+      assertAttachmentCustodySchema(this.#database);
+      reconcileLiveAttachmentTerminals(this.#database, this.#now());
+      const live = assertLiveAttachmentClosure(this.#database);
+      if (hasUnknownAttachmentCustody(this.#database)) return { kind: "retained" as const, reason: "unknown_input" as const };
+      if (candidate.kind === "blob") {
+        if (live.some((set) => set.origin.input.members.some((member) => member.digest === candidate.digest))) return { kind: "retained" as const, reason: "reserved" as const };
+        if (this.#database.query("SELECT 1 FROM message_attachments WHERE digest=? LIMIT 1").get(candidate.digest) !== null) return { kind: "retained" as const, reason: "referenced" as const };
+        const accounting = this.attachmentCustody(candidate.digest);
+        if (accounting !== null && (accounting.referenceCount !== 0 || accounting.canonicalMediaType !== candidate.canonicalMediaType)) {
+          return { kind: "retained" as const, reason: "accounting_conflict" as const };
+        }
+      }
+      const accounted = candidate.kind === "blob" && this.attachmentCustody(candidate.digest) !== null;
+      const result = this.#attachmentCleanupPort.unlinkCleanupCandidateSync(candidate, { notNewerThan: accounted ? null : Math.max(0, this.#now() - ATTACHMENT_BLOB_SWEEP_GRACE_MS) });
+      if (result.kind !== "retained" && candidate.kind === "blob") {
+        this.#database.query("DELETE FROM attachments WHERE digest=? AND reference_count=0 AND NOT EXISTS(SELECT 1 FROM message_attachments WHERE digest=attachments.digest)").run(candidate.digest);
+      }
+      return result;
+    }).immediate();
+  }
+
+  prepareSessionInputMutation(input: AttachmentIngressInput & {
+    kind: "session.send" | "session.steer"; reservation?: AttachmentReservation;
+  }): { attempt: { id: AttemptId; state: MutationState; replay: boolean; result?: unknown };
+    custody: { kind: "empty" } | { kind: "mutation_owned"; custodyId: string; custodyDigest: string } } {
+    const { reservation, ...description } = input;
+    const parsed = parseAttachmentInput(description);
+    if (parsed.kind === "session.queue") throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_INVALID_INPUT");
+    return this.#database.transaction(() => {
+      const existing = this.readMutation(parsed.idempotencyKey);
+      if (existing !== null) {
+        if (existing.kind !== parsed.kind || existing.authorityId !== parsed.sessionId) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+        const parent = readAttachmentParent(this.#database, existing.id);
+        const terminal = ["applied", "failed", "cancelled", "reconciled"].includes(existing.state);
+        const originalInput = { ...parsed,
+          providerAuthority: terminal && parent.proof !== null ? parent.proof.authority : { ...parsed.providerAuthority, processGeneration: existing.authorityGeneration },
+          ...(parent.proof?.daemon ?? {}) };
+        const proof = attachmentInputProof(originalInput);
+        if (existing.kind !== parsed.kind || existing.authorityId !== parsed.sessionId || existing.requestDigest !== proof.requestDigest) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+        if (parent.format === null && existing.state === "prepared") throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+        if (parent.proof !== null && JSON.stringify(parent.proof) !== JSON.stringify(proof)) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+        if (reservation !== undefined) {
+          const redundant = requireAttachmentReservation(this.#database, reservation, parsed);
+          if (redundant.parentAttemptId === null) releaseAttachmentSet(this.#database, reservation, parsed, this.#now());
+          else if (redundant.parentAttemptId !== existing.id) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+        }
+        return { attempt: { id: existing.id, state: existing.state, replay: true, ...(existing.result === undefined ? {} : { result: existing.result }) },
+          custody: parent.custody === null ? { kind: "empty" as const } : { kind: "mutation_owned" as const, custodyId: parent.custody.origin.id, custodyDigest: parent.custody.digest } };
+      }
+      assertAttachmentDaemon(this.#database, parsed);
+      this.assertProviderAccountAuthorityCurrent(parsed.providerAuthority);
+      if (!sameProviderAccountAuthority(parsed.providerAuthority, this.requireSessionProviderAuthority(sessionIdSchema.parse(parsed.sessionId)))) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_AUTHORITY_CHANGED");
+      const set = parsed.attachments.length === 0 ? null : reservation === undefined
+        ? (() => { throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED"); })()
+        : requireAttachmentReservation(this.#database, reservation, parsed);
+      if (set?.parentAttemptId !== null && set !== null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+      const initial = set === null ? initialEmptyAttachmentInput(parsed) : { format: "retained_v1" as const, custodyId: set.origin.id, digest: set.digest };
+      const attempt = this.#prepareMutation({ kind: parsed.kind, authorityId: parsed.sessionId, authorityGeneration: parsed.providerAuthority.processGeneration,
+        request: parsed.attachments.length === 0 ? { message: parsed.message } : { message: parsed.message, attachments: parsed.attachments }, idempotencyKey: parsed.idempotencyKey,
+        providerAuthorities: [{ role: "primary", authority: parsed.providerAuthority, provenance: parsed.kind === "session.send" ? "session_send" : "session_steer" }] }, initial);
+      if (set === null) insertEmptyAttachmentInput(this.#database, attempt.id, parsed);
+      else bindAttachmentParent(this.#database, attempt.id, set, this.#now());
+      readAttachmentParent(this.#database, attempt.id);
+      return { attempt, custody: set === null ? { kind: "empty" as const } : { kind: "mutation_owned" as const, custodyId: set.origin.id, custodyDigest: set.digest } };
+    }).immediate();
+  }
+
+  /** Historical input identity is checked before live routing or blob custody.
+   * Prepared history is never a dispatch permit and continues through closed prepare. */
+  readSessionInputReplay(input: {
+    kind: "session.send" | "session.steer"; sessionId: SessionId; idempotencyKey: string;
+    message: string; attachments?: readonly AttachmentReference[];
+  }): { id: AttemptId; state: MutationState; replay: true; result?: unknown } | null {
+    const parsed = z.object({ kind: z.enum(["session.send", "session.steer"]), sessionId: sessionIdSchema,
+      idempotencyKey: z.string().uuid(), message: z.string().min(1).max(262_144), attachments: z.unknown().optional() }).strict().parse(input);
+    const references = parseQueueAttachmentReferences(parsed.attachments ?? []);
+    if (parsed.message.trim().length === 0 || !parsed.message.isWellFormed() || utf8Bytes(parsed.message) > 262_144
+      || references.some((reference) => !reference.name.isWellFormed())) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_INVALID_INPUT");
+    return this.#database.transaction(() => {
+      const attempt = this.readMutation(parsed.idempotencyKey);
+      if (attempt === null) return null;
+      if (attempt.kind !== parsed.kind || attempt.authorityId !== parsed.sessionId) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+      const parent = readAttachmentParent(this.#database, attempt.id);
+      const request = references.length === 0 ? { message: parsed.message } : { message: parsed.message, attachments: references };
+      const requestDigest = createHash("sha256").update(JSON.stringify({ kind: parsed.kind, authorityId: parsed.sessionId,
+        authorityGeneration: attempt.authorityGeneration, request })).digest("hex");
+      if (attempt.kind !== parsed.kind || attempt.authorityId !== parsed.sessionId || attempt.requestDigest !== requestDigest
+        || (parent.proof !== null && (parent.proof.referenceCount !== references.length
+          || parent.proof.referenceDigest !== attachmentReferencesDigest(references)
+          || parent.proof.messageDigest !== createHash("sha256").update(parsed.message).digest("hex")
+          || parent.proof.messageUtf8Bytes !== utf8Bytes(parsed.message)))) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+      if (attempt.state === "prepared") return null;
+      return { id: attempt.id, state: attempt.state, replay: true as const, ...(attempt.result === undefined ? {} : { result: attempt.result }) };
+    })();
+  }
+
   recordMessageAttachments(input: {
     sessionId: SessionId;
     sourceId: string;
     attachments: readonly StoredMessageAttachment[];
   }): void {
     this.#database.transaction(() => {
+      const marked = this.#database.query("SELECT id FROM mutation_attempts WHERE id=? AND attachment_input_format IS NOT NULL").get(input.sourceId);
+      if (marked !== null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
       const queue = this.#database.query("SELECT id FROM queue_entries WHERE id=?").get(input.sourceId);
       if (queue !== null && readQueueAttachmentIdentity(this.#database, input.sourceId) === null) {
         throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
@@ -18871,12 +19022,13 @@ export class StateStore {
       }
       this.#database.query(
         `DELETE FROM message_attachments WHERE session_id=?
+         AND NOT ${attachmentMutationProtectedSql("message_attachments.source_id")}
          AND NOT EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.id=message_attachments.source_id
            AND queue.session_id=message_attachments.session_id AND ${queueAttachmentsProtectedSql("queue")})
          AND source_id NOT IN (
            SELECT source_id FROM (
              SELECT source_id, MAX(created_at) AS recent FROM message_attachments
-             WHERE session_id=? AND NOT EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.id=message_attachments.source_id
+             WHERE session_id=? AND NOT ${attachmentMutationProtectedSql("message_attachments.source_id")} AND NOT EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.id=message_attachments.source_id
                AND queue.session_id=message_attachments.session_id AND ${queueAttachmentsProtectedSql("queue")})
              GROUP BY source_id ORDER BY recent DESC, source_id DESC LIMIT ?))`,
       ).run(parsedSessionId, parsedSessionId, MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP);
@@ -19877,6 +20029,7 @@ export class StateStore {
     idempotencyKey?: string;
     providerAuthority: ProviderAccountAuthority;
     attachments?: readonly StoredMessageAttachment[];
+    attachmentReservation?: AttachmentReservation & AttachmentDaemon;
   }): QueueRecord {
     return this.enqueueIdempotentWithResult(input).queued;
   }
@@ -19922,6 +20075,7 @@ export class StateStore {
     idempotencyKey?: string;
     providerAuthority: ProviderAccountAuthority;
     attachments?: readonly StoredMessageAttachment[];
+    attachmentReservation?: AttachmentReservation & AttachmentDaemon;
   }): { queued: QueueRecord; replayed: boolean; verification: "sealed" | "legacy_unverified" } {
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
@@ -19934,7 +20088,21 @@ export class StateStore {
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
     return this.#database.transaction(() => {
     const replay = this.readQueueEnqueueReplay({ sessionId: parsedSessionId, message: parsedMessage, idempotencyKey, attachments: references });
-    if (replay !== null) return { ...replay, replayed: true };
+    const transfer = (queueId: string): void => {
+      if (input.attachmentReservation !== undefined) transferAttachmentQueue(this.#database, input.attachmentReservation, input.attachmentReservation,
+        { kind: "session.queue", sessionId: parsedSessionId, idempotencyKey, message: parsedMessage, attachments: references,
+          providerAuthority, daemonGeneration: input.attachmentReservation.daemonGeneration, bootId: input.attachmentReservation.bootId }, queueId, this.#now());
+    };
+    if (replay !== null) { transfer(replay.queued.id); return { ...replay, replayed: true }; }
+    if (references.length > 0) {
+      if (input.attachmentReservation === undefined) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+      assertAttachmentDaemon(this.#database, input.attachmentReservation);
+      const reservation = requireAttachmentReservation(this.#database, input.attachmentReservation, {
+        kind: "session.queue", sessionId: parsedSessionId, idempotencyKey, message: parsedMessage, attachments: references, providerAuthority,
+        daemonGeneration: input.attachmentReservation.daemonGeneration, bootId: input.attachmentReservation.bootId,
+      });
+      if (reservation.parentAttemptId !== null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+    }
     const currentSessionAuthority = this.requireSessionProviderAuthority(parsedSessionId);
     if (
       providerAuthority.providerAccountId !== currentSessionAuthority.providerAccountId
@@ -19980,6 +20148,7 @@ export class StateStore {
         messageDigest: createHash("sha256").update(parsedMessage).digest("hex"), messageUtf8Bytes: utf8Bytes(parsedMessage),
         manifestDigest: queueAttachmentManifestDigest(references), attachmentCount: references.length, createdAt: queued.createdAt,
       });
+      transfer(queued.id);
       return { queued, replayed: false, verification: "sealed" as const };
     }).immediate();
   }
@@ -20575,6 +20744,7 @@ export class StateStore {
         session_start_id: SessionId | null;
       } | null;
     if (row === null) throw new Error("MUTATION_ATTEMPT_ID_LOOKUP_LOST");
+    if (row.kind === "session.send" || row.kind === "session.steer") readAttachmentParent(this.#database, row.id);
     const originalState = mutationStateSchema.exclude(["reconciled"]).parse(row.state);
     let evidence: MutationEffectEvidenceRecord | undefined;
     if (row.evidence_json !== null) {
@@ -21500,10 +21670,26 @@ export class StateStore {
     const record = classifySessionSendOwnership(this.#database, { idempotencyKey });
     if (record.kind === "absent") return null;
     if (record.kind !== "owned") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
+    readAttachmentParent(this.#database, record.owner.attemptId);
     return record;
   }
 
   prepareOwnedSessionSend(input: SessionSendRequest): SessionSendOwnerHistory & { replayed: boolean } {
+    return this.#prepareOwnedSessionSend(input);
+  }
+
+  prepareOwnedSessionSendWithCustody(input: { request: SessionSendRequest; daemonGeneration: number; bootId: string }): SessionSendOwnerHistory & {
+    replayed: boolean; custody: { kind: "empty" } | { kind: "mutation_owned"; custodyId: string; custodyDigest: string };
+  } {
+    return this.#database.transaction(() => {
+      const history = this.#prepareOwnedSessionSend(input.request, { daemonGeneration: input.daemonGeneration, bootId: input.bootId });
+      const parent = readAttachmentParent(this.#database, history.owner.attemptId);
+      return { ...history, custody: parent.custody === null ? { kind: "empty" as const }
+        : { kind: "mutation_owned" as const, custodyId: parent.custody.origin.id, custodyDigest: parent.custody.digest } };
+    }).immediate();
+  }
+
+  #prepareOwnedSessionSend(input: SessionSendRequest, daemon?: AttachmentDaemon): SessionSendOwnerHistory & { replayed: boolean } {
     const request = sessionSendRequestSchema.parse(input);
     const fingerprint = fingerprintSessionSendRequest(request);
     return this.#database.transaction(() => {
@@ -21511,6 +21697,8 @@ export class StateStore {
       const existing = classifySessionSendOwnership(this.#database, { idempotencyKey: request.idempotencyKey });
       if (existing.kind === "owned") {
         if (JSON.stringify(existing.owner.fingerprint) !== JSON.stringify(fingerprint)) throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
+        const parent = readAttachmentParent(this.#database, existing.owner.attemptId);
+        if (daemon !== undefined && fingerprint.attachmentCount > 0 && parent.format !== "retained_v1") throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
         return { ...existing, replayed: true };
       }
       if (existing.kind === "legacy") throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
@@ -21521,14 +21709,23 @@ export class StateStore {
       const pending = this.#database.query(`SELECT COUNT(*) AS count FROM mutation_attempts m WHERE m.authority_id=? AND ${sessionSendUnclaimedSql("m")}`)
         .get(session.id) as { count: number };
       if (pending.count >= 64) throw new SessionSendOwnershipError("SESSION_SEND_OWNER_LIMIT");
+      const inputDescription = { kind: "session.send" as const, sessionId: session.id, idempotencyKey: request.idempotencyKey,
+        message: request.message, attachments: request.attachments, providerAuthority: baseProviderAccountAuthority(captured) };
+      const reserved = daemon !== undefined && request.attachments.length > 0
+        ? reserveAttachmentSet(this.#database, { ...inputDescription, ...daemon }, this.#now(), fingerprint.requestDigest) : null;
+      const initial = request.attachments.length === 0 ? initialEmptyAttachmentInput(inputDescription, fingerprint.requestDigest)
+        : reserved === null ? undefined : { format: "retained_v1" as const, custodyId: reserved.reservationId, digest: reserved.reservationDigest };
       const record = insertSessionSendOwner(this.#database, {
         version: 1, attemptId: createAttemptId(), idempotencyKey: request.idempotencyKey, sessionId: session.id, fingerprint,
         sourceAuthority: baseProviderAccountAuthority(captured), sourceThreadId: session.providerThreadId,
         sourceSessionRevision: session.revision, sourceAuthorityRevision: captured.authorityRevision,
         routingProvenance: captured.routingProvenance, appliedPointerRevision: captured.appliedPointerRevision,
         createdAt: unixMillisecondsSchema.parse(this.#now()),
-      });
-      return { ...record, replayed: false };
+      }, initial);
+      if (initial?.format === "empty_v1") insertEmptyAttachmentInput(this.#database, record.owner.attemptId, inputDescription, fingerprint.requestDigest);
+      if (reserved !== null) bindAttachmentParent(this.#database, record.owner.attemptId, readAttachmentSet(this.#database, reserved.reservationId), this.#now());
+      readAttachmentParent(this.#database, record.owner.attemptId);
+      return { ...requireSessionSendOwner(this.#database, { attemptId: record.owner.attemptId }), replayed: false };
     }).immediate();
   }
 
@@ -21542,6 +21739,8 @@ export class StateStore {
     const evidence = ownedDirectSendEvidenceSchema.parse(input.evidence);
     return this.#database.transaction(() => {
       const history = requireSessionSendOwner(this.#database, { attemptId: input.attemptId });
+      const custody = readAttachmentParent(this.#database, history.owner.attemptId);
+      if (history.owner.fingerprint.attachmentCount > 0 && (custody.custody === null || custody.custody.releasedBy !== null)) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
       if (history.ownerDigest !== input.ownerDigest || JSON.stringify(fingerprint) !== JSON.stringify(history.owner.fingerprint)) {
         throw new SessionSendOwnershipError("SESSION_SEND_REQUEST_CONFLICT");
       }
@@ -21608,7 +21807,9 @@ export class StateStore {
       }
       // Receipt persistence is historical. No mutable session/runtime projection
       // may be inferred from this receipt or overwrite a newer binding.
-      return appendSessionSendOutcome(this.#database, history, outcome, unixMillisecondsSchema.parse(this.#now()));
+      const result = appendSessionSendOutcome(this.#database, history, outcome, unixMillisecondsSchema.parse(this.#now()));
+      settleAttachmentParent(this.#database, history.owner.attemptId, this.#now());
+      return result;
     }).immediate();
   }
 
@@ -21616,7 +21817,9 @@ export class StateStore {
     return this.#database.transaction(() => {
       const history = requireSessionSendOwner(this.#database, { attemptId: input.attemptId });
       if (history.ownerDigest !== input.ownerDigest || history.claim !== null) throw new SessionSendOwnershipError("SESSION_SEND_CLAIM_CONFLICT");
-      return appendSessionSendOutcome(this.#database, history, { kind: "cancelled" }, unixMillisecondsSchema.parse(this.#now()));
+      const result = appendSessionSendOutcome(this.#database, history, { kind: "cancelled" }, unixMillisecondsSchema.parse(this.#now()));
+      settleAttachmentParent(this.#database, history.owner.attemptId, this.#now());
+      return result;
     }).immediate();
   }
 
@@ -21634,7 +21837,7 @@ export class StateStore {
     return this.#prepareMutation(input);
   }
 
-  #prepareMutation(input: Parameters<StateStore["prepareMutation"]>[0]): { id: AttemptId; state: MutationState; replay: boolean; result?: unknown } {
+  #prepareMutation(input: Parameters<StateStore["prepareMutation"]>[0], attachmentInput?: InitialAttachmentInput): { id: AttemptId; state: MutationState; replay: boolean; result?: unknown } {
     if (input.kind === automaticUsagePolicyMutationKind) throw new Error("AUTOMATIC_USAGE_POLICY_CLOSED_API_REQUIRED");
     if (input.kind === AUTOMATIC_POINTER_MOVE_KIND) throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_CLOSED_API_REQUIRED");
     const idempotencyKey = input.idempotencyKey ?? randomUUID();
@@ -21662,6 +21865,9 @@ export class StateStore {
     const prepare = this.#database.transaction(() => {
       const ownedSession = sessionIdSchema.safeParse(input.authorityId);
       if (ownedSession.success) assertUnsettledSessionSendOwners(this.#database, ownedSession.data);
+      if ((input.kind === "session.send" || input.kind === "session.steer") && attachmentInput === undefined) {
+        throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+      }
       for (const evidence of providerAuthorities) {
         this.assertProviderAccountAuthorityCurrent(evidence.authority);
       }
@@ -21690,7 +21896,9 @@ export class StateStore {
       if (unsettled !== null) throw new Error("UNSETTLED_MUTATION_AUTHORITY");
       id = createAttemptId();
       const now = this.#now();
-      this.#database.query("INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").run(id, idempotencyKey, input.kind, input.authorityId, input.authorityGeneration, digest, "prepared", now, now);
+      this.#database.query("INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at,attachment_input_format,attachment_custody_id,attachment_input_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+        .run(id, idempotencyKey, input.kind, input.authorityId, input.authorityGeneration, digest, "prepared", now, now,
+          attachmentInput?.format ?? null, attachmentInput?.custodyId ?? null, attachmentInput?.digest ?? null);
       for (const evidence of providerAuthorities) {
         insertProviderAuthorityEvidence(
           this.#database,
@@ -21713,6 +21921,7 @@ export class StateStore {
   }>): boolean {
     const attemptId = attemptIdSchema.parse(input.attemptId);
     assertLegacyMutationOwnership(this.#database, { attemptId });
+    if (this.#database.query("SELECT 1 FROM mutation_attempts WHERE id=? AND attachment_input_format IS NOT NULL").get(attemptId) !== null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
     if (this.#database.query("SELECT 1 FROM mutation_attempts WHERE id=? AND kind='session.queue'").get(attemptId) !== null) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
     const providerAuthorities = this.#parseProviderAuthorityEvidence(input.providerAuthorities);
     const begin = this.#database.transaction(() => {
@@ -21727,6 +21936,7 @@ export class StateStore {
 
   transitionMutation(id: AttemptId, from: MutationState, to: MutationState, result?: unknown): boolean {
     assertLegacyMutationOwnership(this.#database, { attemptId: id });
+    if (to === "effect_started" && this.#database.query("SELECT 1 FROM mutation_attempts WHERE id=? AND attachment_input_format IS NOT NULL").get(id) !== null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
     if (this.#database.query("SELECT 1 FROM mutation_attempts WHERE id=? AND kind='session.queue'").get(id) !== null) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
     if (from === "reconciled" || to === "reconciled") {
       throw new Error("Reconciliation is append-only and cannot rewrite a mutation attempt.");
@@ -21756,6 +21966,7 @@ export class StateStore {
              WHERE malformed.mutation_request_key=mutation_attempts.idempotency_key
            )`,
       ).run(to, resultJson, now, attemptId, from);
+      if (update.changes === 1) settleAttachmentParent(this.#database, attemptId, now);
       return update.changes === 1;
     });
     return transition.immediate();
@@ -21767,6 +21978,10 @@ export class StateStore {
     profileGeneration: number;
     providerAuthority: ProviderAccountAuthority;
     evidence: Extract<MutationEffectEvidence, { kind: "session.send" | "session.steer" | "session.stop" | "session.rename" }>;
+    attachments?: readonly StoredMessageAttachment[];
+    custody?: { custodyId: string; custodyDigest: string };
+    daemonGeneration?: number;
+    bootId?: string;
   }): MutationEffectEvidenceRecord {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
     assertLegacyMutationOwnership(this.#database, { attemptId: parsedAttemptId });
@@ -21824,6 +22039,23 @@ export class StateStore {
       }, now);
       if (evidence.kind === "session.send" && evidence.runtimeProfile !== undefined) {
         this.#assertSessionRuntimeProfileContract(parsedSessionId, evidence.runtimeProfile);
+      }
+      if (evidence.kind === "session.send" || evidence.kind === "session.steer") {
+        const parent = readAttachmentParent(this.#database, parsedAttemptId);
+        if (parent.format !== null) {
+          if (input.daemonGeneration === undefined || input.bootId === undefined) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_AUTHORITY_CHANGED");
+          assertAttachmentDaemon(this.#database, { daemonGeneration: input.daemonGeneration, bootId: input.bootId });
+          if (input.attachments === undefined || parent.proof === null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+          const refs = input.attachments.map(({ digest, name, mediaType, byteLength }) => ({ digest, name, mediaType, byteLength }));
+          if (attachmentReferencesDigest(refs) !== parent.proof.referenceDigest || evidence.messageDigest !== parent.proof.messageDigest
+            || evidence.clientMessageId !== parsedAttemptId) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_REQUEST_CONFLICT");
+          if (parent.custody !== null) {
+            if (input.custody?.custodyId !== parent.custody.origin.id || input.custody.custodyDigest !== parent.custody.digest || parent.custody.releasedBy !== null) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_UNPROVED");
+            assertAttachmentDaemon(this.#database, parent.custody.origin);
+          }
+          this.#recordMessageAttachments({ sessionId: parsedSessionId, sourceId: parsedAttemptId, attachments: input.attachments });
+          if (attachmentReferencesDigest(this.messageAttachmentManifest(parsedSessionId, parsedAttemptId)) !== parent.proof.referenceDigest) throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_CORRUPT");
+        }
       }
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
@@ -23964,6 +24196,7 @@ export class StateStore {
       }
       const inserted = this.#database.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, resolution, resolutionJson, receiptJson, now);
       if (inserted.changes !== 1) throw new Error("MUTATION_RECOVERY_CAS_CONFLICT");
+      settleAttachmentParent(this.#database, parsedAttemptId, now);
     });
     resolveAttempt.immediate();
     if (resolvedSessionId === undefined) throw new Error("Mutation recovery lost its session binding.");
@@ -29342,6 +29575,10 @@ export class StateStore {
         ) AND NOT EXISTS(SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
           WHERE switch.session_id=queue_entries.session_id AND ${SESSION_SWITCH_BLOCKING_PREDICATE})`).run(now);
       this.#database.query("UPDATE daemon_state SET generation=?,boot_id=?,started_at=?,stopped_at=NULL WHERE singleton=1 AND generation=?").run(current.generation + 1, bootId, now, current.generation);
+      reconcileAttachmentTerminals(this.#database, now);
+      // Only true invocation holds retire here. Existing mutation-owned holds
+      // follow their canonical parent receipt, never the boot number alone.
+      if (/^boot_[a-f0-9]{32}$/u.test(bootId)) retireAttachmentIngress(this.#database, { daemonGeneration: current.generation + 1, bootId }, now);
       return current.generation + 1;
     });
     const generation = transaction.immediate();

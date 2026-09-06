@@ -161,13 +161,11 @@ import {
   type AttachmentReference,
   type PreparedAttachment,
 } from "../domain/attachments";
-import {
-  ATTACHMENT_BLOB_SWEEP_GRACE_MS,
-  AttachmentBlobStore,
-} from "../storage/attachment-store";
+import { AttachmentBlobStore, parseAttachmentCleanupCandidate } from "../storage/attachment-store";
 import { initializeProfilePaths, profilePaths, type StatePaths } from "../storage/paths";
 import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
 import { QueueAttachmentIdentityError } from "../storage/queue-attachment-identity";
+import { AttachmentCustodyError, type AttachmentDaemon, type AttachmentIngressInput, type AttachmentReservation } from "../storage/attachment-custody";
 import { WorkCapabilityCodec } from "../storage/work-capability";
 import {
   ProviderUsageTurnNotBoundError,
@@ -977,6 +975,7 @@ const restoreLoginReceipt = (value: unknown): LoginOutcome => {
 /** Background tasks that swallow their own rejection record one of these closed codes. */
 export const BACKGROUND_DIAGNOSTIC_CODES = [
   "account_fact_apply_failed",
+  "attachment_ingress_release_failed",
   "attachment_sweep_failed",
   "autorespond_failed",
   "claude_fact_untranslatable",
@@ -2120,6 +2119,22 @@ export class HraService {
       }
     } catch (error: unknown) {
       if (error instanceof CommandFailure) throw error;
+      if (error instanceof AttachmentCustodyError) {
+        const details = { reason: error.code };
+        switch (error.code) {
+          case "ATTACHMENT_CUSTODY_INVALID_INPUT":
+            throw new CommandFailure("INVALID_INPUT", "The attachment request does not match the supported input contract.", details);
+          case "ATTACHMENT_CUSTODY_REQUEST_CONFLICT":
+            throw new CommandFailure("CONFLICT", "The original request or attachment custody belongs to different input.", details);
+          case "ATTACHMENT_CUSTODY_AUTHORITY_CHANGED":
+            throw new CommandFailure("CONFLICT", "The daemon or provider authority changed before attachment admission.", details);
+          case "ATTACHMENT_CUSTODY_LIMIT":
+            throw new CommandFailure("UNAVAILABLE", "Attachment custody is full. Wait for an in-flight request to finish or resolve pending recovery.", details);
+          case "ATTACHMENT_CUSTODY_CORRUPT":
+          case "ATTACHMENT_CUSTODY_UNPROVED":
+            throw new CommandFailure("RECOVERY_REQUIRED", "The original attachment custody cannot be proved. Inspect session recovery before another dispatch.", details);
+        }
+      }
       if (error instanceof QueueAttachmentIdentityError) {
         const details = { reason: error.code };
         switch (error.code) {
@@ -11798,29 +11813,56 @@ export class HraService {
    * Bounded attachment custody maintenance. It runs only after a message that
    * actually carried attachments, so a text-only daemon never pays for it.
    *
-   * First it drops accounting rows that no message references any more — a
-   * session was deleted, or the per-session manifest cap pruned the oldest
-   * source — and removes their blobs. Then it removes blob files that local
-   * custody does not account for at all, which is how a blob written for a
-   * command that never reached the daemon is reclaimed. The grace window
-   * applies only to unaccounted files; it cannot protect an old reused blob
-   * between attachment preparation and durable reference admission.
+   * Both bounded lists are hints, never deletion authority. Storage rechecks
+   * the captured daemon, live reservations, actual references and accounting
+   * while holding SQLite's writer through each synchronous filesystem unlink.
+   * This avoids both stale-snapshot deletion and a whole-history accounting
+   * scan. Only unaccounted files need the ingestion grace window.
    */
   async #sweepAttachmentCustody(active: boolean): Promise<void> {
     if (!active) return;
     try {
-      const blobs = this.#blobs();
+      const daemon = this.#attachmentDaemon();
       for (const row of this.#store.listUnreferencedAttachments(64)) {
-        await blobs.remove(row.digest, row.canonicalMediaType);
-        this.#store.forgetAttachment(row.digest);
+        this.#store.cleanupAttachmentCandidate({ ...daemon,
+          candidate: parseAttachmentCleanupCandidate({ kind: "blob", digest: row.digest, canonicalMediaType: row.canonicalMediaType }) });
       }
-      await blobs.sweepUnaccounted(
-        this.#store.accountedAttachmentDigests(),
-        ATTACHMENT_BLOB_SWEEP_GRACE_MS,
-        Date.now(),
-      );
+      const snapshot = await this.#blobs().listCleanupCandidates(256);
+      for (const candidate of snapshot.candidates) {
+        this.#store.cleanupAttachmentCandidate({ ...daemon, candidate });
+      }
     } catch (error: unknown) {
       this.recordBackgroundDiagnostic("attachment_sweep_failed", error);
+    }
+  }
+
+  #attachmentDaemon(): AttachmentDaemon {
+    if (this.#daemonGeneration <= 0 || this.#daemonBootId === undefined) {
+      throw new AttachmentCustodyError("ATTACHMENT_CUSTODY_AUTHORITY_CHANGED");
+    }
+    return { daemonGeneration: this.#daemonGeneration, bootId: this.#daemonBootId };
+  }
+
+  async #withAttachmentIngress<T>(input: AttachmentIngressInput, action: (
+    attachments: Readonly<{ stored: readonly StoredMessageAttachment[]; values: readonly PreparedAttachment[] }>,
+    reservation: AttachmentReservation | undefined,
+  ) => Promise<T>): Promise<T> {
+    const admitted = this.#store.reserveAttachmentIngress(input);
+    const reservation = admitted.kind === "empty" ? undefined
+      : { reservationId: admitted.reservationId, reservationDigest: admitted.reservationDigest };
+    try {
+      return await action(await this.#prepareAttachments(input.attachments), reservation);
+    } finally {
+      if (reservation !== undefined) {
+        try {
+          // A mutation-owned hold is deliberately inert here. Only its actual
+          // terminal proof can release it; a retry owns a separate invocation.
+          this.#store.releaseAttachmentIngress({ ...reservation,
+            daemonGeneration: input.daemonGeneration, bootId: input.bootId });
+        } catch (error: unknown) {
+          this.recordBackgroundDiagnostic("attachment_ingress_release_failed", error);
+        }
+      }
     }
   }
 
@@ -11842,25 +11884,35 @@ export class HraService {
     actor: SessionMessageActor = "human",
     attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
-    const session = this.#requireBoundSession(selector);
-    const attachments = await this.#prepareAttachments(attachmentReferences);
+    const selected = this.#store.requireSession(selector);
+    const key = idempotencyKey ?? randomUUID();
+    const prior = this.#store.readSessionInputReplay({ kind: "session.send", sessionId: selected.id,
+      idempotencyKey: key, message, attachments: attachmentReferences });
+    if (prior !== null) {
+      const restored = this.#restoreMutationReplay({ kind: "session.send", idempotencyKey: key,
+        restore: (value) => turnStartReceiptSchema.parse(value) }, prior);
+      if (restored.replayed) return { session: selected, turnId: restored.value.turnId,
+        effectiveRuntimeProfile: restored.value.effectiveRuntimeProfile ?? null,
+        ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }), idempotencyKey: key };
+    }
+    const session = this.#requireBoundSession(selected.id);
+    const providerAuthority = this.#sessionProviderAuthority(session);
+    const sessionInput = { kind: "session.send" as const, sessionId: session.id, idempotencyKey: key,
+      message, attachments: attachmentReferences, providerAuthority, ...this.#attachmentDaemon() };
+    return await this.#withAttachmentIngress(sessionInput, async (attachments, reservation) => {
     const profile = this.#store.requireProfile(session.profileId);
     const presetSelection = this.#store.requireSessionPresetRequirement(session.id);
     if (presetSelection.preset !== session.preset) {
       throw new CommandFailure("CONFLICT", "The session preset authority changed before dispatch.");
     }
     this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
-    const providerAuthority = this.#sessionProviderAuthority(session);
     const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     if (project !== undefined) await this.#requireUsableProjectRoot(project.rootPath);
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
-    // A human-authored message is the only thing that resets the consecutive
-    // autorespond counter for a session.
-    if (actor === "human") this.#store.resetAutorespondCounter(session.id);
-    const key = idempotencyKey ?? randomUUID();
+    const execution = { replayed: false };
     let baseline: CodexSessionProjection | undefined;
     let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
     let dispatchSessionRevision: number | undefined;
@@ -11871,7 +11923,9 @@ export class HraService {
     let turnBindingBound = false;
     const result = await (async () => {
       try {
-        return await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_send" }], effect: async (attemptId) => {
+        return await this.#effect<z.infer<typeof turnStartReceiptSchema>>({ kind: "session.send", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_send" }],
+          sessionInput: { ...sessionInput, ...(reservation === undefined ? {} : { reservation }) },
+          onReplay: () => { execution.replayed = true; }, effect: async (attemptId) => {
       if (baseline === undefined || review === undefined) throw new Error("Session send lost its exact pre-effect provider baseline or runtime review.");
       const runtimeReview = review;
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
@@ -11893,7 +11947,7 @@ export class HraService {
       });
       turnBindingTurnId = startedResult.turnId;
       return { ...startedResult, sourceId: attemptId };
-    }, beginEffect: async (attemptId) => {
+    }, beginEffect: async (attemptId, custody) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
       review = await this.#fencedRuntimeReview(this.#sessionRuntime(session.provider), async () => {
@@ -11910,6 +11964,9 @@ export class HraService {
           signal,
         });
       });
+      // Only a newly admitted human send resets the consecutive counter.
+      // A competing writer may have settled this key after replay preflight.
+      if (actor === "human") this.#store.resetAutorespondCounter(session.id);
       // Work authorization and nested begin are one synchronous fence boundary.
       beforeEffect?.(attemptId);
       // The compact projection reads this back to mark the resulting
@@ -11922,6 +11979,10 @@ export class HraService {
         sessionId: session.id,
         profileGeneration: providerAuthority.processGeneration,
         providerAuthority,
+        attachments: attachments.stored,
+        ...(custody?.kind === "mutation_owned" ? { custody: { custodyId: custody.custodyId, custodyDigest: custody.custodyDigest } } : {}),
+        daemonGeneration: sessionInput.daemonGeneration,
+        bootId: sessionInput.bootId,
         evidence: {
           kind: "session.send",
           providerThreadId: session.providerThreadId,
@@ -11931,13 +11992,6 @@ export class HraService {
           runtimeProfile: review.effectiveRuntimeProfile,
         },
       });
-      if (attachments.stored.length > 0) {
-        this.#store.recordMessageAttachments({
-          attachments: attachments.stored,
-          sessionId: session.id,
-          sourceId: attemptId,
-        });
-      }
       dispatchSessionRevision = this.#store.requireSession(session.id).revision;
       dispatchFactEpoch = this.#snapshotSessionFactEpoch(session.id);
     }, receipt: (value) => turnStartReceiptSchema.parse(value), restore: (value) => turnStartReceiptSchema.parse(value), commit: (attemptId, _value, receipt) => {
@@ -11967,10 +12021,12 @@ export class HraService {
         }
       }
     })();
-    await this.#sweepAttachmentCustody(attachments.values.length > 0);
+    if (!execution.replayed) await this.#sweepAttachmentCustody(attachments.values.length > 0);
     const reconciled = this.#store.requireSession(session.id);
-    this.#recordUserMessage(reconciled.id, profile, result.turnId, actor, message);
-    if (reconciled.state === "idle") this.#scheduleQueueDispatch(reconciled);
+    if (!execution.replayed) {
+      this.#recordUserMessage(reconciled.id, profile, result.turnId, actor, message);
+      if (reconciled.state === "idle") this.#scheduleQueueDispatch(reconciled);
+    }
     return {
       session: reconciled,
       turnId: result.turnId,
@@ -11980,6 +12036,7 @@ export class HraService {
         : { attachments: attachments.values.map(attachmentReferenceOf) }),
       idempotencyKey: key,
     };
+    });
   }
 
   /**
@@ -12023,24 +12080,38 @@ export class HraService {
     beforeEffect?: (attemptId: MutationAttemptRecord["id"]) => void,
     attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
-    const session = this.#requireBoundSession(selector);
-    const attachments = await this.#prepareAttachments(attachmentReferences);
+    const selected = this.#store.requireSession(selector);
+    const key = idempotencyKey ?? randomUUID();
+    const prior = this.#store.readSessionInputReplay({ kind: "session.steer", sessionId: selected.id,
+      idempotencyKey: key, message, attachments: attachmentReferences });
+    if (prior !== null) {
+      const restored = this.#restoreMutationReplay({ kind: "session.steer", idempotencyKey: key,
+        restore: (value) => steeredReceiptSchema.parse(value) }, prior);
+      if (restored.replayed) return { steered: true, turnId: restored.value.activeTurnId,
+        ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }), idempotencyKey: key };
+    }
+    const session = this.#requireBoundSession(selected.id);
+    const providerAuthority = this.#sessionProviderAuthority(session);
+    const sessionInput = { kind: "session.steer" as const, sessionId: session.id, idempotencyKey: key,
+      message, attachments: attachmentReferences, providerAuthority, ...this.#attachmentDaemon() };
+    return await this.#withAttachmentIngress(sessionInput, async (attachments, reservation) => {
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
-    const providerAuthority = this.#sessionProviderAuthority(session);
     const runtimeAuthority = authorityFor(this.#paths, profile, providerAuthority);
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
-    const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let activeTurnId: string | undefined;
-    const result = await this.#effect({ kind: "session.steer", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_steer" }], effect: async (attemptId) => {
+    const execution = { replayed: false };
+    const result = await this.#effect({ kind: "session.steer", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: { message, ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }) }, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_steer" }],
+      sessionInput: { ...sessionInput, ...(reservation === undefined ? {} : { reservation }) },
+      onReplay: () => { execution.replayed = true; }, effect: async (attemptId) => {
       if (activeTurnId === undefined) throw new CommandFailure("CONFLICT", "The session has no active turn to steer.");
       const turnId = activeTurnId;
       await this.#fencedEffect(async () => await this.#runtimeForSession(session).steer({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, activeTurnId: turnId, message, ...(attachments.values.length === 0 ? {} : { attachments: attachments.values }), clientMessageId: attemptId, signal }));
       return { steered: true as const, activeTurnId: turnId };
-    }, beginEffect: async (attemptId) => {
+    }, beginEffect: async (attemptId, custody) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       activeTurnId = baseline.activeTurnId;
       // Work authorization and nested begin are one synchronous fence boundary.
@@ -12050,6 +12121,10 @@ export class HraService {
         sessionId: session.id,
         profileGeneration: providerAuthority.processGeneration,
         providerAuthority,
+        attachments: attachments.stored,
+        ...(custody?.kind === "mutation_owned" ? { custody: { custodyId: custody.custodyId, custodyDigest: custody.custodyDigest } } : {}),
+        daemonGeneration: sessionInput.daemonGeneration,
+        bootId: sessionInput.bootId,
         evidence: {
           kind: "session.steer",
           providerThreadId: session.providerThreadId,
@@ -12059,16 +12134,11 @@ export class HraService {
           messageDigest: digestText(message),
         },
       });
-      if (attachments.stored.length > 0) {
-        this.#store.recordMessageAttachments({
-          attachments: attachments.stored,
-          sessionId: session.id,
-          sourceId: attemptId,
-        });
-      }
     }, receipt: (value) => steeredReceiptSchema.parse(value), restore: (value) => steeredReceiptSchema.parse(value), onAmbiguous: () => this.#quarantineSession(session.id) });
-    this.#recordUserMessage(session.id, profile, result.activeTurnId, "human", message);
-    await this.#sweepAttachmentCustody(attachments.values.length > 0);
+    if (!execution.replayed) {
+      this.#recordUserMessage(session.id, profile, result.activeTurnId, "human", message);
+      await this.#sweepAttachmentCustody(attachments.values.length > 0);
+    }
     return {
       steered: true,
       turnId: result.activeTurnId,
@@ -12077,6 +12147,7 @@ export class HraService {
         : { attachments: attachments.values.map(attachmentReferenceOf) }),
       idempotencyKey: key,
     };
+    });
   }
 
   async #queue(
@@ -12109,13 +12180,15 @@ export class HraService {
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
     const providerAuthority = this.#sessionProviderAuthority(session);
-    // Re-prove bytes before admission. Cross-process protection of this read
-    // remains the responsibility of the shared attachment reservation boundary.
-    const attachments = await this.#prepareAttachments(attachmentReferences);
+    const sessionInput = { kind: "session.queue" as const, sessionId: session.id, idempotencyKey: key,
+      message, attachments: attachmentReferences, providerAuthority, ...this.#attachmentDaemon() };
+    return await this.#withAttachmentIngress(sessionInput, async (attachments, reservation) => {
     // Work authorization and durable enqueue are one synchronous fence boundary.
     beforeEffect?.();
     const admitted = this.#store.enqueueIdempotentWithResult({ sessionId: session.id, profileGeneration: providerAuthority.processGeneration,
-      providerAuthority, message, attachments: attachments.stored, idempotencyKey: key });
+      providerAuthority, message, attachments: attachments.stored, idempotencyKey: key,
+      ...(reservation === undefined ? {} : { attachmentReservation: { ...reservation,
+        daemonGeneration: sessionInput.daemonGeneration, bootId: sessionInput.bootId } }) });
     const queued = admitted.queued;
     if (admitted.replayed) {
       return {
@@ -12137,6 +12210,7 @@ export class HraService {
         : { attachments: attachments.values.map(attachmentReferenceOf) }),
       idempotencyKey: key,
     };
+    });
   }
 
   #scheduleQueueDispatch(session: SessionRecord): void {
@@ -13898,23 +13972,49 @@ export class HraService {
     }
   }
 
-  async #effect<T>(input: { kind: string; authorityId: string; authorityGeneration: number; request: unknown; idempotencyKey: string | undefined; providerAuthorities?: readonly Readonly<{ role: "primary" | "source" | "target"; authority: ProviderAccountAuthority; provenance: string }>[]; beginEffect?(attemptId: MutationAttemptRecord["id"]): Promise<void> | void; effect(attemptId: MutationAttemptRecord["id"]): Promise<T>; receipt(result: T): unknown; restore(receipt: unknown): T; commit?(attemptId: MutationAttemptRecord["id"], result: T, receipt: unknown): Promise<void> | void; onAmbiguous?: (result: T | undefined) => void }): Promise<T> {
-    const attempt = this.#store.prepareMutation(input);
-    if (attempt.replay) {
-      if (attempt.state === "applied") return input.restore(attempt.result);
-      if (attempt.state === "reconciled") {
-        if (attempt.result !== undefined) return input.restore(attempt.result);
-        throw new CommandFailure("CONFLICT", `${input.kind} was explicitly resolved without replay and will never be dispatched under the same idempotency key.`, { idempotencyKey: input.idempotencyKey });
-      }
-      if (attempt.state === "effect_started" || attempt.state === "ambiguous") {
-        throw new CommandFailure("RECOVERY_REQUIRED", `${input.kind} has an indeterminate earlier attempt and will not be replayed.`, { idempotencyKey: input.idempotencyKey });
-      }
-      if (attempt.state !== "prepared") throw new CommandFailure("CONFLICT", `${input.kind} already reached ${attempt.state}.`);
+  #restoreMutationReplay<T>(input: {
+    kind: string; idempotencyKey: string | undefined; restore(receipt: unknown): T;
+  }, attempt: ReturnType<StateStore["prepareMutation"]>): { replayed: false } | { replayed: true; value: T } {
+    if (!attempt.replay) return { replayed: false };
+    if (attempt.state === "applied") return { replayed: true, value: input.restore(attempt.result) };
+    if (attempt.state === "reconciled") {
+      if (attempt.result !== undefined) return { replayed: true, value: input.restore(attempt.result) };
+      throw new CommandFailure("CONFLICT", `${input.kind} was explicitly resolved without replay and will never be dispatched under the same idempotency key.`, { idempotencyKey: input.idempotencyKey });
+    }
+    if (attempt.state === "effect_started" || attempt.state === "ambiguous") {
+      throw new CommandFailure("RECOVERY_REQUIRED", `${input.kind} has an indeterminate earlier attempt and will not be replayed.`, { idempotencyKey: input.idempotencyKey });
+    }
+    if (attempt.state !== "prepared") throw new CommandFailure("CONFLICT", `${input.kind} already reached ${attempt.state}.`);
+    return { replayed: false };
+  }
+
+  async #effect<T>(input: {
+    kind: string; authorityId: string; authorityGeneration: number; request: unknown; idempotencyKey: string | undefined;
+    providerAuthorities?: readonly Readonly<{ role: "primary" | "source" | "target"; authority: ProviderAccountAuthority; provenance: string }>[];
+    sessionInput?: Parameters<StateStore["prepareSessionInputMutation"]>[0];
+    beginEffect?(attemptId: MutationAttemptRecord["id"], custody?: ReturnType<StateStore["prepareSessionInputMutation"]>["custody"]): Promise<void> | void;
+    effect(attemptId: MutationAttemptRecord["id"]): Promise<T>; receipt(result: T): unknown; restore(receipt: unknown): T;
+    commit?(attemptId: MutationAttemptRecord["id"], result: T, receipt: unknown): Promise<void> | void;
+    onAmbiguous?: (result: T | undefined) => void;
+    onReplay?(): void;
+  }): Promise<T> {
+    if (input.sessionInput !== undefined && (input.beginEffect === undefined
+      || input.kind !== input.sessionInput.kind || input.authorityId !== input.sessionInput.sessionId
+      || input.authorityGeneration !== input.sessionInput.providerAuthority.processGeneration
+      || input.idempotencyKey !== input.sessionInput.idempotencyKey)) {
+      throw new Error("Session input preparation lost its exact effect context.");
+    }
+    const preparedInput = input.sessionInput === undefined ? null : this.#store.prepareSessionInputMutation(input.sessionInput);
+    const attempt = preparedInput?.attempt ?? this.#store.prepareMutation(input);
+    const restored = this.#restoreMutationReplay(input, attempt);
+    if (restored.replayed) {
+      input.onReplay?.();
+      return restored.value;
     }
     if (input.beginEffect === undefined) {
       if (!this.#store.transitionMutation(attempt.id, "prepared", "effect_started")) throw new CommandFailure("CONFLICT", "Mutation authority changed before effect dispatch.");
     } else {
-      await input.beginEffect(attempt.id);
+      await input.beginEffect(attempt.id, preparedInput?.custody);
       await this.#daemonAuthority.assertCurrent();
     }
     let result: T;

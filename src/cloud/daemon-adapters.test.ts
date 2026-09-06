@@ -188,6 +188,8 @@ const machineOnlyRemotePolicy = (
 
 async function fixture(): Promise<Readonly<{
   codex: FakeCodex;
+  daemonGeneration: number;
+  daemonBootId: string;
   now: () => number;
   paths: StatePaths;
   sessionId: string;
@@ -200,6 +202,8 @@ async function fixture(): Promise<Readonly<{
   await initializeStatePaths(paths);
   let now = 1_000;
   const store = new StateStore(paths, { now: () => now });
+  const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   const profile = store.createProfile(`Personal \`${privateRootFixture}/profile\``);
   const current = store.nextProfileGeneration(profile.id);
   expect(store.setProfileState(current.id, current.processGeneration, "signed_in", {
@@ -240,6 +244,8 @@ async function fixture(): Promise<Readonly<{
   }), usageAuthority);
   return {
     codex,
+    daemonGeneration,
+    daemonBootId,
     now: () => now,
     paths,
     sessionId: bound.id,
@@ -277,11 +283,15 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
     pluginCapability: true as const,
     enabledApps: [],
   };
-  const attempt = value.store.prepareMutation({
-    authorityGeneration: profile.processGeneration,
-    authorityId: session.id,
+  const { attempt } = value.store.prepareSessionInputMutation({
     kind: "session.send",
-    request: { message: "fixture" },
+    sessionId: session.id,
+    providerAuthority,
+    message: "fixture",
+    attachments: [],
+    idempotencyKey: crypto.randomUUID(),
+    daemonGeneration: value.daemonGeneration,
+    bootId: value.daemonBootId,
   });
   value.store.beginSessionMutationEffect({
     attemptId: attempt.id,
@@ -289,13 +299,16 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
       baseline: { activeTurnId: null, providerUpdatedAt: session.providerUpdatedAt ?? null, status: "idle" },
       clientMessageId: attempt.id,
       kind: "session.send",
-      messageDigest: "a".repeat(64),
+      messageDigest: sha256("fixture"),
       providerThreadId: session.providerThreadId ?? "thread_0001",
       runtimeProfile: runtime,
     },
     profileGeneration: profile.processGeneration,
     providerAuthority,
     sessionId: session.id,
+    attachments: [],
+    daemonGeneration: value.daemonGeneration,
+    bootId: value.daemonBootId,
   });
   return { attemptId: attempt.id as `attempt_${string}`, profile: runtime, providerAuthority };
 }

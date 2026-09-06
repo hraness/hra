@@ -9,6 +9,8 @@ import { automaticPointerMoveCapsuleDigest, type AutomaticPointerMoveRequest } f
 import { codexProviderAccountAuthoritySchema } from "../domain/provider-accounts";
 import { createStoredAccountUsageSnapshot } from "../domain/usage-metrics";
 import { type ProfileId } from "../domain/values";
+import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
+import { ATTACHMENT_CUSTODY_COLUMNS } from "./attachment-custody-schema";
 import { AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS } from "./automatic-pointer-move";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { QUEUE_ATTACHMENT_SCHEMA_OBJECTS } from "./queue-attachment-identity";
@@ -237,6 +239,18 @@ describe("automatic pointer-only storage", () => {
   test("upgrades actual v45 additively and refuses a missing current-format guard before repair", async () => {
     const value = await fixture(); const db = value.inspect();
     try {
+      db.exec("PRAGMA foreign_keys=OFF");
+      for (const type of ["trigger", "index"] as const) {
+        for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
+          if (object.type === type) db.exec(`DROP ${type.toUpperCase()} ${object.name}`);
+        }
+      }
+      for (const definition of [...ATTACHMENT_CUSTODY_COLUMNS].reverse()) {
+        db.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${definition.slice(0, definition.indexOf(" "))}`);
+      }
+      for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
+        if (object.type === "table") db.exec(`DROP TABLE ${object.name}`);
+      }
       for (const object of QUEUE_ATTACHMENT_SCHEMA_OBJECTS) {
         if (object.type === "trigger") db.exec(`DROP TRIGGER ${object.name}`);
       }
@@ -252,12 +266,13 @@ describe("automatic pointer-only storage", () => {
           if (object.type === type) db.exec(`DROP ${type.toUpperCase()} ${object.name}`);
         }
       }
-      db.exec("DELETE FROM migrations WHERE version IN (46,47); PRAGMA user_version=45");
+      db.exec("DELETE FROM migrations WHERE version IN (46,47,48); PRAGMA user_version=45; PRAGMA foreign_keys=ON");
       expect(db.query("SELECT version FROM migrations WHERE version>45").all()).toEqual([]);
       expect(db.query("SELECT name FROM pragma_table_info('queue_entries') WHERE name IN ('enqueue_identity_format','enqueue_identity_attempt_id')").all()).toEqual([]);
+      expect(db.query("SELECT name FROM pragma_table_info('mutation_attempts') WHERE name LIKE 'attachment_%'").all()).toEqual([]);
       const upgraded = value.open();
-      expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 47 });
-      expect(db.query("SELECT version FROM migrations WHERE version>45 ORDER BY version").all()).toEqual([{ version: 46 }, { version: 47 }]);
+      expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 48 });
+      expect(db.query("SELECT version FROM migrations WHERE version>45 ORDER BY version").all()).toEqual([{ version: 46 }, { version: 47 }, { version: 48 }]);
       expect(upgraded.requireProfile(value.source.id)).toEqual(value.store.requireProfile(value.source.id));
       upgraded.settleAutomaticPointerMove(value.request());
       db.exec("DROP TRIGGER automatic_pointer_move_anchor_insert_guard");

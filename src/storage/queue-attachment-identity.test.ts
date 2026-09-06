@@ -33,7 +33,8 @@ async function fixture() {
   const clock = { now: 1_800_000_000_000 };
   const store = new StateStore(paths, { now: () => clock.now });
   stores.push(store);
-  store.nextDaemonGeneration(`boot_${randomUUID().replaceAll("-", "")}`);
+  const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
+  const daemon = { bootId, daemonGeneration: store.nextDaemonGeneration(bootId) };
   const profile = store.nextProfileGeneration(store.createProfile("Queue attachments").id);
   expect(store.setProfileState(profile.id, profile.processGeneration, "signed_in", {
     email: "queue@example.com", plan: "Plus",
@@ -49,7 +50,22 @@ async function fixture() {
     const input = { sessionId: session.id, profileGeneration: authority.processGeneration,
       providerAuthority: authority, message: "The exact queued human request.", idempotencyKey,
       ...(attachments === undefined ? {} : { attachments }) };
-    return store.enqueueIdempotent(input);
+    const references = manifest(attachments ?? []);
+    const previous = store.readQueueEnqueueReplay({ idempotencyKey, sessionId: session.id,
+      message: input.message, attachments: references });
+    // Keep exact historical replay token-free and validate changed replay
+    // input before consulting today's reservation authority.
+    if (previous !== null || references.length === 0) return store.enqueueIdempotent(input);
+    const reservation = store.reserveAttachmentIngress({ kind: "session.queue", sessionId: session.id,
+      idempotencyKey, message: input.message, attachments: references, providerAuthority: authority, ...daemon });
+    if (reservation.kind !== "reserved") throw new Error("Expected attached queue reservation.");
+    const attachmentReservation = { reservationId: reservation.reservationId,
+      reservationDigest: reservation.reservationDigest, ...daemon };
+    try {
+      return store.enqueueIdempotent({ ...input, attachmentReservation });
+    } finally {
+      store.releaseAttachmentIngress(attachmentReservation);
+    }
   };
   const enqueue = (attachments: readonly StoredMessageAttachment[], idempotencyKey: string = randomUUID()) => {
     const queued = admit(attachments, idempotencyKey);

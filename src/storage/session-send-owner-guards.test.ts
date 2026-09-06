@@ -9,7 +9,7 @@ import { presetRequirements } from "../domain/presets";
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import { createAttemptId } from "../domain/values";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
-import { applySessionSendOwnerSchema, SessionSendOwnershipError } from "./session-send-owner";
+import { SessionSendOwnershipError } from "./session-send-owner";
 import { StateStore } from "./state-store";
 
 const stores: StateStore[] = [];
@@ -76,7 +76,7 @@ async function fixture(stage: "unclaimed" | "claimed" | "settled" = "unclaimed")
   const database = new Database(paths.database, { strict: true });
   databases.push(database);
   database.exec("PRAGMA foreign_keys=ON");
-  return { store, database, request, prepared, authority, runtimeProfile, evidence, receipt, session, unrelated };
+  return { store, database, request, prepared, authority, runtimeProfile, evidence, receipt, session, unrelated, daemonGeneration, bootId };
 }
 
 function genericSend(value: Awaited<ReturnType<typeof fixture>>, idempotencyKey = value.request.idempotencyKey, sessionId = value.session.id) {
@@ -89,18 +89,27 @@ function genericSend(value: Awaited<ReturnType<typeof fixture>>, idempotencyKey 
 }
 
 function detachMutation(value: Awaited<ReturnType<typeof fixture>>, corruption: "orphan" | "relocated"): void {
+  const names = corruption === "orphan"
+    ? ["session_send_mutation_delete_guard", "attachment_parent_delete_guard"]
+    : ["session_send_mutation_guard", "attachment_parent_immutable"];
+  const guards = names.map((name) => {
+    const row = value.database.query<{ sql: string }, [string]>(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+    ).get(name);
+    if (row === null) throw new Error(`Missing controlled-corruption guard: ${name}`);
+    return { name, sql: row.sql };
+  });
   value.database.exec("PRAGMA foreign_keys=OFF");
   try {
+    for (const guard of guards) value.database.exec(`DROP TRIGGER ${guard.name}`);
     if (corruption === "orphan") {
-      value.database.exec("DROP TRIGGER session_send_mutation_delete_guard");
       value.database.query("DELETE FROM mutation_attempts WHERE id=?").run(value.prepared.owner.attemptId);
     } else {
-      value.database.exec("DROP TRIGGER session_send_mutation_guard");
       value.database.query("UPDATE mutation_attempts SET idempotency_key=? WHERE id=?")
         .run(randomUUID(), value.prepared.owner.attemptId);
     }
-    applySessionSendOwnerSchema(value.database);
   } finally {
+    for (const guard of guards) value.database.exec(guard.sql);
     value.database.exec("PRAGMA foreign_keys=ON");
   }
 }
@@ -147,9 +156,9 @@ describe("original send generic guards", () => {
       const attemptId = value.prepared.owner.attemptId;
       const before = value.store.readOwnedSessionSend(value.request.idempotencyKey);
       expect(() => value.database.query("UPDATE mutation_attempts SET request_format=NULL WHERE id=?").run(attemptId)).toThrow("SESSION_SEND_");
-      expect(() => value.database.query("UPDATE mutation_attempts SET idempotency_key=? WHERE id=?").run(randomUUID(), attemptId)).toThrow("SESSION_SEND_");
+      expect(() => value.database.query("UPDATE mutation_attempts SET idempotency_key=? WHERE id=?").run(randomUUID(), attemptId)).toThrow("ATTACHMENT_CUSTODY_CORRUPT");
       expect(() => value.database.query("UPDATE mutation_attempts SET result_json='{}' WHERE id=?").run(attemptId)).toThrow("SESSION_SEND_");
-      expect(() => value.database.query("DELETE FROM mutation_attempts WHERE id=?").run(attemptId)).toThrow("SESSION_SEND_");
+      expect(() => value.database.query("DELETE FROM mutation_attempts WHERE id=?").run(attemptId)).toThrow("ATTACHMENT_CUSTODY_CORRUPT");
       const changedEvidence = JSON.stringify({ ...value.evidence, messageDigest: "0".repeat(64) });
       expect(() => value.database.query(`INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at)
         VALUES (?,'session.send',?,?,10000)`).run(attemptId, changedEvidence, createHash("sha256").update(changedEvidence).digest("hex")))
@@ -186,6 +195,7 @@ describe("original send generic guards", () => {
       expect(() => value.store.readMutation(value.request.idempotencyKey)).toThrow(rejected);
       expect(() => value.store.prepareMutation(genericSend(value))).toThrow(rejected);
       expect(() => value.store.prepareOwnedSessionSend(value.request)).toThrow(rejected);
+      const mutationsBefore = value.database.query("SELECT * FROM mutation_attempts ORDER BY id").all();
       for (const [attemptId, key] of [
         [createAttemptId(), value.request.idempotencyKey],
         [value.prepared.owner.attemptId, randomUUID()],
@@ -194,8 +204,9 @@ describe("original send generic guards", () => {
           id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at
         ) VALUES (?,?,'session.send',?,?,?,'prepared',10000,10000)`).run(
           attemptId, key, value.session.id, value.authority.processGeneration, "0".repeat(64),
-        )).toThrow("SESSION_SEND_OWNER_CORRUPT");
+        )).toThrow("ATTACHMENT_CUSTODY_CORRUPT");
       }
+      expect(value.database.query("SELECT * FROM mutation_attempts ORDER BY id").all()).toEqual(mutationsBefore);
       expect(value.database.query("SELECT COUNT(*) AS count FROM session_send_execution_claims WHERE attempt_id=?")
         .get(value.prepared.owner.attemptId)).toEqual({ count: 1 });
     });
@@ -209,7 +220,9 @@ describe("original send generic guards", () => {
       .toThrow(new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT"));
     expect(value.database.query("SELECT id FROM mutation_attempts WHERE idempotency_key=?").get(key)).toBeNull();
     const unrelatedKey = randomUUID();
-    expect(value.store.prepareMutation(genericSend(value, unrelatedKey, value.unrelated.id)).state).toBe("prepared");
+    expect(value.store.prepareSessionInputMutation({ kind: "session.send", idempotencyKey: unrelatedKey,
+      sessionId: value.unrelated.id, providerAuthority: value.authority, message: value.request.message,
+      attachments: [], daemonGeneration: value.daemonGeneration, bootId: value.bootId }).attempt.state).toBe("prepared");
     expect(value.database.query("SELECT COUNT(*) AS count FROM session_send_execution_claims WHERE attempt_id=?")
       .get(value.prepared.owner.attemptId)).toEqual({ count: 1 });
   });

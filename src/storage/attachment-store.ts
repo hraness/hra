@@ -335,10 +335,9 @@ export class AttachmentBlobStore {
   }
 
   /**
-   * Removes blob files that local custody does not account for and that are
-   * older than the grace window. The window exists because the CLI writes the
-   * bytes before the daemon records the reference: a blob younger than the
-   * window may belong to a command that is still in flight.
+   * Legacy snapshot-based primitive, not production deletion authority.
+   * The daemon uses StateStore's transactional cleanup boundary instead.
+   * A grace window alone cannot protect an old blob reused by an active input.
    */
   async sweepUnaccounted(
     accounted: ReadonlySet<string>,
@@ -372,5 +371,5 @@ export class AttachmentBlobStore {
   }
 }
 
-/** Blobs younger than this are never swept, so an in-flight command is safe. */
+/** Grace for unaccounted files; age alone never proves in-flight custody. */
 export const ATTACHMENT_BLOB_SWEEP_GRACE_MS = 60 * 60 * 1_000;

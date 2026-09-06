@@ -313,6 +313,8 @@ async function claudeFixture(
     options.now === undefined ? {} : { now: options.now },
   );
   stores.push(store);
+  const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   // These tests drive every approval by hand.
   store.setDefaultApprovalMode("manual");
   const processes: FakeClaudeProcess[] = [];
@@ -358,6 +360,8 @@ async function claudeFixture(
     cloud,
     codex: new SignInOnlyCodex(),
     daemonAuthority: { assertCurrent: async () => {}, close: () => {} },
+    daemonGeneration,
+    daemonBootId,
     paths,
     platform: "linux",
     requestStop: () => undefined,
