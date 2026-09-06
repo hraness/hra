@@ -6,7 +6,7 @@ export type CodexTaskFailure =
   | { readonly _tag: "CodexFailure"; readonly error: CodexError }
   | { readonly _tag: "ReadAborted"; readonly reason: unknown };
 
-export type TaskGroup = "requests" | "facts" | "writes" | "dynamic" | "server" | "responses" | "stdout";
+export type TaskGroup = "requests" | "facts" | "writes" | "dynamic" | "server" | "responses" | "stdout" | "stderr";
 
 export class CodexConnectionWork extends Context.Tag("@hraness/hra/CodexConnectionWork")<
   CodexConnectionWork,
@@ -24,11 +24,12 @@ export const CodexConnectionWorkLive = Layer.scoped(CodexConnectionWork, Effect.
   const server = yield* FiberSet.make<unknown, never>();
   const responses = yield* FiberSet.make<unknown, never>();
   const stdout = yield* FiberSet.make<unknown, never>();
+  const stderr = yield* FiberSet.make<unknown, never>();
   const factOrder = yield* Effect.makeSemaphore(1);
-  return { groups: { requests, facts, writes, dynamic, server, responses, stdout }, factOrder };
+  return { groups: { requests, facts, writes, dynamic, server, responses, stdout, stderr }, factOrder };
 }));
 
-export function completionBefore<A>(deferred: Deferred.Deferred<A, CodexTaskFailure>, expiresAt: number, expire: Effect.Effect<void>, abort?: Effect.Effect<never, CodexTaskFailure>): Effect.Effect<A, CodexTaskFailure> {
+export function completionBefore<A>(deferred: Deferred.Deferred<A, CodexTaskFailure>, expiresAt: number, expire: Effect.Effect<void>): Effect.Effect<A, CodexTaskFailure> {
   const deadline = Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis;
     const remainingMs = expiresAt - now;
@@ -36,8 +37,7 @@ export function completionBefore<A>(deferred: Deferred.Deferred<A, CodexTaskFail
     yield* expire;
     return yield* Deferred.await(deferred);
   });
-  const completion = Effect.raceFirst(Deferred.await(deferred), deadline);
-  return abort === undefined ? completion : Effect.raceFirst(completion, abort);
+  return Effect.raceFirst(Deferred.await(deferred), deadline);
 }
 
 export function orderedFact(program: Effect.Effect<void, CodexTaskFailure>): Effect.Effect<void, CodexTaskFailure, CodexConnectionWork> {

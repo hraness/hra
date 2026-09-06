@@ -683,6 +683,7 @@ describe("transactional HRA installer", () => {
       "@hraness/oh": "0.2.7",
       "@openai/codex": "0.153.2",
       convex: "1.45.0",
+      effect: "3.22.1",
       zod: "4.4.3",
     });
     const dependencyFreeSourceManifest = { ...sourcePackageManifest };

@@ -93,7 +93,7 @@ test("scope disposal attempts iterator release without awaiting an uncancelable 
       };
     },
   };
-  const reading = runtime.read(source, async value => { values.push(value); }, () => { throw new Error("unexpected cleanup failure"); });
+  const reading = runtime.read("stdout", source, async value => { values.push(value); }, () => { throw new Error("unexpected cleanup failure"); });
   const observed = reading.catch((error: unknown) => error);
   await entered.promise;
   await runtime.close();
@@ -148,6 +148,73 @@ test("deadline activation follows the domain reservation even after expiration",
     expect(completion.start()).toBe(result);
     await expect(result).rejects.toBe(failure);
     expect(expired).toBe(1);
+  } finally {
+    await runtime.close();
+  }
+});
+
+for (const order of ["response-first", "abort-first", "response-reserved-first"] as const) {
+  test(`synchronous request reservation arbitrates ${order}`, async () => {
+    const runtime = new CodexConnectionEffects();
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    let pending = true;
+    let aborted = 0;
+    const completion = runtime.completion<number>("requests", {
+      deadlineMs: 1000,
+      signal: controller.signal,
+      onDeadline: () => { completion.reject(new CodexError("TIMEOUT", "unexpected expiry")); },
+      onAbort: () => {
+        if (!pending) return false;
+        pending = false;
+        aborted += 1;
+        return true;
+      },
+    });
+    const result = completion.start();
+    try {
+      if (order === "response-first") {
+        pending = false;
+        completion.succeed(42);
+        controller.abort(reason);
+      } else if (order === "abort-first") {
+        controller.abort(reason);
+        completion.succeed(42);
+      } else {
+        pending = false;
+        controller.abort(reason);
+        // Model the interval after accepting the exact response reservation,
+        // before its caller's validation/projection has completed.
+        await Promise.resolve();
+        completion.succeed(42);
+      }
+      if (order === "abort-first") {
+        await expect(result).rejects.toBe(reason);
+        expect(aborted).toBe(1);
+      } else {
+        expect(await result).toBe(42);
+        expect(aborted).toBe(0);
+      }
+    } finally {
+      await runtime.close();
+    }
+  });
+}
+
+test("an abort admission callback defect rejects through the owned request", async () => {
+  const runtime = new CodexConnectionEffects();
+  const controller = new AbortController();
+  const defect = new TypeError("abort admission failed");
+  const completion = runtime.completion<undefined>("requests", {
+    deadlineMs: 1000,
+    signal: controller.signal,
+    onDeadline: () => { completion.reject(new CodexError("TIMEOUT", "unexpected expiry")); },
+    onAbort: () => { throw defect; },
+  });
+  try {
+    const result = completion.start();
+    controller.abort();
+    await expect(result).rejects.toBe(defect);
   } finally {
     await runtime.close();
   }

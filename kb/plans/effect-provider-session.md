@@ -2,10 +2,10 @@
 
 Design: [issue 118](https://github.com/hraness/hra/issues/118).
 
-Status: implemented; focused validation passed. Aggregate validation and independent review are pending.
+Status: implemented; focused validation passed. Independent review passed; aggregate validation on the converged source is pending.
 
 The Codex connection uses Effect 3.22.1 for request deadlines and cancellation,
-ordered fact delivery, background task ownership, and stdout consumption. The
+ordered fact delivery, background task ownership, and stdout/stderr consumption. The
 public Promise API, parser contracts, operation descriptors and exception classes
 remain stable. Claude Code and other provider runtimes are outside this phase.
 
@@ -27,7 +27,7 @@ indeterminate and is reconciled without replay. No generic retry policy is added
   settlement and retryable process close.
 - New session-runtime tests prove synchronous completion reservation, exact
   exception projection, ordered facts after failure, background admission counts,
-  and interruption of consumption without a false claim of native cancellation.
+  response/abort arbitration, and interruption of consumption without a false claim of native cancellation.
 - The repository TypeScript compiler and ESLint accept the implementation.
 - `check:effect-architecture` classifies every production Effect module and
   enforces the reviewed program, adapter and runtime-root roles. Its paired
@@ -39,8 +39,10 @@ indeterminate and is reconciled without replay. No generic retry policy is added
 
 ## Validation and delivery record
 
-Focused evidence: `bun test ./src/codex/session-effects.test.ts ./src/codex/client.test.ts --isolate --max-concurrency=1` passed 88 tests and 433 assertions, including 50 generated fact-order sequences. Focused ESLint passed. The architecture checker fixtures passed 7 tests and 30 assertions. The repository TypeScript check passed before the final reservation-activation and named shutdown-report refinements; the aggregate gate must validate those changes again.
+Focused evidence: `bun test ./src/codex/session-effects.test.ts ./src/codex/client.test.ts --isolate --max-concurrency=1` passed 93 tests and 443 assertions, including 50 generated fact-order sequences, both response/abort orderings, reservation removal before response projection, and late stderr after scoped close. Focused ESLint passed. The architecture checker fixtures passed 7 tests and 30 assertions. The session modules passed a focused strict check with the repository's TypeScript 5.9.2.
 
-The first aggregate attempt passed installer pins, the architecture policy and security-primitive counts, then stopped on two strict lint incompatibilities in the checker. The shared checker was corrected without relaxing policy and its focused lint and fixture tests passed. A fresh aggregate gate and independent review remain pending.
+The first aggregate attempt stopped on two strict checker lint incompatibilities; the shared checker was corrected without relaxing policy. The next attempt passed installer pins, the architecture policy, security-primitive counts, full lint/typecheck and script/plugin tests. Its source suite passed 2,780 tests and failed only the exact installer dependency inventory, which now includes Effect 3.22.1 and passes its focused test. The remaining aggregate steps did not run.
 
-This phase does not authorize substituting fake process tests for native custody proofs, or treating compiler checks as proof of durable authority correctness.
+Review hardened reservation-before-deadline activation and found a reproduced response/abort tie regression in the initial nested races. The repaired native listener now synchronously claims the exact pending reservation and settles the same Deferred as responses and timeouts. The callback's scoped finalizer removes the listener. A separate stderr scope stops diagnostic consumption after close without turning normal interruption into a failure diagnostic.
+
+Independent review of the runtime and subsequent reservation, abort, stderr and inventory repairs found no remaining concrete defect. A fresh aggregate gate on the converged source remains pending. This phase does not authorize substituting fake process tests for native custody proofs, or treating compiler checks as proof of durable authority correctness.

@@ -1275,7 +1275,7 @@ export class CodexAppServerClient {
           ? new IndeterminateCodexEffectError(descriptor.method, id)
           : new CodexError("TIMEOUT", `${descriptor.method} timed out`));
       },
-      onAbort: () => { this.#takePending(id); },
+      onAbort: () => this.#takePending(id) !== undefined,
     });
     const exactPending: PendingRequest = {
       id,
@@ -1432,7 +1432,7 @@ export class CodexAppServerClient {
 
   async #readLoop(): Promise<void> {
     try {
-      await this.#effects.read(this.#process.stdout, async chunk => {
+      await this.#effects.read("stdout", this.#process.stdout, async chunk => {
         for (const message of this.#decoder.push(chunk)) await this.#handleMessage(message);
       }, () => { this.#onSafeDiagnostic("Codex stdout iterator cleanup failed"); });
       for (const message of this.#decoder.finish()) await this.#handleMessage(message);
@@ -1455,11 +1455,17 @@ export class CodexAppServerClient {
 
   async #drainStderr(): Promise<void> {
     try {
-      for await (const chunk of this.#process.stderr) {
+      await this.#effects.read("stderr", this.#process.stderr, async chunk => {
         this.#onSafeDiagnostic(`Codex wrote ${String(chunk.byteLength)} bytes to stderr`);
-      }
+      }, () => {
+        if (this.#state !== "closing" && this.#state !== "closed") {
+          this.#onSafeDiagnostic("Codex stderr iterator cleanup failed");
+        }
+      });
     } catch {
-      this.#onSafeDiagnostic("Codex stderr closed unexpectedly");
+      if (this.#state !== "closing" && this.#state !== "closed") {
+        this.#onSafeDiagnostic("Codex stderr closed unexpectedly");
+      }
     }
   }
 

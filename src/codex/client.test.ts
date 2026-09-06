@@ -3975,3 +3975,40 @@ describe("CodexAppServerClient", () => {
     expect(process.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM"]);
   });
 });
+
+test("closed Codex scope stops late stderr diagnostics without reporting normal interruption as failure", async () => {
+  const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+  const diagnostics: string[] = [];
+  const process = new FakeProcess((message, target) => {
+    if (message.method === "initialize") {
+      target.respond({ id: message.id, result: {
+        userAgent: "codex-cli/0.153.2", codexHome, platformFamily: "unix", platformOs: "macos",
+      } });
+    }
+  }, { ignoreTerm: true, leaveStreamsOpenAfterKill: true });
+  const client = createClient({
+    process,
+    authority: { profileId: "profile-a", processGeneration: 1 },
+    expectedCodexHome: codexHome,
+    isAuthorityCurrent: () => true,
+    onSafeDiagnostic: message => { diagnostics.push(message); },
+    shutdownTermGraceMs: 5,
+    shutdownSettlementMs: 5,
+  });
+  try {
+    await client.initialize();
+    process.stderrQueue.push("before");
+    await waitFor(() => diagnostics.includes("Codex wrote 6 bytes to stderr"));
+    await client.close();
+    expect(client.state).toBe("closed");
+    const completedDiagnostics = [...diagnostics];
+    process.stderrQueue.push("late");
+    await Bun.sleep(5);
+    expect(diagnostics).toEqual(completedDiagnostics);
+    expect(diagnostics).not.toContain("Codex stderr closed unexpectedly");
+  } finally {
+    process.stdoutQueue.close();
+    process.stderrQueue.close();
+    await client.close();
+  }
+});

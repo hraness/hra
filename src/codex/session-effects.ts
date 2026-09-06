@@ -1,4 +1,4 @@
-import { Cause, Deferred, Effect, Exit, Fiber, FiberId, FiberSet, ManagedRuntime, Option } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, FiberId, FiberSet, ManagedRuntime, Option, type Scope } from "effect";
 
 import { CodexConnectionWork, CodexConnectionWorkLive, completionBefore, consumeValues, orderedFact, settleConnection, type CodexTaskFailure, type ShutdownReport, type TaskGroup } from "./session-program.ts";
 
@@ -26,16 +26,21 @@ function callback<A>(run: () => A | Promise<A>): Effect.Effect<A, CodexTaskFailu
   });
 }
 
-function readAborted(signal: AbortSignal): Effect.Effect<never, CodexTaskFailure> {
-  return Effect.async<never, CodexTaskFailure>((resume) => {
-    const abort = (): void => resume(Effect.fail({
-      _tag: "ReadAborted",
-      reason: (signal.reason as unknown) ?? new DOMException("The Codex read was aborted", "AbortError"),
-    }));
-    signal.addEventListener("abort", abort, { once: true });
-    if (signal.aborted) abort();
-    return Effect.sync(() => { signal.removeEventListener("abort", abort); });
-  });
+function listenForAbort<A>(signal: AbortSignal, deferred: Deferred.Deferred<A, CodexTaskFailure>, onAbort: (reason: unknown) => boolean): Effect.Effect<void, never, Scope.Scope> {
+  const abort = (): void => {
+    const reason: unknown = signal.reason ?? new DOMException("The Codex read was aborted", "AbortError");
+    // The pending table decides synchronously. Once a response removed that
+    // reservation, even a response not yet parsed must beat a later abort.
+    try {
+      if (onAbort(reason)) Deferred.unsafeDone(deferred, Effect.fail({ _tag: "ReadAborted", reason }));
+    } catch (error: unknown) {
+      Deferred.unsafeDone(deferred, rejectTask(error));
+    }
+  };
+  return Effect.acquireRelease(
+    Effect.sync(() => { signal.addEventListener("abort", abort, { once: true }); }),
+    () => Effect.sync(() => { signal.removeEventListener("abort", abort); }),
+  ).pipe(Effect.tap(() => Effect.sync(() => { if (signal.aborted) abort(); })));
 }
 
 function unwrap<A>(exit: Exit.Exit<A, CodexTaskFailure>): A {
@@ -76,19 +81,17 @@ export class CodexConnectionEffects {
     readonly deadlineMs: number;
     readonly signal?: AbortSignal;
     readonly onDeadline: () => void;
-    readonly onAbort: (reason: unknown) => void;
+    readonly onAbort: (reason: unknown) => boolean;
   }): CodexCompletion<A> {
     // Reservation is synchronous: the domain table and pre-write fence must
     // exist before any provider callback can observe the allocated request id.
     const deferred = Deferred.unsafeMake<A, CodexTaskFailure>(FiberId.none);
     let program: Effect.Effect<A, CodexTaskFailure> = Deferred.await(deferred);
     if (options !== undefined) {
-      const abort = options.signal === undefined ? undefined : readAborted(options.signal).pipe(
-        Effect.tapError(failure => Effect.sync(() => {
-          if (failure._tag === "ReadAborted") options.onAbort(failure.reason);
-        })),
-      );
-      program = completionBefore(deferred, Date.now() + options.deadlineMs, Effect.sync(options.onDeadline), abort);
+      program = completionBefore(deferred, Date.now() + options.deadlineMs, Effect.sync(options.onDeadline));
+      if (options.signal !== undefined) {
+        program = Effect.scoped(Effect.zipRight(listenForAbort(options.signal, deferred, options.onAbort), program));
+      }
     }
     let result: Promise<A> | undefined;
     return {
@@ -130,12 +133,12 @@ export class CodexConnectionEffects {
     return this.#runtime.runPromise(Effect.flatMap(CodexConnectionWork, work => FiberSet.awaitEmpty(work.groups[group])));
   }
 
-  read<A>(source: AsyncIterable<A>, consume: (value: A) => Promise<void>, cleanupFailed: () => void): Promise<void> {
+  read<A>(group: "stdout" | "stderr", source: AsyncIterable<A>, consume: (value: A) => Promise<void>, cleanupFailed: () => void): Promise<void> {
     const iterator = source[Symbol.asyncIterator]();
     // The process owns and closes its streams. Do not await iterator.return()
     // as an Effect finalizer: foreign next()/return() may never settle. Native
     // exit remains separately proven by the client before disposing this scope.
-    return this.#run("stdout", consumeValues(callback(() => iterator.next()), value => callback(() => consume(value)))).finally(() => {
+    return this.#run(group, consumeValues(callback(() => iterator.next()), value => callback(() => consume(value)))).finally(() => {
       // Attempt release on EOF, parse failure and interruption. Keep observing
       // foreign settlement without letting a stuck return() block native close.
       try {
