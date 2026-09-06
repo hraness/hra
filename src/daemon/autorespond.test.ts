@@ -45,11 +45,13 @@ const workspacePermission: InteractionDisplay = {
 };
 
 describe("autorespond policy", () => {
-  test("accepts commands, file changes, and permissions at once scope under auto:all", () => {
-    for (const display of [command, fileChange, network]) {
+  test("accepts commands and permissions at once scope under auto:all", () => {
+    for (const display of [command, network]) {
       const decision = decideAutorespond({ budgets: quiet, display, kind: display.kind, mode: "auto:all" });
       expect(decision).toMatchObject({ action: "accept", decision: "once" });
     }
+    expect(decideAutorespond({ budgets: quiet, display: fileChange, kind: fileChange.kind, mode: "auto:all" }))
+      .toMatchObject({ action: "escalate", code: "protected_authority_required" });
   });
 
   test("never answers under manual mode and never answers questions or forms", () => {
@@ -65,19 +67,38 @@ describe("autorespond policy", () => {
       .toMatchObject({ action: "escalate", code: "not_an_approval" });
   });
 
-  test("auto:workspace escalates network, MCP, and unknown permissions but accepts workspace ones", () => {
-    expect(decideAutorespond({ budgets: quiet, display: network, kind: "permission_approval", mode: "auto:workspace" }))
-      .toMatchObject({ action: "escalate", code: "network_or_external" });
-    expect(decideAutorespond({ budgets: quiet, display: workspacePermission, kind: "permission_approval", mode: "auto:workspace" }))
-      .toMatchObject({ action: "accept" });
+  test("auto:workspace fails closed for every permission category without exact authority", () => {
+    for (const requested of [
+      [{ name: "network" }],
+      [{ name: "mcp" }],
+      [{ name: "camera" }],
+      [{ name: "file_camera" }],
+      [{ name: "read_keychain" }],
+      [{ name: "filesystem_remote" }],
+      [{ name: "workspace_write" }],
+      [{ name: "workspace_write" }, { name: "camera" }],
+    ]) {
+      const display: InteractionDisplay = { ...workspacePermission, requested };
+      expect(decideAutorespond({ budgets: quiet, display, kind: "permission_approval", mode: "auto:workspace" }))
+        .toMatchObject({ action: "escalate", code: "protected_authority_required" });
+    }
     const empty: InteractionDisplay = { ...network, requested: [] };
     expect(decideAutorespond({ budgets: quiet, display: empty, kind: "permission_approval", mode: "auto:all" }))
       .toMatchObject({ action: "escalate", code: "decision_unavailable" });
   });
 
+  test("auto:workspace does not treat a command class as exact authority", () => {
+    for (const display of [command, { ...command, commandClass: "git push" }]) {
+      expect(decideAutorespond({ budgets: quiet, display, kind: display.kind, mode: "auto:workspace" }))
+        .toMatchObject({ action: "escalate", code: "protected_authority_required" });
+    }
+  });
+
   test("respects the provider's offered decisions", () => {
-    const declineOnly: InteractionDisplay = { ...fileChange, availableDecisions: ["decline", "cancel"] };
+    const declineOnly: InteractionDisplay = { ...command, availableDecisions: ["decline", "cancel"] };
     expect(decideAutorespond({ budgets: quiet, display: declineOnly, kind: "file_change_approval", mode: "auto:all" }))
+      .toMatchObject({ action: "escalate", code: "not_an_approval" });
+    expect(decideAutorespond({ budgets: quiet, display: declineOnly, kind: "command_approval", mode: "auto:all" }))
       .toMatchObject({ action: "escalate", code: "decision_unavailable" });
   });
 

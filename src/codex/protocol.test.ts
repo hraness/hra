@@ -730,7 +730,6 @@ describe("pinned server requests and safe notifications", () => {
 
   test("parses every brokered method into a bounded display and exact private authority", () => {
     for (const [method, params] of Object.entries(brokeredFixtures) as [BrokeredCodexServerRequestMethod, unknown][]) {
-      if (method === "item/fileChange/requestApproval") continue;
       const parsed = parseBrokeredCodexServerRequest({
         authority: codexAuthority(9),
         connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
@@ -748,13 +747,42 @@ describe("pinned server requests and safe notifications", () => {
       expect(JSON.stringify(parsed.display)).not.toContain("git push origin main");
     }
 
-    expect(() => parseBrokeredCodexServerRequest({
+    const fileChange = parseBrokeredCodexServerRequest({
       authority: codexAuthority(9),
       connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
       requestId: { type: "string", value: "file" },
       method: "item/fileChange/requestApproval",
-      params: brokeredFixtures["item/fileChange/requestApproval"],
-    })).toThrow(expect.objectContaining({ code: "UNSUPPORTED_CAPABILITY" }));
+      params: {
+        ...(brokeredFixtures["item/fileChange/requestApproval"] as Record<string, unknown>),
+        // This field is absent from the pinned params contract. Even if a
+        // malformed peer supplies it, it must not create an acceptance path.
+        availableDecisions: ["accept", "acceptForSession"],
+      },
+    });
+    expect(fileChange.display).toEqual({
+      kind: "file_change_approval",
+      summary: "Allow the proposed file changes",
+      reason: "write files",
+      grantRoot: "/workspace",
+      availableDecisions: ["decline", "cancel"],
+    });
+    expect(fileChange.privateApprovalAuthority).toBeNull();
+    for (const decision of ["decline", "cancel"] as const) {
+      expect(compileCodexInteractionResponse({
+        method: "item/fileChange/requestApproval",
+        kind: fileChange.kind,
+        privateParams: fileChange.privateParams,
+        resolution: { kind: "approval_decision", decision },
+      })).toEqual({ decision });
+    }
+    for (const decision of ["once", "session"] as const) {
+      expect(() => compileCodexInteractionResponse({
+        method: "item/fileChange/requestApproval",
+        kind: fileChange.kind,
+        privateParams: fileChange.privateParams,
+        resolution: { kind: "approval_decision", decision },
+      })).toThrow("does not offer");
+    }
 
     const urlSecret = "URL_SECRET_SENTINEL";
     try {

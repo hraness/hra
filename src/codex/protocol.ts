@@ -2640,6 +2640,17 @@ const commandApprovalDecisionContractUnsupported = (): CodexError => new CodexEr
   "The command approval uses a decision contract HRA cannot safely represent.",
 );
 
+/**
+ * The pinned `FileChangeRequestApprovalParams` has no `availableDecisions`
+ * field, while its fixed response contract admits four literals. HRA exposes
+ * only the two non-granting responses so an absent or unexpected input field
+ * can never create blind file-write authority.
+ */
+const safeFileChangeApprovalDecisions: readonly InteractionDecision[] = Object.freeze([
+  "decline",
+  "cancel",
+]);
+
 const isKnownCommandApprovalAmendment = (value: unknown): boolean => {
   if (!plainJsonObject(value)) return false;
   const entries = Object.entries(value);
@@ -2812,12 +2823,10 @@ export function parseBrokeredCodexServerRequest(input: {
     // The pinned Codex file-change callback omits affected paths and change
     // detail, so HRA has never had enough to support an informed human
     // decision. The request is still admitted as a durable interaction (never
-    // exposing a private approval authority, since none exists) so a session
-    // in an autorespond mode can accept it blind, exactly as the owner
-    // accepted in the plan; a session in manual mode auto-declines it at the
-    // daemon layer instead of leaving a human staring at an unreviewable
-    // prompt (`src/daemon/autorespond.ts`).
-    const availableDecisions = commandApprovalDecisions(privateParams.availableDecisions);
+    // exposing a private approval authority, since none exists), but every
+    // autorespond mode leaves it pending. Blind acceptance is a global safety
+    // refusal; a foreground operator may still decline the request.
+    const availableDecisions = safeFileChangeApprovalDecisions;
     const reason = nullableSafeDisplayText(privateParams.reason, "file change approval reason", 4_096);
     const grantRoot = nullableSafeDisplayText(privateParams.grantRoot, "file change grant root", 1_024);
     return {
@@ -2978,6 +2987,12 @@ export function compileCodexInteractionResponse(input: {
       && !commandApprovalDecisions(privateParams.availableDecisions).includes(resolution.decision)
     ) {
       throw new CodexError("INVALID_INPUT", "the command approval does not offer that decision");
+    }
+    if (
+      method === "item/fileChange/requestApproval"
+      && !safeFileChangeApprovalDecisions.includes(resolution.decision)
+    ) {
+      throw new CodexError("INVALID_INPUT", "the file change approval does not offer that decision");
     }
     const decision = resolution.decision === "once"
       ? "accept"

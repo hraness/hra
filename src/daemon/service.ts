@@ -246,7 +246,10 @@ import {
   SessionEventStreamRedactor,
   type SessionEventWrite,
 } from "./streaming-redaction";
-import { SessionStateTracker } from "./session-state-tracker";
+import {
+  SessionStateTracker,
+  type SessionStateContext,
+} from "./session-state-tracker";
 import {
   decideAutorespond,
   decideProseAutorespond,
@@ -1111,6 +1114,8 @@ export class HraService {
   readonly #now: () => number;
   readonly #mutationTails = new Map<string, Promise<unknown>>();
   readonly #background = new Set<Promise<unknown>>();
+  /** Exact pending approvals with a live protocol autorespond owner. */
+  readonly #scheduledAutorespondInteractions = new Set<string>();
   readonly #operations = new Set<Promise<void>>();
   readonly #projectionRecoveriesInFlight = new Set<string>();
   readonly #sessionFactEpochs = new Map<string, number>();
@@ -4115,15 +4120,20 @@ export class HraService {
       && record.kind !== "permission_approval"
     ) return;
     const sessionId = record.sessionId;
+    this.#scheduledAutorespondInteractions.add(record.publicId);
     const tracked = this.#autorespondAdmitted(record, sessionId).then(
       () => undefined,
       (error: unknown) => {
         if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
         else this.recordBackgroundDiagnostic("autorespond_failed", error);
+        this.#escalatePendingAutorespondInteraction(record, "autorespond_failed");
       },
     );
     this.#background.add(tracked);
-    void tracked.then(() => this.#background.delete(tracked));
+    void tracked.then(() => {
+      this.#scheduledAutorespondInteractions.delete(record.publicId);
+      this.#background.delete(tracked);
+    });
   }
 
   async #autorespondAdmitted(record: InteractionRecord, sessionId: SessionRecord["id"]): Promise<void> {
@@ -4133,19 +4143,18 @@ export class HraService {
     const decision = decideAutorespond({ budgets, display: record.display, kind: record.kind, mode });
     const kind = record.kind as "command_approval" | "file_change_approval" | "permission_approval";
     if (decision.action === "escalate") {
-      if (decision.code !== "manual_mode" && decision.code !== "not_an_approval") {
-        this.#store.recordAutorespondEvidence({
-          approvalClass: decision.approvalClass,
-          decision: decision.code,
-          interactionId: record.publicId,
-          kind,
-          latencyMs: this.#now() - startedAt,
-          mode,
-          outcome: "refused",
-          sessionId,
-          subagent: false,
-        });
-      }
+      this.#store.recordAutorespondEvidence({
+        approvalClass: decision.approvalClass,
+        decision: decision.code,
+        interactionId: record.publicId,
+        kind,
+        latencyMs: this.#now() - startedAt,
+        mode,
+        outcome: "refused",
+        sessionId,
+        subagent: false,
+      });
+      this.#escalatePendingAutorespondInteraction(record, `autorespond_${decision.code}`);
       return;
     }
     const resolution = record.kind === "permission_approval"
@@ -4179,6 +4188,9 @@ export class HraService {
         sessionId,
         subagent: false,
       });
+      if (outcome === "refused") {
+        this.#escalatePendingAutorespondInteraction(record, "autorespond_resolution_refused");
+      }
     }
   }
 
@@ -4363,12 +4375,16 @@ export class HraService {
    * that hands the turn back to the human. A later revision always wins, so
    * the browser and the CLI converge on the escalation.
    */
-  #escalateSessionState(sessionId: SessionRecord["id"], reason: string): void {
+  #escalateSessionState(
+    sessionId: SessionRecord["id"],
+    reason: string,
+    state: "needs_answer" | "needs_approval" = "needs_answer",
+  ): void {
     try {
       const body = this.#sessionStateTracker.escalate(sessionId, {
         attention: true,
         reason,
-        state: "needs_answer",
+        state,
       });
       const snapshot = this.#sessionStateTracker.snapshot(sessionId);
       if (snapshot === null) return;
@@ -4390,6 +4406,29 @@ export class HraService {
         body,
       );
     } catch (error: unknown) {
+      this.recordBackgroundDiagnostic("session_state_tracking_failed", error);
+    }
+  }
+
+  /*
+   * A provider validation refusal can leave the same approval pending, while
+   * connection loss or indeterminate delivery terminalizes it first. Only the
+   * former is actionable. Re-read the exact revision so a stale background
+   * decision cannot manufacture attention for a resolved or expired prompt.
+   */
+  #escalatePendingAutorespondInteraction(record: InteractionRecord, reason: string): void {
+    try {
+      const current = this.#store.requireInteraction(record.publicId);
+      if (
+        current.sessionId === null
+        || current.sessionId !== record.sessionId
+        || current.revision !== record.revision
+        || current.state !== "pending"
+        || this.#now() >= current.deadlineAt
+      ) return;
+      this.#escalateSessionState(current.sessionId, reason, "needs_approval");
+    } catch (error: unknown) {
+      if (error instanceof SelectionError && error.code === "NOT_FOUND") return;
       this.recordBackgroundDiagnostic("session_state_tracking_failed", error);
     }
   }
@@ -4447,6 +4486,52 @@ export class HraService {
   }
 
   /*
+   * Session-state attention is derived from the complete actionable pending
+   * set, not merely from the newest interaction's kind. Exact in-flight
+   * scheduler ownership is authoritative for older requests; settings and
+   * bounded audit history cannot retroactively claim them. The newly persisted
+   * request is classified synchronously because scheduling happens immediately
+   * after its event is tracked. If the bounded page overflows, fail closed and
+   * keep attention visible.
+   */
+  #pendingSessionStateContext(
+    sessionId: SessionRecord["id"],
+    newlyRequestedInteractionId?: string,
+  ): SessionStateContext {
+    const page = this.#store.listInteractionPage({
+      sessionId,
+      pendingOnly: true,
+      limit: 200,
+    });
+    let representative = page.interactions[0];
+    if (representative === undefined) return {};
+    let autorespondWillAct = page.nextPosition === null;
+    for (const interaction of page.interactions) {
+      let willAct = interaction.state !== "pending"
+        || this.#scheduledAutorespondInteractions.has(interaction.publicId);
+      if (!willAct && interaction.publicId === newlyRequestedInteractionId) {
+        const { mode } = this.#store.readSessionApprovalMode(sessionId);
+        const budgets = this.#store.readAutorespondBudgets(sessionId, this.#now());
+        willAct = decideAutorespond({
+            budgets,
+            display: interaction.display,
+            kind: interaction.kind,
+            mode,
+          }).action === "accept";
+      }
+      if (!willAct) {
+        representative = interaction;
+        autorespondWillAct = false;
+        break;
+      }
+    }
+    return {
+      pendingInteraction: { kind: representative.kind },
+      autorespondWillAct,
+    };
+  }
+
+  /*
    * Classify the session after every persisted event. The tracker decides
    * whether the state changed; a change is persisted as the session's durable
    * latest state and appended as one `session_state` event. Failures here are
@@ -4472,14 +4557,17 @@ export class HraService {
           });
         }
       }
-      const pending = write.body.type === "interaction_requested"
+      const pendingContext = write.body.type === "interaction_requested"
         || write.body.type === "interaction_state"
         || write.body.type === "turn_completed"
-        ? this.#store.listInteractions({ sessionId: write.sessionId, pendingOnly: true, limit: 1 })[0]
-        : undefined;
-      const body = this.#sessionStateTracker.observe(write.sessionId, write.body, {
-        ...(pending === undefined ? {} : { pendingInteraction: { kind: pending.kind } }),
-      });
+        ? this.#pendingSessionStateContext(
+            write.sessionId,
+            write.body.type === "interaction_requested"
+              ? write.body.interactionId
+              : undefined,
+          )
+        : {};
+      const body = this.#sessionStateTracker.observe(write.sessionId, write.body, pendingContext);
       if (body === null) return;
       const snapshot = this.#sessionStateTracker.snapshot(write.sessionId);
       if (snapshot === null) return;
@@ -4500,7 +4588,7 @@ export class HraService {
       if (
         body.state === "needs_approval"
         && write.body.type === "turn_completed"
-        && pending === undefined
+        && pendingContext.pendingInteraction === undefined
       ) {
         const classification = this.#sessionStateTracker.classification(write.sessionId);
         if (classification !== null) {
@@ -8776,7 +8864,11 @@ export class HraService {
 
   #appendInteractionState(interaction: InteractionRecord): void {
     if (interaction.sessionId === null) return;
-    this.#store.appendSessionEvent({
+    // Route state transitions through the ordinary event pipeline so the
+    // session-state tracker re-reads the complete pending set. Direct store
+    // appends would leave an autorespond escalation stuck after the exact
+    // interaction resolved or expired.
+    const write: SessionEventWrite = {
       sessionId: interaction.sessionId,
       accountId: interaction.authority.profileId,
       providerGeneration: interaction.authority.processGeneration,
@@ -8794,8 +8886,10 @@ export class HraService {
         state: interaction.state,
         revision: interaction.revision,
       },
-    });
+    };
+    this.#store.appendSessionEvent(write);
     this.#eventWaiters.notify(interaction.sessionId);
+    this.#trackSessionState(write, write.providerAuthority);
   }
 
   #surfaceAbandonedSessionSwitchInteractions(

@@ -133,7 +133,9 @@ export class SessionStateTracker {
       }
       case "interaction_requested":
       case "interaction_state": {
-        if (tracking.active !== null && context.pendingInteraction === undefined) return null;
+        if (tracking.active !== null && context.pendingInteraction === undefined) {
+          return this.#emit(sessionId, tracking, this.#working("turn active"));
+        }
         return this.#emit(sessionId, tracking, this.#classify(tracking, context));
       }
       case "session_status": {
@@ -180,7 +182,8 @@ export class SessionStateTracker {
   /*
    * Force one further revision without reclassifying. The daemon uses this
    * when an autorespond outcome, not new provider text, changes who must act:
-   * a verbatim mismatch escalates the turn to the human.
+   * a policy refusal, provider refusal, or verbatim mismatch escalates the
+   * turn to the human.
    */
   escalate(
     sessionId: string,

@@ -51,12 +51,10 @@ export type InteractionDecision = z.infer<typeof interactionDecisionSchema>;
 
 /**
  * Per-session and daemon-default answering policy for brokered protocol
- * approvals. `auto:all` autoresponds every approval kind; `auto:workspace`
- * autoresponds commands and file changes but escalates permission approvals
- * whose requested category looks like network access, MCP, or an
- * unrecognised tool; `manual` never autoresponds (file-change approvals are
- * still auto-declined under `manual` because HRA cannot show their exact
- * affected paths, so no informed human decision is possible).
+ * approvals. `auto:all` autoresponds command and permission approvals;
+ * `auto:workspace` escalates both until their exact provider authority can be
+ * proved workspace-local. File changes remain local because HRA cannot show
+ * their exact affected paths. `manual` never autoresponds.
  */
 export const approvalModeSchema = z.enum(["auto:all", "auto:workspace", "manual"]);
 
@@ -657,13 +655,7 @@ export function computeInteractionPresentation(display: InteractionDisplay): Int
   }
 }
 
-// --- Autorespond decision mapping ------------------------------------------
-//
-// Pure, provider-neutral policy: given an interaction kind, its sanitised
-// display, and the effective approval mode, decide whether to resolve it
-// automatically (and with what resolution) or to leave it for a human.
-// Budgets, evidence, and the actual provider round trip live in
-// `src/daemon/autorespond.ts`, which is the only caller of this function.
+// --- Permission-category presentation helpers ------------------------------
 
 export type PermissionCategoryClass = "network" | "mcp" | "workspace" | "unknown";
 
@@ -671,7 +663,9 @@ export type PermissionCategoryClass = "network" | "mcp" | "workspace" | "unknown
  * Heuristic classification of a requested permission category name. Codex's
  * exact permission-category vocabulary is not published, so this errs
  * conservative: anything not recognisably workspace-local classifies as
- * `unknown` and escalates under `auto:workspace`.
+ * `unknown`. These labels support safe presentation and the remote decline
+ * policy; autorespond authority lives only in `src/daemon/autorespond.ts` and
+ * never derives authority from this classifier.
  */
 export function classifyPermissionCategory(name: string): PermissionCategoryClass {
   const lower = name.toLowerCase();
@@ -681,118 +675,4 @@ export function classifyPermissionCategory(name: string): PermissionCategoryClas
     return "workspace";
   }
   return "unknown";
-}
-
-/**
- * The second, wider net over a requested permission category name. It exists
- * because `classifyPermissionCategory` matches a prefix vocabulary, while a
- * category that merely mentions the outside world anywhere in its name must
- * never be auto-approved or approved from a device that cannot read its exact
- * values. `src/daemon/autorespond.ts` applies it to the `auto:workspace` gate
- * and the remote-decision verifier applies it to browser approvals, so both
- * paths refuse exactly the same category names.
- */
-const networkOrExternalPermissionPattern =
-  /(?:network|internet|http|https|url|fetch|socket|dns|proxy|mcp|remote|web)/iu;
-
-export function permissionCategoryIsNetworkOrExternal(name: string): boolean {
-  return networkOrExternalPermissionPattern.test(name);
-}
-
-export type AutorespondAction =
-  | Readonly<{ action: "resolve"; resolution: InteractionResolution; outcome: "accepted" | "refused" }>
-  | Readonly<{ action: "escalate"; reason: string }>;
-
-/**
- * Decision table (kind × mode → action):
- *
- * | kind                 | manual              | auto:all | auto:workspace                                  |
- * | --------------------- | ------------------- | -------- | ------------------------------------------------ |
- * | command_approval      | escalate            | accept   | accept                                            |
- * | file_change_approval  | decline (refused)   | accept   | accept                                            |
- * | permission_approval   | escalate            | accept   | accept unless any requested category is network, MCP, or unknown; then escalate |
- * | user_input            | escalate (always)   | escalate | escalate                                          |
- * | mcp_elicitation       | escalate (always)   | escalate | escalate                                          |
- *
- * "accept" for command_approval and file_change_approval means Codex decision
- * `accept` (HRA `once` scope), never `acceptForSession`. "accept" for
- * permission_approval means a `permission_grant` of every requested category
- * at `scope: "turn"`, never `session`.
- */
-export function decideAutorespondAction(input: {
-  readonly kind: InteractionKind;
-  readonly display: InteractionDisplay;
-  readonly mode: ApprovalMode;
-}): AutorespondAction {
-  const { kind, display, mode } = input;
-  if (kind === "user_input" || kind === "mcp_elicitation") {
-    return { action: "escalate", reason: "This interaction kind always requires a human." };
-  }
-  if (kind === "file_change_approval") {
-    if (display.kind !== "file_change_approval") {
-      return { action: "escalate", reason: "The interaction display does not match its kind." };
-    }
-    if (mode === "manual") {
-      if (!display.availableDecisions.includes("decline")) {
-        return { action: "escalate", reason: "The provider request does not offer decline." };
-      }
-      return {
-        action: "resolve",
-        resolution: { kind: "approval_decision", decision: "decline" },
-        outcome: "refused",
-      };
-    }
-    if (!display.availableDecisions.includes("once")) {
-      return { action: "escalate", reason: "The provider request does not offer once-scope acceptance." };
-    }
-    return {
-      action: "resolve",
-      resolution: { kind: "approval_decision", decision: "once" },
-      outcome: "accepted",
-    };
-  }
-  if (mode === "manual") {
-    return { action: "escalate", reason: "Approval mode is manual." };
-  }
-  if (kind === "command_approval") {
-    if (display.kind !== "command_approval") {
-      return { action: "escalate", reason: "The interaction display does not match its kind." };
-    }
-    if (!display.availableDecisions.includes("once")) {
-      return { action: "escalate", reason: "The provider request does not offer once-scope acceptance." };
-    }
-    return {
-      action: "resolve",
-      resolution: { kind: "approval_decision", decision: "once" },
-      outcome: "accepted",
-    };
-  }
-  // permission_approval
-  if (display.kind !== "permission_approval") {
-    return { action: "escalate", reason: "The interaction display does not match its kind." };
-  }
-  if (display.requested.length === 0) {
-    return { action: "escalate", reason: "No permission category was requested." };
-  }
-  if (mode === "auto:workspace") {
-    const sensitive = display.requested.find((permission) => {
-      const cls = classifyPermissionCategory(permission.name);
-      return cls === "network" || cls === "mcp" || cls === "unknown";
-    });
-    if (sensitive !== undefined) {
-      return {
-        action: "escalate",
-        reason: `The requested "${sensitive.name}" permission category is not auto-approved under auto:workspace.`,
-      };
-    }
-  }
-  return {
-    action: "resolve",
-    resolution: {
-      kind: "permission_grant",
-      permissions: display.requested.map((permission) => permission.name),
-      scope: "turn",
-    },
-    outcome: "accepted",
-  };
 }

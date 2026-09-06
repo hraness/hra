@@ -542,6 +542,29 @@ export const sessionStateRowSchema = z.object({
 }).strict();
 
 export type SessionStateRow = z.infer<typeof sessionStateRowSchema>;
+
+/*
+ * Closed reasons whose session-state ownership comes from a live provider
+ * interaction. A daemon-generation rollover terminalizes that authority, so
+ * only these exact rows may be repaired during restart. In particular,
+ * prose-only `autorespond_verbatim_mismatch` attention is not on this list.
+ */
+const restartInteractionSessionStateReasons: ReadonlySet<string> = new Set([
+  "pending command_approval",
+  "pending file_change_approval",
+  "pending permission_approval",
+  "pending user_input",
+  "pending mcp_elicitation",
+  "autorespond_manual_mode",
+  "autorespond_not_an_approval",
+  "autorespond_decision_unavailable",
+  "autorespond_protected_authority_required",
+  "autorespond_consecutive_limit",
+  "autorespond_hourly_budget",
+  "autorespond_daily_budget",
+  "autorespond_resolution_refused",
+  "autorespond_failed",
+]);
 /*
  * Autorespond evidence covers both paths. `protocol` rows answer a provider
  * approval and carry its interaction id; `prose` rows answer an assistant
@@ -25969,9 +25992,9 @@ export class StateStore {
 
   /**
    * Append only local retirement evidence under the immutable authority that
-   * originally owned the session. The account-login transaction is the sole
-   * caller: ordinary event appends and every provider effect continue through
-   * the current-authority path above.
+   * originally owned the session. Account-login and daemon-restart retirement
+   * are the only callers: ordinary event appends and every provider effect
+   * continue through the current-authority path above.
    */
   #appendHistoricalSessionRetirementEventInTransaction(input: Readonly<{
     sessionId: SessionId;
@@ -26198,6 +26221,79 @@ export class StateStore {
     } else {
       this.#appendHistoricalSessionRetirementEventInTransaction(event);
     }
+  }
+
+  /*
+   * Restart removes the provider callback that owned an interaction-derived
+   * attention state. Repair that exact durable projection in the same
+   * transaction as interaction terminalization, and append the matching
+   * public event before any captured provider authority advances. Other
+   * attention reasons and independently owned recovery holds are untouched.
+   */
+  #repairRestartInteractionSessionStateInTransaction(
+    sessionId: SessionId,
+    recordedAt: number,
+  ): void {
+    if (this.hasUnsettledLegacyProviderAuthorityQuarantineForSession(sessionId)
+      || this.hasUnsettledQueueAttachmentQuarantineForSession(sessionId)) return;
+    const current = this.readSessionState(sessionId);
+    if (
+      current === null
+      || !restartInteractionSessionStateReasons.has(current.reason)
+      || this.#database.query(
+        `SELECT 1 FROM provider_interactions
+         WHERE session_id=? AND state IN ('pending','response_prepared','response_written')
+         LIMIT 1`,
+      ).get(sessionId) !== null
+    ) return;
+    const session = this.requireSession(sessionId);
+    const providerAuthority = baseProviderAccountAuthority(this.requireCapturedSessionProviderAuthority(sessionId));
+    if (this.sessionSwitchAdmissionBlocked({ sessionId, providerThreadId: session.providerThreadId ?? null,
+      providerAuthority }).blocked) return;
+    if (current.revision >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("SESSION_STATE_REVISION_EXHAUSTED");
+    }
+    // Only Codex can resume an active turn. Claude is terminal after restart;
+    // Devin's joined-close proof admits idle writers only, and unproved active
+    // writers receive recovery_required later in this same transaction.
+    const working = session.provider === "codex" && session.state === "active" && session.activeTurnId !== undefined;
+    const state = working ? "working" as const : "aborted" as const;
+    const reason = working
+      ? "turn active"
+      : "provider interaction ended during daemon restart";
+    const revision = current.revision + 1;
+    const changed = this.#database.query(
+      `UPDATE session_states
+       SET state=?,attention=0,reason=?,verbatim_required=0,verbatim_literal=NULL,
+           last_activity_at=?,revision=?,updated_at=MAX(updated_at,?)
+       WHERE session_id=? AND revision=?`,
+    ).run(
+      state,
+      reason,
+      recordedAt,
+      revision,
+      recordedAt,
+      sessionId,
+      current.revision,
+    );
+    if (changed.changes !== 1) throw new Error("SESSION_STATE_RESTART_CONFLICT");
+    this.#appendHistoricalSessionRetirementEventInTransaction({
+      sessionId,
+      accountId: providerAuthority.profileId,
+      providerGeneration: providerAuthority.processGeneration,
+      providerAuthority,
+      providerConnectionId: null,
+      body: {
+        type: "session_state",
+        state,
+        attention: false,
+        reason,
+        verbatimRequired: false,
+        lastActivityAt: recordedAt,
+        revision,
+      },
+      recordedAt,
+    });
   }
 
   maintainSessionEventRetention(sessionId: SessionId, now = this.#now()): SessionEventStreamPosition {
@@ -28738,6 +28834,11 @@ export class StateStore {
         `SELECT i.* FROM provider_interactions i
          WHERE i.state IN ('pending','response_prepared','response_written')
            AND NOT EXISTS(
+             SELECT 1 FROM legacy_provider_authority_quarantines quarantine
+             WHERE (quarantine.scope_kind='interaction' AND quarantine.scope_id=i.public_id)
+               OR (quarantine.scope_kind='session' AND quarantine.scope_id=i.session_id)
+           )
+           AND NOT EXISTS(
              SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
              LEFT JOIN session_switch_target_start_receipts target
                ON target.attempt_id=switch.attempt_id
@@ -28779,6 +28880,39 @@ export class StateStore {
            )
          ORDER BY i.requested_at,i.public_id`,
       ).all();
+      // Include a projection stranded by a crash under an older daemon that
+      // terminalized its interaction before this atomic repair existed.
+      const affectedInteractionSessions = new Set(
+        this.#database.query(
+          `SELECT ss.session_id FROM session_states ss
+           WHERE (
+             ss.reason GLOB 'pending *'
+             OR ss.reason GLOB 'autorespond_*'
+           )
+             AND NOT EXISTS(
+               SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+               WHERE switch.session_id=ss.session_id AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+             )
+             AND NOT EXISTS(
+               SELECT 1 FROM legacy_provider_authority_quarantines quarantine
+               WHERE quarantine.scope_kind='session' AND quarantine.scope_id=ss.session_id
+             )
+             AND NOT EXISTS(
+               SELECT 1 FROM queue_attachment_quarantines quarantine WHERE quarantine.session_id=ss.session_id
+                 AND quarantine.ordinal=1 AND NOT EXISTS(
+                   SELECT 1 FROM queue_attachment_quarantines abandoned
+                   WHERE abandoned.queue_id=quarantine.queue_id AND abandoned.ordinal=2)
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM provider_interactions i
+               WHERE i.session_id=ss.session_id
+                 AND i.state IN ('pending','response_prepared','response_written')
+             )
+           ORDER BY ss.session_id`,
+        ).all().map((row) => sessionIdSchema.parse(
+          z.object({ session_id: z.string() }).strict().parse(row).session_id,
+        )),
+      );
       for (const value of interactions) {
         const interaction = interactionRowSchema.parse(value);
         const state = interaction.state === "pending" ? "expired" : "resolution_unknown";
@@ -28788,7 +28922,12 @@ export class StateStore {
            WHERE public_id=? AND revision=? AND state=?`,
         ).run(state, now, now, interaction.public_id, interaction.revision, interaction.state);
         if (changed.changes !== 1) throw new Error("INTERACTION_DAEMON_RESTART_CONFLICT");
-        this.#recordInteractionTransition(this.#requireInteractionRow(interaction.public_id), now);
+        const terminalRow = this.#requireInteractionRow(interaction.public_id);
+        this.#recordInteractionTransition(terminalRow, now);
+        const terminal = this.#mapInteraction(terminalRow);
+        this.#ensureInteractionStateEventInTransaction(terminal, now, terminal.sessionId === null ? undefined
+          : baseProviderAccountAuthority(this.requireCapturedSessionProviderAuthority(terminal.sessionId)));
+        if (terminal.sessionId !== null) affectedInteractionSessions.add(terminal.sessionId);
       }
       const activeLoginAuthorities = this.#database.query(`SELECT a.attempt_id,a.profile_id,
                                                                   a.process_generation
@@ -28965,6 +29104,11 @@ export class StateStore {
                AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
            )`,
       ).run(claudeRestartDisposition, now);
+      // Repair after provider-specific terminal/recovery decisions, but before
+      // the process-successor ledgers change captured session authority.
+      for (const sessionId of affectedInteractionSessions) {
+        this.#repairRestartInteractionSessionStateInTransaction(sessionId, now);
+      }
       for (const profile of this.listProfiles()) {
         if (this.#sessionMutationAuthorityTuplesForProfile(profile.id).length === 0) continue;
         this.#recordSessionMutationAuthoritySuccessors({

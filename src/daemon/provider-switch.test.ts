@@ -4087,6 +4087,154 @@ describe("provider portability", () => {
     expect(value.codex.endedThreads).toEqual(["codex-thread-1"]);
   });
 
+  test.each(["target_starting", "rebound"] as const)("restart attention repair preserves a %s switch quarantine without provider replay", async (phase) => {
+    const value = await fixture();
+    const source = await codexSession(value);
+    const unrelated = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(source.accountId, "codex"),
+      providerThreadId: "unrelated-restart-attention-thread",
+      title: "Unrelated restart attention",
+      state: "idle",
+    });
+    const attention = value.store.upsertSessionState({
+      sessionId: source.sessionId,
+      state: "needs_approval",
+      attention: true,
+      reason: "autorespond_protected_authority_required",
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+      lastActivityAt: 1_000,
+      revision: (value.store.readSessionState(source.sessionId)?.revision ?? 0) + 1,
+    });
+    if (phase === "target_starting") {
+      const beginTarget = value.store.beginSessionSwitchTargetStart.bind(value.store);
+      Object.defineProperty(value.store, "beginSessionSwitchTargetStart", {
+        configurable: true,
+        value: (input: Parameters<StateStore["beginSessionSwitchTargetStart"]>[0]) => {
+          beginTarget(input);
+          throw new Error("crash after target-start intent");
+        },
+      });
+    } else {
+      Object.defineProperty(value.store, "beginSessionSwitchSeedDispatch", {
+        configurable: true,
+        value: () => { throw new SessionSwitchStoreError("SESSION_SWITCH_STORAGE_FENCED"); },
+      });
+    }
+    const key = crypto.randomUUID();
+    await expect(value.service.execute({
+      idempotencyKey: key,
+      kind: "session.switch",
+      provider: "claude",
+      session: source.sessionId,
+    }, { signal })).rejects.toBeDefined();
+    const prepared = value.store.readSessionSwitchByIdempotencyKey(key);
+    expect(prepared).toMatchObject({ phase });
+    if (prepared === null) throw new Error("Expected the dedicated switch journal.");
+    expect(value.store.readSessionState(source.sessionId)).toEqual(attention);
+    const originalAuthorities = value.store.readMutationProviderAuthorities(prepared.attemptId);
+    const calls = { codex: [...value.codex.calls], claude: [...value.claude.calls] };
+    const bootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+
+    const daemonGeneration = value.store.nextDaemonGeneration(bootId);
+
+    expect(value.store.readSessionSwitchByIdempotencyKey(key)).toMatchObject({
+      phase: "reconciliation_required",
+      diagnosticCode: "DAEMON_RESTART_AUTHORITY_RETIRED",
+    });
+    expect(value.store.requireSession(source.sessionId).state).toBe("recovery_required");
+    expect(value.store.readSessionState(source.sessionId)).toEqual(attention);
+    expect(value.store.readMutationProviderAuthorities(prepared.attemptId)).toEqual(originalAuthorities);
+    expect(value.store.requireSessionProviderAuthority(unrelated.id).processGeneration)
+      .toBeGreaterThan(prepared.sourceAuthority.processGeneration);
+    const restarted = new HraService({
+      claude: value.claude,
+      cloud: new OfflineCloud(),
+      codex: value.codex,
+      daemonAuthority: new SwitchDaemonAuthority(),
+      daemonGeneration,
+      paths: value.paths,
+      requestStop: () => undefined,
+      store: value.store,
+    });
+    services.push(restarted);
+    await restarted.recover();
+    await expect(restarted.execute({ kind: "session.recover", session: source.sessionId }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.codex.calls).toEqual(calls.codex);
+    expect(value.claude.calls).toEqual(calls.claude);
+    expect(value.store.nextDaemonGeneration(bootId)).toBe(daemonGeneration);
+    expect(value.store.readSessionState(source.sessionId)).toEqual(attention);
+  });
+
+  test.each(["codex", "claude"] as const)("restart attention repair reflects the final active %s session disposition", async (provider) => {
+    const value = await fixture();
+    const active = {
+      providerThreadId: `${provider}-active-attention-thread`,
+      title: "Active restart attention",
+      status: "active" as const,
+      activeTurnId: `${provider}-active-attention-turn`,
+      providerUpdatedAt: 50,
+    };
+    if (provider === "codex") value.codex.projection = active;
+    else value.claude.projection = active;
+    const source = await (provider === "codex" ? codexSession(value) : claudeSession(value));
+    const captured = value.store.requireCapturedSessionProviderAuthority(source.sessionId);
+    if (provider === "claude") {
+      expect(captured.processGeneration).not.toBe(value.store.requireProfileById(source.accountId).processGeneration);
+    }
+    expect(value.store.requireSession(source.sessionId)).toMatchObject({
+      state: "active", activeTurnId: active.activeTurnId,
+    });
+    const attention = value.store.upsertSessionState({
+      sessionId: source.sessionId,
+      state: "needs_approval",
+      attention: true,
+      reason: "autorespond_resolution_refused",
+      verbatimRequired: false,
+      verbatimLiteral: undefined,
+      lastActivityAt: 1_000,
+      revision: (value.store.readSessionState(source.sessionId)?.revision ?? 0) + 1,
+    });
+    const calls = { codex: [...value.codex.calls], claude: [...value.claude.calls] };
+    const bootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+
+    const generation = value.store.nextDaemonGeneration(bootId);
+
+    expect(value.store.requireSession(source.sessionId).state).toBe(provider === "codex" ? "active" : "terminal");
+    const repaired = value.store.readSessionState(source.sessionId);
+    expect(repaired).toMatchObject({
+      state: provider === "codex" ? "working" : "aborted",
+      attention: false,
+      revision: attention.revision + 1,
+    });
+    const events = value.store.listSessionEvents({ sessionId: source.sessionId, afterSequence: 0 }).events;
+    const repairedEvents = events.filter((event) => event.body.type === "session_state" && event.body.revision === attention.revision + 1);
+    expect(repairedEvents).toMatchObject([{
+        accountId: captured.profileId,
+        providerGeneration: captured.processGeneration,
+        body: { state: provider === "codex" ? "working" : "aborted", attention: false },
+      }]);
+    const repairedEvent = repairedEvents[0];
+    if (repairedEvent === undefined) throw new Error("Expected the exact repaired state event.");
+    const inspector = new Database(value.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(`SELECT provider_account_id,profile_id,provider,binding_generation,process_generation
+        FROM session_event_provider_authorities WHERE session_id=? AND sequence=?`).get(source.sessionId, repairedEvent.sequence))
+        .toEqual({
+          provider_account_id: captured.providerAccountId,
+          profile_id: captured.profileId,
+          provider: captured.provider,
+          binding_generation: captured.bindingGeneration,
+          process_generation: captured.processGeneration,
+        });
+    } finally { inspector.close(false); }
+    expect(value.codex.calls).toEqual(calls.codex);
+    expect(value.claude.calls).toEqual(calls.claude);
+    expect(value.store.nextDaemonGeneration(bootId)).toBe(generation);
+    expect(value.store.readSessionState(source.sessionId)).toEqual(repaired);
+  });
+
   test("quarantines a crash-adjacent provider switch and permits only exact local abandon", async () => {
     const value = await fixture();
     const { sessionId } = await codexSession(value);
