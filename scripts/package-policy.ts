@@ -92,7 +92,10 @@ export async function assertProductionPackageOnly(
         || /(?:^|\/)\.github(?:\/|$)/u.test(packagePath)
         || /(?:^|\/)docs\/live-acceptance(?:\/|\.|$)/u.test(packagePath)
         || /(?:^|\/)live-acceptance[^/]*\.ts$/u.test(packagePath)
+        || /(?:^|\/)src\/cloud\/device-commands\.ts$/u.test(packagePath)
         || /(?:^|\/)src\/cloud\/inviteAuthority\.ts$/u.test(packagePath)
+        || /(?:^|\/)src\/domain\/model-routing\.ts$/u.test(packagePath)
+        || /(?:^|\/)src\/domain\/model-task-shape\.ts$/u.test(packagePath)
         || /(?:^|\/)src\/storage\/legacy-secret-migration\.ts$/u.test(packagePath)
       ) {
         throw new Error("The install artifact contains repository-only source.");
@@ -103,6 +106,7 @@ export async function assertProductionPackageOnly(
         && (
           entry.name === "AGENTS.md"
           || entry.name.endsWith(".test.ts")
+          || entry.name.endsWith(".fixture.json")
           || entry.name === "testAssertions.ts"
         )
       ) {
@@ -127,9 +131,9 @@ export async function assertProductionPackageOnly(
 
 export async function assertReviewedReleaseInventory(packageRoot: string): Promise<void> {
   const expected = Object.freeze({
-    count: 176,
-    jsonBytes: 8_298,
-    sha256: "999aeb6e3c4844fa347622c18b0e7b38d2f19c06b6c7b1258794e8c93771f139",
+    count: 171,
+    jsonBytes: 8_028,
+    sha256: "0f86e6ca8bfa3ffb8d228170b52cf14b31f30b0cdc5a462ba0de6f91e017a58d",
   });
   const inventory: Array<readonly [string, "directory" | "file", number, number]> = [];
   const visit = async (path: string): Promise<void> => {

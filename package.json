@@ -54,9 +54,13 @@
   "files": [
     "src",
     "!src/**/*.test.ts",
+    "!src/**/*.fixture.json",
     "!src/**/AGENTS.md",
+    "!src/cloud/device-commands.ts",
     "!src/cloud/inviteAuthority.ts",
     "!src/cloud/testAssertions.ts",
+    "!src/domain/model-routing.ts",
+    "!src/domain/model-task-shape.ts",
     "!src/storage/legacy-secret-migration.ts",
     "README.md",
     "LICENSE",
