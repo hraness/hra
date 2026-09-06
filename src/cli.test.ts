@@ -143,7 +143,7 @@ const downgradeStateSchema = (databasePath: string): void => {
 // An install written by a newer HRA build than this one. No migration exists for
 // it, so every entry point must refuse instead of guessing.
 // Keep this expectation independent of the implementation's schema constant.
-const expectedStateSchemaVersion = 45;
+const expectedStateSchemaVersion = 46;
 const advanceStateSchema = (databasePath: string): void => {
   const database = new Database(databasePath, { create: false, strict: true });
   try {

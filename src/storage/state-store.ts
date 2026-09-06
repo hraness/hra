@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -81,6 +81,7 @@ import {
 } from "../domain/presets";
 import {
   createClaudeProviderAccountId,
+  codexProviderAccountAuthoritySchema,
   createDevinProviderAccountId,
   devinProviderAccountAuthoritySchema,
   providerAccountAuthoritySchema,
@@ -103,11 +104,27 @@ import {
 } from "../domain/runtime-profile";
 import {
   ACCOUNT_USAGE_HISTORY_PAGE_LIMIT,
+  automaticRateLimitResetDecision,
+  automaticRateLimitResetObservation,
   CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES,
   accountRateLimitResetOutcomeSchema,
   storedAccountUsageSnapshotSchema,
   type AccountRateLimitResetOutcome,
 } from "../domain/usage-metrics";
+import {
+  automaticPointerMoveRequestSchema,
+  automaticPointerMoveRequestDigest,
+  createAutomaticPointerMoveCapsule,
+  type AutomaticPointerMoveRequest,
+  type AutomaticPointerMoveAccount,
+} from "../domain/automatic-pointer-move";
+import { AUTOMATIC_USAGE_ACCOUNT_LIMIT, type SettledAutomaticPointerMove } from "../domain/usage-policy";
+import {
+  AUTOMATIC_POINTER_MOVE_KIND, AutomaticPointerMoveStoreError,
+  applyAutomaticPointerMoveSchema, auditAutomaticPointerMoves, assertAutomaticPointerMoveHead,
+  classifyAutomaticPointerMove, insertAutomaticPointerMove, readAutomaticPointerMoveLineage,
+  type AutomaticPointerMoveHistory,
+} from "./automatic-pointer-move";
 import {
   canonicalProviderUsageComponent,
   canonicalProviderUsageJson,
@@ -1401,7 +1418,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 45;
+const currentSchemaVersion = 46;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -9919,6 +9936,7 @@ const migrateWritableDatabase = (
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
   if (initialVersion === currentSchemaVersion) {
+    auditAutomaticPointerMoves(database);
     auditSessionSendOwners(database);
     auditDevinJoinedCloses(database);
     assertSchemaVersion43AutomaticUsagePolicy(database);
@@ -9941,6 +9959,7 @@ const migrateWritableDatabase = (
     // fences. Do not recreate missing current-format custody as a migration.
     if (initialVersion >= 40) assertWorkSignalProviderAuthorities(database);
     if (initialVersion >= 44) auditDevinJoinedCloses(database);
+    if (initialVersion >= 46) auditAutomaticPointerMoves(database);
     if (initialVersion >= 45) auditSessionSendOwners(database);
     let redacted = false;
     let version = initialVersion;
@@ -10492,6 +10511,13 @@ const migrateWritableDatabase = (
       database.exec("PRAGMA user_version=45");
       version = 45;
     }
+    if (version < 46) {
+      applyAutomaticPointerMoveSchema(database);
+      auditAutomaticPointerMoves(database);
+      database.query("INSERT INTO migrations(version,applied_at) VALUES(46,?)").run(now());
+      database.exec("PRAGMA user_version = 46");
+      version = 46;
+    }
 
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
@@ -10559,6 +10585,7 @@ const migrateWritableDatabase = (
     auditAutomaticUsagePolicyHistory(database);
     auditDevinJoinedCloses(database);
     auditSessionSendOwners(database);
+    auditAutomaticPointerMoves(database);
     return hasPendingSecurityScrub(database);
   })();
   if (securityScrubPending) completePendingSecurityScrub(database, false, securityScrubCheckpoint);
@@ -13143,6 +13170,7 @@ export class StateStore {
       assertSchemaVersion42SessionSwitch(this.#database);
       if (this.#readonly) auditAutomaticUsagePolicyHistory(this.#database);
       if (this.#readonly) auditDevinJoinedCloses(this.#database);
+      if (this.#readonly) auditAutomaticPointerMoves(this.#database);
       if (this.#readonly) auditSessionSendOwners(this.#database);
       assertCompositeNotificationPolicy(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
@@ -13413,9 +13441,12 @@ export class StateStore {
   }
 
   readProviderAccountState(provider: Provider): ProviderAccountState {
-    return mapProviderAccountState(this.#database.query(
-      "SELECT * FROM provider_account_states WHERE provider=?",
-    ).get(providerSchema.parse(provider)));
+    return this.#database.transaction(() => {
+      if (provider === "codex") assertAutomaticPointerMoveHead(this.#database);
+      return mapProviderAccountState(this.#database.query(
+        "SELECT * FROM provider_account_states WHERE provider=?",
+      ).get(providerSchema.parse(provider)));
+    })();
   }
 
   requireProviderAccountAuthority(
@@ -21078,6 +21109,129 @@ export class StateStore {
     })();
   }
 
+  readAutomaticPointerMove(idempotencyKey: string): AutomaticPointerMoveHistory | null {
+    return this.#database.transaction(() => {
+      const existing = classifyAutomaticPointerMove(this.#database, { idempotencyKey });
+      if (existing.kind === "automatic_pointer_move") return existing;
+      if (existing.kind !== "absent") throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_REQUEST_CONFLICT");
+      // Also reserve orphan original-send keys before declaring a key absent.
+      if (classifySessionSendOwnership(this.#database, { idempotencyKey }).kind !== "absent") {
+        throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_REQUEST_CONFLICT");
+      }
+      return null;
+    })();
+  }
+
+  readAutomaticPointerMoveLineage(input: Readonly<{ fromPointerRevision: number; throughPointerRevision: number }>): readonly SettledAutomaticPointerMove[] {
+    const parsed = z.object({ fromPointerRevision: z.number().int().positive(), throughPointerRevision: z.number().int().positive() }).strict().parse(input);
+    return this.#database.transaction(() => readAutomaticPointerMoveLineage(this.#database, parsed.fromPointerRevision, parsed.throughPointerRevision))();
+  }
+
+  /**
+   * Pointer-only admission: no provider calls, reset mutation, or session writes.
+   * A refusal does not accept/reserve the supplied key. Only an actual atomic
+   * pointer move owns a receipt. Settled-reset admission is deliberately absent
+   * until the reset journal captures its original authorizing quota revision.
+   */
+  settleAutomaticPointerMove(input: AutomaticPointerMoveRequest): AutomaticPointerMoveHistory & { replayed: boolean } {
+    const request = automaticPointerMoveRequestSchema.parse(input);
+    const requestDigest = automaticPointerMoveRequestDigest(request);
+    return this.#database.transaction(() => {
+      const existing = classifyAutomaticPointerMove(this.#database, { idempotencyKey: request.idempotencyKey });
+      if (existing.kind === "automatic_pointer_move") {
+        if (existing.capsule.requestDigest !== requestDigest) throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_REQUEST_CONFLICT");
+        return { ...existing, replayed: true };
+      }
+      if (existing.kind !== "absent" || classifySessionSendOwnership(this.#database, { idempotencyKey: request.idempotencyKey }).kind !== "absent") {
+        throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_REQUEST_CONFLICT");
+      }
+      assertAutomaticPointerMoveHead(this.#database);
+      const refuse = (): never => { throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_NOT_ADMITTED"); };
+      const conflict = (): never => { throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_CAS_CONFLICT"); };
+      const daemon = this.#database.query("SELECT generation,boot_id,stopped_at FROM daemon_state WHERE singleton=1").get() as
+        { generation: number; boot_id: string | null; stopped_at: number | null };
+      if (daemon.generation !== request.daemonGeneration || daemon.boot_id !== request.bootId || daemon.stopped_at !== null) return conflict();
+      const configuration = this.readAutomaticUsagePolicyConfiguration();
+      const pointer = this.readProviderAccountState("codex");
+      if (configuration.automaticPolicyRevision !== request.expectedAutomaticPolicyRevision
+        || pointer.orderRevision !== request.expectedOrderRevision || pointer.pointerRevision !== request.expectedPointerRevision
+        || pointer.activeProviderAccountId !== request.expectedSourceAuthority.providerAccountId) return conflict();
+      const rows = this.#database.query(`SELECT * FROM provider_accounts WHERE provider='codex' AND readiness!='removed'
+        ORDER BY CASE WHEN order_position IS NULL THEN 1 ELSE 0 END,order_position,created_at,profile_id LIMIT ?`)
+        .all(AUTOMATIC_USAGE_ACCOUNT_LIMIT + 1).map(mapProviderAccount);
+      if (rows.length === 0 || rows.length > AUTOMATIC_USAGE_ACCOUNT_LIMIT) return refuse();
+      const accounts: AutomaticPointerMoveAccount[] = [];
+      let sourcePayload: ReturnType<typeof storedAccountUsageSnapshotSchema.parse> | null = null;
+      for (const account of rows) {
+        const authority = codexProviderAccountAuthoritySchema.parse({ provider: "codex", providerAccountId: account.id,
+          profileId: account.profileId, bindingGeneration: account.bindingGeneration, processGeneration: account.processGeneration });
+        const row = this.#database.query(`SELECT source_revision,observed_at,payload_json,digest FROM usage_snapshots
+          WHERE profile_id=? ORDER BY source_revision DESC LIMIT 1`).get(account.profileId) as
+          { source_revision: number; observed_at: number; payload_json: string; digest: string } | null;
+        if (row === null) { accounts.push({ authority, readiness: account.readiness, authorityMode: "mutation_authoritative", quota: { kind: "absent" } }); continue; }
+        // Read the newest raw row first; a missing newest sidecar must not let an
+        // INNER JOIN silently fall back to an older authorizing observation.
+        const metadata = this.readCodexUsageAuthorityMetadata("usage_snapshot", account.profileId, row.source_revision);
+        const payload = storedAccountUsageSnapshotSchema.parse(JSON.parse(row.payload_json) as unknown);
+        if (account.id === pointer.activeProviderAccountId) sourcePayload = payload;
+        const refusal = (reason: "invalid_quota" | "compatibility_display_only" | "authority_mismatch"): void => {
+          accounts.push({ authority, readiness: account.readiness, authorityMode: metadata.mode,
+            quota: { kind: "refused", reason, sourceRevision: row.source_revision, sourceDigest: row.digest } });
+        };
+        if (metadata.mode !== "mutation_authoritative") { refusal("compatibility_display_only"); continue; }
+        if (metadata.authority === null || !sameProviderAccountAuthority(metadata.authority, authority)) { refusal("authority_mismatch"); continue; }
+        const observation = projectCodexV1Usage({ snapshot: payload, sourceRevision: row.source_revision, observedAt: row.observed_at,
+          storedDigest: row.digest, authority, authorityMode: metadata.mode }).observation;
+        if (observation?.quota === null || observation?.quota === undefined) { refusal("invalid_quota"); continue; }
+        const component = canonicalProviderUsageComponent(observation.quota);
+        if (component.component !== "quota") { refusal("invalid_quota"); continue; }
+        accounts.push({ authority, readiness: account.readiness, authorityMode: metadata.mode,
+          quota: { kind: "observed", component } });
+      }
+      const source = accounts.find((account) => account.authority.providerAccountId === pointer.activeProviderAccountId);
+      if (source === undefined || !sameProviderAccountAuthority(source.authority, request.expectedSourceAuthority)) return conflict();
+      if (source.quota.kind !== "observed" || sourcePayload === null) return refuse();
+      if (source.quota.component.observationRevision !== request.expectedSourceQuotaObservationRevision
+        || source.quota.component.componentDigest !== request.expectedSourceQuotaComponentDigest) return conflict();
+      const policy = this.requireAccountRateLimitResetPolicy(source.authority.profileId);
+      if (policy.revision !== request.expectedResetPolicyRevision) return conflict();
+      const profile = this.requireProfile(source.authority.profileId);
+      if (profile.providerEmail === undefined) return refuse();
+      const fingerprint = canonicalAccountFingerprint(profile.providerEmail);
+      if (sourcePayload.observation.accountFingerprint !== fingerprint) return refuse();
+      const evaluatedAt = unixMillisecondsSchema.parse(this.#now());
+      const reset = automaticRateLimitResetDecision({ providerPayload: sourcePayload.providerPayload, now: evaluatedAt });
+      const resetObservation = automaticRateLimitResetObservation({ providerPayload: sourcePayload.providerPayload, now: evaluatedAt });
+      const boundary = resetObservation.available ? resetObservation.weeklyWindowResetsAt : null;
+      if (reset.eligible) return refuse();
+      // Unresolved attempts retain their original identity/window latches; a
+      // new quota window cannot erase them. No settled baseline is inferred.
+      if (this.#database.query(`SELECT 1 FROM account_rate_limit_reset_attempts WHERE profile_id=?
+        AND (state NOT IN ('settled','closed') OR (weekly_window_resets_at IS ? AND account_fingerprint=?)) LIMIT 1`)
+        .get(source.authority.profileId, boundary, fingerprint) !== null) return refuse();
+      const built = createAutomaticPointerMoveCapsule({ request, moveId: randomBytes(20).toString("hex"), evaluatedAt, settledAt: evaluatedAt,
+        configuration, orderRevision: pointer.orderRevision, pointerRevision: pointer.pointerRevision,
+        activeProviderAccountId: pointer.activeProviderAccountId, order: accounts.map((account) => account.authority.providerAccountId), accounts,
+        resetProof: { kind: "not_eligible", sourceAccountFingerprint: fingerprint, policy, unresolvedAttemptCount: 0, sameWindowTerminalAttempt: null,
+          gate: { authority: source.authority, quotaObservationRevision: source.quota.component.observationRevision,
+            resetPolicyRevision: policy.revision, resetBoundary: boundary, state: "not_eligible", reason: reset.reason } } });
+      if (built.status !== "created") return refuse();
+      // The capsule proves selection; the transaction seal additionally proves
+      // neither selected endpoint is owned by unsettled authentication/reset.
+      // Match authentication by provider-specific kind/profile, not a join that
+      // could hide a missing/corrupted primary authority sidecar.
+      for (const endpoint of [built.capsule.move.authority.source.authority, built.capsule.move.target.authority]) {
+        this.assertProviderAccountAuthorityCurrent(endpoint);
+        if (this.#database.query(`SELECT 1 FROM mutation_attempts auth LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=auth.id
+          WHERE auth.authority_id=? AND auth.kind IN ('account.login','account.logout','account.login-cancel')
+            AND auth.state IN ('prepared','effect_started','ambiguous') AND resolution.attempt_id IS NULL LIMIT 1`).get(endpoint.profileId) !== null
+          || this.#database.query(`SELECT 1 FROM account_rate_limit_reset_attempts WHERE profile_id=? AND state NOT IN ('settled','closed') LIMIT 1`)
+            .get(endpoint.profileId) !== null) return refuse();
+      }
+      return { ...insertAutomaticPointerMove(this.#database, createAttemptId(), built.capsule), replayed: false };
+    }).immediate();
+  }
+
   updateAutomaticUsagePolicyConfiguration(
     input: AutomaticUsagePolicyConfigurationUpdate,
   ): AutomaticUsagePolicyConfiguration {
@@ -21264,6 +21418,7 @@ export class StateStore {
     providerAuthorities?: readonly ProviderAuthorityEvidence[];
   }): { id: AttemptId; state: MutationState; replay: boolean; result?: unknown } {
     if (input.kind === automaticUsagePolicyMutationKind) throw new Error("AUTOMATIC_USAGE_POLICY_CLOSED_API_REQUIRED");
+    if (input.kind === AUTOMATIC_POINTER_MOVE_KIND) throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_CLOSED_API_REQUIRED");
     const idempotencyKey = input.idempotencyKey ?? randomUUID();
     const canonical = JSON.stringify({ kind: input.kind, authorityId: input.authorityId, authorityGeneration: input.authorityGeneration, request: input.request });
     const digest = createHash("sha256").update(canonical).digest("hex");

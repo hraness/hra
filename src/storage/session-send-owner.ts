@@ -6,6 +6,7 @@ import { providerAccountAuthoritySchema, sessionRoutingProvenanceSchema } from "
 import { reviewedRuntimeProfileProvider, reviewedRuntimeProfileSchema } from "../domain/runtime-profile";
 import { sessionSendRequestFingerprintSchema } from "../domain/session-send-request";
 import { attemptIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
+import { assertNoAutomaticPointerMoveOwnership, AutomaticPointerMoveStoreError } from "./automatic-pointer-move";
 
 export const SESSION_SEND_REQUEST_FORMAT = "original_send_v1";
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
@@ -269,6 +270,12 @@ const canonical = <T>(schema: z.ZodType<T>, json: unknown): T => {
   return value;
 };
 export function classifySessionSendOwnership(database: Database, lookup: SessionSendOwnershipLookup): SessionSendOwnership {
+  try { assertNoAutomaticPointerMoveOwnership(database, lookup); }
+  catch (error: unknown) {
+    if (!(error instanceof AutomaticPointerMoveStoreError)) throw error;
+    throw new SessionSendOwnershipError(error.code === "AUTOMATIC_POINTER_MOVE_CORRUPT"
+      ? "SESSION_SEND_OWNER_CORRUPT" : "SESSION_SEND_OWNED_API_REQUIRED");
+  }
   assertSessionSendOwnerSchema(database);
   const byKey = "idempotencyKey" in lookup;
   const value = byKey ? z.string().uuid().parse(lookup.idempotencyKey) : z.string().min(1).max(200).parse(lookup.attemptId);
