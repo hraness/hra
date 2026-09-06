@@ -53,6 +53,7 @@ import {
 
 function sameSummary(left: SessionCardSummary, right: SessionCardSummary): boolean {
   return left.archived === right.archived
+    && left.retiredProvider === right.retiredProvider
     && left.attention === right.attention
     && left.lastActivityAt === right.lastActivityAt
     && left.metadataRevision === right.metadataRevision
@@ -68,16 +69,13 @@ const codexPresetOptions: readonly Readonly<{ label: string; value: PresetChoice
 const claudePresetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[] = [
   { label: presetLabels["fable-max"], value: "fable-max" },
 ];
-const devinPresetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[] = [
-  { label: presetLabels.astra, value: "astra" },
-];
 
 const presetOptionsForProvider = (
-  provider: "codex" | "claude" | "devin",
+  provider: "codex" | "claude",
 ): readonly Readonly<{ label: string; value: PresetChoice }>[] =>
   provider === "claude"
     ? claudePresetOptions
-    : provider === "devin" ? devinPresetOptions : codexPresetOptions;
+    : codexPresetOptions;
 
 /** The card under the pointer during a drag, resolved from the DOM. */
 function cardUnderPointer(clientX: number, clientY: number): string | null {

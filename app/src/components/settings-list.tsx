@@ -106,7 +106,8 @@ export function ChoiceGroup<Value extends string>({
   label: string;
   onSelect: (value: Value) => void;
   options: readonly ChoiceOption<Value>[];
-  value: Value;
+  /** Null leaves every supported choice unselected for a retired historical value. */
+  value: Value | null;
 }>) {
   const groupId = useId();
   return (

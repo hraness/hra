@@ -121,9 +121,9 @@ export const effectiveClaudeRuntimeProfileSchema = z.union([
 export type EffectiveClaudeRuntimeProfile = z.infer<typeof effectiveClaudeRuntimeProfileSchema>;
 
 /**
- * The exact local Devin ACP profile HRA admits. The pinned CLI owns its
- * authentication and model defaults inside the isolated home; HRA records
- * only the public runtime/protocol facts it proved before dispatch.
+ * Historical Devin ACP documents written by schema-v39 builds. This parser
+ * preserves their exact public runtime tuple for archival reads and evidence
+ * validation; it does not admit another provider effect.
  */
 const effectiveDevinRuntimeProfileFields = {
   profileId: profileIdSchema,

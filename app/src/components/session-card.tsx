@@ -76,9 +76,11 @@ export function SessionCard({
   const title = model.title ?? shortSessionLabel(publicId);
   const lastActivityAt = Math.max(model.lastActivityAt, head.updatedAt);
   const archived = metadata.archived;
+  const retired = metadata.retiredProvider === "devin";
 
   const summary = useMemo<SessionCardSummary>(() => ({
     archived,
+    ...(retired ? { retiredProvider: "devin" as const } : {}),
     attention: model.attention,
     lastActivityAt,
     metadataRevision: head.metadataRevision,
@@ -93,6 +95,7 @@ export function SessionCard({
     model.state,
     publicId,
     title,
+    retired,
   ]);
 
   useEffect(() => { onSummary(summary); }, [onSummary, summary]);
@@ -101,6 +104,7 @@ export function SessionCard({
     payload: Parameters<typeof submit>[0]["payload"],
     pending: string,
   ) => {
+    if (retired) return;
     setBusy(true);
     setNotice(pending);
     void submit({
@@ -111,7 +115,7 @@ export function SessionCard({
       .then(() => { setNotice(null); })
       .catch((failure: unknown) => { setNotice(failureMessage(failure)); })
       .finally(() => { setBusy(false); });
-  }, [head.executionDevicePublicId, publicId, submit]);
+  }, [head.executionDevicePublicId, publicId, retired, submit]);
 
   const copyId = useCallback(() => {
     // `clipboard-write` is not denied by the app's permissions policy, but a
@@ -136,13 +140,13 @@ export function SessionCard({
       onSelect: () => { ordering.onMove(publicId, "right"); },
     },
     {
-      disabled: busy,
+      disabled: busy || retired,
       id: "archive",
       label: "Archive",
       onSelect: () => { run({ archived: true, kind: "archive_session" }, "Archiving."); },
     },
     {
-      disabled: busy,
+      disabled: busy || retired,
       id: "rename",
       label: "Rename",
       onSelect: () => {
@@ -193,6 +197,7 @@ export function SessionCard({
         >
           <span className="truncate text-sm font-semibold">{title}</span>
           <StateIndicator state={model.state} />
+          {retired ? <span className="text-xs text-ink-muted">Devin retired · read-only</span> : null}
           {model.lastPrompt === null ? null : (
             <span className="line-clamp-2 text-xs text-ink-muted">{model.lastPrompt}</span>
           )}

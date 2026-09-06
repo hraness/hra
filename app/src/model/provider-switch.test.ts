@@ -15,11 +15,11 @@ import {
 } from "./provider-switch";
 
 describe("the menu", () => {
-  test("offers every provider, in the words the reader sees", () => {
+  test("offers only supported providers, in the words the reader sees", () => {
     expect(providerSwitchOptions.map((option) => option.label))
-      .toEqual(["Run on Codex", "Run on Claude Code (Linux machine only)", "Run on Devin"]);
+      .toEqual(["Run on Codex", "Run on Claude Code (Linux machine only)"]);
     expect(providerSwitchOptions.map((option) => option.provider))
-      .toEqual(["codex", "claude", "devin"]);
+      .toEqual(["codex", "claude"]);
   });
 
   test("says in one line what a switch carries across", () => {
@@ -32,12 +32,11 @@ describe("the menu", () => {
   test("pins a compatible default preset into every provider switch", () => {
     expect(defaultSessionPresetForProvider("codex")).toBe("ultra");
     expect(defaultSessionPresetForProvider("claude")).toBe("fable-max");
-    expect(defaultSessionPresetForProvider("devin")).toBe("astra");
   });
 
   test("keeps every model visible while the current provider is unknown", () => {
     expect(sessionPresetOptionsForProvider(null).map((option) => option.value))
-      .toEqual(["low", "high", "ultra", "fable-max", "astra"]);
+      .toEqual(["low", "high", "ultra", "fable-max"]);
   });
 
   test("offers only presets compatible with the provider after selection", () => {
@@ -45,15 +44,10 @@ describe("the menu", () => {
       .toEqual(["low", "high", "ultra"]);
     expect(sessionPresetOptionsForProvider("claude").map((option) => option.value))
       .toEqual(["fable-max"]);
-    expect(sessionPresetOptionsForProvider("devin").map((option) => option.value))
-      .toEqual(["astra"]);
   });
 });
 
 describe("the payload", () => {
-  // `set_provider` is not in the repository's `RemoteCommandPayload` union yet,
-  // so the built value is compared as a record. That is the whole point of the
-  // module: one place to align when the daemon side lands.
   const built = (input: Parameters<typeof buildSetProviderPayload>[0]) =>
     buildSetProviderPayload(input) as unknown as Readonly<Record<string, unknown>>;
 
@@ -61,22 +55,18 @@ describe("the payload", () => {
     expect(built({ provider: "claude" }))
       .toEqual({ kind: setProviderCommandKind, provider: "claude" });
     expect(built({ provider: "codex" })).toEqual({ kind: "set_provider", provider: "codex" });
-    expect(built({ provider: "devin" })).toEqual({ kind: "set_provider", provider: "devin" });
   });
 
   test("carries a preset only when one was chosen", () => {
     expect(built({ preset: "fable-max", provider: "claude" }))
       .toEqual({ kind: "set_provider", preset: "fable-max", provider: "claude" });
     expect(Object.hasOwn(built({ provider: "claude" }), "preset")).toBe(false);
-    expect(built({ preset: "astra", provider: "devin" }))
-      .toEqual({ kind: "set_provider", preset: "astra", provider: "devin" });
   });
 
   test("every offered provider payload survives the daemon's compatibility parser", () => {
     for (const input of [
       { preset: "high", provider: "codex" },
       { preset: "fable-max", provider: "claude" },
-      { preset: "astra", provider: "devin" },
     ] as const) {
       const payload = buildSetProviderPayload(input);
       expect(parseRemoteCommandPayload(payload)).toEqual(payload);
@@ -90,8 +80,18 @@ describe("the payload", () => {
       .toEqual({ kind: "set_provider", preset: "ultra", provider: "codex" });
     expect(buildDefaultSetProviderPayload("claude"))
       .toEqual({ kind: "set_provider", preset: "fable-max", provider: "claude" });
-    expect(buildDefaultSetProviderPayload("devin"))
-      .toEqual({ kind: "set_provider", preset: "astra", provider: "devin" });
+  });
+
+  test("rejects stale retired selections even when they bypass compile-time types", () => {
+    for (const stale of [
+      { provider: "devin" },
+      { provider: "devin", preset: "astra" },
+      { provider: "codex", preset: "astra" },
+    ]) {
+      expect(() => buildSetProviderPayload(
+        stale as unknown as Parameters<typeof buildSetProviderPayload>[0],
+      )).toThrow("not valid");
+    }
   });
 });
 
@@ -134,15 +134,11 @@ describe("the settling line", () => {
       .toEqual({ settled: false, text: "Waiting for the machine to pick up the switch to Claude Code." });
     expect(providerSwitchNotice(record("effect_started"), "codex"))
       .toEqual({ settled: false, text: "Switching this session to Codex." });
-    expect(providerSwitchNotice(record("prepared"), "devin"))
-      .toEqual({ settled: false, text: "Switching this session to Devin." });
   });
 
   test("settles on the applied state", () => {
     expect(providerSwitchNotice(record("applied"), "claude"))
       .toEqual({ settled: true, text: "This session is running on Claude Code." });
-    expect(providerSwitchNotice(record("applied"), "devin"))
-      .toEqual({ settled: true, text: "This session is running on Devin." });
   });
 
   test("an ambiguous outcome is never phrased as a failure", () => {

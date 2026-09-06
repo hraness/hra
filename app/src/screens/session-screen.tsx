@@ -99,7 +99,7 @@ export function SessionScreen({
   sessionPublicId,
 }: Readonly<{ sessionPublicId: string }>): ReactNode {
   const head = useSessionHead(sessionPublicId);
-  const { compactEvents, historyLoading, liveModel, model } = useSessionModel(
+  const { compactEvents, historyLoading, liveModel, metadata, model } = useSessionModel(
     head,
     { history: "full" },
   );
@@ -125,6 +125,7 @@ export function SessionScreen({
   const pickerRef = useRef<HTMLInputElement>(null);
 
   const title = model.title ?? shortSessionLabel(sessionPublicId);
+  const retired = metadata.retiredProvider === "devin";
   const entries = useMemo(
     () => deriveTranscript(compactEvents, {
       streamingText: liveModel.streamingText,
@@ -143,7 +144,7 @@ export function SessionScreen({
   const decisionCommandId = interactionCommandPublicId(decisionCommand, interaction);
 
   const run = useCallback(async (payload: RemoteCommandPayload): Promise<string | null> => {
-    if (head === null) return null;
+    if (head === null || retired) return null;
     setSending(true);
     setNotice(null);
     try {
@@ -158,7 +159,7 @@ export function SessionScreen({
     } finally {
       setSending(false);
     }
-  }, [head, sessionPublicId, submit]);
+  }, [head, retired, sessionPublicId, submit]);
 
   const scroller = useRef<HTMLDivElement>(null);
   const following = useRef(true);
@@ -187,7 +188,7 @@ export function SessionScreen({
     fastRequestForSession?.enabled ?? null,
   );
   const presetOptions = sessionPresetOptionsForProvider(provider);
-  const providerDisabledReason = providerSwitchDisabledReason({
+  const providerDisabledReason = retired ? "Devin support is retired; this session is read-only." : providerSwitchDisabledReason({
     sending,
     supported: providerSwitchSupported(),
     turnActive: model.turnActive,
@@ -200,7 +201,7 @@ export function SessionScreen({
   // text, which is factual rather than a sentence invented on the reader's
   // behalf. The daemon refuses an empty message, so something has to be there.
   const outgoing = typed.length > 0 ? typed : defaultMessageForAttachments(attachments);
-  const canSend = head !== null && !sending && !attach.busy && outgoing.length > 0;
+  const canSend = head !== null && !retired && !sending && !attach.busy && outgoing.length > 0;
 
   const send = (event: { preventDefault: () => void }) => {
     event.preventDefault();
@@ -273,7 +274,8 @@ export function SessionScreen({
       </div>
 
       <div className="flex flex-col gap-2 border-t border-line bg-surface px-[max(1rem,env(safe-area-inset-left))] pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
-        {interaction === null ? null : (
+        {retired ? <p className="text-xs text-ink-muted">Devin support is retired. This session is read-only.</p> : null}
+        {interaction === null || retired ? null : (
           <InteractionPanel
             commandPublicId={decisionCommandId}
             interaction={interaction}
@@ -323,7 +325,7 @@ export function SessionScreen({
           />
           <Button
             aria-label="Attach a file"
-            disabled={head === null}
+            disabled={head === null || retired}
             onClick={() => { pickerRef.current?.click(); }}
             size="icon"
             variant="ghost"
@@ -332,7 +334,7 @@ export function SessionScreen({
           </Button>
           <Textarea
             aria-label="Message this session"
-            disabled={head === null}
+            disabled={head === null || retired}
             onChange={(event) => { setMessage(event.target.value); }}
             onPaste={attach.onPaste}
             placeholder="Send or steer. Paste or drop an image or a text file to attach it."
@@ -341,7 +343,7 @@ export function SessionScreen({
           {model.turnActive ? (
             <Button
               aria-label="Stop the turn"
-              disabled={sending}
+              disabled={sending || retired}
               onClick={() => { void run({ kind: "stop" }); }}
               size="icon"
               variant="secondary"
@@ -364,6 +366,7 @@ export function SessionScreen({
         <div className="mt-2 flex flex-col gap-2">
           {presetOptions.map(({ label, value }) => (
             <ChoiceRow
+              disabled={retired}
               key={value}
               label={label}
               onSelect={() => {
@@ -377,14 +380,14 @@ export function SessionScreen({
 
         <h2 className="mt-4 text-base font-semibold">Fast (Codex only)</h2>
         <p className="mt-1 text-xs text-ink-muted">
-          Applies to future turns; Claude Code and Devin have no Fast mode. The daemon
+          Applies to future turns; Claude Code has no Fast mode. The daemon
           holds the current value, so this browser highlights only a change the machine
           confirmed.
         </p>
         <div className="mt-2 flex flex-col gap-2">
           {([true, false] as const).map((enabled) => (
             <ChoiceRow
-              disabled={head === null || sending || model.turnActive}
+              disabled={head === null || retired || sending || model.turnActive}
               key={String(enabled)}
               label={enabled ? "On" : "Off"}
               onSelect={() => {
@@ -415,6 +418,7 @@ export function SessionScreen({
         <div className="mt-2 flex flex-col gap-2">
           {approvalOptions.map(([value, label]) => (
             <ChoiceRow
+              disabled={retired}
               key={value}
               label={label}
               onSelect={() => {

@@ -79,7 +79,7 @@ describe("public content contract", () => {
     expect(lines[6]).toBe("```sh");
     expect(lines[7]).toBe(publicContent.installCommand);
     expect(publicContent.thesis).toBe(
-      "HRA runs Codex, Claude Code, and Devin sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.",
+      "HRA runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.",
     );
     expect(publicContent.statusLine).toContain(`v${publicContent.releaseVersion}`);
     expect(publicContent.statusLine).toContain("hosted sync is live as an open beta");
@@ -99,13 +99,11 @@ describe("public content contract", () => {
       `Bun ${packageJson.engines.bun}`,
       `runtime: Codex ${packageJson.dependencies["@openai/codex"]}`,
       `runtime: Claude Code ${publicPins.claude}`,
-      `runtime: Devin CLI ${publicPins.devin}`,
     ]);
     expect(publicPins).toEqual({
       bun: packageJson.engines.bun,
       claude: "2.1.260",
       codex: packageJson.dependencies["@openai/codex"],
-      devin: "3000.6.14",
     });
     for (const badge of publicContent.badges) {
       expect(badge.image).toMatch(/^https:\/\/img\.shields\.io\//u);
@@ -115,7 +113,6 @@ describe("public content contract", () => {
     expect(publicContent.badges[4]?.image).toBe("https://img.shields.io/badge/Bun-1.3.14-14151a");
     expect(publicContent.badges[5]?.image).toBe("https://img.shields.io/badge/runtime-Codex%200.153.2-0b5fa5");
     expect(publicContent.badges[6]?.image).toBe("https://img.shields.io/badge/runtime-Claude%20Code%202.1.260-6f42c1");
-    expect(publicContent.badges[7]?.image).toBe("https://img.shields.io/badge/runtime-Devin%20CLI%203000.6.14-5936b4");
     expect(renderSiteHtml()).not.toContain("img.shields.io");
   });
 
@@ -125,8 +122,8 @@ describe("public content contract", () => {
     expect(jsonLd).toBeDefined();
     const structured = JSON.parse(jsonLd ?? "{}") as Record<string, unknown>;
 
-    expect(publicContent.tagline).toBe("Control plane for Codex, Claude Code, and Devin");
-    expect(publicContent.providerRoadmap).toBe("Codex, Claude Code, and Devin.");
+    expect(publicContent.tagline).toBe("Control plane for Codex and Claude Code");
+    expect(publicContent.providerRoadmap).toBe("Codex and Claude Code, side by side.");
     expect(packageJson.description).toBe(publicContent.description);
     expect(publicContent.description).toStartWith(`${publicContent.tagline} in current source;`);
     expect(structured).toMatchObject({
@@ -143,7 +140,7 @@ describe("public content contract", () => {
     expect(html).toContain(`<p class="hraness-marketing-hero__eyebrow">${publicContent.tagline}</p>`);
     expect(renderPreviewHtml()).toContain(`<p class="preview-eyebrow">${publicContent.tagline}</p>`);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · Codex + Claude Code + Devin · v0.6.0 release-ready · hra.sh",
+      alt: "HRA · Codex + Claude Code · v0.6.0 release-ready · hra.sh",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -166,7 +163,7 @@ describe("public content contract", () => {
   });
 
   test("names the product and its maintainer once, beside what HRA does", () => {
-    const nameSentence = "HRA is short for harness: the control plane that keeps Codex, Claude Code, and Devin sessions working together, and ";
+    const nameSentence = "HRA is short for harness: the control plane that keeps Codex and Claude Code sessions working together, and ";
     const maintainerSentence = "The Hraness organization maintains HRA and publishes it under the MIT license.";
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
@@ -398,41 +395,16 @@ describe("public content contract", () => {
     }
   });
 
-  test("publishes the exact Devin runtime, login, Astra, and usage boundaries", () => {
+  test("removes active Devin claims and documents preserved historical data", () => {
     const markdown = renderReadmeMarkdown();
     const html = htmlVisibleText(renderSiteHtml());
-    const claims = [
-      "Devin CLI 3000.6.14",
-      "hra account login personal --provider devin",
-      "--manual-token-flow",
-      "devin auth login",
-      "--force-manual-token-flow",
-      "HOME",
-      "XDG_CONFIG_HOME",
-      "XDG_DATA_HOME",
-      "XDG_CACHE_HOME",
-      "XDG_STATE_HOME",
-      "never opens, parses, copies, or uploads it",
-      "devin auth status",
-      "hra session start personal --provider devin --preset astra --json",
-      "devin acp --model gpt-6-astra",
-      "It is the default preset for Devin.",
-      "Codex Astra Max",
-      "Codex Astra Ultra",
-      "current context occupancy and capacity",
-      "cumulative provider cost only when Devin supplies it",
-      "reports allowance",
-      "devin_acp",
-      "never applies a Codex reset credit to Devin",
-      "ACP v1 has no in-turn steer method",
-      "HRA never sends concurrent prompts to one Devin session",
-      "A Devin session can participate in Work coordination records and provider-neutral signal delivery",
-      "it cannot own or execute a Work attempt",
-      "Work attempt routes remain Codex-only",
-    ];
-    for (const claim of claims) {
-      expect(markdown).toContain(claim);
-      expect(html).toContain(claim);
+    for (const surface of [markdown, html]) {
+      expect(surface).toContain("Devin support has been removed");
+      expect(surface).toContain("Existing Devin history is read-only");
+      expect(surface).not.toContain("devin acp");
+      expect(surface).not.toContain("hra account login personal --provider devin");
+      expect(surface).not.toContain("|devin");
+      expect(surface).not.toContain("|astra");
     }
   });
 
@@ -525,7 +497,7 @@ describe("public content contract", () => {
       "Project directories are local-only and are neither synced nor remotely changed.",
       "hra remote send <cloud-session> <message>",
       "hra remote command <uuidv7>",
-      "hra remote provider <cloud-session> <codex|claude|devin> [--preset <low|high|ultra|fable-max|astra>]",
+      "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
       "--idempotency-key <current-uuidv7>",
       "includes interaction events with a public interaction ID, kind, state, revision, blocking status, bounded safe summary, and a nested version 2 remote policy",
       "Another device may decline a pending command, permission, or file-change request with",
@@ -582,14 +554,11 @@ describe("public content contract", () => {
       "never retains, returns, projects, or uploads the identity or usage fields",
       "Codex and Claude Code personal-session adoption status: whether discovery is enabled and bounded pending, adopted, and fenced counts.",
       "Candidate identities and records are never included.",
-      "Devin has no personal-home adoption surface.",
-      "Devin account identity and allowance are not projected.",
-      "provider-supplied session context and cost facts in the neutral session stream",
       "For an explicitly requested Codex web login, the provider HTTPS verification URL and separate one-time user code.",
       "encrypts both to the account key before upload",
       "deletes the hosted handoff on that read or after five minutes",
       "OAuth access or refresh tokens; authorization codes; PKCE verifiers; provider cookies; or the private device code.",
-      "Raw Codex app-server, Claude Code stream, or Devin ACP requests or responses.",
+      "Raw Codex app-server or Claude Code stream requests or responses.",
       "Personal-home adoption candidate identities or records, personal-runtime bindings, process identities, schedule-source metadata, provider-home provenance, provider-account authority hashes, or the automation id, firing time, and instructions from an exact Codex Desktop heartbeat envelope. Such an envelope is replaced with generic protected text before session content is projected.",
       "Raw reasoning, hidden chain of thought, or approval secrets.",
       "Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.",
@@ -642,8 +611,6 @@ describe("public content contract", () => {
       expect(surface).toContain("curl with HTTPS and TLS 1.2 support");
       expect(surface).toContain("support macOS and Linux");
       expect(surface).toContain("Codex effects run on both platforms");
-      expect(surface).toContain("Devin effects also run on both platforms");
-      expect(surface).toContain("Devin CLI reports exactly 3000.6.14");
       expect(surface).toContain("Claude Code effects run on Linux only");
       expect(surface).toContain("refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance");
       expect(surface).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
@@ -698,9 +665,8 @@ describe("public content contract", () => {
       "--follow",
       "equivalent compatibility spelling",
       "hra session interactions <session-id> --pending --json",
-      "Claude Code, Devin, and provider switching",
+      "Claude Code and provider switching",
       "hra session start personal --provider claude --preset fable-max --json",
-      "hra session start personal --provider devin --preset astra --json",
       "hra session switch <session-id> --provider claude --preset fable-max",
       "hra session export <session-id> --format json",
       "Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form.",

@@ -36,6 +36,7 @@ import {
   type CommandState,
   type DeviceCommandResultPayload,
   type RemoteCommandPayload,
+  type SupportedPreset,
 } from "../hra/cloud";
 import { formatRelativeTime, formatUtcDay } from "../model/relative-time";
 import {
@@ -65,7 +66,6 @@ import {
   showThinkingCommand,
   unarchiveSessionCommand,
   type ApprovalMode,
-  type PresetChoice,
 } from "../model/settings-commands";
 import {
   accountBrowserLoginAllowed,
@@ -449,7 +449,7 @@ function MachineCard({
 
       <SettingsRow
         control={(
-          <ChoiceGroup<PresetChoice>
+          <ChoiceGroup<SupportedPreset>
             disabled={disabled}
             label={`Default preset on ${machine.label}`}
             onSelect={(preset) => { send(defaultPresetCommand(preset)); }}
@@ -457,7 +457,7 @@ function MachineCard({
               label: presetLabels[preset],
               value: preset,
             }))}
-            value={machine.defaultPreset}
+            value={machine.defaultPreset === "astra" ? null : machine.defaultPreset}
           />
         )}
         description="The model preset new sessions start with."
@@ -523,6 +523,7 @@ function ArchivedSessionRow({
   session,
 }: Readonly<{ now: number; session: ArchivedSessionView }>) {
   const command = useSettingsCommand();
+  const retired = session.retiredProvider === "devin";
   const day = formatUtcDay(session.updatedAt);
   const machine = session.machineLabel ?? shortSessionId(session.executionDevicePublicId);
 
@@ -530,8 +531,9 @@ function ArchivedSessionRow({
     <SettingsRow
       control={(
         <Button
-          disabled={command.busy}
+          disabled={command.busy || retired}
           onClick={() => {
+            if (retired) return;
             command.run({
               payload: unarchiveSessionCommand(),
               target: {
@@ -549,6 +551,7 @@ function ArchivedSessionRow({
       description={`${machine}, last updated ${formatRelativeTime(session.updatedAt, now)}${day === null ? "" : ` on ${day}`}`}
       title={session.title}
     >
+      {retired ? <p className="text-xs text-ink-muted">Devin retired · read-only</p> : null}
       <Notice>{command.notice}</Notice>
     </SettingsRow>
   );
@@ -830,7 +833,9 @@ function AccountRow({
       description={account.machineLabel}
       title={account.label}
     >
-      {accountBrowserLoginAllowed(account) ? (
+      {account.provider === "devin" ? (
+        <p className="text-xs text-ink-muted">Devin support is retired. This historical account is read-only.</p>
+      ) : accountBrowserLoginAllowed(account) ? (
         <AccountBrowserLoginControls
           account={account}
           busy={busy}
@@ -844,11 +849,6 @@ function AccountRow({
             <p className="text-xs text-ink-muted">
               Run this on its Linux custodian. Claude linking is not available in the browser,
               and macOS refuses before provider launch.
-            </p>
-          ) : account.provider === "devin" ? (
-            <p className="text-xs text-ink-muted">
-              Devin owns this foreground sign-in. Browser linking is not available; run the
-              command on the custodian machine, or add --manual-token-flow for a headless shell.
             </p>
           ) : null}
         </>
@@ -1056,7 +1056,7 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
               <CommandHint>hra remote allow account-linking</CommandHint>
             </SettingsRow>
             <SettingsRow
-              description="Codex, Claude, and Devin sign in on the machine that owns their isolated provider home."
+              description="Codex and Claude sign in on the machine that owns their isolated provider home."
               title="Link an account from the machine"
             >
               <CommandHint>hra account login &lt;profile&gt; [--provider &lt;provider&gt;]</CommandHint>

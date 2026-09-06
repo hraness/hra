@@ -1,11 +1,11 @@
 # Session portability
 
 HRA owns a provider-neutral record of every session. On Linux, a conversation
-can move among Codex, Claude Code, and Devin while it is running, and it can be
+can move from Codex to Claude Code and back while it is running, and it can be
 exported in the letta-ai trajectory v1 shape for memory and search tooling.
-Codex and Devin switching remain available on macOS, but a switch into Claude
-is refused there until authenticated testing proves isolated Keychain custody
-and detached-daemon reads without a prompt.
+Codex switching remains available on macOS, but a switch into Claude is refused
+there until authenticated testing proves isolated Keychain custody and
+detached-daemon reads without a prompt.
 
 Before this, HRA stored no conversation of its own. Assistant text existed only
 as `assistant_delta` events, there was no record of what HRA had sent, and
@@ -57,7 +57,7 @@ still has a readable conversation.
 ## Switching provider
 
 ```
-hra session switch <session> --provider codex|claude|devin [--preset <preset>] [--account <account>]
+hra session switch <session> --provider codex|claude [--preset <preset>] [--account <account>]
 ```
 
 In order, a switch:
@@ -111,9 +111,9 @@ A switch is refused, with no effect, when:
   no way to attribute its result. Stop it with `hra session stop` first;
 - the session is quarantined or terminal;
 - the requested preset is not one the target provider can run (`low` on
-  Claude or Devin, `fable-max` on Codex or Devin, and `astra` on Codex or
-  Claude). With no `--preset`, the switch keeps the session's tier when the
-  target has one and otherwise takes the target's highest;
+  Claude, `fable-max` on Codex). With no `--preset`, the switch keeps the
+  session's tier when the target has one and otherwise takes the target's
+  highest;
 - the target is Claude and the custodian daemon is not running on Linux;
 - the session already runs that provider, preset, and account.
 
@@ -127,13 +127,12 @@ its event stream; the session id never changes.
 
 **Not preserved, and not recoverable:**
 
-- the provider's own hidden state, Codex's server-side thread, Claude's full
-  reasoning traces, and Devin's provider-private ACP state, none of which HRA
-  ever stored;
-- the provider's native thread. Codex `thread/resume`, the pinned Claude CLI's
-  `--resume`, and Devin ACP `session/load` accept only their own native session
-  identities and cannot import a foreign transcript. No provider can be handed
-  another provider's thread, so the target starts a genuinely new one;
+- the provider's own hidden state, Codex's server-side thread and Claude's
+  full reasoning traces, neither of which HRA ever stored;
+- the provider's native thread. Codex `thread/resume` takes only a thread id,
+  and the pinned Claude CLI's `--resume` takes only its own session id and
+  cannot import a foreign transcript. Neither provider can be handed the
+  other's thread, so the target starts a genuinely new one;
 - cached context and prompt-cache warmth. The target pays full context cost for
   the seed;
 - anything the redaction rules removed on the way in: secrets, absolute paths,
@@ -174,7 +173,7 @@ The payload deliberately has no account field. Account selection is
 user-directed and stays on the machine that holds the credentials; a remote
 switch keeps the session's account.
 
-`hra remote provider <cloud-session> <codex|claude|devin> [--preset <preset>]` is the
+`hra remote provider <cloud-session> <codex|claude> [--preset <preset>]` is the
 CLI form. The custodian daemon applies the same Linux-only admission rule to a
 remote switch into Claude; the browser cannot widen platform support.
 

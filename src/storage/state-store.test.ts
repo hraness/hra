@@ -30,12 +30,13 @@ import {
   observedAccountTokenVelocity,
   type StoredAccountUsageSnapshot,
 } from "../domain/usage-metrics";
-import { createAttemptId, utf8Bytes } from "../domain/values";
+import { createAttemptId, createQueueId, utf8Bytes } from "../domain/values";
 import { canTransitionQueue, queueStateSchema, type QueueState } from "../domain/transitions";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import { presetRequirements } from "../domain/presets";
 import {
   effectiveClaudeRuntimeProfileSchema,
+  effectiveDevinRuntimeProfileSchema,
   effectiveRuntimeProfileSchema,
 } from "../domain/runtime-profile";
 import { initializeProfilePaths, initializeStatePaths, resolveStatePaths } from "./paths";
@@ -189,6 +190,39 @@ async function fixture(
   stores.push(store);
   return { store, home };
 }
+
+/** Exact v39 storage fixture, never an admission path for a new Devin session. */
+const seedLegacyDevinSession = (
+  store: StateStore,
+  input: Parameters<StateStore["createSession"]>[0],
+) => {
+  const session = store.createSession({ ...input, provider: "codex", preset: "ultra" });
+  const database = new Database(store.paths.database, { create: false, strict: true });
+  try {
+    database.query("UPDATE sessions SET provider_v39='devin' WHERE id=?").run(session.id);
+  } finally {
+    database.close(false);
+  }
+  return store.requireSession(session.id);
+};
+
+/** A pending send retained from a build that still admitted this provider. */
+const seedLegacyDevinQueue = (store: StateStore, sessionId: Parameters<StateStore["enqueue"]>[0]) => {
+  const id = createQueueId();
+  const database = new Database(store.paths.database, { create: false, strict: true });
+  try {
+    database.transaction(() => {
+      const sequence = z.object({ sequence: z.number().int().positive() }).parse(database.query(
+        "UPDATE queue_sequence_authority SET next_sequence=next_sequence+1 WHERE singleton=1 RETURNING next_sequence-1 AS sequence",
+      ).get()).sequence;
+      database.query("INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at) VALUES (?,?,'legacy pending send','pending',?,1000,1000)")
+        .run(id, sessionId, sequence);
+    }).immediate();
+  } finally {
+    database.close(false);
+  }
+  return store.requireQueue(id);
+};
 
 const dropProviderSwitchProgressSchema = (database: Database): void => {
   database.exec(`
@@ -6385,6 +6419,56 @@ describe("StateStore", () => {
     })).toThrow("CLAUDE_LOGIN_NOT_UNSETTLED");
   });
 
+  test("does not expose retired Devin account-login execution APIs", () => {
+    expect("canReleaseIdleDevinSessionForAccountLogin" in StateStore.prototype).toBe(false);
+    expect("terminalizeIdleDevinSessionForAccountLogin" in StateStore.prototype).toBe(false);
+  });
+
+  test("retains exact legacy Devin login authority for acknowledged abandonment only", async () => {
+    const { store, home } = await fixture();
+    const profile = store.createProfile("Legacy Devin foreground auth");
+    const key = "00000000-0000-4000-8000-000000000617";
+    const attemptId = createAttemptId();
+    const evidence = { kind: "account.devin-login", provider: "devin", baselineSignedIn: false };
+    const evidenceJson = JSON.stringify(evidence);
+    const request = { kind: "account.devin-login", authorityId: profile.id,
+      authorityGeneration: profile.processGeneration, request: { provider: "devin" } };
+    const database = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      database.transaction(() => {
+        database.query("INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,?,?,?,?,'prepared',1000,1000)")
+          .run(attemptId, key, request.kind, profile.id, profile.processGeneration,
+            createHash("sha256").update(JSON.stringify(request)).digest("hex"));
+        database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,1000)")
+          .run(attemptId, request.kind, evidenceJson, createHash("sha256").update(evidenceJson).digest("hex"));
+        database.query("UPDATE mutation_attempts SET state='effect_started' WHERE id=?").run(attemptId);
+      }).immediate();
+    } finally {
+      database.close(false);
+    }
+    expect(store.readMutation(key)).toMatchObject({ state: "effect_started", evidence: { evidence } });
+    expect(store.providerAuthorityAdvanceBlocker(profile.id, "devin")).toBe("unsettled_authority");
+    expect(store.providerAuthorityAdvanceBlocker(profile.id, "codex")).toBe("unsettled_authority");
+    expect(() => store.nextProfileGeneration(profile.id)).toThrow("DEVIN_LOGIN_AUTHORITY_UNSETTLED");
+    store.close();
+
+    const restarted = new StateStore(resolveStatePaths({ homeDirectory: home, platform: "darwin" }));
+    stores.push(restarted);
+    restarted.nextDaemonGeneration(`boot_${"d".repeat(32)}`);
+    expect(restarted.recoverEffectStartedMutations()).toEqual({ recovered: [attemptId], unresolved: [] });
+    const abandon = { attemptId, idempotencyKey: key, profileId: profile.id,
+      profileGeneration: profile.processGeneration, acknowledgeChildExited: true as const };
+    expect(() => restarted.abandonDevinLoginMutation({ ...abandon, profileGeneration: profile.processGeneration + 1 }))
+      .toThrow("DEVIN_LOGIN_AUTHORITY_MISMATCH");
+    expect(restarted.abandonDevinLoginMutation(abandon)).toMatchObject({ acknowledgedChildExited: true });
+    expect(restarted.abandonDevinLoginMutation(abandon)).toMatchObject({ acknowledgedChildExited: true });
+    expect(restarted.readMutation(key)).toMatchObject({
+      state: "reconciled", originalState: "ambiguous", resolution: { kind: "abandoned" }, evidence: { evidence },
+    });
+    expect(restarted.providerAuthorityAdvanceBlocker(profile.id, "devin")).toBeNull();
+    expect(() => restarted.prepareMutation({ ...request, idempotencyKey: "00000000-0000-4000-8000-000000000618" }))
+      .toThrow("PROVIDER_RETIRED:devin");
+  });
   test("classifies effect-started authorities at restart and rejects new keys", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Restart recovery", "restart@example.com");
@@ -9066,6 +9150,299 @@ describe("StateStore", () => {
       .toBe("gpt-5.6-sol");
   });
 
+  test.each([
+    ["source", "valid"], ["target", "valid"],
+    ["source", "digest"], ["target", "binding"],
+    ["source", "runtime_profile"], ["target", "runtime_profile"],
+  ] as const)(
+    "handles retired Devin %s switch shutdown with %s evidence without reviving authority",
+    async (side, variant) => {
+      const { store } = await fixture();
+      const profile = signInProfile(store, `Retired ${side} shutdown`, "retired-shutdown@example.com");
+      const created = side === "source"
+        ? seedLegacyDevinSession(store, { profileId: profile.id, preset: "astra", fastEnabled: false })
+        : store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+      const session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+        providerThreadId: "legacy-shutdown-source", state: "idle" });
+      const attemptId = createAttemptId();
+      const key = "00000000-0000-4000-8000-0000000006c3";
+      const evidence = {
+        kind: "session.switch", requestedAccountId: null, requestedPreset: null,
+        sourceProfileId: profile.id, sourceProcessGeneration: profile.processGeneration,
+        sourceProvider: side === "source" ? "devin" : "codex",
+        sourceProviderThreadId: session.providerThreadId,
+        sourcePreset: side === "source" ? "astra" : "high",
+        targetProfileId: profile.id, targetProcessGeneration: profile.processGeneration,
+        targetProvider: side === "target" ? "devin" : "codex",
+        targetPreset: side === "target" ? "astra" : "high",
+        transcriptDigest: "b".repeat(64), seedDigest: "c".repeat(64),
+        seedIncludedRecords: 0, seedOmittedRecords: 0,
+        runtimeProfile: side === "target" ? {
+          profileId: profile.id, processGeneration: profile.processGeneration, observedAt: 1000,
+          preset: "astra", model: "gpt-6-astra", reasoningEffort: "provider-default",
+          devinVersion: "3000.6.14", protocolVersion: 1, isolatedHome: true,
+        } : effectiveRuntimeProfileSchema.parse(codexAdoptionRuntimeProfile(profile, "high", false)),
+      };
+      if (variant === "binding") evidence.sourceProviderThreadId = "unmatched-legacy-source";
+      if (variant === "runtime_profile") evidence.runtimeProfile.processGeneration += 1;
+      const evidenceJson = JSON.stringify(evidence);
+      const database = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        database.query("INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.switch',?,?,?,'effect_started',1000,1000)")
+          .run(attemptId, key, session.id, profile.processGeneration, "d".repeat(64));
+        database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,'session.switch',?,?,1000)")
+          .run(attemptId, evidenceJson, variant === "digest" ? "f".repeat(64)
+            : createHash("sha256").update(evidenceJson).digest("hex"));
+        const before = database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId);
+        if (variant !== "valid") {
+          expect(store.recoverEffectStartedMutations()).toEqual({ recovered: [],
+            unresolved: [{ id: attemptId, kind: "session.switch", authorityId: session.id }] });
+          expect(store.requireSession(session.id)).toEqual(session);
+          expect(database.query("SELECT state FROM mutation_attempts WHERE id=?").get(attemptId))
+            .toEqual({ state: "effect_started" });
+          expect(database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId)).toEqual(before);
+          return;
+        }
+        for (const boot of ["a", "b"] as const) {
+          expect(() => store.nextDaemonGeneration(`boot_${boot.repeat(32)}`)).not.toThrow();
+          expect(store.recoverEffectStartedMutations()).toEqual({
+            recovered: boot === "a" ? [attemptId] : [], unresolved: [],
+          });
+          expect(store.requireSession(session.id).state).toBe("recovery_required");
+          expect(store.readMutation(key)?.state).toBe("ambiguous");
+          expect(store.isSessionMutationProviderAuthorityCurrent({ attemptId,
+            profileId: profile.id, provider: "devin", originGeneration: profile.processGeneration })).toBe(false);
+          expect(store.isSessionMutationProviderAuthorityCurrent({ attemptId,
+            profileId: profile.id, provider: "codex", originGeneration: profile.processGeneration })).toBe(true);
+        }
+        expect(database.query("SELECT provider,from_generation,to_generation FROM session_mutation_authority_rebinds_v39 WHERE attempt_id=? ORDER BY from_generation").all(attemptId))
+          .toEqual([
+            { provider: "codex", from_generation: profile.processGeneration, to_generation: profile.processGeneration + 1 },
+            { provider: "codex", from_generation: profile.processGeneration + 1, to_generation: profile.processGeneration + 2 },
+          ]);
+        expect(database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId)).toEqual(before);
+        expect(JSON.stringify(store.readMutation(key)?.evidence?.evidence)).toBe(evidenceJson);
+      } finally {
+        database.close(false);
+      }
+    },
+  );
+
+  test.each(["valid", "digest", "binding", "runtime_profile"] as const)(
+    "quarantines retired Devin dispatch after daemon generation advance only with %s evidence",
+    async (variant) => {
+      const { store } = await fixture();
+      const profile = store.createProfile("Retired queue restart");
+      const created = seedLegacyDevinSession(store, {
+        profileId: profile.id, preset: "astra", fastEnabled: false,
+      });
+      const session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+        providerThreadId: "retired-queue-thread", state: "idle" });
+      const queue = seedLegacyDevinQueue(store, session.id);
+      const runtimeProfile = effectiveDevinRuntimeProfileSchema.parse({
+        profileId: profile.id, processGeneration: profile.processGeneration, observedAt: 1000,
+        preset: "astra", model: "gpt-6-astra", reasoningEffort: "provider-default",
+        devinVersion: "3000.6.14", protocolVersion: 1, isolatedHome: true,
+      });
+      if (variant === "runtime_profile") runtimeProfile.processGeneration += 1;
+      const evidence = { kind: "queue.dispatch", queueId: queue.id, sessionId: session.id,
+        providerThreadId: variant === "binding" ? "unmatched-thread" : "retired-queue-thread",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queue.id, messageDigest: createHash("sha256").update(queue.message).digest("hex"),
+        runtimeProfile,
+      };
+      const evidenceJson = JSON.stringify(evidence);
+      const database = new Database(store.paths.database, { create: false, strict: true });
+      try {
+        database.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,1000)")
+          .run(queue.id, evidenceJson, variant === "digest" ? "f".repeat(64)
+            : createHash("sha256").update(evidenceJson).digest("hex"));
+        database.query("UPDATE queue_entries SET state='dispatching' WHERE id=?").run(queue.id);
+        const before = database.query("SELECT * FROM queue_effect_evidence WHERE queue_id=?").get(queue.id);
+        store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
+        const beforeSession = store.requireSession(session.id);
+        if (variant === "digest") {
+          expect(() => store.recoverDispatchingQueueEffects()).toThrow("QUEUE_EFFECT_EVIDENCE_MISMATCH");
+        } else {
+          expect(store.recoverDispatchingQueueEffects()).toEqual(variant === "valid"
+            ? { recovered: [queue.id], unresolved: [] }
+            : { recovered: [], unresolved: [queue.id] });
+        }
+        expect(store.requireQueue(queue.id).state).toBe(variant === "valid" ? "ambiguous" : "dispatching");
+        expect(store.requireQueue(queue.id).message).toBe(queue.message);
+        if (variant === "valid") {
+          expect(store.requireSession(session.id).state).toBe("recovery_required");
+          expect(store.recoverDispatchingQueueEffects()).toEqual({ recovered: [], unresolved: [] });
+          expect(store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(false);
+        } else {
+          expect(store.requireSession(session.id)).toEqual(beforeSession);
+        }
+        expect(database.query("SELECT * FROM queue_effect_evidence WHERE queue_id=?").get(queue.id)).toEqual(before);
+      } finally {
+        database.close(false);
+      }
+    },
+  );
+
+  test("keeps legacy Devin status recovery inert except explicit local abandonment", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Retired recovery");
+    const created = seedLegacyDevinSession(store, {
+      profileId: profile.id, preset: "astra", fastEnabled: false,
+    });
+    const bound = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+      providerThreadId: "retired-recovery-thread", state: "idle" });
+    const queue = seedLegacyDevinQueue(store, bound.id);
+    const recovery = store.quarantineSession(bound.id);
+    expect(() => store.resolveSessionStatusRecovery({ sessionId: recovery.id,
+      expectedRevision: recovery.revision, resolution: "provider_state_reconciled",
+      provider: { providerThreadId: "retired-recovery-thread", title: "Must not restore", status: "idle" },
+    })).toThrow("PROVIDER_RETIRED:devin");
+    expect(store.requireSession(recovery.id)).toEqual(recovery);
+    expect(store.requireQueue(queue.id).state).toBe("pending");
+    expect(store.resolveSessionStatusRecovery({ sessionId: recovery.id,
+      expectedRevision: recovery.revision, resolution: "abandoned" }))
+      .toMatchObject({ provider: "devin", state: "terminal" });
+    expect(store.requireQueue(queue.id).state).toBe("cancelled");
+  });
+
+  test("includes retired local history only through an explicit read-only authority-filter opt-in", async () => {
+    const { store } = await fixture();
+    const account = signInProfile(store, "Retired history", "retired-history@example.com");
+    const codex = store.upsertProviderSession({
+      profileId: account.id,
+      provider: "codex",
+      providerThreadId: "current-codex-history-thread",
+      providerAccountKey: providerAccountKeyForProfile(store, account.id, "codex"),
+      title: "Current supported history",
+      preset: "high",
+      fastEnabled: false,
+      state: "idle",
+    });
+    const unprovenCodex = store.createSession({
+      profileId: account.id, preset: "high", fastEnabled: false,
+    });
+    const unprovenClaude = store.createSession({
+      profileId: account.id, provider: "claude", preset: "fable-max", fastEnabled: false,
+    });
+    const devin = seedLegacyDevinSession(store, {
+      profileId: account.id, preset: "astra", fastEnabled: false,
+    });
+    const input = { profileId: account.id, after: null, limit: 10,
+      requireCurrentAccountAuthority: true } as const;
+    expect(store.listLocalSessionPage(input).sessions).toEqual([codex]);
+    expect(store.listLocalSessionPage({ ...input, includeRetiredHistory: false }).sessions)
+      .toEqual([codex]);
+    expect(new Set(store.listLocalSessionPage({ ...input, includeRetiredHistory: true })
+      .sessions.map((session) => session.id))).toEqual(new Set([codex.id, devin.id]));
+    expect(store.listLocalSessionPage({ ...input, includeRetiredHistory: true,
+      excludedProvider: "devin" }).sessions).toEqual([codex]);
+    expect(store.listLocalSessionPage(input).sessions).toEqual([codex]);
+    for (const session of [unprovenCodex, unprovenClaude, devin]) {
+      expect(store.sessionAccountAuthorityMatches(session.id, account.id)).toBe(false);
+      expect(store.requireSession(session.id)).toEqual(session);
+    }
+    expect(store.setProfileState(account.id, account.processGeneration, "signed_in", {
+      email: "replacement-history@example.com", plan: "Plus",
+    })).toBe(true);
+    expect(store.listLocalSessionPage(input).sessions).toEqual([]);
+    expect(store.listLocalSessionPage({ ...input, includeRetiredHistory: true }).sessions)
+      .toEqual([devin]);
+    expect(store.sessionAccountAuthorityMatches(codex.id, account.id)).toBe(false);
+    expect(store.sessionAccountAuthorityMatches(devin.id, account.id)).toBe(false);
+    expect(() => store.enqueue(devin.id, "history is not executable"))
+      .toThrow("PROVIDER_RETIRED:devin");
+  });
+
+  test("keeps mixed v39 history readable while rejecting new retired-provider effects", async () => {
+    const { store } = await fixture();
+    const account = signInProfile(store, "Mixed provider archive", "archive@example.com");
+    const codex = store.createSession({ profileId: account.id, preset: "high", fastEnabled: false });
+    const claude = store.createSession({ profileId: account.id, provider: "claude", preset: "fable-max", fastEnabled: false });
+    const created = seedLegacyDevinSession(store, { profileId: account.id, preset: "astra", fastEnabled: false });
+    const devin = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+      providerThreadId: "legacy-devin-thread", state: "idle" });
+    expect(store.sessionAccountAuthorityMatches(devin.id, account.id)).toBe(false);
+    expect(store.listLocalSessionPage({ profileId: account.id, after: null, limit: 10,
+      requireCurrentAccountAuthority: true }).sessions).not.toContainEqual(devin);
+    expect(store.listLocalSessionPage({ profileId: account.id, after: null, limit: 10 }).sessions)
+      .toContainEqual(devin);
+    const runtimeProfile = effectiveDevinRuntimeProfileSchema.parse({
+      profileId: account.id, processGeneration: account.processGeneration, observedAt: 1000,
+      preset: "astra", model: "gpt-6-astra", reasoningEffort: "provider-default",
+      devinVersion: "3000.6.14", protocolVersion: 1, isolatedHome: true,
+    });
+    const archivedProfile = store.recordSessionRuntimeProfile({
+      sessionId: devin.id, sourceKind: "session_start", sourceId: "legacy-devin-start", profile: runtimeProfile,
+    });
+    const usage = store.appendSessionEvent({
+      sessionId: devin.id, accountId: account.id, providerGeneration: account.processGeneration,
+      providerConnectionId: null, body: { type: "token_usage", turnId: null, inputTokens: null,
+        cachedInputTokens: null, outputTokens: null, reasoningOutputTokens: null, totalTokens: 42,
+        modelContextWindow: 200000, providerCost: { amount: 0.5, currency: "USD" } },
+    });
+    const queue = seedLegacyDevinQueue(store, devin.id);
+    const mutation = store.prepareMutation({
+      kind: "session.send", authorityId: devin.id, authorityGeneration: account.processGeneration,
+      request: { message: "rejected" }, idempotencyKey: "00000000-0000-4000-8000-0000000006b3",
+    });
+    expect(store.isSessionMutationProviderAuthorityCurrent({ attemptId: mutation.id,
+      profileId: account.id, provider: "devin", originGeneration: account.processGeneration }))
+      .toBe(false);
+    expect(() => store.createSession({ profileId: account.id, provider: "devin", preset: "astra", fastEnabled: false }))
+      .toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.upsertProviderSession({ profileId: account.id, provider: "devin",
+      providerThreadId: "rejected-import", title: "Rejected import", preset: "astra",
+      fastEnabled: false, state: "idle" })).toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.setDefaultPreset("astra")).toThrow();
+    expect(() => store.enqueue(devin.id, "rejected")).toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.updateSessionMetadata({ sessionId: devin.id, expectedRevision: devin.revision, preset: "astra" }))
+      .toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.beginSessionMutationEffect({
+      attemptId: mutation.id, sessionId: devin.id, profileGeneration: account.processGeneration,
+      evidence: { kind: "session.send", providerThreadId: "legacy-devin-thread",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: mutation.id, messageDigest: "a".repeat(64), runtimeProfile },
+    })).toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.beginQueueEffect({
+      queueId: queue.id, sessionId: devin.id, profileGeneration: account.processGeneration,
+      evidence: { kind: "queue.dispatch", queueId: queue.id, sessionId: devin.id,
+        providerThreadId: "legacy-devin-thread", profileGeneration: account.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: queue.id, messageDigest: "a".repeat(64), runtimeProfile },
+    })).toThrow("PROVIDER_RETIRED:devin");
+    expect(store.readMutation("00000000-0000-4000-8000-0000000006b3")).toMatchObject({ state: "prepared" });
+    expect(store.requireQueue(queue.id)).toMatchObject({ state: "pending", message: "legacy pending send" });
+    const inspect = () => {
+      const database = new Database(store.paths.database, { readonly: true, strict: true });
+      try {
+        return {
+          version: database.query("PRAGMA user_version").get(),
+          sessions: database.query("SELECT id,provider,provider_v39,preset,preset_contract FROM sessions ORDER BY id").all(),
+          profiles: database.query("SELECT profile_json FROM session_runtime_profiles ORDER BY session_id,revision").all(),
+          events: database.query("SELECT * FROM session_events WHERE session_id=? ORDER BY sequence").all(devin.id),
+          mutations: database.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
+          queue: database.query("SELECT * FROM queue_entries ORDER BY id").all(),
+        };
+      } finally { database.close(false); }
+    };
+    const before = inspect();
+    store.close();
+    const reopened = new StateStore(store.paths, { now: () => 2000 });
+    stores.push(reopened);
+    expect(reopened.requireSession(codex.id).provider).toBe("codex");
+    expect(reopened.requireSession(claude.id).provider).toBe("claude");
+    expect(reopened.requireSession(devin.id)).toMatchObject({ provider: "devin", preset: "astra" });
+    expect(reopened.latestSessionRuntimeProfile(devin.id)).toEqual(archivedProfile);
+    expect(reopened.listSessionEvents({ sessionId: devin.id, afterSequence: null, limit: 10, now: 2000 }).events).toContainEqual(usage);
+    expect(inspect()).toEqual(before);
+    const readonly = new StateStore(store.paths, { readonly: true });
+    stores.push(readonly);
+    expect(readonly.requireSession(devin.id).provider).toBe("devin");
+    expect(readonly.latestSessionRuntimeProfile(devin.id)?.profile).toEqual(runtimeProfile);
+    expect(inspect()).toEqual(before);
+  });
   test("refuses a session-start evidence row whose profile names another provider", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Mismatch", "mismatch@example.com");
@@ -9345,7 +9722,7 @@ describe("StateStore", () => {
     expect(store.transitionQueue(first.id, "dispatching", "failed")).toBe(true);
     expect(store.nextPendingQueue(session.id)?.id).toBe(second.id);
     expect(() => store.enqueue(`sess_${"f".repeat(32)}`, "must roll back"))
-      .toThrow("session provider account authority is not current");
+      .toThrow(SelectionError);
     const third = store.enqueue(session.id, "third");
 
     const inspector = new Database(paths.database, { create: false, strict: true });
@@ -15702,7 +16079,7 @@ describe("StateStore", () => {
   test("migrates the exact protected-main provider-v39 predecessor to adoption v40", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Provider v39 Devin");
-    const session = store.createSession({
+    const session = seedLegacyDevinSession(store, {
       profileId: profile.id,
       provider: "devin",
       preset: "astra",

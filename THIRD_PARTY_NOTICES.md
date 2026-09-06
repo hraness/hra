@@ -1,6 +1,6 @@
 # Third-party notices
 
-HRA depends on the official OpenAI Codex package and `@agentclientprotocol/sdk` 1.4.0, which are licensed under Apache License 2.0, and on Hraness Oh, which is licensed under the MIT License. HRA pins the immutable public npm release `@hraness/oh@0.2.7`; `bun.lock` binds its exact registry artifact integrity. HRA also interoperates with the separately installed Claude Code 2.1.260 and Devin CLI 3000.6.14 runtimes. HRA does not redistribute Claude Code or Devin CLI, copy or redistribute any provider credential, or vendor Oh.
+HRA depends on the official OpenAI Codex package, which is licensed under Apache License 2.0, and on Hraness Oh, which is licensed under the MIT License. HRA pins the immutable public npm release `@hraness/oh@0.2.7`; `bun.lock` binds its exact registry artifact integrity. HRA also interoperates with the separately installed Claude Code 2.1.260 runtime. HRA does not redistribute Claude Code, copy or redistribute any provider credential, or vendor Oh.
 
 The static hra.sh analytics asset incorporates `@hraness/posthog` version 0.1.2 and its `posthog-js` version 1.412.1 dependency. Both are licensed under the MIT License. HRA pins the immutable `@hraness/posthog` GitHub release tag, and `bun.lock` binds the exact dependency graph used to build the self-hosted browser asset.
 

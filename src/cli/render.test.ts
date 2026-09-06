@@ -627,18 +627,15 @@ describe("CLI rendering", () => {
     expect(json.stdout.join("")).not.toMatch(/providerEmail|providerPlan|updatedAt|state/u);
   });
 
-  test("renders Devin auth and explicit unknown account allowance", () => {
+  test("renders retired Devin history without suggesting login or fabricating usage", () => {
     const accountId = `acct_${"9".repeat(32)}`;
     const data = {
-      account: { id: accountId, label: "Devin private" },
-      authentication: { provider: "devin", signedIn: false },
-      nextCommand: `hra account login ${accountId} --provider devin`,
+      account: { id: accountId, label: "Retired history" },
+      provider: "devin",
+      status: "retired",
       providerGeneration: 2,
-      usage: {
-        allowance: "unknown",
-        reason: "Devin ACP reports context and optional cumulative session cost, but exposes no account allowance or reset window.",
-        source: "devin_acp",
-      },
+      credentialAction: "none",
+      diagnostic: "Devin support has been removed. Existing credentials are unchanged.",
     } as const;
     const human = capture();
     renderSuccess(
@@ -648,16 +645,36 @@ describe("CLI rendering", () => {
       human.output,
     );
     expect(human.stdout.join("")).toBe([
-      "Devin: signed out",
-      "Label: Devin private",
+      "Devin: retired (local history and login cleanup only)",
+      "Label: Retired history",
       `ID: ${accountId}`,
       "Provider generation: 2",
-      `Next: hra account login ${accountId} --provider devin`,
-      "Account allowance: unknown",
-      "  Devin ACP reports context and optional cumulative session cost, but exposes no account allowance or reset window.",
+      data.diagnostic,
       "",
     ].join("\n"));
-    expect(human.stdout.join("")).not.toContain("Account: unknown");
+    expect(human.stdout.join("")).not.toMatch(/signed in|signed out|Account allowance|hra account login /u);
+    const json = capture();
+    renderSuccess({ kind: "account.show", account: accountId, provider: "devin" }, data, true, json.output);
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      command: "account.show", data, ok: true, version: 1,
+    });
+
+    const recovery = capture();
+    const abandonCommand = `hra account login-cancel ${accountId} --provider devin --attempt-id attempt_${"a".repeat(32)} --provider-generation 2 --idempotency-key 00000000-0000-4000-8000-000000000102 --acknowledge-child-exited`;
+    renderSuccess(
+      { kind: "account.show", account: accountId, provider: "devin" },
+      { ...data, recovery: {
+        required: true,
+        diagnostic: "Confirm the original child exited; cleanup does not stop it.",
+        statusCommand: `hra account show ${accountId} --provider devin`,
+        abandonCommand,
+      } },
+      false,
+      recovery.output,
+    );
+    expect(recovery.stdout.join("")).toContain("Recovery: required");
+    expect(recovery.stdout.join("")).toContain(`Only after confirming the original Devin child exited: ${abandonCommand}`);
+    expect(recovery.stdout.join("")).not.toMatch(/signed in|signed out|Account allowance|hra account login /u);
   });
 
   test("renders Claude recovery and acknowledged local abandon truthfully", () => {

@@ -7,6 +7,7 @@
  * enter this bundle. Keeping the deep relative paths in one file makes the
  * boundary reviewable and keeps the eslint layering rule enforceable.
  */
+export { type SupportedPreset, type SupportedProvider } from "../../../src/domain/presets";
 export {
   canonicalDevicePublicKeyJson,
   decodeBase64Url,

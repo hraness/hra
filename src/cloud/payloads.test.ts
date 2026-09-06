@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { decryptBytes, randomKeyBytes } from "./crypto";
+import { decryptBytes, encryptBytes, randomKeyBytes } from "./crypto";
 import {
   cloudPayloadAad,
   decryptDeviceCommand,
@@ -75,7 +75,7 @@ describe("closed encrypted payloads", () => {
   });
 
   test("admits every provider-specific preset in model and default-preset commands", () => {
-    for (const preset of ["high", "fable-max", "astra"] as const) {
+    for (const preset of ["high", "fable-max"] as const) {
       expect(parseRemoteCommandPayload({ kind: "set_model", preset }))
         .toEqual({ kind: "set_model", preset });
       expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset }))
@@ -90,7 +90,10 @@ describe("closed encrypted payloads", () => {
     expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "fable-max", provider: "claude" }))
       .toEqual({ kind: "set_provider", preset: "fable-max", provider: "claude" });
     expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "astra", provider: "devin" }))
-      .toEqual({ kind: "set_provider", preset: "astra", provider: "devin" });
+      .toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_provider", provider: "devin" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_model", preset: "astra" })).toBeNull();
+    expect(parseRemoteCommandPayload({ kind: "set_default_preset", preset: "astra" })).toBeNull();
     expect(parseRemoteCommandPayload({ kind: "set_provider", preset: "high", provider: "codex" }))
       .toEqual({ kind: "set_provider", preset: "high", provider: "codex" });
     for (const mismatch of [
@@ -125,6 +128,15 @@ describe("closed encrypted payloads", () => {
       .toBeNull();
   });
 
+  test("accepts only the closed historical retirement marker without dropping legacy metadata", () => {
+    const retired = { archived: true, name: "Past work", note: null, retiredProvider: "devin" as const };
+    expect(parseSessionMetadataPayload(retired)).toEqual(retired);
+    expect(parseSessionMetadataPayload({ ...retired, retiredProvider: "codex" })).toBeNull();
+    expect(parseSessionMetadataPayload({ ...retired, retiredProvider: true })).toBeNull();
+    expect(parseSessionMetadataPayload({ name: "Past work", note: null }))
+      .toEqual({ name: "Past work", note: null });
+  });
+
   test("remote commands round trip only under their entity authority", async () => {
     const key = randomKeyBytes();
     const authority = {
@@ -137,8 +149,9 @@ describe("closed encrypted payloads", () => {
     const existingEnvelope = await encryptRemoteCommand(existingPayload, key, authority);
     expect(await decryptRemoteCommand(existingEnvelope, key, authority)).toEqual(existingPayload);
     const devinPayload = { kind: "set_provider", preset: "astra", provider: "devin" } as const;
-    const envelope = await encryptRemoteCommand(devinPayload, key, authority);
-    expect(await decryptRemoteCommand(envelope, key, authority)).toEqual(devinPayload);
+    // A valid envelope written by the former client must fail after decryption.
+    const envelope = await encryptBytes(new TextEncoder().encode(JSON.stringify(devinPayload)), key, 1, cloudPayloadAad(authority));
+    await expectPromiseToReject(decryptRemoteCommand(envelope, key, authority));
     await expectPromiseToReject(decryptRemoteCommand(envelope, key, {
       ...authority,
       entityPublicId: "command_87654321",
@@ -662,7 +675,7 @@ describe("device command payloads", () => {
       ...sessionStart,
       preset: "astra",
       provider: "devin",
-    })).toEqual({ ...sessionStart, preset: "astra", provider: "devin" });
+    })).toBeNull();
     expect(parseDeviceCommandPayload({
       accountPublicId: "account_primary",
       kind: "account_login_start",
@@ -886,8 +899,10 @@ describe("device command payloads", () => {
     } as const;
     const resultAuthority = { ...commandAuthority, kind: "device_command_result" } as const;
     const devinSessionStart = { ...sessionStart, preset: "astra", provider: "devin" } as const;
-    const envelope = await encryptDeviceCommand(devinSessionStart, key, commandAuthority);
-    expect(await decryptDeviceCommand(envelope, key, commandAuthority)).toEqual(devinSessionStart);
+    const legacyEnvelope = await encryptBytes(new TextEncoder().encode(JSON.stringify(devinSessionStart)), key, 1, cloudPayloadAad(commandAuthority));
+    await expectPromiseToReject(decryptDeviceCommand(legacyEnvelope, key, commandAuthority));
+    const envelope = await encryptDeviceCommand(sessionStart, key, commandAuthority);
+    expect(await decryptDeviceCommand(envelope, key, commandAuthority)).toEqual(sessionStart);
     // The two authorities are separate: a command envelope never decrypts as a
     // result, so a relayed login handoff cannot be produced by replaying a request.
     await expectPromiseToReject(decryptDeviceCommandResult(envelope, key, resultAuthority));

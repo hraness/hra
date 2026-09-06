@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   assertPresetSupportedByProvider,
+  assertSupportedProvider,
   currentPresetContract,
   defaultPresetForProvider,
   isAdmittedPresetRequirement,
@@ -16,6 +17,8 @@ import {
   presetTiers,
   presetsForProvider,
   providerSchema,
+  supportedPresetSchema,
+  supportedProviderSchema,
 } from "./presets";
 import {
   effectiveDevinRuntimeProfileSchema,
@@ -26,6 +29,15 @@ import {
 } from "./runtime-profile";
 
 describe("model presets and providers", () => {
+  test("separates current admission from immutable retired provider history", () => {
+    expect(supportedProviderSchema.options).toEqual(["codex", "claude"]);
+    expect(supportedPresetSchema.options).toEqual(["low", "high", "ultra", "fable-max"]);
+    expect(providerSchema.parse("devin")).toBe("devin");
+    expect(presetSchema.parse("astra")).toBe("astra");
+    expect(() => assertSupportedProvider("devin")).toThrow("PROVIDER_RETIRED:devin");
+    expect(() => assertSupportedProvider("codex")).not.toThrow();
+    expect(() => assertSupportedProvider("claude")).not.toThrow();
+  });
   test("names exactly the five presets and three providers", () => {
     expect(presetSchema.options).toEqual(["low", "high", "ultra", "fable-max", "astra"]);
     expect(providerSchema.options).toEqual(["codex", "claude", "devin"]);
@@ -139,7 +151,7 @@ describe("model presets and providers", () => {
     }).success).toBe(false);
   });
 
-  test("pins Devin to Astra through ACP without inventing an effort flag", () => {
+  test("decodes the historical Devin Astra ACP profile without widening its exact tuple", () => {
     const profile = {
       devinVersion: "3000.6.14",
       isolatedHome: true,
