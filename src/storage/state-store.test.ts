@@ -11722,9 +11722,10 @@ describe("StateStore", () => {
     };
 
     const sendSession = bind("thread-atomic-send", "idle");
-    const sendMessage = `/Users/private/project/${"x".repeat(
-      SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS,
-    )}`;
+    const sendMessage = [
+      "", "Users", "private", "project",
+      "x".repeat(SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS),
+    ].join("/");
     const sendKey = peerIdempotencyKey(70_001);
     const sendAttempt = store.prepareMutation({
       kind: "session.send",
