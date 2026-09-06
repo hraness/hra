@@ -67,6 +67,21 @@ describe("device command guards", () => {
     }))).toMatchObject({ notifyFirstSessionStart: false });
   });
 
+  test("admits notification-hour updates through the same local cap without account or session authority", () => {
+    const hours = payload({
+      endMinute: 1_320,
+      expectedRevision: 4,
+      kind: "set_notification_hours",
+      startMinute: 600,
+      timeZone: "America/Puerto_Rico",
+      version: 1,
+    });
+    expect(deviceCommandGuardDecision(input({ accounts: [], payload: hours, projectPublicIds: [] })))
+      .toMatchObject({ kind: "admitted", notifyFirstSessionStart: false });
+    expect(deviceCommandGuardDecision(input({ deviceCommandsAllowed: false, payload: hours })))
+      .toEqual({ code: "DEVICE_COMMANDS_DENIED", kind: "refused" });
+  });
+
   test("the kill switch refuses every kind with DEVICE_COMMANDS_DENIED", () => {
     for (const kind of [sessionStart, payload({ kind: "usage_refresh" })]) {
       expect(deviceCommandGuardDecision(input({

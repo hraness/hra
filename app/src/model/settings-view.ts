@@ -13,6 +13,7 @@ import type {
   DeviceRegistryPayload,
   DeviceRegistryProject,
   DeviceRegistryScheduledTask,
+  NotificationHoursPolicy,
 } from "../hra/cloud";
 import type { ApprovalMode, PresetChoice } from "./settings-commands";
 
@@ -71,19 +72,27 @@ export type ScheduledTaskView = Readonly<{
 }>;
 
 export type MachineView = Readonly<{
-  // The two local device-command switches, as this machine last published
-  // them. A registry written before device commands existed carries neither,
-  // which reads as the shipped defaults: commands allowed, linking denied.
+  // Local switches as this machine last published them. A registry written
+  // before device commands existed reads as the shipped defaults: commands
+  // allowed and linking denied. Email absence never reads as enabled.
   accountLinkingAllowed: boolean;
   accounts: readonly DeviceRegistryAccount[];
+  /** Null unless the composite hosted freshness fence matches decrypted policy. */
+  attentionEmailEnabled: boolean | null;
   daemonVersion: string;
   defaultApprovalMode: ApprovalMode;
   defaultPreset: PresetChoice;
   deviceCommandsAllowed: boolean;
   devicePublicId: string;
+  /** Current hosted device authority; a stale registry can outlive this row. */
+  deviceStatus: MachineDeviceState["status"] | null;
   heartbeatAt: number;
   label: string;
   online: boolean;
+  notificationHours: NotificationHoursPolicy | null;
+  notificationHoursStatus: "available" | "unreadable" | "unsupported";
+  notificationPolicyFreshness: "current" | "stale" | "unreadable" | "unsupported";
+  notificationPolicyRevision: number | null;
   projects: readonly DeviceRegistryProject[];
   proseAutorespondConfigured: boolean;
   revision: number;
@@ -93,9 +102,14 @@ export type MachineView = Readonly<{
 }>;
 
 export type MachineViewInput = Readonly<{
+  attentionEmailEnabled?: boolean | null;
   device: MachineDeviceState | null;
   devicePublicId: string;
   now: number;
+  notificationHours?: NotificationHoursPolicy | null;
+  notificationHoursStatus?: MachineView["notificationHoursStatus"];
+  notificationPolicyFreshness?: MachineView["notificationPolicyFreshness"];
+  notificationPolicyRevision?: number | null;
   payload: DeviceRegistryPayload;
   revision: number;
   updatedAt: number;
@@ -106,11 +120,13 @@ export function toMachineView(input: MachineViewInput): MachineView {
   return {
     accountLinkingAllowed: payload.accountLinkingAllowed ?? false,
     accounts: payload.accounts,
+    attentionEmailEnabled: input.attentionEmailEnabled ?? null,
     daemonVersion: payload.daemonVersion,
     defaultApprovalMode: payload.defaultApprovalMode,
     defaultPreset: payload.defaultPreset,
     deviceCommandsAllowed: payload.deviceCommandsAllowed ?? true,
     devicePublicId: input.devicePublicId,
+    deviceStatus: input.device?.status ?? null,
     heartbeatAt: payload.heartbeatAt,
     label: payload.machineLabel,
     online: isMachineOnline({
@@ -132,7 +148,57 @@ export function toMachineView(input: MachineViewInput): MachineView {
       sessionPublicId: task.sessionPublicId,
     })),
     showThinkingDefault: payload.showThinkingDefault,
+    notificationHours: input.notificationHours ?? null,
+    notificationHoursStatus: input.notificationHoursStatus
+      ?? (input.notificationHours == null ? "unsupported" : "available"),
+    notificationPolicyFreshness: input.notificationPolicyFreshness ?? "unsupported",
+    notificationPolicyRevision: input.notificationPolicyRevision ?? null,
     updatedAt: input.updatedAt,
+  };
+}
+
+export type AttentionEmailPresentation = Readonly<{
+  description: string;
+  label: "disabled" | "enabled" | "refresh needed" | "unavailable";
+  tone: "accent" | "attention" | "neutral";
+}>;
+
+/** Read-only copy for the settings row; this function grants no command authority. */
+export function attentionEmailPresentation(
+  machine: Pick<
+    MachineView,
+    "attentionEmailEnabled" | "notificationPolicyFreshness" | "notificationPolicyRevision"
+  >,
+): AttentionEmailPresentation {
+  if (
+    machine.notificationPolicyFreshness === "current"
+    && machine.notificationPolicyRevision !== null
+    && machine.attentionEmailEnabled !== null
+  ) {
+    return {
+      description: `Last published local email opt-in at notification policy revision ${machine.notificationPolicyRevision}.`,
+      label: machine.attentionEmailEnabled ? "enabled" : "disabled",
+      tone: machine.attentionEmailEnabled ? "accent" : "neutral",
+    };
+  }
+  if (machine.notificationPolicyFreshness === "stale") {
+    return {
+      description: "The encrypted setting and hosted policy revision do not match yet.",
+      label: "refresh needed",
+      tone: "attention",
+    };
+  }
+  if (machine.notificationPolicyFreshness === "unreadable") {
+    return {
+      description: "This machine’s email opt-in projection could not be verified.",
+      label: "unavailable",
+      tone: "attention",
+    };
+  }
+  return {
+    description: "Unavailable on this machine’s current daemon.",
+    label: "unavailable",
+    tone: "neutral",
   };
 }
 

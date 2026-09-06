@@ -1,9 +1,12 @@
 import { formatAttachmentSize } from "../domain/attachments";
 import {
+  notificationEmailCommandResultSchema,
+  notificationHoursCommandResultSchema,
   publicSessionListPageSchema,
   signedOutSessionListMetadataSchema,
   type LocalCommand,
 } from "../domain/contracts";
+import { canonicalizeNotificationTimeZone } from "../domain/notification-hours";
 import {
   parseAccountKeyStatus,
   parseCloudDeviceList,
@@ -784,6 +787,54 @@ const workResultMatchesOperation = (
 };
 
 const assertCommandSuccessData = (command: LocalCommand, data: unknown): void => {
+  if (
+    command.kind === "notification-email.status"
+    || command.kind === "notification-email.enable"
+    || command.kind === "notification-email.disable"
+  ) {
+    const parsed = notificationEmailCommandResultSchema.safeParse(data);
+    if (!parsed.success) return invalidCommandResponse(command);
+    const authorityState = parsed.data.hostedAuthority.state;
+    if (
+      (command.kind === "notification-email.enable"
+        && authorityState !== "not_observed"
+        && authorityState !== "observed")
+      || (command.kind === "notification-email.disable"
+        && authorityState !== "not_observed"
+        && authorityState !== "acknowledged"
+        && authorityState !== "revocation_pending")
+    ) return invalidCommandResponse(command);
+    if (
+      command.kind !== "notification-email.status"
+      && (
+        parsed.data.policy.revision !== command.expectedRevision + 1
+        || parsed.data.policy.enabled !== (command.kind === "notification-email.enable")
+      )
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (
+    command.kind === "notification-hours.status"
+    || command.kind === "notification-hours.set"
+  ) {
+    const parsed = notificationHoursCommandResultSchema.safeParse(data);
+    if (!parsed.success) return invalidCommandResponse(command);
+    if (command.kind === "notification-hours.set") {
+      let expectedTimeZone: string;
+      try {
+        expectedTimeZone = canonicalizeNotificationTimeZone(command.timeZone);
+      } catch {
+        return invalidCommandResponse(command);
+      }
+      if (
+        parsed.data.policy.revision !== command.expectedRevision + 1
+        || parsed.data.policy.startMinute !== command.startMinute
+        || parsed.data.policy.endMinute !== command.endMinute
+        || parsed.data.policy.timeZone !== expectedTimeZone
+      ) invalidCommandResponse(command);
+    }
+    return;
+  }
   if (command.kind === "work.protocol") {
     const parsed = workProtocolDocumentSchema.safeParse(data);
     if (
@@ -1028,6 +1079,15 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
 };
 
 const publicInteractionData = (command: LocalCommand, data: unknown): unknown => {
+  if (
+    command.kind === "notification-email.status"
+    || command.kind === "notification-email.enable"
+    || command.kind === "notification-email.disable"
+  ) return notificationEmailCommandResultSchema.parse(data);
+  if (
+    command.kind === "notification-hours.status"
+    || command.kind === "notification-hours.set"
+  ) return notificationHoursCommandResultSchema.parse(data);
   if (command.kind === "work.protocol") return workProtocolDocumentSchema.parse(data);
   if (command.kind === "work.apply") return workOperationResultSchema.parse(data);
   if (command.kind === "work.snapshot") return workSnapshotSchema.parse(data);
@@ -1192,6 +1252,77 @@ const renderSessionTask = (task: SessionTaskRecord): string => [
   "Prompt",
   indented(task.prompt),
 ].join("\n");
+
+const notificationWallClock = (minute: number): string => {
+  const hour = Math.floor(minute / 60).toString().padStart(2, "0");
+  const minuteWithinHour = (minute % 60).toString().padStart(2, "0");
+  return `${hour}:${minuteWithinHour}`;
+};
+
+const renderNotificationHours = (data: unknown): string => {
+  const observation = notificationHoursCommandResultSchema.parse(data);
+  return [
+    "Notification hours",
+    `Range: ${notificationWallClock(observation.policy.startMinute)}-${notificationWallClock(observation.policy.endMinute)}`,
+    `Time zone: ${line(observation.policy.timeZone)}`,
+    `Current: ${observation.withinHours ? "yes" : "no"}`,
+    `Revision: ${String(observation.policy.revision)}`,
+    `Observed: ${instant(observation.observedAt)}`,
+  ].join("\n");
+};
+
+const renderNotificationEmail = (data: unknown): string => {
+  const result = notificationEmailCommandResultSchema.parse(data);
+  const authority = result.hostedAuthority;
+  const deviceConsentCurrent = authority.state === "observed"
+    && authority.deviceAuthority !== null
+    && result.policy.enabled
+    && authority.globalState === "enabled"
+    && authority.deviceAuthority.localNotificationPolicyRevision === result.policy.revision
+    && authority.deviceAuthority.globalNotificationGeneration
+      === authority.globalNotificationGeneration
+    && authority.deviceAuthority.consentLeaseUntil > authority.observedAt;
+  const hostedLines = authority.state === "not_observed"
+    ? [
+        "Hosted authority: not observed",
+        "No hosted acknowledgement is claimed.",
+      ]
+    : authority.state === "observed"
+      ? [
+          `Hosted authority: ${authority.globalState.replace("_", " ")}`,
+          `Hosted generation: ${String(authority.globalNotificationGeneration)}`,
+          `Hosted observed: ${instant(authority.observedAt)}`,
+          ...(authority.deviceAuthority === null
+            ? [
+                "Device consent: none observed",
+                "Device consent current: no",
+              ]
+            : [
+                `Device consent revision: ${String(authority.deviceAuthority.localNotificationPolicyRevision)}`,
+                `Device consent generation: ${String(authority.deviceAuthority.globalNotificationGeneration)}`,
+                `Device consent current: ${deviceConsentCurrent ? "yes" : "no"}`,
+                `Device consent expires: ${instant(authority.deviceAuthority.consentLeaseUntil)}`,
+              ]),
+        ]
+      : authority.state === "acknowledged"
+        ? [
+            "Hosted invalidation: acknowledged",
+            `Acknowledged: ${instant(authority.acknowledgedAt)}`,
+            `Consent lease closed: ${instant(authority.consentLeaseUntil)}`,
+            "This does not claim recall of any delivery already started.",
+          ]
+        : [
+            "Hosted invalidation: pending",
+            `Existing hosted consent expires no later than: ${instant(authority.expiresNoLaterThan)}`,
+            "This does not claim recall of any delivery already started.",
+          ];
+  return [
+    "Attention email notifications",
+    `Local setting: ${result.policy.enabled ? "enabled" : "disabled"}`,
+    `Revision: ${String(result.policy.revision)}`,
+    ...hostedLines,
+  ].join("\n");
+};
 
 const renderInteractionList = (
   command: Extract<LocalCommand, { kind: "interaction.list" | "session.interactions" }>,
@@ -2377,6 +2508,17 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       rows.push(table(report.recent as Record<string, unknown>[], ["occurredAt", "path", "kind", "rule", "decision", "outcome", "model", "sessionId"]));
     }
     output.writeStdout(`${rows.join("\n")}\n`);
+  } else if (
+    command.kind === "notification-email.status"
+    || command.kind === "notification-email.enable"
+    || command.kind === "notification-email.disable"
+  ) {
+    output.writeStdout(`${renderNotificationEmail(data)}\n`);
+  } else if (
+    command.kind === "notification-hours.status"
+    || command.kind === "notification-hours.set"
+  ) {
+    output.writeStdout(`${renderNotificationHours(data)}\n`);
   } else if (
     command.kind === "remote.policy-set"
     || command.kind === "remote.policy-status"

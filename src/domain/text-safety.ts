@@ -7,6 +7,8 @@ const absolutePathTokenGlobalPattern = /(^|[^\p{L}\p{N}_/\\])((?:file:\/\/+|~\/|
 const repeatedLeadingSlashPathPattern = /(^|[\s"'`<>{}[\](),;])\/{2,}[^\s"'`<>{}[\](),;]*/u;
 const repeatedLeadingSlashPathGlobalPattern = /(^|[\s"'`<>{}[\](),;])\/{2,}[^\s"'`<>{}[\](),;]*/gu;
 const unsafeTerminalScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const secretShapedTextPattern =
+  /(?:-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\b(?:sk|re)_[A-Za-z0-9_-]{8,}|\bsk-ant-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9_-]{8,}|\bAKIA[A-Z0-9]{12,}|\bBearer\s+[A-Za-z0-9._~-]{8,})/u;
 
 export function containsAbsolutePath(value: string): boolean {
   return absolutePathTokenPattern.test(value) || repeatedLeadingSlashPathPattern.test(value);
@@ -26,4 +28,9 @@ export function containsUnsafeTerminalScalar(value: string, allowLineFeeds = fal
     if (unsafeTerminalScalarPattern.test(scalar)) return true;
   }
   return false;
+}
+
+/** Recognised credential material that must never cross a public/cloud text boundary. */
+export function containsSecretShapedText(value: string): boolean {
+  return secretShapedTextPattern.test(value);
 }

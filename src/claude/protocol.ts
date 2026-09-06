@@ -4,6 +4,7 @@ import {
   attachmentFencedText,
   type PreparedAttachment,
 } from "../domain/attachments.ts";
+import { isRecord, snapshotForeignJson } from "../domain/guards.ts";
 import type { InteractionDisplay, InteractionKind } from "../domain/interactions.ts";
 import { redactAbsolutePaths } from "../domain/text-safety.ts";
 import { redactCompleteSensitiveText } from "../sensitive-text.ts";
@@ -208,6 +209,11 @@ export const boundClaudeText = (input: string, maxUtf8Bytes: number): string => 
 const SUMMARY_BYTES = 2_048;
 const displayText = (input: string): string =>
   boundClaudeText(sanitizeClaudeText(input), SUMMARY_BYTES);
+
+const displayTextResult = (input: string): Readonly<{ exact: boolean; text: string }> => {
+  const text = displayText(input);
+  return { exact: text === input, text };
+};
 
 // ---------------------------------------------------------------------------
 // The closed stream-event union.
@@ -630,25 +636,43 @@ export const claudeInteractionDisplay = (request: ClaudeCanUseTool): Interaction
         reason,
         summary: displayText(`${request.displayName} ${filePathOf(request)}`),
       };
-    case "user_input":
+    case "user_input": {
+      const questions = request.questions ?? [];
+      const exactRemoteAnswerMap = questions.every((question) => !question.multiSelect)
+        && new Set(questions.map((question) => question.question)).size === questions.length;
       return {
         blocking: true,
         kind: "user_input",
-        questions: (request.questions ?? []).map((question, index) => ({
-          allowsOther: false,
-          header: displayText(question.header),
-          id: `q${String(index)}`,
-          options: question.options.map((option) => ({
-            description: displayText(option.description),
-            label: displayText(option.label),
-          })),
-          question: displayText(question.question),
-          // Claude's question tool has no secret-answer mode; HRA still marks
-          // every projected answer field as non-secret explicitly.
-          secret: false,
-        })),
+        questions: questions.map((question, index) => {
+          const header = displayTextResult(question.header);
+          const prompt = displayTextResult(question.question);
+          const renderedOptions = question.options.map((option) => {
+            const description = displayTextResult(option.description);
+            const label = displayTextResult(option.label);
+            return {
+              exact: description.exact && label.exact,
+              option: { description: description.text, label: label.text },
+            };
+          });
+          const remoteAnswerable = exactRemoteAnswerMap
+            && header.exact
+            && prompt.exact
+            && renderedOptions.every(({ exact }) => exact);
+          return {
+            allowsOther: false,
+            header: header.text,
+            id: `q${String(index)}`,
+            options: renderedOptions.map(({ option }) => option),
+            question: prompt.text,
+            // Claude's question tool has no secret-answer mode; HRA still marks
+            // every projected answer field as non-secret explicitly.
+            secret: false,
+            ...(remoteAnswerable ? { remoteAnswerable: true as const } : {}),
+          };
+        }),
         summary: displayText(request.questions?.[0]?.question ?? request.displayName),
       };
+    }
     case "permission_approval":
       return {
         allowsSessionScope: false,
@@ -675,20 +699,40 @@ export const claudeAnswerMap = (
   request: ClaudeCanUseTool,
   answers: Readonly<Record<string, string>>,
 ): Record<string, string> => {
-  const wire: Record<string, string> = {};
-  (request.questions ?? []).forEach((question, index) => {
-    const answer = answers[`q${String(index)}`];
-    if (answer === undefined) return;
+  const questions = request.questions ?? [];
+  if (
+    questions.some((question) => question.multiSelect)
+    || new Set(questions.map((question) => question.question)).size !== questions.length
+  ) throw new ClaudeError("UNSUPPORTED_CAPABILITY", "Claude question answers are not exact");
+  const snapshot = snapshotForeignJson(answers);
+  if (!snapshot.ok || !isRecord(snapshot.value)) {
+    throw new ClaudeError("INVALID_INPUT", "Claude answers must be plain data");
+  }
+  const answerData = snapshot.value;
+  const expectedKeys = questions.map((_, index) => `q${String(index)}`);
+  const answerKeys = Reflect.ownKeys(answerData);
+  if (
+    answerKeys.length !== expectedKeys.length
+    || answerKeys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))
+  ) throw new ClaudeError("INVALID_INPUT", "Every Claude question must be answered exactly once");
+  const entries: Array<readonly [string, string]> = [];
+  questions.forEach((question, index) => {
+    const key = `q${String(index)}`;
+    const descriptor = Reflect.getOwnPropertyDescriptor(answerData, key);
+    if (
+      descriptor === undefined
+      || !("value" in descriptor)
+      || descriptor.enumerable !== true
+      || typeof descriptor.value !== "string"
+    ) throw new ClaudeError("INVALID_INPUT", "Claude answers must be plain data");
+    const answer = descriptor.value;
     const labels = question.options.map((option) => option.label);
     if (labels.length > 0 && !labels.includes(answer)) {
       throw new ClaudeError("INVALID_INPUT", "An answer must be one of the question's options");
     }
-    wire[question.question] = answer;
+    entries.push([question.question, answer]);
   });
-  if (Object.keys(wire).length !== (request.questions ?? []).length) {
-    throw new ClaudeError("INVALID_INPUT", "Every Claude question must be answered exactly once");
-  }
-  return wire;
+  return Object.fromEntries(entries);
 };
 
 export type ClaudeControlResponse =

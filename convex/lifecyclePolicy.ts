@@ -1,4 +1,5 @@
 export const CLOUD_USAGE_SNAPSHOT_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
+export const ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 
 // live_tail retention for detail-stream chunks: keep the current and
 // previous turn. The corpus this plan is based on (23,699 measured turns)
@@ -20,7 +21,7 @@ export const LIVE_TAIL_ROW_CAP_TRIGGER = 20;
 export type HostedTableLifecycle = Readonly<{
   owner: "user" | "parent" | "email_digest" | "capability" | "service";
   quota: "identity" | "device" | "account" | "session" | "chunk" | "usage" | "command" | "custody" | "receipt" | "security" | "job" | null;
-  retention: "auth_library" | "challenge_expiry" | "invite_expiry" | "active" | "encrypted_history" | "live_tail" | "lease_expiry" | "command_recovery" | "usage_90d_daily" | "receipt_expiry" | "security_90d" | "job_until_complete" | "service_permanent";
+  retention: "auth_library" | "challenge_expiry" | "invite_expiry" | "active" | "encrypted_history" | "live_tail" | "lease_expiry" | "command_recovery" | "attention_notification_7d" | "usage_90d_daily" | "receipt_expiry" | "security_90d" | "job_until_complete" | "service_permanent";
   deletionOrder: number | null;
   disposition: "erase" | "expire" | "complete_receipt" | "service_reset";
 }>;
@@ -61,6 +62,8 @@ export const HOSTED_TABLE_LIFECYCLE = {
   executionLeases: { owner: "user", quota: "session", retention: "lease_expiry", deletionOrder: 10, disposition: "erase" },
   sessionCommands: { owner: "user", quota: "command", retention: "command_recovery", deletionOrder: 10, disposition: "erase" },
   deviceCommands: { owner: "user", quota: "command", retention: "command_recovery", deletionOrder: 10, disposition: "erase" },
+  attentionNotificationOutbox: { owner: "user", quota: "command", retention: "attention_notification_7d", deletionOrder: 10, disposition: "erase" },
+  attentionNotificationSafetyFaults: { owner: "service", quota: "security", retention: "attention_notification_7d", deletionOrder: 10, disposition: "expire" },
   codexAccounts: { owner: "user", quota: "account", retention: "active", deletionOrder: 50, disposition: "erase" },
   deviceAccountBindings: { owner: "user", quota: "account", retention: "active", deletionOrder: 40, disposition: "erase" },
   accountUsageSnapshots: { owner: "user", quota: "usage", retention: "usage_90d_daily", deletionOrder: 40, disposition: "erase" },

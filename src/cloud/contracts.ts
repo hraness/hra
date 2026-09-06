@@ -1,4 +1,5 @@
 import { hasExactKeys, isRecord } from "../domain/guards";
+import { cloudEnvelopeLimits } from "../domain/cloud-envelope-contract";
 import { containsAbsolutePath } from "../domain/text-safety";
 
 // These helpers moved to src/domain. The re-exports keep cloud callers stable
@@ -9,20 +10,24 @@ export {
   type AccountKeyLossPreconditionFailure,
   type CloudProjectionRecoveryAdmissionFailure,
 } from "../domain/cloud-outcomes";
-export { assertNever, hasExactKeys, isRecord } from "../domain/guards";
+export { assertNever, hasExactKeys, isRecord, snapshotForeignJson } from "../domain/guards";
+export { cloudEnvelopeLimits, jsonValueFitsCloudEnvelope } from "../domain/cloud-envelope-contract";
 export {
   containsAbsolutePath,
+  containsSecretShapedText,
   containsUnsafeTerminalScalar,
   redactAbsolutePaths,
 } from "../domain/text-safety";
 export { isUuidV7 } from "../domain/uuid-v7";
 
 export const cloudLimits = Object.freeze({
-  ciphertextCharacters: 350_000,
+  ciphertextCharacters: cloudEnvelopeLimits.ciphertextCharacters,
   detailChunkBytes: 256 * 1024,
   deviceLabelCiphertextCharacters: 2_048,
   identifierCharacters: 96,
   metadataCiphertextCharacters: 16_384,
+  notificationEmailCiphertextCharacters: 2_048,
+  notificationHoursCiphertextCharacters: 4_096,
   pageSize: 100,
   registryCiphertextCharacters: 65_536,
   resultCodeCharacters: 64,
@@ -103,13 +108,15 @@ export type DeviceCommandKind =
   | "session_start"
   | "account_login_start"
   | "account_login_status"
-  | "usage_refresh";
+  | "usage_refresh"
+  | "set_notification_hours";
 
 export const DEVICE_COMMAND_KINDS: readonly DeviceCommandKind[] = Object.freeze([
   "session_start",
   "account_login_start",
   "account_login_status",
   "usage_refresh",
+  "set_notification_hours",
 ] as const);
 
 export function isDeviceCommandKind(value: unknown): value is DeviceCommandKind {

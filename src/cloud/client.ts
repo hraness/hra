@@ -37,6 +37,8 @@ export const cloudQueries = [
 
 export const cloudMutations = [
   "accountDeletion:request",
+  "attentionNotifications:authorityStatus",
+  "attentionNotifications:reconcile",
   "devices:register",
   "devices:recoverRegistration",
   "devices:approve",

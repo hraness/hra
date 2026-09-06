@@ -29,6 +29,9 @@ export {
 export {
   cloudLimits,
   COMMAND_KINDS,
+  containsAbsolutePath,
+  containsSecretShapedText,
+  containsUnsafeTerminalScalar,
   DEVICE_COMMAND_KINDS,
   hasExactKeys,
   isBase64Url,
@@ -42,6 +45,7 @@ export {
   isUuidV7,
   parseEncryptedEnvelope,
   parseWrappedKeyEnvelope,
+  snapshotForeignJson,
   type AuthorityTuple,
   type CommandKind,
   type CommandState,
@@ -57,11 +61,16 @@ export {
   decryptDetailEvents,
   parseCompactSessionEvent,
   parseDetailSessionEvent,
+  remoteInteractionPolicyReasonCodeOrder,
   sessionChunkAad,
   type CompactInteractionDecision,
   type CompactInteractionKind,
   type CompactInteractionQuestion,
   type CompactInteractionState,
+  type CompactRemoteInteractionAction,
+  type CompactRemoteInteractionPolicy,
+  type CompactRemoteInteractionQuestion,
+  type CompactRemoteInteractionReasonCode,
   type CompactMessageActor,
   type CompactSessionEvent,
   type DetailSessionEvent,
@@ -75,16 +84,20 @@ export {
   cloudPayloadAad,
   decryptDeviceCommandResult,
   decryptDeviceRegistry,
+  decryptNotificationEmail,
+  decryptNotificationHours,
   decryptSessionMetadata,
   deviceCommandLoginResultLifetimeMs,
   deviceCommandLimits,
   deviceRegistryLimits,
   encryptDeviceCommand,
   encryptRemoteCommand,
+  encryptNotificationHours,
   parseDeviceCommandPayload,
   parseDeviceCommandResultPayload,
   parseDeviceRegistryPayload,
   parseRemoteCommandPayload,
+  remoteInteractionAnswersFitCommandEnvelope,
   type CloudPayloadAuthority,
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
@@ -97,6 +110,15 @@ export {
 } from "../../../src/cloud/payloads";
 
 export type {
+  NotificationEmailPolicy,
+} from "../../../src/domain/notification-email-contract";
+
+export type {
+  NotificationHoursPolicy,
+  NotificationHoursUpdate,
+} from "../../../src/domain/notification-hours";
+
+export type {
   CloudAction,
   CloudMutation,
   CloudQuery,
@@ -105,3 +127,8 @@ export type {
 export {
   createCloudUuidV7,
 } from "../../../src/domain/uuid-v7";
+
+export {
+  remoteInteractionAnswerLimits,
+  remoteInteractionJsonFitsProviderLimit,
+} from "../../../src/domain/remote-interaction-contract";

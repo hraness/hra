@@ -38,6 +38,7 @@ import {
   sessionStartTargets,
   type PresetChoice,
 } from "../model/device-commands";
+import { presetLabels } from "../model/settings-commands";
 import {
   attachmentAcceptAttribute,
   attachmentSendSupported,
@@ -59,9 +60,9 @@ function sameSummary(left: SessionCardSummary, right: SessionCardSummary): boole
 }
 
 const presetOptions: readonly Readonly<{ label: string; value: PresetChoice }>[] = [
-  { label: "Sol Low", value: "low" },
-  { label: "Sol High", value: "high" },
-  { label: "Sol Ultra", value: "ultra" },
+  { label: presetLabels.low, value: "low" },
+  { label: presetLabels.high, value: "high" },
+  { label: presetLabels.ultra, value: "ultra" },
 ];
 
 /** The card under the pointer during a drag, resolved from the DOM. */

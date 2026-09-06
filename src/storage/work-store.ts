@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import type { Database } from "bun:sqlite";
 
+import { currentPresetContract } from "../domain/presets";
 import { isUuidV7 } from "../domain/uuid-v7";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
 import { workPreparedEffectMessage } from "../domain/work-message";
@@ -142,6 +143,7 @@ CREATE TABLE IF NOT EXISTS works (
   client_ref TEXT NOT NULL UNIQUE CHECK(length(CAST(client_ref AS BLOB)) BETWEEN 1 AND 256),
   coordinator_session_id TEXT NOT NULL REFERENCES sessions(id),
   objective TEXT NOT NULL CHECK(length(CAST(objective AS BLOB)) BETWEEN 1 AND 16384),
+  preset_contract INTEGER NOT NULL DEFAULT 1 CHECK(preset_contract IN (1,2)),
   state TEXT NOT NULL CHECK(state IN ('active','cancel_pending','fail_pending','completed','failed','cancelled')),
   revision INTEGER NOT NULL CHECK(revision >= 0),
   stream_epoch TEXT NOT NULL CHECK(length(stream_epoch) = 36),
@@ -530,8 +532,9 @@ CREATE TABLE IF NOT EXISTS work_nested_effect_settlements (
   created_at INTEGER NOT NULL CHECK(created_at >= 0)
 ) STRICT;
 
-CREATE TRIGGER IF NOT EXISTS works_identity_immutable
-BEFORE UPDATE OF id,client_ref,coordinator_session_id,objective,stream_epoch,created_at ON works
+DROP TRIGGER IF EXISTS works_identity_immutable;
+CREATE TRIGGER works_identity_immutable
+BEFORE UPDATE OF id,client_ref,coordinator_session_id,objective,preset_contract,stream_epoch,created_at ON works
 BEGIN SELECT RAISE(ABORT,'WORK_IMMUTABLE'); END;
 CREATE TRIGGER IF NOT EXISTS works_no_delete
 BEFORE DELETE ON works
@@ -643,11 +646,15 @@ WHEN NOT (
   (OLD.state = 'recovery_required' AND NEW.state IN ('running','submitted','completed','failed','released','cancelled'))
 )
 BEGIN SELECT RAISE(ABORT,'WORK_ATTEMPT_STATE_TRANSITION'); END;
-CREATE TRIGGER IF NOT EXISTS work_attempt_route_guard
+DROP TRIGGER IF EXISTS work_attempt_route_guard;
+CREATE TRIGGER work_attempt_route_guard
 BEFORE INSERT ON work_attempts
 WHEN NOT EXISTS (
+  -- Contract 1 and 2 both resolve Codex low to the exact Luna/max tuple.
+  -- High and ultra changed model and therefore remain version-fenced.
   SELECT 1
   FROM work_tasks AS t
+  JOIN works AS w ON w.id=t.work_id
   JOIN sessions AS s ON s.id=NEW.worker_session_id
   JOIN work_members AS m ON m.work_id=NEW.work_id AND m.session_id=s.id
   WHERE t.id=NEW.task_id AND t.work_id=NEW.work_id
@@ -655,17 +662,28 @@ WHEN NOT EXISTS (
     AND t.preset=NEW.preset AND t.fast=NEW.fast
     AND s.profile_id=NEW.account_id AND s.project_id=NEW.project_id
     AND s.preset=NEW.preset AND s.fast_enabled=NEW.fast
+    AND s.provider='codex'
+    AND (
+      s.preset_contract=w.preset_contract
+      OR NEW.preset='low'
+    )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_ATTEMPT_ROUTE_MISMATCH'); END;
-CREATE TRIGGER IF NOT EXISTS work_session_attempt_authority_guard
-BEFORE UPDATE OF profile_id,project_id,preset,fast_enabled ON sessions
+DROP TRIGGER IF EXISTS work_session_attempt_authority_guard;
+CREATE TRIGGER work_session_attempt_authority_guard
+BEFORE UPDATE OF profile_id,project_id,provider,preset,fast_enabled,preset_contract ON sessions
 WHEN EXISTS (
   SELECT 1 FROM work_attempts AS a
+  JOIN works AS w ON w.id=a.work_id
   WHERE a.worker_session_id=OLD.id
     AND a.state IN ('claimed','dispatching','running','recovery_required')
     AND (
       NEW.profile_id!=a.account_id OR NEW.project_id!=a.project_id
-      OR NEW.preset!=a.preset OR NEW.fast_enabled!=a.fast
+      OR NEW.provider!='codex' OR NEW.preset!=a.preset OR NEW.fast_enabled!=a.fast
+      OR (
+        NEW.preset_contract!=w.preset_contract
+        AND a.preset!='low'
+      )
     )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_SESSION_ATTEMPT_AUTHORITY'); END;
@@ -1018,13 +1036,16 @@ const assertWorkSchemaShape = (database: Database): void => {
   const requiredColumns: Readonly<Record<string, readonly string[]>> = {
     // Current work authority guards inspect the provider on their parent
     // session, so a merely present trigger is not a usable work schema.
-    sessions: ["provider"],
+    sessions: ["provider", "preset_contract"],
     work_release_tombstones: [
       "work_id", "release_idempotency_key", "release_request_digest", "client_ref_digest",
       "terminal_kind", "final_revision", "final_head_hash", "discarded_counts_json",
       "discarded_records_digest", "released_at", "retention_upper_bound_at", "result_json",
     ],
-    works: ["id", "coordinator_session_id", "state", "revision", "stream_epoch", "next_sequence"],
+    works: [
+      "id", "coordinator_session_id", "preset_contract", "state", "revision",
+      "stream_epoch", "next_sequence",
+    ],
     work_tasks: [
       "id", "work_id", "account_id", "project_id", "preset", "fast", "not_before",
       "claim_by", "deadline", "max_attempts", "required_reviews",
@@ -1182,6 +1203,7 @@ type WorkRow = Readonly<{
   client_ref: string;
   coordinator_session_id: string;
   objective: string;
+  preset_contract: 1 | 2;
   state: "active" | "cancel_pending" | "fail_pending" | "completed" | "failed" | "cancelled";
   revision: number;
   stream_epoch: string;
@@ -1960,13 +1982,15 @@ export class WorkStore {
       `SELECT 1 AS present
        FROM work_tasks AS t
        JOIN work_members AS m ON m.work_id=t.work_id AND m.session_id=?
+       JOIN works AS w ON w.id=t.work_id
        JOIN sessions AS s ON s.id=m.session_id
        JOIN profiles AS p ON p.id=s.profile_id
        WHERE t.id=? AND t.work_id=?
          AND t.account_id=s.profile_id AND t.project_id=s.project_id
          AND t.preset=s.preset AND t.fast=s.fast_enabled
-         AND s.state IN ('active','idle') AND p.state!='removed'
-         AND (s.provider='claude' OR p.state='signed_in')
+         AND s.provider='codex'
+         AND (s.preset_contract=w.preset_contract OR s.preset='low')
+         AND s.state IN ('active','idle') AND p.state='signed_in'
          AND p.process_generation=?`,
     ).get(
       effect.targetSessionId,
@@ -3522,10 +3546,16 @@ export class WorkStore {
       `SELECT p.process_generation AS account_generation
        FROM sessions AS s
        JOIN profiles AS p ON p.id=s.profile_id
+       JOIN works AS w ON w.id=?
        WHERE s.id=? AND s.profile_id=? AND s.project_id=? AND s.preset=? AND s.fast_enabled=?
-         AND s.state IN ('active','idle') AND p.state!='removed'
-         AND (s.provider='claude' OR p.state='signed_in')`,
+         AND s.provider='codex'
+         AND (
+           s.preset_contract=w.preset_contract
+           OR s.preset='low'
+         )
+         AND s.state IN ('active','idle') AND p.state='signed_in'`,
     ).get(
+      task.work_id,
       actorSessionId,
       task.account_id,
       task.project_id,
@@ -3545,9 +3575,14 @@ export class WorkStore {
        FROM sessions AS s
        JOIN profiles AS p ON p.id=s.profile_id
        JOIN work_members AS m ON m.work_id=? AND m.session_id=s.id
+       JOIN works AS w ON w.id=m.work_id
        WHERE s.id=? AND s.profile_id=? AND s.project_id=? AND s.preset=? AND s.fast_enabled=?
-         AND s.state IN ('active','idle') AND p.state!='removed'
-         AND (s.provider='claude' OR p.state='signed_in')
+         AND s.provider='codex'
+         AND (
+           s.preset_contract=w.preset_contract
+           OR s.preset='low'
+         )
+         AND s.state IN ('active','idle') AND p.state='signed_in'
          AND p.process_generation=?`,
     ).get(
       attempt.work_id,
@@ -4262,14 +4297,15 @@ export class WorkStore {
         const now = this.#tick();
         this.#database.query(
           `INSERT INTO works(
-             id,client_ref,coordinator_session_id,objective,state,revision,stream_epoch,next_sequence,head_hash,
+             id,client_ref,coordinator_session_id,objective,preset_contract,state,revision,stream_epoch,next_sequence,head_hash,
              created_at,updated_at
-           ) VALUES (?,?,?,?,'active',0,?,1,NULL,?,?)`,
+           ) VALUES (?,?,?,?,?,'active',0,?,1,NULL,?,?)`,
         ).run(
           workId,
           operation.clientRef,
           operation.coordinatorSessionId,
           operation.objective,
+          currentPresetContract,
           randomUUID(),
           now,
           now,

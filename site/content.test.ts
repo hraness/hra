@@ -485,9 +485,9 @@ describe("public content contract", () => {
       "hra remote command <uuidv7>",
       "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
       "--idempotency-key <current-uuidv7>",
-      "includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary",
-      "A pending command or file-change approval can be decided from another device with",
-      "Session scope and secret answers never travel remotely.",
+      "includes interaction events with a public interaction ID, kind, state, revision, blocking status, bounded safe summary, and a nested version 2 remote policy",
+      "Another device may decline a pending command, permission, or file-change request with",
+      "every MCP answer stays on the execution machine",
       "Transcript upload is bound to a durable local stream ledger",
       "HRA never resets, aliases, overwrites, or destructively reseeds encrypted history.",
       "hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
@@ -635,13 +635,13 @@ describe("public content contract", () => {
     const html = htmlVisibleText(rawHtml);
     const claims = [
       "Human terminal",
-      "hra session start personal --provider codex --preset high",
+      "hra session start personal --provider codex",
       "/account personal",
       "/session <session-id>",
       "Agent caller",
       "data.session.id",
       "data.eventStream.cursor",
-      "hra session start personal --provider codex --preset high --json",
+      "hra session start personal --provider codex --json",
       "hra session status <session-id> --json",
       "hra session watch <session-id> --cursor <status-cursor> --jsonl",
       "--follow",
@@ -671,6 +671,13 @@ describe("public content contract", () => {
       expect(markdown).toContain(claim);
       expect(html).toContain(claim);
     }
+    expect(publicContent.hero.steps[0]).toMatchObject({
+      command: "hra session start personal --provider codex --json",
+      detail: "Create an Astra Ultra Codex session under the account profile you name.",
+    });
+    expect(markdown).toContain("Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping");
+    expect(html).toContain("Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping");
+    expect(markdown).not.toContain("session start personal --provider codex --preset high");
   });
 
   test("publishes bounded status and cursor-safe observation contracts", () => {
@@ -805,7 +812,7 @@ describe("public content contract", () => {
       expect(surface).toContain("anchored when the provider delivered it");
       expect(surface).toContain("caps the pending interval at 30 minutes");
       expect(surface).toContain("never invents an answer or grant");
-      expect(surface).toContain("encrypted remote interaction metadata does not include it");
+      expect(surface).toContain("nested remote policy version 2 carries the same absolute deadline");
     }
   });
 

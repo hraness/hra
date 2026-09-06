@@ -52,6 +52,25 @@ describe("bounded Convex transport", () => {
     expect(cloudMutations).toContain("deviceCommands:confirmTerminalRecovery");
   });
 
+  test("exposes only daemon authority mutations for attention notifications", () => {
+    expect(cloudQueries.filter((name) => name.startsWith("attentionNotifications:")))
+      .toEqual([]);
+    expect(cloudMutations.filter((name) => name.startsWith("attentionNotifications:")))
+      .toEqual([
+        "attentionNotifications:authorityStatus",
+        "attentionNotifications:reconcile",
+      ]);
+    for (const forbidden of [
+      "attentionNotifications:claimNext",
+      "attentionNotifications:settleAttempt",
+      "attentionNotificationDelivery:deliver",
+      "attentionNotificationDelivery:drain",
+    ]) {
+      expect(cloudQueries as readonly string[]).not.toContain(forbidden);
+      expect(cloudMutations as readonly string[]).not.toContain(forbidden);
+    }
+  });
+
   test("ends a hung query even when fetch ignores its abort signal", async () => {
     let calls = 0;
     let observedSignal: AbortSignal | null | undefined;

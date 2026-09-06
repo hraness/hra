@@ -25,7 +25,11 @@ import {
   type CloudProjectionRecoveryJournalEntry,
 } from "../cloud/daemon-journal";
 import { renderSuccess } from "../cli/render";
-import { localCommandSchema, type LocalCommand } from "../domain/contracts";
+import {
+  localCommandSchema,
+  type LocalCommand,
+  type NotificationEmailHostedAuthority,
+} from "../domain/contracts";
 import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
@@ -39,7 +43,6 @@ import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
 import type { PreparedAttachment } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
-import type { Preset } from "../domain/presets";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import {
   SESSION_EVENT_RETAIN_AGE_MS,
@@ -77,7 +80,7 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
   processGeneration: authority.generation,
   observedAt: 2_000,
   preset: "high",
-  model: "gpt-5.6-sol",
+  model: "gpt-6-astra",
   reasoningEffort: "max",
   serviceTier: null,
   fast: false,
@@ -201,6 +204,8 @@ class FakeCodex implements CodexRuntimePort {
   listedProjections: readonly CodexSessionProjection[] = [];
   listedNextCursor: string | null = null;
   readonly sessionListRequests: Array<Parameters<CodexRuntimePort["listSessions"]>[0]> = [];
+  readonly sessionReviewRequests: Array<Parameters<CodexRuntimePort["reviewSessionStart"]>[0]> = [];
+  readonly turnReviewRequests: Array<Parameters<CodexRuntimePort["reviewTurnStart"]>[0]> = [];
   loginResult: CodexLoginOutcome = { status: "signed_in", account: { signedIn: true, email: "person@example.com", plan: "Plus" } };
   cancelLoginResult: { status: "canceled" | "not_found" } = { status: "canceled" };
   beforeLoginReturn?: (input: { authority: ProfileAuthority; method: "browser" | "device_code" }) => Promise<void>;
@@ -235,16 +240,17 @@ class FakeCodex implements CodexRuntimePort {
     this.sessionListRequests.push(input);
     return { sessions: this.listedProjections, nextCursor: this.listedNextCursor };
   }
-  async reviewSessionStart(input: { authority: ProfileAuthority; preset: Preset; fast: boolean }): Promise<RuntimeStartReview> {
+  async reviewSessionStart(input: Parameters<CodexRuntimePort["reviewSessionStart"]>[0]): Promise<RuntimeStartReview> {
     this.calls.push("review-session");
+    this.sessionReviewRequests.push(input);
     const base = runtimeProfile(input.authority);
     const effectiveRuntimeProfile = this.runtimeProfileOverride ?? {
       ...base,
       preset: input.preset,
       fast: input.fast,
       serviceTier: input.fast ? "priority" as const : null,
-      model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
-      reasoningEffort: input.preset === "ultra" ? "ultra" as const : "max" as const,
+      model: input.requirement.model,
+      reasoningEffort: input.requirement.effort,
     };
     return { reviewId: crypto.randomUUID(), kind: "session_start", effectiveRuntimeProfile };
   }
@@ -299,9 +305,10 @@ class FakeCodex implements CodexRuntimePort {
     await this.beforeReadSessionReturn?.();
     return this.readProjection;
   }
-  async reviewTurnStart(input: { authority: ProfileAuthority; preset: Preset; fast: boolean }): Promise<RuntimeStartReview> {
+  async reviewTurnStart(input: Parameters<CodexRuntimePort["reviewTurnStart"]>[0]): Promise<RuntimeStartReview> {
     this.calls.push("review-turn");
     this.turnEffectTrace.push("review");
+    this.turnReviewRequests.push(input);
     const error = this.reviewTurnErrorOnce;
     delete this.reviewTurnErrorOnce;
     if (error !== undefined) throw error;
@@ -311,8 +318,8 @@ class FakeCodex implements CodexRuntimePort {
       preset: input.preset,
       fast: input.fast,
       serviceTier: input.fast ? "priority" as const : null,
-      model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
-      reasoningEffort: input.preset === "ultra" ? "ultra" as const : "max" as const,
+      model: input.requirement.model,
+      reasoningEffort: input.requirement.effort,
     };
     return { reviewId: crypto.randomUUID(), kind: "turn_start", effectiveRuntimeProfile };
   }
@@ -426,6 +433,16 @@ class FakeDaemonAuthority {
 }
 
 class FakeCloud implements CloudControlPort {
+  attentionObservation: NotificationEmailHostedAuthority = { state: "not_observed" };
+  attentionInvalidation: Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  > | null = null;
+  beforeAttentionInvalidation?: (
+    input: Parameters<NonNullable<CloudControlPort[
+      "invalidateAttentionNotificationAuthority"
+    ]>>[0],
+  ) => Promise<void> | void;
   readonly projectionRecoveries: Array<{
     acknowledgeGap: true;
     idempotencyKey: string;
@@ -481,6 +498,21 @@ class FakeCloud implements CloudControlPort {
     return this.statusResult;
   }
   async sync(): Promise<unknown> { return { synced: true }; }
+  async observeAttentionNotificationAuthority(): Promise<NotificationEmailHostedAuthority> {
+    return this.attentionObservation;
+  }
+  async invalidateAttentionNotificationAuthority(input: Parameters<NonNullable<
+    CloudControlPort["invalidateAttentionNotificationAuthority"]
+  >>[0]): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    await this.beforeAttentionInvalidation?.(input);
+    if (this.attentionInvalidation === null) {
+      throw new Error("Fake hosted notification invalidation is unavailable.");
+    }
+    return this.attentionInvalidation;
+  }
   async isCompactProjectionRecoveryUnsettled(sessionPublicId: `sess_${string}`): Promise<boolean> {
     await this.beforeProjectionUnsettledSessionReturn?.(sessionPublicId);
     return this.projectionRecoveryBlocker === undefined
@@ -943,6 +975,286 @@ const renderJson = (command: LocalCommand, data: unknown): string => {
 };
 
 describe("HraService", () => {
+  test("reports and CAS-updates notification hours with the injected clock only", async () => {
+    let now = Date.parse("2026-09-04T12:30:00.000Z");
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => now,
+    );
+    const approvalBefore = await value.service.execute(
+      { kind: "autorespond.status" },
+      { signal },
+    );
+
+    expect(await value.service.execute({
+      kind: "notification-hours.set",
+      expectedRevision: 1,
+      version: 1,
+      startMinute: 10 * 60,
+      endMinute: 22 * 60,
+      timeZone: "UTC",
+    }, { signal })).toEqual({
+      policy: {
+        version: 1,
+        revision: 2,
+        startMinute: 10 * 60,
+        endMinute: 22 * 60,
+        timeZone: "UTC",
+      },
+      observedAt: now,
+      withinHours: true,
+    });
+
+    now = Date.parse("2026-09-04T22:00:00.000Z");
+    expect(await value.service.execute(
+      { kind: "notification-hours.status" },
+      { signal },
+    )).toEqual({
+      policy: {
+        version: 1,
+        revision: 2,
+        startMinute: 10 * 60,
+        endMinute: 22 * 60,
+        timeZone: "UTC",
+      },
+      observedAt: now,
+      withinHours: false,
+    });
+    expect(await value.service.execute(
+      { kind: "autorespond.status" },
+      { signal },
+    )).toEqual(approvalBefore);
+  });
+
+  test("maps a stale notification-hours revision to a closed conflict", async () => {
+    const value = await fixture();
+    const first = {
+      kind: "notification-hours.set",
+      expectedRevision: 1,
+      version: 1,
+      startMinute: 8 * 60,
+      endMinute: 20 * 60,
+      timeZone: "UTC",
+    } as const;
+    await value.service.execute(first, { signal });
+
+    await expect(value.service.execute({
+      ...first,
+      startMinute: 9 * 60,
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      name: "CommandFailure",
+    });
+    expect(value.store.readNotificationHours()).toEqual({
+      version: 1,
+      revision: 2,
+      startMinute: 8 * 60,
+      endMinute: 20 * 60,
+      timeZone: "UTC",
+    });
+  });
+
+  test("keeps notification email local, default-off, and on the shared revision", async () => {
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 1_000);
+    expect(await value.service.execute(
+      { kind: "notification-email.status" },
+      { signal },
+    )).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: false, revision: 1, version: 1 },
+    });
+    expect(await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: true, revision: 2, version: 1 },
+    });
+    expect((await value.service.execute(
+      { kind: "notification-hours.status" },
+      { signal },
+    ) as { policy: { revision: number } }).policy.revision).toBe(2);
+
+    await value.service.execute({
+      kind: "notification-hours.set",
+      expectedRevision: 2,
+      version: 1,
+      startMinute: 480,
+      endMinute: 1_200,
+      timeZone: "UTC",
+    }, { signal });
+    expect(await value.service.execute(
+      { kind: "notification-email.status" },
+      { signal },
+    )).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: true, revision: 3, version: 1 },
+    });
+    expect(await value.service.execute({
+      expectedRevision: 3,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: false, revision: 4, version: 1 },
+    });
+  });
+
+  test("commits local disable before reporting hosted acknowledgement", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    cloud.beforeAttentionInvalidation = (input) => {
+      expect(value.store.readNotificationEmailPolicy()).toEqual({
+        enabled: false,
+        revision: 3,
+        version: 1,
+      });
+      expect(input.localNotificationPolicyRevision).toBe(3);
+    };
+    cloud.attentionInvalidation = {
+      acknowledgedAt: 61_000,
+      consentLeaseUntil: 61_000,
+      state: "acknowledged",
+    };
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: {
+        acknowledgedAt: 61_000,
+        consentLeaseUntil: 61_000,
+        state: "acknowledged",
+      },
+      policy: { enabled: false, revision: 3, version: 1 },
+    });
+  });
+
+  test("returns exact bounded hosted observations for status and enable", async () => {
+    const cloud = new FakeCloud();
+    cloud.attentionObservation = {
+      deviceAuthority: {
+        consentLeaseUntil: 180_000,
+        globalNotificationGeneration: 4,
+        localNotificationPolicyRevision: 1,
+      },
+      globalNotificationGeneration: 4,
+      globalState: "enabled",
+      observedAt: 60_000,
+      state: "observed",
+    };
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    expect(await value.service.execute(
+      { kind: "notification-email.status" },
+      { signal },
+    )).toEqual({
+      hostedAuthority: cloud.attentionObservation,
+      policy: { enabled: false, revision: 1, version: 1 },
+    });
+    expect(await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal })).toEqual({
+      hostedAuthority: cloud.attentionObservation,
+      policy: { enabled: true, revision: 2, version: 1 },
+    });
+    for (const attentionObservation of [
+      {
+        acknowledgedAt: 61_000,
+        consentLeaseUntil: 61_000,
+        state: "acknowledged" as const,
+      },
+      {
+        expiresNoLaterThan: 180_000,
+        state: "revocation_pending" as const,
+      },
+      { state: "not_observed" as const },
+    ]) {
+      cloud.attentionObservation = attentionObservation;
+      expect((await value.service.execute(
+        { kind: "notification-email.status" },
+        { signal },
+      ) as { hostedAuthority: unknown }).hostedAuthority).toEqual(attentionObservation);
+    }
+    cloud.attentionObservation = {
+      acknowledgedAt: 61_000,
+      consentLeaseUntil: 61_000,
+      state: "acknowledged",
+    };
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.enable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: true, revision: 3, version: 1 },
+    });
+  });
+
+  test("does not invent a revocation deadline when offline after the local commit", async () => {
+    const cloud = new FakeCloud();
+    cloud.beforeAttentionInvalidation = () => {
+      throw new Error("offline");
+    };
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: { state: "not_observed" },
+      policy: { enabled: false, revision: 3, version: 1 },
+    });
+    expect(value.store.readNotificationEmailPolicy().enabled).toBe(false);
+  });
+
+  test("reports revocation pending only from an exact control receipt", async () => {
+    const cloud = new FakeCloud();
+    cloud.attentionInvalidation = {
+      expiresNoLaterThan: 180_000,
+      state: "revocation_pending",
+    };
+    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    expect(await value.service.execute({
+      expectedRevision: 2,
+      kind: "notification-email.disable",
+    }, { signal })).toEqual({
+      hostedAuthority: cloud.attentionInvalidation,
+      policy: { enabled: false, revision: 3, version: 1 },
+    });
+  });
+
+  test("maps stale notification-email CAS without changing local authority", async () => {
+    const value = await fixture();
+    await value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.enable",
+    }, { signal });
+    await expect(value.service.execute({
+      expectedRevision: 1,
+      kind: "notification-email.disable",
+    }, { signal })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining("notification-email status"),
+      name: "CommandFailure",
+    });
+    expect(value.store.readNotificationEmailPolicy()).toEqual({
+      enabled: true,
+      revision: 2,
+      version: 1,
+    });
+  });
+
   test("sets the two device-command switches locally and reports them", async () => {
     const value = await fixture();
     expect(await value.service.execute({ kind: "remote.policy-status" }, { signal })).toEqual({
@@ -2890,6 +3202,40 @@ describe("HraService", () => {
     }]);
   });
 
+  test("refuses local and remote preset changes until session recovery settles", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Recovery preset fence");
+    const quarantined = value.store.quarantineSession(sessionId);
+    const profile = value.store.requireProfileById(quarantined.profileId);
+    if (quarantined.providerThreadId === undefined) throw new Error("Expected provider binding.");
+    const refusal = {
+      code: "RECOVERY_REQUIRED",
+      message: "The session requires recovery before its model preset can change.",
+    };
+
+    await expect(value.service.execute({
+      kind: "session.preset",
+      preset: "high",
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject(refusal);
+    await expect(value.service.executeRemote({
+      idempotencyKey: "00000000-0000-4000-8000-0000000006c1",
+      kind: "session.preset",
+      preset: "high",
+      session: sessionId,
+    }, {
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      providerThreadId: quarantined.providerThreadId,
+      sessionId,
+    }, { signal })).rejects.toMatchObject(refusal);
+    expect(value.store.requireSession(sessionId)).toMatchObject({
+      preset: "high",
+      revision: quarantined.revision,
+      state: "recovery_required",
+    });
+  });
+
   test("reactivates stale live memory with a current TTL and does not churn epochs on unchanged resume", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     factsMemory.simulateExpiry = true;
@@ -3678,10 +4024,25 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([{ version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }, { version: 29 }, { version: 30 }, { version: 31 }, { version: 32 }, { version: 33 }, { version: 34 }, { version: 35 }]);
+      ).all()).toEqual([
+        { version: 25 },
+        { version: 26 },
+        { version: 27 },
+        { version: 28 },
+        { version: 29 },
+        { version: 30 },
+        { version: 31 },
+        { version: 32 },
+        { version: 33 },
+        { version: 34 },
+        { version: 35 },
+        { version: 36 },
+        { version: 37 },
+        { version: 38 },
+      ]);
     } finally {
       inspector.close(false);
     }
@@ -6173,6 +6534,53 @@ describe("HraService", () => {
     await service.settled();
     expect(store.requireQueue(queued.queued.id)).toMatchObject({ state: "applied" });
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
+    expect(codex.turnReviewRequests.at(-1)?.requirement).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(store.latestSessionRuntimeProfile(imported.id)?.profile).toMatchObject({
+      preset: "high",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+    });
+  });
+
+  test("sends an imported session with its legacy exact preset requirement", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Imported send" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Imported send docs", path: documents }, { signal });
+    const project = store.listProjects()[0];
+    if (project === undefined) throw new Error("Expected the imported session project.");
+    const imported = store.upsertProviderSession({
+      profileId: added.account.id,
+      projectId: project.id,
+      providerThreadId: "provider-thread-imported-send",
+      title: "Imported send",
+      state: "idle",
+      providerUpdatedAt: 10,
+    });
+    codex.readProjection = {
+      ...codex.readProjection,
+      providerThreadId: "provider-thread-imported-send",
+    };
+    codex.turnStatus = "completed";
+
+    await service.execute({
+      kind: "session.send",
+      session: imported.id,
+      message: "keep the admitted model",
+    }, { signal });
+
+    expect(codex.turnReviewRequests.at(-1)?.requirement).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "max",
+    });
+    expect(store.latestSessionRuntimeProfile(imported.id)?.profile).toMatchObject({
+      preset: "high",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+    });
   });
 
   test("retries bounded pre-evidence baseline and capability failures without replaying a provider effect", async () => {

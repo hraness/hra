@@ -46,7 +46,7 @@ const codexProfile = (
   processGeneration: authority.generation,
   observedAt: 2_000,
   preset,
-  model: preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
+  model: preset === "low" ? "gpt-5.6-luna" : "gpt-6-astra",
   reasoningEffort: preset === "ultra" ? "ultra" : "max",
   serviceTier: null,
   fast: false,

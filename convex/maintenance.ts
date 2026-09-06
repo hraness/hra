@@ -3,9 +3,27 @@ import { v } from "convex/values";
 
 import { isSafePositiveInteger, isUuidV7 } from "../src/cloud/contracts";
 import { deviceCommandLoginResultLifetimeMs } from "../src/cloud/payloads";
+import { sha256Hex } from "../src/cloud/crypto";
 import { maximumLiveOtpChallenges } from "./authPolicy";
+import {
+  attentionNotificationGroupLimit,
+  attentionNotificationQuarantineRowLimit,
+  attentionNotificationQuotaReservations,
+  attentionNotificationRetryRecoveryMs,
+  latchCorruptAttentionNotificationDelivery,
+  quarantineFaultedAttentionNotificationDelivery,
+  validatedStartedAttentionNotificationGroup,
+} from "./attentionNotifications";
+import {
+  deleteExpiredAttentionNotificationSafetyFaults,
+  readOldestPendingStoredAttentionNotificationSafetyFault,
+  releaseUnusedAttentionNotificationFaultCapacity,
+} from "./attentionNotificationControl";
 import { commandTerminalRetentionMs } from "./commands";
-import { CLOUD_USAGE_SNAPSHOT_RETENTION_MS } from "./lifecyclePolicy";
+import {
+  ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+  CLOUD_USAGE_SNAPSHOT_RETENTION_MS,
+} from "./lifecyclePolicy";
 import {
   adjustCommandQuotaForPatch,
   adjustQuotaForPatch,
@@ -43,6 +61,10 @@ const maintenanceCategories = [
   "pending_device_commands",
   "device_command_login_results",
   "terminal_device_commands",
+  "pending_attention_notifications",
+  "started_attention_notifications",
+  "terminal_attention_notifications",
+  "attention_notification_faults",
   "security_events",
   "usage_snapshots",
   "account_deletion_receipts",
@@ -73,12 +95,16 @@ type CleanupCounts = {
   devicePresence: number;
   deviceRevocationJobs: number;
   deviceCommandLoginResults: number;
+  expiredPendingAttentionNotifications: number;
   expiredPendingCommands: number;
   expiredPendingDeviceCommands: number;
   idempotencyReceipts: number;
   liveTailChunks: number;
   otpChallenges: number;
   securityEvents: number;
+  startedAttentionNotifications: number;
+  terminalAttentionNotifications: number;
+  attentionNotificationFaults: number;
   terminalCommands: number;
   terminalDeviceCommands: number;
   usageSnapshots: number;
@@ -98,6 +124,10 @@ const countField = {
   pending_device_commands: "expiredPendingDeviceCommands",
   device_command_login_results: "deviceCommandLoginResults",
   terminal_device_commands: "terminalDeviceCommands",
+  pending_attention_notifications: "expiredPendingAttentionNotifications",
+  started_attention_notifications: "startedAttentionNotifications",
+  terminal_attention_notifications: "terminalAttentionNotifications",
+  attention_notification_faults: "attentionNotificationFaults",
   security_events: "securityEvents",
   usage_snapshots: "usageSnapshots",
   account_deletion_receipts: "accountDeletionReceipts",
@@ -513,6 +543,166 @@ async function deleteTerminalDeviceCommands(ctx: MutationCtx, now: number, limit
   return processed;
 }
 
+async function expirePendingAttentionNotifications(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+): Promise<number> {
+  const records = await ctx.db.query("attentionNotificationOutbox")
+    .withIndex("by_state_and_claim_deadline", (builder) => builder
+      .eq("state", "pending")
+      .lt("claimDeadline", now))
+    .take(limit);
+  for (const record of records) {
+    if (record.claimCapacityReservation !== attentionNotificationQuotaReservations.pending) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    const patch = {
+      claimCapacityReservation: undefined,
+      nonterminal: false,
+      state: "expired" as const,
+      terminalCleanupAfter: now + ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+      updatedAt: now,
+    };
+    await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+    await ctx.db.patch(record._id, patch);
+  }
+  return records.length;
+}
+
+async function closeUnsettledAttentionNotifications(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+): Promise<number> {
+  const fault = await readOldestPendingStoredAttentionNotificationSafetyFault(ctx);
+  if (fault !== null) {
+    const quarantine = await quarantineFaultedAttentionNotificationDelivery(
+      ctx,
+      fault.faultId,
+      Math.min(limit, attentionNotificationQuarantineRowLimit),
+    );
+    if (quarantine.deleted > 0) return quarantine.deleted;
+  }
+  const seeds = await ctx.db.query("attentionNotificationOutbox")
+    .withIndex("by_state_and_delivery_deadline", (builder) => builder
+      .eq("state", "effect_started")
+      .lt("delivery.deadline", now))
+    .take(limit);
+  const visited = new Set<string>();
+  let processed = 0;
+  for (const seed of seeds) {
+    const seedDelivery = seed.delivery;
+    if (seedDelivery === undefined || seedDelivery.settledAt !== undefined) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    if (visited.has(seedDelivery.id)) continue;
+    visited.add(seedDelivery.id);
+    const records = await ctx.db.query("attentionNotificationOutbox")
+      .withIndex("by_delivery_id", (builder) => builder.eq("delivery.id", seedDelivery.id))
+      .take(attentionNotificationGroupLimit + 1);
+    if (records.length === 0) throw new Error("Maintenance authority is corrupt.");
+    if (records.length > attentionNotificationGroupLimit) {
+      await latchCorruptAttentionNotificationDelivery(ctx, seedDelivery.id);
+      break;
+    }
+    if (records.length > limit - processed) break;
+    const validated = await validatedStartedAttentionNotificationGroup(
+      ctx,
+      seedDelivery.id,
+    );
+    if (validated === null || validated.rows.some((record) =>
+      record.delivery === undefined || record.delivery.deadline >= now)) {
+      await latchCorruptAttentionNotificationDelivery(ctx, seedDelivery.id);
+      break;
+    }
+    const exactRecords = validated.rows;
+    const exactDelivery = exactRecords[0]?.delivery;
+    if (exactDelivery === undefined) throw new Error("Maintenance authority is corrupt.");
+    const settlementSafeAfter = Math.max(
+      exactDelivery.deadline,
+      exactDelivery.effectStartedAt + attentionNotificationRetryRecoveryMs,
+      exactDelivery.nextAttemptAt ?? 0,
+    );
+    if (now <= settlementSafeAfter) continue;
+    const outcomeCode = "unsettled_effect" as const;
+    const outcomeDigest = await sha256Hex([
+      "hra-attention-settlement:v1",
+      seedDelivery.id,
+      String(seedDelivery.generation),
+      outcomeCode,
+    ].join("\u0000"));
+    for (const record of exactRecords) {
+      const delivery = record.delivery;
+      if (delivery === undefined) throw new Error("Maintenance authority is corrupt.");
+      const deliveryWithoutRetry = { ...delivery };
+      Reflect.deleteProperty(deliveryWithoutRetry, "nextAttemptAt");
+      const patch = {
+        claimCapacityReservation: undefined,
+        delivery: {
+          ...deliveryWithoutRetry,
+          outcomeCode,
+          outcomeDigest,
+          settledAt: now,
+        },
+        nonterminal: false,
+        state: "ambiguous" as const,
+        terminalCleanupAfter: now + ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS,
+        updatedAt: now,
+      };
+      await adjustCommandQuotaForPatch(ctx, record.userId, record, patch);
+      await ctx.db.patch(record._id, patch);
+    }
+    const first = exactRecords[0];
+    if (first?.faultCapacityAnchor === undefined) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    await releaseUnusedAttentionNotificationFaultCapacity(ctx, {
+      anchorRowId: first.faultCapacityAnchor,
+      deliveryId: exactDelivery.id,
+      userId: first.userId,
+    });
+    processed += exactRecords.length;
+  }
+  return processed;
+}
+
+async function deleteTerminalAttentionNotifications(
+  ctx: MutationCtx,
+  now: number,
+  limit: number,
+): Promise<number> {
+  let remaining = limit;
+  for (const state of [
+    "accepted",
+    "refused",
+    "ambiguous",
+    "cancelled",
+    "expired",
+  ] as const) {
+    if (remaining === 0) break;
+    const records = await ctx.db.query("attentionNotificationOutbox")
+      .withIndex("by_state_and_cleanup_after", (builder) => builder
+        .eq("state", state)
+        .gt("terminalCleanupAfter", 0)
+        .lt("terminalCleanupAfter", now))
+      .take(remaining);
+    let deleted = 0;
+    for (const record of records) {
+      const locators = await ctx.db.query("attentionNotificationSafetyFaults")
+        .withIndex("by_cleanup_row", (builder) => builder.eq("cleanupRowId", record._id))
+        .take(2);
+      if (locators.length > 1) throw new Error("Maintenance authority is corrupt.");
+      if (locators[0]?.quarantineState === "pending") continue;
+      await releaseCommandQuotaForDelete(ctx, record.userId, record);
+      await ctx.db.delete(record._id);
+      deleted += 1;
+    }
+    remaining -= deleted;
+  }
+  return limit - remaining;
+}
+
 async function deleteExpiredSecurityEvents(ctx: MutationCtx, now: number, limit: number): Promise<number> {
   const records = await ctx.db.query("securityEvents")
     .withIndex("by_created_at", (builder) => builder
@@ -680,6 +870,10 @@ const handlers = {
   pending_device_commands: expirePendingDeviceCommands,
   device_command_login_results: expireDeviceCommandLoginResults,
   terminal_device_commands: deleteTerminalDeviceCommands,
+  pending_attention_notifications: expirePendingAttentionNotifications,
+  started_attention_notifications: closeUnsettledAttentionNotifications,
+  terminal_attention_notifications: deleteTerminalAttentionNotifications,
+  attention_notification_faults: deleteExpiredAttentionNotificationSafetyFaults,
   security_events: deleteExpiredSecurityEvents,
   usage_snapshots: deleteExpiredUsage,
   account_deletion_receipts: deleteExpiredAccountReceipts,
@@ -698,12 +892,16 @@ const emptyCounts = (): CleanupCounts => ({
   devicePresence: 0,
   deviceRevocationJobs: 0,
   deviceCommandLoginResults: 0,
+  expiredPendingAttentionNotifications: 0,
   expiredPendingCommands: 0,
   expiredPendingDeviceCommands: 0,
   idempotencyReceipts: 0,
   liveTailChunks: 0,
   otpChallenges: 0,
   securityEvents: 0,
+  startedAttentionNotifications: 0,
+  terminalAttentionNotifications: 0,
+  attentionNotificationFaults: 0,
   terminalCommands: 0,
   terminalDeviceCommands: 0,
   usageSnapshots: 0,

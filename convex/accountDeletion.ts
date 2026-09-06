@@ -8,6 +8,7 @@ import {
   isSafePositiveInteger,
 } from "../src/cloud/contracts";
 import { sha256Hex } from "../src/cloud/crypto";
+import { deleteAttentionNotificationsForAccountDeletion } from "./attentionNotifications";
 import type { HOSTED_TABLE_LIFECYCLE } from "./lifecyclePolicy";
 import {
   adjustQuotaForPatch,
@@ -109,6 +110,8 @@ export const ACCOUNT_DELETION_TABLE_STRATEGY = {
   executionLeases: "user_index",
   sessionCommands: "user_index",
   deviceCommands: "user_index",
+  attentionNotificationOutbox: "user_index",
+  attentionNotificationSafetyFaults: "user_index_service_quota",
   codexAccounts: "user_index",
   deviceAccountBindings: "user_index",
   accountUsageSnapshots: "user_index",
@@ -136,6 +139,7 @@ export const ACCOUNT_DELETION_TABLE_STRATEGY = {
   | "issuer_or_bound_email_index"
   | "service_retained"
   | "user_index"
+  | "user_index_service_quota"
   | "user_index_immutable_erasure"
 >>;
 
@@ -255,6 +259,13 @@ async function deleteCommandsAndLeases(
   }
   remaining -= deviceCommands.length;
   if (remaining === 0) return { deleted: limit, empty: false };
+  const notifications = await deleteAttentionNotificationsForAccountDeletion(
+    ctx,
+    userId,
+    remaining,
+  );
+  remaining -= notifications.deleted;
+  if (remaining === 0) return { deleted: limit, empty: false };
   const leases = await ctx.db.query("executionLeases")
     .withIndex("by_user", (builder) => builder.eq("userId", userId))
     .take(remaining);
@@ -265,7 +276,10 @@ async function deleteCommandsAndLeases(
   remaining -= leases.length;
   return {
     deleted: limit - remaining,
-    empty: commands.length === 0 && deviceCommands.length === 0 && leases.length === 0,
+    empty: commands.length === 0
+      && deviceCommands.length === 0
+      && notifications.empty
+      && leases.length === 0,
   };
 }
 

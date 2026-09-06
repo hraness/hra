@@ -50,6 +50,7 @@ import type {
 import { BridgedCloudControl, StateBackedCloudDaemonAdapter } from "./daemon-adapters";
 import { parseDeviceRegistryPayload, type RemoteCommandPayload } from "./payloads";
 import type { CloudRemoteControlPort } from "./local-control";
+import type { CompactRemoteInteractionReasonCode } from "./projection";
 
 const privateRootFixture = ["", "Users", "alice", "private"].join("/");
 const bearerFixture = ["Bearer", "secret-token-value"].join(" ");
@@ -153,23 +154,35 @@ class FakeCodex implements CodexRuntimePort {
 const temporaryDirectories: string[] = [];
 
 /**
- * The whole of the detail an `mcp_elicitation` interaction projects. The
- * server name, every field name, and every choice stay on the machine: an MCP
- * form is declared as possibly carrying protected values, so the projection
- * says only that one exists and where it is answered.
+ * The presentation detail an `mcp_elicitation` interaction projects. The
+ * server name, unsupported field names, choices, and values stay on the
+ * machine. A separately validated remote policy may identify only answerable
+ * bounded string fields.
  */
 const mcpElicitationProjectedDetail = {
   detailMarkdown: [
     "- This form may contain protected values.",
     "- It is completed on the machine running the session.",
   ].join("\n"),
-  detailVersion: 1,
+  detailVersion: 2,
   headline: "Codex requests MCP form input",
   label: "MCP form",
 } as const;
 
+const machineOnlyRemotePolicy = (
+  deadlineAt: number,
+  reasonCodes: readonly CompactRemoteInteractionReasonCode[],
+) => ({
+  actions: [],
+  deadlineAt,
+  questions: [],
+  reasonCodes,
+  version: 2,
+}) as const;
+
 async function fixture(): Promise<Readonly<{
   codex: FakeCodex;
+  now: () => number;
   paths: StatePaths;
   sessionId: string;
   setNow: (now: number) => void;
@@ -220,6 +233,7 @@ async function fixture(): Promise<Readonly<{
   }));
   return {
     codex,
+    now: () => now,
     paths,
     sessionId: bound.id,
     setNow: (nextNow) => {
@@ -240,7 +254,7 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
     processGeneration: profile.processGeneration,
     observedAt: 2_000,
     preset: input.preset,
-    model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
+    model: input.preset === "low" ? "gpt-5.6-luna" : "gpt-6-astra",
     reasoningEffort: input.preset === "ultra" ? "ultra" as const : "max" as const,
     serviceTier: input.fast ? "priority" as const : null,
     fast: input.fast,
@@ -311,7 +325,7 @@ async function materializeScheduledTaskQueue(
     processGeneration: profile.processGeneration,
     observedAt: 2_000,
     preset: "high" as const,
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     reasoningEffort: "max" as const,
     serviceTier: "priority" as const,
     fast: true,
@@ -762,6 +776,7 @@ describe("state-backed cloud daemon adapter", () => {
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
       executeRemote: () => Promise.resolve({}),
+      now: value.now,
       paths: value.paths,
       store: value.store,
     });
@@ -850,6 +865,7 @@ describe("state-backed cloud daemon adapter", () => {
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
       executeRemote: () => Promise.resolve({}),
+      now: value.now,
       paths: value.paths,
       store: value.store,
     });
@@ -909,6 +925,7 @@ describe("state-backed cloud daemon adapter", () => {
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
       executeRemote: () => Promise.resolve({}),
+      now: value.now,
       paths: value.paths,
       store: value.store,
     });
@@ -981,6 +998,7 @@ describe("state-backed cloud daemon adapter", () => {
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
       executeRemote: () => Promise.resolve({}),
+      now: value.now,
       paths: value.paths,
       store: value.store,
     });
@@ -1002,6 +1020,7 @@ describe("state-backed cloud daemon adapter", () => {
         sequence: 4,
         state: "pending",
         ...mcpElicitationProjectedDetail,
+        remotePolicy: machineOnlyRemotePolicy(1_801_000, ["MCP_ANSWER_LOCAL_ONLY"]),
         summary: "An MCP server requests protected form input",
       });
       const serialized = JSON.stringify(first.events.at(-1));
@@ -1035,6 +1054,7 @@ describe("state-backed cloud daemon adapter", () => {
         sequence: 5,
         state: "expired",
         ...mcpElicitationProjectedDetail,
+        remotePolicy: machineOnlyRemotePolicy(1_801_000, ["INTERACTION_NOT_PENDING"]),
         summary: "An MCP server requests protected form input",
       });
       await adapter.listSessions({ limit: 25, signal });
@@ -1062,6 +1082,7 @@ describe("state-backed cloud daemon adapter", () => {
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
       executeRemote: () => Promise.resolve({}),
+      now: value.now,
       paths: value.paths,
       store: value.store,
     });
@@ -1127,6 +1148,7 @@ describe("state-backed cloud daemon adapter", () => {
         sequence: 5,
         state: "expired",
         ...mcpElicitationProjectedDetail,
+        remotePolicy: machineOnlyRemotePolicy(1_801_000, ["INTERACTION_NOT_PENDING"]),
         summary: "An MCP server requests protected form input",
       }]);
       expect(JSON.stringify(terminal.events)).not.toContain(unobservedId);
@@ -1258,6 +1280,7 @@ describe("state-backed cloud daemon adapter", () => {
     let adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
       executeRemote: () => Promise.resolve({}),
+      now: value.now,
       paths: value.paths,
       store: value.store,
     });
@@ -1311,6 +1334,7 @@ describe("state-backed cloud daemon adapter", () => {
       adapter = new StateBackedCloudDaemonAdapter({
         codex: value.codex,
         executeRemote: () => Promise.resolve({}),
+        now: value.now,
         paths: value.paths,
         store: value.store,
       });
@@ -1923,6 +1947,12 @@ describe("state-backed cloud daemon adapter", () => {
 
   test("waits for an exact in-flight turn profile, then ingests it without freezing unknown metadata", async () => {
     const value = await fixture();
+    const initial = value.store.requireSession(value.sessionId);
+    value.store.updateSessionMetadata({
+      expectedRevision: initial.revision,
+      preset: "ultra",
+      sessionId: initial.id,
+    });
     const binding = beginTurnProfileBinding(value, { fast: true, preset: "ultra" });
     value.codex.projection = {
       ...value.codex.projection,
@@ -2094,6 +2124,7 @@ describe("state-backed cloud daemon adapter", () => {
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
       executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
+      now: value.now,
       paths: value.paths,
       store: value.store,
     });
@@ -2344,6 +2375,7 @@ describe("state-backed cloud daemon adapter", () => {
     let adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
       executeRemote: () => Promise.resolve({}),
+      now: value.now,
       paths: value.paths,
       store: value.store,
     });
@@ -2376,6 +2408,7 @@ describe("state-backed cloud daemon adapter", () => {
         revision: 2,
         state: "expired",
         ...mcpElicitationProjectedDetail,
+        remotePolicy: machineOnlyRemotePolicy(1_801_000, ["INTERACTION_NOT_PENDING"]),
         summary: "An MCP server requests protected form input",
       }]);
       const installation = {
@@ -2392,6 +2425,7 @@ describe("state-backed cloud daemon adapter", () => {
       adapter = new StateBackedCloudDaemonAdapter({
         codex: value.codex,
         executeRemote: () => Promise.resolve({}),
+        now: value.now,
         paths: value.paths,
         store: value.store,
       });
@@ -2416,6 +2450,7 @@ describe("state-backed cloud daemon adapter", () => {
         sequence: 301,
         state: "expired",
         ...mcpElicitationProjectedDetail,
+        remotePolicy: machineOnlyRemotePolicy(1_801_000, ["INTERACTION_NOT_PENDING"]),
         summary: "An MCP server requests protected form input",
       }]);
 
@@ -2937,6 +2972,28 @@ describe("state-backed cloud daemon adapter", () => {
 
   test("migrates a legacy v1 cache without changing its stream meaning", async () => {
     const value = await fixture();
+    const interactionId = "70000000-0000-4000-8000-000000000291";
+    admitCloudInteraction(
+      value,
+      interactionId,
+      "80000000-0000-4000-8000-000000000291",
+    );
+    const legacyInteractionBody = {
+      detailMarkdown: [
+        "- This form may contain protected values.",
+        "- It is completed on the machine running the session.",
+      ].join("\n"),
+      detailVersion: 1,
+      headline: "Codex requests MCP form input",
+      label: "MCP form",
+      blocking: true,
+      interactionId,
+      interactionKind: "mcp_elicitation",
+      kind: "interaction_state",
+      revision: 1,
+      state: "pending",
+      summary: "An MCP server requests protected form input",
+    } as const;
     const cachePath = join(value.paths.root, "cloud-projection.sqlite");
     const database = new Database(cachePath, { create: true, strict: true });
     database.exec(`
@@ -2971,6 +3028,21 @@ describe("state-backed cloud daemon adapter", () => {
         VALUES (1,'cache_legacy_12345678');
       PRAGMA user_version=1;
     `);
+    database.query(
+      "INSERT INTO projection_sessions(session_id,next_sequence) VALUES (?,2)",
+    ).run(value.sessionId);
+    database.query(
+      `INSERT INTO projection_turns(
+         session_id,turn_id,start_sequence,event_count,digest,events_json
+       ) VALUES (?,?,?,?,?,?)`,
+    ).run(
+      value.sessionId,
+      `hraix_${sha256(`${interactionId}:1`)}`,
+      1,
+      1,
+      sha256(JSON.stringify([legacyInteractionBody])),
+      JSON.stringify([{ ...legacyInteractionBody, sequence: 1 }]),
+    );
     database.close(false);
     await chmod(cachePath, 0o600);
     const adapter = new StateBackedCloudDaemonAdapter({
@@ -2991,7 +3063,11 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       });
       expect(projection.cacheId).toBe("cache_legacy_12345678");
-      expect(projection.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+      expect(projection.events.map((event) => event.sequence)).toEqual([1, 2, 3, 4]);
+      expect(projection.events[0]).toEqual({ ...legacyInteractionBody, sequence: 1 });
+      expect(projection.events[0]?.kind === "interaction_state"
+        ? projection.events[0].remotePolicy
+        : "wrong-kind").toBeUndefined();
     } finally {
       adapter.close();
       const migrated = new Database(cachePath, { strict: true });
@@ -3423,6 +3499,21 @@ describe("bridged cloud control", () => {
     const bridge: CloudDaemonBridge = {
       close: () => { calls.push("close"); return Promise.resolve(); },
       cycle: () => { calls.push("bridge"); return Promise.resolve(cycle); },
+      invalidateAttentionNotificationAuthority: () => {
+        calls.push("attention-invalidate");
+        return Promise.resolve({
+          expiresNoLaterThan: 124_000,
+          state: "revocation_pending",
+        });
+      },
+      observeAttentionNotificationAuthority: () => {
+        calls.push("attention-observe");
+        return Promise.resolve({
+          acknowledgedAt: 4_000,
+          consentLeaseUntil: 4_000,
+          state: "acknowledged",
+        });
+      },
       pullRemoteSessions: () => Promise.resolve([]),
     };
     const unused = () => Promise.reject(new Error("unused"));
@@ -3502,6 +3593,23 @@ describe("bridged cloud control", () => {
     expect(JSON.stringify(synced).length).toBeLessThan(2_048);
     expect(JSON.stringify(synced)).not.toContain("sentinel");
     expect(calls).toEqual(["bridge", "control"]);
+
+    calls.length = 0;
+    expect(await combined.observeAttentionNotificationAuthority(
+      new AbortController().signal,
+    )).toEqual({
+      acknowledgedAt: 4_000,
+      consentLeaseUntil: 4_000,
+      state: "acknowledged",
+    });
+    expect(await combined.invalidateAttentionNotificationAuthority({
+      localNotificationPolicyRevision: 4,
+      signal: new AbortController().signal,
+    })).toEqual({
+      expiresNoLaterThan: 124_000,
+      state: "revocation_pending",
+    });
+    expect(calls).toEqual(["attention-observe", "attention-invalidate"]);
 
     calls.length = 0;
     expect(await combined.deleteAccount({
@@ -3634,6 +3742,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
       executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
+      now: value.now,
       paths: value.paths,
       store: value.store,
     });
@@ -3672,7 +3781,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
     };
   }
 
-  test("projects a command class and a bounded detail, never the exact command or a local path", async () => {
+  test("projects bounded command detail but keeps every command grant on the execution device", async () => {
     const value = await fixture();
     const interactionId = "70000000-0000-4000-8000-000000000301";
     const absoluteFixture = ["", "opt", "private", "checkout"].join("/");
@@ -3688,12 +3797,19 @@ describe("remote interaction detail and the decisions it licenses", () => {
     try {
       const event = await harnessed.projected(interactionId);
       expect(event).toMatchObject({
-        availableDecisions: ["once", "decline"],
-        commandClass: "git commit",
-        detailVersion: 1,
+        detailVersion: 2,
         headline: "Allow git commit",
         label: "Command approval",
+        remotePolicy: {
+          actions: ["decline"],
+          questions: [],
+          reasonCodes: ["COMMAND_APPROVAL_LOCAL_ONLY"],
+          version: 2,
+        },
       });
+      expect(event?.availableDecisions).toBeUndefined();
+      expect(event?.commandClass).toBeUndefined();
+      expect(event?.questions).toBeUndefined();
       const detail = event?.detailMarkdown as string;
       expect(detail).toContain("- Runs: git commit");
       expect(detail).toContain("- Directory: src/cloud");
@@ -3706,10 +3822,18 @@ describe("remote interaction detail and the decisions it licenses", () => {
         interactionId,
         kind: "resolve_interaction",
         revision: 1,
+      })).toEqual({ code: "INTERACTION_COMMAND_APPROVAL_LOCAL_ONLY", state: "failed" });
+      expect(harnessed.commands).toHaveLength(0);
+
+      expect(await harnessed.resolve({
+        decision: "decline",
+        interactionId,
+        kind: "resolve_interaction",
+        revision: 1,
       })).toEqual({ code: "APPLIED", state: "applied" });
       expect(harnessed.commands.at(-1)).toMatchObject({
         kind: "interaction.resolve",
-        resolution: { decision: "once", kind: "approval_decision" },
+        resolution: { decision: "decline", kind: "approval_decision" },
       });
     } finally {
       harnessed.adapter.close();
@@ -3717,7 +3841,7 @@ describe("remote interaction detail and the decisions it licenses", () => {
     }
   });
 
-  test("licenses a workspace permission approval and refuses one the class cannot cover", async () => {
+  test("keeps every permission grant local because public categories hide protected values", async () => {
     const value = await fixture();
     const workspaceId = "70000000-0000-4000-8000-000000000311";
     const networkId = "70000000-0000-4000-8000-000000000312";
@@ -3739,8 +3863,12 @@ describe("remote interaction detail and the decisions it licenses", () => {
     try {
       const workspace = await harnessed.projected(workspaceId);
       expect(workspace).toMatchObject({
-        availableDecisions: ["once", "decline"],
-        commandClass: "permission:workspace",
+        detailVersion: 2,
+        remotePolicy: {
+          actions: ["decline"],
+          questions: [],
+          reasonCodes: ["PERMISSION_APPROVAL_LOCAL_ONLY"],
+        },
       });
       expect(workspace?.detailMarkdown).toContain("- Requested category: workspace");
       // The class is projected; the exact requested value never is.
@@ -3748,6 +3876,11 @@ describe("remote interaction detail and the decisions it licenses", () => {
 
       const network = await harnessed.projected(networkId);
       expect(network?.commandClass).toBeUndefined();
+      expect(network?.remotePolicy).toMatchObject({
+        actions: ["decline"],
+        questions: [],
+        reasonCodes: ["PERMISSION_APPROVAL_LOCAL_ONLY"],
+      });
       expect(JSON.stringify(network)).not.toContain("network_outbound");
       expect(network?.detailMarkdown).toContain("- Requested category: network");
 
@@ -3756,28 +3889,28 @@ describe("remote interaction detail and the decisions it licenses", () => {
         interactionId: workspaceId,
         kind: "resolve_interaction",
         revision: 1,
-      })).toEqual({ code: "APPLIED", state: "applied" });
-      expect(harnessed.commands.at(-1)).toMatchObject({
-        kind: "interaction.resolve",
-        resolution: { kind: "permission_grant", permissions: ["workspace_write"], scope: null },
-      });
+      })).toEqual({ code: "INTERACTION_PERMISSION_APPROVAL_LOCAL_ONLY", state: "failed" });
+      expect(harnessed.commands).toHaveLength(0);
 
-      // A network category has no re-verifiable class, so neither direction is
-      // decidable from a device.
-      for (const decision of ["once", "decline"] as const) {
+      // Decline remains safe for either category; no remote path can compile a
+      // hidden permission value into a provider grant.
+      for (const [interactionId, decision, expected] of [
+        [workspaceId, "decline", { code: "APPLIED", state: "applied" }],
+        [networkId, "once", { code: "INTERACTION_PERMISSION_APPROVAL_LOCAL_ONLY", state: "failed" }],
+        [networkId, "decline", { code: "APPLIED", state: "applied" }],
+      ] as const) {
         expect(await harnessed.resolve({
           decision,
-          interactionId: networkId,
+          interactionId,
           kind: "resolve_interaction",
           revision: 1,
-        })).toEqual({ code: "INTERACTION_PERMISSION_CLASS_UNVERIFIED", state: "failed" });
+        })).toEqual(expected);
       }
-      expect(await harnessed.resolve({
-        decision: "cancel",
-        interactionId: networkId,
-        kind: "resolve_interaction",
-        revision: 1,
-      })).toEqual({ code: "INTERACTION_PERMISSION_DECISION_UNAVAILABLE", state: "failed" });
+      expect(harnessed.commands).toHaveLength(2);
+      expect(harnessed.commands.every((command) =>
+        command.kind === "interaction.resolve"
+        && command.resolution.kind === "approval_decision"
+        && command.resolution.decision === "decline")).toBe(true);
     } finally {
       harnessed.adapter.close();
       value.store.close();
@@ -3792,19 +3925,21 @@ describe("remote interaction detail and the decisions it licenses", () => {
       kind: "user_input",
       questions: [
         {
-          allowsOther: true,
+          allowsOther: false,
           header: "Region",
           id: "region",
-          options: null,
+          options: [{ description: "Europe", label: "eu" }],
           question: "Which region should it deploy to?",
+          remoteAnswerable: true,
           secret: false,
         },
         {
-          allowsOther: true,
+          allowsOther: false,
           header: "Registry token",
           id: "registry_token",
-          options: null,
+          options: [{ description: "Use the stored value", label: "Stored" }],
           question: "Paste the registry token.",
+          remoteAnswerable: true,
           secret: true,
         },
       ],
@@ -3813,13 +3948,14 @@ describe("remote interaction detail and the decisions it licenses", () => {
     const harnessed = await harness(value);
     try {
       const event = await harnessed.projected(interactionId);
-      expect(event?.questions).toEqual([
-        { id: "region", label: "Region", secret: false },
-        { id: "registry_token", label: "Registry token", secret: true },
-      ]);
-      // The projection carries the secret question's identity so the reader
-      // knows what is being asked, and carries nothing that could become its
-      // value: no field contract, no options, no prior answer.
+      expect(event?.questions).toBeUndefined();
+      expect(event?.remotePolicy).toMatchObject({
+        actions: [],
+        questions: [],
+        reasonCodes: ["USER_INPUT_SECRET_QUESTION"],
+      });
+      // Presentation acknowledges the local-only question without projecting
+      // either its answer authority or protected prompt text.
       expect(event?.detailMarkdown).toContain("- Registry token: answered on the machine");
       expect(event?.detailMarkdown).not.toContain("Paste the registry token");
 
@@ -3847,15 +3983,28 @@ describe("remote interaction detail and the decisions it licenses", () => {
         blocking: true,
         kind: "user_input",
         questions: [{
-          allowsOther: true,
+          allowsOther: false,
           header: "Region",
           id: "region",
-          options: null,
+          options: [{ description: "Europe", label: "eu" }],
           question: "Which region should it deploy to?",
+          remoteAnswerable: true,
           secret: false,
         }],
         summary: "Codex needs user input",
       });
+      for (const answers of [
+        { region: { answers: [] } },
+        { region: { answers: [""] } },
+        { region: { answers: ["eu", "us"] } },
+      ]) {
+        expect(await harnessed.resolve({
+          answers,
+          interactionId: plainId,
+          kind: "resolve_interaction",
+          revision: 1,
+        })).toEqual({ code: "INTERACTION_ANSWER_CONSTRAINT_FAILED", state: "failed" });
+      }
       expect(await harnessed.resolve({
         answers: { region: { answers: ["eu"] } },
         interactionId: plainId,
@@ -3866,16 +4015,25 @@ describe("remote interaction detail and the decisions it licenses", () => {
         kind: "interaction.resolve",
         resolution: { answers: { region: { answers: ["eu"] } }, kind: "user_answers" },
       });
+
     } finally {
       harnessed.adapter.close();
       value.store.close();
     }
   });
 
-  test("answers a plain-text MCP form and refuses one whose values are not text", async () => {
+  test("keeps every MCP form local regardless of its public field shape", async () => {
     const value = await fixture();
     const textId = "70000000-0000-4000-8000-000000000331";
     const typedId = "70000000-0000-4000-8000-000000000332";
+    const mixedRequiredId = "70000000-0000-4000-8000-000000000333";
+    const optionalUnsupportedId = "70000000-0000-4000-8000-000000000334";
+    const prototypeNameId = "70000000-0000-4000-8000-000000000335";
+    const allOptionalId = "70000000-0000-4000-8000-000000000336";
+    const tooManyFieldsId = "70000000-0000-4000-8000-000000000337";
+    const unicodeOneId = "70000000-0000-4000-8000-000000000338";
+    const unicodeTwoId = "70000000-0000-4000-8000-000000000339";
+    const aggregateId = "70000000-0000-4000-8000-000000000340";
     admitDisplay(value, textId, {
       fields: [{
         format: null,
@@ -3906,35 +4064,251 @@ describe("remote interaction detail and the decisions it licenses", () => {
       summary: "Review provider input",
       url: null,
     });
+    admitDisplay(value, mixedRequiredId, {
+      fields: [
+        {
+          format: null,
+          maxLength: 64,
+          minLength: 1,
+          name: "region",
+          required: true,
+          type: "string",
+        },
+        {
+          choices: ["blue", "green"],
+          name: "slot",
+          required: true,
+          type: "single_select",
+        },
+      ],
+      kind: "mcp_elicitation",
+      mayContainSecrets: true,
+      mode: "form",
+      serverName: "deploy_server",
+      summary: "Review provider input",
+      url: null,
+    });
+    admitDisplay(value, optionalUnsupportedId, {
+      fields: [
+        {
+          format: null,
+          maxLength: 64,
+          minLength: 1,
+          name: "region",
+          required: true,
+          type: "string",
+        },
+        {
+          choices: ["blue", "green"],
+          name: "slot",
+          required: false,
+          type: "single_select",
+        },
+      ],
+      kind: "mcp_elicitation",
+      mayContainSecrets: true,
+      mode: "form",
+      serverName: "deploy_server",
+      summary: "Review provider input",
+      url: null,
+    });
+    admitDisplay(value, prototypeNameId, {
+      fields: [
+        {
+          format: null,
+          maxLength: 64,
+          minLength: 1,
+          name: "region",
+          required: true,
+          type: "string",
+        },
+        {
+          format: null,
+          maxLength: 64,
+          minLength: 0,
+          name: "constructor",
+          required: false,
+          type: "string",
+        },
+      ],
+      kind: "mcp_elicitation",
+      mayContainSecrets: true,
+      mode: "form",
+      serverName: "deploy_server",
+      summary: "Review provider input",
+      url: null,
+    });
+    admitDisplay(value, allOptionalId, {
+      fields: [{
+        format: null,
+        maxLength: 64,
+        minLength: 0,
+        name: "notes",
+        required: false,
+        type: "string",
+      }],
+      kind: "mcp_elicitation",
+      mayContainSecrets: true,
+      mode: "form",
+      serverName: "deploy_server",
+      summary: "Review provider input",
+      url: null,
+    });
+    admitDisplay(value, tooManyFieldsId, {
+      fields: Array.from({ length: 9 }, (_, index) => ({
+        format: null,
+        maxLength: 64,
+        minLength: 0,
+        name: `field_${String(index + 1)}`,
+        required: false,
+        type: "string" as const,
+      })),
+      kind: "mcp_elicitation",
+      mayContainSecrets: true,
+      mode: "form",
+      serverName: "deploy_server",
+      summary: "Review provider input",
+      url: null,
+    });
+    for (const [interactionId, length] of [
+      [unicodeOneId, 1],
+      [unicodeTwoId, 2],
+    ] as const) {
+      admitDisplay(value, interactionId, {
+        fields: [{
+          format: null,
+          maxLength: length,
+          minLength: length,
+          name: "symbol",
+          required: true,
+          type: "string",
+        }],
+        kind: "mcp_elicitation",
+        mayContainSecrets: true,
+        mode: "form",
+        serverName: "deploy_server",
+        summary: "Review provider input",
+        url: null,
+      });
+    }
+    admitDisplay(value, aggregateId, {
+      fields: Array.from({ length: 8 }, (_, index) => ({
+        format: null,
+        maxLength: 16_384,
+        minLength: 0,
+        name: `field_${String(index)}`,
+        required: false,
+        type: "string" as const,
+      })),
+      kind: "mcp_elicitation",
+      mayContainSecrets: true,
+      mode: "form",
+      serverName: "deploy_server",
+      summary: "Review provider input",
+      url: null,
+    });
     const harnessed = await harness(value);
     try {
       const text = await harnessed.projected(textId);
-      expect(text?.questions).toEqual([{ id: "region", label: "region", secret: false }]);
+      expect(text?.questions).toBeUndefined();
+      expect(text?.remotePolicy).toMatchObject({
+        actions: [],
+        questions: [],
+        reasonCodes: ["MCP_ANSWER_LOCAL_ONLY"],
+      });
       // The server name and every unanswerable field name stay local.
       expect(JSON.stringify(text)).not.toContain("deploy_server");
       const typed = await harnessed.projected(typedId);
       expect(typed?.questions).toBeUndefined();
+      expect(typed?.remotePolicy).toMatchObject({
+        actions: [],
+        questions: [],
+        reasonCodes: ["MCP_ANSWER_LOCAL_ONLY"],
+      });
       expect(JSON.stringify(typed)).not.toContain("slot");
+      const mixedRequired = await harnessed.projected(mixedRequiredId);
+      expect(mixedRequired?.remotePolicy).toMatchObject({
+        actions: [],
+        questions: [],
+        reasonCodes: ["MCP_ANSWER_LOCAL_ONLY"],
+      });
+      const optionalUnsupported = await harnessed.projected(optionalUnsupportedId);
+      expect(optionalUnsupported?.remotePolicy).toMatchObject({
+        actions: [],
+        questions: [],
+        reasonCodes: ["MCP_ANSWER_LOCAL_ONLY"],
+      });
+      expect(JSON.stringify(optionalUnsupported)).not.toContain("slot");
+      expect(optionalUnsupported?.detailMarkdown)
+        .toContain("- It is completed on the machine running the session.");
+      expect(optionalUnsupported?.detailMarkdown)
+        .not.toContain("can be answered from here");
+      const prototypeName = await harnessed.projected(prototypeNameId);
+      expect(prototypeName?.remotePolicy).toMatchObject({
+        actions: [],
+        questions: [],
+        reasonCodes: ["MCP_ANSWER_LOCAL_ONLY"],
+      });
+      const tooManyFields = await harnessed.projected(tooManyFieldsId);
+      expect(tooManyFields?.remotePolicy).toMatchObject({
+        actions: [],
+        questions: [],
+        reasonCodes: ["MCP_ANSWER_LOCAL_ONLY"],
+      });
+      expect(tooManyFields?.detailMarkdown)
+        .toContain("- It is completed on the machine running the session.");
+      expect(tooManyFields?.detailMarkdown)
+        .not.toContain("can be answered from here.");
 
       expect(await harnessed.resolve({
         answers: { region: { answers: ["eu"] } },
         interactionId: textId,
         kind: "resolve_interaction",
         revision: 1,
-      })).toMatchObject({ state: "applied" });
-      expect(harnessed.commands.at(-1)).toMatchObject({
-        kind: "interaction.resolve",
-        resolution: { action: "accept", content: { region: "eu" }, kind: "mcp_submission" },
-      });
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+      // Question IDs are untrusted provider strings. An omitted optional name
+      // that shadows Object.prototype must not be mistaken for an answer.
+      expect(await harnessed.resolve({
+        answers: { region: { answers: ["eu"] } },
+        interactionId: prototypeNameId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+      expect(await harnessed.resolve({
+        answers: {},
+        interactionId: allOptionalId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+      expect(await harnessed.resolve({
+        answers: Object.fromEntries(Array.from({ length: 8 }, (_, index) => [
+          `field_${String(index)}`,
+          { answers: ["x".repeat(10_000)] },
+        ])),
+        interactionId: aggregateId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+      expect(await harnessed.resolve({
+        answers: { symbol: { answers: ["😀"] } },
+        interactionId: unicodeOneId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+      expect(await harnessed.resolve({
+        answers: { symbol: { answers: ["😀"] } },
+        interactionId: unicodeTwoId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
 
-      // A field this device could not have been shown is a protected value,
-      // whatever its type, so the secret refusal is the one that fires.
+      // A form with no exact remote action refuses every submitted field.
       expect(await harnessed.resolve({
         answers: { slot: { answers: ["blue"] } },
         interactionId: typedId,
         kind: "resolve_interaction",
         revision: 1,
-      })).toEqual({ code: "INTERACTION_SECRET_ANSWER_REFUSED", state: "failed" });
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
       expect(await harnessed.resolve({
         answers: { region: { answers: ["eu"] } },
         interactionId: typedId,
@@ -3947,6 +4321,19 @@ describe("remote interaction detail and the decisions it licenses", () => {
         kind: "resolve_interaction",
         revision: 1,
       })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+      expect(await harnessed.resolve({
+        answers: { region: { answers: ["eu"] } },
+        interactionId: mixedRequiredId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+      expect(await harnessed.resolve({
+        answers: { region: { answers: ["eu"] } },
+        interactionId: optionalUnsupportedId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_ELICITATION_NOT_REMOTE", state: "failed" });
+      expect(harnessed.commands).toHaveLength(0);
     } finally {
       harnessed.adapter.close();
       value.store.close();
@@ -3966,7 +4353,14 @@ describe("remote interaction detail and the decisions it licenses", () => {
     const harnessed = await harness(value);
     try {
       const event = await harnessed.projected(interactionId);
-      expect(event).toMatchObject({ availableDecisions: ["once", "decline"] });
+      expect(event).toMatchObject({
+        remotePolicy: {
+          actions: ["decline"],
+          questions: [],
+          reasonCodes: ["FILE_CHANGE_APPROVAL_LOCAL_ONLY"],
+        },
+      });
+      expect(event?.availableDecisions).toBeUndefined();
       expect(event?.commandClass).toBeUndefined();
       expect(event?.detailMarkdown).toContain("cannot show the exact affected paths");
 
@@ -4031,6 +4425,185 @@ describe("remote interaction detail and the decisions it licenses", () => {
         kind: "resolve_interaction",
         revision: 1,
       })).toEqual({ code: "INTERACTION_DECISION_NOT_REMOTE", state: "failed" });
+    } finally {
+      harnessed.adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("keeps projection and live-verifier action membership identical for every kind", async () => {
+    const value = await fixture();
+    const fixtures = [
+      {
+        answers: { value: { answers: ["eu"] } },
+        display: {
+          availableDecisions: ["once", "decline"],
+          commandClass: "git status",
+          kind: "command_approval",
+          reason: null,
+          summary: "Allow git status",
+          workingDirectory: "src",
+        },
+        id: "70000000-0000-4000-8000-000000000361",
+      },
+      {
+        answers: { value: { answers: ["eu"] } },
+        display: {
+          availableDecisions: ["once", "decline"],
+          grantRoot: "src",
+          kind: "file_change_approval",
+          reason: null,
+          summary: "Allow file changes",
+        },
+        id: "70000000-0000-4000-8000-000000000362",
+      },
+      {
+        answers: { value: { answers: ["eu"] } },
+        display: {
+          allowsSessionScope: true,
+          kind: "permission_approval",
+          reason: null,
+          requested: [{ name: "workspace_write" }],
+          summary: "Allow workspace write",
+        },
+        id: "70000000-0000-4000-8000-000000000363",
+      },
+      {
+        answers: { value: { answers: ["eu"] } },
+        display: {
+          blocking: true,
+          kind: "user_input",
+          questions: [{
+            allowsOther: false,
+            header: "Region",
+            id: "value",
+            options: [{ description: "Europe", label: "eu" }],
+            question: "Which region?",
+            remoteAnswerable: true,
+            secret: false,
+          }],
+          summary: "Codex needs user input",
+        },
+        id: "70000000-0000-4000-8000-000000000364",
+      },
+      {
+        answers: { value: { answers: ["eu"] } },
+        display: {
+          fields: [{
+            format: null,
+            maxLength: 10,
+            minLength: 1,
+            name: "value",
+            required: true,
+            type: "string",
+          }],
+          kind: "mcp_elicitation",
+          mayContainSecrets: true,
+          mode: "form",
+          serverName: "fixture",
+          summary: "Review provider input",
+          url: null,
+        },
+        id: "70000000-0000-4000-8000-000000000365",
+      },
+    ] satisfies ReadonlyArray<{
+      answers: Record<string, { answers: string[] }>;
+      display: Parameters<StateStore["admitInteraction"]>[0]["display"];
+      id: string;
+    }>;
+    for (const item of fixtures) admitDisplay(value, item.id, item.display);
+    const harnessed = await harness(value);
+    try {
+      for (const item of fixtures) {
+        const event = await harnessed.projected(item.id);
+        const policy = event?.remotePolicy as { actions?: readonly string[] } | undefined;
+        const projectedActions = policy?.actions ?? [];
+        for (const action of ["approve_once", "decline", "answer"] as const) {
+          const payload = action === "answer"
+            ? {
+                answers: item.answers,
+                interactionId: item.id,
+                kind: "resolve_interaction" as const,
+                revision: 1,
+              }
+            : {
+                decision: action === "approve_once" ? "once" as const : "decline" as const,
+                interactionId: item.id,
+                kind: "resolve_interaction" as const,
+                revision: 1,
+              };
+          const result = await harnessed.resolve(payload);
+          expect(result.state === "applied").toBe(projectedActions.includes(action));
+        }
+      }
+    } finally {
+      harnessed.adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("uses the injected deadline clock, freezes a projected revision, and closes prepared state", async () => {
+    const value = await fixture();
+    const deadlineId = "70000000-0000-4000-8000-000000000371";
+    admitDisplay(value, deadlineId, {
+      availableDecisions: ["once", "decline"],
+      commandClass: "git status",
+      kind: "command_approval",
+      reason: null,
+      summary: "Allow git status",
+      workingDirectory: "src",
+    });
+    const deadlineAt = value.store.requireInteraction(deadlineId).deadlineAt;
+    value.setNow(deadlineAt - 1);
+    const harnessed = await harness(value);
+    try {
+      const before = await harnessed.projected(deadlineId);
+      expect(before?.remotePolicy).toMatchObject({
+        actions: ["decline"],
+        deadlineAt,
+        reasonCodes: ["COMMAND_APPROVAL_LOCAL_ONLY"],
+      });
+      value.setNow(deadlineAt);
+      expect(await harnessed.resolve({
+        decision: "decline",
+        interactionId: deadlineId,
+        kind: "resolve_interaction",
+        revision: 1,
+      })).toEqual({ code: "INTERACTION_EXPIRED", state: "failed" });
+      // The cached event is evidence from first observation; the client and
+      // final verifier both suppress it at deadline without mutating its digest.
+      expect(await harnessed.projected(deadlineId)).toEqual(before);
+
+      const preparedId = "70000000-0000-4000-8000-000000000372";
+      admitDisplay(value, preparedId, {
+        availableDecisions: ["once", "decline"],
+        commandClass: "git status",
+        kind: "command_approval",
+        reason: null,
+        summary: "Allow git status",
+        workingDirectory: "src",
+      });
+      value.store.prepareInteractionResponse({
+        expectedRevision: 1,
+        id: preparedId,
+        responseDigest: "f".repeat(64),
+      });
+      const prepared = await harnessed.projected(preparedId);
+      expect(prepared).toMatchObject({
+        revision: 2,
+        state: "response_prepared",
+        remotePolicy: {
+          actions: [],
+          questions: [],
+          reasonCodes: ["INTERACTION_NOT_PENDING"],
+        },
+      });
+      expect(await harnessed.resolve({
+        decision: "decline",
+        interactionId: preparedId,
+        kind: "resolve_interaction",
+        revision: 2,
+      })).toEqual({ code: "INTERACTION_ALREADY_RESOLVED", state: "failed" });
     } finally {
       harnessed.adapter.close();
       value.store.close();
@@ -4226,6 +4799,63 @@ describe("settings commands and the device registry", () => {
           sessionPublicId: null,
         }),
       ]);
+      const notificationProjection = await adapter.readDeviceRegistryProjection({ signal });
+      expect(notificationProjection).toMatchObject({
+        notificationEmail: { enabled: false, revision: 1 },
+        notificationHours: { revision: 1 },
+        notificationPolicyRevision: 1,
+      });
+      value.store.updateNotificationEmailPolicy({ enabled: true, expectedRevision: 1 });
+      expect(await adapter.readDeviceRegistryProjection({ signal })).toMatchObject({
+        notificationEmail: { enabled: true, revision: 2 },
+        notificationHours: { revision: 2 },
+        notificationPolicyRevision: 2,
+      });
+      admitCloudInteraction(
+        value,
+        "40000000-0000-4000-8000-000000000001",
+        "40000000-0000-4000-8000-000000000002",
+      );
+      const attention = await adapter.readAttentionNotificationSnapshot({
+        limit: 64,
+        now: value.now(),
+        signal,
+      });
+      expect(attention).toMatchObject({
+        candidates: [{
+          interactionId: "40000000-0000-4000-8000-000000000001",
+          interactionKind: "mcp_elicitation",
+          interactionRevision: 1,
+          remoteActions: [],
+          sessionPublicId: value.sessionId,
+        }],
+        notificationEmail: { enabled: true, revision: 2 },
+        notificationHours: { revision: 2 },
+        notificationPolicyRevision: 2,
+        observedAt: value.now(),
+        status: "complete",
+      });
+      expect(Object.keys(attention.candidates[0] ?? {}).sort()).toEqual([
+        "interactionDeadline",
+        "interactionId",
+        "interactionKind",
+        "interactionRevision",
+        "remoteActions",
+        "sessionPublicId",
+      ]);
+      expect(JSON.stringify(attention)).not.toMatch(/display|question|prompt|path|provider/i);
+      const readEmail = value.store.readNotificationEmailPolicy.bind(value.store);
+      Object.defineProperty(value.store, "readNotificationEmailPolicy", {
+        configurable: true,
+        value: () => ({ ...readEmail(), revision: 3 }),
+      });
+      await expect(adapter.readDeviceRegistryProjection({ signal }))
+        .rejects.toThrow("NOTIFICATION_POLICY_REVISION_DIVERGED");
+      await expect(adapter.readAttentionNotificationSnapshot({
+        limit: 64,
+        now: value.now(),
+        signal,
+      })).rejects.toThrow("NOTIFICATION_POLICY_REVISION_DIVERGED");
     } finally {
       adapter.close();
       value.store.close();
@@ -4401,6 +5031,69 @@ describe("device command execution", () => {
       }
       expect(world.executed).toEqual([]);
       expect(world.notices).toEqual([]);
+    } finally {
+      world.adapter.close();
+      world.value.store.close();
+    }
+  });
+
+  test("updates notification hours by its own revision without a provider call", async () => {
+    const world = await deviceCommandFixture();
+    try {
+      const before = world.value.store.readNotificationHours();
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-0000000000aa",
+        payload: {
+          endMinute: 1_320,
+          expectedRevision: before.revision,
+          kind: "set_notification_hours",
+          startMinute: 600,
+          timeZone: "America/Puerto_Rico",
+          version: 1,
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      })).toEqual({ code: "APPLIED", state: "applied" });
+      expect(world.value.store.readNotificationHours()).toMatchObject({
+        endMinute: 1_320,
+        revision: before.revision + 1,
+        startMinute: 600,
+      });
+      expect(world.executed).toEqual([]);
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-0000000000ab",
+        payload: {
+          endMinute: 1_320,
+          expectedRevision: before.revision,
+          kind: "set_notification_hours",
+          startMinute: 600,
+          timeZone: "America/Puerto_Rico",
+          version: 1,
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      })).toEqual({ code: "LOCAL_NOTIFICATION_HOURS_REVISION_CONFLICT", state: "failed" });
+      const authority = new Database(world.value.paths.database, { create: false, strict: true });
+      authority.exec(`
+        DROP TRIGGER notification_hours_update_guard;
+        DROP TRIGGER attention_email_policy_update_guard;
+        UPDATE notification_hours SET revision=9007199254740991 WHERE singleton=1;
+        UPDATE attention_email_policy SET revision=9007199254740991 WHERE singleton=1;
+      `);
+      authority.close(false);
+      expect(await world.adapter.executeDeviceCommand({
+        idempotencyKey: "018bcfe5-6800-7000-8000-0000000000ac",
+        payload: {
+          endMinute: 1_320,
+          expectedRevision: Number.MAX_SAFE_INTEGER,
+          kind: "set_notification_hours",
+          startMinute: 600,
+          timeZone: "America/Puerto_Rico",
+          version: 1,
+        },
+        requestingDevicePublicId: "device_browser1",
+        signal: new AbortController().signal,
+      })).toEqual({ code: "LOCAL_NOTIFICATION_HOURS_REVISION_EXHAUSTED", state: "failed" });
     } finally {
       world.adapter.close();
       world.value.store.close();

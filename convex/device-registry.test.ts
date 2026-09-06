@@ -22,6 +22,9 @@ type RegistryRow = Readonly<{
   devicePublicId: string;
   envelope: Readonly<{ ciphertext: string; keyVersion: number }>;
   keyVersion: number;
+  notificationEmailEnvelope?: Readonly<{ ciphertext: string; keyVersion: number }>;
+  notificationHoursEnvelope?: Readonly<{ ciphertext: string; keyVersion: number }>;
+  notificationPolicyRevision?: number;
   revision: number;
   updatedAt: number;
 }>;
@@ -159,6 +162,145 @@ describe("device registry", () => {
       revision: 2,
     });
     expect(stored?.envelope.ciphertext).toBe("D".repeat(48));
+  });
+
+  test("keeps notification hours separately encrypted and clears it when an older publisher omits it", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("hours", await world.enrollUser("hours"));
+    const runtime = world.asDevice(primary);
+    const hours = envelopeWith("H".repeat(48));
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("M".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+      notificationHoursEnvelope: hours,
+    });
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .toMatchObject({ notificationHoursEnvelope: hours });
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("N".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+    });
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .not.toHaveProperty("notificationHoursEnvelope");
+  });
+
+  test("binds email consent and hours to one outer revision and clears consent on downgrade", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("email", await world.enrollUser("email"));
+    const runtime = world.asDevice(primary);
+    const email = envelopeWith("E".repeat(48));
+    const hours = envelopeWith("H".repeat(48));
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("M".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+      notificationEmailEnvelope: email,
+      notificationHoursEnvelope: hours,
+      notificationPolicyRevision: 7,
+    });
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .toMatchObject({
+        notificationEmailEnvelope: email,
+        notificationHoursEnvelope: hours,
+        notificationPolicyRevision: 7,
+      });
+
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("N".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+      notificationHoursEnvelope: hours,
+    });
+    const downgraded = await runtime.query(getRegistry, {
+      devicePublicId: primary.devicePublicId,
+    });
+    expect(downgraded).toMatchObject({ notificationHoursEnvelope: hours, revision: 2 });
+    expect(downgraded).not.toHaveProperty("notificationEmailEnvelope");
+    expect(downgraded).not.toHaveProperty("notificationPolicyRevision");
+  });
+
+  test("rejects composite rollback below stored and retained hosted revision authority", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("rollback", await world.enrollUser("rollback"));
+    const runtime = world.asDevice(primary);
+    const email = envelopeWith("E".repeat(48));
+    const hours = envelopeWith("H".repeat(48));
+    const writeComposite = (expectedRevision: number, notificationPolicyRevision: number) =>
+      runtime.mutation(updateRegistry, {
+        envelope: envelopeWith("M".repeat(48)),
+        expectedRevision,
+        keyVersion: 1,
+        notificationEmailEnvelope: email,
+        notificationHoursEnvelope: hours,
+        notificationPolicyRevision,
+      });
+
+    await writeComposite(0, 7);
+    await expectPromiseToReject(
+      writeComposite(1, 6),
+      "Cloud authority is not current.",
+    );
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .toMatchObject({ notificationPolicyRevision: 7, revision: 1 });
+
+    await world.testRuntime.run(async (ctx) => {
+      const devices = await ctx.db.query("devices")
+        .withIndex("by_user_and_public_id", (builder) => builder
+          .eq("userId", primary.userId)
+          .eq("publicId", primary.devicePublicId))
+        .take(2);
+      expect(devices).toHaveLength(1);
+      const device = devices[0];
+      if (device === undefined) throw new Error("missing rollback fixture device");
+      await ctx.db.patch(device._id, {
+        attentionNotificationAuthority: {
+          consentLeaseUntil: Date.now(),
+          globalNotificationGeneration: 1,
+          localNotificationPolicyRevision: 7,
+          reconciliationSequence: 1,
+        },
+      });
+    });
+    await runtime.mutation(updateRegistry, {
+      envelope: envelopeWith("N".repeat(48)),
+      expectedRevision: 1,
+      keyVersion: 1,
+    });
+    await expectPromiseToReject(
+      writeComposite(2, 6),
+      "Cloud authority is not current.",
+    );
+    const cleared = await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId });
+    expect(cleared).toMatchObject({ revision: 2 });
+    expect(cleared).not.toHaveProperty("notificationEmailEnvelope");
+    expect(cleared).not.toHaveProperty("notificationPolicyRevision");
+  });
+
+  test("rejects every incomplete composite notification-policy envelope", async () => {
+    const world = await registryWorld();
+    const primary = await world.enrollDevice("incomplete", await world.enrollUser("incomplete"));
+    const runtime = world.asDevice(primary);
+    const base = {
+      envelope: envelopeWith("M".repeat(48)),
+      expectedRevision: 0,
+      keyVersion: 1,
+    } as const;
+    const email = envelopeWith("E".repeat(48));
+    const hours = envelopeWith("H".repeat(48));
+    for (const partial of [
+      { notificationEmailEnvelope: email },
+      { notificationEmailEnvelope: email, notificationPolicyRevision: 1 },
+      { notificationHoursEnvelope: hours, notificationPolicyRevision: 1 },
+    ]) {
+      await expectPromiseToReject(
+        runtime.mutation(updateRegistry, { ...base, ...partial }),
+        "Cloud authority is not current.",
+      );
+    }
+    expect(await runtime.query(getRegistry, { devicePublicId: primary.devicePublicId }))
+      .toBeNull();
   });
 
   test("rejects a stale expected revision and preserves the stored envelope", async () => {

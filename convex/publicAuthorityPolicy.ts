@@ -2,6 +2,8 @@ export const HOSTED_PUBLIC_FUNCTION_AUTHORITY = Object.freeze({
   "account:current": "verified_identity",
   "accountDeletion:request": "verified_identity",
   "accountDeletion:status": "status_capability",
+  "attentionNotifications:authorityStatus": "active_daemon_device",
+  "attentionNotifications:reconcile": "active_daemon_device",
   "auth:isAuthenticated": "convex_auth",
   "auth:signIn": "convex_auth",
   "auth:signOut": "convex_auth",

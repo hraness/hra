@@ -3,7 +3,12 @@ import { makeFunctionReference } from "convex/server";
 import type { Value } from "convex/values";
 import { convexTest } from "convex-test";
 
+import { sha256Hex } from "../src/cloud/crypto";
+import { buildHraAttentionEmailBody } from "./attentionEmail";
+import { attentionNotificationQuotaReservations } from "./attentionNotifications";
+import { reserveAttentionNotificationFaultCapacity } from "./attentionNotificationControl";
 import {
+  adjustCommandQuotaForPatch,
   initializeAccountUsageQuotaAuthority,
   initializeUserQuotaAuthority,
   logicalDocumentBytes,
@@ -24,6 +29,7 @@ import { modules } from "./test.setup";
 type Args = Readonly<Record<string, Value>>;
 const cleanupExpired = makeFunctionReference<"mutation", Args, Readonly<{
   abandonedIdentities: number;
+  attentionNotificationFaults: number;
   accountDeletionReceipts: number;
   authAttempts: number;
   authInvites: number;
@@ -31,6 +37,7 @@ const cleanupExpired = makeFunctionReference<"mutation", Args, Readonly<{
   deviceCommandLoginResults: number;
   devicePresence: number;
   deviceRevocationJobs: number;
+  expiredPendingAttentionNotifications: number;
   expiredPendingCommands: number;
   expiredPendingDeviceCommands: number;
   idempotencyReceipts: number;
@@ -38,6 +45,8 @@ const cleanupExpired = makeFunctionReference<"mutation", Args, Readonly<{
   otpChallenges: number;
   processed: number;
   securityEvents: number;
+  startedAttentionNotifications: number;
+  terminalAttentionNotifications: number;
   terminalCommands: number;
   terminalDeviceCommands: number;
   usageSnapshots: number;
@@ -983,6 +992,104 @@ describe("bounded cloud retention", () => {
       } as const;
       await reserveSessionHeadQuotaForInsert(ctx, userId, session);
       const sessionId = await ctx.db.insert("sessionHeads", session);
+      const notificationBase = {
+        allowedWindowEnd: now + 60_000,
+        claimDeadline: now - 1,
+        coalesceAfter: now - 60_000,
+        consentLeaseUntil: now + 60_000,
+        createdAt: now - 100_000,
+        executionAuthority: {
+          bootGeneration: 1,
+          bootId: "boot_fair_notification",
+          fence: 1,
+        },
+        globalNotificationGeneration: 1,
+        interactionDeadline: now + 60_000,
+        interactionKind: "command_approval" as const,
+        interactionRevision: 1,
+        localNotificationPolicyRevision: 1,
+        reconciliationSequence: 1,
+        remoteActions: ["decline"] as ("answer" | "decline")[],
+        sessionId,
+        sessionPublicId: session.publicId,
+        sourceDeviceId: deviceId,
+        updatedAt: now - 100_000,
+        userId,
+      };
+      const pendingNotification = {
+        ...notificationBase,
+        claimCapacityReservation: attentionNotificationQuotaReservations.pending,
+        interactionId: "interaction_fair_pending",
+        nonterminal: true,
+        state: "pending" as const,
+      };
+      await reserveNonterminalCommandQuotaForInsert(ctx, userId, pendingNotification);
+      await ctx.db.insert("attentionNotificationOutbox", pendingNotification);
+      const startedNotification = {
+        ...notificationBase,
+        claimCapacityReservation: attentionNotificationQuotaReservations.pending,
+        claimDeadline: now + 60_000,
+        interactionId: "interaction_fair_started",
+        nonterminal: true,
+        state: "pending" as const,
+      };
+      await reserveNonterminalCommandQuotaForInsert(ctx, userId, startedNotification);
+      const startedNotificationId = await ctx.db.insert(
+        "attentionNotificationOutbox",
+        startedNotification,
+      );
+      const startedBody = buildHraAttentionEmailBody([{
+        interactionKind: startedNotification.interactionKind,
+        sessionPublicId: startedNotification.sessionPublicId,
+      }]);
+      const startedBodyDigest = await sha256Hex(
+        `hra-attention-body:v1\u0000${startedBody.text}`,
+      );
+      const startedDeliveryId = "01912345-6789-7abc-8def-0123456789d1";
+      const startedRecipientDigest = "7".repeat(64);
+      const startedIdempotencyKey = await sha256Hex([
+        "hra-attention-resend:v1",
+        startedDeliveryId,
+        startedRecipientDigest,
+        startedBodyDigest,
+      ].join("\u0000"));
+      const startedPatch = {
+        claimCapacityReservation: attentionNotificationQuotaReservations.started,
+        delivery: {
+          attemptCount: 3,
+          body: startedBody,
+          bodyDigest: startedBodyDigest,
+          claimedAt: now - 200_000,
+          deadline: now - 1,
+          effectStartedAt: now - 200_000,
+          firstAttemptAt: now - 200_000,
+          generation: 1,
+          id: startedDeliveryId,
+          idempotencyKey: startedIdempotencyKey,
+          lastAttemptAt: now - 200_000,
+          leaderRowId: startedNotificationId,
+          recipientDigest: startedRecipientDigest,
+        },
+        faultCapacityAnchor: startedNotificationId,
+        state: "effect_started" as const,
+      };
+      expect(await reserveAttentionNotificationFaultCapacity(ctx, {
+        anchorRowId: startedNotificationId,
+        deliveryId: startedDeliveryId,
+        now,
+        userId,
+      })).toBe(true);
+      await adjustCommandQuotaForPatch(ctx, userId, startedNotification, startedPatch);
+      await ctx.db.patch(startedNotificationId, startedPatch);
+      const terminalNotification = {
+        ...notificationBase,
+        interactionId: "interaction_fair_terminal",
+        nonterminal: false,
+        state: "cancelled" as const,
+        terminalCleanupAfter: now - 1,
+      };
+      await reserveQuotaForInsert(ctx, userId, "command", terminalNotification);
+      await ctx.db.insert("attentionNotificationOutbox", terminalNotification);
       const commandBase = {
         createdAt: now - 100_000,
         deadline: now - 1,
@@ -1133,23 +1240,28 @@ describe("bounded cloud retention", () => {
     const result = await runtime.mutation(cleanupExpired, { limit: 200 });
     expect(result).toMatchObject({
       abandonedIdentities: 1,
+      attentionNotificationFaults: 0,
       accountDeletionReceipts: 1,
       authAttempts: 1,
       authInvites: 1,
       bindChallenges: 1,
+      deviceCommandLoginResults: 0,
       devicePresence: 1,
       deviceRevocationJobs: 1,
+      expiredPendingAttentionNotifications: 1,
       expiredPendingCommands: 1,
       expiredPendingDeviceCommands: 1,
       idempotencyReceipts: 1,
       liveTailChunks: 0,
       otpChallenges: 1,
       securityEvents: 1,
+      startedAttentionNotifications: 1,
+      terminalAttentionNotifications: 1,
       terminalCommands: 1,
       terminalDeviceCommands: 1,
       usageSnapshots: 1,
-      processed: 15,
-      visitedCategories: 17,
+      processed: 18,
+      visitedCategories: 21,
     });
     expect(await runtime.run(async (ctx) => {
       const row = (await ctx.db.query("deviceCommands").collect())
@@ -1165,6 +1277,18 @@ describe("bounded cloud retention", () => {
       requesterAcknowledgedAt: expect.any(Number),
       state: "expired",
       terminalCleanupAfter: expect.any(Number),
+    });
+    const retainedNotifications = await runtime.run(async (ctx) =>
+      await ctx.db.query("attentionNotificationOutbox").collect());
+    expect(retainedNotifications.find((row) =>
+      row.interactionId === "interaction_fair_started")).toMatchObject({
+      delivery: {
+        outcomeCode: "unsettled_effect",
+        outcomeDigest: expect.stringMatching(/^[a-f0-9]{64}$/u) as unknown as string,
+        settledAt: expect.any(Number) as unknown as number,
+      },
+      nonterminal: false,
+      state: "ambiguous",
     });
     expect(await runtime.run(async (ctx) => {
       const service = await ctx.db.query("storageUsageService")
@@ -1202,10 +1326,10 @@ describe("bounded cloud retention", () => {
         // The expired pending device command is still a stored row: expiry
         // terminalizes it, and the terminal sweep deletes it only after the
         // requester has acknowledged and the retention window has passed.
-        records: 8,
+        records: 10,
         serviceLogicalBytes: 0,
         serviceRecords: 0,
-        userRecords: 8,
+        userRecords: 10,
       },
       userResources: [
         { records: 1, resource: "codex_account" },
@@ -1216,5 +1340,213 @@ describe("bounded cloud retention", () => {
         { records: 1, resource: "session_head" },
       ],
     });
+  });
+
+  test("closes only complete attention delivery groups within the row budget", async () => {
+    const runtime = convexTest(schema, modules);
+    await runtime.mutation(genesisQuota, {});
+    const now = Date.now();
+    await runtime.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", { email: "attention-maintenance@example.com" });
+      await initializeUserQuotaAuthority(ctx, userId);
+      const user = await ctx.db.get(userId);
+      if (user === null) throw new Error("missing attention maintenance user");
+      await reserveQuotaForStoredIdentity(ctx, userId, user);
+      const device = {
+        activatedAt: now,
+        authEpoch: 1,
+        createdAt: now,
+        encryptedLabel: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "A".repeat(32),
+          keyVersion: 1,
+          nonce: "A".repeat(16),
+        },
+        keyVersion: 1,
+        publicId: "device_attention_maintenance",
+        revision: 1,
+        signingPublicKey: "fixture-signing-key",
+        status: "active" as const,
+        updatedAt: now,
+        userId,
+        wrappingPublicKey: "fixture-wrapping-key",
+      };
+      await reserveDeviceQuotaForInsert(ctx, userId, device);
+      const deviceId = await ctx.db.insert("devices", device);
+      const session = {
+        compactHeadSequence: 0,
+        createdAt: now,
+        detailHeadSequence: 0,
+        executionDeviceId: deviceId,
+        metadataRevision: 0,
+        projectionRevision: 0,
+        publicId: "session_attention_maintenance",
+        state: "idle" as const,
+        updatedAt: now,
+        userId,
+      };
+      await reserveSessionHeadQuotaForInsert(ctx, userId, session);
+      const sessionId = await ctx.db.insert("sessionHeads", session);
+      for (let groupIndex = 0; groupIndex < 3; groupIndex += 1) {
+        const body = buildHraAttentionEmailBody(Array.from({ length: 8 }, () => ({
+          interactionKind: "command_approval" as const,
+          sessionPublicId: session.publicId,
+        })));
+        const bodyDigest = await sha256Hex(`hra-attention-body:v1\u0000${body.text}`);
+        const deliveryId = `01912345-6789-7abc-8def-0123456789e${String(groupIndex)}`;
+        const recipientDigest = String(groupIndex + 7).repeat(64);
+        const idempotencyKey = await sha256Hex([
+          "hra-attention-resend:v1",
+          deliveryId,
+          recipientDigest,
+          bodyDigest,
+        ].join("\u0000"));
+        const rowIds = [];
+        for (let rowIndex = 0; rowIndex < 8; rowIndex += 1) {
+          const pending = {
+            allowedWindowEnd: now + 60_000,
+            claimCapacityReservation: attentionNotificationQuotaReservations.pending,
+            claimDeadline: now + 60_000,
+            coalesceAfter: now - 60_000,
+            consentLeaseUntil: now + 60_000,
+            createdAt: now - 100_000,
+            executionAuthority: {
+              bootGeneration: 1,
+              bootId: "boot_attention_maintenance",
+              fence: 1,
+            },
+            globalNotificationGeneration: 1,
+            interactionDeadline: now + 60_000,
+            interactionId: `interaction_attention_maintenance_${String(groupIndex)}_${String(rowIndex)}`,
+            interactionKind: "command_approval" as const,
+            interactionRevision: 1,
+            localNotificationPolicyRevision: 1,
+            nonterminal: true,
+            reconciliationSequence: 1,
+            remoteActions: ["decline"] as ("answer" | "decline")[],
+            sessionId,
+            sessionPublicId: session.publicId,
+            sourceDeviceId: deviceId,
+            state: "pending" as const,
+            updatedAt: now - 100_000,
+            userId,
+          };
+          await reserveNonterminalCommandQuotaForInsert(ctx, userId, pending);
+          rowIds.push(await ctx.db.insert("attentionNotificationOutbox", pending));
+        }
+        const leaderRowId = rowIds[0];
+        if (leaderRowId === undefined) throw new Error("missing attention group leader");
+        expect(await reserveAttentionNotificationFaultCapacity(ctx, {
+          anchorRowId: leaderRowId,
+          deliveryId,
+          now,
+          userId,
+        })).toBe(true);
+        for (const [rowIndex, rowId] of rowIds.entries()) {
+          const pending = await ctx.db.get(rowId);
+          if (pending === null) throw new Error("missing attention group row");
+          const patch = {
+            claimCapacityReservation: attentionNotificationQuotaReservations.started,
+            delivery: {
+              attemptCount: 3,
+              ...(rowIndex === 0
+                ? { body }
+                : {}),
+              bodyDigest,
+              claimedAt: now - 200_000,
+              deadline: now - 30_000 + groupIndex * 1_000,
+              effectStartedAt: now - 200_000,
+              firstAttemptAt: now - 200_000,
+              generation: 1,
+              id: deliveryId,
+              idempotencyKey,
+              lastAttemptAt: now - 200_000,
+              leaderRowId,
+              nextAttemptAt: now - 60_000,
+              recipientDigest,
+            },
+            faultCapacityAnchor: leaderRowId,
+            state: "effect_started" as const,
+          };
+          await adjustCommandQuotaForPatch(ctx, userId, pending, patch);
+          await ctx.db.patch(rowId, patch);
+        }
+      }
+      await ctx.db.insert("maintenanceState", {
+        key: "retention",
+        nextCategory: "started_attention_notifications",
+        updatedAt: now,
+      });
+    });
+
+    expect(await runtime.mutation(cleanupExpired, { limit: 20 })).toMatchObject({
+      processed: 16,
+      startedAttentionNotifications: 16,
+    });
+    const groups = await runtime.run(async (ctx) => {
+      const rows = await ctx.db.query("attentionNotificationOutbox").collect();
+      return [0, 1, 2].map((groupIndex) => rows.filter((row) =>
+        row.delivery?.id === `01912345-6789-7abc-8def-0123456789e${String(groupIndex)}`));
+    });
+    for (const group of groups.slice(0, 2)) {
+      expect(group).toHaveLength(8);
+      expect(new Set(group.map((row) => row.delivery?.settledAt)).size).toBe(1);
+      expect(new Set(group.map((row) => row.delivery?.outcomeDigest)).size).toBe(1);
+      expect(group.every((row) => row.delivery?.nextAttemptAt === undefined)).toBe(true);
+      expect(group.every((row) => row.state === "ambiguous" && !row.nonterminal)).toBe(true);
+    }
+    expect(groups[2]).toHaveLength(8);
+    expect(groups[2]?.every((row) =>
+      row.state === "effect_started"
+      && row.nonterminal
+      && row.delivery?.settledAt === undefined)).toBe(true);
+
+    await runtime.run(async (ctx) => {
+      const corruptDeliveryId = "01912345-6789-7abc-8def-0123456789e2";
+      const corruptRows = await ctx.db.query("attentionNotificationOutbox")
+        .withIndex("by_delivery_id", (builder) => builder.eq("delivery.id", corruptDeliveryId))
+        .collect();
+      const leader = corruptRows.find((row) => row.delivery?.body !== undefined);
+      if (leader?.delivery?.body === undefined) throw new Error("missing corrupt leader fixture");
+      await ctx.db.patch(leader._id, {
+        delivery: {
+          ...leader.delivery,
+          body: { ...leader.delivery.body, text: `${leader.delivery.body.text} changed` },
+        },
+      });
+      const state = await ctx.db.query("maintenanceState").unique();
+      if (state === null) throw new Error("missing maintenance state fixture");
+      await ctx.db.patch(state._id, { nextCategory: "started_attention_notifications" });
+    });
+    expect(await runtime.mutation(cleanupExpired, { limit: 20 })).toMatchObject({
+      processed: 0,
+      startedAttentionNotifications: 0,
+    });
+    const [control, fault] = await runtime.run(async (ctx) => await Promise.all([
+      ctx.db.query("serviceControl").unique(),
+      ctx.db.query("attentionNotificationSafetyFaults")
+        .withIndex("by_state_and_observed_at", (builder) => builder.eq("state", "latched"))
+        .first(),
+    ]));
+    expect(control).toMatchObject({ attentionNotificationGeneration: 1 });
+    expect(fault).toMatchObject({
+      deliveryId: "01912345-6789-7abc-8def-0123456789e2",
+      reason: "stored_delivery_corrupt",
+    });
+    expect(control?.attentionNotifications).toBeUndefined();
+    await runtime.run(async (ctx) => {
+      const state = await ctx.db.query("maintenanceState").unique();
+      if (state === null) throw new Error("missing maintenance state fixture");
+      await ctx.db.patch(state._id, { nextCategory: "started_attention_notifications" });
+    });
+    expect(await runtime.mutation(cleanupExpired, { limit: 20 })).toMatchObject({
+      processed: 8,
+      startedAttentionNotifications: 8,
+    });
+    expect(await runtime.run(async (ctx) =>
+      await ctx.db.query("attentionNotificationOutbox")
+        .withIndex("by_delivery_id", (builder) => builder
+          .eq("delivery.id", "01912345-6789-7abc-8def-0123456789e2"))
+        .collect())).toEqual([]);
   });
 });

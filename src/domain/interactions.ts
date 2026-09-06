@@ -109,6 +109,7 @@ const interactionQuestionSchema = z.object({
   options: z.array(interactionOptionSchema).max(20).nullable(),
   allowsOther: z.boolean(),
   secret: z.boolean(),
+  remoteAnswerable: z.literal(true).optional(),
 }).strict();
 
 const permissionNameSchema = z.string().min(1).max(256);
@@ -704,115 +705,4 @@ export function decideAutorespondAction(input: {
     },
     outcome: "accepted",
   };
-}
-
-// --- Remote interaction detail ---------------------------------------------
-//
-// What a device that cannot see the exact command text, the exact affected
-// paths, or the exact requested permission values is still allowed to know,
-// and what it is therefore allowed to decide. Every function here is pure and
-// derives only from an already-sanitised `InteractionDisplay`, so the daemon
-// can recompute the same answer at apply time and refuse a decision whose
-// basis has changed. The hosted projection carries the result (bounded and
-// re-checked against the projection's own text rules) and the browser derives
-// its buttons from that; neither side may widen what these return.
-
-/** The only decision scopes a device that is not the custodian may ever send. */
-export type RemoteInteractionDecision = "once" | "decline";
-
-/**
- * The bounded class a remote approval is allowed to be taken on, or `null`
- * when no device but the custodian may decide.
- *
- * A command approval carries the provider's own closed command class. A
- * permission approval has no provider class, so its class is derived from the
- * requested categories and exists only when every one of them is recognisably
- * workspace-local: a network, MCP, or unrecognised category has no remote
- * class at all and therefore no remote decision. Questions and MCP forms are
- * answered, not classed.
- */
-export function computeInteractionCommandClass(display: InteractionDisplay): string | null {
-  if (display.kind === "command_approval") {
-    const value = display.commandClass.trim();
-    return value.length === 0 ? null : value.slice(0, 128);
-  }
-  if (display.kind !== "permission_approval") return null;
-  if (display.requested.length === 0) return null;
-  const workspaceOnly = display.requested.every((permission) =>
-    classifyPermissionCategory(permission.name) === "workspace"
-    && !permissionCategoryIsNetworkOrExternal(permission.name));
-  return workspaceOnly ? "permission:workspace" : null;
-}
-
-/**
- * The decisions the provider actually offered, reduced to the remote
- * vocabulary. Session scope is dropped here and never reaches a projection or
- * a command payload; `cancel` is a custodian decision and is not offered to a
- * device either. A permission approval has no provider decision list: the
- * callback is grant-or-decline, and whether either is legal remotely is
- * decided by `computeInteractionCommandClass`, not by this list.
- */
-export function computeRemoteAvailableDecisions(
-  display: InteractionDisplay,
-): readonly RemoteInteractionDecision[] {
-  if (display.kind === "command_approval" || display.kind === "file_change_approval") {
-    return display.availableDecisions.filter((decision): decision is RemoteInteractionDecision =>
-      decision === "once" || decision === "decline");
-  }
-  return display.kind === "permission_approval" ? ["once", "decline"] : [];
-}
-
-/**
- * A question a device may see. `secret` means the value must never be typed
- * anywhere but the custodian machine: the browser lists the question so the
- * reader knows what is being asked, and offers no input for it.
- */
-export type RemoteInteractionQuestion = Readonly<{
-  id: string;
-  label: string;
-  secret: boolean;
-}>;
-
-const credentialShapedFieldName =
-  /(?:token|secret|password|passphrase|credential|api[_.-]?key|private[_.-]?key|auth|otp|\bpin\b|cookie|session)/iu;
-
-/**
- * Whether one MCP form field can be answered as free text from a device.
- * Only a plain, format-free string field qualifies: a typed field (number,
- * boolean, choice) cannot be reconstructed from a text answer, a formatted
- * field carries a provider-side contract this path does not model, and a
- * credential-shaped name is treated as secret whatever its type.
- */
-export function mcpFieldIsRemotelyAnswerable(field: McpFormField): boolean {
-  return field.type === "string"
-    && field.format === null
-    && !credentialShapedFieldName.test(field.name);
-}
-
-/**
- * The questions a device may be shown for one interaction, in provider order.
- *
- * A user-input interaction reports the provider's own questions with the
- * provider's own `secret` flag. An MCP elicitation reports its form fields,
- * but only when the form is one HRA can complete at all (`form` mode with a
- * declared field list); every field that is not plain text is marked secret so
- * no input is offered for it. Approvals have no questions.
- */
-export function computeRemoteInteractionQuestions(
-  display: InteractionDisplay,
-): readonly RemoteInteractionQuestion[] {
-  if (display.kind === "user_input") {
-    return display.questions.map((question) => ({
-      id: question.id,
-      label: question.header.length > 0 ? question.header : question.question,
-      secret: question.secret,
-    }));
-  }
-  if (display.kind !== "mcp_elicitation") return [];
-  if (display.mode !== "form" || display.fields === undefined) return [];
-  return display.fields.map((field) => ({
-    id: field.name,
-    label: field.name,
-    secret: !mcpFieldIsRemotelyAnswerable(field),
-  }));
 }

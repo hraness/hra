@@ -50,10 +50,6 @@ const rulesEndMarker = "# hra-local-efficiency:rules:end";
 const codexConfigStartMarker = "# hra-local-efficiency:config:start";
 const codexConfigEndMarker = "# hra-local-efficiency:config:end";
 const claudeSettings = Object.freeze({
-  // Do not widen Claude's data-flow boundary here. The current repository's
-  // own remote is discovered by Claude; sibling repositories and public npm
-  // remain separate destinations whose publication must be judged in context.
-  autoModeEnvironment: Object.freeze(["$defaults"]),
   defaultMode: "auto",
 });
 const minimumClaudeAutoModeVersion = Object.freeze([2, 1, 83] as const);
@@ -240,10 +236,11 @@ export function claudeAutoModeCapability(
         return Object.freeze({ available: false, reason: "config_unavailable", version });
       }
       const lists = parsed as Record<string, unknown>;
+      const requiresNonemptyLists = action === "defaults";
       if (!["allow", "environment", "hard_deny", "soft_deny"].every((key) => {
         const list = lists[key];
         return Array.isArray(list)
-          && list.length > 0
+          && (!requiresNonemptyLists || list.length > 0)
           && list.every((entry) => typeof entry === "string" && entry.length > 0);
       })) return Object.freeze({ available: false, reason: "config_unavailable", version });
     }
@@ -822,10 +819,10 @@ function retainedClaudePermissionAllows(value: string): readonly string[] {
 
 function claudeAutoModeList(
   value: string,
-  key: "allow" | "soft_deny",
+  key: "allow" | "environment" | "soft_deny",
 ): readonly string[] {
   const parsed = JSON.parse(value) as {
-    autoMode?: { allow?: unknown; soft_deny?: unknown };
+    autoMode?: { allow?: unknown; environment?: unknown; soft_deny?: unknown };
   };
   const current = parsed.autoMode?.[key];
   if (current !== undefined && (
@@ -841,6 +838,7 @@ function expectedClaudeSettings(claudeHome: string): string {
   const initial = rootJsonObject(expected, "Claude settings");
   const retainedAllows = retainedClaudePermissionAllows(expected);
   const autoModeAllows = claudeAutoModeList(expected, "allow");
+  const autoModeEnvironment = claudeAutoModeList(expected, "environment");
   const autoModeSoftDenies = claudeAutoModeList(expected, "soft_deny");
   if (!initial.members.some((member) => member.key === "permissions")) {
     expected = upsertJsonProperty(
@@ -874,7 +872,7 @@ function expectedClaudeSettings(claudeHome: string): string {
       "autoMode",
       JSON.stringify({
         allow: autoModeAllows,
-        environment: claudeSettings.autoModeEnvironment,
+        environment: autoModeEnvironment,
         soft_deny: autoModeSoftDenies,
       }),
       "Claude settings",
@@ -884,7 +882,7 @@ function expectedClaudeSettings(claudeHome: string): string {
       expected,
       ["autoMode"],
       "environment",
-      JSON.stringify(claudeSettings.autoModeEnvironment),
+      JSON.stringify(autoModeEnvironment),
       "Claude settings",
     );
     expected = upsertJsonProperty(
@@ -911,7 +909,7 @@ function expectedClaudeSettings(claudeHome: string): string {
     || JSON.stringify(parsed.permissions.allow) !== JSON.stringify(retainedAllows)
     || JSON.stringify(parsed.autoMode?.allow) !== JSON.stringify(autoModeAllows)
     || JSON.stringify(parsed.autoMode?.environment)
-      !== JSON.stringify(claudeSettings.autoModeEnvironment)
+      !== JSON.stringify(autoModeEnvironment)
     || JSON.stringify(parsed.autoMode?.soft_deny) !== JSON.stringify(autoModeSoftDenies)
   ) throw new Error("managed Claude settings did not converge");
   return expected;

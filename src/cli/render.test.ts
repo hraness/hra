@@ -34,7 +34,7 @@ const data = {
     processGeneration: 3,
     observedAt: 2_000,
     preset: "high",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     reasoningEffort: "max",
     serviceTier: null,
     fast: false,
@@ -62,6 +62,267 @@ const data = {
 };
 
 describe("CLI rendering", () => {
+  test("renders notification hours without implying approval or autonomy behavior", () => {
+    const notificationData = {
+      policy: {
+        version: 1 as const,
+        revision: 2,
+        startMinute: 10 * 60,
+        endMinute: 22 * 60,
+        timeZone: "UTC",
+      },
+      observedAt: Date.parse("2026-09-04T12:30:00.000Z"),
+      withinHours: true,
+    };
+    const human = capture();
+    renderSuccess(
+      { kind: "notification-hours.status" },
+      notificationData,
+      false,
+      human.output,
+    );
+    expect(human.stdout.join("")).toBe([
+      "Notification hours",
+      "Range: 10:00-22:00",
+      "Time zone: UTC",
+      "Current: yes",
+      "Revision: 2",
+      "Observed: 2026-09-04T12:30:00.000Z",
+      "",
+    ].join("\n"));
+    expect(human.stdout.join("")).not.toMatch(/approval|autonomy|automatic/iu);
+
+    const json = capture();
+    renderSuccess(
+      { kind: "notification-hours.status" },
+      notificationData,
+      true,
+      json.output,
+    );
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      command: "notification-hours.status",
+      data: notificationData,
+      ok: true,
+      version: 1,
+    });
+  });
+
+  test("rejects malformed or command-mismatched notification-hours results", () => {
+    const command = {
+      kind: "notification-hours.set",
+      expectedRevision: 2,
+      version: 1,
+      startMinute: 22 * 60,
+      endMinute: 6 * 60,
+      timeZone: "UTC",
+    } as const;
+    const result = {
+      policy: {
+        version: 1 as const,
+        revision: 3,
+        startMinute: command.startMinute,
+        endMinute: command.endMinute,
+        timeZone: command.timeZone,
+      },
+      observedAt: Date.parse("2026-09-04T23:00:00.000Z"),
+      withinHours: true,
+    };
+    expect(() => renderSuccess(command, {
+      ...result,
+      authority: "invented",
+    }, true, capture().output)).toThrow(InvalidCommandResponseError);
+    expect(() => renderSuccess(command, {
+      ...result,
+      policy: { ...result.policy, revision: 4 },
+    }, true, capture().output)).toThrow(InvalidCommandResponseError);
+    expect(() => renderSuccess(command, {
+      ...result,
+      withinHours: false,
+    }, true, capture().output)).toThrow(InvalidCommandResponseError);
+    expect(() => renderSuccess(command, {
+      ...result,
+      observedAt: Number.MAX_SAFE_INTEGER,
+    }, true, capture().output)).toThrow(InvalidCommandResponseError);
+  });
+
+  test("renders local notification-email authority without claiming hosted revocation", () => {
+    const data = {
+      hostedAuthority: { state: "not_observed" as const },
+      policy: { enabled: false, revision: 4, version: 1 as const },
+    };
+    const human = capture();
+    renderSuccess({ kind: "notification-email.status" }, data, false, human.output);
+    expect(human.stdout.join("")).toBe([
+      "Attention email notifications",
+      "Local setting: disabled",
+      "Revision: 4",
+      "Hosted authority: not observed",
+      "No hosted acknowledgement is claimed.",
+      "",
+    ].join("\n"));
+
+    const json = capture();
+    renderSuccess({ kind: "notification-email.status" }, data, true, json.output);
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      command: "notification-email.status",
+      data,
+      ok: true,
+      version: 1,
+    });
+  });
+
+  test("renders observed, acknowledged, and bounded-pending hosted authority truthfully", () => {
+    const currentAuthority = {
+      deviceAuthority: {
+        consentLeaseUntil: 180_000,
+        globalNotificationGeneration: 3,
+        localNotificationPolicyRevision: 4,
+      },
+      globalNotificationGeneration: 3,
+      globalState: "enabled" as const,
+      observedAt: 60_000,
+      state: "observed" as const,
+    };
+    const cases = [
+      {
+        authority: currentAuthority,
+        enabled: true,
+        expected: ["Hosted authority: enabled", "Device consent current: yes"],
+      },
+      {
+        authority: {
+          acknowledgedAt: 60_000,
+          consentLeaseUntil: 60_000,
+          state: "acknowledged" as const,
+        },
+        enabled: false,
+        expected: [
+          "Hosted invalidation: acknowledged",
+          "does not claim recall of any delivery already started",
+        ],
+      },
+      {
+        authority: {
+          expiresNoLaterThan: 180_000,
+          state: "revocation_pending" as const,
+        },
+        enabled: false,
+        expected: [
+          "Hosted invalidation: pending",
+          "expires no later than",
+          "does not claim recall of any delivery already started",
+        ],
+      },
+    ];
+    for (const entry of cases) {
+      const output = capture();
+      renderSuccess({ kind: "notification-email.status" }, {
+        hostedAuthority: entry.authority,
+        policy: { enabled: entry.enabled, revision: 4, version: 1 },
+      }, false, output.output);
+      for (const expected of entry.expected) {
+        expect(output.stdout.join("")).toContain(expected);
+      }
+    }
+
+    for (const authority of [
+      { ...currentAuthority, globalState: "disabled" as const },
+      { ...currentAuthority, globalState: "safety_latched" as const },
+      {
+        ...currentAuthority,
+        deviceAuthority: { ...currentAuthority.deviceAuthority, consentLeaseUntil: 60_000 },
+      },
+      {
+        ...currentAuthority,
+        deviceAuthority: {
+          ...currentAuthority.deviceAuthority,
+          localNotificationPolicyRevision: 3,
+        },
+      },
+      {
+        ...currentAuthority,
+        deviceAuthority: {
+          ...currentAuthority.deviceAuthority,
+          globalNotificationGeneration: 2,
+        },
+      },
+    ]) {
+      const output = capture();
+      renderSuccess({ kind: "notification-email.status" }, {
+        hostedAuthority: authority,
+        policy: { enabled: true, revision: 4, version: 1 },
+      }, false, output.output);
+      expect(output.stdout.join("")).toContain("Device consent current: no");
+      expect(output.stdout.join("")).toContain("Device consent generation:");
+    }
+
+    const locallyDisabled = capture();
+    renderSuccess({ kind: "notification-email.status" }, {
+      hostedAuthority: currentAuthority,
+      policy: { enabled: false, revision: 4, version: 1 },
+    }, false, locallyDisabled.output);
+    expect(locallyDisabled.stdout.join("")).toContain("Device consent current: no");
+
+    expect(() => renderSuccess({ kind: "notification-email.status" }, {
+      hostedAuthority: {
+        ...currentAuthority,
+        deviceAuthority: {
+          ...currentAuthority.deviceAuthority,
+          consentLeaseUntil: currentAuthority.observedAt + 2 * 60 * 1_000 + 1,
+        },
+      },
+      policy: { enabled: true, revision: 4, version: 1 },
+    }, false, capture().output)).toThrow(InvalidCommandResponseError);
+  });
+
+  test("rejects malformed and command-mismatched notification-email results", () => {
+    const command = {
+      expectedRevision: 4,
+      kind: "notification-email.enable",
+    } as const;
+    const result = {
+      hostedAuthority: { state: "not_observed" as const },
+      policy: { enabled: true, revision: 5, version: 1 as const },
+    };
+    for (const data of [
+      { ...result, policy: { ...result.policy, enabled: false } },
+      { ...result, policy: { ...result.policy, revision: 6 } },
+      { ...result, hostedAuthority: { state: "acknowledged" } },
+      { ...result, extra: true },
+    ]) expect(() => renderSuccess(command, data, true, capture().output))
+      .toThrow(InvalidCommandResponseError);
+
+    const acknowledged = {
+      acknowledgedAt: 60_000,
+      consentLeaseUntil: 60_000,
+      state: "acknowledged" as const,
+    };
+    expect(() => renderSuccess(command, {
+      hostedAuthority: acknowledged,
+      policy: result.policy,
+    }, true, capture().output)).toThrow(InvalidCommandResponseError);
+    expect(() => renderSuccess({
+      expectedRevision: 4,
+      kind: "notification-email.disable",
+    }, {
+      hostedAuthority: {
+        deviceAuthority: null,
+        globalNotificationGeneration: 3,
+        globalState: "enabled",
+        observedAt: 60_000,
+        state: "observed",
+      },
+      policy: { enabled: false, revision: 5, version: 1 },
+    }, true, capture().output)).toThrow(InvalidCommandResponseError);
+    expect(() => renderSuccess({
+      expectedRevision: 4,
+      kind: "notification-email.disable",
+    }, {
+      hostedAuthority: acknowledged,
+      policy: { enabled: false, revision: 5, version: 1 },
+    }, true, capture().output)).not.toThrow();
+  });
+
   test("renders a Claude session's reviewed runtime profile, not the Codex one", () => {
     const shown = capture();
     renderSuccess(
@@ -1198,7 +1459,7 @@ describe("CLI rendering", () => {
       "Runtime",
       "  account: acct_00000000000000000000000000000000 generation 3",
       "  preset: high",
-      "  model: gpt-5.6-sol",
+      "  model: gpt-6-astra",
       "  reasoning effort: max",
       "  service tier: default",
       "  Fast: disabled",

@@ -1,9 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  computeInteractionCommandClass,
-  computeRemoteAvailableDecisions,
-  computeRemoteInteractionQuestions,
   interactionRecordSchema,
   protectedInteractionDetailDocumentSchema,
   mcpFormFieldSchema,
@@ -11,7 +8,6 @@ import {
   providerRequestIdSchema,
   permissionCategoryIsNetworkOrExternal,
   publicInteractionSchema,
-  type InteractionDecision,
 } from "./interactions";
 import { isNetworkOrExternalPermission } from "../daemon/autorespond";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
@@ -283,16 +279,7 @@ describe("provider interactions", () => {
   });
 });
 
-describe("remote interaction detail", () => {
-  const commandApproval = {
-    availableDecisions: ["once", "session", "decline", "cancel"] as InteractionDecision[],
-    commandClass: "git commit",
-    kind: "command_approval" as const,
-    reason: null,
-    summary: "Allow git commit",
-    workingDirectory: "src",
-  };
-
+describe("permission category classification", () => {
   const permissionApproval = (names: readonly string[]) => ({
     allowsSessionScope: true,
     kind: "permission_approval" as const,
@@ -301,120 +288,10 @@ describe("remote interaction detail", () => {
     summary: "Allow additional permissions",
   });
 
-  test("a command approval carries the provider class, a permission approval only a workspace one", () => {
-    expect(computeInteractionCommandClass(commandApproval)).toBe("git commit");
-    expect(computeInteractionCommandClass(permissionApproval(["workspace_write"])))
-      .toBe("permission:workspace");
-    for (const requested of [
-      [],
-      ["network_outbound"],
-      ["mcp_tool"],
-      ["telemetry"],
-      ["workspace_write", "network_outbound"],
-      // Recognisably workspace-local by prefix, but it reaches outward: both
-      // tests must agree or the autoresponder and the browser would disagree.
-      ["file_http_fetch"],
-    ]) {
-      expect(computeInteractionCommandClass(permissionApproval(requested))).toBeNull();
-    }
-    expect(computeInteractionCommandClass({
-      blocking: true,
-      kind: "user_input",
-      questions: [{
-        allowsOther: false,
-        header: "Where",
-        id: "where",
-        options: null,
-        question: "Where?",
-        secret: false,
-      }],
-      summary: "Codex needs user input",
-    })).toBeNull();
-  });
-
-  test("the remote decision vocabulary drops session and cancel", () => {
-    expect(computeRemoteAvailableDecisions(commandApproval)).toEqual(["once", "decline"]);
-    expect(computeRemoteAvailableDecisions({
-      ...commandApproval,
-      availableDecisions: ["session", "cancel"] as InteractionDecision[],
-    })).toEqual([]);
-    expect(computeRemoteAvailableDecisions(permissionApproval(["workspace_write"])))
-      .toEqual(["once", "decline"]);
-  });
-
-  test("a question keeps the provider's secret flag and an MCP field earns one", () => {
-    expect(computeRemoteInteractionQuestions({
-      blocking: true,
-      kind: "user_input",
-      questions: [
-        {
-          allowsOther: false,
-          header: "Region",
-          id: "region",
-          options: null,
-          question: "Which region?",
-          secret: false,
-        },
-        {
-          allowsOther: false,
-          header: "Token",
-          id: "token",
-          options: null,
-          question: "Paste it.",
-          secret: true,
-        },
-      ],
-      summary: "Codex needs user input",
-    })).toEqual([
-      { id: "region", label: "Region", secret: false },
-      { id: "token", label: "Token", secret: true },
-    ]);
-
-    const field = (name: string, overrides: Record<string, unknown> = {}) => ({
-      format: null,
-      maxLength: 64,
-      minLength: 0,
-      name,
-      required: false,
-      type: "string" as const,
-      ...overrides,
-    });
-    expect(computeRemoteInteractionQuestions({
-      fields: [
-        field("region"),
-        field("api_key"),
-        field("contact", { format: "email" }),
-        { choices: ["a"], name: "slot", required: false, type: "single_select" },
-      ],
-      kind: "mcp_elicitation",
-      mayContainSecrets: true,
-      mode: "form",
-      serverName: "server",
-      summary: "Review provider input",
-      url: null,
-    })).toEqual([
-      { id: "region", label: "region", secret: false },
-      { id: "api_key", label: "api_key", secret: true },
-      { id: "contact", label: "contact", secret: true },
-      { id: "slot", label: "slot", secret: true },
-    ]);
-
-    // A form HRA cannot complete at all offers no question to answer.
-    expect(computeRemoteInteractionQuestions({
-      kind: "mcp_elicitation",
-      mayContainSecrets: true,
-      mode: "openai_form",
-      serverName: "server",
-      summary: "Review provider input",
-      url: null,
-    })).toEqual([]);
-  });
-
   test("the network category test agrees with the autoresponder gate", () => {
     for (const name of ["network_outbound", "mcp_tool", "web_search", "remote_exec"]) {
       expect(permissionCategoryIsNetworkOrExternal(name)).toBe(true);
       expect(isNetworkOrExternalPermission(permissionApproval([name]))).toBe(true);
-      expect(computeInteractionCommandClass(permissionApproval([name]))).toBeNull();
     }
     expect(permissionCategoryIsNetworkOrExternal("workspace_write")).toBe(false);
     expect(isNetworkOrExternalPermission(permissionApproval(["workspace_write"]))).toBe(false);

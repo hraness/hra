@@ -25,9 +25,17 @@ import {
   type DynamicToolPublicResult,
 } from "../codex/index";
 import {
+  notificationEmailCommandResultSchema,
+  notificationEmailHostedAuthoritySchema,
+  notificationHoursCommandResultSchema,
   signedOutSessionListMetadataSchema,
   type LocalCommand,
+  type NotificationEmailHostedAuthority,
 } from "../domain/contracts";
+import {
+  isWithinNotificationHours,
+  type NotificationHoursPolicy,
+} from "../domain/notification-hours";
 import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
@@ -48,8 +56,10 @@ import {
   type SessionStatus,
 } from "../domain/observation";
 import {
+  currentPresetContract,
   isPresetSupportedByProvider,
   PresetProviderMismatchError,
+  presetRequirementForContract,
   presetsForProvider,
   presetTiers,
   type Preset,
@@ -1168,6 +1178,48 @@ export class HraService {
           const effective = this.#store.readSessionApprovalMode(session.id);
           return { version: 1, session: session.id, mode: effective.mode, source: effective.source };
         }
+        case "notification-hours.status":
+          return this.#notificationHoursObservation(
+            this.#store.readNotificationHours(),
+          );
+        case "notification-hours.set":
+          return await this.#serialize("notification-policy", async () => {
+            const policy = this.#store.updateNotificationHours({
+              expectedRevision: command.expectedRevision,
+              version: command.version,
+              startMinute: command.startMinute,
+              endMinute: command.endMinute,
+              timeZone: command.timeZone,
+            });
+            return this.#notificationHoursObservation(policy);
+          });
+        case "notification-email.status":
+          return notificationEmailCommandResultSchema.parse({
+            hostedAuthority: await this.#readAttentionNotificationAuthority(
+              context.signal,
+            ),
+            policy: this.#store.readNotificationEmailPolicy(),
+          });
+        case "notification-email.enable":
+        case "notification-email.disable":
+          return await this.#serialize("notification-policy", async () => {
+            // Local consent is the primary authority and commits before any
+            // hosted observation or revocation attempt.
+            const policy = this.#store.updateNotificationEmailPolicy({
+              enabled: command.kind === "notification-email.enable",
+              expectedRevision: command.expectedRevision,
+            });
+            const hostedAuthority = command.kind === "notification-email.disable"
+              ? await this.#invalidateAttentionNotificationAuthority(
+                  policy.revision,
+                  context.signal,
+                )
+              : await this.#readAttentionNotificationAuthorityForEnable(context.signal);
+            return notificationEmailCommandResultSchema.parse({
+              hostedAuthority,
+              policy,
+            });
+          });
         case "remote.policy-set": {
           if (command.switch === "device-commands") {
             this.#store.setDeviceCommandsAllowed(command.allowed);
@@ -1221,7 +1273,12 @@ export class HraService {
         case "session.note.edit": throw new CommandFailure("INTERACTION_REQUIRED", "Open the editor through the local `hra session note edit` command.");
         case "session.note.set": return { session: await this.#updateSession(command.session, (session) => ({ note: command.note, expectedRevision: session.revision })) };
         case "session.note.clear": return { session: await this.#updateSession(command.session, (session) => ({ note: "", expectedRevision: session.revision })) };
-        case "session.preset": return { session: await this.#updateSession(command.session, (session) => ({ preset: command.preset, expectedRevision: session.revision })) };
+        case "session.preset": return {
+          session: await this.#updateSession(
+            command.session,
+            (session) => this.#presetMetadataUpdate(session, command.preset),
+          ),
+        };
         case "session.switch": {
           const replay = this.#settledProviderSwitchReplay(command);
           if (replay.matched) return replay.value;
@@ -1236,7 +1293,12 @@ export class HraService {
           );
         }
         case "session.transcript": return this.#readTranscript(command.session, command.after, command.limit);
-        case "session.fast": return { session: await this.#updateSession(command.session, (session) => ({ fastEnabled: command.enabled, expectedRevision: session.revision })) };
+        case "session.fast": return {
+          session: await this.#updateSession(
+            command.session,
+            (session) => this.#fastMetadataUpdate(session, command.enabled),
+          ),
+        };
         case "session.project": {
           const project = this.#store.requireProject(command.project);
           const session = await this.#updateSession(command.session, (current) => ({ projectId: project.id, expectedRevision: current.revision }));
@@ -1574,6 +1636,30 @@ export class HraService {
         )
       ) throw new CommandFailure("CONFLICT", error.message);
       if (error instanceof Error && error.message === "UNSETTLED_MUTATION_AUTHORITY") throw new CommandFailure("RECOVERY_REQUIRED", "This mutation authority has an unsettled earlier effect and rejects new idempotency keys.");
+      if (error instanceof Error && error.message === "NOTIFICATION_HOURS_REVISION_CONFLICT") {
+        throw new CommandFailure(
+          "CONFLICT",
+          "Notification policy changed since that revision. Run `hra notification-hours status` and retry with its revision.",
+        );
+      }
+      if (error instanceof Error && error.message === "NOTIFICATION_HOURS_REVISION_EXHAUSTED") {
+        throw new CommandFailure(
+          "CONFLICT",
+          "Notification-policy revision capacity is exhausted; this setting cannot be updated further.",
+        );
+      }
+      if (error instanceof Error && error.message === "ATTENTION_EMAIL_POLICY_REVISION_CONFLICT") {
+        throw new CommandFailure(
+          "CONFLICT",
+          "Notification policy changed since that revision. Run `hra notification-email status` and retry with its revision.",
+        );
+      }
+      if (error instanceof Error && error.message === "ATTENTION_EMAIL_POLICY_REVISION_EXHAUSTED") {
+        throw new CommandFailure(
+          "CONFLICT",
+          "Notification-policy revision capacity is exhausted; this setting cannot be updated further.",
+        );
+      }
       if (error instanceof Error && error.message === "SESSION_EVENT_CURSOR_AHEAD") {
         throw new CommandFailure("CONFLICT", "The session event cursor is ahead of the current stream.");
       }
@@ -1671,17 +1757,15 @@ export class HraService {
         case "session.rename": return await this.#rename(session.id, command.name, command.idempotencyKey, context.signal);
         case "session.preset": return {
           session: this.#store.updateSessionMetadata({
-            expectedRevision: session.revision,
-            preset: command.preset,
             sessionId: session.id,
+            ...this.#presetMetadataUpdate(session, command.preset),
           }),
         };
         case "session.switch": return await this.#switchProvider(command, context.signal);
         case "session.fast": return {
           session: this.#store.updateSessionMetadata({
-            expectedRevision: session.revision,
-            fastEnabled: command.enabled,
             sessionId: session.id,
+            ...this.#fastMetadataUpdate(session, command.enabled),
           }),
         };
         case "interaction.resolve": {
@@ -7258,6 +7342,10 @@ export class HraService {
     // port proves, and every later turn, steer, stop, and interaction on this
     // session is routed back to the same port by `sessions.provider`.
     const runtime = this.#sessionRuntime(provider);
+    const requirement = presetRequirementForContract(
+      command.preset,
+      currentPresetContract,
+    );
     // Prove authentication under the account serializer before the first
     // durable mutation row or runtime review exists. Storage consumes this
     // exact profile/provider/generation tuple at the effect boundary.
@@ -7294,6 +7382,7 @@ export class HraService {
             authority: authorityFor(this.#paths, profile),
             projectRoot,
             preset: command.preset,
+            requirement,
             fast: command.fast,
             signal,
           });
@@ -7659,6 +7748,10 @@ export class HraService {
     });
 
     const runtime = this.#sessionRuntime(command.provider);
+    const requirement = presetRequirementForContract(
+      preset,
+      currentPresetContract,
+    );
     const fromProvider = session.provider;
     const fromPreset = session.preset;
     let sessionReview: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
@@ -7695,6 +7788,7 @@ export class HraService {
               authority: authorityFor(this.#paths, targetProfile),
               ...(projectRoot === undefined ? {} : { projectRoot }),
               preset,
+              requirement,
               fast: session.fastEnabled,
               signal,
             }),
@@ -7775,6 +7869,7 @@ export class HraService {
                 providerThreadId: startedTarget.providerThreadId,
                 ...(projectRoot === undefined ? {} : { projectRoot }),
                 preset,
+                requirement,
                 fast: session.fastEnabled,
                 signal,
               }),
@@ -8051,6 +8146,10 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const attachments = await this.#prepareAttachments(attachmentReferences);
     const profile = this.#store.requireProfile(session.profileId);
+    const presetSelection = this.#store.requireSessionPresetRequirement(session.id);
+    if (presetSelection.preset !== session.preset) {
+      throw new CommandFailure("CONFLICT", "The session preset authority changed before dispatch.");
+    }
     this.#assertEstablishedSessionAccount(profile, session);
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     if (project !== undefined) await this.#requireUsableProjectRoot(project.rootPath);
@@ -8098,6 +8197,7 @@ export class HraService {
           providerThreadId: session.providerThreadId,
           ...(projectRoot === undefined ? {} : { projectRoot }),
           preset: session.preset,
+          requirement: presetSelection.requirement,
           fast: session.fastEnabled,
           signal,
         });
@@ -9446,6 +9546,34 @@ export class HraService {
     });
   }
 
+  /** Fast is a Codex service tier; disabling remains available to repair legacy rows. */
+  #fastMetadataUpdate(
+    session: SessionRecord,
+    enabled: boolean,
+  ): Omit<Parameters<StateStore["updateSessionMetadata"]>[0], "sessionId"> {
+    if (enabled && session.provider !== "codex") {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        "Fast mode is available only for Codex sessions.",
+        { reason: "unsupported_capability" },
+      );
+    }
+    return { expectedRevision: session.revision, fastEnabled: enabled };
+  }
+
+  #presetMetadataUpdate(
+    session: SessionRecord,
+    preset: Preset,
+  ): Omit<Parameters<StateStore["updateSessionMetadata"]>[0], "sessionId"> {
+    if (session.state === "recovery_required") {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session requires recovery before its model preset can change.",
+      );
+    }
+    return { expectedRevision: session.revision, preset };
+  }
+
   async #reconcileTerminalFactsMemory(): Promise<void> {
     const targetRevision = this.#terminalFactsMemoryRevision;
     if (
@@ -9490,6 +9618,8 @@ export class HraService {
     const admittedProfile = this.#store.requireProfile(session.profileId);
     if (!this.#profileAllowsEstablishedSession(admittedProfile, session)) return;
     const boundSession: BoundSessionRecord = { ...session, providerThreadId: session.providerThreadId };
+    const presetSelection = this.#store.requireSessionPresetRequirement(session.id);
+    if (presetSelection.preset !== session.preset) return;
     const queued = this.#store.nextPendingQueue(session.id);
     if (queued === null) return;
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
@@ -9512,6 +9642,7 @@ export class HraService {
           providerThreadId: boundSession.providerThreadId,
           projectRoot,
           preset: session.preset,
+          requirement: presetSelection.requirement,
           fast: session.fastEnabled,
           signal,
         });
@@ -9648,6 +9779,75 @@ export class HraService {
         this.#scheduleUsageRefresh(authority);
       }
     });
+  }
+
+  #notificationHoursObservation(
+    policy: NotificationHoursPolicy,
+  ): z.infer<typeof notificationHoursCommandResultSchema> {
+    const observedAt = this.#now();
+    return notificationHoursCommandResultSchema.parse({
+      policy,
+      observedAt,
+      withinHours: isWithinNotificationHours(policy, observedAt),
+    });
+  }
+
+  async #readAttentionNotificationAuthority(
+    signal: AbortSignal,
+  ): Promise<NotificationEmailHostedAuthority> {
+    if (this.#cloud.observeAttentionNotificationAuthority === undefined) {
+      return { state: "not_observed" };
+    }
+    try {
+      const parsed = notificationEmailHostedAuthoritySchema.safeParse(
+        await this.#cloud.observeAttentionNotificationAuthority(signal),
+      );
+      return parsed.success ? parsed.data : { state: "not_observed" };
+    } catch {
+      return { state: "not_observed" };
+    }
+  }
+
+  async #readAttentionNotificationAuthorityForEnable(
+    signal: AbortSignal,
+  ): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "not_observed" | "observed" }
+  >> {
+    const authority = await this.#readAttentionNotificationAuthority(signal);
+    return authority.state === "not_observed" || authority.state === "observed"
+      ? authority
+      : { state: "not_observed" };
+  }
+
+  async #invalidateAttentionNotificationAuthority(
+    localNotificationPolicyRevision: number,
+    signal: AbortSignal,
+  ): Promise<Extract<
+    NotificationEmailHostedAuthority,
+    { state: "acknowledged" | "not_observed" | "revocation_pending" }
+  >> {
+    if (this.#cloud.invalidateAttentionNotificationAuthority === undefined) {
+      return { state: "not_observed" };
+    }
+    try {
+      const parsed = notificationEmailHostedAuthoritySchema.safeParse(
+        await this.#cloud.invalidateAttentionNotificationAuthority({
+          localNotificationPolicyRevision,
+          signal,
+        }),
+      );
+      return parsed.success
+        && (parsed.data.state === "not_observed"
+          || parsed.data.state === "acknowledged"
+          || parsed.data.state === "revocation_pending")
+        ? parsed.data
+        : { state: "not_observed" };
+    } catch {
+      // Failure after the local CAS is not a command failure, but without a
+      // bridge/control receipt this layer cannot invent a hosted deadline.
+      return { state: "not_observed" };
+    }
   }
 
   async #serialize<T>(key: string, operation: () => Promise<T> | T): Promise<T> {

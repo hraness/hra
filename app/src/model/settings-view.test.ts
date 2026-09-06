@@ -6,6 +6,7 @@ import {
   accountRows,
   allScheduledTasks,
   archivedSessionRows,
+  attentionEmailPresentation,
   commandTargetForMachine,
   isMachineOnline,
   machineLabelsByDevice,
@@ -111,10 +112,21 @@ describe("isMachineOnline", () => {
 
 describe("toMachineView", () => {
   test("decodes a registry into the row the machine card renders", () => {
+    const notificationHours = {
+      endMinute: 1_320,
+      revision: 4,
+      startMinute: 600,
+      timeZone: "America/Puerto_Rico",
+      version: 1,
+    } as const;
     const view = toMachineView({
       device: { online: true, status: "active" },
       devicePublicId: "dev_one",
       now,
+      notificationHours,
+      attentionEmailEnabled: false,
+      notificationPolicyFreshness: "current",
+      notificationPolicyRevision: 4,
       payload: registry(),
       revision: 7,
       updatedAt: now - minute,
@@ -126,10 +138,30 @@ describe("toMachineView", () => {
     expect(view.showThinkingDefault).toBe(false);
     expect(view.proseAutorespondConfigured).toBe(true);
     expect(view.devicePublicId).toBe("dev_one");
+    expect(view.deviceStatus).toBe("active");
+    expect(view.notificationHours).toEqual(notificationHours);
+    expect(view.notificationHoursStatus).toBe("available");
+    expect(view.attentionEmailEnabled).toBe(false);
+    expect(view.notificationPolicyFreshness).toBe("current");
+    expect(view.notificationPolicyRevision).toBe(4);
     expect(view.revision).toBe(7);
     expect(view.online).toBe(true);
     expect(view.accounts.map((account) => account.label)).toEqual(["work", "personal"]);
     expect(view.projects.map((project) => project.label)).toEqual(["hra"]);
+  });
+
+  test("defaults an older registry to no displayable email consent", () => {
+    const view = toMachineView({
+      device: { online: true, status: "active" },
+      devicePublicId: "dev_one",
+      now,
+      payload: registry(),
+      revision: 1,
+      updatedAt: now,
+    });
+    expect(view.attentionEmailEnabled).toBeNull();
+    expect(view.notificationPolicyFreshness).toBe("unsupported");
+    expect(view.notificationPolicyRevision).toBeNull();
   });
 
   test("labels every scheduled task by provider and carries its machine", () => {
@@ -151,6 +183,39 @@ describe("toMachineView", () => {
   test("names both scheduled task kinds", () => {
     expect(scheduledTaskKindLabel("codex_automation")).toBe("Codex");
     expect(scheduledTaskKindLabel("hra_conversation")).toBe("HRA");
+  });
+});
+
+describe("attentionEmailPresentation", () => {
+  test("reports current enabled and disabled revisions without creating a command", () => {
+    expect(attentionEmailPresentation({
+      attentionEmailEnabled: true,
+      notificationPolicyFreshness: "current",
+      notificationPolicyRevision: 9,
+    })).toEqual({
+      description: "Last published local email opt-in at notification policy revision 9.",
+      label: "enabled",
+      tone: "accent",
+    });
+    expect(attentionEmailPresentation({
+      attentionEmailEnabled: false,
+      notificationPolicyFreshness: "current",
+      notificationPolicyRevision: 10,
+    }).label).toBe("disabled");
+  });
+
+  test("never presents stale, unreadable, or legacy evidence as enabled", () => {
+    for (const [freshness, label] of [
+      ["stale", "refresh needed"],
+      ["unreadable", "unavailable"],
+      ["unsupported", "unavailable"],
+    ] as const) {
+      expect(attentionEmailPresentation({
+        attentionEmailEnabled: null,
+        notificationPolicyFreshness: freshness,
+        notificationPolicyRevision: freshness === "unsupported" ? null : 4,
+      }).label).toBe(label);
+    }
   });
 });
 

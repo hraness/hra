@@ -382,8 +382,8 @@ export const publicContent: PublicContent = {
     steps: [
       {
         label: "Start",
-        command: "hra session start personal --provider codex --preset high --json",
-        detail: "Create a Codex session under the account profile you name.",
+        command: "hra session start personal --provider codex --json",
+        detail: "Create an Astra Ultra Codex session under the account profile you name.",
       },
       {
         label: "Inspect",
@@ -681,7 +681,7 @@ export const publicContent: PublicContent = {
         {
           kind: "commands",
           commands: [
-            "hra session start personal --provider codex --preset high",
+            "hra session start personal --provider codex",
             "hra",
             "/account personal",
             "/session <session-id>",
@@ -699,7 +699,7 @@ export const publicContent: PublicContent = {
         {
           kind: "commands",
           commands: [
-            "hra session start personal --provider codex --preset high --json",
+            "hra session start personal --provider codex --json",
             "hra session status <session-id> --json",
             "hra session send <session-id> -- \"Review this project and summarize its current state.\"",
             "hra session watch <session-id> --cursor <status-cursor> --jsonl",
@@ -1109,10 +1109,17 @@ export const publicContent: PublicContent = {
         ),
         list(
           [code("low"), text(": Codex Luna Max, currently "), code("gpt-5.6-luna"), text(" with "), code("max"), text(" reasoning.")],
-          [code("high"), text(": Codex Sol Max, currently "), code("gpt-5.6-sol"), text(" with "), code("max"), text(" reasoning.")],
-          [code("ultra"), text(": Codex Sol Ultra, currently "), code("gpt-5.6-sol"), text(" with "), code("ultra"), text(" reasoning.")],
+          [code("high"), text(": Codex Astra Max, currently "), code("gpt-6-astra"), text(" with "), code("max"), text(" reasoning.")],
+          [code("ultra"), text(": Codex Astra Ultra, currently "), code("gpt-6-astra"), text(" with "), code("ultra"), text(" reasoning.")],
           [code("fable-max"), text(": Claude Code Fable, currently "), code("claude-fable-5-1"), text(" with "), code("max"), text(" reasoning.")],
           [code("fast on|off"), text(": a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.")],
+        ),
+        paragraph(
+          text("New HRA-created Codex sessions and every explicit preset selection use the current mapping above. Pre-cutover and provider-imported Codex sessions keep their durable exact Sol mapping for "),
+          code("high"),
+          text(" and "),
+          code("ultra"),
+          text(" until a preset is explicitly selected; metadata edits, restart recovery, and queued work do not reinterpret an established session."),
         ),
         paragraph(
           code("hra init"),
@@ -1183,9 +1190,9 @@ export const publicContent: PublicContent = {
         ),
         paragraph(
           code("hra remote show"),
-          text(" includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary. Provider request IDs, permission values, MCP fields, protected answers, and response digests remain local. A pending command or file-change approval can be decided from another device with "),
-          code("hra remote resolve <cloud-session> --interaction <id> --revision <n> --decision once|decline|cancel"),
-          text(": the encrypted decision travels as a remote command in its own scheduling lane, and the execution device applies it only when the interaction is still pending at that revision, belongs to that session, is inside its deadline, offers that decision, and the requesting device is still active. Session scope and secret answers never travel remotely. "),
+          text(" includes interaction events with a public interaction ID, kind, state, revision, blocking status, bounded safe summary, and a nested version 2 remote policy. That policy is the only remote action authority. Provider request IDs, exact commands, permission values, affected paths, MCP fields, protected answers, and response digests remain local. Another device may decline a pending command, permission, or file-change request with "),
+          code("hra remote resolve <cloud-session> --interaction <id> --revision <n> --decision decline"),
+          text(". The web app may answer only a complete non-secret closed-choice user question set whose provider adapter proves exact response translation. Every command, permission, or file-change acceptance or grant, cancel, session scope, free-text or Other response, and every MCP answer stays on the execution machine. A missing policy, nested policy version 1, or unknown policy version exposes no control. The execution daemon rechecks the session, revision, pending state, deadline, requesting device, and exact action membership before using the ordinary local resolution path. "),
           code("hra remote send --or-steer"),
           text(" lets the execution device decide whether a message steers the active turn or starts a new one, because a remote view of turn state is always slightly stale."),
         ),
@@ -1264,6 +1271,10 @@ export const publicContent: PublicContent = {
             "hra auth login --input-stdin|--input-fd <fd>",
             "hra auth status|logout",
             "hra auth delete --acknowledge-erasure",
+            "hra notification-hours status [--json]",
+            "hra notification-hours set --start <HH:MM> --end <HH:MM> --timezone <IANA-zone> --revision <n> [--json]",
+            "hra notification-email status [--json]",
+            "hra notification-email enable|disable --revision <n> [--json]",
             "hra device list",
             "hra device pair",
             "hra device key-loss --acknowledge-no-key-holders",
@@ -1330,7 +1341,7 @@ export const publicContent: PublicContent = {
             "hra remote command <uuidv7>",
             "hra remote send|queue|steer <cloud-session> <message>",
             "hra remote send --or-steer <cloud-session> <message>",
-            "hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <once|decline|cancel>",
+            "hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>",
             "hra remote stop <cloud-session>",
             "hra remote preset <cloud-session> <low|high|ultra|fable-max>",
             "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
@@ -1367,7 +1378,7 @@ export const publicContent: PublicContent = {
         paragraph(
           text("Every admitted callback carries a local deadline anchored when the provider delivered it. HRA caps the pending interval at 30 minutes and honors a shorter valid provider interval, including an immediate zero interval. At the deadline it writes one provider-neutral timeout error through the same write-ahead ledger, never invents an answer or grant, and quarantines the provider generation if the write may have escaped. "),
           code("interaction show"),
-          text(" displays the safe local deadline; encrypted remote interaction metadata does not include it."),
+          text(" displays the safe local deadline; nested remote policy version 2 carries the same absolute deadline so readers can suppress an expired control, while the daemon remains authoritative."),
         ),
         paragraph(
           text("For a standard MCP form, interaction show returns the exact public field contract without defaults or answers. Accept reads one protected document shaped as "),

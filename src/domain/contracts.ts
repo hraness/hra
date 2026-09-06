@@ -5,6 +5,12 @@ import { z } from "zod";
 import { attachmentReferenceListSchema } from "./attachment-schemas";
 import { presetSchema, providerSchema } from "./presets";
 import { interactionResolutionSchema } from "./interactions";
+import { notificationEmailPolicySchema } from "./notification-email";
+import {
+  isWithinNotificationHours,
+  notificationHoursPolicySchema,
+  notificationHoursUpdateSchema,
+} from "./notification-hours";
 import {
   SESSION_EVENT_PAGE_LIMIT,
   SESSION_EVENT_WAIT_MAX_MS,
@@ -160,6 +166,127 @@ export const publicSessionListPageSchema = z.object({
 });
 
 export type PublicSessionListPage = z.infer<typeof publicSessionListPageSchema>;
+
+export const notificationHoursCommandResultSchema = z.object({
+  policy: notificationHoursPolicySchema,
+  observedAt: unixMillisecondsSchema,
+  withinHours: z.boolean(),
+}).strict().superRefine((value, context) => {
+  let withinHours: boolean;
+  try {
+    withinHours = isWithinNotificationHours(value.policy, value.observedAt);
+  } catch {
+    context.addIssue({
+      code: "custom",
+      path: ["observedAt"],
+      message: "Notification-hours observation instant is outside the supported date range.",
+    });
+    return;
+  }
+  if (withinHours === value.withinHours) return;
+  context.addIssue({
+    code: "custom",
+    path: ["withinHours"],
+    message: "Notification-hours status must match its policy and observation instant.",
+  });
+});
+
+export type NotificationHoursCommandResult = z.infer<
+  typeof notificationHoursCommandResultSchema
+>;
+
+const hostedNotificationDeviceAuthoritySchema = z.object({
+  consentLeaseUntil: unixMillisecondsSchema,
+  globalNotificationGeneration: z.number().int().nonnegative()
+    .max(Number.MAX_SAFE_INTEGER),
+  localNotificationPolicyRevision: positiveRevisionSchema,
+}).strict();
+
+const observedNotificationHostedAuthoritySchema = z.object({
+  deviceAuthority: hostedNotificationDeviceAuthoritySchema.nullable(),
+  globalNotificationGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  globalState: z.enum(["disabled", "enabled", "safety_latched"]),
+  observedAt: unixMillisecondsSchema,
+  state: z.literal("observed"),
+}).strict().superRefine((value, context) => {
+  if (value.globalState === "enabled" && value.globalNotificationGeneration < 1) {
+    context.addIssue({
+      code: "custom",
+      message: "Enabled hosted notification authority requires a positive global generation.",
+      path: ["globalNotificationGeneration"],
+    });
+  }
+  if (
+    value.deviceAuthority !== null
+    && value.deviceAuthority.consentLeaseUntil - value.observedAt > 2 * 60 * 1_000
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Hosted device consent cannot exceed the two-minute server lease.",
+      path: ["deviceAuthority", "consentLeaseUntil"],
+    });
+  }
+});
+
+const acknowledgedNotificationHostedAuthoritySchema = z.object({
+  acknowledgedAt: unixMillisecondsSchema,
+  consentLeaseUntil: unixMillisecondsSchema,
+  state: z.literal("acknowledged"),
+}).strict().superRefine((value, context) => {
+  if (value.consentLeaseUntil === value.acknowledgedAt) return;
+  context.addIssue({
+    code: "custom",
+    message: "Acknowledged invalidation must close hosted consent at its acknowledgement instant.",
+    path: ["consentLeaseUntil"],
+  });
+});
+
+export const notificationEmailHostedAuthoritySchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("not_observed") }).strict(),
+  z.object({
+    expiresNoLaterThan: unixMillisecondsSchema,
+    state: z.literal("revocation_pending"),
+  }).strict(),
+  observedNotificationHostedAuthoritySchema,
+  acknowledgedNotificationHostedAuthoritySchema,
+]);
+
+export type NotificationEmailHostedAuthority = z.infer<
+  typeof notificationEmailHostedAuthoritySchema
+>;
+
+export const notificationEmailCommandResultSchema = z.object({
+  policy: notificationEmailPolicySchema,
+  hostedAuthority: notificationEmailHostedAuthoritySchema,
+}).strict();
+
+export type NotificationEmailCommandResult = z.infer<
+  typeof notificationEmailCommandResultSchema
+>;
+
+const notificationHoursSetCommandSchema = z.object({
+  kind: z.literal("notification-hours.set"),
+  expectedRevision: positiveRevisionSchema,
+  version: z.literal(1),
+  startMinute: z.number().int().min(0).max(1_439),
+  endMinute: z.number().int().min(0).max(1_439),
+  timeZone: z.string().min(1).max(255),
+}).strict().superRefine((value, context) => {
+  const update = notificationHoursUpdateSchema.safeParse({
+    version: value.version,
+    startMinute: value.startMinute,
+    endMinute: value.endMinute,
+    timeZone: value.timeZone,
+  });
+  if (update.success) return;
+  for (const issue of update.error.issues) {
+    context.addIssue({
+      code: "custom",
+      path: issue.path,
+      message: issue.message,
+    });
+  }
+});
 
 export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("doctor"), offline: z.boolean() }).strict(),
@@ -369,6 +496,13 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     key: gatewayKeySchema,
   }).strict(),
   z.object({ kind: z.literal("autorespond.gateway-clear") }).strict(),
+  z.object({ kind: z.literal("notification-hours.status") }).strict(),
+  notificationHoursSetCommandSchema,
+  z.object({ kind: z.literal("notification-email.status") }).strict(),
+  z.object({
+    kind: z.enum(["notification-email.enable", "notification-email.disable"]),
+    expectedRevision: positiveRevisionSchema,
+  }).strict(),
   // The two local device-command switches. They are set here and nowhere else:
   // no hosted command and no browser can reach them, which is what makes the
   // kill switch and the account-linking opt-in meaningful.

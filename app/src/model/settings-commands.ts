@@ -43,9 +43,9 @@ export const presetChoices: readonly PresetChoice[] = Object.freeze([
 
 export const presetLabels: Readonly<Record<PresetChoice, string>> = Object.freeze({
   "fable-max": "Fable Max",
-  high: "High",
-  low: "Low",
-  ultra: "Ultra",
+  high: "Astra Max",
+  low: "Luna Max",
+  ultra: "Astra Ultra",
 });
 
 export function approvalModeCommand(mode: ApprovalMode): RemoteCommandPayload {
@@ -58,6 +58,61 @@ export function showThinkingCommand(enabled: boolean): RemoteCommandPayload {
 
 export function defaultPresetCommand(preset: PresetChoice): RemoteCommandPayload {
   return { kind: "set_default_preset", preset };
+}
+
+/** Fast is a session-only manual control; there is no inferred browser state. */
+export function sessionFastCommand(enabled: boolean): RemoteCommandPayload {
+  return { enabled, kind: "set_fast" };
+}
+
+export type SessionFastCommandNotice = Readonly<{
+  applied: boolean;
+  text: string;
+}>;
+
+/**
+ * Truthful state for the last Fast command this browser submitted.
+ *
+ * The browser has no authoritative current Fast value. It may highlight a
+ * choice only after the machine reports that exact command as applied; an
+ * ambiguous result remains unselected because either outcome is possible.
+ */
+export function sessionFastCommandNotice(
+  command: Readonly<{ resultCode: string | null; state: string }> | null,
+  enabled: boolean | null,
+): SessionFastCommandNotice | null {
+  if (command === null || enabled === null) return null;
+  const value = enabled ? "on" : "off";
+  switch (command.state) {
+    case "pending":
+      return { applied: false, text: `Waiting for the machine to set Fast ${value}.` };
+    case "prepared":
+    case "effect_started":
+      return { applied: false, text: `Setting Fast ${value} for future turns.` };
+    case "applied":
+      return {
+        applied: true,
+        text: `The machine applied Fast ${value} for future turns.`,
+      };
+    case "ambiguous":
+      return {
+        applied: false,
+        text: "The machine could not confirm the Fast change. Check the session before trying again.",
+      };
+    case "expired":
+      return { applied: false, text: "The machine never picked up the Fast change." };
+    case "cancelled":
+      return { applied: false, text: "The Fast change was cancelled." };
+    case "failed":
+      return {
+        applied: false,
+        text: command.resultCode === null
+          ? "The machine refused the Fast change."
+          : `The machine refused the Fast change: ${command.resultCode}.`,
+      };
+    default:
+      return { applied: false, text: `Setting Fast ${value} for future turns.` };
+  }
 }
 
 /** Unarchive is session scoped: it addresses the archived session itself. */
