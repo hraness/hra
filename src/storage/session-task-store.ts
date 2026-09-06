@@ -374,11 +374,6 @@ export const assertSessionTaskSchema = (database: Database): void => {
   ).all();
 };
 
-// Canonical adoption40 and private task48 shipped byte-identical task DDL.
-// Its existing exact signature includes tables, indexes, triggers and FKs.
-export const assertCanonicalAdoption40SessionTaskSchema = assertSessionTaskSchema;
-export const assertPrivateTask48SessionTaskSchema = assertSessionTaskSchema;
-
 const taskRowSchema = z.object({
   id: sessionTaskIdSchema,
   session_id: sessionIdSchema,

@@ -11,10 +11,6 @@ import { workPreparedEffectMessage } from "../domain/work-message";
 import { MESSAGE_MAX_BYTES, sessionIdSchema } from "../domain/values";
 import { assertLegacyMutationOwnership, SessionSendOwnershipError } from "./session-send-owner";
 import { normalizeSchemaSql } from "./schema-cohort";
-export {
-  assertCanonicalAdoption40WorkSchema,
-  assertPrivateTask48WorkSchema,
-} from "./work-schema-cohorts";
 import {
   verifyWorkEvidence,
   WorkEvidenceVerificationError,

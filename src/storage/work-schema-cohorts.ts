@@ -3,7 +3,9 @@ import { z } from "zod";
 
 import { schemaCohortDigest } from "./schema-cohort";
 
-// Frozen from 3f6ac73 (private task48) and 6f056dc (canonical adoption40).
+// Frozen from 3f6ac73 (private task48), 6f056dc (canonical adoption40),
+// and 0ae3177 (combined49). Never derive these historical fingerprints from
+// the current WORK_SCHEMA_SQL or current preset contract.
 // Every named index and trigger is checked, including its owning table.
 // Tables retain their released ALTER history. Their fingerprint below comes
 // from the actual archived SQLite images, never fresh CREATE statements.
@@ -148,7 +150,7 @@ const objectSchema = z.object({
 
 const assertFrozenWorkSchema = (
   database: Database,
-  cohort: "canonical40" | "private48",
+  cohort: "canonical40" | "private48" | "combined49",
 ): void => {
   if (!z.object({ foreign_keys: z.literal(1) }).safeParse(
     database.query("PRAGMA foreign_keys").get(),
@@ -163,22 +165,24 @@ const assertFrozenWorkSchema = (
   const tables = tableNames.map((name) => objectSchema.parse(database.query(
     "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type='table' AND name=?",
   ).get(name)));
-  // Both authentic cohorts have identical Work table SQL, including the
+  // These authentic cohorts have identical Work table SQL, including the
   // historical preset_contract ALTER and every CHECK/UNIQUE/FK declaration.
   // Reproduce from scripts/fixtures/{canonical-adoption40,private-task48}.ts.
   if (schemaCohortDigest(tables)
     !== "ff5fea682951978d5e7f4a925369741cb21dbc72382abe0f73b6e0c6a6830836") {
     throw new Error(`WORK_SCHEMA_COHORT_INVALID:${cohort}`);
   }
-  const names: readonly string[] = cohort === "canonical40"
+  const names: readonly string[] = cohort !== "private48"
     ? [...privateObjectNames, ...adoptionAddedObjectNames].sort((a, b) => a.localeCompare(b))
     : privateObjectNames;
   const objects = names.map((name) => objectSchema.parse(database.query(
     "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name=?",
   ).get(name)));
-  const expected = cohort === "canonical40"
-    ? "5d912fbe1aa5f68b9bcc7a0962bcd179c1c54f5133c29d52d1d4e0290c9f9b8f"
-    : "95b50cf876fb6356f7d3d099e2e9323f4e989761d4a3f27f74c2b8976d8c7d33";
+  const expected = {
+    canonical40: "5d912fbe1aa5f68b9bcc7a0962bcd179c1c54f5133c29d52d1d4e0290c9f9b8f",
+    private48: "95b50cf876fb6356f7d3d099e2e9323f4e989761d4a3f27f74c2b8976d8c7d33",
+    combined49: "4680776382ec6c47b7302596548923cbec516104dea46cea8a7a3dc9da83a819",
+  }[cohort];
   if (schemaCohortDigest(objects) !== expected) {
     throw new Error(`WORK_SCHEMA_COHORT_INVALID:${cohort}`);
   }
@@ -190,10 +194,11 @@ const assertFrozenWorkSchema = (
     }
   }
   const requiredColumns: Readonly<Record<string, readonly string[]>> = {
-    profiles: ["state", "process_generation", "provider_email"],
+    profiles: ["state", "process_generation", "provider_email",
+      ...(cohort === "combined49" ? ["codex_account_key"] : [])],
     sessions: ["provider_v39", "provider_thread_id", "preset_contract"],
     works: ["preset_contract"],
-    ...(cohort === "canonical40" ? {
+    ...(cohort !== "private48" ? {
       session_account_authorities: ["session_id", "profile_id", "account_key"],
       session_provider_account_authorities: ["session_id", "provider", "runtime_scope", "account_key"],
       session_personal_runtime_bindings: ["session_id", "provider", "provider_thread_id", "state"],
@@ -213,9 +218,18 @@ const assertFrozenWorkSchema = (
     .safeParse(database.query("SELECT logical_time FROM work_clock WHERE singleton=1").get()).success) {
     throw new Error("WORK_SCHEMA_CLOCK_MISSING");
   }
+  // Preserve the combined49 row invariant without importing a future live
+  // provider discriminator or preset contract. This is historical evidence.
+  if (cohort === "combined49" && database.query(`SELECT 1 FROM works w
+    JOIN sessions s ON s.id=w.coordinator_session_id
+    WHERE s.provider_v39='devin' AND w.preset_contract!=2 LIMIT 1`).get() !== null) {
+    throw new Error("WORK_SCHEMA_DEVIN_PRESET_CONTRACT_INVALID");
+  }
 };
 
 export const assertCanonicalAdoption40WorkSchema = (database: Database): void =>
   assertFrozenWorkSchema(database, "canonical40");
 export const assertPrivateTask48WorkSchema = (database: Database): void =>
   assertFrozenWorkSchema(database, "private48");
+export const assertCombined49WorkSchema = (database: Database): void =>
+  assertFrozenWorkSchema(database, "combined49");

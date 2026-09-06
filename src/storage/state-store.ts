@@ -268,8 +268,6 @@ import {
   WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL,
   WorkStore,
   assertProviderVersion39WorkSchema,
-  assertCanonicalAdoption40WorkSchema,
-  assertPrivateTask48WorkSchema,
   assertReadonlyWorkSchema,
   assertWorkSchema,
   assertWorkSignalProviderAuthorities,
@@ -279,12 +277,20 @@ import {
   type WorkCursorEncoder,
 } from "./work-store";
 import {
+  assertCanonicalAdoption40WorkSchema,
+  assertPrivateTask48WorkSchema,
+  assertCombined49WorkSchema,
+} from "./work-schema-cohorts";
+import {
   SESSION_TASK_SCHEMA_SQL,
   SessionTaskStore,
   assertSessionTaskSchema,
+} from "./session-task-store";
+import {
   assertCanonicalAdoption40SessionTaskSchema,
   assertPrivateTask48SessionTaskSchema,
-} from "./session-task-store";
+  assertCombined49SessionTaskSchema,
+} from "./session-task-schema-cohorts";
 import type { StatePaths } from "./paths";
 import type {
   DesktopRecoveryBinding,
@@ -12453,8 +12459,8 @@ const classifyStateSchemaCohort = (
     assertTaskOwnershipCohort(database);
     assertSchemaVersion40AdoptionObjects(database, { useExactProviderProcessCustody: true });
     assertExactSchemaVersion40AdoptionSurface(database);
-    assertReadonlyWorkSchema(database);
-    assertSessionTaskSchema(database);
+    assertCombined49WorkSchema(database);
+    assertCombined49SessionTaskSchema(database);
     auditClaudeProcessCustody(database);
     auditSessionSwitchAdoptionBeforeContainment(database);
     return "combined49";
@@ -12491,8 +12497,8 @@ const migrateWritableDatabase = (
     assertSchemaVersion39ProviderAuthority(database);
     assertSchemaVersion40AdoptionObjects(database, { useExactProviderProcessCustody: true });
     assertExactSchemaVersion40AdoptionSurface(database);
-    assertReadonlyWorkSchema(database);
-    assertSessionTaskSchema(database);
+    assertCombined49WorkSchema(database);
+    assertCombined49SessionTaskSchema(database);
   }
   // Both pre-release adoption and notification builds used version 36. Freeze
   // their identity before any additive pre-application can blur the evidence.
