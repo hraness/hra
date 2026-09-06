@@ -15,8 +15,8 @@ function task(overrides: Partial<ScheduledTaskView> = {}): ScheduledTaskView {
   return {
     cadence: "every day at 09:00",
     id: "task-1",
-    kind: "codex_automation",
-    kindLabel: "Codex",
+    kind: "hra_conversation",
+    kindLabel: "HRA",
     label: "Morning sweep",
     machineLabel: "workshop",
     nextRunAt: now + hour,
@@ -50,6 +50,7 @@ function machine(
     proseAutorespondConfigured: false,
     revision: 1,
     scheduledTasks,
+    sessionAdoption: null,
     showThinkingDefault: false,
     updatedAt: now,
   };
@@ -62,10 +63,8 @@ describe("formatting", () => {
     expect(scheduledTaskNextRun(null, now)).toBe("not scheduled");
   });
 
-  test("the line names the provider, the cadence, and the next run", () => {
+  test("the line names HRA, the cadence, and the next run", () => {
     expect(scheduledTaskLine(task(), now))
-      .toBe("Codex · every day at 09:00 · next run in 1 hour");
-    expect(scheduledTaskLine(task({ kind: "hra_conversation", kindLabel: "HRA" }), now))
       .toBe("HRA · every day at 09:00 · next run in 1 hour");
   });
 
@@ -126,7 +125,7 @@ describe("sessionScheduledTasks", () => {
       "session-a",
       now,
     );
-    expect(view.rows[0]?.line).toBe("Codex · hourly · next run in 2 hours");
+    expect(view.rows[0]?.line).toBe("HRA · hourly · next run in 2 hours");
   });
 
   test("no machine, no match, and no session all render nothing", () => {

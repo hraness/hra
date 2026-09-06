@@ -1,7 +1,11 @@
+import { z } from "zod";
+
 import { formatAttachmentSize } from "../domain/attachments";
+import { attachmentReferenceListSchema } from "../domain/attachment-schemas";
 import {
   notificationEmailCommandResultSchema,
   notificationHoursCommandResultSchema,
+  publicSessionListItemSchema,
   publicSessionListPageSchema,
   signedOutSessionListMetadataSchema,
   type LocalCommand,
@@ -32,11 +36,17 @@ import {
   type SessionEventPage,
 } from "../domain/session-events";
 import {
+  projectPublicReviewedRuntimeProfile,
+  publicReviewedRuntimeProfileSchema,
+  reviewedRuntimeProfileSchema,
+} from "../domain/runtime-profile";
+import {
   accountUsageHistoryPageSchema,
   automaticRateLimitResetStatusSchema,
 } from "../domain/usage-metrics";
 import { sessionStateReportSchema } from "../domain/session-state";
-import { profileIdSchema, sessionIdSchema } from "../domain/values";
+import { profileIdSchema, projectIdSchema, sessionIdSchema } from "../domain/values";
+import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import {
   sessionTaskDeleteResultSchema,
   sessionTaskListSchema,
@@ -264,10 +274,11 @@ const stringArray = (value: unknown): readonly string[] =>
 
 const renderTurnSummary = (value: unknown): string | null => {
   const turn = object(value);
-  if (turn === null || typeof turn.id !== "string" || typeof turn.status !== "string") return null;
+  if (turn === null || typeof turn.status !== "string") return null;
   const files = stringArray(turn.files);
   const actions = stringArray(turn.actions);
-  const rows = [`${line(turn.id)}  ${line(turn.status)}  ${duration(turn.runtimeMs)}`];
+  const turnLabel = typeof turn.id === "string" ? line(turn.id) : "Turn";
+  const rows = [`${turnLabel}  ${line(turn.status)}  ${duration(turn.runtimeMs)}`];
   if (files.length > 0) rows.push(`  files: ${files.map(line).join(", ")}`);
   if (actions.length > 0) rows.push(`  actions: ${actions.map(line).join(", ")}`);
   if (typeof turn.omittedFiles === "number" && turn.omittedFiles > 0) {
@@ -283,9 +294,9 @@ const renderEffectiveRuntimeProfile = (value: unknown): readonly string[] => {
   const profile = object(value);
   if (profile === null) return [];
   // The two providers review different documents. Claude Code owns its own
-  // permission engine, so its profile names the pinned CLI version, the
-  // interactive permission mode, and the isolated runtime home instead of the
-  // Codex approval, review, and app capabilities.
+  // permission engine, so its public profile names the pinned CLI version and
+  // interactive permission mode instead of Codex approval/review capability.
+  // Private config-home provenance is intentionally never rendered.
   if (typeof profile.claudeVersion === "string") {
     return [
       "Runtime",
@@ -295,7 +306,6 @@ const renderEffectiveRuntimeProfile = (value: unknown): readonly string[] => {
       `  model: ${line(profile.model)}`,
       `  reasoning effort: ${line(profile.reasoningEffort)}`,
       `  permission mode: ${line(profile.permissionMode)}`,
-      `  isolated profile: ${profile.isolatedConfigDir === true ? "enabled" : "unavailable"}`,
       `  stream: ${line(profile.inputFormat)} in, ${line(profile.outputFormat)} out`,
       `  observed at: ${line(profile.observedAt)}`,
     ];
@@ -617,6 +627,290 @@ export class InvalidCommandResponseError extends Error {
 
 const invalidCommandResponse = (command: LocalCommand): never => {
   throw new InvalidCommandResponseError(command.kind);
+};
+
+const publicSessionCommandRecordSchema = publicSessionListItemSchema.extend({
+  activeTurnId: publicProviderIdentifierSchema.optional(),
+}).strict();
+
+const publicProjectionTextOmissionSchema = z.object({
+  originalUtf8Bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  returnedUtf8Bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  omittedUtf8Bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+
+const publicProjectedMessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  text: z.string(),
+  turnId: publicProviderIdentifierSchema.optional(),
+  omission: publicProjectionTextOmissionSchema.optional(),
+  attachments: attachmentReferenceListSchema.optional(),
+}).strict();
+
+const publicTurnSummarySchema = z.object({
+  id: publicProviderIdentifierSchema.optional(),
+  status: z.enum(["completed", "interrupted", "failed", "inProgress"]),
+  startedAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  completedAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  runtimeMs: z.number().nonnegative().finite().optional(),
+  files: z.array(z.string()).max(128),
+  actions: z.array(z.string()).max(128),
+  omittedFiles: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  omittedActions: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+
+const publicProjectionOmissionSchema = z.object({
+  hasMoreOlderTurns: z.boolean(),
+  returnedTurns: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  turnLimit: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  omittedMessages: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  truncatedMessages: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  unreadItemTurnIds: z.array(publicProviderIdentifierSchema).max(100),
+  incompleteTurnIds: z.array(publicProviderIdentifierSchema).max(100),
+}).strict();
+
+const publicSessionProjectionSchema = z.object({
+  title: z.string(),
+  status: z.enum(["active", "idle", "terminal"]),
+  projectRoot: z.string().max(4_096).optional(),
+  activeTurnId: publicProviderIdentifierSchema.optional(),
+  messages: z.array(publicProjectedMessageSchema).max(100).optional(),
+  turnSummaries: z.array(publicTurnSummarySchema).max(100).optional(),
+  omission: publicProjectionOmissionSchema.optional(),
+}).strict();
+
+const publicSessionRecoverySchema = z.object({
+  required: z.literal(true),
+  cleared: z.literal(false),
+}).strict();
+
+const publicSessionShowResultSchema = z.object({
+  session: publicSessionCommandRecordSchema,
+  effectiveRuntimeProfile: publicReviewedRuntimeProfileSchema.nullable(),
+  projection: publicSessionProjectionSchema.optional(),
+  recovery: publicSessionRecoverySchema.optional(),
+}).strict();
+
+const publicSessionStartResultSchema = z.object({
+  session: publicSessionCommandRecordSchema,
+  effectiveRuntimeProfile: publicReviewedRuntimeProfileSchema.nullable(),
+  idempotencyKey: z.string().uuid(),
+}).strict();
+
+const publicSessionSendResultSchema = z.object({
+  session: publicSessionCommandRecordSchema,
+  effectiveRuntimeProfile: publicReviewedRuntimeProfileSchema.nullable(),
+  idempotencyKey: z.string().uuid(),
+  turnId: publicProviderIdentifierSchema.optional(),
+  attachments: attachmentReferenceListSchema.optional(),
+}).strict();
+
+type PublicSessionCommand = Extract<
+  LocalCommand,
+  { kind: "session.show" | "session.start" | "session.send" }
+>;
+
+const projectPublicProviderAlias = (value: unknown): string | undefined => {
+  const parsed = publicProviderIdentifierSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+};
+
+const projectPublicSessionRecord = (
+  value: unknown,
+): z.infer<typeof publicSessionCommandRecordSchema> | null => {
+  const parsed = publicSessionListItemSchema.safeParse(value);
+  if (!parsed.success) return null;
+  const record = object(value);
+  const activeTurnId = projectPublicProviderAlias(record?.activeTurnId);
+  const projected = publicSessionCommandRecordSchema.safeParse({
+    ...parsed.data,
+    ...(activeTurnId === undefined ? {} : { activeTurnId }),
+  });
+  return projected.success ? projected.data : null;
+};
+
+const projectPublicMessage = (
+  value: unknown,
+): z.infer<typeof publicProjectedMessageSchema> | null => {
+  const message = object(value);
+  if (message === null) return null;
+  const turnId = projectPublicProviderAlias(message.turnId);
+  const projected = publicProjectedMessageSchema.safeParse({
+    role: message.role,
+    text: message.text,
+    ...(turnId === undefined ? {} : { turnId }),
+    ...(message.omission === undefined ? {} : { omission: message.omission }),
+    ...(message.attachments === undefined ? {} : { attachments: message.attachments }),
+  });
+  return projected.success ? projected.data : null;
+};
+
+const projectPublicTurnSummary = (
+  value: unknown,
+): z.infer<typeof publicTurnSummarySchema> | null => {
+  const summary = object(value);
+  if (summary === null) return null;
+  const id = projectPublicProviderAlias(summary.id);
+  const projected = publicTurnSummarySchema.safeParse({
+    ...(id === undefined ? {} : { id }),
+    status: summary.status,
+    ...(summary.startedAt === undefined ? {} : { startedAt: summary.startedAt }),
+    ...(summary.completedAt === undefined ? {} : { completedAt: summary.completedAt }),
+    ...(summary.runtimeMs === undefined ? {} : { runtimeMs: summary.runtimeMs }),
+    files: summary.files,
+    actions: summary.actions,
+    omittedFiles: summary.omittedFiles,
+    omittedActions: summary.omittedActions,
+  });
+  return projected.success ? projected.data : null;
+};
+
+const projectPublicProviderAliases = (value: unknown): readonly string[] | null => {
+  if (!Array.isArray(value)) return null;
+  return value.flatMap((entry) => {
+    const alias = projectPublicProviderAlias(entry);
+    return alias === undefined ? [] : [alias];
+  });
+};
+
+const projectPublicSessionProjection = (
+  value: unknown,
+): z.infer<typeof publicSessionProjectionSchema> | null => {
+  const projection = object(value);
+  if (projection === null) return null;
+  const messages = projection.messages === undefined
+    ? undefined
+    : Array.isArray(projection.messages)
+      ? projection.messages.map(projectPublicMessage)
+      : null;
+  const turnSummaries = projection.turnSummaries === undefined
+    ? undefined
+    : Array.isArray(projection.turnSummaries)
+      ? projection.turnSummaries.map(projectPublicTurnSummary)
+      : null;
+  if (messages === null || messages?.some((message) => message === null) === true) return null;
+  if (turnSummaries === null || turnSummaries?.some((summary) => summary === null) === true) return null;
+  const omission = projection.omission === undefined
+    ? undefined
+    : object(projection.omission);
+  const unreadItemTurnIds = omission === undefined
+    ? undefined
+    : projectPublicProviderAliases(omission?.unreadItemTurnIds);
+  const incompleteTurnIds = omission === undefined
+    ? undefined
+    : projectPublicProviderAliases(omission?.incompleteTurnIds);
+  if (
+    omission === null
+    || unreadItemTurnIds === null
+    || incompleteTurnIds === null
+  ) return null;
+  const activeTurnId = projectPublicProviderAlias(projection.activeTurnId);
+  const projected = publicSessionProjectionSchema.safeParse({
+    title: projection.title,
+    status: projection.status,
+    ...(projection.projectRoot === undefined ? {} : { projectRoot: projection.projectRoot }),
+    ...(activeTurnId === undefined ? {} : { activeTurnId }),
+    ...(messages === undefined ? {} : { messages }),
+    ...(turnSummaries === undefined ? {} : { turnSummaries }),
+    ...(omission === undefined
+      ? {}
+      : {
+          omission: {
+            hasMoreOlderTurns: omission.hasMoreOlderTurns,
+            returnedTurns: omission.returnedTurns,
+            turnLimit: omission.turnLimit,
+            omittedMessages: omission.omittedMessages,
+            truncatedMessages: omission.truncatedMessages,
+            unreadItemTurnIds,
+            incompleteTurnIds,
+          },
+        }),
+  });
+  return projected.success ? projected.data : null;
+};
+
+const projectPublicRuntimeProfile = (
+  value: unknown,
+): z.infer<typeof publicReviewedRuntimeProfileSchema> | null | undefined => {
+  if (value === null) return null;
+  const reviewed = reviewedRuntimeProfileSchema.safeParse(value);
+  if (!reviewed.success) return undefined;
+  const projected = publicReviewedRuntimeProfileSchema.safeParse(
+    projectPublicReviewedRuntimeProfile(reviewed.data),
+  );
+  return projected.success ? projected.data : undefined;
+};
+
+const projectPublicSessionCommandData = (
+  command: PublicSessionCommand,
+  data: unknown,
+): z.infer<typeof publicSessionShowResultSchema>
+  | z.infer<typeof publicSessionStartResultSchema>
+  | z.infer<typeof publicSessionSendResultSchema>
+  | null => {
+  const root = object(data);
+  if (root === null) return null;
+  const session = projectPublicSessionRecord(root.session);
+  const effectiveRuntimeProfile = projectPublicRuntimeProfile(root.effectiveRuntimeProfile);
+  if (session === null || effectiveRuntimeProfile === undefined) return null;
+  if (command.kind === "session.show") {
+    const requestedSession = sessionIdSchema.safeParse(command.session);
+    if (requestedSession.success && session.id !== requestedSession.data) return null;
+    const projection = root.projection === undefined
+      ? undefined
+      : projectPublicSessionProjection(root.projection);
+    if (projection === null) return null;
+    const recoveryRecord = root.recovery === undefined ? undefined : object(root.recovery);
+    if (recoveryRecord === null) return null;
+    const recovery = recoveryRecord === undefined
+      ? undefined
+      : publicSessionRecoverySchema.safeParse({
+          required: recoveryRecord.required,
+          cleared: recoveryRecord.cleared,
+        });
+    if (recovery !== undefined && !recovery.success) return null;
+    const parsed = publicSessionShowResultSchema.safeParse({
+      session,
+      effectiveRuntimeProfile,
+      ...(projection === undefined ? {} : { projection }),
+      ...(recovery === undefined ? {} : { recovery: recovery.data }),
+    });
+    return parsed.success ? parsed.data : null;
+  }
+  if (command.kind === "session.start") {
+    const requestedAccount = profileIdSchema.safeParse(command.account);
+    const requestedProject = command.project === undefined
+      ? null
+      : projectIdSchema.safeParse(command.project);
+    if (
+      (requestedAccount.success && session.profileId !== requestedAccount.data)
+      || (requestedProject?.success === true && session.projectId !== requestedProject.data)
+      || session.provider !== (command.provider ?? "codex")
+      || session.preset !== command.preset
+      || session.fastEnabled !== command.fast
+      || (command.idempotencyKey !== undefined && root.idempotencyKey !== command.idempotencyKey)
+    ) return null;
+    const parsed = publicSessionStartResultSchema.safeParse({
+      session,
+      effectiveRuntimeProfile,
+      idempotencyKey: root.idempotencyKey,
+    });
+    return parsed.success ? parsed.data : null;
+  }
+  const requestedSession = sessionIdSchema.safeParse(command.session);
+  if (
+    (requestedSession.success && session.id !== requestedSession.data)
+    || (command.idempotencyKey !== undefined && root.idempotencyKey !== command.idempotencyKey)
+  ) return null;
+  const turnId = projectPublicProviderAlias(root.turnId);
+  const parsed = publicSessionSendResultSchema.safeParse({
+    session,
+    effectiveRuntimeProfile,
+    idempotencyKey: root.idempotencyKey,
+    ...(turnId === undefined ? {} : { turnId }),
+    ...(root.attachments === undefined ? {} : { attachments: root.attachments }),
+  });
+  return parsed.success ? parsed.data : null;
 };
 
 const hasOnlyValidInteractions = (value: unknown): boolean =>
@@ -1127,6 +1421,14 @@ const publicInteractionData = (command: LocalCommand, data: unknown): unknown =>
       nextCursor: parsed.data.nextCursor === null ? null : nextCursor ?? null,
     };
   }
+  if (
+    command.kind === "session.show"
+    || command.kind === "session.start"
+    || command.kind === "session.send"
+  ) {
+    return projectPublicSessionCommandData(command, data)
+      ?? invalidCommandResponse(command);
+  }
   if (command.kind === "interaction.show") {
     const record = interactionRecord(data);
     return { interaction: record };
@@ -1205,10 +1507,10 @@ const renderSessionList = (
     && accountId.success
     && metadata.data.accountSelector === accountId.data
     ? [
-        `Scope: local-only cache for ${accountId.data}`,
-        "Freshness: stale; provider not contacted",
-        `Completeness: ${metadata.data.localCompleteness === "complete" ? "complete local cache" : "partial local cache; more pages available"}; provider completeness unknown`,
-        `Sign in to refresh: ${metadata.data.nextCommand}`,
+        `Codex scope: local-only cache for ${accountId.data}`,
+        "Codex freshness: stale; Codex provider not contacted",
+        `Codex completeness: ${metadata.data.localCompleteness === "complete" ? "complete local cache" : "partial local cache; more pages available"}; Codex provider completeness unknown`,
+        `Sign in to refresh Codex: ${metadata.data.nextCommand}`,
       ]
     : [];
   const tableListing = table(sessions, ["title", "state", "preset", "fastEnabled", "id"]);
@@ -2398,6 +2700,10 @@ const renderSyncStatus = (data: unknown): string => {
 
 export function renderSuccess(command: LocalCommand, data: unknown, json: boolean, output: Output): void {
   assertCommandSuccessData(command, data);
+  // Both render modes consume this exact projection. JSON cannot bypass the
+  // human renderer's privacy boundary, and human fallback output cannot dump
+  // an internal daemon record that JSON would have stripped.
+  const publicData = publicInteractionData(command, data);
   if (json) {
     if (command.kind === "work.apply") {
       output.writeStdout(`${safeJson(workAgentProtocolResponseSchema.parse({
@@ -2405,7 +2711,7 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
         version: WORK_PROTOCOL_VERSION,
         requestId: command.requestId,
         ok: true,
-        result: publicInteractionData(command, data),
+        result: publicData,
       }))}\n`);
       return;
     }
@@ -2415,7 +2721,6 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       || command.kind === "work.poll"
       || command.kind === "work.events"
     ) {
-      const publicData = publicInteractionData(command, data);
       const line = workReadSuccessWireDocument(command.kind, publicData);
       const maximum = command.kind === "work.snapshot"
         ? WORK_SNAPSHOT_MAX_BYTES
@@ -2434,13 +2739,10 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       ok: true,
       version: 1,
       command: command.kind,
-      data: publicInteractionData(command, data),
+      data: publicData,
     })}\n`);
     return;
   }
-  const publicData = command.kind === "account.login" || command.kind === "session.list"
-    ? publicInteractionData(command, data)
-    : data;
   const value = publicData as Record<string, unknown>;
   if (command.kind === "doctor") {
     output.writeStdout(`${renderDoctor(data)}\n`);
@@ -2484,7 +2786,7 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       `Deleted conversation task ${line(deleted.taskId)} from ${line(deleted.sessionId)} at ${instant(deleted.deletedAt)} (revision ${String(deleted.revision)}).\n`,
     );
   } else if (command.kind === "session.show") {
-    output.writeStdout(`${renderSession(data)}\n`);
+    output.writeStdout(`${renderSession(publicData)}\n`);
   } else if (command.kind === "session.status") {
     output.writeStdout(`${renderSessionStatus(data)}\n`);
   } else if (command.kind === "session.state") {
@@ -2617,7 +2919,7 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
   } else if (command.kind === "sync.status") {
     output.writeStdout(`${renderSyncStatus(data)}\n`);
   } else {
-    output.writeStdout(`${safeJson(data, 2)}\n`);
+    output.writeStdout(`${safeJson(publicData, 2)}\n`);
   }
 }
 

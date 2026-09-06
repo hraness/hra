@@ -1,6 +1,6 @@
 ---
 title: Codex scheduled tasks (automations) ground truth
-description: Where Codex Desktop stores recurring "automations" on disk and in local SQLite, how a fired automation lands in a session, and what the app-server protocol does and does not expose for a read-only scheduled-tasks projection.
+description: Where Codex Desktop stores recurring automations, how they land in sessions, and why their metadata stays private except for a narrow local adoption age gate.
 type: note
 status: current
 area: hra
@@ -15,7 +15,7 @@ relations:
 
 # Codex scheduled tasks (automations) ground truth
 
-Spike for the "Scheduled tasks (read-only, Codex only)" prerequisite in [HRA Web v1](../plans/hra-web-v1.md#web-app-w2). Measured on this machine: pinned HRA Codex CLI `0.149.0` (`@openai/codex` in `package.json`); the interactively-driven Codex Desktop app on this machine is a newer build (`cli_version` seen in session metadata: `0.151.0-alpha.7.2`). The app-server JSON schema below was generated from the pinned `0.149.0` binary via `codex app-server generate-json-schema --experimental`.
+Ground truth for the local adoption age-gate integration. The original protocol probe used HRA's then-pinned Codex CLI `0.149.0` and generated its app-server JSON schema with `codex app-server generate-json-schema --experimental`; current compatibility remains governed by the repository's reviewed pin and schema digests. Every task name, prompt, thread id, path, and timestamp below is synthetic and carries no operator data.
 
 ## What exists: "automations" (kind `heartbeat`)
 
@@ -25,20 +25,20 @@ Codex Desktop calls its scheduled-task feature an **automation**. Nothing in thi
 
 ```toml
 version = 1
-id = "upload-codex-and-claude-usage-to-tokscale"
+id = "weekly-project-maintenance"
 kind = "heartbeat"
-name = "Upload Codex and Claude usage to Tokscale"
-prompt = "Upload this machine's local Codex and Claude Code usage data to the saved Tokscale account. Run `...`. Report ..."
+name = "Weekly project maintenance"
+prompt = "Review the registered project and report any maintenance work."
 status = "ACTIVE"                                              # or "PAUSED"
 rrule = "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=22;BYMINUTE=0"       # RFC 5545 RRULE; sometimes prefixed "RRULE:", sometimes not
-target_thread_id = "01a06277-c3f2-7360-ab88-e5cdc7aa1504"       # links the automation to a Codex session/thread id
-created_at = 1788358694391                                      # epoch ms
-updated_at = 1788358694391                                      # epoch ms
+target_thread_id = "00000000-0000-4000-8000-000000000001"       # links the automation to a Codex session/thread id
+created_at = 1700000000000                                      # synthetic epoch ms
+updated_at = 1700000000000                                      # synthetic epoch ms
 ```
 
-Three automations were observed on this machine, all `kind = "heartbeat"`; no other `kind` value has been seen, so the schema for non-heartbeat kinds is unknown. `id` is a user/app-chosen slug (same string as the directory name), not a UUID, and can contain anything the automation was named from. `~/.codex/automations/.run-jitter-salt` also exists (a small opaque text file) and is presumably used to jitter fire times across a population of installs; its format was not decoded and it carries no automation-specific data.
+Only `kind = "heartbeat"` has been verified; the schema for any other kind remains unknown. `id` is a user/app-chosen slug (the same string as the directory name), not necessarily a UUID, and can derive from the automation's name. Desktop also maintains a small opaque `.run-jitter-salt` beside the automation directories; its format was not decoded and it carries no automation-specific data.
 
-**Local SQLite cache: `~/.codex/sqlite/codex-dev.db`** (this machine's active desktop build) and `~/.codex/sqlite/codex.db` (a second, currently-empty copy of the same schema, likely a different build channel) each have:
+**Local SQLite cache:** inspected Desktop builds have used `~/.codex/sqlite/codex-dev.db` or `~/.codex/sqlite/codex.db` with this relevant schema:
 
 ```sql
 CREATE TABLE automations (
@@ -66,7 +66,7 @@ CREATE TABLE inbox_items (
 );
 ```
 
-`automations` rows mirror the TOML files and add `next_run_at`/`last_run_at`, which the TOML does not carry. On this machine `automation_runs` and `inbox_items` are both empty (0 rows) even though automations have fired (`last_run_at` is populated), which means the observed `heartbeat` kind does not go through `automation_runs`/`inbox_items` at all: it fires straight into the existing `target_thread_id` as another turn (see below). The `automation_runs`/`inbox_items` schema (keyed by a fresh `thread_id` per run, with an inbox title/summary) looks built for a different, unobserved automation mode that spawns a **new** thread per firing rather than continuing one target thread; the empty `target_type`/`project_id` columns on every `automations` row are consistent with that second mode existing but unused here. Treat this as inferred, not confirmed.
+`automations` rows mirror the TOML files and add `next_run_at`/`last_run_at`, which the TOML does not carry. Verified `heartbeat` behavior fires straight into the existing `target_thread_id` as another turn (see below), without requiring an `automation_runs` or `inbox_items` row. The latter tables are keyed by a fresh `thread_id` per run and carry inbox fields, so they appear intended for a different, unverified mode that creates a new thread per firing. Treat that interpretation as an inference, not a contract.
 
 ## How a fired automation lands in a session
 
@@ -74,10 +74,10 @@ When a `heartbeat` automation fires, Codex Desktop appends a normal `user_messag
 
 ```
 <heartbeat>
-  <automation_id>finish-linkedin-contacts-import</automation_id>
-  <current_time_iso>2026-08-16T02:31:21.454Z</current_time_iso>
+  <automation_id>weekly-project-maintenance</automation_id>
+  <current_time_iso>2030-01-02T03:04:05.678Z</current_time_iso>
   <instructions>
-  ...the automation's prompt, verbatim...
+  Review the registered project and report any maintenance work.
   </instructions>
 </heartbeat>
 ```
@@ -96,29 +96,68 @@ Searched the generated schema (`codex app-server generate-json-schema --out ... 
 - There **is** a different, non-overlapping `ScheduledTask*` type family (`ScheduledTaskSummary { key, name, prompt, schedule }`, `ScheduledTaskSchedule` = one of `HourlyScheduledTaskSchedule { intervalHours, days? }` / `DailyScheduledTaskSchedule { time }` / `WeekdaysScheduledTaskSchedule { time }` / `WeeklyScheduledTaskSchedule { days, time }`, `ScheduledTaskWeekday` = `MO..SU`), but it appears only as `PluginDetail.scheduledTasks` inside the response of `plugin/read`. This describes scheduled tasks a **plugin manifest declares it wants to register** (no thread/session id field at all), not a live per-user automation. It is a lookalike name, not the same feature; do not build the projection from it.
 - The only reachable RPC surface adjacent to "recurring work" is `plugin/list`, `plugin/read`, `plugin/search`, `plugin/install`, `plugin/installed`, `plugin/uninstall`, none of which return the user's actual automations.
 
-`~/Library/Application Support/Codex` and `~/Library/Application Support/com.openai.codex` were checked and contain only ordinary Chromium/Electron app-shell state (caches, cookies, crash reporting, component updater data); nothing schedule-related lives there. No `LaunchAgents`/launchd plist drives automation firing; it is presumably timed by the running Desktop app process itself (consistent with the jitter-salt file).
+The inspected Desktop build kept schedule authority under the Codex home rather than its ordinary Chromium/Electron app-support state, and no launchd plist drove firing. Timing therefore appears owned by the running Desktop process, consistent with the jitter-salt file; that mechanism is an inference and not part of HRA's authority contract.
 
-## Recommended read-only projection
+## Session-adoption trigger
 
-```ts
-type ScheduledTaskProjection = {
-  id: string;              // automations.id / automation.toml `id` (user-chosen slug, not a UUID)
-  label: string;            // automation.toml `name`
-  cadence: string;          // automation.toml / automations.rrule, raw RFC 5545 RRULE, passed through unparsed
-  nextRunAt?: number;        // automations.next_run_at (epoch ms) from the local SQLite cache; absent for PAUSED or if the cache is missing/stale
-  lastRunAt?: number;        // automations.last_run_at (epoch ms) from the same cache, OR derived by scanning the target session for the newest `<heartbeat><current_time_iso>` tag
-  sessionPublicId?: string;  // automation.toml `target_thread_id`, mapped through the daemon's existing Codex session/thread id -> HRA session public id table
-  source: "codex";
-};
-```
+Personal-home session adoption uses one additional narrow consequence of this
+mapping: a present, valid `heartbeat` record with an exact nonblank
+`target_thread_id` makes that Codex thread discoverable even when it falls
+outside the ordinary recent-session window. Both `ACTIVE` and `PAUSED` records
+count because pausing does not delete the task or its conversation binding;
+deletion or retargeting removes the trigger. HRA opens and locally parses the
+bounded TOML document, but it never selects, retains, logs, returns, or projects
+`prompt`, `cwds`, or another ignored field. It reads no transcript for this
+decision.
 
-Can be derived reliably:
-- `id`, `label`, `cadence` (as a raw RRULE string), `status` (ACTIVE/PAUSED), `sessionPublicId`: read directly from `~/.codex/automations/*/automation.toml`. This needs no undocumented SQLite access and is stable as long as the TOML shape holds.
-- A firing history for a given automation: scan the target session's rollout files for `<heartbeat>` user messages (works even without the SQLite cache).
+Authority discovery advances through a private live directory cursor. If that
+cursor expires, its safe raw position reconstructs the reader without granting
+authority until the reconstructed cursor is consumed. After a daemon restart,
+the first bounded page rotates by the unbounded daemon generation; an offset
+beyond the current directory wraps over its raw cardinality in constant memory
+and under the same absolute deadline instead of falling back to a fixed first
+page ring. If an unusually large directory cannot reach its offset or EOF before
+that deadline, the pass yields no authority and a later pass retries. Exact-source
+rechecks still decide whether an individual target has authority, so directory
+churn can delay discovery but cannot turn a stale offset into a positive claim.
 
-Cannot be derived without touching the unstable local SQLite cache, or not derivable at all:
-- `nextRunAt` / `lastRunAt` as single numeric fields: only present in `~/.codex/sqlite/codex-dev.db` (or `codex.db`) `automations.next_run_at`/`last_run_at`; the TOML has no equivalent. This is an internal cache with no version guarantee (two near-identical DB files were found, one active and one empty, suggesting the file name/location can shift across Desktop builds); treat any dependency on it as best-effort and fail closed (omit the field) rather than guess.
-- A human-readable cadence: rendering "every Monday at 1pm" from the raw RRULE needs an RRULE evaluator; only three concrete shapes have been observed (`FREQ=HOURLY;INTERVAL=n`, `FREQ=WEEKLY;BYDAY=...;BYHOUR=..;BYMINUTE=..`, `FREQ=MONTHLY;BYDAY=..;BYSETPOS=..;BYHOUR=..;BYMINUTE=..;BYSECOND=..`, the last sometimes prefixed `RRULE:`), not the full grammar; scope a real RRULE parser as separate work rather than hand-rolling one from these three samples.
-- Any automation whose `kind` is not `heartbeat`, or a "new thread per run" mode: the `automation_runs`/`inbox_items` schema suggests one exists, but no example was observed to confirm its shape or how it would populate `sessionPublicId` (a run's thread would presumably rotate per firing rather than staying fixed).
-- A live "currently executing" state for an automation: there is no such field anywhere; it would have to be inferred from whether the target session currently has an active turn.
-- Any app-server-native way to do the above: as established, the automations feature is not on the app-server RPC surface at all in the pinned `0.149.0` schema, so a projection built from app-server alone cannot list automations; it must read the local TOML files (and, best-effort, the SQLite cache) directly, the same way HRA already treats other undocumented Codex local state. Pin the exact file/column shapes read and fail closed on drift, per the plan's existing rule for unpublished Codex/Claude contracts.
+The automation is only an age-gate hint. HRA obtains the exact target through
+metadata-only `thread/read`, without resuming it during discovery, and then
+requires the ordinary account, registered-project, timestamp, liveness,
+quiescence, collision, and exact-resume proofs. It re-reads the association
+around claim. The Codex Desktop task remains owned by Codex Desktop; HRA adopts
+its target conversation as an ordinary HRA session and does not convert the
+record into an HRA conversation task. Claude has no equivalent schedule source.
+
+## Privacy and sync boundary
+
+Codex Desktop automation data is private provider-home input. HRA may read the
+minimum TOML association needed to waive only the recent-session age limit
+during personal-session discovery, then it rechecks that association around
+claim. The automation does not become an HRA schedule, and adoption does not
+create a public schedule origin marker.
+
+The encrypted device registry and app-facing scheduled-task list contain only
+ordinary HRA conversation tasks from HRA's session-task store. They never
+contain a Desktop automation's id, name, RRULE, status, target thread, mapped
+session correlation, firing history, or SQLite timing fields. This remains true
+when the target conversation is adopted: native and adopted HRA task rows have
+the same public shape and no provider-home source field.
+
+After Desktop fires a task, its exact provider-generated heartbeat user
+envelope may appear in the ordinary Codex transcript. The Codex projection
+boundary replaces that whole envelope with generic `[protected]` text in
+compact messages, detailed items, preview-derived titles, and live thread-name
+facts. The automation id, firing timestamp, instructions, and any
+schedule-specific origin marker therefore never enter public or cloud state;
+an exact envelope echoed by the assistant or a reasoning summary is protected
+too. Plausible live prefixes stay in bounded local staging until the item
+boundary proves or rejects the whole envelope, while near-matching user,
+assistant, or reasoning-summary text retains its ordinary semantics.
+
+Readers discard the legacy `codex_automation` registry rows emitted by earlier
+builds. Writers canonicalize the registry before encryption so even a stale
+in-process caller cannot re-sync those fields. The only adoption data allowed in
+that encrypted registry is the exact Codex and Claude Code provider-level
+`enabled`, `pending`, `adopted`, and `fenced` aggregate. Devin has no adoption
+key, and candidate records and identities stay local.

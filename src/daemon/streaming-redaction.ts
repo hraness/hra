@@ -1,4 +1,9 @@
 import { redactAbsolutePaths } from "../domain/text-safety";
+import {
+  CODEX_DESKTOP_HEARTBEAT_ENVELOPE_PREFIX,
+  isExactCodexDesktopHeartbeatEnvelope,
+  replaceCodexDesktopHeartbeatEnvelope,
+} from "../domain/codex-heartbeat-envelope";
 import type { InteractionDisplay } from "../domain/interactions";
 import type { SessionEvent, SessionEventBody } from "../domain/session-events";
 import {
@@ -32,6 +37,7 @@ type StagedNode = {
 
 type ActiveStream = {
   context: Omit<SessionEventWrite, "body">;
+  heartbeatEnvelopeState: "candidate" | "prefix" | "rejected";
   pending: StagedNode[];
   proven: string;
   redactor: StreamingSensitiveRedactor;
@@ -194,9 +200,13 @@ export const sanitizeInteractionDisplay = (
 const sanitizeCompleteBody = (
   body: SessionEventBody,
   projectPublicProviderIdentifier: PublicProviderIdentifierProjector,
+  protectCodexDesktopHeartbeatEnvelope: boolean,
 ): SessionEventBody => {
-  const safe = (value: string): string => sanitizeProviderProse(value);
-  const safeInline = (value: string): string => sanitizeProviderProse(value, false);
+  const protect = (value: string): string => protectCodexDesktopHeartbeatEnvelope
+    ? replaceCodexDesktopHeartbeatEnvelope(value)
+    : value;
+  const safe = (value: string): string => sanitizeProviderProse(protect(value));
+  const safeInline = (value: string): string => sanitizeProviderProse(protect(value), false);
   const publicId = (value: string): string => projectPublicProviderIdentifier(value);
   switch (body.type) {
     case "plan_updated": return {
@@ -392,6 +402,7 @@ export class SessionEventStreamRedactor {
   readonly #maximumActiveStreamsPerSession: number;
   readonly #maximumStagedCodeUnits: number;
   readonly #maximumStagedNodes: number;
+  readonly #isCodexSession: (write: SessionEventWrite) => boolean;
   readonly #projectPublicProviderIdentifier: PublicProviderIdentifierProjector;
   #stagedCodeUnits = 0;
   #stagedNodes = 0;
@@ -401,6 +412,7 @@ export class SessionEventStreamRedactor {
     maximumActiveStreamsPerSession?: number;
     maximumStagedCodeUnits?: number;
     maximumStagedNodes?: number;
+    isCodexSession?: (write: SessionEventWrite) => boolean;
     projectPublicProviderIdentifier?: PublicProviderIdentifierProjector;
   }> = {}) {
     const positive = (value: number | undefined, fallback: number): number => {
@@ -420,6 +432,7 @@ export class SessionEventStreamRedactor {
       2 * 1024 * 1024,
     );
     this.#maximumStagedNodes = positive(input.maximumStagedNodes, 4_096);
+    this.#isCodexSession = input.isCodexSession ?? (() => false);
     this.#projectPublicProviderIdentifier = input.projectPublicProviderIdentifier
       ?? createEphemeralPublicProviderIdentifierProjector();
     if (this.#maximumActiveStreamsPerSession > this.#maximumActiveStreams) {
@@ -464,6 +477,7 @@ export class SessionEventStreamRedactor {
       }
       let stream = this.#streams.get(key);
       if (stream === undefined) {
+        const protectCodexDesktopHeartbeatEnvelope = this.#isCodexSession(write);
         stream = {
           context: {
             accountId: write.accountId,
@@ -471,6 +485,9 @@ export class SessionEventStreamRedactor {
             providerGeneration: write.providerGeneration,
             sessionId: write.sessionId,
           },
+          heartbeatEnvelopeState: protectCodexDesktopHeartbeatEnvelope
+            ? "prefix"
+            : "rejected",
           pending: [],
           proven: "",
           redactor: new StreamingSensitiveRedactor(),
@@ -481,7 +498,7 @@ export class SessionEventStreamRedactor {
       const node: StagedNode = { rawText: body.text, readyBody: undefined, write };
       stream.pending.push(node);
       this.#enqueue(node);
-      this.#applyProvenOutput(stream, stream.redactor.push(body.text));
+      this.#applyStreamInput(stream, body.text);
       return [...released, ...this.#drainSession(write.sessionId)];
     }
 
@@ -492,6 +509,7 @@ export class SessionEventStreamRedactor {
       readyBody: sanitizeCompleteBody(
         body,
         this.#projectPublicProviderIdentifier,
+        this.#isCodexSession(write),
       ),
       write,
     });
@@ -657,12 +675,42 @@ export class SessionEventStreamRedactor {
         this.#protectPending(stream);
         continue;
       }
-      this.#applyProvenOutput(stream, stream.redactor.push("", true));
+      if (stream.heartbeatEnvelopeState === "rejected") {
+        this.#applyProvenOutput(stream, stream.redactor.push("", true));
+      } else {
+        const raw = stream.pending.map((node) => node.rawText).join("");
+        if (isExactCodexDesktopHeartbeatEnvelope(raw)) {
+          this.#protectPending(stream);
+          continue;
+        }
+        stream.heartbeatEnvelopeState = "rejected";
+        this.#applyProvenOutput(stream, stream.redactor.push(raw, true));
+      }
       if (stream.pending.length === 0) continue;
       const raw = stream.pending.map((node) => node.rawText).join("");
       if (stream.proven === raw) this.#releaseProvenNodes(stream);
       if (stream.pending.length > 0) this.#protectPending(stream);
     }
+  }
+
+  #applyStreamInput(stream: ActiveStream, value: string): void {
+    if (stream.heartbeatEnvelopeState === "rejected") {
+      this.#applyProvenOutput(stream, stream.redactor.push(value));
+      return;
+    }
+    // Once the complete canonical prefix matches, only the item boundary can
+    // prove or reject the exact whole-envelope grammar. Keep later chunks in
+    // the existing bounded staging queue without repeatedly joining them.
+    if (stream.heartbeatEnvelopeState === "candidate") return;
+    const raw = stream.pending.map((node) => node.rawText).join("");
+    if (raw.length < CODEX_DESKTOP_HEARTBEAT_ENVELOPE_PREFIX.length) {
+      if (CODEX_DESKTOP_HEARTBEAT_ENVELOPE_PREFIX.startsWith(raw)) return;
+    } else if (raw.startsWith(CODEX_DESKTOP_HEARTBEAT_ENVELOPE_PREFIX)) {
+      stream.heartbeatEnvelopeState = "candidate";
+      return;
+    }
+    stream.heartbeatEnvelopeState = "rejected";
+    this.#applyProvenOutput(stream, stream.redactor.push(raw));
   }
 
   #applyProvenOutput(stream: ActiveStream, output: string): void {

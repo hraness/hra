@@ -3,7 +3,7 @@
 - Auth implements verified-email HRA identity and device credentials.
 - Sync encrypts and uploads bounded local projections.
 - Remote control claims commands under one execution lease.
-- The device registry projects this machine's settings, accounts, projects, and scheduled tasks as labels only.
+- The encrypted device registry projects this machine's settings, accounts, projects, and scheduled tasks as labels, plus provider-level personal-session adoption opt-in and aggregate counts. Candidate identity, content, liveness, paths, and provenance stay local.
 
 # Guidelines
 

@@ -24,6 +24,10 @@ export type ClaudeFact =
       readonly permissionMode: string;
       readonly claudeVersion: string;
     }
+  | {
+      readonly type: "providerDisconnected";
+      readonly reason: "eof" | "process_exit" | "protocol_fault";
+    }
   | { readonly type: "turnStarted"; readonly turnId: string }
   | {
       readonly type: "assistantDelta";

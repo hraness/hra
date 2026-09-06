@@ -1,4 +1,7 @@
 {
+  "src/claude/account.ts": {
+    "O_NOFOLLOW": 1
+  },
   "src/claude/process.ts": {
     "safeEnvironmentKeys": 2
   },
@@ -17,7 +20,7 @@
   "src/cli.ts": {
     "mode0600": 3,
     "mode0700": 3,
-    "assertCurrent": 7,
+    "assertCurrent": 1,
     "redactCompleteSensitiveText": 1
   },
   "src/cloud/daemon-adapters.ts": {
@@ -39,6 +42,9 @@
   "src/cloud/local-control.ts": {
     "assertCurrent": 20
   },
+  "src/codex/automations.ts": {
+    "O_NOFOLLOW": 1
+  },
   "src/codex/index.ts": {
     "safeEnvironmentKeys": 1
   },
@@ -52,7 +58,7 @@
     "O_NOFOLLOW": 1
   },
   "src/daemon/claude-runtime-adapter.ts": {
-    "assertCurrent": 5
+    "assertCurrent": 8
   },
   "src/daemon/codex-runtime-adapter.ts": {
     "redactCompleteSensitiveText": 1
@@ -71,8 +77,12 @@
     "mode0600": 6,
     "validateOwnedFile": 6
   },
+  "src/daemon/personal-session-discovery.ts": {
+    "O_NOFOLLOW": 1,
+    "redactCompleteSensitiveText": 1
+  },
   "src/daemon/service.ts": {
-    "assertCurrent": 62
+    "assertCurrent": 94
   },
   "src/daemon/session-event-cursor.ts": {
     "timingSafeEqual": 1
@@ -150,7 +160,7 @@
   "src/storage/state-store.ts": {
     "O_NOFOLLOW": 2,
     "mode0600": 3,
-    "immediateTransaction": 93,
+    "immediateTransaction": 119,
     "secureDelete": 2,
     "synchronousFull": 1,
     "redactCompleteSensitiveText": 2
@@ -163,7 +173,7 @@
   },
   "src/storage/work-store.ts": {
     "assertFence": 6,
-    "immediateTransaction": 7
+    "immediateTransaction": 8
   },
   "src/streaming-sensitive-text.ts": {
     "redactCompleteSensitiveText": 2

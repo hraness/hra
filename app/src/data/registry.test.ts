@@ -199,6 +199,55 @@ describe("notification policy registry compatibility", () => {
     });
   });
 
+  test("drops legacy Codex Desktop automation metadata before it reaches the app", async () => {
+    const key = randomKeyBytes();
+    const authority = { devicePublicId, keyVersion: 1, userPublicId } as const;
+    const hraTask = {
+      cadence: "every 60 minutes",
+      id: "stask_public_hra_task",
+      kind: "hra_conversation",
+      label: "Public HRA task",
+      nextRunAt: 1_760_000_060_000,
+      sessionPublicId: "sess_public_hra_session",
+    } as const;
+    const privateAutomation = {
+      cadence: "FREQ=WEEKLY;BYDAY=MO",
+      id: "desktop-private-automation-id",
+      kind: "codex_automation",
+      label: "Desktop private automation label",
+      nextRunAt: null,
+      sessionPublicId: "sess_private_target_correlation",
+    } as const;
+    // Encrypt the legacy wire shape directly so this exercises an old daemon's
+    // existing row rather than the current writer, which already strips it.
+    const envelope = await encryptedJson({
+      ...registryPayload(),
+      scheduledTasks: [hraTask, privateAutomation],
+    }, key, registryAad(authority));
+    const projection = await decryptRegistryProjection({
+      key,
+      row: parseRow({
+        devicePublicId,
+        envelope,
+        keyVersion: 1,
+        revision: 1,
+        updatedAt: 1,
+      }),
+      userPublicId,
+    });
+
+    expect(projection.registry.scheduledTasks).toEqual([hraTask]);
+    const appProjection = JSON.stringify(projection);
+    for (const privateValue of [
+      privateAutomation.id,
+      privateAutomation.label,
+      privateAutomation.cadence,
+      privateAutomation.sessionPublicId,
+    ]) {
+      expect(appProjection).not.toContain(privateValue);
+    }
+  });
+
   test("shows email consent only when the composite revision is current", async () => {
     const key = randomKeyBytes();
     const authority = { devicePublicId, keyVersion: 1, userPublicId } as const;

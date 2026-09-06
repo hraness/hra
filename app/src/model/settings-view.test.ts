@@ -10,6 +10,7 @@ import {
   commandTargetForMachine,
   isMachineOnline,
   machineLabelsByDevice,
+  personalSessionAdoptionCommand,
   registryHeartbeatToleranceMs,
   scheduledTaskKindLabel,
   shortSessionId,
@@ -44,7 +45,7 @@ function registry(overrides: Partial<DeviceRegistryPayload> = {}): DeviceRegistr
       {
         cadence: "every day at 09:00",
         id: "task_one",
-        kind: "codex_automation",
+        kind: "hra_conversation",
         label: "morning sweep",
         nextRunAt: now + 3 * minute,
         sessionPublicId: "sess_one",
@@ -138,6 +139,7 @@ describe("toMachineView", () => {
     expect(view.defaultPreset).toBe("ultra");
     expect(view.showThinkingDefault).toBe(false);
     expect(view.proseAutorespondConfigured).toBe(true);
+    expect(view.sessionAdoption).toBeNull();
     expect(view.devicePublicId).toBe("dev_one");
     expect(view.deviceStatus).toBe("active");
     expect(view.notificationHours).toEqual(notificationHours);
@@ -153,6 +155,33 @@ describe("toMachineView", () => {
       ["build", "devin", "login_pending"],
     ]);
     expect(view.projects.map((project) => project.label)).toEqual(["hra"]);
+  });
+
+  test("renders personal-home consent as a local command in both directions", () => {
+    expect(personalSessionAdoptionCommand("codex", false))
+      .toBe("hra session adoption enable <account> --provider codex");
+    expect(personalSessionAdoptionCommand("claude", true))
+      .toBe("hra session adoption disable --provider claude");
+  });
+
+  test("carries exact provider aggregates and never guesses an older daemon's opt-in", () => {
+    const view = toMachineView({
+      device: { online: true, status: "active" },
+      devicePublicId: "dev_one",
+      now,
+      payload: registry({
+        sessionAdoption: {
+          claude: { adopted: 1, enabled: false, fenced: 2, pending: 3 },
+          codex: { adopted: 4, enabled: true, fenced: 5, pending: 6 },
+        },
+      }),
+      revision: 7,
+      updatedAt: now - minute,
+    });
+    expect(view.sessionAdoption).toEqual({
+      claude: { adopted: 1, enabled: false, fenced: 2, pending: 3 },
+      codex: { adopted: 4, enabled: true, fenced: 5, pending: 6 },
+    });
   });
 
   test("defaults an older registry to no displayable email consent", () => {
@@ -179,14 +208,13 @@ describe("toMachineView", () => {
       updatedAt: now,
     });
     expect(view.scheduledTasks.map((task) => [task.label, task.kindLabel])).toEqual([
-      ["morning sweep", "Codex"],
+      ["morning sweep", "HRA"],
       ["weekly review", "HRA"],
     ]);
     for (const task of view.scheduledTasks) expect(task.machineLabel).toBe("studio");
   });
 
-  test("names both scheduled task kinds", () => {
-    expect(scheduledTaskKindLabel("codex_automation")).toBe("Codex");
+  test("names the public HRA conversation task kind", () => {
     expect(scheduledTaskKindLabel("hra_conversation")).toBe("HRA");
   });
 });
@@ -263,7 +291,7 @@ describe("machine and task ordering", () => {
         scheduledTasks: [{
           cadence: "hourly",
           id: "task_three",
-          kind: "codex_automation",
+          kind: "hra_conversation",
           label: "hourly sweep",
           nextRunAt: now + minute,
           sessionPublicId: null,

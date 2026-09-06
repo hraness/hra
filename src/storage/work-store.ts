@@ -2,12 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 
 import type { Database } from "bun:sqlite";
 
-import { currentPresetContract } from "../domain/presets";
+import { currentPresetContract, type Provider } from "../domain/presets";
 import { isUuidV7 } from "../domain/uuid-v7";
-import type { Provider } from "../domain/presets";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
 import { workPreparedEffectMessage } from "../domain/work-message";
-import { MESSAGE_MAX_BYTES } from "../domain/values";
+import { MESSAGE_MAX_BYTES, sessionIdSchema } from "../domain/values";
 import {
   verifyWorkEvidence,
   WorkEvidenceVerificationError,
@@ -102,6 +101,76 @@ const WORK_TASK_DEPTH_LIMIT = DOMAIN_WORK_TASK_DEPTH_LIMIT;
 const WORK_PAGE_LIMIT = WORK_EVENT_PAGE_LIMIT;
 const WORK_POLL_DEFAULT_LIMIT = 50;
 const WORK_POLL_LIMIT = WORK_POLL_ITEM_LIMIT;
+const WORK_SESSION_AUTHORITY_CHANGE_LIMIT = 500;
+
+/**
+ * One closed provider-authority predicate for every Work admission and
+ * recheck. The optional expression is a SQL boolean such as an exact captured
+ * profile-generation match. Provider additions must extend the final branch;
+ * an unknown provider never inherits Codex or Claude authority.
+ */
+const currentWorkSessionAuthorityExistsSql = (
+  sessionIdExpression: string,
+  generationPredicate = "",
+): string => `EXISTS (
+  SELECT 1
+  FROM sessions AS authority_session
+  JOIN profiles AS authority_profile ON authority_profile.id=authority_session.profile_id
+  LEFT JOIN session_provider_account_authorities AS provider_authority
+    ON provider_authority.session_id=authority_session.id
+      AND provider_authority.provider=authority_session.provider_v39
+  WHERE authority_session.id=${sessionIdExpression}
+    AND authority_session.state IN ('active','idle')
+    ${generationPredicate.length === 0 ? "" : `AND (${generationPredicate})`}
+    AND NOT EXISTS (
+      SELECT 1 FROM provider_runtime_account_revocations AS authority_revocation
+      WHERE authority_revocation.profile_id=authority_session.profile_id
+        AND authority_revocation.profile_generation=authority_profile.process_generation
+        AND authority_revocation.provider=authority_session.provider_v39
+        AND authority_revocation.runtime_scope=provider_authority.runtime_scope
+        AND (
+          authority_revocation.state='releasing'
+          OR authority_revocation.current_account_key IS NULL
+          OR authority_revocation.current_account_key!=provider_authority.account_key
+        )
+    )
+    AND (
+      (provider_authority.runtime_scope='personal' AND EXISTS (
+        SELECT 1 FROM session_personal_runtime_bindings AS authority_binding
+        WHERE authority_binding.session_id=authority_session.id
+          AND authority_binding.provider=authority_session.provider_v39
+          AND authority_binding.provider_thread_id=authority_session.provider_thread_id
+          AND authority_binding.state='active'
+      ))
+      OR (provider_authority.runtime_scope='managed' AND NOT EXISTS (
+        SELECT 1 FROM session_personal_runtime_bindings AS authority_binding
+        WHERE authority_binding.session_id=authority_session.id
+          AND authority_binding.state IN ('active','detaching')
+      ))
+      OR (authority_session.provider_v39='devin' AND NOT EXISTS (
+        SELECT 1 FROM session_personal_runtime_bindings AS authority_binding
+        WHERE authority_binding.session_id=authority_session.id
+          AND authority_binding.state IN ('active','detaching')
+      ))
+    )
+    AND (
+      (authority_session.provider_v39='claude'
+        AND authority_profile.state IN ('signed_in','signed_out'))
+      OR (authority_session.provider_v39='codex'
+        AND authority_profile.state='signed_in'
+        AND authority_profile.provider_email IS NOT NULL
+        AND authority_profile.codex_account_key=provider_authority.account_key
+        AND EXISTS (
+          SELECT 1 FROM session_account_authorities AS legacy_authority
+          WHERE legacy_authority.session_id=authority_session.id
+            AND legacy_authority.profile_id=authority_session.profile_id
+            AND legacy_authority.account_key IS NOT NULL
+            AND legacy_authority.account_key=lower(trim(authority_profile.provider_email))
+        ))
+      OR (authority_session.provider_v39='devin'
+        AND authority_profile.state IN ('signed_in','signed_out'))
+    )
+)`;
 
 export const WORK_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS work_clock (
@@ -184,6 +253,11 @@ WHEN NEW.provider_v39='devin' AND (
   )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
+DROP TRIGGER IF EXISTS work_coordinator_account_authority_guard;
+CREATE TRIGGER work_coordinator_account_authority_guard
+BEFORE INSERT ON works
+WHEN NOT ${currentWorkSessionAuthorityExistsSql("NEW.coordinator_session_id")}
+BEGIN SELECT RAISE(ABORT,'WORK_COORDINATOR_AUTHORITY_MISMATCH'); END;
 
 CREATE TABLE IF NOT EXISTS work_routes (
   work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
@@ -609,6 +683,11 @@ CREATE TRIGGER IF NOT EXISTS work_member_limit_guard
 BEFORE INSERT ON work_members
 WHEN (SELECT COUNT(*) FROM work_members WHERE work_id=NEW.work_id) >= ${WORK_MEMBER_LIMIT}
 BEGIN SELECT RAISE(ABORT,'WORK_MEMBER_LIMIT'); END;
+DROP TRIGGER IF EXISTS work_member_account_authority_guard;
+CREATE TRIGGER work_member_account_authority_guard
+BEFORE INSERT ON work_members
+WHEN NOT ${currentWorkSessionAuthorityExistsSql("NEW.session_id")}
+BEGIN SELECT RAISE(ABORT,'WORK_MEMBER_AUTHORITY_MISMATCH'); END;
 
 CREATE TRIGGER IF NOT EXISTS work_tasks_no_update
 BEFORE UPDATE ON work_tasks BEGIN SELECT RAISE(ABORT,'WORK_TASK_IMMUTABLE'); END;
@@ -698,6 +777,14 @@ WHEN NOT EXISTS (
     )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_ATTEMPT_ROUTE_MISMATCH'); END;
+DROP TRIGGER IF EXISTS work_attempt_account_authority_guard;
+CREATE TRIGGER work_attempt_account_authority_guard
+BEFORE INSERT ON work_attempts
+WHEN NOT ${currentWorkSessionAuthorityExistsSql(
+    "NEW.worker_session_id",
+    "authority_session.provider_v39='codex' AND authority_session.profile_id=NEW.account_id AND authority_profile.process_generation=NEW.account_generation",
+  )}
+BEGIN SELECT RAISE(ABORT,'WORK_ATTEMPT_ACCOUNT_AUTHORITY_MISMATCH'); END;
 DROP TRIGGER IF EXISTS work_session_switch_attempt_authority_guard;
 CREATE TRIGGER work_session_switch_attempt_authority_guard
 BEFORE UPDATE OF state ON mutation_attempts
@@ -742,6 +829,14 @@ WHEN EXISTS (
     )
 )
 BEGIN SELECT RAISE(ABORT,'WORK_PROFILE_ATTEMPT_AUTHORITY'); END;
+CREATE TRIGGER IF NOT EXISTS work_profile_attempt_identity_guard
+BEFORE UPDATE OF provider_email ON profiles
+WHEN lower(trim(NEW.provider_email)) IS NOT lower(trim(OLD.provider_email)) AND EXISTS (
+  SELECT 1 FROM work_attempts AS a
+  WHERE a.account_id=OLD.id
+    AND a.state IN ('claimed','dispatching','running')
+)
+BEGIN SELECT RAISE(ABORT,'WORK_PROFILE_ATTEMPT_AUTHORITY'); END;
 
 CREATE TRIGGER IF NOT EXISTS work_attempt_reports_no_update
 BEFORE UPDATE ON work_attempt_reports BEGIN SELECT RAISE(ABORT,'WORK_REPORT_IMMUTABLE'); END;
@@ -769,6 +864,11 @@ WHEN NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND sessio
     WHERE s.id=NEW.submission_id AND s.worker_session_id=NEW.reviewer_session_id
   )
 BEGIN SELECT RAISE(ABORT,'WORK_REVIEWER_INVALID'); END;
+DROP TRIGGER IF EXISTS work_review_account_authority_guard;
+CREATE TRIGGER work_review_account_authority_guard
+BEFORE INSERT ON work_reviews
+WHEN NOT ${currentWorkSessionAuthorityExistsSql("NEW.reviewer_session_id")}
+BEGIN SELECT RAISE(ABORT,'WORK_REVIEWER_AUTHORITY_MISMATCH'); END;
 
 CREATE TRIGGER IF NOT EXISTS work_signals_no_update
 BEFORE UPDATE ON work_signals BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_IMMUTABLE'); END;
@@ -783,11 +883,19 @@ WHEN NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND sessio
   OR NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND session_id=NEW.to_session_id)
   OR NOT EXISTS (
     SELECT 1 FROM sessions AS s JOIN profiles AS p ON p.id=s.profile_id
-    WHERE s.id=NEW.to_session_id AND s.state IN ('active','idle')
-      AND p.state!='removed' AND (s.provider_v39 IN ('claude','devin') OR p.state='signed_in')
+    WHERE s.id=NEW.to_session_id
       AND p.process_generation=NEW.target_account_generation
   )
 BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_MEMBER_INVALID'); END;
+DROP TRIGGER IF EXISTS work_signal_account_authority_guard;
+CREATE TRIGGER work_signal_account_authority_guard
+BEFORE INSERT ON work_signals
+WHEN NOT ${currentWorkSessionAuthorityExistsSql("NEW.from_session_id")}
+OR NOT ${currentWorkSessionAuthorityExistsSql(
+    "NEW.to_session_id",
+    "authority_profile.process_generation=NEW.target_account_generation",
+  )}
+BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_ACCOUNT_AUTHORITY_MISMATCH'); END;
 CREATE TRIGGER IF NOT EXISTS work_receipts_no_update
 BEFORE UPDATE ON work_signal_receipts BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_RECEIPT_IMMUTABLE'); END;
 CREATE TRIGGER IF NOT EXISTS work_receipts_no_delete
@@ -805,6 +913,19 @@ WHEN NEW.kind='ack' AND NOT EXISTS (
   WHERE s.id=NEW.signal_id AND s.to_session_id=NEW.actor_session_id
 )
 BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_ACK_ACTOR_INVALID'); END;
+DROP TRIGGER IF EXISTS work_signal_ack_account_authority_guard;
+CREATE TRIGGER work_signal_ack_account_authority_guard
+BEFORE INSERT ON work_signal_receipts
+WHEN NEW.kind='ack' AND NOT EXISTS (
+  SELECT 1 FROM work_signals AS signal
+  WHERE signal.id=NEW.signal_id
+    AND signal.to_session_id=NEW.actor_session_id
+    AND ${currentWorkSessionAuthorityExistsSql(
+      "signal.to_session_id",
+      "authority_profile.process_generation=signal.target_account_generation",
+    )}
+)
+BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_ACK_ACCOUNT_AUTHORITY_MISMATCH'); END;
 CREATE TRIGGER IF NOT EXISTS work_receipt_chain_guard
 BEFORE INSERT ON work_signal_receipts
 WHEN NEW.sequence != COALESCE((
@@ -946,6 +1067,65 @@ WHEN NOT EXISTS (
 BEGIN SELECT RAISE(ABORT,'WORK_NESTED_EFFECT_SETTLEMENT_IMMUTABLE'); END;
 `;
 
+// These guards jointly bind Work to the session's provider, preset contract,
+// and immutable account authority. They have changed across schema versions,
+// so presence alone is not enough: a same-name legacy body would silently
+// weaken the current route fence.
+const exactWorkAuthorityTriggerNames = [
+  "works_identity_immutable",
+  "work_devin_preset_contract_guard",
+  "work_session_devin_contract_guard",
+  "work_coordinator_account_authority_guard",
+  "work_member_account_authority_guard",
+  "work_attempt_route_guard",
+  "work_attempt_account_authority_guard",
+  "work_session_switch_attempt_authority_guard",
+  "work_session_attempt_authority_guard",
+  "work_review_account_authority_guard",
+  "work_signal_member_guard",
+  "work_signal_account_authority_guard",
+  "work_signal_ack_account_authority_guard",
+] as const;
+
+const normalizeWorkSchemaSql = (sql: string): string =>
+  sql.replace(/\bIF NOT EXISTS\b/giu, "").replace(/\s+/gu, " ").trim().replace(/;$/u, "");
+
+const exactWorkAuthorityTriggerSql = new Map(
+  exactWorkAuthorityTriggerNames.map((name) => {
+    const markers = [`CREATE TRIGGER ${name}\n`, `CREATE TRIGGER IF NOT EXISTS ${name}\n`];
+    const start = markers
+      .map((marker) => WORK_SCHEMA_SQL.indexOf(marker))
+      .find((offset) => offset >= 0) ?? -1;
+    const end = WORK_SCHEMA_SQL.indexOf("END;", start);
+    if (start < 0 || end < 0) throw new Error(`WORK_SCHEMA_DEFINITION_INVALID:${name}`);
+    return [name, normalizeWorkSchemaSql(WORK_SCHEMA_SQL.slice(start, end + 4))] as const;
+  }),
+);
+
+const providerVersion39AddedAuthorityTriggerNames = new Set([
+  "work_coordinator_account_authority_guard",
+  "work_member_account_authority_guard",
+  "work_attempt_account_authority_guard",
+  "work_profile_attempt_identity_guard",
+  "work_review_account_authority_guard",
+  "work_signal_account_authority_guard",
+  "work_signal_ack_account_authority_guard",
+]);
+
+const providerVersion39SignalMemberGuardSql = normalizeWorkSchemaSql(`
+CREATE TRIGGER work_signal_member_guard
+BEFORE INSERT ON work_signals
+WHEN NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND session_id=NEW.from_session_id)
+  OR NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND session_id=NEW.to_session_id)
+  OR NOT EXISTS (
+    SELECT 1 FROM sessions AS s JOIN profiles AS p ON p.id=s.profile_id
+    WHERE s.id=NEW.to_session_id AND s.state IN ('active','idle')
+      AND p.state!='removed' AND (s.provider_v39 IN ('claude','devin') OR p.state='signed_in')
+      AND p.process_generation=NEW.target_account_generation
+  )
+BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_MEMBER_INVALID'); END
+`);
+
 const requiredWorkTables = [
   "work_clock",
   "work_purge_authority",
@@ -979,6 +1159,7 @@ const requiredWorkTriggers = [
   "work_retained_limit_guard",
   "work_devin_preset_contract_guard",
   "work_session_devin_contract_guard",
+  "work_coordinator_account_authority_guard",
   "works_no_delete",
   "works_state_guard",
   "works_stream_advance_guard",
@@ -989,6 +1170,7 @@ const requiredWorkTriggers = [
   "work_members_no_update",
   "work_members_no_delete",
   "work_member_limit_guard",
+  "work_member_account_authority_guard",
   "work_tasks_no_update",
   "work_tasks_no_delete",
   "work_dependencies_no_update",
@@ -1003,9 +1185,11 @@ const requiredWorkTriggers = [
   "work_attempt_no_delete",
   "work_attempt_state_guard",
   "work_attempt_route_guard",
+  "work_attempt_account_authority_guard",
   "work_session_switch_attempt_authority_guard",
   "work_session_attempt_authority_guard",
   "work_profile_attempt_authority_guard",
+  "work_profile_attempt_identity_guard",
   "work_attempt_reports_no_update",
   "work_attempt_reports_no_delete",
   "work_submissions_no_update",
@@ -1013,9 +1197,11 @@ const requiredWorkTriggers = [
   "work_reviews_no_update",
   "work_reviews_no_delete",
   "work_review_member_guard",
+  "work_review_account_authority_guard",
   "work_signals_no_update",
   "work_signals_no_delete",
   "work_signal_member_guard",
+  "work_signal_account_authority_guard",
   "work_task_history_index_attempt",
   "work_task_history_index_attempt_report",
   "work_task_history_index_submission",
@@ -1029,6 +1215,7 @@ const requiredWorkTriggers = [
   "work_receipts_no_update",
   "work_receipts_no_delete",
   "work_signal_ack_guard",
+  "work_signal_ack_account_authority_guard",
   "work_receipt_chain_guard",
   "work_events_no_update",
   "work_events_no_delete",
@@ -1077,10 +1264,33 @@ const assertWorkSchemaShape = (database: Database): void => {
   for (const name of requiredWorkTriggers) {
     if (!triggers.has(name)) throw new Error(`WORK_SCHEMA_MISSING_TRIGGER:${name}`);
   }
+  for (const name of exactWorkAuthorityTriggerNames) {
+    const row = database.query(
+      "SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?",
+    ).get(name) as { type?: unknown; tbl_name?: unknown; sql?: unknown } | null;
+    if (
+      row?.type !== "trigger"
+      || typeof row.tbl_name !== "string"
+      || typeof row.sql !== "string"
+      || normalizeWorkSchemaSql(row.sql) !== exactWorkAuthorityTriggerSql.get(name)
+    ) throw new Error(`WORK_SCHEMA_STALE_TRIGGER:${name}`);
+  }
   const requiredColumns: Readonly<Record<string, readonly string[]>> = {
     // Current work authority guards inspect the provider on their parent
     // session, so a merely present trigger is not a usable work schema.
-    sessions: ["provider_v39", "preset_contract"],
+    profiles: ["state", "process_generation", "provider_email", "codex_account_key"],
+    sessions: ["provider_v39", "provider_thread_id", "preset_contract"],
+    session_account_authorities: ["session_id", "profile_id", "account_key"],
+    session_provider_account_authorities: [
+      "session_id", "provider", "runtime_scope", "account_key",
+    ],
+    session_personal_runtime_bindings: [
+      "session_id", "provider", "provider_thread_id", "state",
+    ],
+    provider_runtime_account_revocations: [
+      "profile_id", "profile_generation", "provider", "runtime_scope",
+      "current_account_key", "state",
+    ],
     work_release_tombstones: [
       "work_id", "release_idempotency_key", "release_request_digest", "client_ref_digest",
       "terminal_kind", "final_revision", "final_head_hash", "discarded_counts_json",
@@ -1142,6 +1352,78 @@ export function assertWorkSchema(database: Database): void {
   assertWorkSchemaShape(database);
   const integrity = database.query("PRAGMA foreign_key_check").all();
   if (integrity.length !== 0) throw new Error("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
+}
+
+/**
+ * Exact authority surface shipped by provider schema v39 immediately before
+ * adoption v40. This is deliberately narrower than a repair: it proves the
+ * only predecessor whose Work guards may be replaced during the migration.
+ */
+export function assertProviderVersion39WorkSchema(database: Database): void {
+  const tableRows = database.query("PRAGMA table_list").all() as Array<{
+    name?: unknown;
+    strict?: unknown;
+    type?: unknown;
+  }>;
+  const tables = new Map(
+    tableRows
+      .filter((row) => row.type === "table" && typeof row.name === "string")
+      .map((row) => [row.name as string, row.strict]),
+  );
+  for (const name of requiredWorkTables) {
+    if (!tables.has(name)) throw new Error(`WORK_SCHEMA_V39_MISSING:${name}`);
+    if (tables.get(name) !== 1) throw new Error(`WORK_SCHEMA_V39_NOT_STRICT:${name}`);
+  }
+
+  const triggerRows = database.query(
+    "SELECT name,type,tbl_name,sql FROM sqlite_master WHERE type='trigger'",
+  ).all() as Array<{
+    name?: unknown;
+    type?: unknown;
+    tbl_name?: unknown;
+    sql?: unknown;
+  }>;
+  const triggers = new Map(triggerRows.flatMap((row) =>
+    typeof row.name === "string" ? [[row.name, row] as const] : []));
+  for (const name of requiredWorkTriggers) {
+    if (providerVersion39AddedAuthorityTriggerNames.has(name)) {
+      if (triggers.has(name)) throw new Error(`WORK_SCHEMA_V39_UNEXPECTED_TRIGGER:${name}`);
+    } else if (!triggers.has(name)) {
+      throw new Error(`WORK_SCHEMA_V39_MISSING_TRIGGER:${name}`);
+    }
+  }
+  for (const name of exactWorkAuthorityTriggerNames) {
+    if (providerVersion39AddedAuthorityTriggerNames.has(name)) continue;
+    const row = triggers.get(name);
+    const expected = name === "work_signal_member_guard"
+      ? providerVersion39SignalMemberGuardSql
+      : exactWorkAuthorityTriggerSql.get(name);
+    if (
+      row?.type !== "trigger"
+      || typeof row.tbl_name !== "string"
+      || typeof row.sql !== "string"
+      || normalizeWorkSchemaSql(row.sql) !== expected
+    ) throw new Error(`WORK_SCHEMA_V39_STALE_TRIGGER:${name}`);
+  }
+  const requiredColumns: Readonly<Record<string, readonly string[]>> = {
+    profiles: ["state", "process_generation", "provider_email"],
+    sessions: ["provider_v39", "provider_thread_id", "preset_contract"],
+    works: ["preset_contract"],
+  };
+  for (const [table, columns] of Object.entries(requiredColumns)) {
+    const present = new Set((database.query(`PRAGMA table_info(${table})`).all() as Array<{
+      name?: unknown;
+    }>).flatMap((row) => typeof row.name === "string" ? [row.name] : []));
+    for (const name of columns) {
+      if (!present.has(name)) throw new Error(`WORK_SCHEMA_V39_MISSING_COLUMN:${table}.${name}`);
+    }
+  }
+  const clock = database.query(
+    "SELECT logical_time FROM work_clock WHERE singleton=1",
+  ).get() as { logical_time?: unknown } | null;
+  if (!Number.isSafeInteger(clock?.logical_time) || (clock?.logical_time as number) < 0) {
+    throw new Error("WORK_SCHEMA_V39_CLOCK_MISSING");
+  }
 }
 
 // Readonly opens (`hra status`, `hra doctor --offline`) verify the same table,
@@ -1694,6 +1976,15 @@ export class WorkStore {
     return structuredClone(WORK_PROTOCOL_DESCRIPTION);
   }
 
+  /**
+   * StateStore authority changes call into WorkStore from an enclosing SQLite
+   * transaction.  Identity, rather than a matching pathname, proves those
+   * writes participate in that same transaction.
+   */
+  isBackedByDatabase(database: Database): boolean {
+    return this.#database === database;
+  }
+
   #capability(authority: WorkCapabilityAuthority): string {
     return workCapabilitySchema.parse(this.#issueCapability(authority));
   }
@@ -2037,14 +2328,15 @@ export class WorkStore {
        JOIN work_members AS m ON m.work_id=t.work_id AND m.session_id=?
        JOIN works AS w ON w.id=t.work_id
        JOIN sessions AS s ON s.id=m.session_id
-       JOIN profiles AS p ON p.id=s.profile_id
        WHERE t.id=? AND t.work_id=?
          AND t.account_id=s.profile_id AND t.project_id=s.project_id
          AND t.preset=s.preset AND t.fast=s.fast_enabled
          AND s.provider_v39='codex'
          AND (s.preset_contract=w.preset_contract OR s.preset='low')
-         AND s.state IN ('active','idle') AND p.state='signed_in'
-         AND p.process_generation=?`,
+         AND ${currentWorkSessionAuthorityExistsSql(
+           "s.id",
+           "authority_profile.process_generation=?",
+         )}`,
     ).get(
       effect.targetSessionId,
       effect.taskId,
@@ -2061,12 +2353,12 @@ export class WorkStore {
        FROM work_signals AS w
        JOIN work_members AS m ON m.work_id=w.work_id AND m.session_id=w.to_session_id
        JOIN sessions AS s ON s.id=m.session_id
-       JOIN profiles AS p ON p.id=s.profile_id
        WHERE w.id=? AND w.work_id=? AND w.to_session_id=? AND w.mode=?
          AND w.target_account_generation=?
-         AND p.process_generation=w.target_account_generation
-         AND s.state IN ('active','idle') AND p.state!='removed'
-         AND (s.provider_v39 IN ('claude','devin') OR p.state='signed_in')`,
+         AND ${currentWorkSessionAuthorityExistsSql(
+           "s.id",
+           "authority_profile.process_generation=w.target_account_generation",
+         )}`,
     ).get(
       effect.signalId,
       effect.workId,
@@ -2618,9 +2910,40 @@ export class WorkStore {
     if (row === null) throw new WorkStoreError("MEMBER_NOT_FOUND");
   }
 
+  #sessionAccountAuthorityCurrent(
+    sessionId: string,
+    expectedGeneration?: number,
+  ): boolean {
+    const authority = this.#database.query(
+      `SELECT 1 AS present
+       WHERE ${currentWorkSessionAuthorityExistsSql(
+         "?",
+         "? IS NULL OR authority_profile.process_generation=?",
+       )}`,
+    ).get(
+      sessionId,
+      expectedGeneration ?? null,
+      expectedGeneration ?? null,
+    ) as { present: number } | null;
+    return authority !== null;
+  }
+
+  #requireSessionAccountAuthority(
+    sessionId: string,
+    code: WorkStoreErrorCode,
+    expectedGeneration?: number,
+  ): void {
+    if (!this.#sessionAccountAuthorityCurrent(sessionId, expectedGeneration)) {
+      throw new WorkStoreError(code);
+    }
+  }
+
   #assertCoordinator(workId: string, coordinatorSessionId: string): WorkRow {
     const work = this.#requireWork(workId);
-    if (work.coordinator_session_id !== coordinatorSessionId) {
+    if (
+      work.coordinator_session_id !== coordinatorSessionId
+      || !this.#sessionAccountAuthorityCurrent(coordinatorSessionId)
+    ) {
       throw new WorkStoreError("ATTEMPT_NOT_OWNER");
     }
     return work;
@@ -3614,7 +3937,7 @@ export class WorkStore {
              AND sm.state IN ('effect_started','ambiguous')
              AND sr.attempt_id IS NULL
          )
-         AND s.state IN ('active','idle') AND p.state='signed_in'`,
+         AND ${currentWorkSessionAuthorityExistsSql("s.id")}`,
     ).get(
       task.work_id,
       actorSessionId,
@@ -3632,9 +3955,8 @@ export class WorkStore {
 
   #attemptAuthorityCurrent(attempt: AttemptRow): boolean {
     const authority = this.#database.query(
-      `SELECT 1 AS present
+       `SELECT 1 AS present
        FROM sessions AS s
-       JOIN profiles AS p ON p.id=s.profile_id
        JOIN work_members AS m ON m.work_id=? AND m.session_id=s.id
        JOIN works AS w ON w.id=m.work_id
        WHERE s.id=? AND s.profile_id=? AND s.project_id=? AND s.preset=? AND s.fast_enabled=?
@@ -3643,8 +3965,10 @@ export class WorkStore {
            s.preset_contract=w.preset_contract
            OR s.preset='low'
          )
-         AND s.state IN ('active','idle') AND p.state='signed_in'
-         AND p.process_generation=?`,
+         AND ${currentWorkSessionAuthorityExistsSql(
+           "s.id",
+           "authority_profile.process_generation=?",
+         )}`,
     ).get(
       attempt.work_id,
       attempt.worker_session_id,
@@ -3655,6 +3979,74 @@ export class WorkStore {
       attempt.account_generation,
     ) as { present: number } | null;
     return authority !== null;
+  }
+
+  #retireAttemptAuthority(
+    attempts: readonly AttemptRow[],
+    expectedGeneration: number,
+    claimedSummary: string,
+  ): readonly string[] {
+    const workIds = [...new Set(attempts.map((attempt) => attempt.work_id))].sort();
+    const now = this.#tick();
+    for (const attempt of attempts) {
+      if (attempt.state === "claimed") {
+        const task = this.#requireTask(attempt.task_id, attempt.work_id);
+        const failureReason = this.#retryFailureReason(task.task, task.state, now);
+        this.#database.query(
+          `UPDATE work_attempts
+           SET state='released',revision=revision+1,updated_at=?,terminal_at=?
+           WHERE id=? AND state='claimed' AND account_generation=?`,
+        ).run(now, now, attempt.id, expectedGeneration);
+        this.#database.query(
+          `UPDATE work_task_states
+           SET state=?,revision=revision+1,retry_not_before=NULL,updated_at=?
+           WHERE task_id=? AND state='claimed'`,
+        ).run(failureReason === null ? "pending" : "failed", now, attempt.task_id);
+        const released = {
+          type: "attempt.released" as const,
+          attemptId: attempt.id,
+          summaryDigest: digestJson(claimedSummary),
+        };
+        this.#appendEvent(
+          attempt.work_id,
+          released.type,
+          attempt.worker_session_id,
+          released,
+        );
+        if (failureReason !== null) {
+          this.#appendTaskFailure(
+            attempt.work_id,
+            attempt.task_id,
+            failureReason,
+            attempt.worker_session_id,
+          );
+        }
+        continue;
+      }
+      this.#database.query(
+        `UPDATE work_attempts
+         SET state='recovery_required',revision=revision+1,updated_at=?
+         WHERE id=? AND state=? AND account_generation=?`,
+      ).run(now, attempt.id, attempt.state, expectedGeneration);
+      this.#database.query(
+        `UPDATE work_task_states
+         SET state='recovery_required',revision=revision+1,updated_at=?
+         WHERE task_id=?`,
+      ).run(now, attempt.task_id);
+      const recovery = {
+        type: "attempt.recovery_required" as const,
+        attemptId: attempt.id,
+        fence: attempt.fence,
+        reason: "custodian_restart" as const,
+      };
+      this.#appendEvent(
+        attempt.work_id,
+        recovery.type,
+        attempt.worker_session_id,
+        recovery,
+      );
+    }
+    return workIds;
   }
 
   prepareProfileAuthorityChange(
@@ -3677,67 +4069,70 @@ export class WorkStore {
            AND (? IS NULL OR s.provider_v39=?)
          ORDER BY a.work_id,a.created_at,a.id`,
       ).all(profileId, expectedGeneration, provider ?? null, provider ?? null) as AttemptRow[];
-      const workIds = [...new Set(attempts.map((attempt) => attempt.work_id))].sort();
-      const now = this.#tick();
-      for (const attempt of attempts) {
-        if (attempt.state === "claimed") {
-          const task = this.#requireTask(attempt.task_id, attempt.work_id);
-          const failureReason = this.#retryFailureReason(task.task, task.state, now);
-          this.#database.query(
-            `UPDATE work_attempts
-             SET state='released',revision=revision+1,updated_at=?,terminal_at=?
-             WHERE id=? AND state='claimed' AND account_generation=?`,
-          ).run(now, now, attempt.id, expectedGeneration);
-          this.#database.query(
-            `UPDATE work_task_states
-             SET state=?,revision=revision+1,retry_not_before=NULL,updated_at=?
-             WHERE task_id=? AND state='claimed'`,
-          ).run(failureReason === null ? "pending" : "failed", now, attempt.task_id);
-          const released = {
-            type: "attempt.released" as const,
-            attemptId: attempt.id,
-            summaryDigest: digestJson("Profile authority retired before dispatch."),
-          };
-          this.#appendEvent(
-            attempt.work_id,
-            released.type,
-            attempt.worker_session_id,
-            released,
-          );
-          if (failureReason !== null) {
-            this.#appendTaskFailure(
-              attempt.work_id,
-              attempt.task_id,
-              failureReason,
-              attempt.worker_session_id,
-            );
-          }
-          continue;
-        }
-        this.#database.query(
-          `UPDATE work_attempts
-           SET state='recovery_required',revision=revision+1,updated_at=?
-           WHERE id=? AND state=? AND account_generation=?`,
-        ).run(now, attempt.id, attempt.state, expectedGeneration);
-        this.#database.query(
-          `UPDATE work_task_states
-           SET state='recovery_required',revision=revision+1,updated_at=?
-           WHERE task_id=?`,
-        ).run(now, attempt.task_id);
-        const recovery = {
-          type: "attempt.recovery_required" as const,
-          attemptId: attempt.id,
-          fence: attempt.fence,
-          reason: "custodian_restart" as const,
-        };
-        this.#appendEvent(
-          attempt.work_id,
-          recovery.type,
-          attempt.worker_session_id,
-          recovery,
-        );
+      return this.#retireAttemptAuthority(
+        attempts,
+        expectedGeneration,
+        "Profile authority retired before dispatch.",
+      );
+    });
+    return prepare.immediate();
+  }
+
+  prepareSessionAuthorityChange(
+    sessionIds: readonly string[],
+    expectedProfileGeneration: number,
+  ): readonly string[] {
+    if (sessionIds.length > WORK_SESSION_AUTHORITY_CHANGE_LIMIT) {
+      throw new WorkStoreError("WORK_CAPACITY_EXCEEDED");
+    }
+    if (
+      !Number.isSafeInteger(expectedProfileGeneration)
+      || expectedProfileGeneration < 0
+    ) throw new WorkStoreError("REVISION_CONFLICT");
+    const uniqueSessionIds = [...new Set(sessionIds)];
+    if (uniqueSessionIds.some((sessionId) => !sessionIdSchema.safeParse(sessionId).success)) {
+      throw new WorkStoreError("REVISION_CONFLICT");
+    }
+    if (uniqueSessionIds.length === 0) return [];
+    uniqueSessionIds.sort();
+    const prepare = this.#database.transaction((): readonly string[] => {
+      let profileId: string | null = null;
+      for (const sessionId of uniqueSessionIds) {
+        const session = this.#database.query(
+          `SELECT s.profile_id,p.process_generation
+           FROM sessions AS s
+           JOIN profiles AS p ON p.id=s.profile_id
+           WHERE s.id=?`,
+        ).get(sessionId) as {
+          process_generation: number;
+          profile_id: string;
+        } | null;
+        if (
+          session === null
+          || session.process_generation !== expectedProfileGeneration
+          || (profileId !== null && session.profile_id !== profileId)
+        ) throw new WorkStoreError("REVISION_CONFLICT");
+        profileId = session.profile_id;
       }
-      return workIds;
+      const attemptsById = new Map<string, AttemptRow>();
+      for (const sessionId of uniqueSessionIds) {
+        const attempts = this.#database.query(
+          `SELECT * FROM work_attempts
+           WHERE worker_session_id=? AND account_generation=?
+             AND state IN ('claimed','dispatching','running')
+           ORDER BY work_id,created_at,id`,
+        ).all(sessionId, expectedProfileGeneration) as AttemptRow[];
+        for (const attempt of attempts) attemptsById.set(attempt.id, attempt);
+      }
+      const attempts = [...attemptsById.values()].sort((left, right) =>
+        left.work_id.localeCompare(right.work_id)
+        || left.created_at - right.created_at
+        || left.id.localeCompare(right.id));
+      return this.#retireAttemptAuthority(
+        attempts,
+        expectedProfileGeneration,
+        "Session controller authority retired before dispatch.",
+      );
     });
     return prepare.immediate();
   }
@@ -4360,10 +4755,10 @@ export class WorkStore {
         if (retainedCount >= WORK_RETAINED_LIMIT) {
           throw new WorkStoreError("WORK_CAPACITY_EXCEEDED");
         }
-        const coordinator = this.#database.query(
-          "SELECT 1 AS present FROM sessions WHERE id=?",
-        ).get(operation.coordinatorSessionId) as { present: number } | null;
-        if (coordinator === null) throw new WorkStoreError("MEMBER_NOT_FOUND");
+        this.#requireSessionAccountAuthority(
+          operation.coordinatorSessionId,
+          "MEMBER_NOT_FOUND",
+        );
         const workId = createWorkId();
         const now = this.#tick();
         this.#database.query(
@@ -4451,10 +4846,7 @@ export class WorkStore {
       case "work.join": {
         this.#requireActiveWork(operation.workId);
         this.#assertCoordinator(operation.workId, operation.coordinatorSessionId);
-        const session = this.#database.query("SELECT 1 AS present FROM sessions WHERE id=?").get(
-          operation.actorSessionId,
-        ) as { present: number } | null;
-        if (session === null) throw new WorkStoreError("MEMBER_NOT_FOUND");
+        this.#requireSessionAccountAuthority(operation.actorSessionId, "MEMBER_NOT_FOUND");
         const joined = this.#database.query(
           "SELECT 1 AS present FROM work_members WHERE work_id=? AND session_id=?",
         ).get(operation.workId, operation.actorSessionId) as { present: number } | null;
@@ -5083,6 +5475,7 @@ export class WorkStore {
   #review(operation: Extract<WorkOperation, { kind: "submission.review" }>): WorkApplyResult {
     this.#requireActiveWork(operation.workId);
     this.#requireMember(operation.workId, operation.reviewerSessionId);
+    this.#requireSessionAccountAuthority(operation.reviewerSessionId, "ROUTE_MISMATCH");
     const submission = this.#database.query(
       "SELECT * FROM work_submissions WHERE id=? AND work_id=?",
     ).get(operation.submissionId, operation.workId) as SubmissionRow | null;
@@ -5283,6 +5676,7 @@ export class WorkStore {
     this.#requireActiveWork(operation.workId);
     this.#requireMember(operation.workId, operation.senderSessionId);
     this.#requireMember(operation.workId, operation.targetSessionId);
+    this.#requireSessionAccountAuthority(operation.senderSessionId, "ROUTE_MISMATCH");
     this.#assertSignalGovernance(
       operation.workId,
       operation.senderSessionId,
@@ -5292,9 +5686,9 @@ export class WorkStore {
     );
     const targetAuthority = this.#database.query(
       `SELECT p.process_generation AS account_generation
-       FROM sessions AS s JOIN profiles AS p ON p.id=s.profile_id
-       WHERE s.id=? AND s.state IN ('active','idle') AND p.state!='removed'
-         AND (s.provider_v39 IN ('claude','devin') OR p.state='signed_in')`,
+       FROM sessions AS s
+       JOIN profiles AS p ON p.id=s.profile_id
+       WHERE s.id=? AND ${currentWorkSessionAuthorityExistsSql("s.id")}`,
     ).get(operation.targetSessionId) as { account_generation: number } | null;
     if (
       targetAuthority === null
@@ -5379,15 +5773,22 @@ export class WorkStore {
     this.#requireWork(operation.workId);
     this.#requireMember(operation.workId, operation.actorSessionId);
     const signal = this.#database.query(
-      "SELECT id,to_session_id FROM work_signals WHERE id=? AND work_id=?",
+      `SELECT id,to_session_id,target_account_generation
+       FROM work_signals WHERE id=? AND work_id=?`,
     ).get(operation.signalId, operation.workId) as {
       id: string;
+      target_account_generation: number;
       to_session_id: string;
     } | null;
     if (signal === null) throw new WorkStoreError("SIGNAL_NOT_FOUND");
     if (signal.to_session_id !== operation.actorSessionId) {
       throw new WorkStoreError("MEMBER_NOT_FOUND");
     }
+    this.#requireSessionAccountAuthority(
+      operation.actorSessionId,
+      "ROUTE_MISMATCH",
+      signal.target_account_generation,
+    );
     const signalBefore = this.#signalRecord(signal.id);
     if (signalBefore.revision !== operation.expectedSignalRevision) {
       throw new WorkStoreError("REVISION_CONFLICT");

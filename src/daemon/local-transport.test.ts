@@ -506,6 +506,64 @@ describe("local daemon transport", () => {
     expect(JSON.stringify(response)).not.toContain(secret);
   });
 
+  test("renders provider-account recovery identically without controller provenance", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const privateDiagnostics = [
+      "personal-home account mismatch at /opt/hra-fixture/personal/.codex runtimeScope=personal",
+      "managed account revocation pending at /opt/hra-fixture/managed/.hra runtimeScope=managed",
+    ];
+    let calls = 0;
+    const server = await LocalDaemonServer.start({
+      paths,
+      handler: () => {
+        const diagnostic = privateDiagnostics[calls] ?? privateDiagnostics.at(-1);
+        calls += 1;
+        throw Object.assign(new Error(diagnostic), {
+          [commandFailureBrand]: true as const,
+          code: "RECOVERY_REQUIRED" as const,
+          details: {
+            accountId: "acct_11111111111111111111111111111111",
+            provider: "codex",
+          },
+        });
+      },
+    });
+    servers.push(server);
+
+    const native = await callLocalDaemon({ paths, command: { kind: "daemon.status" } });
+    const adopted = await callLocalDaemon({ paths, command: { kind: "daemon.status" } });
+    if (native.ok || adopted.ok) throw new Error("Expected closed recovery failures.");
+    expect(JSON.stringify(native.error)).toBe(JSON.stringify(adopted.error));
+    expect(native.error).toEqual({
+      code: "RECOVERY_REQUIRED",
+      message: "The local command requires recovery before it can continue.",
+      details: {
+        accountId: "acct_11111111111111111111111111111111",
+        provider: "codex",
+      },
+    });
+
+    const rendered = [native.error, adopted.error].map((failure) => {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      expect(renderFailure(failure, false, {
+        writeStdout: (value) => { stdout.push(value); },
+        writeStderr: (value) => { stderr.push(value); },
+      })).toBe(7);
+      expect(stdout).toEqual([]);
+      return stderr.join("");
+    });
+    expect(rendered[0]).toBe(rendered[1]);
+    const exposed = `${JSON.stringify([native.error, adopted.error])}${rendered.join("")}`
+      .toLowerCase();
+    expect(exposed).not.toContain("personal");
+    expect(exposed).not.toContain("managed");
+    expect(exposed).not.toContain("runtimescope");
+    expect(exposed).not.toContain("home");
+  });
+
   test("preserves closed settled-rejection guidance across the local transport", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });

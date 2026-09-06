@@ -13,6 +13,7 @@ import type {
   DeviceRegistryPayload,
   DeviceRegistryProject,
   DeviceRegistryScheduledTask,
+  DeviceRegistrySessionAdoption,
   NotificationHoursPolicy,
 } from "../hra/cloud";
 import type { ApprovalMode, PresetChoice } from "./settings-commands";
@@ -25,6 +26,21 @@ export const registryHeartbeatIntervalMs = 60_000;
 
 /** Three missed registry heartbeats before a machine reads as offline. */
 export const registryHeartbeatToleranceMs = 3 * registryHeartbeatIntervalMs;
+
+export type SessionAdoptionProvider = keyof DeviceRegistrySessionAdoption;
+
+/**
+ * Personal-home access is a machine-local consent boundary. Settings shows
+ * the exact local command instead of manufacturing a browser mutation.
+ */
+export function personalSessionAdoptionCommand(
+  provider: SessionAdoptionProvider,
+  enabled: boolean,
+): string {
+  return enabled
+    ? `hra session adoption disable --provider ${provider}`
+    : `hra session adoption enable <account> --provider ${provider}`;
+}
 
 export type MachineDeviceState = Readonly<{
   online: boolean;
@@ -52,12 +68,16 @@ export function isMachineOnline(input: MachineOnlineInput): boolean {
   return now - heartbeatAt <= registryHeartbeatToleranceMs;
 }
 
-export type ScheduledTaskKindLabel = "Codex" | "HRA";
+export type ScheduledTaskKindLabel = "HRA";
+
+const scheduledTaskKindLabels: Readonly<
+  Record<DeviceRegistryScheduledTask["kind"], ScheduledTaskKindLabel>
+> = { hra_conversation: "HRA" };
 
 export function scheduledTaskKindLabel(
   kind: DeviceRegistryScheduledTask["kind"],
 ): ScheduledTaskKindLabel {
-  return kind === "codex_automation" ? "Codex" : "HRA";
+  return scheduledTaskKindLabels[kind];
 }
 
 export type ScheduledTaskView = Readonly<{
@@ -97,6 +117,8 @@ export type MachineView = Readonly<{
   proseAutorespondConfigured: boolean;
   revision: number;
   scheduledTasks: readonly ScheduledTaskView[];
+  /** Null means the daemon predates this optional registry projection. */
+  sessionAdoption: DeviceRegistrySessionAdoption | null;
   showThinkingDefault: boolean;
   updatedAt: number;
 }>;
@@ -147,6 +169,7 @@ export function toMachineView(input: MachineViewInput): MachineView {
       nextRunAt: task.nextRunAt,
       sessionPublicId: task.sessionPublicId,
     })),
+    sessionAdoption: payload.sessionAdoption ?? null,
     showThinkingDefault: payload.showThinkingDefault,
     notificationHours: input.notificationHours ?? null,
     notificationHoursStatus: input.notificationHoursStatus

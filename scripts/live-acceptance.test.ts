@@ -45,6 +45,7 @@ import {
   readLiveRuntimeAttestation,
   resumeLiveAcceptanceCleanup,
   sourceGitOutput,
+  startLiveAcceptanceProcessWorkerForTesting,
   startLiveAcceptanceRun,
   type LiveAcceptanceDeviceName,
   type LiveAcceptanceWorker,
@@ -109,6 +110,31 @@ async function removeOwnedTestBase(root: string): Promise<void> {
     await rm(root, { force: false, recursive: true });
   }
 }
+
+const startSyntheticProcessWorker = async (
+  descriptor: AcceptanceInstallationDescriptor,
+  body: readonly string[],
+): Promise<LiveAcceptanceWorker> => {
+  const defaultLaunch = liveAcceptanceWorkerLaunch(descriptor);
+  const harness = [
+    'import { createInterface } from "node:readline";',
+    "const lines = createInterface({ input: process.stdin })[Symbol.asyncIterator]();",
+    "const descriptorFrame = await lines.next();",
+    'if (descriptorFrame.done) throw new Error("missing descriptor");',
+    "const descriptor = JSON.parse(descriptorFrame.value);",
+    "const writeStatus = async (value) => await new Promise((resolve, reject) => {",
+    '  process.stdout.write(JSON.stringify(value) + "\\n", (error) => {',
+    "    if (error === undefined || error === null) resolve();",
+    "    else reject(error);",
+    "  });",
+    "});",
+    ...body,
+  ].join("\n");
+  return await startLiveAcceptanceProcessWorkerForTesting(descriptor, {
+    ...defaultLaunch,
+    arguments: ["--no-env-file", "-e", harness],
+  });
+};
 
 const response = (data: unknown): CommandResponse => ({
   data,
@@ -592,6 +618,94 @@ describe("source-only live acceptance isolation", () => {
     }
   });
 
+  test("initializes in the scrubbed environment before running an abort-aware daemon", async () => {
+    const base = await privateTestBase();
+    let child: ReturnType<typeof spawn> | undefined;
+    let childClosed: Promise<Readonly<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>> | undefined;
+    let runRoot: string | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const descriptor = layout.descriptors.a;
+      const launch = liveAcceptanceWorkerLaunch(descriptor);
+      const workerModule = new URL("./live-acceptance-worker.ts", import.meta.url).href;
+      const harness = [
+        `import { runLiveAcceptanceWorkerSupervisorForTest } from ${JSON.stringify(workerModule)};`,
+        "const exitCode = await runLiveAcceptanceWorkerSupervisorForTest({",
+        '  kind: "worker_main",',
+        "  runDaemon: async (_installation, options) => {",
+        "    const signal = options.stopSignal;",
+        '    if (signal === undefined) throw new Error("missing generation stop signal");',
+        "    await new Promise((resolve) => {",
+        "      if (signal.aborted) resolve();",
+        '      else signal.addEventListener("abort", resolve, { once: true });',
+        "    });",
+        "    return 0;",
+        "  },",
+        "  waitForDaemonReady: async () => ({",
+        '    bootId: "boot_00000000000000000000000000000001",',
+        "    generation: 1,",
+        '    nonce: "00000000-0000-4000-8000-000000000001",',
+        "    pid: process.pid,",
+        '    protocol: "hra-control-plane-local-v2",',
+        "  }),",
+        "});",
+        "process.exitCode = exitCode;",
+      ].join("\n");
+      child = spawn(launch.executable, ["--no-env-file", "-e", harness], {
+        cwd: launch.cwd,
+        env: launch.environment,
+        stdio: [...LIVE_ACCEPTANCE_WORKER_STDIO],
+      });
+      childClosed = new Promise<Readonly<{ code: number | null; signal: NodeJS.Signals | null }>>(
+        (resolvePromise) => child!.once("close", (code, signal) => {
+          resolvePromise({ code, signal });
+        }),
+      );
+      const lines = createInterface({ input: child.stdout! })[Symbol.asyncIterator]();
+
+      child.stdin!.write(`${JSON.stringify(descriptor)}\n`);
+      const readyLine = await lines.next();
+      expect(readyLine.done).toBe(false);
+      expect(liveAcceptanceWorkerStatusSchema.parse(
+        JSON.parse(readyLine.value!) as unknown,
+      )).toMatchObject({
+        device: descriptor.device,
+        runId: descriptor.runId,
+        type: "ready",
+      });
+
+      child.stdin!.end();
+      const stoppedLine = await lines.next();
+      expect(stoppedLine.done).toBe(false);
+      expect(liveAcceptanceWorkerStatusSchema.parse(
+        JSON.parse(stoppedLine.value!) as unknown,
+      )).toEqual({
+        device: descriptor.device,
+        runId: descriptor.runId,
+        type: "stopped",
+        version: 1,
+      });
+      expect(await lines.next()).toMatchObject({ done: true });
+
+      expect(await childClosed).toEqual({ code: 0, signal: null });
+      child = undefined;
+      childClosed = undefined;
+    } finally {
+      if (child !== undefined) {
+        child.stdin?.destroy();
+        child.stdout?.destroy();
+        child.kill("SIGTERM");
+        await childClosed?.catch(() => undefined);
+      }
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
   test("prepares many private credential homes concurrently", async () => {
     const base = await privateTestBase();
     let runRoot: string | undefined;
@@ -631,6 +745,112 @@ describe("source-only live acceptance isolation", () => {
     }
   });
 
+  test("rejects a failure status attributed to another worker identity", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    let worker: LiveAcceptanceWorker | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const descriptor = layout.descriptors.a;
+      worker = await startSyntheticProcessWorker(descriptor, [
+        "await writeStatus({",
+        '  code: "daemon_failed",',
+        '  device: descriptor.device === "a" ? "b" : "a",',
+        "  runId: descriptor.runId,",
+        '  type: "failed",',
+        "  version: 1,",
+        "});",
+      ]);
+
+      await expect(worker.ready()).rejects.toThrow("worker_protocol_invalid");
+    } finally {
+      await worker?.preserve();
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("rejects a stopped status while a control request is pending", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    let worker: LiveAcceptanceWorker | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const descriptor = layout.descriptors.a;
+      worker = await startSyntheticProcessWorker(descriptor, [
+        "await writeStatus({",
+        "  device: descriptor.device,",
+        "  pid: process.pid,",
+        "  runId: descriptor.runId,",
+        '  type: "ready",',
+        "  version: 1,",
+        "});",
+        "const controlFrame = await lines.next();",
+        'if (controlFrame.done) throw new Error("missing control");',
+        "const control = JSON.parse(controlFrame.value);",
+        "await writeStatus({",
+        "  device: descriptor.device,",
+        "  runId: descriptor.runId,",
+        '  type: "stopped",',
+        "  version: 1,",
+        "});",
+        "await writeStatus({",
+        "  requestId: control.requestId,",
+        "  response: { data: null, ok: true, requestId: control.requestId, version: 1 },",
+        '  type: "command_result",',
+        "  version: 1,",
+        "});",
+      ]);
+      await worker.ready();
+
+      await expect(worker.command({ kind: "daemon.status" }))
+        .rejects.toThrow("worker_protocol_invalid");
+      await expect(worker.lifetime()).rejects.toThrow("worker_protocol_invalid");
+    } finally {
+      await worker?.preserve();
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("rejects an unsolicited clean worker shutdown", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    let worker: LiveAcceptanceWorker | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const descriptor = layout.descriptors.a;
+      worker = await startSyntheticProcessWorker(descriptor, [
+        "await writeStatus({",
+        "  device: descriptor.device,",
+        "  pid: process.pid,",
+        "  runId: descriptor.runId,",
+        '  type: "ready",',
+        "  version: 1,",
+        "});",
+        "await new Promise((resolve) => setImmediate(resolve));",
+        "await writeStatus({",
+        "  device: descriptor.device,",
+        "  runId: descriptor.runId,",
+        '  type: "stopped",',
+        "  version: 1,",
+        "});",
+      ]);
+      await worker.ready().catch((error: unknown) => {
+        expect(error).toMatchObject({ message: "worker_protocol_invalid" });
+      });
+
+      await expect(worker.lifetime()).rejects.toThrow("worker_protocol_invalid");
+    } finally {
+      await worker?.preserve();
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
   test("keeps state, sockets, and capabilities out of worker argv and environment", async () => {
     const base = await privateTestBase();
     let runRoot: string | undefined;
@@ -657,6 +877,211 @@ describe("source-only live acceptance isolation", () => {
       await removeOwnedTestBase(base);
     }
   });
+
+  test("publishes descriptor failures without terminating itself by signal", async () => {
+    const base = await privateTestBase();
+    let child: ReturnType<typeof spawn> | undefined;
+    let childClosed: Promise<Readonly<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>> | undefined;
+    let runRoot: string | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const launch = liveAcceptanceWorkerLaunch(layout.descriptors.a);
+      child = spawn(launch.executable, [...launch.arguments], {
+        cwd: launch.cwd,
+        env: launch.environment,
+        stdio: [...LIVE_ACCEPTANCE_WORKER_STDIO],
+      });
+      childClosed = new Promise<Readonly<{ code: number | null; signal: NodeJS.Signals | null }>>(
+        (resolvePromise) => child!.once("close", (code, signal) => {
+          resolvePromise({ code, signal });
+        }),
+      );
+      const lines = createInterface({ input: child.stdout! })[Symbol.asyncIterator]();
+
+      child.stdin!.end("{}\n");
+      const failedLine = await lines.next();
+      expect(failedLine.done).toBe(false);
+      expect(liveAcceptanceWorkerStatusSchema.parse(
+        JSON.parse(failedLine.value!) as unknown,
+      )).toEqual({
+        code: "descriptor_invalid",
+        type: "failed",
+        version: 1,
+      });
+      expect(await lines.next()).toMatchObject({ done: true });
+      expect(await childClosed).toEqual({ code: 1, signal: null });
+      child = undefined;
+      childClosed = undefined;
+    } finally {
+      if (child !== undefined) {
+        child.stdin?.destroy();
+        child.stdout?.destroy();
+        child.kill("SIGTERM");
+        await childClosed?.catch(() => undefined);
+      }
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("waits for unsettled daemon cleanup after readiness rejects", async () => {
+    const base = await privateTestBase();
+    let child: ReturnType<typeof spawn> | undefined;
+    let childClosed: Promise<Readonly<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>> | undefined;
+    let runRoot: string | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const descriptor = layout.descriptors.a;
+      const launch = liveAcceptanceWorkerLaunch(descriptor);
+      const workerModule = new URL("./live-acceptance-worker.ts", import.meta.url).href;
+      const harness = [
+        `import { runLiveAcceptanceWorkerSupervisorForTest } from ${JSON.stringify(workerModule)};`,
+        "const descriptor = JSON.parse(Bun.argv[1]);",
+        "let finishCleanup;",
+        "const cleanup = new Promise((resolve) => { finishCleanup = resolve; });",
+        "let observeAbort;",
+        "const aborted = new Promise((resolve) => { observeAbort = resolve; });",
+        "const starting = runLiveAcceptanceWorkerSupervisorForTest({",
+        '  kind: "start",',
+        "  descriptor,",
+        "  runDaemon: async (_installation, options) => {",
+        "    const signal = options.stopSignal;",
+        '    if (signal === undefined) throw new Error("missing generation stop signal");',
+        "    if (signal.aborted) observeAbort();",
+        '    else signal.addEventListener("abort", observeAbort, { once: true });',
+        "    await aborted;",
+        "    return await cleanup;",
+        "  },",
+        '  waitForDaemonReady: async () => { throw new Error("synthetic readiness rejection"); },',
+        "});",
+        "let startSettled = false;",
+        "void starting.then(() => { startSettled = true; }, () => { startSettled = true; });",
+        "await aborted;",
+        "await Promise.resolve();",
+        'if (startSettled) throw new Error("start settled before daemon cleanup");',
+        "finishCleanup(0);",
+        "const failure = await starting.then(() => null, (error) => error);",
+        'if (!(failure instanceof Error) || failure.message !== "daemon_failed") {',
+        '  throw new Error("readiness rejection was not normalized");',
+        "}",
+        'process.stdout.write("ok\\n");',
+      ].join("\n");
+      child = spawn(launch.executable, [
+        "--no-env-file",
+        "-e",
+        harness,
+        JSON.stringify(descriptor),
+      ], {
+        cwd: launch.cwd,
+        env: launch.environment,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout!.setEncoding("utf8");
+      child.stderr!.setEncoding("utf8");
+      child.stdout!.on("data", (chunk: string) => { stdout += chunk; });
+      child.stderr!.on("data", (chunk: string) => { stderr += chunk; });
+      childClosed = new Promise<Readonly<{ code: number | null; signal: NodeJS.Signals | null }>>(
+        (resolvePromise) => child!.once("close", (code, signal) => {
+          resolvePromise({ code, signal });
+        }),
+      );
+
+      expect(await childClosed).toEqual({ code: 0, signal: null });
+      expect(stdout).toBe("ok\n");
+      expect(stderr).toBe("");
+      child = undefined;
+      childClosed = undefined;
+    } finally {
+      if (child !== undefined) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.kill("SIGTERM");
+        await childClosed?.catch(() => undefined);
+      }
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
+
+  test("publishes one daemon failure for a valid descriptor and rejected daemon start", async () => {
+    const base = await privateTestBase();
+    let child: ReturnType<typeof spawn> | undefined;
+    let childClosed: Promise<Readonly<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>> | undefined;
+    let runRoot: string | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const descriptor = layout.descriptors.a;
+      const launch = liveAcceptanceWorkerLaunch(descriptor);
+      const workerModule = new URL("./live-acceptance-worker.ts", import.meta.url).href;
+      const harness = [
+        `import { runLiveAcceptanceWorkerSupervisorForTest } from ${JSON.stringify(workerModule)};`,
+        "let daemonStarts = 0;",
+        "let initializations = 0;",
+        "const neverReady = new Promise(() => undefined);",
+        "const exitCode = await runLiveAcceptanceWorkerSupervisorForTest({",
+        '  kind: "worker_main",',
+        "  initializeWorkerInstallation: async () => { initializations += 1; },",
+        "  runDaemon: async () => {",
+        "    daemonStarts += 1;",
+        '    throw new Error("synthetic daemon-start rejection");',
+        "  },",
+        "  waitForDaemonReady: async () => await neverReady,",
+        "});",
+        "process.exitCode = initializations === 1 && daemonStarts === 1 ? exitCode : 99;",
+      ].join("\n");
+      child = spawn(launch.executable, ["--no-env-file", "-e", harness], {
+        cwd: launch.cwd,
+        env: launch.environment,
+        stdio: [...LIVE_ACCEPTANCE_WORKER_STDIO],
+      });
+      childClosed = new Promise<Readonly<{ code: number | null; signal: NodeJS.Signals | null }>>(
+        (resolvePromise) => child!.once("close", (code, signal) => {
+          resolvePromise({ code, signal });
+        }),
+      );
+      const lines = createInterface({ input: child.stdout! })[Symbol.asyncIterator]();
+
+      child.stdin!.end(`${JSON.stringify(descriptor)}\n`);
+      const failedLine = await lines.next();
+      expect(failedLine.done).toBe(false);
+      expect(liveAcceptanceWorkerStatusSchema.parse(
+        JSON.parse(failedLine.value!) as unknown,
+      )).toEqual({
+        code: "daemon_failed",
+        device: descriptor.device,
+        runId: descriptor.runId,
+        type: "failed",
+        version: 1,
+      });
+      expect(await lines.next()).toMatchObject({ done: true });
+      expect(await childClosed).toEqual({ code: 1, signal: null });
+      child = undefined;
+      childClosed = undefined;
+    } finally {
+      if (child !== undefined) {
+        child.stdin?.destroy();
+        child.stdout?.destroy();
+        child.kill("SIGTERM");
+        await childClosed?.catch(() => undefined);
+      }
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
 
   test("carries descriptor and fatal controls on stdin with status only on stdout", async () => {
     const base = await privateTestBase();

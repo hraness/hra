@@ -7,6 +7,7 @@ import { ClaudeError } from "./errors";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./pin";
 import { presetRequirements } from "../domain/presets";
 import {
+  claudeSessionArgv,
   locateClaudeExecutable,
   resolvePinnedClaudeRuntime,
   spawnClaudeVersionProbe,
@@ -89,6 +90,24 @@ describe("pinned Claude runtime", () => {
     }
   });
 
+  test("binds creation and resume to one canonical durable session id", async () => {
+    const { configDir, path } = await fakeExecutable();
+    const runtime = await resolvePinnedClaudeRuntime({
+      configDir,
+      executablePath: path,
+      probeVersion: async () => CLAUDE_PIN,
+    });
+    const providerThreadId = "726b1b3d-ed97-4b55-9904-e58fa7d7eb45";
+    expect(claudeSessionArgv(runtime, { kind: "create", providerThreadId }).slice(-2))
+      .toEqual(["--session-id", providerThreadId]);
+    expect(claudeSessionArgv(runtime, { kind: "resume", providerThreadId }).slice(-2))
+      .toEqual(["--resume", providerThreadId]);
+    expect(() => claudeSessionArgv(runtime, {
+      kind: "resume",
+      providerThreadId: "not-a-session",
+    })).toThrow("canonical lowercase UUID");
+  });
+
   test("requires an absolute config directory and an absolute executable", async () => {
     const { configDir, path } = await fakeExecutable();
     await expect(resolvePinnedClaudeRuntime({
@@ -143,6 +162,7 @@ describe("pinned Claude runtime", () => {
     };
     await expect(spawnClaudeVersionProbe({
       configDir: "/tmp/claude-config",
+      configHome: "isolated",
       deadlineMs: 1_000,
       environment: { PATH: "/usr/bin:/bin" },
       executablePath: "/test/claude",
@@ -171,6 +191,7 @@ describe("pinned Claude runtime", () => {
     };
     await expect(spawnClaudeVersionProbe({
       configDir: "/tmp/claude-config",
+      configHome: "isolated",
       deadlineMs: 1,
       environment: { PATH: "/usr/bin:/bin" },
       executablePath: "/test/claude",
@@ -191,6 +212,7 @@ describe("pinned Claude runtime", () => {
     };
     await expect(spawnClaudeVersionProbe({
       configDir: "/tmp/claude-config",
+      configHome: "isolated",
       deadlineMs: 1_000,
       environment: { PATH: "/usr/bin:/bin" },
       executablePath: "/test/claude",
@@ -198,5 +220,35 @@ describe("pinned Claude runtime", () => {
       signal: new AbortController().signal,
     })).rejects.toThrow("could not be joined after forced termination");
     expect(trace).toEqual(["terminate", "force"]);
+  });
+
+  test("exports the reviewed home only for isolated probes", async () => {
+    const environments: Array<Readonly<Record<string, string>>> = [];
+    const processFactory = (input: Readonly<{
+      argv: readonly [string, "--version"];
+      environment: Readonly<Record<string, string>>;
+    }>): ClaudeVersionProbeProcess => {
+      environments.push(input.environment);
+      return {
+        exited: Promise.resolve(0),
+        stdout: (async function* () { yield new TextEncoder().encode(CLAUDE_PIN); })(),
+        stderr: (async function* () { yield* []; })(),
+        terminate: () => undefined,
+        forceTerminate: () => undefined,
+      };
+    };
+    for (const configHome of ["isolated", "personal"] as const) {
+      await spawnClaudeVersionProbe({
+        configDir: "/tmp/reviewed-claude-home",
+        configHome,
+        deadlineMs: 1_000,
+        environment: { PATH: "/usr/bin:/bin" },
+        executablePath: "/test/claude",
+        processFactory,
+        signal: new AbortController().signal,
+      });
+    }
+    expect(environments[0]?.CLAUDE_CONFIG_DIR).toBe("/tmp/reviewed-claude-home");
+    expect(environments[1]?.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 });

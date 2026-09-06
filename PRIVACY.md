@@ -8,7 +8,8 @@ Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code 
 
 - User messages and final assistant display text.
 - Session names, notes, queued messages, and steering input.
-- Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields; it never opens or parses a Claude credential file. Devin account identity and allowance are not projected. HRA reports only local signed-in readiness and records provider-supplied session context and cost facts in the neutral session stream.
+- Codex account labels and observed provider email and plan metadata when cloud sync is enabled. Claude Code account identity and usage are not projected. For managed profiles, HRA validates one bounded Claude Code authentication-status response transiently, reduces it to signedIn, and never retains, returns, projects, or uploads the identity or usage fields. Personal-home Claude adoption transiently reads bounded account, email, and organization identity metadata and retains only a one-way local authority key. Raw Claude identity fields and that private authority key are never publicly returned, projected, or uploaded; HRA never opens or parses a Claude credential file. Devin account identity and allowance are not projected. HRA reports only local signed-in readiness and records provider-supplied session context and cost facts in the neutral session stream.
+- Codex and Claude Code personal-session adoption status: whether discovery is enabled and bounded pending, adopted, and fenced counts. Candidate identities and records are never included. Devin has no personal-home adoption surface.
 - Turn timing, observed model and tier, and provider usage summaries.
 - Bounded observed file and Git metadata, without unbounded filesystem paths.
 - Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.
@@ -19,6 +20,7 @@ Cloud sync is optional. Local provider profiles, Codex credentials, Claude Code 
 
 - Codex, Claude Code, or Devin credentials; provider profile or configuration files; plugin credentials; OAuth access or refresh tokens; authorization codes; PKCE verifiers; provider cookies; or the private device code.
 - Raw Codex app-server, Claude Code stream, or Devin ACP requests or responses.
+- Personal-home adoption candidate identities or records, personal-runtime bindings, process identities, schedule-source metadata, provider-home provenance, provider-account authority hashes, or the automation id, firing time, and instructions from an exact Codex Desktop heartbeat envelope. Such an envelope is replaced with generic protected text before session content is projected.
 - Raw reasoning, hidden chain of thought, or approval secrets.
 - Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.
 - Environment variables, arbitrary command output, or unbounded filesystem paths.

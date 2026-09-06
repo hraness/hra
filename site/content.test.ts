@@ -426,6 +426,9 @@ describe("public content contract", () => {
       "never applies a Codex reset credit to Devin",
       "ACP v1 has no in-turn steer method",
       "HRA never sends concurrent prompts to one Devin session",
+      "A Devin session can participate in Work coordination records and provider-neutral signal delivery",
+      "it cannot own or execute a Work attempt",
+      "Work attempt routes remain Codex-only",
     ];
     for (const claim of claims) {
       expect(markdown).toContain(claim);
@@ -577,6 +580,9 @@ describe("public content contract", () => {
       "Claude Code account identity and usage are not projected.",
       "validates one bounded Claude Code authentication-status response transiently",
       "never retains, returns, projects, or uploads the identity or usage fields",
+      "Codex and Claude Code personal-session adoption status: whether discovery is enabled and bounded pending, adopted, and fenced counts.",
+      "Candidate identities and records are never included.",
+      "Devin has no personal-home adoption surface.",
       "Devin account identity and allowance are not projected.",
       "provider-supplied session context and cost facts in the neutral session stream",
       "For an explicitly requested Codex web login, the provider HTTPS verification URL and separate one-time user code.",
@@ -584,6 +590,7 @@ describe("public content contract", () => {
       "deletes the hosted handoff on that read or after five minutes",
       "OAuth access or refresh tokens; authorization codes; PKCE verifiers; provider cookies; or the private device code.",
       "Raw Codex app-server, Claude Code stream, or Devin ACP requests or responses.",
+      "Personal-home adoption candidate identities or records, personal-runtime bindings, process identities, schedule-source metadata, provider-home provenance, provider-account authority hashes, or the automation id, firing time, and instructions from an exact Codex Desktop heartbeat envelope. Such an envelope is replaced with generic protected text before session content is projected.",
       "Raw reasoning, hidden chain of thought, or approval secrets.",
       "Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.",
       "Provider-internal login and request IDs, permission values, MCP field contracts, protected answers, or response digests.",
