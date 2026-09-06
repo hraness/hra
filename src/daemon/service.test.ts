@@ -13751,7 +13751,8 @@ describe("HraService", () => {
       { requestedAt: now, deadlineAt: now + 10_000 },
     );
     const evidenceDeadline = Date.now() + 2_000;
-    while (value.store.listAutorespondEvidence({ sessionId }).length === 0) {
+    while (!value.store.listAutorespondEvidence({ sessionId }).some((row) =>
+      row.interactionId === automatic.interaction.publicId)) {
       if (Date.now() >= evidenceDeadline) {
         throw new Error("Timed out waiting for fenced autorespond evidence.");
       }
@@ -13765,10 +13766,23 @@ describe("HraService", () => {
     expect(value.store.requireInteraction(manual.interaction.publicId).state).toBe("pending");
     expect(value.store.requireInteraction(deadline.interaction.publicId).state).toBe("pending");
     expect(value.store.requireInteraction(automatic.interaction.publicId).state).toBe("pending");
-    expect(value.store.listAutorespondEvidence({ sessionId })).toMatchObject([{
-      interactionId: automatic.interaction.publicId,
+    const evidence = value.store.listAutorespondEvidence({ sessionId });
+    expect(evidence).toHaveLength(3);
+    expect(evidence.find((row) => row.interactionId === manual.interaction.publicId)).toMatchObject({
+      decision: "manual_mode",
+      mode: "manual",
       outcome: "refused",
-    }]);
+    });
+    expect(evidence.find((row) => row.interactionId === deadline.interaction.publicId)).toMatchObject({
+      decision: "manual_mode",
+      mode: "manual",
+      outcome: "refused",
+    });
+    expect(evidence.find((row) => row.interactionId === automatic.interaction.publicId)).toMatchObject({
+      decision: "once",
+      mode: "auto:all",
+      outcome: "refused",
+    });
     expect(value.store.requireProfileById(profile.id).state).toBe("signed_in");
 
     release();
