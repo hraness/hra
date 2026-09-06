@@ -108,6 +108,26 @@ describe("public text policy", () => {
       .toThrow(PublicTextPolicyError);
   });
 
+  test("distinguishes the exact public npm certificate subject from numeric package scopes", () => {
+    const subject = "repo:hraness@307125679/hra@1343008607:environment:npm-release";
+    expect(() => assertPublicText(subject, "certificate subject")).not.toThrow();
+    expect(() => assertPublicText(`Subject: \`${subject}\`.`, "quoted certificate subject")).not.toThrow();
+    for (const value of [
+      ["@307125679", "hra"].join("/"),
+      subject.replace("npm-release", "unreviewed"),
+      subject.replace("1343008607", "1343008608"),
+      `private-${subject}`,
+      `${subject}/unreviewed`,
+      `${subject}-unreviewed`,
+      `π${subject}`,
+      `${subject}１`,
+      `１${subject}`,
+      `${subject}π`,
+      `${subject}\u0301`,
+      `${subject}\u200b`,
+    ]) expect(() => assertPublicText(value, "unreviewed identity")).toThrow(PublicTextPolicyError);
+  });
+
   test("scans SVG and TOML text and rejects unreviewed file types", async () => {
     const root = await mkdtemp(join(tmpdir(), "hra-public-policy-"));
     const svg = join(root, "image.svg");

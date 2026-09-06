@@ -49,6 +49,12 @@ const absoluteUserPaths = [
 ] as const;
 const scopedPackage = /@([a-z0-9][a-z0-9-]*)\/[a-z0-9][a-z0-9._-]*/gu;
 const gitTagReferencePackageShape = ["@refs", "tags"].join("/");
+// A public certificate subject is not an npm scope. Match the complete reviewed
+// identity, including its boundaries, rather than admitting numeric scopes.
+const npmEnvironmentSubject = "repo:hraness@307125679/hra@1343008607:environment:npm-release";
+const subjectPackageOffset = npmEnvironmentSubject.indexOf("@");
+const isSubjectDelimiter = (character: string | undefined): boolean =>
+  character === undefined || /^[\t\r\n "'`()[\]{},;]$/u.test(character);
 
 export class PublicTextPolicyError extends Error {
   constructor(
@@ -68,11 +74,18 @@ export function assertPublicText(value: string, label: string): void {
     const packageName = match[0];
     const matchEnd = match.index + packageName.length;
     const isGitTagReference = packageName === gitTagReferencePackageShape && value[matchEnd] === "/";
+    const subjectStart = match.index - subjectPackageOffset;
+    const subjectEnd = subjectStart + npmEnvironmentSubject.length;
+    const isNpmEnvironmentSubject = subjectStart >= 0
+      && value.slice(subjectStart, subjectEnd) === npmEnvironmentSubject
+      && isSubjectDelimiter(value[subjectStart - 1])
+      && isSubjectDelimiter(value[subjectEnd]);
     if (
       scope !== undefined
       && !allowedPublicScopes.has(scope)
       && !allowedPublicScopedPackages.has(packageName)
       && !isGitTagReference
+      && !isNpmEnvironmentSubject
     ) {
       throw new PublicTextPolicyError("PRIVATE_SCOPE", label);
     }
