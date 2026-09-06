@@ -187,6 +187,7 @@ export const liveAcceptanceWorkerStatusSchema = z.discriminatedUnion("type", [
       "daemon_failed",
       "descriptor_invalid",
       "home_changed",
+      "initialization_failed",
       "internal_failure",
       "layout_invalid",
       "status_unavailable",
@@ -905,6 +906,13 @@ export type LiveAcceptanceWorkerLaunch = Readonly<{
   executable: string;
 }>;
 
+type ProcessWorkerLaunch = Readonly<{
+  arguments: readonly string[];
+  cwd: string;
+  environment: NodeJS.ProcessEnv;
+  executable: string;
+}>;
+
 export function liveAcceptanceWorkerLaunch(
   descriptorInput: AcceptanceInstallationDescriptor,
 ): LiveAcceptanceWorkerLaunch {
@@ -976,6 +984,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
   #statusBuffer = Buffer.alloc(0);
   #receivedStopped = false;
   #receivedReady = false;
+  #shutdownRequested = false;
   #statusEnded = false;
   #terminalError: Error | undefined;
   #stopOperation: Promise<void> | undefined;
@@ -1025,9 +1034,12 @@ class ProcessWorker implements LiveAcceptanceWorker {
     });
   }
 
-  static async start(descriptorInput: AcceptanceInstallationDescriptor): Promise<ProcessWorker> {
+  static async start(
+    descriptorInput: AcceptanceInstallationDescriptor,
+    launchInput?: ProcessWorkerLaunch,
+  ): Promise<ProcessWorker> {
     const descriptor = acceptanceInstallationDescriptorSchema.parse(descriptorInput);
-    const launch = liveAcceptanceWorkerLaunch(descriptor);
+    const launch = launchInput ?? liveAcceptanceWorkerLaunch(descriptor);
     const child = spawn(launch.executable, [...launch.arguments], {
       cwd: launch.cwd,
       env: launch.environment,
@@ -1082,7 +1094,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
 
   async command(commandInput: LocalCommand): Promise<CommandResponse> {
     await this.ready();
-    this.#assertHealthy();
+    this.#assertControlAvailable();
     const command = localCommandSchema.parse(commandInput);
     const requestId = randomUUID();
     const result = deferred<CommandResponse>();
@@ -1101,7 +1113,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
     options: Readonly<{ protectedDocument?: unknown }> = {},
   ): Promise<LiveAcceptanceCliResult> {
     await this.ready();
-    this.#assertHealthy();
+    this.#assertControlAvailable();
     const requestId = randomUUID();
     const result = deferred<LiveAcceptanceCliResult>();
     const hasProtectedDocument = Object.hasOwn(options, "protectedDocument");
@@ -1148,6 +1160,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
 
   async stop(): Promise<void> {
     if (this.#stopOperation !== undefined) return await this.#stopOperation;
+    this.#shutdownRequested = true;
     this.#stopOperation = (async () => {
       this.#assertHealthy();
       const requestId = randomUUID();
@@ -1161,6 +1174,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
   }
 
   async preserve(): Promise<void> {
+    this.#shutdownRequested = true;
     if (this.#child.exitCode === null && this.#child.signalCode === null) {
       this.#control.end();
     }
@@ -1173,7 +1187,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
 
   async #workerAction(action: "resume" | "suspend"): Promise<void> {
     await this.ready();
-    this.#assertHealthy();
+    this.#assertControlAvailable();
     const requestId = randomUUID();
     const result = deferredSignal();
     this.#pending.set(requestId, { action, kind: "ack", result });
@@ -1224,6 +1238,9 @@ class ProcessWorker implements LiveAcceptanceWorker {
   }
 
   #acceptStatus(frame: LiveAcceptanceWorkerStatus): void {
+    if (this.#terminalError !== undefined) {
+      throw new LiveAcceptanceError("worker_protocol_invalid");
+    }
     if (frame.type === "ready") {
       if (
         this.#receivedReady
@@ -1235,6 +1252,22 @@ class ProcessWorker implements LiveAcceptanceWorker {
       this.#receivedReady = true;
       this.#ready.resolve();
       return;
+    }
+    if (frame.type === "failed") {
+      const hasDevice = frame.device !== undefined;
+      const hasRunId = frame.runId !== undefined;
+      if (
+        this.#receivedStopped
+        || hasDevice !== hasRunId
+        || (this.#receivedReady && !hasDevice)
+        || (hasDevice && frame.device !== this.device)
+        || (hasRunId && frame.runId !== this.#descriptor.runId)
+      ) throw new LiveAcceptanceError("worker_protocol_invalid");
+      this.#fail(new LiveAcceptanceError("worker_failed"));
+      return;
+    }
+    if (!this.#receivedReady || this.#receivedStopped) {
+      throw new LiveAcceptanceError("worker_protocol_invalid");
     }
     if (frame.type === "command_result") {
       const pending = this.#pending.get(frame.requestId);
@@ -1259,16 +1292,14 @@ class ProcessWorker implements LiveAcceptanceWorker {
       pending.result.resolve();
       return;
     }
-    if (frame.type === "stopped") {
-      if (frame.device !== this.device || frame.runId !== this.#descriptor.runId) {
-        throw new LiveAcceptanceError("worker_protocol_invalid");
-      }
-      if (this.#receivedStopped) throw new LiveAcceptanceError("worker_protocol_invalid");
-      this.#receivedStopped = true;
-      this.#stopped.resolve();
-      return;
+    if (frame.device !== this.device || frame.runId !== this.#descriptor.runId) {
+      throw new LiveAcceptanceError("worker_protocol_invalid");
     }
-    this.#fail(new LiveAcceptanceError("worker_failed"));
+    if (!this.#shutdownRequested || this.#pending.size !== 0) {
+      throw new LiveAcceptanceError("worker_protocol_invalid");
+    }
+    this.#receivedStopped = true;
+    this.#stopped.resolve();
   }
 
   #fail(error: Error): void {
@@ -1288,7 +1319,19 @@ class ProcessWorker implements LiveAcceptanceWorker {
       throw new LiveAcceptanceError("worker_failed");
     }
   }
+
+  #assertControlAvailable(): void {
+    this.#assertHealthy();
+    if (this.#shutdownRequested || this.#receivedStopped) {
+      throw new LiveAcceptanceError("worker_failed");
+    }
+  }
 }
+
+export const startLiveAcceptanceProcessWorkerForTesting = async (
+  descriptor: AcceptanceInstallationDescriptor,
+  launch: ProcessWorkerLaunch,
+): Promise<LiveAcceptanceWorker> => await ProcessWorker.start(descriptor, launch);
 
 const initialReceipt = (
   layout: LiveAcceptanceLayout,

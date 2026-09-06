@@ -26,11 +26,31 @@ const capture = (): { output: Output; stdout: string[]; stderr: string[] } => {
   };
 };
 
-const command = { kind: "session.show", session: "session-1", detail: false } as const;
+const primarySessionId = `sess_${"1".repeat(32)}`;
+const primaryProfileId = `acct_${"0".repeat(32)}`;
+const primaryProjectId = `proj_${"2".repeat(32)}`;
+const primaryTurnId = publicProviderId("turn-1");
+const command = { kind: "session.show", session: primarySessionId, detail: false } as const;
 const data = {
-  session: { id: "session-1", title: "Local title", state: "idle" },
+  session: {
+    activeTurnId: "raw-active-turn",
+    createdAt: 1_000,
+    fastEnabled: false,
+    id: primarySessionId,
+    note: "private local note",
+    preset: "high",
+    profileId: primaryProfileId,
+    projectId: primaryProjectId,
+    provider: "codex",
+    providerThreadId: "thread-1",
+    providerUpdatedAt: 1_500,
+    revision: 2,
+    state: "idle",
+    title: "Local title",
+    updatedAt: 2_000,
+  },
   effectiveRuntimeProfile: {
-    profileId: "acct_00000000000000000000000000000000",
+    profileId: primaryProfileId,
     processGeneration: 3,
     observedAt: 2_000,
     preset: "high",
@@ -51,11 +71,11 @@ const data = {
     status: "idle",
     projectRoot: "/workspace/project",
     messages: [
-      { role: "user", text: "please fix it", turnId: "turn-1" },
-      { role: "assistant", text: "fixed\nverified", turnId: "turn-1", omission: { originalUtf8Bytes: 18, returnedUtf8Bytes: 14, omittedUtf8Bytes: 4 } },
+      { role: "user", text: "please fix it", turnId: primaryTurnId },
+      { role: "assistant", text: "fixed\nverified", turnId: primaryTurnId, omission: { originalUtf8Bytes: 18, returnedUtf8Bytes: 14, omittedUtf8Bytes: 4 } },
     ],
     turnSummaries: [
-      { id: "turn-1", status: "completed", runtimeMs: 1_234, files: ["src/index.ts"], actions: ["git status", "bun test"], omittedFiles: 0, omittedActions: 0 },
+      { id: primaryTurnId, status: "completed", runtimeMs: 1_234, files: ["src/index.ts"], actions: ["git status", "bun test"], omittedFiles: 0, omittedActions: 0 },
     ],
     omission: { hasMoreOlderTurns: true, returnedTurns: 1, turnLimit: 24, omittedMessages: 2, truncatedMessages: 1, unreadItemTurnIds: [], incompleteTurnIds: [] },
   },
@@ -324,14 +344,29 @@ describe("CLI rendering", () => {
   });
 
   test("renders a Claude session's reviewed runtime profile, not the Codex one", () => {
+    const claudeSession = {
+      createdAt: 1_000,
+      fastEnabled: false,
+      id: `sess_${"c".repeat(32)}`,
+      note: "private Claude note",
+      preset: "fable-max",
+      profileId: primaryProfileId,
+      projectId: primaryProjectId,
+      provider: "claude",
+      providerThreadId: "thread-claude",
+      revision: 2,
+      state: "idle",
+      title: "Claude work",
+      updatedAt: 2_000,
+    } as const;
     const shown = capture();
     renderSuccess(
       { detail: true, kind: "session.show", session: "claude-session" },
       {
         effectiveRuntimeProfile: {
           claudeVersion: "2.1.260",
+          configHome: "isolated",
           inputFormat: "stream-json",
-          isolatedConfigDir: true,
           model: "claude-fable-5-1",
           observedAt: 2_000,
           outputFormat: "stream-json",
@@ -349,7 +384,7 @@ describe("CLI rendering", () => {
           title: "Claude work",
           turnSummaries: [],
         },
-        session: { id: "sess-claude", state: "idle", title: "Claude work" },
+        session: claudeSession,
       },
       false,
       shown.output,
@@ -359,13 +394,47 @@ describe("CLI rendering", () => {
     expect(rendered).toContain("preset: fable-max");
     expect(rendered).toContain("model: claude-fable-5-1");
     expect(rendered).toContain("permission mode: default");
-    expect(rendered).toContain("isolated profile: enabled");
+    expect(rendered).not.toContain("config home");
+    expect(rendered).not.toContain("isolatedConfigDir");
     expect(rendered).toContain("stream: stream-json in, stream-json out");
     // No Codex-only row is invented for a provider that has none of them.
     expect(rendered).not.toContain("service tier");
     expect(rendered).not.toContain("Fast:");
     expect(rendered).not.toContain("plugin capability");
     expect(rendered).not.toContain("enabled apps");
+
+    const json = capture();
+    renderSuccess(
+      { detail: false, kind: "session.show", session: "claude-session" },
+      {
+        effectiveRuntimeProfile: {
+          claudeVersion: "2.1.260",
+          configHome: "personal",
+          inputFormat: "stream-json",
+          model: "claude-fable-5-1",
+          observedAt: 2_000,
+          outputFormat: "stream-json",
+          permissionMode: "default",
+          preset: "fable-max",
+          processGeneration: 3,
+          profileId: "acct_00000000000000000000000000000000",
+          reasoningEffort: "max",
+        },
+        projection: {
+          providerThreadId: "thread-claude",
+          status: "idle",
+          title: "Claude work",
+        },
+        session: claudeSession,
+      },
+      true,
+      json.output,
+    );
+    const document = JSON.parse(json.stdout.join("")) as {
+      data: { effectiveRuntimeProfile: Record<string, unknown> };
+    };
+    expect(document.data.effectiveRuntimeProfile).not.toHaveProperty("configHome");
+    expect(document.data.effectiveRuntimeProfile).not.toHaveProperty("isolatedConfigDir");
   });
 
   test("renders bounded local root status with closed recovery commands", () => {
@@ -1506,16 +1575,16 @@ describe("CLI rendering", () => {
       "History: 2 messages omitted",
       "",
       "Messages",
-      "You  turn-1",
+      `You  ${primaryTurnId}`,
       "  please fix it",
       "",
-      "Codex  turn-1",
+      `Codex  ${primaryTurnId}`,
       "  fixed",
       "  verified",
       "  … [4 UTF-8 bytes omitted]",
       "",
       "Turns",
-      "turn-1  completed  1.2s",
+      `${primaryTurnId}  completed  1.2s`,
       "  files: src/index.ts",
       "  actions: git status, bun test",
       "",
@@ -1531,9 +1600,230 @@ describe("CLI rendering", () => {
       ok: true,
       version: 1,
       command: "session.show",
-      data,
+      data: {
+        effectiveRuntimeProfile: data.effectiveRuntimeProfile,
+        projection: {
+          messages: data.projection.messages,
+          omission: data.projection.omission,
+          projectRoot: data.projection.projectRoot,
+          status: data.projection.status,
+          title: data.projection.title,
+          turnSummaries: data.projection.turnSummaries,
+        },
+        session: {
+          createdAt: 1_000,
+          fastEnabled: false,
+          id: primarySessionId,
+          preset: "high",
+          profileId: primaryProfileId,
+          projectId: primaryProjectId,
+          provider: "codex",
+          revision: 2,
+          state: "idle",
+          title: "Local title",
+          updatedAt: 2_000,
+        },
+      },
     });
     expect(target.stderr).toEqual([]);
+  });
+
+  test("strips private session and provider identifiers from show, start, and send", () => {
+    const privateSentinel = "PRIVATE-SESSION-PROVENANCE-SENTINEL";
+    const sessionId = `sess_${"7".repeat(32)}`;
+    const publicTurnId = publicProviderId("already-public-turn");
+    const session = {
+      activeTurnId: privateSentinel,
+      archivedAt: 900,
+      createdAt: 100,
+      fastEnabled: false,
+      id: sessionId,
+      note: privateSentinel,
+      preset: "high",
+      profileId: `acct_${"8".repeat(32)}`,
+      provider: "codex",
+      providerThreadId: privateSentinel,
+      providerUpdatedAt: 800,
+      revision: 3,
+      state: "idle",
+      title: "Public session",
+      updatedAt: 200,
+    } as const;
+    const idempotencyKey = "00000000-0000-4000-8000-000000000731";
+    const cases = [
+      {
+        command: { detail: false, kind: "session.show", session: sessionId } as const,
+        response: {
+          effectiveRuntimeProfile: null,
+          privateBinding: privateSentinel,
+          projection: {
+            activeTurnId: privateSentinel,
+            messages: [
+              { clientId: privateSentinel, role: "user", text: "hello", turnId: privateSentinel },
+              { role: "assistant", text: "hi", turnId: publicTurnId },
+            ],
+            omission: {
+              hasMoreOlderTurns: false,
+              incompleteTurnIds: [privateSentinel, publicTurnId],
+              omittedMessages: 0,
+              returnedTurns: 2,
+              truncatedMessages: 0,
+              turnLimit: 24,
+              unreadItemTurnIds: [privateSentinel, publicTurnId],
+            },
+            providerThreadId: privateSentinel,
+            providerUpdatedAt: 800,
+            status: "idle",
+            title: "Public session",
+            turnSummaries: [{
+              actions: [],
+              files: [],
+              id: privateSentinel,
+              itemId: privateSentinel,
+              omittedActions: 0,
+              omittedFiles: 0,
+              status: "completed",
+            }],
+            turns: [{ itemId: privateSentinel, turnId: privateSentinel }],
+          },
+          session,
+        },
+      },
+      {
+        command: {
+          account: session.profileId,
+          fast: false,
+          idempotencyKey,
+          kind: "session.start",
+          preset: "high",
+          provider: "codex",
+        } as const,
+        response: {
+          effectiveRuntimeProfile: null,
+          idempotencyKey,
+          privateBinding: privateSentinel,
+          session,
+        },
+      },
+      {
+        command: {
+          idempotencyKey,
+          kind: "session.send",
+          message: "hello",
+          session: sessionId,
+        } as const,
+        response: {
+          effectiveRuntimeProfile: null,
+          idempotencyKey,
+          privateBinding: privateSentinel,
+          session,
+          turnId: privateSentinel,
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      for (const json of [false, true]) {
+        const target = capture();
+        renderSuccess(testCase.command, testCase.response, json, target.output);
+        const rendered = target.stdout.join("");
+        expect(rendered).not.toContain(privateSentinel);
+        if (testCase.command.kind === "session.show") expect(rendered).toContain(publicTurnId);
+      }
+    }
+  });
+
+  test("gives native and adopted show, start, and send results identical public key sets", () => {
+    const sessionId = `sess_${"9".repeat(32)}`;
+    const profileId = `acct_${"a".repeat(32)}`;
+    const idempotencyKey = "00000000-0000-4000-8000-000000000732";
+    const publicTurnId = publicProviderId("shared-public-turn");
+    const session = {
+      createdAt: 100,
+      fastEnabled: false,
+      id: sessionId,
+      preset: "high",
+      profileId,
+      provider: "codex",
+      revision: 3,
+      state: "idle",
+      title: "Same public session",
+      updatedAt: 200,
+    } as const;
+    const commands = [
+      { detail: false, kind: "session.show", session: sessionId } as const,
+      {
+        account: profileId,
+        fast: false,
+        idempotencyKey,
+        kind: "session.start",
+        preset: "high",
+        provider: "codex",
+      } as const,
+      { idempotencyKey, kind: "session.send", message: "hello", session: sessionId } as const,
+    ];
+    const publicData = (
+      command: (typeof commands)[number],
+      origin: "native" | "adopted",
+    ): Record<string, unknown> => {
+      const rawProviderId = `${origin}-private-provider-thread`;
+      const rawSession = {
+        ...session,
+        activeTurnId: `${origin}-private-active-turn`,
+        note: `${origin}-private-note`,
+        providerThreadId: rawProviderId,
+        providerUpdatedAt: 300,
+      };
+      const response = command.kind === "session.show"
+        ? {
+            effectiveRuntimeProfile: null,
+            origin,
+            projection: {
+              activeTurnId: `${origin}-private-active-turn`,
+              messages: [{ role: "assistant", text: "same", turnId: publicTurnId }],
+              providerThreadId: rawProviderId,
+              status: "idle",
+              title: "Same public session",
+              turns: [{ itemId: `${origin}-private-item`, turnId: `${origin}-private-turn` }],
+            },
+            session: rawSession,
+          }
+        : command.kind === "session.start"
+          ? {
+              effectiveRuntimeProfile: null,
+              idempotencyKey,
+              origin,
+              session: rawSession,
+            }
+          : {
+              effectiveRuntimeProfile: null,
+              idempotencyKey,
+              origin,
+              session: rawSession,
+              turnId: `${origin}-private-turn`,
+            };
+      const target = capture();
+      renderSuccess(command, response, true, target.output);
+      return (JSON.parse(target.stdout.join("")) as { data: Record<string, unknown> }).data;
+    };
+
+    for (const sessionCommand of commands) {
+      const native = publicData(sessionCommand, "native");
+      const adopted = publicData(sessionCommand, "adopted");
+      expect(adopted).toEqual(native);
+      expect(Object.keys(adopted.session as Record<string, unknown>).sort()).toEqual([
+        "createdAt",
+        "fastEnabled",
+        "id",
+        "preset",
+        "profileId",
+        "provider",
+        "revision",
+        "state",
+        "title",
+        "updatedAt",
+      ]);
+    }
   });
 
   test("renders strict conversation-bound session task records without list prompt leakage", () => {
@@ -1723,7 +2013,19 @@ describe("CLI rendering", () => {
     expect(jsonText).not.toContain("\u0007");
     expect(jsonText).not.toContain("\u202e");
     expect(jsonText).toContain("\\u202e");
-    expect(JSON.parse(jsonText)).toEqual({ ok: true, version: 1, command: command.kind, data: attacked });
+    expect(JSON.parse(jsonText)).toMatchObject({
+      command: command.kind,
+      data: {
+        projection: {
+          messages: [{ role: "assistant", text: `${attack}\nvisible` }],
+          title: attack,
+          turnSummaries: [{ files: [attack], status: "completed" }],
+        },
+        session: { id: primarySessionId },
+      },
+      ok: true,
+      version: 1,
+    });
   });
 
   test("renders desktop switch recovery outcomes without exposing evidence internals", () => {
@@ -2378,6 +2680,7 @@ describe("CLI rendering", () => {
       listing: {
         accountSelector: accountId,
         accountState: "signed_out",
+        provider: "codex",
         scope: "local_only",
         freshness: "stale",
         localCompleteness: "partial",
@@ -2396,6 +2699,17 @@ describe("CLI rendering", () => {
         revision: 4,
         createdAt: 1_700_000_000_000,
         updatedAt: 1_700_000_000_001,
+      }, {
+        id: "sess_11111111111111111111111111111111",
+        profileId: accountId,
+        title: "Live Claude thread",
+        state: "idle",
+        provider: "claude",
+        preset: "fable-max",
+        fastEnabled: false,
+        revision: 2,
+        createdAt: 1_700_000_000_002,
+        updatedAt: 1_700_000_000_003,
       }],
       nextCursor: cursor,
     };
@@ -2406,13 +2720,17 @@ describe("CLI rendering", () => {
       false,
       human.output,
     );
-    expect(human.stdout.join("")).toContain(`Scope: local-only cache for ${accountId}`);
-    expect(human.stdout.join("")).toContain("Freshness: stale; provider not contacted");
+    expect(human.stdout.join("")).toContain(`Codex scope: local-only cache for ${accountId}`);
+    expect(human.stdout.join("")).toContain("Codex freshness: stale; Codex provider not contacted");
     expect(human.stdout.join("")).toContain(
-      "Completeness: partial local cache; more pages available; provider completeness unknown",
+      "Codex completeness: partial local cache; more pages available; Codex provider completeness unknown",
     );
-    expect(human.stdout.join("")).toContain(`Sign in to refresh: hra account login ${accountId}`);
+    expect(human.stdout.join("")).toContain(`Sign in to refresh Codex: hra account login ${accountId}`);
     expect(human.stdout.join("")).toContain("Older imported thread");
+    expect(human.stdout.join("")).toContain("Live Claude thread");
+    expect(human.stdout.join("")).not.toContain("Claude freshness");
+    expect(human.stdout.join("")).not.toContain("Claude provider not contacted");
+    expect(human.stdout.join("")).not.toContain("Sign in to refresh Claude");
     expect(human.stdout.join("")).toContain(
       `Continue: hra session list --account ${accountId} --limit 37 --cursor ${cursor}\n`,
     );
@@ -2505,6 +2823,20 @@ describe("CLI rendering", () => {
       unsafeMetadata.output,
     )).toThrow(InvalidCommandResponseError);
     expect(unsafeMetadata.stdout.join("")).not.toContain("touch /tmp/unsafe");
+
+    for (const invalidListing of [
+      { ...listing.listing, provider: "claude" },
+      Object.fromEntries(Object.entries(listing.listing).filter(([key]) => key !== "provider")),
+    ]) {
+      const invalidProvider = capture();
+      expect(() => renderSuccess(
+        { kind: "session.list", account: accountId, archived: false, limit: 37 },
+        { ...listing, listing: invalidListing },
+        false,
+        invalidProvider.output,
+      )).toThrow(InvalidCommandResponseError);
+      expect(invalidProvider.stdout).toEqual([]);
+    }
   });
 
   test("renders brokered MCP form input as protected", () => {

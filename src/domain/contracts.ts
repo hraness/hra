@@ -3,7 +3,7 @@ import { isAbsolute, normalize } from "node:path";
 import { z } from "zod";
 
 import { attachmentReferenceListSchema } from "./attachment-schemas";
-import { presetSchema, providerSchema } from "./presets";
+import { adoptableProviderSchema, presetSchema, providerSchema } from "./presets";
 import { interactionResolutionSchema } from "./interactions";
 import { notificationEmailPolicySchema } from "./notification-email";
 import {
@@ -83,6 +83,7 @@ const daemonStopAuthoritySchema = z.object({
 export const signedOutSessionListMetadataSchema = z.object({
   accountSelector: profileIdSchema,
   accountState: z.literal("signed_out"),
+  provider: z.literal("codex"),
   scope: z.literal("local_only"),
   freshness: z.literal("stale"),
   localCompleteness: z.enum(["partial", "complete"]),
@@ -432,6 +433,20 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.stop"), session: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.rename"), session: selectorSchema, name: titleSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.archive"), session: selectorSchema, archived: z.boolean() }).strict(),
+  z.object({
+    kind: z.literal("session.adoption.status"),
+    provider: adoptableProviderSchema.optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("session.adoption.set"),
+    provider: adoptableProviderSchema,
+    enabled: z.boolean(),
+    account: selectorSchema.optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("session.adoption.discover"),
+    provider: adoptableProviderSchema.optional(),
+  }).strict(),
   z.object({ kind: z.literal("session.recover"), session: selectorSchema }).strict(),
   z.object({ kind: z.literal("session.abandon"), session: selectorSchema }).strict(),
   z.object({ kind: z.literal("session.note.get"), session: selectorSchema }).strict(),

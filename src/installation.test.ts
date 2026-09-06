@@ -11,7 +11,7 @@ import {
   createAcceptanceInstallation,
   type AcceptanceInstallationDescriptor,
 } from "../scripts/live-acceptance-installation";
-import { resolveStatePaths } from "./storage/paths";
+import { personalProviderPaths, resolveStatePaths } from "./storage/paths";
 
 const roots: string[] = [];
 const ACCEPTANCE_RUN_ID = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
@@ -55,6 +55,7 @@ describe("HRA installation composition", () => {
       mcpOauth: "file",
     });
     expect(installation.paths).toEqual(resolveStatePaths());
+    expect(installation.personalProviderHomes).toEqual(personalProviderPaths());
   });
 
   test("uses only file-backed custody and an isolated process temp directory", async () => {
@@ -96,6 +97,17 @@ describe("HRA installation composition", () => {
       cwd: descriptor.documentsDirectory,
       mcpOauth: "file",
     });
+    expect(installation.personalProviderHomes).toEqual(personalProviderPaths(
+      join(installation.paths.root, "personal-home"),
+    ));
+    const personalEnvironment = await installation.codexEnvironment(
+      installation.personalProviderHomes.codexHome,
+    );
+    expect(personalEnvironment?.TMPDIR).toBe(join(
+      installation.personalProviderHomes.codexHome,
+      "tmp",
+    ));
+    expect(personalEnvironment?.TMPDIR?.startsWith(`${installation.paths.root}/`)).toBe(true);
   });
 
   test("refuses a changed Codex credential-store file on restart", async () => {

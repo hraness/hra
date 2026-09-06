@@ -1,7 +1,12 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { resolveStatePaths, type StatePaths } from "./storage/paths";
+import {
+  personalProviderPaths,
+  resolveStatePaths,
+  type PersonalProviderPaths,
+  type StatePaths,
+} from "./storage/paths";
 import { GenerationalSecretCustody } from "./storage/secret-custody";
 
 type HraInstallationCommon = Readonly<{
@@ -14,6 +19,7 @@ type HraInstallationCommon = Readonly<{
   }>;
   documentsDirectory: string;
   paths: StatePaths;
+  personalProviderHomes: PersonalProviderPaths;
   createSecretCustody(): GenerationalSecretCustody;
   prepareCodexHome(codexHome: string): Promise<void>;
 }>;
@@ -53,6 +59,7 @@ export function createProductionInstallation(): HraInstallation {
     expectedHomeDirectory: null,
     kind: "production",
     paths,
+    personalProviderHomes: personalProviderPaths(),
     prepareCodexHome: noOpPrepareCodexHome,
   };
 }

@@ -235,6 +235,9 @@ export async function launchPinnedCodexAppServer(
             onConversationAutomationToolResponseWritten:
               options.onConversationAutomationToolResponseWritten,
           }),
+      ...(options.onAccountAuthoritySignal === undefined
+        ? {}
+        : { onAccountAuthoritySignal: options.onAccountAuthoritySignal }),
       ...(options.onFact === undefined ? {} : { onFact: options.onFact }),
       ...(options.onSafeDiagnostic === undefined
         ? {}
