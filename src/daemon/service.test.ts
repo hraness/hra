@@ -4243,6 +4243,39 @@ describe("HraService", () => {
     expect(await service.execute({ kind: "session.rename", session: started.session.id, name: "Release" }, { signal })).toMatchObject({ session: { title: "Release" } });
   });
 
+  test("scheduled task materialization dispatches through the sealed empty-attachment queue writer", async () => {
+    let now = 2_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { service, store, codex } = value;
+    try {
+      const { sessionId } = await createIdleSession(value, "Sealed scheduled task");
+      const tasks = store.createSessionTaskStore();
+      const task = tasks.create({
+        sessionId, name: "Scheduled check", prompt: "Check the scheduled work once.",
+        minutes: 15, status: "active", idempotencyKey: crypto.randomUUID(),
+      });
+      expect(task.nextDueAt).toBe(902_000);
+      now = task.nextDueAt ?? now;
+      expect(await service.maintainSessionTasks()).toEqual({ materialized: 1 });
+      await service.settled();
+      const queues = store.listQueue(sessionId);
+      expect(queues).toHaveLength(1);
+      const queue = queues[0];
+      if (queue === undefined) throw new Error("Scheduled task did not create its queue.");
+      expect(queue.state).toBe("applied");
+      expect(store.queueAttachmentManifest(queue.id)).toEqual([]);
+      expect(store.hasUnsettledQueueAttachmentQuarantineForSession(sessionId)).toBe(false);
+      expect(codex.startTurnAttachments).toEqual([{ clientMessageId: queue.id }]);
+      expect(codex.readProjection.messages?.at(-1)).toMatchObject({
+        text: "Check the scheduled work once.", clientId: queue.id,
+      });
+      expect(await service.maintainSessionTasks()).toEqual({ materialized: 0 });
+      expect(store.listQueue(sessionId)).toHaveLength(1);
+    } finally {
+      await service.close();
+    }
+  });
+
   test("carries attachments from a command to the provider, custody, and the projection", async () => {
     const value = await fixture();
     const { service, codex, documents, paths, store } = value;
@@ -4311,6 +4344,169 @@ describe("HraService", () => {
       message: "look",
       session: started.session.id,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
+  test.each(["rename", "reorder", "omit", "append"] as const)("queue attachment identity rejects a %s retry without changing custody", async (change) => {
+    const { service, codex, documents, paths, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Queue identity" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    await service.execute({ kind: "session.send", session: started.session.id, message: "Keep the provider busy." }, { signal });
+    await writeFile(join(documents, "first.txt"), "first attachment");
+    await writeFile(join(documents, "second.txt"), "second attachment");
+    const references = await ingestAttachments(AttachmentBlobStore.forStatePaths(paths), ["first.txt", "second.txt"], documents);
+    const one = references[0];
+    if (one === undefined) throw new Error("Missing queue attachment fixture.");
+    const command = { kind: "session.queue" as const, session: started.session.id, message: "Use both files.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const first = await service.execute(command, { signal }) as { queued: { id: string } };
+    const manifest = store.messageAttachmentManifest(started.session.id, first.queued.id);
+    const custody = references.map((reference) => store.attachmentCustody(reference.digest));
+    const calls = [...codex.calls];
+    const attachments = change === "rename" ? [{ ...one, name: "renamed.txt" }, ...references.slice(1)]
+      : change === "reorder" ? [...references].reverse()
+        : change === "omit" ? [] : [...references, { ...one, name: "extra.txt" }];
+    await expect(service.execute({ ...command, attachments }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store.listQueue(started.session.id)).toHaveLength(1);
+    expect(store.messageAttachmentManifest(started.session.id, first.queued.id)).toEqual(manifest);
+    expect(references.map((reference) => store.attachmentCustody(reference.digest))).toEqual(custody);
+    expect(codex.calls).toEqual(calls);
+  });
+
+  test("queue attachment identity rolls back enqueue when manifest admission fails", async () => {
+    const { service, documents, paths, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Queue rollback" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    await service.execute({ kind: "session.send", session: started.session.id, message: "Keep the provider busy." }, { signal });
+    await writeFile(join(documents, "atomic.txt"), "atomic attachment");
+    const references = await ingestAttachments(AttachmentBlobStore.forStatePaths(paths), ["atomic.txt"], documents);
+    const command = { kind: "session.queue" as const, session: started.session.id, message: "All or nothing.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const inspector = new Database(paths.database, { strict: true });
+    try {
+      inspector.exec("CREATE TRIGGER fail_queue_manifest BEFORE INSERT ON message_attachments BEGIN SELECT RAISE(ABORT,'injected_queue_manifest_failure'); END");
+      await expect(service.execute(command, { signal })).rejects.toThrow("injected_queue_manifest_failure");
+      expect(store.listQueue(started.session.id)).toEqual([]);
+      expect(store.readMutation(command.idempotencyKey)).toBeNull();
+    } finally {
+      inspector.exec("DROP TRIGGER fail_queue_manifest");
+      inspector.close(false);
+    }
+  });
+
+  test("queue attachment identity replays before blob and live session preflight", async () => {
+    const { service, codex, documents, paths, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Queue historical replay" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    await service.execute({ kind: "session.send", session: started.session.id, message: "Keep the provider busy." }, { signal });
+    await writeFile(join(documents, "historical.txt"), "historical attachment");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const references = await ingestAttachments(blobs, ["historical.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing queue replay fixture.");
+    const command = { kind: "session.queue" as const, session: started.session.id, message: "Keep the original receipt.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const first = await service.execute(command, { signal });
+    await blobs.remove(reference.digest, "text/plain");
+    const current = store.requireSession(started.session.id);
+    store.setSessionTurnState({ sessionId: current.id, expectedRevision: current.revision, state: "recovery_required" });
+    const calls = [...codex.calls];
+    await expect(service.execute(command, { signal })).resolves.toEqual(first);
+    expect(store.listQueue(started.session.id)).toHaveLength(1);
+    expect(codex.calls).toEqual(calls);
+  });
+
+  test("queue attachment identity does not sweep or schedule when another writer wins after replay preflight", async () => {
+    const value = await fixture();
+    const { service, store, paths, documents, codex } = value;
+    const { sessionId } = await createIdleSession(value, "Queue replay race");
+    await writeFile(join(documents, "race.txt"), "shared queue attachment");
+    const references = await ingestAttachments(AttachmentBlobStore.forStatePaths(paths), ["race.txt"], documents);
+    const captured = store.requireSessionProviderAuthority(sessionId);
+    const authority = { provider: captured.provider, providerAccountId: captured.providerAccountId, profileId: captured.profileId,
+      bindingGeneration: captured.bindingGeneration, processGeneration: captured.processGeneration };
+    const command = { kind: "session.queue" as const, session: sessionId, message: "One accepted queue item.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const other = new StateStore(paths);
+    const readReplay = store.readQueueEnqueueReplay.bind(store);
+    const listUnreferenced = store.listUnreferencedAttachments.bind(store);
+    let injected = false;
+    let sweepReads = 0;
+    store.readQueueEnqueueReplay = (input) => {
+      const result = readReplay(input);
+      if (!injected && result === null && input.idempotencyKey === command.idempotencyKey) {
+        injected = true;
+        other.enqueueIdempotent({ sessionId, message: command.message, idempotencyKey: command.idempotencyKey,
+          profileGeneration: authority.processGeneration, providerAuthority: authority,
+          attachments: references.map((reference) => ({ ...reference, canonicalMediaType: "text/plain" as const })) });
+      }
+      return result;
+    };
+    store.listUnreferencedAttachments = (...input) => {
+      sweepReads += 1;
+      return listUnreferenced(...input);
+    };
+    const calls = [...codex.calls];
+    try {
+      await expect(service.execute(command, { signal })).resolves.toMatchObject({ queued: { state: "pending" } });
+      await service.settled();
+      expect(injected).toBe(true);
+      expect(store.listQueue(sessionId)).toHaveLength(1);
+      expect(sweepReads).toBe(0);
+      expect(codex.calls).toEqual(calls);
+    } finally {
+      store.readQueueEnqueueReplay = readReplay;
+      store.listUnreferencedAttachments = listUnreferenced;
+      other.close();
+    }
+  });
+
+  test("queue attachment identity quarantines an unproved legacy FIFO head until explicit abandonment", async () => {
+    const value = await fixture();
+    const { service, store, paths, codex } = value;
+    const { sessionId } = await createIdleSession(value, "Legacy queue attachment recovery");
+    const captured = store.requireSessionProviderAuthority(sessionId);
+    const legacyId = `queue_${crypto.randomUUID().replaceAll("-", "")}` as const;
+    const inspector = new Database(paths.database, { strict: true });
+    try {
+      // Released unkeyed enqueue had provider authority but no attachment
+      // identity. An absent manifest cannot prove that it was always empty.
+      inspector.transaction(() => {
+        const sequence = inspector.query("UPDATE queue_sequence_authority SET next_sequence=next_sequence+1 WHERE singleton=1 RETURNING next_sequence-1 AS value").get() as { value: number };
+        const now = Date.now();
+        inspector.query("INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?)")
+          .run(legacyId, sessionId, "Preserve the unproved legacy body.", sequence.value, now, now);
+        inspector.query(`INSERT INTO queue_provider_authorities(queue_id,provider_account_id,profile_id,provider,binding_generation,process_generation,provenance,recorded_at)
+          VALUES(?,?,?,?,?,?,'queue_prepare',?)`).run(legacyId, captured.providerAccountId, captured.profileId, captured.provider,
+          captured.bindingGeneration, captured.processGeneration, now);
+      }).immediate();
+    } finally {
+      inspector.close(false);
+    }
+    const calls = [...codex.calls];
+    const later = await service.execute({ kind: "session.queue", session: sessionId, message: "A later proved request." }, { signal }) as { queued: { id: `queue_${string}` } };
+    await service.settled();
+    expect(store.requireQueue(legacyId)).toMatchObject({ state: "pending", message: "Preserve the unproved legacy body." });
+    expect(store.requireQueue(later.queued.id).state).toBe("pending");
+    expect(store.requireSession(sessionId).state).toBe("recovery_required");
+    expect(codex.calls).toEqual(calls);
+    await expect(service.execute({ kind: "session.recover", session: sessionId }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { reason: "queue_attachment_identity_unproved" } });
+    expect(codex.calls).toEqual(calls);
+    expect(store.requireQueue(legacyId).message).toBe("Preserve the unproved legacy body.");
+    await expect(service.execute({ kind: "session.abandon", session: sessionId }, { signal }))
+      .resolves.toMatchObject({ recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } });
+    await service.settled();
+    expect(store.requireQueue(legacyId)).toMatchObject({ state: "cancelled", message: "[queue message removed after settlement]" });
+    expect(store.hasUnsettledQueueAttachmentQuarantineForSession(sessionId)).toBe(false);
+    expect(store.requireQueue(later.queued.id).state).toBe("cancelled");
+    expect(store.requireSession(sessionId).state).toBe("terminal");
+    expect(codex.calls).toEqual(calls);
   });
 
   test("hooks host-owned facts memory into start, resume, terminal archive, and expiry without a model command", async () => {
@@ -5466,10 +5662,10 @@ describe("HraService", () => {
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 46 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 47 });
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual(Array.from({ length: 22 }, (_, index) => ({ version: index + 25 })));
+      ).all()).toEqual(Array.from({ length: 23 }, (_, index) => ({ version: index + 25 })));
     } finally {
       inspector.close(false);
     }

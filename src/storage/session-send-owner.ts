@@ -7,6 +7,7 @@ import { reviewedRuntimeProfileProvider, reviewedRuntimeProfileSchema } from "..
 import { sessionSendRequestFingerprintSchema } from "../domain/session-send-request";
 import { attemptIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
 import { assertNoAutomaticPointerMoveOwnership, AutomaticPointerMoveStoreError } from "./automatic-pointer-move";
+import { assertQueueAttachmentMutationIntegrity, QueueAttachmentIdentityError } from "./queue-attachment-identity";
 
 export const SESSION_SEND_REQUEST_FORMAT = "original_send_v1";
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
@@ -270,6 +271,11 @@ const canonical = <T>(schema: z.ZodType<T>, json: unknown): T => {
   return value;
 };
 export function classifySessionSendOwnership(database: Database, lookup: SessionSendOwnershipLookup): SessionSendOwnership {
+  try { assertQueueAttachmentMutationIntegrity(database, lookup); }
+  catch (error: unknown) {
+    if (!(error instanceof QueueAttachmentIdentityError)) throw error;
+    throw new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
+  }
   try { assertNoAutomaticPointerMoveOwnership(database, lookup); }
   catch (error: unknown) {
     if (!(error instanceof AutomaticPointerMoveStoreError)) throw error;

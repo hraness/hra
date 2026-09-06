@@ -4262,6 +4262,9 @@ describe("provider portability", () => {
       processGeneration: idleAuthority.processGeneration,
     } as const;
     const sendKey = "00000000-0000-4000-8000-0000000006d2";
+    // Admit the pending queue before arranging the independently unsettled
+    // send; sealed queue admission cannot bypass an existing mutation fence.
+    const dispatching = value.store.enqueue(idle.session.id, "uncertain Claude queue");
     const sendAttempt = value.store.prepareMutation({
       kind: "session.send",
       authorityId: idle.session.id,
@@ -4288,7 +4291,6 @@ describe("provider portability", () => {
         runtimeProfile: reviewed,
       },
     });
-    const dispatching = value.store.enqueue(idle.session.id, "uncertain Claude queue");
     value.store.beginQueueEffect({
       queueId: dispatching.id,
       sessionId: idle.session.id,

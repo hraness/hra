@@ -167,6 +167,7 @@ import {
 } from "../storage/attachment-store";
 import { initializeProfilePaths, profilePaths, type StatePaths } from "../storage/paths";
 import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
+import { QueueAttachmentIdentityError } from "../storage/queue-attachment-identity";
 import { WorkCapabilityCodec } from "../storage/work-capability";
 import {
   ProviderUsageTurnNotBoundError,
@@ -2114,6 +2115,18 @@ export class HraService {
       }
     } catch (error: unknown) {
       if (error instanceof CommandFailure) throw error;
+      if (error instanceof QueueAttachmentIdentityError) {
+        const details = { reason: error.code };
+        switch (error.code) {
+          case "QUEUE_ATTACHMENT_REQUEST_CONFLICT":
+            throw new CommandFailure("CONFLICT", "The queue key belongs to a different message or attachment list.", details);
+          case "QUEUE_ATTACHMENT_LIMIT":
+            throw new CommandFailure("CONFLICT", "Resolve pending attached queue entries before adding another attached message.", details);
+          case "QUEUE_ATTACHMENT_IDENTITY_UNPROVED":
+          case "QUEUE_ATTACHMENT_IDENTITY_CORRUPT":
+            throw new CommandFailure("RECOVERY_REQUIRED", "The queued attachment identity cannot be proved. Inspect session recovery before another dispatch.", details);
+        }
+      }
       if (error instanceof SessionEventCursorError) {
         throw new CommandFailure("INVALID_INPUT", error.message);
       }
@@ -2174,6 +2187,8 @@ export class HraService {
           case "SCHEDULE_OVERFLOW":
             throw new CommandFailure("INVALID_INPUT", error.message, details);
           case "DAEMON_AUTHORITY_CHANGED":
+          case "ENQUEUE_INVALID":
+          case "ENQUEUE_UNAVAILABLE":
           case "TIMESTAMP_OVERFLOW":
             throw new CommandFailure("UNAVAILABLE", error.message, details);
           case "IDEMPOTENCY_CONFLICT":
@@ -11693,8 +11708,9 @@ export class HraService {
    * session was deleted, or the per-session manifest cap pruned the oldest
    * source — and removes their blobs. Then it removes blob files that local
    * custody does not account for at all, which is how a blob written for a
-   * command that never reached the daemon is reclaimed. Blobs younger than
-   * the grace window are never touched, so an in-flight command is safe.
+   * command that never reached the daemon is reclaimed. The grace window
+   * applies only to unaccounted files; it cannot protect an old reused blob
+   * between attachment preparation and durable reference admission.
    */
   async #sweepAttachmentCustody(active: boolean): Promise<void> {
     if (!active) return;
@@ -11976,23 +11992,44 @@ export class HraService {
     beforeEffect?: () => void,
     attachmentReferences: readonly AttachmentReference[] = [],
   ): Promise<unknown> {
+    const selected = this.#store.requireSession(selector);
+    const key = idempotencyKey ?? randomUUID();
+    const replay = this.#store.readQueueEnqueueReplay({
+      idempotencyKey: key,
+      sessionId: selected.id,
+      message,
+      attachments: attachmentReferences,
+    });
+    if (replay !== null) {
+      // Work keeps its exact authorization even for a historical queue receipt.
+      // A replay does not reread files, change custody or schedule dispatch.
+      beforeEffect?.();
+      return {
+        queued: replay.queued,
+        ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }),
+        ...(replay.verification === "legacy_unverified" ? { attachmentVerification: "legacy_unverified" } : {}),
+        idempotencyKey: key,
+      };
+    }
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertProviderReady(profile, this.#sessionProviderAuthority(session), { session });
     const providerAuthority = this.#sessionProviderAuthority(session);
-    // Custody is proved before anything durable exists, so a queue entry never
-    // outlives the attachments it references.
+    // Re-prove bytes before admission. Cross-process protection of this read
+    // remains the responsibility of the shared attachment reservation boundary.
     const attachments = await this.#prepareAttachments(attachmentReferences);
-    const key = idempotencyKey ?? randomUUID();
     // Work authorization and durable enqueue are one synchronous fence boundary.
     beforeEffect?.();
-    const queued = this.#store.enqueueIdempotent({ sessionId: session.id, profileGeneration: providerAuthority.processGeneration, providerAuthority, message, idempotencyKey: key });
-    if (attachments.stored.length > 0) {
-      this.#store.recordMessageAttachments({
-        attachments: attachments.stored,
-        sessionId: session.id,
-        sourceId: queued.id,
-      });
+    const admitted = this.#store.enqueueIdempotentWithResult({ sessionId: session.id, profileGeneration: providerAuthority.processGeneration,
+      providerAuthority, message, attachments: attachments.stored, idempotencyKey: key });
+    const queued = admitted.queued;
+    if (admitted.replayed) {
+      return {
+        queued,
+        ...(attachmentReferences.length === 0 ? {} : { attachments: attachmentReferences }),
+        ...(admitted.verification === "legacy_unverified" ? { attachmentVerification: "legacy_unverified" } : {}),
+        idempotencyKey: key,
+      };
     }
     await this.#sweepAttachmentCustody(attachments.values.length > 0);
     const observed = this.#store.requireSession(session.id);
@@ -12272,6 +12309,30 @@ export class HraService {
 
   async #resolveSessionRecovery(selector: string, action: "recover" | "abandon", signal: AbortSignal): Promise<unknown> {
     const session = this.#store.requireSession(selector);
+    if (this.#store.hasUnsettledQueueAttachmentQuarantineForSession(session.id)) {
+      if (action !== "abandon") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "This queue has no provable original attachment identity. `hra session abandon` ends the local session and cancels its pending queue without replay; HRA will not infer missing attachments.",
+          { reason: "queue_attachment_identity_unproved" },
+        );
+      }
+      const resolved = this.#store.abandonQueueAttachmentQuarantinedSession({
+        sessionId: session.id,
+        expectedRevision: session.revision,
+      });
+      await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
+      this.#resumeSessionWorkAfterRecovery(resolved);
+      return {
+        session: resolved,
+        recovery: {
+          resolved: true,
+          resolution: "abandoned",
+          providerEffectRetried: false,
+          providerStateDeleted: false,
+        },
+      };
+    }
     if (this.#store.hasUnsettledLegacyProviderAuthorityQuarantineForSession(session.id)) {
       if (action !== "abandon") {
         throw new CommandFailure(
@@ -13349,6 +13410,9 @@ export class HraService {
     let providerApplied = false;
     let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
     try {
+      // Known missing or corrupt identity refuses before any provider load or
+      // review. The final dispatch transaction verifies this seal again.
+      const attachmentReferences = this.#store.queueAttachmentManifest(queued.id);
       const signal = new AbortController().signal;
       const profile = this.#store.requireProfile(session.profileId);
       await this.#requireUsableProjectRoot(project.rootPath);
@@ -13373,7 +13437,7 @@ export class HraService {
       // The queued manifest is durable; its bytes are re-proved here, at
       // dispatch, exactly as they were at enqueue.
       const queuedAttachments = await this.#prepareAttachments(
-        this.#store.messageAttachmentManifest(session.id, queued.id),
+        attachmentReferences,
       );
       evidence = this.#store.beginQueueEffect({
         queueId: queued.id,
@@ -13449,6 +13513,11 @@ export class HraService {
       }
       await this.#daemonAuthority.assertCurrent();
       if (evidence === undefined) {
+        if (error instanceof QueueAttachmentIdentityError) {
+          this.#queuePreEffectRetryCounts.delete(queued.id);
+          this.#store.quarantineQueueAttachmentIdentity({ queueId: queued.id, sessionId: session.id });
+          return;
+        }
         if (this.#isRetryableQueuePreEffectError(error)) this.#scheduleQueuePreEffectRetry(session, queued.id);
         return;
       }

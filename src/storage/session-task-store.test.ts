@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite";
 import {
   createProfileId,
   createProjectId,
+  createQueueId,
   createSessionId,
   type SessionId,
 } from "../domain/values";
@@ -16,6 +17,7 @@ import {
   SessionTaskStore,
   SessionTaskStoreError,
   assertSessionTaskSchema,
+  type SessionTaskQueueRecord,
   type SessionTaskStoreErrorCode,
 } from "./session-task-store";
 
@@ -129,10 +131,13 @@ type Fixture = Readonly<{
   otherSessionId: SessionId;
   sessionId: SessionId;
   store: SessionTaskStore;
+  enqueueCalls: Readonly<{ sessionId: SessionId; message: string; inTransaction: boolean }>[];
 }>;
 
 function fixture(input: Readonly<{
   resolveProjectDirectory?: (root: string) => Promise<string | null>;
+  enqueue?: false;
+  afterEnqueue?: (queue: SessionTaskQueueRecord) => SessionTaskQueueRecord;
 }> = {}): Fixture {
   const database = new Database(":memory:", { strict: true });
   databases.push(database);
@@ -155,11 +160,28 @@ function fixture(input: Readonly<{
     ).run(id, accountId, projectId, `thread-${id}`);
   }
   const now = { value: 1_000 };
-  const store = new SessionTaskStore(database, {
+  const enqueueCalls: Fixture["enqueueCalls"] = [];
+  // The leaf suite supplies an explicit synchronous queue-writer double.
+  // StateStore integration separately proves the real callback's sealed owner.
+  const enqueue = (sessionId: SessionId, message: string): SessionTaskQueueRecord => {
+    enqueueCalls.push({ sessionId, message, inTransaction: database.inTransaction });
+    const allocated = database.query(`UPDATE queue_sequence_authority
+      SET next_sequence=next_sequence+1 WHERE singleton=1 AND next_sequence<9007199254740991
+      RETURNING next_sequence-1 AS sequence`).get() as { sequence: number } | null;
+    if (allocated === null) throw new Error("QUEUE_SEQUENCE_EXHAUSTED");
+    const queue: SessionTaskQueueRecord = { id: createQueueId(), sessionId, message, state: "pending",
+      createdAt: now.value, updatedAt: now.value };
+    database.query(`INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at)
+      VALUES (?,?,?,'pending',?,?,?)`).run(queue.id, sessionId, message, allocated.sequence, queue.createdAt, queue.updatedAt);
+    return input.afterEnqueue?.(queue) ?? queue;
+  };
+  const options = {
     now: () => now.value,
     resolveProjectDirectory: input.resolveProjectDirectory ?? (async (root) => root),
-  });
-  return { database, now, otherSessionId, sessionId, store };
+    ...(input.enqueue === false ? {} : { enqueue }),
+  };
+  const store = new SessionTaskStore(database, options);
+  return { database, now, otherSessionId, sessionId, store, enqueueCalls };
 }
 
 const createTask = (
@@ -663,6 +685,76 @@ describe("SessionTaskStore mutation authority", () => {
 });
 
 describe("SessionTaskStore due materialization", () => {
+  test("materialization requires a queue owner while leaf reads and edits remain available", async () => {
+    let projectReads = 0;
+    const value = fixture({ enqueue: false, resolveProjectDirectory: async (root) => {
+      projectReads += 1;
+      return root;
+    } });
+    const created = createTask(value);
+    const edited = value.store.edit({ sessionId: value.sessionId, taskId: created.id, expectedRevision: created.revision,
+      patch: { name: "Read and edit without execution authority" }, idempotencyKey: idempotencyKey() });
+    expect(value.store.require(value.sessionId, created.id)).toEqual(edited);
+    await expect(value.store.materializeDue({ now: edited.nextDueAt ?? 0 })).rejects.toThrow("SESSION_TASK_ENQUEUE_UNAVAILABLE");
+    expect(projectReads).toBe(0);
+    expect(value.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
+    expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+    expect(value.store.require(value.sessionId, created.id)).toEqual(edited);
+  });
+
+  test("materialization calls the queue owner once inside the transaction and retains its id and timestamps", async () => {
+    const value = fixture();
+    const created = createTask(value, { prompt: "Keep this exact task prompt.\n" });
+    value.now.value = 910_123;
+    const result = await value.store.materializeDue({ now: created.nextDueAt ?? 0, daemonGeneration: 7 });
+    expect(value.enqueueCalls).toEqual([{ sessionId: value.sessionId, message: created.prompt, inTransaction: true }]);
+    const item = result[0];
+    if (item === undefined) throw new Error("Missing callback materialization.");
+    expect(item.queue).toMatchObject({ createdAt: value.now.value, updatedAt: value.now.value });
+    expect(item.occurrence).toMatchObject({ queueId: item.queue.id, createdAt: value.now.value });
+    expect(value.database.query("SELECT id,created_at,updated_at FROM queue_entries").all())
+      .toEqual([{ id: item.queue.id, created_at: value.now.value, updated_at: value.now.value }]);
+    expect(await value.store.materializeDue({ now: (created.nextDueAt ?? 0) + 900_000 })).toEqual([]);
+    expect(value.enqueueCalls).toHaveLength(1);
+  });
+
+  test("queue owner failure rolls back its allocation and retries the unchanged due slot", async () => {
+    let refuse = true;
+    const value = fixture({ afterEnqueue: (queue) => {
+      if (refuse) throw new Error("injected queue owner failure");
+      return queue;
+    } });
+    const created = createTask(value);
+    const sequence = value.database.query("SELECT * FROM queue_sequence_authority").get();
+    await expect(value.store.materializeDue({ now: created.nextDueAt ?? 0 })).rejects.toThrow("injected queue owner failure");
+    expect(value.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
+    expect(value.database.query("SELECT * FROM queue_sequence_authority").get()).toEqual(sequence);
+    expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+    expect(value.store.require(value.sessionId, created.id)).toEqual(created);
+    refuse = false;
+    expect(await value.store.materializeDue({ now: created.nextDueAt ?? 0 })).toHaveLength(1);
+    expect(value.enqueueCalls).toHaveLength(2);
+  });
+
+  test.each(["queue id", "session", "message", "timestamp"] as const)("refuses a queue owner result with a different durable %s", async (field) => {
+    const value = fixture({ afterEnqueue: (queue) => {
+      switch (field) {
+        case "queue id": return { ...queue, id: createQueueId() };
+        case "session": return { ...queue, sessionId: createSessionId() };
+        case "message": return { ...queue, message: "A different queue body." };
+        case "timestamp": return { ...queue, createdAt: queue.createdAt + 1 };
+      }
+    } });
+    const created = createTask(value);
+    const sequence = value.database.query("SELECT * FROM queue_sequence_authority").get();
+    await expect(value.store.materializeDue({ now: created.nextDueAt ?? 0 })).rejects.toThrow("SESSION_TASK_ENQUEUE_INVALID");
+    expect(value.enqueueCalls).toHaveLength(1);
+    expect(value.database.query("SELECT * FROM queue_entries").all()).toEqual([]);
+    expect(value.database.query("SELECT * FROM queue_sequence_authority").get()).toEqual(sequence);
+    expect(value.store.listOccurrences(value.sessionId, created.id)).toEqual([]);
+    expect(value.store.require(value.sessionId, created.id)).toEqual(created);
+  });
+
   test("excludes open and reconciled provider switches at both due-scan boundaries", async () => {
     const blocked = fixture();
     const blockedTask = createTask(blocked);

@@ -68,9 +68,19 @@ message_attachments(session_id, source_id, position PK, digest, name, media_type
 
 `attachments.media_type` is the **canonical** type, so one digest has exactly one row even when two messages declare the same bytes as `text/markdown` and `text/csv`. `message_attachments.media_type` is the **declared** type. `source_id` is the client message id the turn was dispatched under: an `attempt_…` id for a send or a steer, a `queue_…` id for a queued message. Two triggers keep `reference_count` exact, and link rows are immutable.
 
-Per session, `MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP` (200) manifest sources are retained, oldest pruned first. A message that has been sent stores only its `messageDigest`, exactly as before; the manifest is the only durable record of what was attached, and it holds no bytes.
+Each nonempty manifest admission prunes historical sources toward `MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP` (200) per session, oldest first. Pending, dispatching and unresolved ambiguous queues retain their manifests separately from that display target. Settling those queues can temporarily leave more historical sources until a later manifest admission prunes them. At most 200 unresolved attached queue sources may be admitted per session; a full allowance refuses another attached enqueue atomically, without consuming its request key. It does not add a limit to attachment-free queues. A message that has been sent stores only its `messageDigest`, exactly as before; the manifest holds no bytes.
 
-Custody maintenance runs after any message that actually carried attachments. It drops accounting rows nothing references any more and removes their blobs, then removes blob files local custody does not account for at all. Blobs younger than `ATTACHMENT_BLOB_SWEEP_GRACE_MS` (one hour) are never touched, so a command still in flight is safe.
+Custody maintenance runs after a new message that actually carried attachments. It drops accounting rows nothing references any more and removes their blobs, then removes blob files local custody does not account for at all. The `ATTACHMENT_BLOB_SWEEP_GRACE_MS` age check (one hour) applies to unaccounted files; it is not a reservation for an old blob reused by an in-flight command.
+
+### Queue identity and recovery
+
+Schema version 47 seals each new queue request, including an explicitly empty attachment list, under its existing mutation key. The queue, provider authority, accounting, complete ordered manifest and immutable identity commit in one transaction. The identity and its independent anchor retain only identifiers, digests, lengths and counts, not a second message body or attachment bytes. Existing terminal queue-body scrubbing is unchanged.
+
+The same key cannot add, remove, reorder or rename attachments, or change their type, length or digest. An already-known exact historical replay uses the original authority and receipt before current provider or file checks. A concurrent replay discovered at transactional admission may already have read the files; neither replay rewrites a manifest, sweeps files or schedules a provider turn. Dispatch verifies the sealed manifest and accounting before provider preparation and again at its final admission boundary. Missing identity is never interpreted as an empty attachment list.
+
+Older queue requests did not bind attachment identity. Neither an absent nor a retained old manifest proves the original list, because the old writer could append references during a retry. Historical receipt lookup preserves the original message semantics and reports `attachmentVerification: legacy_unverified`; an attached retry cannot supply the missing proof or rewrite custody.
+
+An unproved legacy FIFO head blocks later dispatch and places the session in recovery while preserving queued text. `hra session recover` cannot infer missing attachments or send the message. Explicit `hra session abandon` ends the local session, cancels its pending queue and applies normal body scrubbing without replaying or deleting provider state. It is not a command to discard only one queue entry.
 
 ## Providers
 
@@ -213,6 +223,7 @@ A manifest is parsed as strictly as an interaction detail: the name must be boun
 - `src/domain/attachment-schemas.ts` - the zod schemas that parse a reference
 - `src/storage/attachment-store.ts` - the content-addressed blob store and `attachmentDigest`
 - `src/storage/state-store.ts` - schema version 34, `attachments`, `message_attachments`, and their custody methods
+- `src/storage/queue-attachment-identity.ts` - schema version 47 queue identity, manifest integrity, retention guards and recovery evidence
 - `src/daemon/attachment-ingest.ts` - path to custody
 - `src/daemon/attachments.ts` - references back to bytes for the providers
 - `src/daemon/service.ts` - send, queue, steer, queue dispatch, projection enrichment, custody sweep

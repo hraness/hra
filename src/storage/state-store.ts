@@ -23,8 +23,10 @@ import {
 import {
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_MAX_COUNT,
+  isAttachmentImageMediaType,
   type AttachmentManifestEntry,
   type AttachmentMediaType,
+  type AttachmentReference,
 } from "../domain/attachments";
 import {
   INTERACTION_MAX_PENDING_MS,
@@ -164,6 +166,12 @@ import {
 import { TRANSCRIPT_SEED_MAX_CHARACTERS } from "../domain/transcript";
 import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../domain/session-tasks";
 import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
+import {
+  QUEUE_ATTACHMENT_FORMAT, QUEUE_ATTACHMENT_PENDING_SOURCE_CAP, QueueAttachmentIdentityError,
+  applyQueueAttachmentSchema, auditQueueAttachmentIdentities, insertQueueAttachmentIdentity,
+  parseQueueAttachmentReferences, queueAttachmentManifestDigest, queueAttachmentRequestDigest, queueAttachmentQuarantineUnsettled,
+  queueAttachmentsProtectedSql, readQueueAttachmentIdentity, readVerifiedQueueAttachmentManifest,
+} from "./queue-attachment-identity";
 import { fingerprintSessionSendRequest, sessionSendRequestSchema, sessionSendRequestFingerprintSchema,
   type SessionSendRequest, type SessionSendRequestFingerprint } from "../domain/session-send-request";
 import { appendSessionSendOutcome, applySessionSendOwnerSchema, assertLegacyMutationOwnership,
@@ -1418,7 +1426,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 46;
+const currentSchemaVersion = 47;
 // A cloud device public id (`isOpaqueIdentifier` in src/cloud/contracts.ts).
 // The ledger keys on it, so the shape is pinned here rather than accepting an
 // arbitrary string from the cloud bridge.
@@ -9936,6 +9944,7 @@ const migrateWritableDatabase = (
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
   if (initialVersion === currentSchemaVersion) {
+    auditQueueAttachmentIdentities(database);
     auditAutomaticPointerMoves(database);
     auditSessionSendOwners(database);
     auditDevinJoinedCloses(database);
@@ -9959,6 +9968,7 @@ const migrateWritableDatabase = (
     // fences. Do not recreate missing current-format custody as a migration.
     if (initialVersion >= 40) assertWorkSignalProviderAuthorities(database);
     if (initialVersion >= 44) auditDevinJoinedCloses(database);
+    if (initialVersion >= 47) auditQueueAttachmentIdentities(database);
     if (initialVersion >= 46) auditAutomaticPointerMoves(database);
     if (initialVersion >= 45) auditSessionSendOwners(database);
     let redacted = false;
@@ -10518,6 +10528,19 @@ const migrateWritableDatabase = (
       database.exec("PRAGMA user_version = 46");
       version = 46;
     }
+    if (version < 47) {
+      applyQueueAttachmentSchema(database);
+      auditQueueAttachmentIdentities(database);
+      database.query(`INSERT INTO queue_attachment_quarantines(queue_id,ordinal,session_id,kind,reason,recorded_at)
+        SELECT id,1,session_id,'quarantined','legacy_identity_unproved',? FROM queue_entries WHERE state='pending' AND enqueue_identity_format IS NULL
+        ON CONFLICT(queue_id,ordinal) DO NOTHING`).run(now());
+      database.query(`UPDATE sessions SET state='recovery_required',revision=revision+1,updated_at=MAX(updated_at,?)
+        WHERE state NOT IN ('terminal','recovery_required') AND EXISTS(SELECT 1 FROM queue_attachment_quarantines quarantine WHERE quarantine.session_id=sessions.id)`)
+        .run(now());
+      database.query("INSERT INTO migrations(version,applied_at) VALUES(47,?)").run(now());
+      database.exec("PRAGMA user_version=47");
+      version = 47;
+    }
 
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
@@ -10586,6 +10609,7 @@ const migrateWritableDatabase = (
     auditDevinJoinedCloses(database);
     auditSessionSendOwners(database);
     auditAutomaticPointerMoves(database);
+    auditQueueAttachmentIdentities(database);
     return hasPendingSecurityScrub(database);
   })();
   if (securityScrubPending) completePendingSecurityScrub(database, false, securityScrubCheckpoint);
@@ -13171,6 +13195,7 @@ export class StateStore {
       if (this.#readonly) auditAutomaticUsagePolicyHistory(this.#database);
       if (this.#readonly) auditDevinJoinedCloses(this.#database);
       if (this.#readonly) auditAutomaticPointerMoves(this.#database);
+      if (this.#readonly) auditQueueAttachmentIdentities(this.#database);
       if (this.#readonly) auditSessionSendOwners(this.#database);
       assertCompositeNotificationPolicy(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
@@ -13203,7 +13228,10 @@ export class StateStore {
   }
 
   createSessionTaskStore(): SessionTaskStore {
-    return new SessionTaskStore(this.#database, { now: this.#now });
+    return new SessionTaskStore(this.#database, {
+      now: this.#now,
+      enqueue: (sessionId, message) => this.enqueue(sessionId, message),
+    });
   }
 
   isConversationAutomationEnabled(
@@ -18758,12 +18786,36 @@ export class StateStore {
     sourceId: string;
     attachments: readonly StoredMessageAttachment[];
   }): void {
+    this.#database.transaction(() => {
+      const queue = this.#database.query("SELECT id FROM queue_entries WHERE id=?").get(input.sourceId);
+      if (queue !== null && readQueueAttachmentIdentity(this.#database, input.sourceId) === null) {
+        throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+      }
+      this.#recordMessageAttachments(input);
+    }).immediate();
+  }
+
+  #recordMessageAttachments(input: Parameters<StateStore["recordMessageAttachments"]>[0]): void {
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const parsedSourceId = z.string().min(1).max(200).parse(input.sourceId);
     const parsed = storedMessageAttachmentListSchema.parse(input.attachments);
-    if (parsed.length === 0) return;
+    const references = parseQueueAttachmentReferences(parsed.map(({ byteLength, digest, mediaType, name }) => ({ byteLength, digest, mediaType, name })));
+    if (parsed.some((entry) => entry.canonicalMediaType !== (isAttachmentImageMediaType(entry.mediaType) ? entry.mediaType : "text/plain"))) {
+      throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+    }
     const now = this.#now();
     const write = this.#database.transaction(() => {
+      const sealed = this.#database.query("SELECT queue_id FROM queue_attachment_identities WHERE queue_id=? UNION SELECT queue_id FROM queue_attachment_identity_anchors WHERE queue_id=? LIMIT 1")
+        .get(parsedSourceId, parsedSourceId);
+      if (sealed !== null) {
+        const identity = readQueueAttachmentIdentity(this.#database, parsedSourceId);
+        if (identity === null || identity.sessionId !== parsedSessionId || identity.attachmentCount !== references.length
+          || identity.manifestDigest !== queueAttachmentManifestDigest(references)) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+        return;
+      }
+      const legacyQueue = this.#database.query("SELECT 1 FROM queue_entries WHERE id=? AND enqueue_identity_format IS NULL").get(parsedSourceId);
+      if (legacyQueue !== null) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+      if (parsed.length === 0) return;
       for (const [position, attachment] of parsed.entries()) {
         this.#database.query(
           `INSERT INTO attachments(digest,media_type,byte_length,created_at,reference_count)
@@ -18775,6 +18827,10 @@ export class StateStore {
           attachment.byteLength,
           now,
         );
+        const custody = this.#database.query("SELECT media_type,byte_length FROM attachments WHERE digest=?").get(attachment.digest) as { media_type: string; byte_length: number };
+        if (custody.media_type !== attachment.canonicalMediaType || custody.byte_length !== attachment.byteLength) {
+          throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+        }
         this.#database.query(
           `INSERT INTO message_attachments(session_id,source_id,position,digest,name,media_type,byte_length,created_at)
            VALUES (?,?,?,?,?,?,?,?)
@@ -18791,10 +18847,15 @@ export class StateStore {
         );
       }
       this.#database.query(
-        `DELETE FROM message_attachments WHERE session_id=? AND source_id NOT IN (
+        `DELETE FROM message_attachments WHERE session_id=?
+         AND NOT EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.id=message_attachments.source_id
+           AND queue.session_id=message_attachments.session_id AND ${queueAttachmentsProtectedSql("queue")})
+         AND source_id NOT IN (
            SELECT source_id FROM (
              SELECT source_id, MAX(created_at) AS recent FROM message_attachments
-             WHERE session_id=? GROUP BY source_id ORDER BY recent DESC, source_id DESC LIMIT ?))`,
+             WHERE session_id=? AND NOT EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.id=message_attachments.source_id
+               AND queue.session_id=message_attachments.session_id AND ${queueAttachmentsProtectedSql("queue")})
+             GROUP BY source_id ORDER BY recent DESC, source_id DESC LIMIT ?))`,
       ).run(parsedSessionId, parsedSessionId, MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP);
     });
     write.immediate();
@@ -19408,7 +19469,7 @@ export class StateStore {
            AND resolution.attempt_id IS NULL
            AND NOT EXISTS(SELECT 1 FROM session_switch_attempts dedicated WHERE dedicated.attempt_id=mutation.id)
          LIMIT 1`,
-      ).get(current.id) !== null) {
+      ).get(current.id) !== null || this.hasUnsettledQueueAttachmentQuarantineForSession(current.id)) {
         const session = this.quarantineSession(current.id);
         const event = session.revision === current.revision ? undefined : this.appendSessionEvent({
           sessionId: session.id,
@@ -19751,7 +19812,7 @@ export class StateStore {
     return this.requireSession(sessionId);
   }
 
-  #enqueuePrepared(sessionId: SessionId, message: string): QueueRecord {
+  #enqueuePrepared(sessionId: SessionId, message: string, attemptId: AttemptId): QueueRecord {
     const id = createQueueId();
     const now = this.#now();
     const sequenceRow = this.#database.query(
@@ -19764,7 +19825,7 @@ export class StateStore {
     const enqueueSequence = z.object({
       enqueue_sequence: z.number().int().positive().safe(),
     }).strict().parse(sequenceRow).enqueue_sequence;
-    this.#database.query("INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(id, sessionId, message, "pending", enqueueSequence, now, now);
+    this.#database.query("INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at,enqueue_identity_format,enqueue_identity_attempt_id) VALUES (?,?,?,?,?,?,?,?,?)").run(id, sessionId, message, "pending", enqueueSequence, now, now, QUEUE_ATTACHMENT_FORMAT, attemptId);
     const providerAuthority = baseProviderAccountAuthority(
       this.requireSessionProviderAuthority(sessionId),
     );
@@ -19782,13 +19843,8 @@ export class StateStore {
 
   enqueue(sessionId: SessionId, message: string): QueueRecord {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
-    const parsedMessage = z.string().min(1).max(262_144).parse(message);
-    let queued: QueueRecord | undefined;
-    this.#database.transaction(() => {
-      queued = this.#enqueuePrepared(parsedSessionId, parsedMessage);
-    }).immediate();
-    if (queued === undefined) throw new Error("Queue transaction lost its durable row.");
-    return queued;
+    const authority = baseProviderAccountAuthority(this.requireSessionProviderAuthority(parsedSessionId));
+    return this.enqueueIdempotent({ sessionId: parsedSessionId, message, providerAuthority: authority, profileGeneration: authority.processGeneration });
   }
 
   enqueueIdempotent(input: {
@@ -19797,12 +19853,66 @@ export class StateStore {
     message: string;
     idempotencyKey?: string;
     providerAuthority: ProviderAccountAuthority;
+    attachments?: readonly StoredMessageAttachment[];
   }): QueueRecord {
+    return this.enqueueIdempotentWithResult(input).queued;
+  }
+
+  readQueueEnqueueReplay(input: {
+    sessionId: SessionId;
+    message: string;
+    idempotencyKey: string;
+    attachments?: readonly AttachmentReference[];
+  }): { queued: QueueRecord; verification: "sealed" | "legacy_unverified" } | null {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const message = z.string().min(1).max(262_144).parse(input.message);
+    const key = z.string().uuid().parse(input.idempotencyKey);
+    const references = parseQueueAttachmentReferences(input.attachments ?? []);
+    return this.#database.transaction(() => {
+      const attempt = this.readMutation(key);
+      if (attempt === null) return null;
+      if (attempt.kind !== "session.queue" || attempt.authorityId !== sessionId
+        || (attempt.state !== "applied" && attempt.state !== "reconciled")) {
+        throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+      }
+      const result = z.object({ queueId: queueIdSchema }).strict().safeParse(attempt.result);
+      if (!result.success) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
+      const identity = readQueueAttachmentIdentity(this.#database, result.data.queueId);
+      if (identity === null && references.length !== 0) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+      const digest = queueAttachmentRequestDigest({ sessionId, authorityGeneration: attempt.authorityGeneration, message, attachments: references });
+      if (digest !== attempt.requestDigest || (identity !== null && (
+        identity.messageDigest !== createHash("sha256").update(message).digest("hex")
+        || identity.messageUtf8Bytes !== utf8Bytes(message)
+        || identity.manifestDigest !== queueAttachmentManifestDigest(references)
+        || identity.attachmentCount !== references.length
+      ))) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+      const queued = this.requireQueue(result.data.queueId);
+      if (queued.sessionId !== sessionId) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
+      return { queued, verification: identity === null ? "legacy_unverified" as const : "sealed" as const };
+    })();
+  }
+
+  enqueueIdempotentWithResult(input: {
+    sessionId: SessionId;
+    profileGeneration: number;
+    message: string;
+    idempotencyKey?: string;
+    providerAuthority: ProviderAccountAuthority;
+    attachments?: readonly StoredMessageAttachment[];
+  }): { queued: QueueRecord; replayed: boolean; verification: "sealed" | "legacy_unverified" } {
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const parsedMessage = z.string().min(1).max(262_144).parse(input.message);
-    const currentSessionAuthority = this.requireSessionProviderAuthority(parsedSessionId);
+    if (utf8Bytes(parsedMessage) > 262_144) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+    const attachments = storedMessageAttachmentListSchema.parse(input.attachments ?? []);
+    const references = parseQueueAttachmentReferences(attachments.map(({ digest, name, mediaType, byteLength }) => ({ digest, name, mediaType, byteLength })));
+    if (!parsedMessage.isWellFormed() || references.some((reference) => !reference.name.isWellFormed())) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+    const idempotencyKey = z.string().uuid().parse(input.idempotencyKey ?? randomUUID());
     const providerAuthority = providerAccountAuthoritySchema.parse(input.providerAuthority);
+    return this.#database.transaction(() => {
+    const replay = this.readQueueEnqueueReplay({ sessionId: parsedSessionId, message: parsedMessage, idempotencyKey, attachments: references });
+    if (replay !== null) return { ...replay, replayed: true };
+    const currentSessionAuthority = this.requireSessionProviderAuthority(parsedSessionId);
     if (
       providerAuthority.providerAccountId !== currentSessionAuthority.providerAccountId
       || providerAuthority.profileId !== currentSessionAuthority.profileId
@@ -19812,41 +19922,118 @@ export class StateStore {
       || providerAuthority.processGeneration !== currentSessionAuthority.processGeneration
     ) throw new Error("QUEUE_PROVIDER_AUTHORITY_MISMATCH");
     this.assertProviderAccountAuthorityCurrent(providerAuthority);
-    let queueId: QueueId | undefined;
-    const enqueue = this.#database.transaction(() => {
-      const attempt = this.prepareMutation({
+      if (references.length !== 0) {
+        const protectedSources = this.#database.query(`SELECT DISTINCT link.source_id FROM message_attachments link WHERE link.session_id=?
+          AND EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.id=link.source_id AND queue.session_id=link.session_id
+            AND ${queueAttachmentsProtectedSql("queue")}) LIMIT 201`).all(parsedSessionId);
+        if (protectedSources.length >= QUEUE_ATTACHMENT_PENDING_SOURCE_CAP) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_LIMIT");
+      }
+      const attempt = this.#prepareMutation({
         kind: "session.queue",
         authorityId: parsedSessionId,
         authorityGeneration: parsedGeneration,
-        request: { message: parsedMessage },
+        request: references.length === 0 ? { message: parsedMessage } : { version: 2, message: parsedMessage, attachments: references },
         providerAuthorities: [{
           role: "primary",
           authority: providerAuthority,
           provenance: "session_queue",
         }],
-        ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+        idempotencyKey,
       });
-      if (attempt.replay) {
-        if (attempt.state !== "applied" && attempt.state !== "reconciled") {
-          throw new Error(`QUEUE_MUTATION_${attempt.state.toUpperCase()}`);
-        }
-        queueId = z.object({ queueId: queueIdSchema }).strict().parse(attempt.result).queueId;
-        return;
-      }
+      if (attempt.replay) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
       const authority = z.object({ session_state: sessionStateSchema }).strict().parse(
         this.#database.query("SELECT state AS session_state FROM sessions WHERE id=?").get(parsedSessionId),
       );
       if (authority.session_state === "recovery_required" || authority.session_state === "terminal") {
         throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       }
-      const queued = this.#enqueuePrepared(parsedSessionId, parsedMessage);
-      queueId = queued.id;
-      if (!this.transitionMutation(attempt.id, "prepared", "effect_started")) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-      if (!this.transitionMutation(attempt.id, "effect_started", "applied", { queueId: queued.id })) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
-    });
-    enqueue.immediate();
-    if (queueId === undefined) throw new Error("Queue transaction lost its durable receipt.");
-    return this.requireQueue(queueId);
+      const queued = this.#enqueuePrepared(parsedSessionId, parsedMessage, attempt.id);
+      this.#recordMessageAttachments({ sessionId: parsedSessionId, sourceId: queued.id, attachments });
+      if (this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(this.#now(), attempt.id).changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      if (this.#database.query("UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=? WHERE id=? AND state='effect_started'").run(JSON.stringify({ queueId: queued.id }), this.#now(), attempt.id).changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      insertQueueAttachmentIdentity(this.#database, {
+        version: 1, queueId: queued.id, attemptId: attempt.id, idempotencyKey, sessionId: parsedSessionId,
+        authority: providerAuthority, requestDigest: queueAttachmentRequestDigest({ sessionId: parsedSessionId, authorityGeneration: parsedGeneration, message: parsedMessage, attachments: references }),
+        messageDigest: createHash("sha256").update(parsedMessage).digest("hex"), messageUtf8Bytes: utf8Bytes(parsedMessage),
+        manifestDigest: queueAttachmentManifestDigest(references), attachmentCount: references.length, createdAt: queued.createdAt,
+      });
+      return { queued, replayed: false, verification: "sealed" as const };
+    }).immediate();
+  }
+
+  queueAttachmentManifest(queueId: QueueId): readonly AttachmentManifestEntry[] {
+    return this.#database.transaction(() => readVerifiedQueueAttachmentManifest(this.#database, queueIdSchema.parse(queueId)))();
+  }
+
+  quarantineQueueAttachmentIdentity(input: { queueId: QueueId; sessionId: SessionId }): void {
+    const queueId = queueIdSchema.parse(input.queueId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    this.#database.transaction(() => {
+      const queue = this.requireQueue(queueId);
+      if (queue.sessionId !== sessionId || queue.state !== "pending") throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
+      let reason: "legacy_identity_unproved" | "identity_corrupt";
+      try {
+        readVerifiedQueueAttachmentManifest(this.#database, queueId);
+        throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+      } catch (error: unknown) {
+        if (!(error instanceof QueueAttachmentIdentityError) || error.code === "QUEUE_ATTACHMENT_REQUEST_CONFLICT") throw error;
+        reason = error.code === "QUEUE_ATTACHMENT_IDENTITY_UNPROVED" ? "legacy_identity_unproved" : "identity_corrupt";
+      }
+      const original = this.#database.query("SELECT session_id FROM queue_attachment_quarantines WHERE queue_id=? AND ordinal=1").get(queueId) as { session_id: string } | null;
+      if (original !== null && original.session_id !== sessionId) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
+      if (original === null) this.#database.query("INSERT INTO queue_attachment_quarantines(queue_id,ordinal,session_id,kind,reason,recorded_at) VALUES(?,1,?,'quarantined',?,?)").run(queueId, sessionId, reason, this.#now());
+      this.#database.query("UPDATE sessions SET state='recovery_required',revision=revision+1,updated_at=MAX(updated_at,?) WHERE id=? AND state NOT IN ('terminal','recovery_required')").run(this.#now(), sessionId);
+    }).immediate();
+  }
+
+  hasUnsettledQueueAttachmentQuarantineForSession(sessionId: SessionId): boolean {
+    const id = sessionIdSchema.parse(sessionId);
+    return this.#database.transaction(() => {
+    const malformed = this.#database.query(`SELECT 1 FROM queue_attachment_quarantines event LEFT JOIN queue_entries queue ON queue.id=event.queue_id
+      WHERE (event.session_id=? OR queue.session_id=?) AND (queue.id IS NULL OR queue.session_id!=event.session_id) LIMIT 1`).get(id, id);
+    if (malformed !== null) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_CORRUPT");
+    let after = ""; let unsettled = false;
+    for (;;) {
+      const rows = this.#database.query("SELECT DISTINCT queue_id FROM queue_attachment_quarantines WHERE session_id=? AND queue_id>? ORDER BY queue_id LIMIT 100").all(id, after) as Array<{ queue_id: string }>;
+      if (rows.length === 0) return unsettled;
+      for (const row of rows) { unsettled = queueAttachmentQuarantineUnsettled(this.#database, row.queue_id) || unsettled; after = row.queue_id; }
+    }
+    })();
+  }
+
+  abandonQueueAttachmentQuarantinedSession(input: { sessionId: SessionId; expectedRevision: number }): SessionRecord {
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const expectedRevision = z.number().int().positive().safe().parse(input.expectedRevision);
+    this.#database.transaction(() => {
+      const session = this.requireSession(sessionId);
+      assertUnsettledSessionSendOwners(this.#database, sessionId);
+      if (session.state !== "recovery_required" || session.revision !== expectedRevision || session.activeTurnId !== undefined
+        || !this.hasUnsettledQueueAttachmentQuarantineForSession(sessionId)) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+      const blocked = this.#database.query(`SELECT 1 WHERE
+        EXISTS(SELECT 1 FROM mutation_attempts m LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+          LEFT JOIN session_start_attempts start ON start.attempt_id=m.id WHERE (m.authority_id=? OR start.session_id=?)
+          AND m.state IN ('prepared','effect_started','ambiguous') AND r.attempt_id IS NULL AND NOT ${sessionSendUnclaimedSql("m")})
+        OR EXISTS(SELECT 1 FROM queue_entries queue WHERE queue.session_id=? AND queue.state IN ('dispatching','ambiguous')
+          AND NOT EXISTS(SELECT 1 FROM queue_effect_resolutions r WHERE r.queue_id=queue.id))
+        OR EXISTS(SELECT 1 FROM provider_interactions interaction WHERE interaction.session_id=? AND interaction.state IN ('pending','response_prepared','response_written'))
+        OR EXISTS(SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch WHERE switch.session_id=? AND ${SESSION_SWITCH_BLOCKING_PREDICATE})
+        OR EXISTS(SELECT 1 FROM work_attempts work WHERE work.worker_session_id=? AND work.state IN ('claimed','dispatching','running','recovery_required'))
+        OR EXISTS(SELECT 1 FROM work_signals work WHERE work.to_session_id=? AND NOT EXISTS(SELECT 1 FROM work_signal_receipts receipt WHERE receipt.signal_id=work.id AND receipt.kind='ack'))`)
+        .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId);
+      if (blocked !== null) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+      const now = this.#now();
+      this.#database.query(`INSERT INTO queue_attachment_quarantines(queue_id,ordinal,session_id,kind,predecessor,expected_session_revision,reason,recorded_at)
+        SELECT original.queue_id,2,original.session_id,'abandoned',1,?,original.reason,MAX(original.recorded_at,?) FROM queue_attachment_quarantines original
+        JOIN queue_entries queue ON queue.id=original.queue_id AND queue.session_id=original.session_id
+        WHERE original.session_id=? AND original.ordinal=1 AND queue.state='pending'
+          AND NOT EXISTS(SELECT 1 FROM queue_attachment_quarantines done WHERE done.queue_id=original.queue_id AND done.ordinal=2)`)
+        .run(expectedRevision, now, sessionId);
+      this.#database.query("UPDATE queue_entries SET state='cancelled',updated_at=MAX(updated_at,?) WHERE session_id=? AND state='pending'").run(now, sessionId);
+      const changed = this.#database.query("UPDATE sessions SET state='terminal',active_turn_id=NULL,revision=revision+1,updated_at=MAX(updated_at,?) WHERE id=? AND revision=? AND state='recovery_required'").run(now, sessionId, expectedRevision);
+      if (changed.changes !== 1) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+    }).immediate();
+    completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
+    return this.requireSession(sessionId);
   }
 
   listQueue(sessionId: SessionId): readonly QueueRecord[] {
@@ -19962,6 +20149,7 @@ export class StateStore {
     const digest = digestJson(evidence);
     const now = this.#now();
     const begin = this.#database.transaction(() => {
+      readVerifiedQueueAttachmentManifest(this.#database, queueId);
       if (this.readLegacyProviderAuthorityQuarantine("queue", queueId) !== null) {
         throw new Error("QUEUE_PROVIDER_AUTHORITY_QUARANTINED");
       }
@@ -21417,6 +21605,13 @@ export class StateStore {
     idempotencyKey?: string | undefined;
     providerAuthorities?: readonly ProviderAuthorityEvidence[];
   }): { id: AttemptId; state: MutationState; replay: boolean; result?: unknown } {
+    if (input.kind === "session.queue" && (input.idempotencyKey === undefined || this.readMutation(input.idempotencyKey) === null)) {
+      throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+    }
+    return this.#prepareMutation(input);
+  }
+
+  #prepareMutation(input: Parameters<StateStore["prepareMutation"]>[0]): { id: AttemptId; state: MutationState; replay: boolean; result?: unknown } {
     if (input.kind === automaticUsagePolicyMutationKind) throw new Error("AUTOMATIC_USAGE_POLICY_CLOSED_API_REQUIRED");
     if (input.kind === AUTOMATIC_POINTER_MOVE_KIND) throw new AutomaticPointerMoveStoreError("AUTOMATIC_POINTER_MOVE_CLOSED_API_REQUIRED");
     const idempotencyKey = input.idempotencyKey ?? randomUUID();
@@ -21495,6 +21690,7 @@ export class StateStore {
   }>): boolean {
     const attemptId = attemptIdSchema.parse(input.attemptId);
     assertLegacyMutationOwnership(this.#database, { attemptId });
+    if (this.#database.query("SELECT 1 FROM mutation_attempts WHERE id=? AND kind='session.queue'").get(attemptId) !== null) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
     const providerAuthorities = this.#parseProviderAuthorityEvidence(input.providerAuthorities);
     const begin = this.#database.transaction(() => {
       this.#assertMutationProviderAuthorities(attemptId, providerAuthorities);
@@ -21508,6 +21704,7 @@ export class StateStore {
 
   transitionMutation(id: AttemptId, from: MutationState, to: MutationState, result?: unknown): boolean {
     assertLegacyMutationOwnership(this.#database, { attemptId: id });
+    if (this.#database.query("SELECT 1 FROM mutation_attempts WHERE id=? AND kind='session.queue'").get(id) !== null) throw new QueueAttachmentIdentityError("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
     if (from === "reconciled" || to === "reconciled") {
       throw new Error("Reconciliation is append-only and cannot rewrite a mutation attempt.");
     }
@@ -28675,6 +28872,7 @@ export class StateStore {
          WHERE state IN ('pending','dispatching') AND session_id IN (
            SELECT id FROM sessions WHERE provider_v39='claude' AND state!='terminal'
          )
+           AND NOT EXISTS(SELECT 1 FROM queue_attachment_quarantines quarantine WHERE quarantine.queue_id=queue_entries.id AND quarantine.ordinal=1)
            AND NOT EXISTS(
              SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
              WHERE switch.session_id=queue_entries.session_id
@@ -28685,6 +28883,8 @@ export class StateStore {
         `UPDATE sessions SET state='terminal',active_turn_id=NULL,
                              revision=revision+1,updated_at=MAX(updated_at,?)
          WHERE provider_v39='claude' AND state!='terminal'
+           AND NOT EXISTS(SELECT 1 FROM queue_attachment_quarantines quarantine WHERE quarantine.session_id=sessions.id AND quarantine.ordinal=1
+             AND NOT EXISTS(SELECT 1 FROM queue_attachment_quarantines abandoned WHERE abandoned.queue_id=quarantine.queue_id AND abandoned.ordinal=2))
            AND NOT EXISTS(
              SELECT 1 FROM mutation_attempts mutation
              LEFT JOIN mutation_resolutions resolution ON resolution.attempt_id=mutation.id
@@ -28960,6 +29160,7 @@ export class StateStore {
         `UPDATE queue_entries
          SET state='cancelled',updated_at=MAX(updated_at,?)
          WHERE state='pending'
+           AND NOT EXISTS(SELECT 1 FROM queue_attachment_quarantines quarantine WHERE quarantine.queue_id=queue_entries.id AND quarantine.ordinal=1)
            AND NOT EXISTS(
              SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
              WHERE switch.session_id=queue_entries.session_id
@@ -28990,7 +29191,7 @@ export class StateStore {
       ).run(now);
       this.#consumeDevinJoinedCloses(current.generation, current.boot_id, bootId, now);
       this.#database.query(`UPDATE queue_entries SET state='cancelled',updated_at=MAX(updated_at,?)
-        WHERE state='pending' AND EXISTS(
+        WHERE state='pending' AND NOT EXISTS(SELECT 1 FROM queue_attachment_quarantines quarantine WHERE quarantine.queue_id=queue_entries.id AND quarantine.ordinal=1) AND EXISTS(
           SELECT 1 FROM queue_provider_authorities q JOIN provider_accounts a ON a.id=q.provider_account_id
           WHERE q.queue_id=queue_entries.id AND q.provider='devin'
             AND (q.process_generation!=a.process_generation OR q.binding_generation!=a.binding_generation)

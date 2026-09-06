@@ -24,7 +24,6 @@ import {
   type SessionTaskSummary,
 } from "../domain/session-tasks";
 import {
-  createQueueId,
   createSessionTaskId,
   MESSAGE_MAX_BYTES,
   positiveRevisionSchema,
@@ -36,6 +35,7 @@ import {
   type SessionId,
   type SessionTaskId,
 } from "../domain/values";
+import type { QueueState } from "../domain/transitions";
 import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
 import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
 
@@ -435,6 +435,25 @@ export type SessionTaskQueueRecord = Readonly<{
   updatedAt: number;
 }>;
 
+/** The owning StateStore's synchronous, sealed queue admission on this database. */
+export type SessionTaskEnqueue = (sessionId: SessionId, message: string) => Readonly<{
+  id: QueueId;
+  sessionId: SessionId;
+  message: string;
+  state: QueueState;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+const pendingQueueSchema = z.object({
+  id: queueIdSchema,
+  sessionId: sessionIdSchema,
+  message: z.string().min(1).max(MESSAGE_MAX_BYTES),
+  state: z.literal("pending"),
+  createdAt: safeTimestampSchema,
+  updatedAt: safeTimestampSchema,
+}).strict();
+
 export type SessionTaskMaterialization = Readonly<{
   task: SessionTaskRecord;
   occurrence: SessionTaskOccurrence;
@@ -443,6 +462,8 @@ export type SessionTaskMaterialization = Readonly<{
 
 export type SessionTaskStoreErrorCode =
   | "DAEMON_AUTHORITY_CHANGED"
+  | "ENQUEUE_INVALID"
+  | "ENQUEUE_UNAVAILABLE"
   | "IDEMPOTENCY_CONFLICT"
   | "IDEMPOTENCY_REPLAY_SUPERSEDED"
   | "NO_CHANGES"
@@ -557,16 +578,19 @@ export class SessionTaskStore {
   readonly #database: Database;
   readonly #now: () => number;
   readonly #resolveProjectDirectory: (root: string) => Promise<string | null>;
+  readonly #enqueue: SessionTaskEnqueue | undefined;
   #dueScanCursor: Readonly<{ nextDueAt: number; taskId: SessionTaskId }> | null = null;
 
   constructor(database: Database, options: Readonly<{
     now?: () => number;
     resolveProjectDirectory?: (root: string) => Promise<string | null>;
+    enqueue?: SessionTaskEnqueue;
   }> = {}) {
     this.#database = database;
     this.#now = options.now ?? Date.now;
     this.#resolveProjectDirectory = options.resolveProjectDirectory
       ?? resolveUsableCanonicalProjectDirectory;
+    this.#enqueue = options.enqueue;
     this.#database.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     assertSessionTaskSchema(this.#database);
   }
@@ -1197,6 +1221,8 @@ export class SessionTaskStore {
     daemonGeneration?: number;
   }>): Promise<readonly SessionTaskMaterialization[]> {
     const { now, daemonGeneration } = materializeInputSchema.parse(input);
+    const enqueue = this.#enqueue;
+    if (enqueue === undefined) throw new SessionTaskStoreError("ENQUEUE_UNAVAILABLE");
     const scanLimit = SESSION_TASK_LIMIT * 4;
     const cursor = this.#dueScanCursor;
     const candidates = this.#database.query(
@@ -1317,29 +1343,20 @@ export class SessionTaskStore {
           now,
           authoritative.interval_minutes,
         );
-        const sequenceRow = this.#database.query(
-          `UPDATE queue_sequence_authority
-           SET next_sequence=next_sequence+1
-           WHERE singleton=1 AND next_sequence<9007199254740991
-           RETURNING next_sequence-1 AS enqueue_sequence`,
-        ).get();
-        if (sequenceRow === null) throw new Error("QUEUE_SEQUENCE_EXHAUSTED");
-        const enqueueSequence = z.object({
-          enqueue_sequence: z.number().int().positive().safe(),
-        }).strict().parse(sequenceRow).enqueue_sequence;
-        const queueId = createQueueId();
-        this.#database.query(
-          `INSERT INTO queue_entries(
-             id,session_id,message,state,enqueue_sequence,created_at,updated_at
-           ) VALUES (?,?,?,'pending',?,?,?)`,
-        ).run(
-          queueId,
-          authoritative.session_id,
-          authoritative.prompt,
-          enqueueSequence,
-          now,
-          now,
-        );
+        // Queue sequence, mutation ownership, provider authority and empty
+        // attachment identity belong to StateStore, in this same transaction.
+        const enqueued = pendingQueueSchema.safeParse(enqueue(authoritative.session_id, authoritative.prompt));
+        if (!enqueued.success) throw new SessionTaskStoreError("ENQUEUE_INVALID");
+        const queue = enqueued.data;
+        const durable = pendingQueueSchema.safeParse(this.#database.query(
+          `SELECT id,session_id AS sessionId,message,state,created_at AS createdAt,updated_at AS updatedAt
+           FROM queue_entries WHERE id=?`,
+        ).get(queue.id));
+        if (queue.sessionId !== authoritative.session_id || queue.message !== authoritative.prompt
+          || !durable.success || JSON.stringify(durable.data) !== JSON.stringify(queue)) {
+          throw new SessionTaskStoreError("ENQUEUE_INVALID");
+        }
+        const queueId = queue.id;
         this.#database.query(
           `INSERT INTO session_task_occurrences(
              task_id,session_id,task_revision,scheduled_for,coalesced_intervals,queue_id,created_at
@@ -1351,7 +1368,7 @@ export class SessionTaskStore {
           scheduledFor,
           coalescedIntervals,
           queueId,
-          now,
+          queue.createdAt,
         );
         const advanced = this.#database.query(
           `UPDATE session_tasks
@@ -1375,16 +1392,9 @@ export class SessionTaskStore {
             scheduledFor,
             coalescedIntervals,
             queueId,
-            createdAt: now,
+            createdAt: queue.createdAt,
           }),
-          queue: {
-            id: queueId,
-            sessionId: authoritative.session_id,
-            message: authoritative.prompt,
-            state: "pending",
-            createdAt: now,
-            updatedAt: now,
-          },
+          queue,
         };
       });
       try {
