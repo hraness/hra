@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { open, readdir, rename, rm, stat } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { constants, lstatSync, realpathSync, unlinkSync } from "node:fs";
+import { open, opendir, readdir, rename, rm, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
-import { attachmentDigestSchema } from "../domain/attachment-schemas";
+import { z } from "zod";
+
+import { attachmentDigestSchema, attachmentNameSchema } from "../domain/attachment-schemas";
 import {
+  ATTACHMENT_IMAGE_MEDIA_TYPES,
   ATTACHMENT_MAX_BYTES,
   acceptAttachmentBytes,
   attachmentBlobExtension,
@@ -59,6 +62,58 @@ export type AttachmentBlobOutcome =
   | AttachmentBlobRefusal;
 
 const blobNamePattern = /^[0-9a-f]{64}\.(?:png|jpg|gif|webp|txt)$/u;
+// macOS may resolve an uppercase spelling to the same retained blob. Such
+// aliases are never stale-file authority, even on case-sensitive volumes.
+const blobNameAliasPattern = /^[0-9a-f]{64}\.(?:png|jpg|gif|webp|txt)$/iu;
+const canonicalMediaTypes = [...ATTACHMENT_IMAGE_MEDIA_TYPES, "text/plain"] as const;
+const cleanupCandidateSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("blob"), digest: attachmentDigestSchema,
+    canonicalMediaType: z.enum(canonicalMediaTypes) }).strict(),
+  // A real blob cannot bypass the future reference/pin lookup by being
+  // relabelled as an unaccounted stale filename.
+  z.object({ kind: z.literal("stale"), name: attachmentNameSchema.refine((name) =>
+    !blobNameAliasPattern.test(name) && !/[\uD800-\uDFFF]/u.test(name)) }).strict(),
+]);
+export type AttachmentCleanupCandidate = z.infer<typeof cleanupCandidateSchema>;
+export type AttachmentCleanupUnlinkResult = Readonly<
+  { kind: "deleted" | "absent" } | { kind: "retained"; reason: "young" | "unsafe_file" }
+>;
+export type AttachmentCleanupPort = Readonly<{
+  unlinkCleanupCandidateSync(candidate: AttachmentCleanupCandidate,
+    options: Readonly<{ notNewerThan: number | null }>): AttachmentCleanupUnlinkResult;
+}>;
+
+/** Sanitized failure codes: never forward a filesystem path or native error. */
+export class AttachmentCleanupError extends Error {
+  constructor(readonly code: "ATTACHMENT_CLEANUP_INVALID_CANDIDATE" | "ATTACHMENT_CLEANUP_INVALID_LIMIT"
+    | "ATTACHMENT_CLEANUP_INVALID_CUTOFF" | "ATTACHMENT_CLEANUP_UNSAFE_DIRECTORY"
+    | "ATTACHMENT_CLEANUP_INSPECT_FAILED" | "ATTACHMENT_CLEANUP_UNLINK_FAILED"
+    | "ATTACHMENT_CLEANUP_ENUMERATION_FAILED") {
+    super(code);
+    this.name = "AttachmentCleanupError";
+  }
+}
+
+export function parseAttachmentCleanupCandidate(value: unknown): AttachmentCleanupCandidate {
+  const parsed = cleanupCandidateSchema.safeParse(value);
+  if (!parsed.success) throw new AttachmentCleanupError("ATTACHMENT_CLEANUP_INVALID_CANDIDATE");
+  return parsed.data;
+}
+
+const isMissing = (error: unknown): boolean => typeof error === "object" && error !== null
+  && "code" in error && error.code === "ENOENT";
+const assertPrivateCleanupDirectory = (path: string): void => {
+  const metadata = lstatSync(path);
+  const owner = process.getuid?.();
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.nlink < 1
+    || (owner !== undefined && metadata.uid !== owner) || (metadata.mode & 0o077) !== 0
+    || realpathSync(path) !== resolve(path)) {
+    throw new AttachmentCleanupError("ATTACHMENT_CLEANUP_UNSAFE_DIRECTORY");
+  }
+};
+
+/** Maximum directory entries examined, including entries refused as unsafe. */
+export const ATTACHMENT_CLEANUP_SCAN_LIMIT = 100_000;
 
 export class AttachmentBlobStore {
   readonly #directory: string;
@@ -186,6 +241,95 @@ export class AttachmentBlobStore {
     return await this.#byteLengthOf(this.pathFor(digest, canonicalMediaType)) !== null;
   }
 
+  #cleanupDirectoryExistsSync(): boolean {
+    // Even an absent attachment directory needs an intact existing private
+    // parent. Cleanup never prepares, repairs or creates directory custody.
+    try {
+      assertPrivateCleanupDirectory(dirname(this.#directory));
+    } catch (error: unknown) {
+      if (error instanceof AttachmentCleanupError) throw error;
+      throw new AttachmentCleanupError("ATTACHMENT_CLEANUP_INSPECT_FAILED");
+    }
+    try {
+      assertPrivateCleanupDirectory(this.#directory);
+      return true;
+    } catch (error: unknown) {
+      if (isMissing(error)) return false;
+      if (error instanceof AttachmentCleanupError) throw error;
+      throw new AttachmentCleanupError("ATTACHMENT_CLEANUP_INSPECT_FAILED");
+    }
+  }
+
+  /** Hints only. No reference, age or deletion authority survives an await. */
+  async listCleanupCandidates(limit = 256): Promise<Readonly<{
+    candidates: readonly AttachmentCleanupCandidate[]; truncated: boolean;
+  }>> {
+    const parsedLimit = z.number().int().min(1).max(ATTACHMENT_CLEANUP_SCAN_LIMIT).safeParse(limit);
+    if (!parsedLimit.success) throw new AttachmentCleanupError("ATTACHMENT_CLEANUP_INVALID_LIMIT");
+    if (!this.#cleanupDirectoryExistsSync()) return { candidates: [], truncated: false };
+    const candidates: AttachmentCleanupCandidate[] = [];
+    let scanned = 0;
+    try {
+      for await (const entry of await opendir(this.#directory)) {
+        if (scanned >= parsedLimit.data) return { candidates, truncated: true };
+        scanned += 1;
+        if (blobNamePattern.test(entry.name)) {
+          const extension = entry.name.slice(65);
+          const canonicalMediaType = canonicalMediaTypes.find((mediaType) => attachmentBlobExtension(mediaType) === extension);
+          const parsed = cleanupCandidateSchema.safeParse({ kind: "blob", digest: entry.name.slice(0, 64), canonicalMediaType });
+          if (parsed.success) candidates.push(parsed.data);
+        } else {
+          const parsed = cleanupCandidateSchema.safeParse({ kind: "stale", name: entry.name });
+          if (parsed.success) candidates.push(parsed.data);
+        }
+      }
+    } catch (error: unknown) {
+      if (isMissing(error)) return { candidates, truncated: false };
+      throw new AttachmentCleanupError("ATTACHMENT_CLEANUP_ENUMERATION_FAILED");
+    }
+    return { candidates, truncated: false };
+  }
+
+  /**
+   * Filesystem half of one closed storage-owned cleanup transaction. This
+   * method grants no custody authority: its caller must hold SQLite's writer
+   * exclusion while rechecking references, pins and exact live daemon boot.
+   * No await separates the final metadata check from unlink. A later SQL
+   * rollback cannot restore deleted bytes; absent-file retry is conservative.
+   */
+  unlinkCleanupCandidateSync(candidateInput: AttachmentCleanupCandidate,
+    options: Readonly<{ notNewerThan: number | null }>): AttachmentCleanupUnlinkResult {
+    const candidate = parseAttachmentCleanupCandidate(candidateInput);
+    const cutoff = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable().safeParse(options.notNewerThan);
+    if (!cutoff.success || (candidate.kind === "stale" && cutoff.data === null)) {
+      throw new AttachmentCleanupError("ATTACHMENT_CLEANUP_INVALID_CUTOFF");
+    }
+    if (!this.#cleanupDirectoryExistsSync()) return { kind: "absent" };
+    const path = candidate.kind === "blob" ? this.pathFor(candidate.digest, candidate.canonicalMediaType)
+      : join(this.#directory, candidate.name);
+    let metadata;
+    try {
+      metadata = lstatSync(path);
+    } catch (error: unknown) {
+      if (isMissing(error)) return { kind: "absent" };
+      throw new AttachmentCleanupError("ATTACHMENT_CLEANUP_INSPECT_FAILED");
+    }
+    const owner = process.getuid?.();
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1
+      || (owner !== undefined && metadata.uid !== owner) || (metadata.mode & 0o077) !== 0
+      || !Number.isFinite(metadata.mtimeMs) || metadata.mtimeMs < 0) {
+      return { kind: "retained", reason: "unsafe_file" };
+    }
+    if (cutoff.data !== null && metadata.mtimeMs > cutoff.data) return { kind: "retained", reason: "young" };
+    try {
+      unlinkSync(path);
+    } catch (error: unknown) {
+      if (isMissing(error)) return { kind: "absent" };
+      throw new AttachmentCleanupError("ATTACHMENT_CLEANUP_UNLINK_FAILED");
+    }
+    return { kind: "deleted" };
+  }
+
   async remove(digest: string, canonicalMediaType: AttachmentMediaType): Promise<void> {
     await rm(this.pathFor(digest, canonicalMediaType), { force: true });
   }
@@ -209,6 +353,7 @@ export class AttachmentBlobStore {
     }
     let removed = 0;
     for (const entry of entries.slice(0, 100_000)) {
+      if (blobNameAliasPattern.test(entry) && !blobNamePattern.test(entry)) continue;
       const digest = entry.slice(0, 64);
       const stale = entry.endsWith(".part") || !blobNamePattern.test(entry);
       if (!stale && accounted.has(digest)) continue;
