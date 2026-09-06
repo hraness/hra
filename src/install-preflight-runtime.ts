@@ -651,7 +651,7 @@ if (testMode === "normal") {
     heldArchiveIdentity = verifiedArchive.identity;
     archiveSnapshot = verifiedArchive.snapshot;
     if (archiveSnapshot === undefined) throw new Error("The private HRA archive snapshot is unavailable.");
-    const route = "/" + randomUUID() + "/hraness-hra-0.7.0.tgz";
+    const route = "/" + randomUUID() + "/" + ${JSON.stringify(HRA_INSTALL_ARCHIVE_NAME)};
     let requests = 0;
     archiveServer = Bun.serve({
       hostname: "127.0.0.1",
@@ -3390,6 +3390,7 @@ const installIntoStage = async (input: Readonly<{
       throw new InstallPreflightError("Bun staging recorded an invalid isolated HRA archive URL.");
     }
     const stagedArchivePort = Number.parseInt(stagedArchiveUrl.port, 10);
+    const stagedArchivePathSegments = stagedArchiveUrl.pathname.split("/");
     if (
       stagedArchiveUrl.protocol !== "http:"
       || stagedArchiveUrl.hostname !== "127.0.0.1"
@@ -3400,7 +3401,11 @@ const installIntoStage = async (input: Readonly<{
       || stagedArchivePort > 65_535
       || stagedArchiveUrl.search !== ""
       || stagedArchiveUrl.hash !== ""
-      || !/^\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/hraness-hra-0\.6\.0\.tgz$/u.test(stagedArchiveUrl.pathname)
+      || stagedArchivePathSegments.length !== 3
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+        stagedArchivePathSegments[1] ?? "",
+      )
+      || stagedArchivePathSegments[2] !== HRA_INSTALL_ARCHIVE_NAME
     ) throw new InstallPreflightError("Bun staging left its descriptor-bound loopback archive authority.");
     await unlinkHeldChild(stageCustody, globalInstallRoot, "bun.lock", { missing: true });
     await stageCustody.assertAll();

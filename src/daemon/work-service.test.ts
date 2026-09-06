@@ -46,15 +46,15 @@ const signal = new AbortController().signal;
 
 const effectiveRuntimeProfile = (
   authority: ProfileAuthority,
-  preset: "high" = "high",
+  preset: "low" | "high" | "ultra" = "high",
   fast = false,
 ): EffectiveRuntimeProfile => ({
   profileId: authority.id,
   processGeneration: authority.generation,
   observedAt: 10_000,
   preset,
-  model: "gpt-6-astra",
-  reasoningEffort: "max",
+  model: preset === "low" ? "gpt-5.6-luna" : "gpt-6-astra",
+  reasoningEffort: preset === "ultra" ? "ultra" : "max",
   serviceTier: fast ? "priority" : null,
   fast,
   approvalPolicy: "on-request",
@@ -110,7 +110,7 @@ class WorkRuntime implements CodexRuntimePort {
       kind: "session_start",
       effectiveRuntimeProfile: effectiveRuntimeProfile(
         input.authority,
-        input.preset === "high" ? "high" : "high",
+        input.preset === "low" || input.preset === "ultra" ? input.preset : "high",
         input.fast,
       ),
     };
@@ -166,7 +166,7 @@ class WorkRuntime implements CodexRuntimePort {
       kind: "turn_start",
       effectiveRuntimeProfile: effectiveRuntimeProfile(
         input.authority,
-        input.preset === "high" ? "high" : "high",
+        input.preset === "low" || input.preset === "ultra" ? input.preset : "high",
         input.fast,
       ),
     };
@@ -1146,30 +1146,22 @@ describe("HraService work protocol", () => {
     expect(value.runtime.logoutCalls).toBe(0);
   });
 
-  test("refuses a provider switch before effects while the session owns a Work attempt", async () => {
+  test("refuses a meaningful same-account provider switch while the session belongs to live Work", async () => {
     const value = await fixture();
     const actor = await createActor(value);
     await createJoinClaim(value, actor);
-    const target = await value.service.execute(
-      { kind: "account.add", label: "Switch target" },
-      { signal },
-    ) as { account: { id: ProfileId } };
-    await value.service.execute(
-      { kind: "account.login", account: target.account.id, deviceCode: false },
-      { signal },
-    );
     const switchKey = nextKey();
     const startsBefore = value.runtime.startSessionCount;
 
     await expect(value.service.execute({
       kind: "session.switch",
-      account: target.account.id,
       idempotencyKey: switchKey,
+      preset: "low",
       provider: "codex",
       session: actor.sessionId,
     }, { signal })).rejects.toMatchObject({
-      code: "RECOVERY_REQUIRED",
-      details: { reason: "ATTEMPT_RECOVERY_REQUIRED" },
+      code: "CONFLICT",
+      details: { reason: "SESSION_PROVIDER_SWITCH_BLOCKED" },
     });
 
     expect(value.runtime.startSessionCount).toBe(startsBefore);
@@ -1186,15 +1178,8 @@ describe("HraService work protocol", () => {
   test("lets an effect-started provider switch fence a competing Work claim", async () => {
     const value = await fixture();
     const actor = await createActor(value);
-    const { created, joined } = await createAndJoin(value, actor);
-    const target = await value.service.execute(
-      { kind: "account.add", label: "Concurrent switch target" },
-      { signal },
-    ) as { account: { id: ProfileId } };
-    await value.service.execute(
-      { kind: "account.login", account: target.account.id, deviceCode: false },
-      { signal },
-    );
+    const coordinator = await createSiblingActor(value, actor);
+    const { created } = await createAndJoin(value, coordinator);
     let enterTargetStart = (): void => {};
     const targetStartEntered = new Promise<void>((resolve) => { enterTargetStart = resolve; });
     let releaseTargetStart = (): void => {};
@@ -1205,14 +1190,29 @@ describe("HraService work protocol", () => {
       await targetStartGate;
     };
     const switchKey = nextKey();
+    const startsBefore = value.runtime.startSessionCount;
     const switchPromise = value.service.execute({
       kind: "session.switch",
-      account: target.account.id,
       idempotencyKey: switchKey,
+      preset: "low",
       provider: "codex",
       session: actor.sessionId,
     }, { signal });
     await targetStartEntered;
+
+    const joined = workOperationResultSchema.parse(await value.service.execute({
+      kind: "work.apply",
+      requestId: crypto.randomUUID(),
+      operation: {
+        kind: "work.join",
+        idempotencyKey: nextKey(),
+        workId: created.work.id,
+        coordinatorSessionId: coordinator.sessionId,
+        coordinatorCapability: created.coordinatorCapability,
+        actorSessionId: actor.sessionId,
+      },
+    }, { signal }));
+    if (joined.kind !== "work.join") throw new Error("Expected the switching actor to join.");
 
     let claimFailure: unknown;
     try {
@@ -1243,8 +1243,9 @@ describe("HraService work protocol", () => {
     });
     expect(value.workStore.snapshot(created.work.id).tasks[0]?.status).toBe("ready");
     expect(value.store.readMutation(switchKey)).toMatchObject({ state: "applied" });
-    expect(switched.session.profileId).toBe(target.account.id);
-    expect(value.runtime.startSessionCount).toBe(2);
+    expect(switched.session.profileId).toBe(actor.accountId);
+    expect(value.store.requireSession(actor.sessionId).preset).toBe("low");
+    expect(value.runtime.startSessionCount).toBe(startsBefore + 1);
     expect(value.runtime.startTurnCalls).toHaveLength(1);
     expect(value.runtime.endSessionCount).toBe(1);
   });
@@ -1492,6 +1493,8 @@ describe("HraService work protocol", () => {
     ) throw new Error("Expected one exact ambiguous session.send mutation.");
     const session = value.store.requireSession(actor.sessionId);
     if (session.providerThreadId === undefined) throw new Error("Expected a provider thread.");
+    const prepared = value.workStore.preparedEffect(dispatchKey)?.effect;
+    if (prepared?.kind !== "dispatch") throw new Error("Expected the exact dispatch effect.");
     const recoveredTurnId = "provider-turn-recovered";
     value.store.resolveSessionMutation({
       attemptId: nestedMutation.id,
@@ -1509,6 +1512,7 @@ describe("HraService work protocol", () => {
         sourceId: nestedMutation.id,
         effectiveRuntimeProfile: nestedMutation.evidence.evidence.runtimeProfile,
       },
+      message: workPreparedEffectMessage(prepared),
       provider: {
         providerThreadId: session.providerThreadId,
         title: session.title,

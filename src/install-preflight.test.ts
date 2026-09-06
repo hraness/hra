@@ -957,6 +957,44 @@ describe("transactional HRA installer", () => {
     expect(await readdir(join(bunRoot, "install", "hra", "versions"))).toEqual(versions);
   }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
 
+  test("rejects a staged loopback archive URL with a malformed route UUID or archive filename", async () => {
+    for (const mutation of ["route-uuid", "archive-name"] as const) {
+      const root = await makeRoot(`hra-install-loopback-${mutation}-`);
+      await mkdir(join(root, "home"), { mode: 0o700 });
+      const authorityRoot = join(root, "bun root", "install", "hra");
+      const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+      const program = [
+        `const module = await import(${JSON.stringify(runtimePath)});`,
+        `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+        `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
+        "  afterStageWorkerExit: async () => {",
+        '    const fs = await import("node:fs/promises");',
+        '    const path = await import("node:path");',
+        `    const authorityRoot = ${JSON.stringify(authorityRoot)};`,
+        '    const stageName = (await fs.readdir(authorityRoot)).find((entry) => entry.startsWith(".staging-"));',
+        '    if (!stageName) throw new Error("staging root is missing");',
+        '    const manifestPath = path.join(authorityRoot, stageName, "install", "global", "package.json");',
+        "    const manifest = JSON.parse(await fs.readFile(manifestPath, \"utf8\"));",
+        "    const archiveUrl = new URL(manifest.dependencies[module.HRA_INSTALL_PACKAGE_NAME]);",
+        mutation === "route-uuid"
+          ? '    archiveUrl.pathname = "/not-a-v4-uuid/" + module.HRA_INSTALL_ARCHIVE_NAME;'
+          : '    archiveUrl.pathname = archiveUrl.pathname.replace(/[^/]+$/u, "unexpected.tgz");',
+        "    manifest.dependencies[module.HRA_INSTALL_PACKAGE_NAME] = archiveUrl.toString();",
+        '    await fs.writeFile(manifestPath, JSON.stringify(manifest) + "\\n", { mode: 0o600 });',
+        "  },",
+        "});",
+      ].join("\n");
+      const result = await run([process.execPath, "-e", program], {
+        cwd: root,
+        environment: installEnvironment(root),
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("descriptor-bound loopback archive authority");
+      expect(result.stdout).toBe("");
+      expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    }
+  }, 60_000);
+
   test("upgrades and recovers a verified legacy unscoped 0.1.0 installation", async () => {
     const root = await makeRoot("hra-install-legacy-upgrade-");
     const legacy = await createSyntheticPreviousInstall(root, {

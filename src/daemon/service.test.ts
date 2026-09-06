@@ -18873,7 +18873,7 @@ describe("HraService", () => {
   });
 
   test.each(["bound", "source", "target"] as const)(
-    "keeps retired %s recovery evidence read-only before provider or facts-memory effects",
+    "quarantines retired %s recovery without changing evidence or causing provider or facts-memory effects",
     async (side) => {
       const memory = new FakeFactsMemoryLifecycle();
       const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
@@ -18945,14 +18945,18 @@ describe("HraService", () => {
         await expect(value.service.recover()).resolves.toBeUndefined();
         expect(value.store.requireSession(session.id).state).toBe("recovery_required");
         expect(value.store.readMutation(key)).toMatchObject({
-          state: "effect_started",
+          state: "ambiguous",
           evidence: immutableEvidence,
+          result: { code: "DAEMON_RESTART" },
         });
         expect(value.codex.calls).toEqual([]);
         expect(memory.ensures).toEqual([]);
         expect(memory.cleanups).toEqual([]);
         const beforeSession = value.store.requireSession(session.id);
         const beforeMutation = value.store.readMutation(key);
+        await expect(value.service.recover()).resolves.toBeUndefined();
+        expect(value.store.requireSession(session.id)).toEqual(beforeSession);
+        expect(value.store.readMutation(key)).toEqual(beforeMutation);
         for (const kind of ["session.recover", "session.abandon"] as const) {
           await expect(value.service.execute({ kind, session: session.id }, { signal }))
             .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });

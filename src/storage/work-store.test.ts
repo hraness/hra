@@ -865,21 +865,20 @@ describe("WorkStore schema and atomic plans", () => {
     expect(() => value.store.assertSessionProviderSwitchAllowed(value.actorSessionId))
       .not.toThrow();
 
-    value.database.query(
-      "UPDATE sessions SET provider_v39='claude',preset='ultra' WHERE id=?",
-    ).run(value.actorSessionId);
-    value.database.query(
-      `UPDATE session_provider_account_authorities
-       SET provider='claude',runtime_scope='managed',account_key=?
-       WHERE session_id=?`,
-    ).run(claudeAccountKey("managed-work-account"), value.actorSessionId);
-    value.database.query(
-      "UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=2 WHERE id=?",
-    ).run(value.reviewerSessionId);
+    for (const sessionId of [value.actorSessionId, value.reviewerSessionId]) {
+      value.database.query(
+        "UPDATE sessions SET provider_v39='claude',preset='ultra' WHERE id=?",
+      ).run(sessionId);
+      value.database.query(
+        `UPDATE session_provider_account_authorities
+         SET provider='claude',runtime_scope='managed',account_key=?
+         WHERE session_id=?`,
+      ).run(claudeAccountKey("managed-work-account"), sessionId);
+    }
 
     const created = createWork(value, [
-      taskSpec(value, "claude-attempt", { preset: "ultra" }),
-      taskSpec(value, "devin-attempt", { preset: "ultra" }),
+      taskSpec(value, "claude-attempt-a", { preset: "ultra" }),
+      taskSpec(value, "claude-attempt-b", { preset: "ultra" }),
     ]);
     join(value, created.work.id, created.work.revision, value.reviewerSessionId);
 

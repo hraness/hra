@@ -240,6 +240,7 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
   connectionId = "30000000-0000-4000-8000-000000000002";
   connectionIdOnClaim?: string;
   controllerLive = true;
+  liveHostToolCall: HraHostToolCall | null = null;
   disconnectOnObserveRequest?: number;
   processIdentity: ClaudeProcessIdentity = {
     pid: 64_001,
@@ -367,6 +368,23 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
     this.calls.push("activate-host-tools");
     await this.onActivate?.(input);
     if (this.activateError !== undefined) throw this.activateError;
+  }
+  hasLiveHostToolCall(
+    input: Parameters<NonNullable<ClaudeRuntimePort["hasLiveHostToolCall"]>>[0],
+  ): boolean {
+    const call = this.liveHostToolCall;
+    return this.controllerLive
+      && call !== null
+      && this.projection.providerThreadId === input.providerThreadId
+      && this.projection.activeTurnId === input.turnId
+      && this.connectionId === input.connectionId
+      && call.authority.profileId === input.authority.id
+      && call.authority.processGeneration === input.authority.generation
+      && call.threadId === input.providerThreadId
+      && call.turnId === input.turnId
+      && call.connectionId === input.connectionId
+      && call.callId === input.callId
+      && call.requestDigest === input.requestDigest;
   }
   async observeSession(
     input: Parameters<ClaudeRuntimePort["observeSession"]>[0],
@@ -1659,6 +1677,12 @@ describe("provider portability", () => {
       generation: admittedCall.authority.processGeneration,
       id: admittedCall.authority.profileId,
     } as const;
+    await expect(value.service.handleHraHostToolCall(
+      targetAuthority,
+      admittedCall,
+      { provider: "claude", source: "managed" },
+    )).rejects.toThrow("HRA_HOST_TOOL_RUNTIME_AUTHORITY_STALE");
+    value.claude.liveHostToolCall = admittedCall;
     await expect(value.service.handleHraHostToolCall(
       targetAuthority,
       admittedCall,

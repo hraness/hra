@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { closeSync, openSync } from "node:fs";
 import { PassThrough } from "node:stream";
 
+import packageMetadata from "../package.json";
+
 import {
   admitExactDaemonStop,
   daemonRunProcessArguments,
@@ -1994,7 +1996,7 @@ describe("CLI entry point", () => {
         ok: true,
         version: 1,
         command: "version",
-        data: { version: "0.6.0" },
+        data: { version: packageMetadata.version },
       });
       expect(version.read().stderr).toBe("");
     }
@@ -2693,7 +2695,7 @@ describe("CLI entry point", () => {
   test("version is sourced from package metadata", async () => {
     const captured = capture();
     expect(await main(["--version"], captured.output)).toBe(0);
-    expect(captured.read()).toEqual({ stdout: "hra 0.6.0\n", stderr: "" });
+    expect(captured.read()).toEqual({ stdout: `hra ${packageMetadata.version}\n`, stderr: "" });
   });
 
   test("completes protected interaction input outside argv and never renders its value", async () => {
