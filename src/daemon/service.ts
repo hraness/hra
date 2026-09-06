@@ -995,6 +995,20 @@ const classifyBackgroundDiagnosticCause = (error: unknown): BackgroundDiagnostic
   return "error";
 };
 
+// Timestamp provenance belongs to local recovery authority, never public projections.
+const publicProviderProjection = (projection: CodexSessionProjection): Omit<CodexSessionProjection, "providerTimestampUnit"> => {
+  const publicProjection = { ...projection };
+  delete publicProjection.providerTimestampUnit;
+  return publicProjection;
+};
+
+const providerTimestampMarker = (projection: CodexSessionProjection): { providerTimestampUnit?: "unix_milliseconds_v1" } =>
+  projection.providerTimestampUnit === "unix_milliseconds_v1"
+    && projection.providerUpdatedAt !== undefined
+    && Number.isSafeInteger(projection.providerUpdatedAt)
+    && projection.providerUpdatedAt >= 0
+    ? { providerTimestampUnit: projection.providerTimestampUnit } : {};
+
 /** Upper bound on remembered per-session fact epochs; oldest entries are dropped first. */
 const SESSION_FACT_EPOCH_LIMIT = 4_096;
 const PERSONAL_SESSION_ADOPTION_SCAN_LIMIT = 50;
@@ -2137,7 +2151,7 @@ export class HraService {
             "The session authority changed during the cloud projection read.",
           );
         }
-        return projection;
+        return publicProviderProjection(projection);
       }, { allowDuringProjectionRecovery: true });
     } finally {
       finish();
@@ -12809,7 +12823,7 @@ export class HraService {
       detail,
       signal,
     );
-    const projection = this.#withAttachmentManifests(session.id, observed);
+    const projection = publicProviderProjection(this.#withAttachmentManifests(session.id, observed));
     if (projectionRecoveryUnsettled || this.#projectionRecoveriesInFlight.has(session.id)) {
       const runtimeProfile = this.#store.latestSessionRuntimeProfile(session.id)?.profile ?? null;
       const coherentSession = this.#store.requireSession(session.id);
@@ -14589,6 +14603,7 @@ export class HraService {
           kind: "session.stop",
           providerThreadId: session.providerThreadId,
           baseline: this.#providerBaseline(baseline),
+          ...providerTimestampMarker(baseline),
           activeTurnId,
         },
       });
@@ -14622,6 +14637,7 @@ export class HraService {
           kind: "session.rename",
           providerThreadId: session.providerThreadId,
           baseline: this.#providerBaseline(baseline),
+          ...providerTimestampMarker(baseline),
           requestedName: name,
         },
       });
@@ -14685,7 +14701,7 @@ export class HraService {
       this.#resumeSessionWorkAfterRecovery(resolved);
       return {
         session: resolved,
-        projection,
+        projection: publicProviderProjection(projection),
         recovery: {
           resolved: true,
           resolution: "provider_state_reconciled",
@@ -14769,7 +14785,7 @@ export class HraService {
       });
       await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
       this.#resumeSessionWorkAfterRecovery(resolved);
-      return { session: resolved, projection, idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
+      return { session: resolved, projection: publicProviderProjection(projection), idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
     }
 
     const proof = this.#proveSessionMutation(attempt, session.id, projection);
@@ -14787,7 +14803,7 @@ export class HraService {
     });
     await this.#reconcileCommittedSessionFactsMemory(resolved);
       this.#resumeSessionWorkAfterRecovery(resolved);
-    return { session: resolved, projection, idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false } };
+    return { session: resolved, projection: publicProviderProjection(projection), idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false } };
   }
 
   async #resolveProviderSwitchRecovery(
@@ -15305,7 +15321,7 @@ export class HraService {
       this.#resumeSessionWorkAfterRecovery(resolved);
       return {
         session: resolved,
-        ...(projection === undefined ? {} : { projection }),
+        ...(projection === undefined ? {} : { projection: publicProviderProjection(projection) }),
         idempotencyKey: attempt.idempotencyKey,
         recovery: {
           resolved: true,
@@ -15812,8 +15828,14 @@ export class HraService {
       if (evidence.activeTurnId === null || turnId !== evidence.activeTurnId) return null;
       return { receipt: { steered: true, activeTurnId: evidence.activeTurnId }, evidence: { kind: evidence.kind, clientMessageId: evidence.clientMessageId, turnId, providerUpdatedAt: projection.providerUpdatedAt } };
     }
-    const strictlyNewer = evidence.baseline.providerUpdatedAt !== null
+    const strictlyNewer = evidence.providerTimestampUnit === "unix_milliseconds_v1"
+      && projection.providerTimestampUnit === "unix_milliseconds_v1"
+      && evidence.baseline.providerUpdatedAt !== null
+      && Number.isSafeInteger(evidence.baseline.providerUpdatedAt)
+      && evidence.baseline.providerUpdatedAt >= 0
       && projection.providerUpdatedAt !== undefined
+      && Number.isSafeInteger(projection.providerUpdatedAt)
+      && projection.providerUpdatedAt >= 0
       && projection.providerUpdatedAt > evidence.baseline.providerUpdatedAt;
     if (!strictlyNewer) return null;
     if (evidence.kind === "session.stop") {
@@ -15821,10 +15843,10 @@ export class HraService {
       const observed = (projection.turnSummaries ?? []).find((turn) => turn.id === evidence.activeTurnId);
       const absentOrTerminal = observed === undefined || observed.status === "completed" || observed.status === "interrupted" || observed.status === "failed";
       if (!absentOrTerminal) return null;
-      return { receipt: { stopped: true, activeTurnId: evidence.activeTurnId }, evidence: { kind: evidence.kind, activeTurnId: evidence.activeTurnId, observedStatus: observed?.status ?? "absent", providerUpdatedAt: projection.providerUpdatedAt } };
+      return { receipt: { stopped: true, activeTurnId: evidence.activeTurnId }, evidence: { kind: evidence.kind, providerThreadId: evidence.providerThreadId, providerTimestampUnit: evidence.providerTimestampUnit, activeTurnId: evidence.activeTurnId, observedStatus: observed?.status ?? "absent", providerUpdatedAt: projection.providerUpdatedAt } };
     }
     if (projection.title !== evidence.requestedName) return null;
-    return { receipt: { renamed: true }, evidence: { kind: evidence.kind, requestedName: evidence.requestedName, providerUpdatedAt: projection.providerUpdatedAt } };
+    return { receipt: { renamed: true }, evidence: { kind: evidence.kind, providerThreadId: evidence.providerThreadId, providerTimestampUnit: evidence.providerTimestampUnit, requestedName: evidence.requestedName, providerUpdatedAt: projection.providerUpdatedAt } };
   }
 
   async #resolveQueueRecovery(
@@ -15857,7 +15879,7 @@ export class HraService {
       });
       await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
       this.#resumeSessionWorkAfterRecovery(resolved);
-      return { session: resolved, projection, queueId: record.queueId, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
+      return { session: resolved, projection: publicProviderProjection(projection), queueId: record.queueId, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
     }
     const matches = new Set((projection.messages ?? [])
       .filter((message) => message.role === "user" && message.clientId === record.evidence.clientMessageId && message.turnId !== undefined)
@@ -15877,7 +15899,7 @@ export class HraService {
     });
     await this.#reconcileCommittedSessionFactsMemory(resolved);
       this.#resumeSessionWorkAfterRecovery(resolved);
-    return { session: resolved, projection, queueId: record.queueId, recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false } };
+    return { session: resolved, projection: publicProviderProjection(projection), queueId: record.queueId, recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false } };
   }
 
   async #readExactSessionProjection(session: BoundSessionRecord, profile: ProfileRecord, detail: boolean, signal: AbortSignal): Promise<CodexSessionProjection> {

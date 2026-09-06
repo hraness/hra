@@ -245,3 +245,45 @@ admission. The pinned Codex resume method also cannot add a thread-creation-only
 dynamic tool to a thread that never had it. That limits model-originated
 automation changes in arbitrary existing Codex threads, not the public HRA
 session commands, scheduler, approval authority, or autorespond path.
+
+## Provider timestamp recovery repair
+
+Status: implemented and focused verification complete; independent review and
+exact-tree integration remain in progress.
+Tracked in [issue 121](https://github.com/hraness/hra/issues/121).
+
+Codex thread parsing converts provider epoch seconds to milliseconds. An old
+unmarked stop or rename baseline must not become evidence of advancement merely
+because a later read uses the converted unit. The parser now establishes the
+private `unix_milliseconds_v1` marker only after safe conversion, and the runtime
+adapter propagates it conditionally. Bare adapter projections remain unmarked.
+
+New stop and rename effect evidence may record that marker at the top level.
+Recovery requires both the recorded baseline and the observed projection to
+carry it, both timestamps to be nonnegative safe integers, and strict time
+advancement. Existing exact thread, old-turn absence or terminal state, and
+requested-name proof remains necessary. Direct confirmed receipts and causal
+send, steer, and queue recovery retain their existing authority.
+
+The shared three-field provider baseline is unchanged. No existing evidence or
+resolution is rewritten, normalized, or inferred from timestamp magnitude. The
+typed store refuses invalid new proofs before writes. Schema 41 adds one insert-only
+SQLite guard, `mutation_resolutions_timestamp_proof_insert`, and its migration
+ledger entry. The guard refuses invalid new stop/rename resolutions, requires
+the proof to agree with the resulting session snapshot, and requires SQL NULL
+receipts for non-proven resolutions. Current schema 41 opens require the exact
+stored guard definition before maintenance; missing or altered guards are
+refused without repair. Schema 40 remains an immutable predecessor, and readonly
+older databases retain the migration-required policy. Public and cloud projections
+omit the private unit marker.
+
+Acceptance requires real-parser legacy-unit regressions, positive and invalid
+marked observations, typed and raw SQL atomic refusal, unchanged historical
+bytes and digests after reopen, and public projection privacy. Focused parser,
+adapter, service, and storage proof tests pass. The schema-41 compiler and
+changed-file lint checks passed. The storage and CLI migration run passed 265
+tests and exposed two fixture errors; both were corrected and the focused
+rerun passed seven tests with 370 assertions. The integration owner will record
+independent review, the exact-tree aggregate and package inventory, and delivery
+before closing this repair. No live provider or native authentication claim is
+needed for these local proof rules.
